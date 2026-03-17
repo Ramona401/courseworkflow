@@ -1,49 +1,53 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
-	"github.com/jackc/pgx/v5"
-	"github.com/joho/godotenv"
-	"golang.org/x/crypto/bcrypt"
+	"tedna/internal/config"
+	"tedna/internal/database"
+	"tedna/internal/routes"
 )
 
-// 占位确保依赖被引用
-var _ = jwt.New
-var _ *pgx.Conn
-var _ = uuid.New
-var _ = websocket.DefaultDialer
-var _ = godotenv.Load
-var _ = bcrypt.GenerateFromPassword
-
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"status":"ok","version":"0.0.1"}`)
-}
-
 func main() {
-	// 加载环境变量
-	if err := godotenv.Load(); err != nil {
-		log.Println("未找到 .env 文件，使用系统环境变量")
-	}
+	// 加载配置
+	cfg := config.Load()
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
+	// 初始化数据库
+	database.Init(cfg)
+	defer database.Close()
 
 	// 注册路由
-	http.HandleFunc("/api/v1/health", healthHandler)
+	mux := routes.Setup(cfg)
 
-	log.Printf("TE-DNA 2.0 服务启动，端口: %s", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	// 创建 HTTP 服务器
+	srv := &http.Server{
+		Addr:         ":" + cfg.Port,
+		Handler:      mux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 600 * time.Second, // AI 调用可能很长
+		IdleTimeout:  120 * time.Second,
+	}
+
+	// 优雅关闭
+	go func() {
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+		<-quit
+		log.Println("正在关闭服务器...")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	}()
+
+	log.Printf("TE-DNA 2.0 服务启动，端口: %s", cfg.Port)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("服务启动失败: %v", err)
 	}
+	log.Println("服务器已关闭")
 }
