@@ -1,0 +1,16 @@
+# Go
+backend/server
+backend/*.exe
+backend/tmp/
+
+# 环境变量（不提交密钥）
+backend/.env
+*.env
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# 系统文件
+.DS_Store
+*.log
