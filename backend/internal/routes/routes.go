@@ -6,31 +6,163 @@ import (
 	"time"
 
 	"tedna/internal/config"
+	"tedna/internal/handlers"
+	"tedna/internal/middleware"
+	"tedna/internal/services"
 )
 
-// Setup 注册所有路由，返回 http.ServeMux
-func Setup(cfg *config.Config) *http.ServeMux {
+// Setup 注册所有路由，返回带 CORS 处理的 http.Handler
+func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
+
+	// 创建服务层实例（全局共享）
+	authService := services.NewAuthService(cfg)
+	userService := services.NewUserService()
+
+	// 创建处理器实例
+	authHandler := handlers.NewAuthHandler(authService)
+	userHandler := handlers.NewUserHandler(userService)
+
+	// 创建中间件实例
+	authMW := middleware.AuthMiddleware(authService)
+	adminOnly := middleware.RequireRole("admin")
+
+	// ========== 公共接口（无需认证） ==========
 
 	// 健康检查
 	mux.HandleFunc("/api/v1/health", healthHandler)
 
-	// TODO P1-1: 认证路由
-	// mux.HandleFunc("/api/v1/auth/login", ...)
-	// mux.HandleFunc("/api/v1/auth/logout", ...)
-	// mux.HandleFunc("/api/v1/auth/me", ...)
+	// ========== 认证接口 ==========
 
-	return mux
+	// 登录（公开，无需 token）
+	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
+
+	// 获取当前用户（需要认证）
+	mux.Handle("/api/v1/auth/me",
+		middleware.Chain(
+			http.HandlerFunc(authHandler.GetMe),
+			authMW,
+		),
+	)
+
+	// 登出（需要认证）
+	mux.Handle("/api/v1/auth/logout",
+		middleware.Chain(
+			http.HandlerFunc(authHandler.Logout),
+			authMW,
+		),
+	)
+
+	// ========== 用户管理接口（仅admin）P1-4 ==========
+
+	// GET /api/v1/users — 用户列表
+	mux.Handle("/api/v1/users",
+		middleware.Chain(
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					userHandler.List(w, r)
+				case http.MethodPost:
+					userHandler.Create(w, r)
+				default:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"code": -1, "message": "仅支持GET/POST请求",
+					})
+				}
+			}),
+			authMW,
+			adminOnly,
+		),
+	)
+
+	// PUT /api/v1/users/{id} — 编辑用户（通过路径前缀匹配）
+	// 注意：Go 1.22 的 ServeMux 支持 {id} 通配，但为兼容性使用前缀匹配
+	// /api/v1/users/ 带尾部斜杠会匹配所有子路径
+	mux.Handle("/api/v1/users/",
+		middleware.Chain(
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				path := r.URL.Path
+
+				// 路由分发：根据子路径后缀决定处理器
+				switch {
+				// PUT /api/v1/users/{id}/password — 重置密码
+				case len(path) > len("/api/v1/users/") && hasSuffix(path, "/password"):
+					userHandler.ResetPassword(w, r)
+
+				// PUT /api/v1/users/{id}/status — 启用/禁用
+				case len(path) > len("/api/v1/users/") && hasSuffix(path, "/status"):
+					userHandler.UpdateStatus(w, r)
+
+				// GET/PUT /api/v1/users/{id}/assignments — 课程分配
+				case len(path) > len("/api/v1/users/") && hasSuffix(path, "/assignments"):
+					switch r.Method {
+					case http.MethodGet:
+						userHandler.GetAssignments(w, r)
+					case http.MethodPut:
+						userHandler.UpdateAssignments(w, r)
+					default:
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusMethodNotAllowed)
+						json.NewEncoder(w).Encode(map[string]interface{}{
+							"code": -1, "message": "仅支持GET/PUT请求",
+						})
+					}
+
+				// PUT /api/v1/users/{id} — 编辑用户基本信息
+				default:
+					userHandler.Update(w, r)
+				}
+			}),
+			authMW,
+			adminOnly,
+		),
+	)
+
+	// ========== TODO: 后续 Phase 路由 ==========
+	// P2: AI 配置路由（admin only）
+	// P3: 课程管理路由（admin + operator）
+	// P4: Pipeline 路由（admin + operator）
+	// P5: 引擎控制路由
+	// P6: 审核中心路由
+
+	// 包裹 CORS 中间件后返回
+	return corsMiddleware(mux)
+}
+
+// hasSuffix 检查路径是否以指定后缀结尾
+func hasSuffix(path string, suffix string) bool {
+	return len(path) >= len(suffix) && path[len(path)-len(suffix):] == suffix
+}
+
+// corsMiddleware 处理跨域请求（开发阶段允许所有来源）
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 设置 CORS 响应头
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		// 预检请求直接返回
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		// 继续处理请求
+		next.ServeHTTP(w, r)
+	})
 }
 
 // healthHandler 健康检查接口
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.0.1",
+		"version": "0.3.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

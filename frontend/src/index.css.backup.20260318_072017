@@ -1,0 +1,54 @@
+/* TE-DNA 2.0 全局样式 */
+/* Tailwind CSS v4：直接导入即可，无需配置文件 */
+@import "tailwindcss";
+
+/* 自定义 CSS 变量：TE-DNA 品牌色 */
+:root {
+  /* 主色调：深蓝 */
+  --color-primary: #1e40af;
+  --color-primary-hover: #1d4ed8;
+  --color-primary-light: #dbeafe;
+
+  /* 侧边栏 */
+  --color-sidebar-bg: #0f172a;
+  --color-sidebar-text: #94a3b8;
+  --color-sidebar-active: #1e40af;
+  --color-sidebar-active-text: #ffffff;
+  --color-sidebar-hover: #1e293b;
+
+  /* 页面背景 */
+  --color-page-bg: #f1f5f9;
+
+  /* 字体 */
+  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Code', Consolas, monospace;
+}
+
+/* 全局重置 */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: var(--color-page-bg);
+}
+
+/* 滚动条美化（Webkit） */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}

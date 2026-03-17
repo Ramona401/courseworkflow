@@ -2,14 +2,17 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 
+// https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
   resolve: {
+    // 路径别名：@ 指向 src 目录
     alias: {
       '@': path.resolve(__dirname, './src'),
     },
   },
   server: {
+    // 开发模式下代理 API 请求到后端
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:8080',
