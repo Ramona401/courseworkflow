@@ -20,14 +20,12 @@ func Setup(cfg *config.Config) http.Handler {
 	userService := services.NewUserService()
 	aiConfigService := services.NewAIConfigService(cfg)
 	promptService := services.NewPromptService()
-	edService := services.NewExternalDataService(cfg) // P3-1新增：外部数据配置服务
 
 	// 创建处理器实例
 	authHandler := handlers.NewAuthHandler(authService)
 	userHandler := handlers.NewUserHandler(userService)
 	aiConfigHandler := handlers.NewAIConfigHandler(aiConfigService)
 	promptHandler := handlers.NewPromptHandler(promptService)
-	edHandler := handlers.NewExternalDataHandler(edService) // P3-1新增：外部数据配置处理器
 
 	// 创建中间件实例
 	authMW := middleware.AuthMiddleware(authService)
@@ -229,33 +227,8 @@ func Setup(cfg *config.Config) http.Handler {
 		),
 	)
 
-	// ========== 外部数据配置接口（仅admin）P3-1 ==========
-
-	// GET /api/v1/external-data/configs — 获取所有外部数据配置
-	// PUT /api/v1/external-data/configs — 批量更新外部数据配置
-	mux.Handle("/api/v1/external-data/configs",
-		middleware.Chain(
-			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch r.Method {
-				case http.MethodGet:
-					edHandler.GetConfigs(w, r)
-				case http.MethodPut:
-					edHandler.UpdateConfigs(w, r)
-				default:
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusMethodNotAllowed)
-					json.NewEncoder(w).Encode(map[string]interface{}{
-						"code": -1, "message": "仅支持GET/PUT请求",
-					})
-				}
-			}),
-			authMW,
-			adminOnly,
-		),
-	)
-
 	// ========== TODO: 后续 Phase 路由 ==========
-	// P3-2: 课程管理路由（admin + operator）
+	// P3: 课程管理路由（admin + operator）
 	// P4: Pipeline 路由（admin + operator）
 	// P5: 引擎控制路由
 	// P6: 审核中心路由
@@ -295,7 +268,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.8.0",
+		"version": "0.7.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

@@ -2,16 +2,18 @@
  * 主布局组件 - Apple 风格
  * - 左侧深色侧边栏 + 右侧浅色内容区
  * - 顶部精致的标题栏
+ * - P3-1新增：外部数据配置标题映射
  */
 import { Outlet, useLocation } from 'react-router-dom'
 import Sidebar from './Sidebar'
 
-// 路由标题映射
+// 路由标题映射（P3-1新增 /external-data）
 const pageTitles: Record<string, string> = {
   '/': '仪表盘',
   '/users': '用户管理',
   '/ai-config': 'AI 配置',
   '/prompts': '提示词管理',
+  '/external-data': '外部数据配置',
   '/courses': '课程管理',
   '/pipelines': 'Pipeline',
   '/review': '审核中心',

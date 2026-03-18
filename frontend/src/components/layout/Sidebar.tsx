@@ -3,6 +3,7 @@
  * - 深色毛玻璃背景
  * - 根据用户角色显示菜单
  * - 优雅的悬停和激活效果
+ * - P3-1新增：外部数据配置菜单项
  */
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
@@ -11,6 +12,7 @@ import {
   Users,
   Bot,
   FileText,
+  Database,
   BookOpen,
   Workflow,
   ClipboardCheck,
@@ -28,12 +30,13 @@ interface MenuItem {
   roles: string[]
 }
 
-// 菜单配置（P2-3新增提示词管理）
+// 菜单配置（P3-1新增外部数据配置）
 const menuItems: MenuItem[] = [
   { key: 'dashboard', label: '仪表盘', icon: LayoutDashboard, path: '/', roles: ['admin', 'operator', 'viewer'] },
   { key: 'users', label: '用户管理', icon: Users, path: '/users', roles: ['admin'] },
   { key: 'ai-config', label: 'AI 配置', icon: Bot, path: '/ai-config', roles: ['admin'] },
   { key: 'prompts', label: '提示词管理', icon: FileText, path: '/prompts', roles: ['admin'] },
+  { key: 'external-data', label: '外部数据配置', icon: Database, path: '/external-data', roles: ['admin'] },
   { key: 'courses', label: '课程管理', icon: BookOpen, path: '/courses', roles: ['admin', 'operator'] },
   { key: 'pipelines', label: 'Pipeline', icon: Workflow, path: '/pipelines', roles: ['admin', 'operator'] },
   { key: 'review', label: '审核中心', icon: ClipboardCheck, path: '/review', roles: ['admin', 'operator'] },

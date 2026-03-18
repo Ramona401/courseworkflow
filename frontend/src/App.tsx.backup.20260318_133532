@@ -4,7 +4,6 @@
  * - 路由配置：登录页 / 主布局（含侧边栏）
  * - 路由守卫：未登录跳转登录页
  * - 角色守卫：按角色控制页面访问
- * - P3-1新增：外部数据配置路由
  */
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AuthContext } from '@/store/auth'
@@ -18,7 +17,6 @@ import DashboardPage from '@/pages/dashboard/DashboardPage'
 import UsersPage from '@/pages/users/UsersPage'
 import AIConfigPage from '@/pages/ai-config/AIConfigPage'
 import PromptsPage from '@/pages/prompts/PromptsPage'
-import ExternalDataPage from '@/pages/external-data/ExternalDataPage'
 
 /**
  * 路由守卫组件
@@ -123,14 +121,7 @@ export default function App() {
               </RoleGuard>
             } />
 
-            {/* P3-1 外部数据配置（仅admin） */}
-            <Route path="external-data" element={
-              <RoleGuard roles={['admin']}>
-                <ExternalDataPage />
-              </RoleGuard>
-            } />
-
-            {/* TODO: P3-2 课程管理 */}
+            {/* TODO: P3 课程管理 */}
             {/* <Route path="courses" element={<CoursesPage />} /> */}
 
             {/* TODO: P4 Pipeline */}
