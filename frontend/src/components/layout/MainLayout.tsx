@@ -11,6 +11,7 @@ const pageTitles: Record<string, string> = {
   '/': '仪表盘',
   '/users': '用户管理',
   '/ai-config': 'AI 配置',
+  '/prompts': '提示词管理',
   '/courses': '课程管理',
   '/pipelines': 'Pipeline',
   '/review': '审核中心',

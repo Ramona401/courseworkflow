@@ -19,11 +19,13 @@ func Setup(cfg *config.Config) http.Handler {
 	authService := services.NewAuthService(cfg)
 	userService := services.NewUserService()
 	aiConfigService := services.NewAIConfigService(cfg)
+	promptService := services.NewPromptService()
 
 	// 创建处理器实例
 	authHandler := handlers.NewAuthHandler(authService)
 	userHandler := handlers.NewUserHandler(userService)
 	aiConfigHandler := handlers.NewAIConfigHandler(aiConfigService)
+	promptHandler := handlers.NewPromptHandler(promptService)
 
 	// 创建中间件实例
 	authMW := middleware.AuthMiddleware(authService)
@@ -172,8 +174,60 @@ func Setup(cfg *config.Config) http.Handler {
 		),
 	)
 
+	// ========== 提示词管理接口（仅admin）P2-3 ==========
+
+	// GET /api/v1/prompts — 获取所有提示词（当前生效版本）
+	mux.Handle("/api/v1/prompts",
+		middleware.Chain(
+			http.HandlerFunc(promptHandler.ListPrompts),
+			authMW,
+			adminOnly,
+		),
+	)
+
+	// /api/v1/prompts/ — 子路径分发
+	// GET  /api/v1/prompts/{key} — 获取指定提示词
+	// PUT  /api/v1/prompts/{key} — 更新提示词（创建新版本）
+	// GET  /api/v1/prompts/{key}/versions — 版本历史
+	// POST /api/v1/prompts/{key}/rollback — 回滚到指定版本
+	mux.Handle("/api/v1/prompts/",
+		middleware.Chain(
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				path := r.URL.Path
+
+				// 路由分发：根据子路径后缀决定处理器
+				switch {
+				// GET /api/v1/prompts/{key}/versions — 版本历史
+				case hasSuffix(path, "/versions"):
+					promptHandler.GetVersionHistory(w, r)
+
+				// POST /api/v1/prompts/{key}/rollback — 回滚
+				case hasSuffix(path, "/rollback"):
+					promptHandler.RollbackVersion(w, r)
+
+				// GET /api/v1/prompts/{key} — 获取指定提示词
+				// PUT /api/v1/prompts/{key} — 更新提示词
+				default:
+					switch r.Method {
+					case http.MethodGet:
+						promptHandler.GetPrompt(w, r)
+					case http.MethodPut:
+						promptHandler.UpdatePrompt(w, r)
+					default:
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusMethodNotAllowed)
+						json.NewEncoder(w).Encode(map[string]interface{}{
+							"code": -1, "message": "仅支持GET/PUT请求",
+						})
+					}
+				}
+			}),
+			authMW,
+			adminOnly,
+		),
+	)
+
 	// ========== TODO: 后续 Phase 路由 ==========
-	// P2-3: 提示词管理路由（admin only）
 	// P3: 课程管理路由（admin + operator）
 	// P4: Pipeline 路由（admin + operator）
 	// P5: 引擎控制路由
@@ -214,7 +268,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.6.0",
+		"version": "0.7.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

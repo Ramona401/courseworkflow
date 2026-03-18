@@ -16,6 +16,7 @@ import LoginPage from '@/pages/login/LoginPage'
 import DashboardPage from '@/pages/dashboard/DashboardPage'
 import UsersPage from '@/pages/users/UsersPage'
 import AIConfigPage from '@/pages/ai-config/AIConfigPage'
+import PromptsPage from '@/pages/prompts/PromptsPage'
 
 /**
  * 路由守卫组件
@@ -110,6 +111,13 @@ export default function App() {
             <Route path="ai-config" element={
               <RoleGuard roles={['admin']}>
                 <AIConfigPage />
+              </RoleGuard>
+            } />
+
+            {/* P2-3 提示词管理（仅admin） */}
+            <Route path="prompts" element={
+              <RoleGuard roles={['admin']}>
+                <PromptsPage />
               </RoleGuard>
             } />
 
