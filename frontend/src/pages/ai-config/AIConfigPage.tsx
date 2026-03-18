@@ -83,10 +83,10 @@ const selectStyle: React.CSSProperties = {
 // ==================== 可选模型列表 ====================
 
 const MODEL_OPTIONS = [
-  'anthropic/claude-sonnet-4-5',
-  'anthropic/claude-haiku-4-5',
-  'anthropic/claude-opus-4-6',
+  'anthropic/claude-sonnet-4.6',
+  'anthropic/claude-haiku-4.5',
   'google/gemini-3-flash-preview',
+  'google/gemini-3.1-flash-lite-preview',
 ]
 
 // ==================== Toast 组件 ====================
