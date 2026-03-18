@@ -3,6 +3,7 @@
  * - AuthProvider 包裹全局，提供认证状态
  * - 路由配置：登录页 / 主布局（含侧边栏）
  * - 路由守卫：未登录跳转登录页
+ * - 角色守卫：按角色控制页面访问
  */
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AuthContext } from '@/store/auth'
@@ -14,6 +15,7 @@ import MainLayout from '@/components/layout/MainLayout'
 import LoginPage from '@/pages/login/LoginPage'
 import DashboardPage from '@/pages/dashboard/DashboardPage'
 import UsersPage from '@/pages/users/UsersPage'
+import AIConfigPage from '@/pages/ai-config/AIConfigPage'
 
 /**
  * 路由守卫组件
@@ -104,8 +106,12 @@ export default function App() {
               </RoleGuard>
             } />
 
-            {/* TODO: P2 AI配置 */}
-            {/* <Route path="ai-config" element={<AIConfigPage />} /> */}
+            {/* P2-1 AI配置中心（仅admin） */}
+            <Route path="ai-config" element={
+              <RoleGuard roles={['admin']}>
+                <AIConfigPage />
+              </RoleGuard>
+            } />
 
             {/* TODO: P3 课程管理 */}
             {/* <Route path="courses" element={<CoursesPage />} /> */}

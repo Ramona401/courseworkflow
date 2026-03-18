@@ -18,10 +18,12 @@ func Setup(cfg *config.Config) http.Handler {
 	// 创建服务层实例（全局共享）
 	authService := services.NewAuthService(cfg)
 	userService := services.NewUserService()
+	aiConfigService := services.NewAIConfigService(cfg)
 
 	// 创建处理器实例
 	authHandler := handlers.NewAuthHandler(authService)
 	userHandler := handlers.NewUserHandler(userService)
+	aiConfigHandler := handlers.NewAIConfigHandler(aiConfigService)
 
 	// 创建中间件实例
 	authMW := middleware.AuthMiddleware(authService)
@@ -78,8 +80,6 @@ func Setup(cfg *config.Config) http.Handler {
 	)
 
 	// PUT /api/v1/users/{id} — 编辑用户（通过路径前缀匹配）
-	// 注意：Go 1.22 的 ServeMux 支持 {id} 通配，但为兼容性使用前缀匹配
-	// /api/v1/users/ 带尾部斜杠会匹配所有子路径
 	mux.Handle("/api/v1/users/",
 		middleware.Chain(
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -120,8 +120,52 @@ func Setup(cfg *config.Config) http.Handler {
 		),
 	)
 
+	// ========== AI配置接口（仅admin）P2-1 ==========
+
+	// GET /api/v1/ai-config/global — 获取全局配置
+	// PUT /api/v1/ai-config/global — 更新全局配置
+	mux.Handle("/api/v1/ai-config/global",
+		middleware.Chain(
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					aiConfigHandler.GetGlobalConfig(w, r)
+				case http.MethodPut:
+					aiConfigHandler.UpdateGlobalConfig(w, r)
+				default:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"code": -1, "message": "仅支持GET/PUT请求",
+					})
+				}
+			}),
+			authMW,
+			adminOnly,
+		),
+	)
+
+	// GET /api/v1/ai-config/scenes — 获取所有场景配置
+	mux.Handle("/api/v1/ai-config/scenes",
+		middleware.Chain(
+			http.HandlerFunc(aiConfigHandler.GetSceneConfigs),
+			authMW,
+			adminOnly,
+		),
+	)
+
+	// PUT /api/v1/ai-config/scenes/{code} — 更新指定场景配置
+	mux.Handle("/api/v1/ai-config/scenes/",
+		middleware.Chain(
+			http.HandlerFunc(aiConfigHandler.UpdateSceneConfig),
+			authMW,
+			adminOnly,
+		),
+	)
+
 	// ========== TODO: 后续 Phase 路由 ==========
-	// P2: AI 配置路由（admin only）
+	// P2-2: AI连通性测试路由（admin only）
+	// P2-3: 提示词管理路由（admin only）
 	// P3: 课程管理路由（admin + operator）
 	// P4: Pipeline 路由（admin + operator）
 	// P5: 引擎控制路由
@@ -162,7 +206,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.3.0",
+		"version": "0.5.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }
