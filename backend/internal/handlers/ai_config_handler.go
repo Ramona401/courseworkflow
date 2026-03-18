@@ -78,6 +78,27 @@ func (h *AIConfigHandler) UpdateGlobalConfig(w http.ResponseWriter, r *http.Requ
 	utils.Success(w, config)
 }
 
+// ==================== AI连通性测试接口（P2-2新增）====================
+
+// TestConnection 测试AI API连通性
+// POST /api/v1/ai-config/test
+// 使用当前全局配置向AI API发送测试请求，验证连通性并返回延迟
+func (h *AIConfigHandler) TestConnection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+
+	// 执行连通性测试
+	result, err := h.aiConfigService.TestConnection()
+	if err != nil {
+		utils.InternalError(w, "连通性测试执行失败: "+err.Error())
+		return
+	}
+
+	utils.Success(w, result)
+}
+
 // ==================== 场景配置接口 ====================
 
 // GetSceneConfigs 获取所有场景配置
@@ -159,7 +180,8 @@ func handleAIConfigError(w http.ResponseWriter, err error) {
 		services.ErrModelRequired,
 		services.ErrInvalidTemperature,
 		services.ErrInvalidMaxTokens,
-		services.ErrInvalidSceneCode:
+		services.ErrInvalidSceneCode,
+		services.ErrAPIKeyNotSet:
 		utils.BadRequest(w, err.Error())
 	default:
 		utils.InternalError(w, "操作失败: "+err.Error())

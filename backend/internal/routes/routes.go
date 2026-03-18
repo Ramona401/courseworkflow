@@ -120,7 +120,7 @@ func Setup(cfg *config.Config) http.Handler {
 		),
 	)
 
-	// ========== AI配置接口（仅admin）P2-1 ==========
+	// ========== AI配置接口（仅admin）P2-1 + P2-2 ==========
 
 	// GET /api/v1/ai-config/global — 获取全局配置
 	// PUT /api/v1/ai-config/global — 更新全局配置
@@ -145,6 +145,15 @@ func Setup(cfg *config.Config) http.Handler {
 		),
 	)
 
+	// POST /api/v1/ai-config/test — AI连通性测试（P2-2新增）
+	mux.Handle("/api/v1/ai-config/test",
+		middleware.Chain(
+			http.HandlerFunc(aiConfigHandler.TestConnection),
+			authMW,
+			adminOnly,
+		),
+	)
+
 	// GET /api/v1/ai-config/scenes — 获取所有场景配置
 	mux.Handle("/api/v1/ai-config/scenes",
 		middleware.Chain(
@@ -164,7 +173,6 @@ func Setup(cfg *config.Config) http.Handler {
 	)
 
 	// ========== TODO: 后续 Phase 路由 ==========
-	// P2-2: AI连通性测试路由（admin only）
 	// P2-3: 提示词管理路由（admin only）
 	// P3: 课程管理路由（admin + operator）
 	// P4: Pipeline 路由（admin + operator）
@@ -206,7 +214,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.5.0",
+		"version": "0.6.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

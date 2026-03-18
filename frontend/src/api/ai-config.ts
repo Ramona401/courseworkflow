@@ -2,6 +2,7 @@
  * AI配置 API 封装
  * - 全局配置：读取/更新（API地址、Key、模型、温度、Token数）
  * - 场景配置：读取/更新（6个Pipeline步骤各自的AI参数）
+ * - 连通性测试：验证AI API连接状态（P2-2新增）
  * - 仅 admin 可调用
  */
 import client from './client'
@@ -50,6 +51,15 @@ export interface UpdateSceneConfigRequest {
   is_active?: boolean
 }
 
+/** AI连通性测试结果（P2-2新增） */
+export interface TestConnectionResult {
+  success: boolean        // 测试是否成功
+  message: string         // 结果描述
+  latency_ms: number      // 延迟（毫秒）
+  model: string           // 测试使用的模型
+  api_base_url: string    // 测试使用的API地址
+}
+
 // ==================== API 方法 ====================
 
 /** 获取全局AI配置 */
@@ -73,5 +83,11 @@ export async function getSceneConfigs(): Promise<SceneConfig[]> {
 /** 更新指定场景配置 */
 export async function updateSceneConfig(code: string, req: UpdateSceneConfigRequest): Promise<SceneConfig[]> {
   const res = await client.put<{ code: number; data: SceneConfig[] }>(`/ai-config/scenes/${code}`, req)
+  return res.data.data
+}
+
+/** 测试AI API连通性（P2-2新增） */
+export async function testConnection(): Promise<TestConnectionResult> {
+  const res = await client.post<{ code: number; data: TestConnectionResult }>('/ai-config/test')
   return res.data.data
 }

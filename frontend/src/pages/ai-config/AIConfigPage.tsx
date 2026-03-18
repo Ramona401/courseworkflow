@@ -1,13 +1,14 @@
 /**
  * AI配置中心页面（仅admin可访问）
  * - 全局配置区：API地址、Key、模型、温度、Token数
+ * - AI连通性测试：测试按钮+结果显示（P2-2新增）
  * - 场景配置区：6个Pipeline步骤各自的AI参数
  * - Apple 风格：毛玻璃卡片 + 渐变 + 圆角 + 微动效
  */
 import { useState, useEffect, useCallback } from 'react'
-import { getGlobalConfig, updateGlobalConfig, getSceneConfigs, updateSceneConfig } from '@/api/ai-config'
-import type { GlobalConfig, SceneConfig, UpdateSceneConfigRequest } from '@/api/ai-config'
-import { Bot, Save, Eye, EyeOff, RefreshCw, Zap } from 'lucide-react'
+import { getGlobalConfig, updateGlobalConfig, getSceneConfigs, updateSceneConfig, testConnection } from '@/api/ai-config'
+import type { GlobalConfig, SceneConfig, UpdateSceneConfigRequest, TestConnectionResult } from '@/api/ai-config'
+import { Bot, Save, Eye, EyeOff, RefreshCw, Zap, Wifi, WifiOff, Clock } from 'lucide-react'
 
 // ==================== 样式常量 ====================
 
@@ -133,6 +134,10 @@ export default function AIConfigPage() {
   const [showKey, setShowKey] = useState(false)
   const [globalSaving, setGlobalSaving] = useState(false)
 
+  // AI连通性测试状态（P2-2新增）
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<TestConnectionResult | null>(null)
+
   // 场景配置状态
   const [scenes, setScenes] = useState<SceneConfig[]>([])
   const [editingScene, setEditingScene] = useState<string | null>(null)
@@ -182,6 +187,31 @@ export default function AIConfigPage() {
       setToast({ message: msg, type: 'error' })
     } finally {
       setGlobalSaving(false)
+    }
+  }
+
+  // ==================== AI连通性测试（P2-2新增）====================
+
+  const handleTestConnection = async () => {
+    try {
+      setTesting(true)
+      setTestResult(null)
+      const result = await testConnection()
+      setTestResult(result)
+      if (result.success) {
+        setToast({ message: '连接测试成功！', type: 'success' })
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '测试请求失败'
+      setTestResult({
+        success: false,
+        message: msg,
+        latency_ms: 0,
+        model: '',
+        api_base_url: '',
+      })
+    } finally {
+      setTesting(false)
     }
   }
 
@@ -359,8 +389,8 @@ export default function AIConfigPage() {
           </div>
         </div>
 
-        {/* 保存按钮 */}
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px' }}>
+        {/* 操作按钮行：重置 + 测试连接 + 保存 */}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px', alignItems: 'center' }}>
           <button
             onClick={loadData}
             style={{
@@ -375,6 +405,24 @@ export default function AIConfigPage() {
             <RefreshCw size={15} />
             重置
           </button>
+          {/* 测试连接按钮（P2-2新增） */}
+          <button
+            onClick={handleTestConnection}
+            disabled={testing}
+            style={{
+              ...btnPrimary,
+              background: testing
+                ? 'linear-gradient(135deg, #8e8e93, #aeaeb2)'
+                : 'linear-gradient(135deg, #ff9500, #ff6b00)',
+              boxShadow: testing ? 'none' : '0 2px 8px rgba(255,149,0,0.3)',
+              opacity: testing ? 0.7 : 1,
+            }}
+            onMouseEnter={e => { if (!testing) (e.currentTarget as HTMLElement).style.transform = 'translateY(-1px)' }}
+            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.transform = 'none' }}
+          >
+            <Wifi size={15} />
+            {testing ? '测试中...' : '测试连接'}
+          </button>
           <button
             onClick={handleSaveGlobal}
             disabled={globalSaving}
@@ -386,6 +434,74 @@ export default function AIConfigPage() {
             {globalSaving ? '保存中...' : '保存全局配置'}
           </button>
         </div>
+
+        {/* AI连通性测试结果（P2-2新增） */}
+        {testResult && (
+          <div style={{
+            marginTop: '20px',
+            padding: '16px 20px',
+            borderRadius: '12px',
+            border: testResult.success
+              ? '1px solid rgba(52,199,89,0.3)'
+              : '1px solid rgba(255,59,48,0.3)',
+            background: testResult.success
+              ? 'rgba(52,199,89,0.06)'
+              : 'rgba(255,59,48,0.06)',
+          }}>
+            {/* 结果标题行 */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
+              {testResult.success ? (
+                <Wifi size={18} color="#34c759" />
+              ) : (
+                <WifiOff size={18} color="#ff3b30" />
+              )}
+              <span style={{
+                fontSize: '15px',
+                fontWeight: 600,
+                color: testResult.success ? '#34c759' : '#ff3b30',
+              }}>
+                {testResult.success ? '连接成功' : '连接失败'}
+              </span>
+              {testResult.latency_ms > 0 && (
+                <span style={{
+                  display: 'inline-flex', alignItems: 'center', gap: '4px',
+                  fontSize: '12px', color: '#8e8e93',
+                  padding: '2px 8px', borderRadius: '6px',
+                  background: 'rgba(0,0,0,0.04)',
+                }}>
+                  <Clock size={12} />
+                  {testResult.latency_ms}ms
+                </span>
+              )}
+            </div>
+            {/* 详细信息 */}
+            <div style={{ fontSize: '13px', color: '#1d1d1f', lineHeight: '1.6' }}>
+              <div>{testResult.message}</div>
+              {testResult.model && (
+                <div style={{ color: '#8e8e93', marginTop: '4px' }}>
+                  模型：{testResult.model}
+                </div>
+              )}
+              {testResult.api_base_url && (
+                <div style={{ color: '#8e8e93' }}>
+                  地址：{testResult.api_base_url}
+                </div>
+              )}
+            </div>
+            {/* 关闭按钮 */}
+            <button
+              onClick={() => setTestResult(null)}
+              style={{
+                marginTop: '10px',
+                padding: '4px 12px', borderRadius: '6px',
+                border: '1px solid #d2d2d7', background: '#fff',
+                fontSize: '12px', color: '#8e8e93', cursor: 'pointer',
+              }}
+            >
+              关闭
+            </button>
+          </div>
+        )}
       </div>
 
       {/* ==================== 场景配置卡片 ==================== */}
