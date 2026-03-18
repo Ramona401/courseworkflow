@@ -19,6 +19,7 @@ import UsersPage from '@/pages/users/UsersPage'
 import AIConfigPage from '@/pages/ai-config/AIConfigPage'
 import PromptsPage from '@/pages/prompts/PromptsPage'
 import ExternalDataPage from '@/pages/external-data/ExternalDataPage'
+import CoursesPage from '@/pages/courses/CoursesPage'
 
 /**
  * 路由守卫组件
@@ -130,8 +131,12 @@ export default function App() {
               </RoleGuard>
             } />
 
-            {/* TODO: P3-2 课程管理 */}
-            {/* <Route path="courses" element={<CoursesPage />} /> */}
+            {/* P3-3 课程管理（admin + operator） */}
+            <Route path="courses" element={
+              <RoleGuard roles={['admin', 'operator']}>
+                <CoursesPage />
+              </RoleGuard>
+            } />
 
             {/* TODO: P4 Pipeline */}
             {/* <Route path="pipelines" element={<PipelinesPage />} /> */}
