@@ -190,24 +190,63 @@ type EvalRoundRecord struct {
 // EvaluatorResult Evaluator步骤的汇总数据（存入pipeline_steps.step_data JSONB字段）
 // 汇总N轮评估的均值、方差和警告信息
 type EvaluatorResult struct {
-	TotalRounds    int      `json:"total_rounds"`    // 总轮数
-	DoneRounds     int      `json:"done_rounds"`     // 成功完成的轮数
-	FailedRounds   int      `json:"failed_rounds"`   // 失败的轮数
-	AvgTotal       float64  `json:"avg_total"`       // 综合分均值
-	AvgE1          float64  `json:"avg_e1"`          // E1均值
-	AvgE2          float64  `json:"avg_e2"`          // E2均值
-	AvgE3          float64  `json:"avg_e3"`          // E3均值
-	AvgE4          float64  `json:"avg_e4"`          // E4均值
-	Variance       float64  `json:"variance"`        // 综合分方差
-	VarianceWarn   bool     `json:"variance_warn"`   // 方差是否超过阈值
-	RoundScores    []float64 `json:"round_scores"`   // 每轮综合分列表
-	TotalTokens    int      `json:"total_tokens"`    // 总Token消耗
-	TotalLatencyMs int64    `json:"total_latency_ms"` // 总耗时（毫秒）
-	ModelUsed      string   `json:"model_used"`      // 使用的模型（取最后一轮）
+	TotalRounds    int       `json:"total_rounds"`     // 总轮数
+	DoneRounds     int       `json:"done_rounds"`      // 成功完成的轮数
+	FailedRounds   int       `json:"failed_rounds"`    // 失败的轮数
+	AvgTotal       float64   `json:"avg_total"`        // 综合分均值
+	AvgE1          float64   `json:"avg_e1"`           // E1均值
+	AvgE2          float64   `json:"avg_e2"`           // E2均值
+	AvgE3          float64   `json:"avg_e3"`           // E3均值
+	AvgE4          float64   `json:"avg_e4"`           // E4均值
+	Variance       float64   `json:"variance"`         // 综合分方差
+	VarianceWarn   bool      `json:"variance_warn"`    // 方差是否超过阈值
+	RoundScores    []float64 `json:"round_scores"`     // 每轮综合分列表
+	TotalTokens    int       `json:"total_tokens"`     // 总Token消耗
+	TotalLatencyMs int64     `json:"total_latency_ms"` // 总耗时（毫秒）
+	ModelUsed      string    `json:"model_used"`       // 使用的模型（取最后一轮）
 }
 
 // ToJSON 将EvaluatorResult序列化为JSON字符串
 func (r *EvaluatorResult) ToJSON() string {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+// ==================== Meta 步骤数据结构（P4-4新增）====================
+
+// MetaResult Meta步骤（Prompt E）的输出数据（存入pipeline_steps.step_data JSONB字段）
+// Meta步骤执行元评估仲裁：综合N轮评估报告，输出仲裁分数+修改方案+修改后完整索引
+type MetaResult struct {
+	// 仲裁评分（从<<<META_SCORE>>>块提取）
+	TotalFinal     float64 `json:"total_final"`      // 仲裁综合评分
+	E1Final        float64 `json:"e1_final"`          // E1仲裁评分
+	E2Final        float64 `json:"e2_final"`          // E2仲裁评分
+	E3Final        float64 `json:"e3_final"`          // E3仲裁评分
+	E4Final        float64 `json:"e4_final"`          // E4仲裁评分
+	HardConstraint string  `json:"hard_constraint"`   // 硬性约束（PASS/FAIL）
+	Grade          string  `json:"grade"`             // 评级（A/B/C/D）
+	Passed         bool    `json:"passed"`            // 是否通过阈值（TotalFinal >= threshold）
+
+	// 各轮原始分数（供前端展示交叉比对）
+	E1Rounds []float64 `json:"e1_rounds"` // 各轮E1分数 [R1,R2,...RN]
+	E2Rounds []float64 `json:"e2_rounds"` // 各轮E2分数
+	E3Rounds []float64 `json:"e3_rounds"` // 各轮E3分数
+	E4Rounds []float64 `json:"e4_rounds"` // 各轮E4分数
+
+	// 执行信息
+	Attempt      int    `json:"attempt"`        // 当前尝试次数（1~max_meta_retry）
+	TotalRetries int    `json:"total_retries"`  // 总重试次数
+	RawOutput    string `json:"raw_output"`     // AI最终一次的原始输出（截断保存，供诊断）
+	ModelUsed    string `json:"model_used"`     // 使用的AI模型
+	TokensUsed   int    `json:"tokens_used"`    // 累计Token消耗（所有尝试合计）
+	LatencyMs    int64  `json:"latency_ms"`     // 累计耗时（毫秒，所有尝试合计）
+}
+
+// ToJSON 将MetaResult序列化为JSON字符串
+func (r *MetaResult) ToJSON() string {
 	data, err := json.Marshal(r)
 	if err != nil {
 		return "{}"

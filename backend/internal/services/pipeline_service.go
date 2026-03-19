@@ -39,6 +39,14 @@ var (
 	ErrEvalDictMissing          = errors.New("解压缩字典未配置，请先在提示词管理中设置dict")
 	ErrEvalScannerNotDone       = errors.New("Scanner步骤未完成，无法执行Evaluator")
 	ErrEvalAllRoundsFailed      = errors.New("所有评估轮次均失败")
+	// P4-4新增：Meta步骤错误常量
+	ErrMetaPromptMissing        = errors.New("Prompt E未配置，请先在提示词管理中设置prompt_e")
+	ErrMetaDictMissing          = errors.New("解压缩字典未配置（Meta需要dict）")
+	ErrMetaEvalNotDone          = errors.New("Evaluator步骤未完成，无法执行Meta")
+	ErrMetaScannerNotDone       = errors.New("Scanner步骤未完成，无法执行Meta")
+	ErrMetaAllRetriesFailed     = errors.New("Meta所有重试均未达标")
+	ErrMetaAIFailed             = errors.New("Meta AI调用失败")
+	ErrMetaScoreExtractFailed   = errors.New("Meta未能从AI输出中提取META_SCORE评分")
 )
 
 // ==================== PipelineService ====================
@@ -255,6 +263,7 @@ func (s *PipelineService) DeletePipeline(id string) error {
 // P4-1：执行dbCheck → 推进到scanner
 // P4-2：autoMode时继续执行scanner → 推进到evaluator
 // P4-3：autoMode时继续执行evaluator → 推进到meta
+// P4-4：autoMode时继续执行meta → 通过则推进到translator
 func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailResponse, error) {
 	pipeline, err := repository.GetPipelineByID(id)
 	if err != nil {
@@ -313,9 +322,26 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 			return s.GetPipelineDetail(id)
 		}
 
-		// evaluator成功 → 推进到meta（P4-4实现时继续执行）
+		// evaluator成功 → 推进到meta
 		if err := repository.UpdatePipelineStatus(id, models.StepMeta, models.PipelineStatusRunning); err != nil {
 			return nil, fmt.Errorf("推进到Meta失败: %w", err)
+		}
+
+		// P4-4：autoMode时继续执行meta
+		pipeline, err = repository.GetPipelineByID(id)
+		if err != nil {
+			return s.GetPipelineDetail(id)
+		}
+
+		metaErr := s.executeMeta(pipeline)
+		if metaErr != nil {
+			_ = repository.UpdatePipelineError(id, models.StepMeta, metaErr.Error())
+			return s.GetPipelineDetail(id)
+		}
+
+		// meta成功（通过阈值） → 推进到translator（P4-5实现时继续执行）
+		if err := repository.UpdatePipelineStatus(id, models.StepTranslator, models.PipelineStatusRunning); err != nil {
+			return nil, fmt.Errorf("推进到Translator失败: %w", err)
 		}
 	}
 
@@ -492,7 +518,7 @@ func (s *PipelineService) doScanner(pipeline *models.Pipeline) (*models.ScannerR
 	return result, nil
 }
 
-// ==================== Evaluator 步骤（P4-3新增）====================
+// ==================== Evaluator 步骤（P4-3）====================
 
 // executeEvaluator 执行evaluator步骤：多轮独立评估（Prompt B × N轮）
 func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
@@ -717,8 +743,367 @@ func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 	return nil
 }
 
+// ==================== Meta 步骤（P4-4新增）====================
+
+// executeMeta 执行meta步骤：元评估仲裁（Prompt E）
+// 综合N轮评估报告，输出仲裁分数+修改方案+修改后完整索引
+// 评分≥threshold(9.0)通过 | <threshold重试(最多max_meta_retry次)
+func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
+	startTime := time.Now()
+	stepName := models.StepMeta
+
+	if err := repository.StartStep(pipeline.ID, stepName); err != nil {
+		return fmt.Errorf("启动meta失败: %w", err)
+	}
+
+	// 解析Pipeline配置
+	pCfg := models.ParsePipelineConfig(pipeline.Config)
+	threshold := pCfg.Threshold     // 默认9.0
+	maxRetry := pCfg.MaxMetaRetry   // 默认3
+
+	// 1. 加载 Prompt E
+	promptE, err := repository.GetCurrentPromptByKey("prompt_e")
+	if err != nil || promptE == nil {
+		durationMs := time.Since(startTime).Milliseconds()
+		_ = repository.FailStep(pipeline.ID, stepName, durationMs, ErrMetaPromptMissing.Error())
+		return ErrMetaPromptMissing
+	}
+
+	// 2. 加载解压缩字典（Meta也需要dict）
+	dict, err := repository.GetCurrentPromptByKey("dict")
+	if err != nil || dict == nil {
+		durationMs := time.Since(startTime).Milliseconds()
+		_ = repository.FailStep(pipeline.ID, stepName, durationMs, ErrMetaDictMissing.Error())
+		return ErrMetaDictMissing
+	}
+
+	// 3. 获取课程索引（原始索引，作为Meta的输入）
+	course, err := repository.GetCourseByCode(pipeline.CourseCode)
+	if err != nil {
+		durationMs := time.Since(startTime).Milliseconds()
+		errMsg := fmt.Sprintf("meta: 课程 %s 不存在", pipeline.CourseCode)
+		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
+		return fmt.Errorf(errMsg)
+	}
+	courseIndex, err := repository.GetCourseIndex(course.ID)
+	if err != nil {
+		durationMs := time.Since(startTime).Milliseconds()
+		errMsg := "meta: 课程索引不存在"
+		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
+		return fmt.Errorf(errMsg)
+	}
+
+	// 4. 获取Scanner步骤的parsed结果（课程定位JSON）
+	scannerStep, err := repository.GetStepByName(pipeline.ID, models.StepScanner)
+	if err != nil || scannerStep.Status != models.StepStatusDone {
+		durationMs := time.Since(startTime).Milliseconds()
+		_ = repository.FailStep(pipeline.ID, stepName, durationMs, ErrMetaScannerNotDone.Error())
+		return ErrMetaScannerNotDone
+	}
+	scannerLocationJSON := extractScannerParsed(scannerStep.StepData)
+
+	// 5. 获取Evaluator步骤的N轮评估报告（eval_rounds表中的output字段）
+	evalStep, err := repository.GetStepByName(pipeline.ID, models.StepEvaluator)
+	if err != nil || evalStep.Status != models.StepStatusDone {
+		durationMs := time.Since(startTime).Milliseconds()
+		_ = repository.FailStep(pipeline.ID, stepName, durationMs, ErrMetaEvalNotDone.Error())
+		return ErrMetaEvalNotDone
+	}
+	evalRounds, err := repository.GetEvalRoundsByPipelineID(pipeline.ID)
+	if err != nil || len(evalRounds) == 0 {
+		durationMs := time.Since(startTime).Milliseconds()
+		errMsg := "meta: 无法获取评估轮次数据"
+		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
+		return fmt.Errorf(errMsg)
+	}
+
+	// 6. 组装N轮评估报告文本
+	var roundsTextParts []string
+	doneCount := 0
+	for _, r := range evalRounds {
+		if r.Status == models.StepStatusDone && r.Output != "" {
+			doneCount++
+			scoreStr := "?"
+			if r.ScoreTotal != nil {
+				scoreStr = fmt.Sprintf("%.1f", *r.ScoreTotal)
+			}
+			roundsTextParts = append(roundsTextParts,
+				fmt.Sprintf("=== 【评估报告%d/%d】（综合: %s）===\n%s",
+					r.RoundNumber, len(evalRounds), scoreStr, r.Output))
+		}
+	}
+	if doneCount == 0 {
+		durationMs := time.Since(startTime).Milliseconds()
+		errMsg := "meta: 无有效的评估报告（所有轮次均失败）"
+		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
+		return fmt.Errorf(errMsg)
+	}
+	roundsText := strings.Join(roundsTextParts, "\n\n")
+
+	// 7. 获取AI配置（使用meta场景）
+	aiCfg, err := ai.GetEffectiveConfig(
+		s.cfg.AESKey,
+		"meta",
+		s.cfg.AIAPIBaseURL,
+		s.cfg.AIAPIKey,
+		s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		durationMs := time.Since(startTime).Milliseconds()
+		errMsg := fmt.Sprintf("meta: 获取AI配置失败: %s", err.Error())
+		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
+		return fmt.Errorf(errMsg)
+	}
+
+	// 8. 构造系统提示词和用户消息
+	systemPrompt := promptE.Content
+
+	userPromptParts := []string{
+		"【课程定位】",
+		scannerLocationJSON,
+		"",
+		"【待评估索引（原始）】",
+		courseIndex.IndexContent,
+		"",
+		"【多轮评估结果（共" + fmt.Sprintf("%d", doneCount) + "轮）】",
+		roundsText,
+		"",
+		"【TE-DNA解压缩字典】",
+		dict.Content,
+		"",
+		"禁止输出<thinking>标签或任何思维过程标记。",
+	}
+	userPrompt := strings.Join(userPromptParts, "\n")
+
+	// 9. 重试循环：最多maxRetry次，每次调用AI并提取评分，达标即通过
+	metaResult := &models.MetaResult{
+		TotalRetries: maxRetry,
+	}
+	var lastOutput string
+	var lastModelUsed string
+	var totalTokens int
+	var totalLatencyMs int64
+
+	for attempt := 1; attempt <= maxRetry; attempt++ {
+		metaResult.Attempt = attempt
+
+		// 调用AI
+		callResult, callErr := ai.CallAI(aiCfg, systemPrompt, userPrompt)
+		if callErr != nil {
+			// AI调用失败，继续重试
+			totalLatencyMs += time.Since(startTime).Milliseconds() - totalLatencyMs
+			if attempt == maxRetry {
+				// 最后一次也失败
+				durationMs := time.Since(startTime).Milliseconds()
+				errMsg := fmt.Sprintf("%s (第%d次): %s", ErrMetaAIFailed.Error(), attempt, callErr.Error())
+				_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
+				return fmt.Errorf(errMsg)
+			}
+			continue
+		}
+
+		lastOutput = callResult.Content
+		lastModelUsed = callResult.ModelUsed
+		totalTokens += callResult.TokensUsed
+		totalLatencyMs += callResult.LatencyMs
+
+		// 提取META_SCORE评分
+		scoreResult := extractMetaScores(lastOutput)
+
+		if !scoreResult.parseOk {
+			// 评分提取失败，继续重试
+			if attempt == maxRetry {
+				durationMs := time.Since(startTime).Milliseconds()
+				metaResult.RawOutput = truncate(lastOutput, 50000)
+				metaResult.ModelUsed = lastModelUsed
+				metaResult.TokensUsed = totalTokens
+				metaResult.LatencyMs = totalLatencyMs
+				s.saveStepData(pipeline.ID, stepName, metaResult.ToJSON())
+				_ = repository.FailStep(pipeline.ID, stepName, durationMs, ErrMetaScoreExtractFailed.Error())
+				return ErrMetaScoreExtractFailed
+			}
+			continue
+		}
+
+		// 填充MetaResult评分字段
+		metaResult.TotalFinal = scoreResult.totalFinal
+		metaResult.E1Final = scoreResult.e1Final
+		metaResult.E2Final = scoreResult.e2Final
+		metaResult.E3Final = scoreResult.e3Final
+		metaResult.E4Final = scoreResult.e4Final
+		metaResult.HardConstraint = scoreResult.hardConstraint
+		metaResult.Grade = scoreResult.grade
+		metaResult.E1Rounds = scoreResult.e1Rounds
+		metaResult.E2Rounds = scoreResult.e2Rounds
+		metaResult.E3Rounds = scoreResult.e3Rounds
+		metaResult.E4Rounds = scoreResult.e4Rounds
+
+		// 判断是否通过阈值
+		passed := metaResult.TotalFinal >= threshold
+		metaResult.Passed = passed
+		metaResult.RawOutput = truncate(lastOutput, 50000)
+		metaResult.ModelUsed = lastModelUsed
+		metaResult.TokensUsed = totalTokens
+		metaResult.LatencyMs = totalLatencyMs
+
+		if passed {
+			// 通过！保存结果并退出重试循环
+			durationMs := time.Since(startTime).Milliseconds()
+			if err := repository.CompleteStep(
+				pipeline.ID, stepName, durationMs,
+				metaResult.ToJSON(), lastModelUsed, totalTokens,
+			); err != nil {
+				return fmt.Errorf("保存meta结果失败: %w", err)
+			}
+			return nil
+		}
+
+		// 未通过，如果还有重试次数则继续
+		if attempt == maxRetry {
+			// 所有重试用完，仍未达标
+			durationMs := time.Since(startTime).Milliseconds()
+			s.saveStepData(pipeline.ID, stepName, metaResult.ToJSON())
+			errMsg := fmt.Sprintf("%s (最终得分: %.1f, 阈值: %.1f, 共%d次尝试)",
+				ErrMetaAllRetriesFailed.Error(), metaResult.TotalFinal, threshold, maxRetry)
+			_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
+			return fmt.Errorf(errMsg)
+		}
+	}
+
+	// 理论上不会走到这里，但保险起见
+	durationMs := time.Since(startTime).Milliseconds()
+	_ = repository.FailStep(pipeline.ID, stepName, durationMs, "meta: 异常退出重试循环")
+	return fmt.Errorf("meta: 异常退出重试循环")
+}
+
+// ==================== Meta 评分提取（P4-4新增）====================
+
+// metaScoreResult Meta评分提取结果（内部使用）
+type metaScoreResult struct {
+	totalFinal     float64   // TOTAL_FINAL
+	e1Final        float64   // E1_FINAL
+	e2Final        float64   // E2_FINAL
+	e3Final        float64   // E3_FINAL
+	e4Final        float64   // E4_FINAL
+	hardConstraint string    // HARD_CONSTRAINT: PASS/FAIL
+	grade          string    // GRADE: A/B/C/D
+	e1Rounds       []float64 // 各轮E1分数 [R1,R2,...RN]
+	e2Rounds       []float64 // 各轮E2分数
+	e3Rounds       []float64 // 各轮E3分数
+	e4Rounds       []float64 // 各轮E4分数
+	parseOk        bool      // 是否成功提取
+}
+
+// extractMetaScores 从AI Meta输出中提取<<<META_SCORE>>>块中的评分
+// 格式（与HTML parseMetaScore一致）：
+//   <<<META_SCORE>>>
+//   E1_R1:{} E1_R2:{} E1_R3:{}
+//   E2_R1:{} E2_R2:{} E2_R3:{}
+//   E3_R1:{} E3_R2:{} E3_R3:{}
+//   E4_R1:{} E4_R2:{} E4_R3:{}
+//   E1_FINAL:{} E2_FINAL:{} E3_FINAL:{} E4_FINAL:{}
+//   TOTAL_FINAL:{}
+//   HARD_CONSTRAINT:{PASS/FAIL}
+//   GRADE:{}
+//   <<<END_META_SCORE>>>
+func extractMetaScores(output string) *metaScoreResult {
+	result := &metaScoreResult{}
+
+	// 主解析：<<<META_SCORE>>>...<<<END_META_SCORE>>>
+	metaBlockRe := regexp.MustCompile(`(?s)<<<META_SCORE>>>(.*?)<<<END_META_SCORE>>>`)
+	blockMatch := metaBlockRe.FindStringSubmatch(output)
+
+	if len(blockMatch) < 2 {
+		// 未找到META_SCORE块，尝试备用提取TOTAL_FINAL
+		totalFallbackRe := regexp.MustCompile(`(?i)TOTAL_FINAL:\s*([\d.]+)`)
+		tfm := totalFallbackRe.FindStringSubmatch(output)
+		if tfm != nil {
+			result.totalFinal = safeParseFloat(tfm[1])
+			if result.totalFinal > 0 {
+				result.parseOk = true
+			}
+		}
+		return result
+	}
+
+	block := blockMatch[1]
+
+	// 提取 TOTAL_FINAL
+	totalRe := regexp.MustCompile(`(?i)TOTAL_FINAL:\s*([\d.]+)`)
+	tm := totalRe.FindStringSubmatch(block)
+	if tm == nil {
+		return result // 没有TOTAL_FINAL视为解析失败
+	}
+	result.totalFinal = safeParseFloat(tm[1])
+
+	// 提取 E1_FINAL ~ E4_FINAL
+	e1FinalRe := regexp.MustCompile(`(?i)E1_FINAL:\s*([\d.]+)`)
+	e2FinalRe := regexp.MustCompile(`(?i)E2_FINAL:\s*([\d.]+)`)
+	e3FinalRe := regexp.MustCompile(`(?i)E3_FINAL:\s*([\d.]+)`)
+	e4FinalRe := regexp.MustCompile(`(?i)E4_FINAL:\s*([\d.]+)`)
+
+	if m := e1FinalRe.FindStringSubmatch(block); m != nil {
+		result.e1Final = safeParseFloat(m[1])
+	}
+	if m := e2FinalRe.FindStringSubmatch(block); m != nil {
+		result.e2Final = safeParseFloat(m[1])
+	}
+	if m := e3FinalRe.FindStringSubmatch(block); m != nil {
+		result.e3Final = safeParseFloat(m[1])
+	}
+	if m := e4FinalRe.FindStringSubmatch(block); m != nil {
+		result.e4Final = safeParseFloat(m[1])
+	}
+
+	// 提取 HARD_CONSTRAINT
+	hardRe := regexp.MustCompile(`(?i)HARD_CONSTRAINT:\s*(PASS|FAIL)`)
+	if hm := hardRe.FindStringSubmatch(block); hm != nil {
+		result.hardConstraint = hm[1]
+	}
+
+	// 提取 GRADE
+	gradeRe := regexp.MustCompile(`(?i)GRADE:\s*([A-D])`)
+	if gm := gradeRe.FindStringSubmatch(block); gm != nil {
+		result.grade = gm[1]
+	}
+
+	// 提取各轮分数：E1_R1:{值} E1_R2:{值} ... （与HTML parseMetaScore的matchAll一致）
+	roundRe := regexp.MustCompile(`(?i)E([1-4])_R(\d+):\s*([\d.]+)`)
+	allRoundMatches := roundRe.FindAllStringSubmatch(block, -1)
+
+	// 用map暂存：dim -> roundNum -> score
+	roundMap := map[int]map[int]float64{
+		1: {}, 2: {}, 3: {}, 4: {},
+	}
+	maxRound := 0
+	for _, m := range allRoundMatches {
+		dim, _ := strconv.Atoi(m[1])    // 1~4
+		rn, _ := strconv.Atoi(m[2])     // 轮次序号
+		score := safeParseFloat(m[3])
+		if dim >= 1 && dim <= 4 && rn >= 1 {
+			roundMap[dim][rn] = score
+			if rn > maxRound {
+				maxRound = rn
+			}
+		}
+	}
+
+	// 转换为有序数组
+	for rn := 1; rn <= maxRound; rn++ {
+		result.e1Rounds = append(result.e1Rounds, roundMap[1][rn])
+		result.e2Rounds = append(result.e2Rounds, roundMap[2][rn])
+		result.e3Rounds = append(result.e3Rounds, roundMap[3][rn])
+		result.e4Rounds = append(result.e4Rounds, roundMap[4][rn])
+	}
+
+	result.parseOk = true
+	return result
+}
+
+// ==================== 公共工具方法 ====================
+
 // extractScannerParsed 从scanner的step_data JSON中提取parsed字段
-// 返回课程定位JSON字符串（供evaluator的用户消息使用）
+// 返回课程定位JSON字符串（供evaluator和meta的用户消息使用）
 func extractScannerParsed(stepData string) string {
 	if stepData == "" || stepData == "null" {
 		return "（无课程定位数据）"
