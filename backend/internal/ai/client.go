@@ -18,9 +18,8 @@ import (
 // 支持三级配置回退：场景配置 → 全局配置 → .env环境变量
 
 // EffectiveConfig 合并后的有效AI配置
-// 由GetEffectiveConfig()计算得出，供CallAI()使用
 type EffectiveConfig struct {
-	APIBaseURL  string  // API基础地址（如 https://oneapi.xingyunlink.com/v1）
+	APIBaseURL  string  // API基础地址
 	APIKey      string  // 解密后的API Key（明文）
 	Model       string  // 使用的模型名称
 	Temperature float64 // 温度参数（0.0~2.0）
@@ -29,8 +28,8 @@ type EffectiveConfig struct {
 
 // ChatMessage OpenAI兼容的消息格式
 type ChatMessage struct {
-	Role    string `json:"role"`    // 角色：system/user/assistant
-	Content string `json:"content"` // 消息内容
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 // ChatRequest OpenAI兼容的请求体
@@ -65,14 +64,7 @@ type CallResult struct {
 // ==================== 配置获取 ====================
 
 // GetEffectiveConfig 获取指定场景的有效AI配置
-// 三级回退策略：
-//   1. 场景配置（ai_scene_configs表中scene_code对应记录）
-//   2. 全局配置（ai_configs表）
-//   3. .env环境变量（兜底）
-//
-// 参数 aesKey：用于解密数据库中存储的加密API Key
-// 参数 sceneCode：场景代码（scanner/evaluator/meta/translator/reviewer/generator）
-// 参数 fallbackBaseURL/fallbackKey/fallbackModel：来自.env的兜底值
+// 三级回退策略：场景配置 → 全局配置 → .env环境变量
 func GetEffectiveConfig(
 	aesKey string,
 	sceneCode string,
@@ -161,17 +153,12 @@ func GetEffectiveConfig(
 // ==================== AI调用 ====================
 
 // CallAI 调用AI API（OpenAI兼容格式）
-// 参数说明：
-//   cfg        — 由GetEffectiveConfig()得到的有效配置
-//   systemPrompt — 系统提示词（可为空字符串）
-//   userPrompt   — 用户消息（必填）
-//
-// 返回：*CallResult（含输出内容、模型名、Token数、耗时）
+// systemPrompt：系统提示词（可为空）
+// userPrompt：用户消息（必填）
 func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*CallResult, error) {
 	// -------- 构造消息列表 --------
 	var messages []ChatMessage
 
-	// 系统提示词（若非空则添加）
 	if strings.TrimSpace(systemPrompt) != "" {
 		messages = append(messages, ChatMessage{
 			Role:    "system",
@@ -179,7 +166,6 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 		})
 	}
 
-	// 用户消息（必须有）
 	messages = append(messages, ChatMessage{
 		Role:    "user",
 		Content: userPrompt,
@@ -208,8 +194,7 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 
-	// -------- 发送请求 --------
-	// 超时时间120秒（AI生成可能较慢，特别是长文本）
+	// 超时时间120秒（AI生成可能较慢）
 	httpClient := &http.Client{Timeout: 120 * time.Second}
 	startTime := time.Now()
 
@@ -227,7 +212,6 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 		return nil, fmt.Errorf("读取AI响应失败: %w", err)
 	}
 
-	// -------- 检查HTTP状态码 --------
 	if resp.StatusCode != http.StatusOK {
 		errMsg := extractErrorMessage(respBody)
 		return nil, fmt.Errorf("AI API返回错误(HTTP %d): %s", resp.StatusCode, errMsg)
@@ -248,7 +232,7 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 		return nil, fmt.Errorf("AI返回内容为空")
 	}
 
-	// -------- 清理思维链标签（部分模型会输出<thinking>...）--------
+	// 清理思维链标签（部分模型会输出<thinking>...）
 	content = stripThinking(content)
 
 	return &CallResult{
@@ -262,12 +246,7 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 // ==================== JSON提取工具 ====================
 
 // ExtractJSON 从AI输出文本中提取第一个完整的JSON对象
-// 处理AI常见输出格式：
-//   1. 纯JSON: {"key":"value"}
-//   2. Markdown代码块: ```json
-{...}
-```
-//   3. 混合文本: 前后有说明文字，JSON在中间
+// 支持格式：纯JSON、Markdown代码块、混合文本
 func ExtractJSON(text string) (string, bool) {
 	// 优先尝试从Markdown代码块提取
 	if jsonStr, ok := extractFromCodeBlock(text); ok {
@@ -280,7 +259,7 @@ func ExtractJSON(text string) (string, bool) {
 		return "", false
 	}
 
-	// 从第一个{开始，找到匹配的}
+	// 从第一个{开始，找到匹配的}（处理嵌套）
 	depth := 0
 	for i := start; i < len(text); i++ {
 		switch text[i] {
@@ -290,7 +269,6 @@ func ExtractJSON(text string) (string, bool) {
 			depth--
 			if depth == 0 {
 				candidate := text[start : i+1]
-				// 验证是否是有效JSON
 				var obj map[string]interface{}
 				if err := json.Unmarshal([]byte(candidate), &obj); err == nil {
 					return candidate, true
@@ -302,25 +280,19 @@ func ExtractJSON(text string) (string, bool) {
 }
 
 // extractFromCodeBlock 从Markdown代码块中提取JSON内容
-// 支持格式：```json ... ``` 或 ``` ... ```
 func extractFromCodeBlock(text string) (string, bool) {
-	// 查找代码块开始标记
-	markers := []string{"' + ``` + 'json
-", "' + ``` + '
-"}
-	for _, marker := range markers {
+	// 查找 ```json 或 ``` 开头的代码块
+	for _, marker := range []string{"```json\n", "```\n"} {
 		startIdx := strings.Index(text, marker)
 		if startIdx < 0 {
 			continue
 		}
-		content := text[startIdx+len(marker):]
-		// 查找代码块结束标记
-		endIdx := strings.Index(content, "' + ``` + '")
+		afterMarker := text[startIdx+len(marker):]
+		endIdx := strings.Index(afterMarker, "```")
 		if endIdx < 0 {
 			continue
 		}
-		candidate := strings.TrimSpace(content[:endIdx])
-		// 验证JSON有效性
+		candidate := strings.TrimSpace(afterMarker[:endIdx])
 		var obj map[string]interface{}
 		if err := json.Unmarshal([]byte(candidate), &obj); err == nil {
 			return candidate, true
@@ -332,9 +304,7 @@ func extractFromCodeBlock(text string) (string, bool) {
 // ==================== 内部工具函数 ====================
 
 // stripThinking 移除AI输出中的<thinking>...</thinking>思维链标签
-// 部分推理模型（如claude-3.7-sonnet-thinking）会在输出前加入内部思考过程
 func stripThinking(content string) string {
-	// 处理<thinking>...</thinking>标签
 	for {
 		start := strings.Index(content, "<thinking>")
 		if start < 0 {
@@ -342,11 +312,9 @@ func stripThinking(content string) string {
 		}
 		end := strings.Index(content, "</thinking>")
 		if end < 0 {
-			// 有开始标签但无结束标签，截断开始标签前的内容
 			content = content[:start] + content[start+len("<thinking>"):]
 			break
 		}
-		// 移除整个thinking块（含标签）
 		content = content[:start] + content[end+len("</thinking>"):]
 	}
 	return strings.TrimSpace(content)
@@ -369,7 +337,7 @@ func extractErrorMessage(body []byte) string {
 	return raw
 }
 
-// coalesce 返回第一个非空字符串（类似SQL COALESCE）
+// coalesce 返回第一个非空字符串
 func coalesce(values ...string) string {
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {
