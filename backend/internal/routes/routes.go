@@ -12,7 +12,7 @@ import (
 )
 
 // Setup 注册所有路由并返回根Handler
-// 版本：0.10.0（P4-1新增Pipeline路由）
+// 版本：0.11.0（P4-2新增Scanner步骤+AI调用客户端）
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -334,7 +334,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.10.0",
+		"version": "0.11.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

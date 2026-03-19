@@ -2,11 +2,13 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"tedna/internal/ai"
 	"tedna/internal/config"
 	"tedna/internal/database"
 	"tedna/internal/models"
@@ -27,6 +29,9 @@ var (
 	ErrDbCheckIndexMissing      = errors.New("课程索引不存在")
 	ErrDbCheckIndexTooShort     = errors.New("课程索引内容过短，可能不完整")
 	ErrDbCheckIndexHashMismatch = errors.New("课程索引校验码不一致，数据可能损坏")
+	ErrScannerPromptMissing     = errors.New("Prompt A未配置，请先在提示词管理中设置prompt_a")
+	ErrScannerAIFailed          = errors.New("Scanner AI调用失败")
+	ErrScannerParseFailed       = errors.New("Scanner未能从AI输出中提取有效JSON")
 )
 
 // ==================== PipelineService ====================
@@ -261,8 +266,10 @@ func (s *PipelineService) DeletePipeline(id string) error {
 
 // ==================== Pipeline 执行引擎 ====================
 
-// StartPipeline 启动Pipeline执行（从dbCheck开始）
-// 当前为同步执行，后续Phase 5会改为异步goroutine
+// StartPipeline 启动Pipeline执行（从dbCheck开始，autoMode下自动推进到scanner）
+// P4-1：同步执行dbCheck
+// P4-2：autoMode时同步执行scanner
+// P5：改为异步goroutine
 func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailResponse, error) {
 	// 1. 获取Pipeline
 	pipeline, err := repository.GetPipelineByID(id)
@@ -284,9 +291,8 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 	dbCheckErr := s.executeDbCheck(pipeline)
 
 	if dbCheckErr != nil {
-		// dbCheck失败 -> Pipeline标记为failed
+		// dbCheck失败 -> Pipeline标记为failed，返回详情（含失败信息）
 		_ = repository.UpdatePipelineError(id, models.StepDbCheck, dbCheckErr.Error())
-		// 仍返回详情（包含失败信息），不返回error给调用方
 		return s.GetPipelineDetail(id)
 	}
 
@@ -295,19 +301,40 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 		return nil, fmt.Errorf("推进到Scanner失败: %w", err)
 	}
 
-	// 6. 返回最新状态
-	// P4-1只实现dbCheck，scanner及后续步骤在P4-2~P4-6实现
+	// 6. autoMode时自动执行scanner步骤（P4-2新增）
+	if pipeline.AutoMode {
+		// 重新读取最新Pipeline状态（含更新后的current_step）
+		pipeline, err = repository.GetPipelineByID(id)
+		if err != nil {
+			return s.GetPipelineDetail(id)
+		}
+
+		scannerErr := s.executeScanner(pipeline)
+		if scannerErr != nil {
+			// scanner失败 -> Pipeline标记为failed
+			_ = repository.UpdatePipelineError(id, models.StepScanner, scannerErr.Error())
+			return s.GetPipelineDetail(id)
+		}
+
+		// scanner成功 -> 推进到evaluator（P4-3实现时继续）
+		// 目前P4-2只实现到scanner，停在evaluator步骤等待
+		if err := repository.UpdatePipelineStatus(id, models.StepEvaluator, models.PipelineStatusRunning); err != nil {
+			return nil, fmt.Errorf("推进到Evaluator失败: %w", err)
+		}
+	}
+
+	// 7. 返回最新状态
 	return s.GetPipelineDetail(id)
 }
 
-// ==================== dbCheck 步骤实现 ====================
+// ==================== dbCheck 步骤实现（P4-1）====================
 
 // executeDbCheck 执行dbCheck步骤：验证课程索引存在且有效
 // 验证规则：
-//   1. 课程必须存在于courses表
-//   2. course_indexes表必须有该课程的索引记录
-//   3. 索引内容长度必须 > MinIndexLength (50字符)
-//   4. 索引SHA-256校验码必须与实际内容一致
+//  1. 课程必须存在于courses表
+//  2. course_indexes表必须有该课程的索引记录
+//  3. 索引内容长度必须 > MinIndexLength (50字符)
+//  4. 索引SHA-256校验码必须与实际内容一致
 func (s *PipelineService) executeDbCheck(pipeline *models.Pipeline) error {
 	startTime := time.Now()
 	stepName := models.StepDbCheck
@@ -332,7 +359,6 @@ func (s *PipelineService) executeDbCheck(pipeline *models.Pipeline) error {
 		// 验证失败 -> 记录失败信息
 		result.IsValid = false
 		result.ErrorDetail = checkErr.Error()
-		// FailStep记录错误，再单独保存step_data用于诊断
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, checkErr.Error())
 		s.saveStepData(pipeline.ID, stepName, result.ToJSON())
 		return checkErr
@@ -386,6 +412,136 @@ func (s *PipelineService) doDbCheck(pipeline *models.Pipeline, result *models.Db
 	return nil
 }
 
+// ==================== Scanner 步骤实现（P4-2新增）====================
+
+// executeScanner 执行scanner步骤：调用Prompt A对课程进行K12定位分析
+// 输入：课程索引内容
+// 输出：{target, ability_targets, grade_standard, course_standard} JSON
+// 流程：
+//  1. 从数据库加载Prompt A（当前激活版本）
+//  2. 获取课程索引内容
+//  3. 构造用户消息（Prompt A + 课程索引）
+//  4. 调用AI API（使用scanner场景配置）
+//  5. 从AI输出中提取JSON
+//  6. 保存结果到step_data
+func (s *PipelineService) executeScanner(pipeline *models.Pipeline) error {
+	startTime := time.Now()
+	stepName := models.StepScanner
+
+	// 标记步骤开始
+	if err := repository.StartStep(pipeline.ID, stepName); err != nil {
+		return fmt.Errorf("启动scanner失败: %w", err)
+	}
+
+	// 执行实际scanner逻辑
+	result, callErr := s.doScanner(pipeline)
+
+	// 计算耗时
+	durationMs := time.Since(startTime).Milliseconds()
+
+	if callErr != nil {
+		// scanner失败
+		_ = repository.FailStep(pipeline.ID, stepName, durationMs, callErr.Error())
+		// 如果result有部分数据（如raw_output），也保存下来供诊断
+		if result != nil {
+			s.saveStepData(pipeline.ID, stepName, result.ToJSON())
+		}
+		return callErr
+	}
+
+	// scanner成功 -> 保存结果
+	if err := repository.CompleteStep(
+		pipeline.ID, stepName, durationMs,
+		result.ToJSON(), result.ModelUsed, result.TokensUsed,
+	); err != nil {
+		return fmt.Errorf("保存scanner结果失败: %w", err)
+	}
+
+	return nil
+}
+
+// doScanner 执行实际的scanner逻辑（调用AI + 解析JSON）
+func (s *PipelineService) doScanner(pipeline *models.Pipeline) (*models.ScannerResult, error) {
+	result := &models.ScannerResult{}
+
+	// -------- 1. 加载 Prompt A --------
+	promptA, err := repository.GetCurrentPrompt("prompt_a")
+	if err != nil || promptA == nil {
+		return nil, ErrScannerPromptMissing
+	}
+
+	// -------- 2. 获取课程索引内容 --------
+	// 先获取课程ID
+	course, err := repository.GetCourseByCode(pipeline.CourseCode)
+	if err != nil {
+		return nil, fmt.Errorf("scanner: 课程 %s 不存在", pipeline.CourseCode)
+	}
+	courseIndex, err := repository.GetCourseIndex(course.ID)
+	if err != nil {
+		return nil, fmt.Errorf("scanner: 课程索引不存在，请先执行dbCheck")
+	}
+
+	// -------- 3. 获取AI有效配置（三级回退）--------
+	aiCfg, err := ai.GetEffectiveConfig(
+		s.cfg.AESKey,
+		"scanner",           // 场景代码：使用scanner场景配置
+		s.cfg.AIAPIBaseURL,  // .env兜底：API地址
+		s.cfg.AIAPIKey,      // .env兜底：API Key
+		s.cfg.AIDefaultModel, // .env兜底：模型名
+	)
+	if err != nil {
+		return nil, fmt.Errorf("scanner: 获取AI配置失败: %w", err)
+	}
+
+	// -------- 4. 构造AI调用消息 --------
+	// Prompt A作为系统提示词（定义AI角色和输出格式）
+	// 课程索引作为用户消息（待分析的课程内容）
+	systemPrompt := promptA.Content
+	userPrompt := fmt.Sprintf("请分析以下课程索引内容，按照要求输出JSON格式的定位信息：\n\n%s", courseIndex.IndexContent)
+
+	// -------- 5. 调用AI --------
+	callResult, err := ai.CallAI(aiCfg, systemPrompt, userPrompt)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrScannerAIFailed, err.Error())
+	}
+
+	// 保存原始输出
+	result.RawOutput = callResult.Content
+	result.ModelUsed = callResult.ModelUsed
+	result.TokensUsed = callResult.TokensUsed
+
+	// -------- 6. 从AI输出中提取JSON --------
+	jsonStr, ok := ai.ExtractJSON(callResult.Content)
+	if !ok {
+		result.IsValid = false
+		// 原始输出已保存，返回错误（但result有诊断数据）
+		return result, fmt.Errorf("%w (AI输出前200字符: %s)",
+			ErrScannerParseFailed, truncate(callResult.Content, 200))
+	}
+
+	// 验证提取的JSON包含必要字段
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		result.IsValid = false
+		return result, fmt.Errorf("%w (JSON解析错误: %s)", ErrScannerParseFailed, err.Error())
+	}
+
+	// 检查必要字段是否存在（target是必须的）
+	if _, hasTarget := parsed["target"]; !hasTarget {
+		result.IsValid = false
+		return result, fmt.Errorf("%w (缺少必要字段target，实际字段: %v)",
+			ErrScannerParseFailed, getMapKeys(parsed))
+	}
+
+	// 保存解析后的JSON
+	result.Parsed = json.RawMessage(jsonStr)
+	result.IsValid = true
+
+	return result, nil
+}
+
+// ==================== 工具方法 ====================
+
 // saveStepData 单独更新步骤的step_data字段
 // 用于在FailStep之后补充保存诊断数据
 func (s *PipelineService) saveStepData(pipelineID string, stepName string, data string) {
@@ -397,4 +553,22 @@ func (s *PipelineService) saveStepData(pipelineID string, stepName string, data 
 		`UPDATE pipeline_steps SET step_data = $3::jsonb, updated_at = NOW()
 		 WHERE pipeline_id = $1 AND step_name = $2`,
 		pipelineID, stepName, data)
+}
+
+// truncate 截断字符串到指定长度，超出部分加"..."
+func truncate(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "..."
+}
+
+// getMapKeys 获取map的所有key列表（用于错误诊断）
+func getMapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

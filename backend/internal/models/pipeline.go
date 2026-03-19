@@ -112,15 +112,15 @@ func ParsePipelineConfig(jsonStr string) *PipelineConfig {
 // DbCheckResult dbCheck步骤的输出数据（存入step_data JSONB字段）
 // 验证课程索引的存在性和有效性
 type DbCheckResult struct {
-	CourseCode   string `json:"course_code"`   // 课程编号
-	CourseID     string `json:"course_id"`     // 课程UUID
-	ModuleID     int    `json:"module_id"`     // 外部模块ID
-	HasIndex     bool   `json:"has_index"`     // 是否存在索引
-	IndexHash    string `json:"index_hash"`    // 索引SHA-256校验码
-	PageCount    int    `json:"page_count"`    // 索引页面数
-	TotalLength  int    `json:"total_length"`  // 索引总字符数
-	IsValid      bool   `json:"is_valid"`      // 索引是否有效（存在+长度>50+hash一致）
-	ErrorDetail  string `json:"error_detail"`  // 验证失败时的详细原因
+	CourseCode  string `json:"course_code"`  // 课程编号
+	CourseID    string `json:"course_id"`    // 课程UUID
+	ModuleID    int    `json:"module_id"`    // 外部模块ID
+	HasIndex    bool   `json:"has_index"`    // 是否存在索引
+	IndexHash   string `json:"index_hash"`   // 索引SHA-256校验码
+	PageCount   int    `json:"page_count"`   // 索引页面数
+	TotalLength int    `json:"total_length"` // 索引总字符数
+	IsValid     bool   `json:"is_valid"`     // 索引是否有效（存在+长度>50+hash一致）
+	ErrorDetail string `json:"error_detail"` // 验证失败时的详细原因
 }
 
 // ToJSON 将dbCheck结果序列化为JSON字符串
@@ -132,14 +132,38 @@ func (r *DbCheckResult) ToJSON() string {
 	return string(data)
 }
 
-// ==================== Scanner 步骤数据结构（P4-2使用，此处预定义） ====================
+// ==================== Scanner 步骤数据结构（P4-2完整定义）====================
 
 // ScannerResult Scanner步骤的输出数据（存入step_data JSONB字段）
-// 从AI返回的JSON中解析课程定位信息
+// 包含AI原始输出、解析后的JSON定位信息、使用的模型和Token消耗
 type ScannerResult struct {
-	RawOutput string          `json:"raw_output"` // AI原始输出文本
-	Parsed    json.RawMessage `json:"parsed"`     // 解析后的JSON对象（target/ability_targets/grade_standard/course_standard）
-	IsValid   bool            `json:"is_valid"`   // 是否成功解析出有效JSON
+	RawOutput  string          `json:"raw_output"`  // AI原始输出文本（供诊断）
+	Parsed     json.RawMessage `json:"parsed"`      // 解析后的JSON对象（含target/ability_targets/grade_standard/course_standard）
+	IsValid    bool            `json:"is_valid"`    // 是否成功解析出有效JSON
+	ModelUsed  string          `json:"model_used"`  // 实际使用的AI模型
+	TokensUsed int             `json:"tokens_used"` // 消耗的Token数
+}
+
+// ToJSON 将ScannerResult序列化为JSON字符串
+func (r *ScannerResult) ToJSON() string {
+	// Parsed为空时设置为null，避免JSON序列化异常
+	if r.Parsed == nil {
+		r.Parsed = json.RawMessage("null")
+	}
+	data, err := json.Marshal(r)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+// ScannerParsed Scanner解析后的课程定位信息（Prompt A输出的JSON结构）
+// 用于后续步骤引用Scanner结果
+type ScannerParsed struct {
+	Target          string   `json:"target"`           // 课程核心目标（一句话概括）
+	AbilityTargets  []string `json:"ability_targets"`  // 能力目标列表（2-5条）
+	GradeStandard   string   `json:"grade_standard"`   // 年级标准描述
+	CourseStandard  string   `json:"course_standard"`  // 课程标准描述
 }
 
 // ==================== 请求结构体 ====================
@@ -181,23 +205,23 @@ type PipelineListItem struct {
 
 // PipelineDetailResponse Pipeline详情响应（含完整步骤列表）
 type PipelineDetailResponse struct {
-	ID               string              `json:"id"`                 // UUID
-	CourseCode       string              `json:"course_code"`        // 课程编号
-	CourseName       string              `json:"course_name"`        // 课程名称
-	ExternalModuleID *int                `json:"external_module_id"` // 外部模块ID
-	CurrentStep      string              `json:"current_step"`       // 当前步骤
-	CurrentStepName  string              `json:"current_step_name"`  // 当前步骤中文名
-	Status           string              `json:"status"`             // 状态
-	StatusName       string              `json:"status_name"`        // 状态中文名
-	AutoMode         bool                `json:"auto_mode"`          // 自动模式
-	Config           *PipelineConfig     `json:"config"`             // 运行配置
-	ErrorMessage     string              `json:"error_message"`      // 错误信息
-	StartedBy        *string             `json:"started_by"`         // 发起者ID
-	StartedAt        *time.Time          `json:"started_at"`         // 启动时间
-	CompletedAt      *time.Time          `json:"completed_at"`       // 完成时间
-	CreatedAt        *time.Time          `json:"created_at"`         // 创建时间
-	UpdatedAt        *time.Time          `json:"updated_at"`         // 更新时间
-	Steps            []*StepListItem     `json:"steps"`              // 步骤列表
+	ID               string          `json:"id"`                 // UUID
+	CourseCode       string          `json:"course_code"`        // 课程编号
+	CourseName       string          `json:"course_name"`        // 课程名称
+	ExternalModuleID *int            `json:"external_module_id"` // 外部模块ID
+	CurrentStep      string          `json:"current_step"`       // 当前步骤
+	CurrentStepName  string          `json:"current_step_name"`  // 当前步骤中文名
+	Status           string          `json:"status"`             // 状态
+	StatusName       string          `json:"status_name"`        // 状态中文名
+	AutoMode         bool            `json:"auto_mode"`          // 自动模式
+	Config           *PipelineConfig `json:"config"`             // 运行配置
+	ErrorMessage     string          `json:"error_message"`      // 错误信息
+	StartedBy        *string         `json:"started_by"`         // 发起者ID
+	StartedAt        *time.Time      `json:"started_at"`         // 启动时间
+	CompletedAt      *time.Time      `json:"completed_at"`       // 完成时间
+	CreatedAt        *time.Time      `json:"created_at"`         // 创建时间
+	UpdatedAt        *time.Time      `json:"updated_at"`         // 更新时间
+	Steps            []*StepListItem `json:"steps"`              // 步骤列表
 }
 
 // StepListItem 步骤列表单条
@@ -243,13 +267,13 @@ type StepDetailResponse struct {
 
 // Pipeline 状态常量
 const (
-	PipelineStatusPending    = "pending"      // 待启动
-	PipelineStatusRunning    = "running"      // 运行中
+	PipelineStatusPending     = "pending"      // 待启动
+	PipelineStatusRunning     = "running"      // 运行中
 	PipelineStatusReviewQueue = "review_queue" // 等待人工审核
-	PipelineStatusFinalized  = "finalized"    // 已定稿
-	PipelineStatusNeedsHuman = "needs_human"  // 需要人工干预
-	PipelineStatusFailed     = "failed"       // 失败
-	PipelineStatusCancelled  = "cancelled"    // 已取消
+	PipelineStatusFinalized   = "finalized"    // 已定稿
+	PipelineStatusNeedsHuman  = "needs_human"  // 需要人工干预
+	PipelineStatusFailed      = "failed"       // 失败
+	PipelineStatusCancelled   = "cancelled"    // 已取消
 )
 
 // Pipeline 步骤状态常量
@@ -300,13 +324,13 @@ var StepNameMap = map[string]string{
 
 // PipelineStatusNameMap Pipeline状态→中文名映射
 var PipelineStatusNameMap = map[string]string{
-	PipelineStatusPending:    "待启动",
-	PipelineStatusRunning:    "运行中",
+	PipelineStatusPending:     "待启动",
+	PipelineStatusRunning:     "运行中",
 	PipelineStatusReviewQueue: "等待审核",
-	PipelineStatusFinalized:  "已定稿",
-	PipelineStatusNeedsHuman: "需人工干预",
-	PipelineStatusFailed:     "失败",
-	PipelineStatusCancelled:  "已取消",
+	PipelineStatusFinalized:   "已定稿",
+	PipelineStatusNeedsHuman:  "需人工干预",
+	PipelineStatusFailed:      "失败",
+	PipelineStatusCancelled:   "已取消",
 }
 
 // StepStatusNameMap 步骤状态→中文名映射
