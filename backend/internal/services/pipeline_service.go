@@ -264,6 +264,7 @@ func (s *PipelineService) DeletePipeline(id string) error {
 // P4-2：autoMode时继续执行scanner → 推进到evaluator
 // P4-3：autoMode时继续执行evaluator → 推进到meta
 // P4-4：autoMode时继续执行meta → 通过则推进到translator
+// P4-5：autoMode时继续执行translator（Prompt C+D循环） → 通过则推进到generator
 func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailResponse, error) {
 	pipeline, err := repository.GetPipelineByID(id)
 	if err != nil {
@@ -339,9 +340,26 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 			return s.GetPipelineDetail(id)
 		}
 
-		// meta成功（通过阈值） → 推进到translator（P4-5实现时继续执行）
+		// meta成功（通过阈值） → 推进到translator
 		if err := repository.UpdatePipelineStatus(id, models.StepTranslator, models.PipelineStatusRunning); err != nil {
 			return nil, fmt.Errorf("推进到Translator失败: %w", err)
+		}
+
+		// P4-5：autoMode时继续执行translator（Prompt C + D循环）
+		pipeline, err = repository.GetPipelineByID(id)
+		if err != nil {
+			return s.GetPipelineDetail(id)
+		}
+
+		transErr := s.executeTranslator(pipeline)
+		if transErr != nil {
+			_ = repository.UpdatePipelineError(id, models.StepTranslator, transErr.Error())
+			return s.GetPipelineDetail(id)
+		}
+
+		// translator成功 → 推进到generator（P4-6实现时继续执行）
+		if err := repository.UpdatePipelineStatus(id, models.StepGenerator, models.PipelineStatusRunning); err != nil {
+			return nil, fmt.Errorf("推进到Generator失败: %w", err)
 		}
 	}
 

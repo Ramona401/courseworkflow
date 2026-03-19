@@ -435,3 +435,63 @@ const TotalSteps = 7
 
 // MinIndexLength 索引最小有效长度（字符数，低于此值认为无效）
 const MinIndexLength = 50
+
+
+// ==================== Translator+Reviewer 步骤数据结构（P4-5新增）====================
+
+// TranslatorRoundRecord Translator-Reviewer单轮循环记录
+// 每轮包含一次Translator调用和一次Reviewer调用的结果
+type TranslatorRoundRecord struct {
+	Round          int     `json:"round"`                      // 循环轮次（从1开始）
+	TransOutput    string  `json:"trans_output,omitempty"`     // Translator AI输出（截断保存）
+	TransTokens    int     `json:"trans_tokens"`               // Translator消耗Token数
+	TransLatencyMs int64   `json:"trans_latency_ms"`           // Translator调用耗时（毫秒）
+	TransError     string  `json:"trans_error,omitempty"`      // Translator错误信息（如有）
+	ReviewOutput   string  `json:"review_output,omitempty"`    // Reviewer AI输出（截断保存）
+	ReviewTokens   int     `json:"review_tokens"`              // Reviewer消耗Token数
+	ReviewLatencyMs int64  `json:"review_latency_ms"`          // Reviewer调用耗时（毫秒）
+	ReviewError    string  `json:"review_error,omitempty"`     // Reviewer错误信息（如有）
+	Score          float64 `json:"score"`                      // Reviewer评分（TOTAL）
+	QualityGate    string  `json:"quality_gate,omitempty"`     // QUALITY_GATE: PASS/FAIL
+	HardCheck      string  `json:"hard_check,omitempty"`       // HARD_CHECK: PASS/FAIL
+	Grade          string  `json:"grade,omitempty"`            // 评级: A/B/C/D
+	E1             float64 `json:"e1"`                         // E1维度评分
+	E2             float64 `json:"e2"`                         // E2维度评分
+	E3             float64 `json:"e3"`                         // E3维度评分
+	E4             float64 `json:"e4"`                         // E4维度评分
+	Passed         bool    `json:"passed"`                     // 本轮是否通过
+}
+
+// TranslatorResult Translator+Reviewer步骤的汇总数据（存入pipeline_steps.step_data JSONB字段）
+// 记录Translator-Reviewer循环的完整历史和最终结果
+type TranslatorResult struct {
+	// 循环配置
+	MaxLoops  int     `json:"max_loops"`  // 最大循环次数
+	Threshold float64 `json:"threshold"`  // 通过阈值
+
+	// 最终结果
+	Passed           bool    `json:"passed"`                       // 是否通过
+	FinalScore       float64 `json:"final_score"`                  // 最终Reviewer评分
+	FinalQualityGate string  `json:"final_quality_gate,omitempty"` // 最终QUALITY_GATE
+	FinalGrade       string  `json:"final_grade,omitempty"`        // 最终评级
+	FinalRound       int     `json:"final_round"`                  // 最终轮次（在第几轮结束）
+	FinalTransOutput string  `json:"final_trans_output,omitempty"` // 最终Translator输出（截断）
+	FinalReviewOutput string `json:"final_review_output,omitempty"` // 最终Reviewer输出（截断）
+
+	// 循环历史
+	Rounds []*TranslatorRoundRecord `json:"rounds"` // 各轮记录
+
+	// 执行信息
+	TotalTokens    int    `json:"total_tokens"`     // 累计Token消耗
+	TotalLatencyMs int64  `json:"total_latency_ms"` // 累计耗时（毫秒）
+	ModelUsed      string `json:"model_used"`       // 使用的模型（取最后一次）
+}
+
+// ToJSON 将TranslatorResult序列化为JSON字符串
+func (r *TranslatorResult) ToJSON() string {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
