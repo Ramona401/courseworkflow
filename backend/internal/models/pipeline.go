@@ -160,10 +160,59 @@ func (r *ScannerResult) ToJSON() string {
 // ScannerParsed Scanner解析后的课程定位信息（Prompt A输出的JSON结构）
 // 用于后续步骤引用Scanner结果
 type ScannerParsed struct {
-	Target          string   `json:"target"`           // 课程核心目标（一句话概括）
-	AbilityTargets  []string `json:"ability_targets"`  // 能力目标列表（2-5条）
-	GradeStandard   string   `json:"grade_standard"`   // 年级标准描述
-	CourseStandard  string   `json:"course_standard"`  // 课程标准描述
+	Target         string   `json:"target"`          // 课程核心目标（一句话概括）
+	AbilityTargets []string `json:"ability_targets"` // 能力目标列表（2-5条）
+	GradeStandard  string   `json:"grade_standard"`  // 年级标准描述
+	CourseStandard string   `json:"course_standard"` // 课程标准描述
+}
+
+// ==================== Evaluator 步骤数据结构（P4-3新增）====================
+
+// EvalRoundRecord 评估轮次记录（对应 eval_rounds 表）
+// 每轮独立调用AI进行评估，记录输出和各维度评分
+type EvalRoundRecord struct {
+	ID          string     `json:"id"`           // UUID主键
+	PipelineID  string     `json:"pipeline_id"`  // 关联Pipeline ID
+	RoundNumber int        `json:"round_number"` // 轮次序号（从1开始）
+	Status      string     `json:"status"`       // 轮次状态（pending/running/done/failed）
+	Output      string     `json:"output"`       // AI原始输出文本
+	ScoreTotal  *float64   `json:"score_total"`  // 综合评分（0.0-10.0）
+	ScoreE1     *float64   `json:"score_e1"`     // E1难度适配评分
+	ScoreE2     *float64   `json:"score_e2"`     // E2时间节奏评分
+	ScoreE3     *float64   `json:"score_e3"`     // E3互动评估评分
+	ScoreE4     *float64   `json:"score_e4"`     // E4课程设计质量评分
+	Dimensions  string     `json:"dimensions"`   // 扩展维度JSON（JSONB存储，含HARD_CONSTRAINT/GRADE等）
+	ModelUsed   string     `json:"model_used"`   // 使用的AI模型
+	TokensUsed  int        `json:"tokens_used"`  // 消耗的Token数
+	CreatedAt   *time.Time `json:"created_at"`   // 创建时间
+}
+
+// EvaluatorResult Evaluator步骤的汇总数据（存入pipeline_steps.step_data JSONB字段）
+// 汇总N轮评估的均值、方差和警告信息
+type EvaluatorResult struct {
+	TotalRounds    int      `json:"total_rounds"`    // 总轮数
+	DoneRounds     int      `json:"done_rounds"`     // 成功完成的轮数
+	FailedRounds   int      `json:"failed_rounds"`   // 失败的轮数
+	AvgTotal       float64  `json:"avg_total"`       // 综合分均值
+	AvgE1          float64  `json:"avg_e1"`          // E1均值
+	AvgE2          float64  `json:"avg_e2"`          // E2均值
+	AvgE3          float64  `json:"avg_e3"`          // E3均值
+	AvgE4          float64  `json:"avg_e4"`          // E4均值
+	Variance       float64  `json:"variance"`        // 综合分方差
+	VarianceWarn   bool     `json:"variance_warn"`   // 方差是否超过阈值
+	RoundScores    []float64 `json:"round_scores"`   // 每轮综合分列表
+	TotalTokens    int      `json:"total_tokens"`    // 总Token消耗
+	TotalLatencyMs int64    `json:"total_latency_ms"` // 总耗时（毫秒）
+	ModelUsed      string   `json:"model_used"`      // 使用的模型（取最后一轮）
+}
+
+// ToJSON 将EvaluatorResult序列化为JSON字符串
+func (r *EvaluatorResult) ToJSON() string {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
 }
 
 // ==================== 请求结构体 ====================
