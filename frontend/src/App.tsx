@@ -4,7 +4,7 @@
  * - 路由配置：登录页 / 主布局（含侧边栏）
  * - 路由守卫：未登录跳转登录页
  * - 角色守卫：按角色控制页面访问
- * - P3-1新增：外部数据配置路由
+ * - P4-7新增：Pipeline列表+详情路由
  */
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AuthContext } from '@/store/auth'
@@ -20,6 +20,8 @@ import AIConfigPage from '@/pages/ai-config/AIConfigPage'
 import PromptsPage from '@/pages/prompts/PromptsPage'
 import ExternalDataPage from '@/pages/external-data/ExternalDataPage'
 import CoursesPage from '@/pages/courses/CoursesPage'
+import PipelinesPage from '@/pages/pipelines/PipelinesPage'
+import PipelineDetailPage from '@/pages/pipelines/PipelineDetailPage'
 
 /**
  * 路由守卫组件
@@ -138,8 +140,19 @@ export default function App() {
               </RoleGuard>
             } />
 
-            {/* TODO: P4 Pipeline */}
-            {/* <Route path="pipelines" element={<PipelinesPage />} /> */}
+            {/* P4-7 Pipeline列表（admin + operator） */}
+            <Route path="pipelines" element={
+              <RoleGuard roles={['admin', 'operator']}>
+                <PipelinesPage />
+              </RoleGuard>
+            } />
+
+            {/* P4-7 Pipeline详情（admin + operator） */}
+            <Route path="pipelines/:id" element={
+              <RoleGuard roles={['admin', 'operator']}>
+                <PipelineDetailPage />
+              </RoleGuard>
+            } />
 
             {/* TODO: P6 审核中心 */}
             {/* <Route path="review" element={<ReviewPage />} /> */}

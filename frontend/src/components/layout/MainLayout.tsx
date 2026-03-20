@@ -2,27 +2,40 @@
  * 主布局组件 - Apple 风格
  * - 左侧深色侧边栏 + 右侧浅色内容区
  * - 顶部精致的标题栏
- * - P3-1新增：外部数据配置标题映射
+ * - P4-7更新：Pipeline详情页动态标题支持
  */
 import { Outlet, useLocation } from 'react-router-dom'
 import Sidebar from './Sidebar'
 
-// 路由标题映射（P3-1新增 /external-data）
+// 路由标题映射（P4-7更新：添加pipelines路由）
 const pageTitles: Record<string, string> = {
   '/': '仪表盘',
   '/users': '用户管理',
   '/ai-config': 'AI 配置',
   '/prompts': '提示词管理',
   '/external-data': '外部数据配置',
-    '/courses': '课程管理',
+  '/courses': '课程管理',
   '/pipelines': 'Pipeline',
   '/review': '审核中心',
   '/settings': '系统设置',
 }
 
+/** 根据路径获取页面标题（支持动态路由） */
+function getPageTitle(pathname: string): string {
+  // 精确匹配
+  if (pageTitles[pathname]) {
+    return pageTitles[pathname]
+  }
+  // Pipeline详情页：/pipelines/{id}
+  if (pathname.startsWith('/pipelines/')) {
+    return 'Pipeline 详情'
+  }
+  return 'TE-DNA 2.0'
+}
+
 export default function MainLayout() {
   const location = useLocation()
-  const pageTitle = pageTitles[location.pathname] || 'TE-DNA 2.0'
+  const pageTitle = getPageTitle(location.pathname)
 
   return (
     <div style={{
