@@ -221,14 +221,14 @@ func (r *EvaluatorResult) ToJSON() string {
 // Meta步骤执行元评估仲裁：综合N轮评估报告，输出仲裁分数+修改方案+修改后完整索引
 type MetaResult struct {
 	// 仲裁评分（从<<<META_SCORE>>>块提取）
-	TotalFinal     float64 `json:"total_final"`      // 仲裁综合评分
-	E1Final        float64 `json:"e1_final"`          // E1仲裁评分
-	E2Final        float64 `json:"e2_final"`          // E2仲裁评分
-	E3Final        float64 `json:"e3_final"`          // E3仲裁评分
-	E4Final        float64 `json:"e4_final"`          // E4仲裁评分
-	HardConstraint string  `json:"hard_constraint"`   // 硬性约束（PASS/FAIL）
-	Grade          string  `json:"grade"`             // 评级（A/B/C/D）
-	Passed         bool    `json:"passed"`            // 是否通过阈值（TotalFinal >= threshold）
+	TotalFinal     float64 `json:"total_final"`    // 仲裁综合评分
+	E1Final        float64 `json:"e1_final"`        // E1仲裁评分
+	E2Final        float64 `json:"e2_final"`        // E2仲裁评分
+	E3Final        float64 `json:"e3_final"`        // E3仲裁评分
+	E4Final        float64 `json:"e4_final"`        // E4仲裁评分
+	HardConstraint string  `json:"hard_constraint"` // 硬性约束（PASS/FAIL）
+	Grade          string  `json:"grade"`           // 评级（A/B/C/D）
+	Passed         bool    `json:"passed"`          // 是否通过阈值（TotalFinal >= threshold）
 
 	// 各轮原始分数（供前端展示交叉比对）
 	E1Rounds []float64 `json:"e1_rounds"` // 各轮E1分数 [R1,R2,...RN]
@@ -237,12 +237,12 @@ type MetaResult struct {
 	E4Rounds []float64 `json:"e4_rounds"` // 各轮E4分数
 
 	// 执行信息
-	Attempt      int    `json:"attempt"`        // 当前尝试次数（1~max_meta_retry）
-	TotalRetries int    `json:"total_retries"`  // 总重试次数
-	RawOutput    string `json:"raw_output"`     // AI最终一次的原始输出（截断保存，供诊断）
-	ModelUsed    string `json:"model_used"`     // 使用的AI模型
-	TokensUsed   int    `json:"tokens_used"`    // 累计Token消耗（所有尝试合计）
-	LatencyMs    int64  `json:"latency_ms"`     // 累计耗时（毫秒，所有尝试合计）
+	Attempt      int    `json:"attempt"`       // 当前尝试次数（1~max_meta_retry）
+	TotalRetries int    `json:"total_retries"` // 总重试次数
+	RawOutput    string `json:"raw_output"`    // AI最终一次的原始输出（截断保存，供诊断）
+	ModelUsed    string `json:"model_used"`    // 使用的AI模型
+	TokensUsed   int    `json:"tokens_used"`   // 累计Token消耗（所有尝试合计）
+	LatencyMs    int64  `json:"latency_ms"`    // 累计耗时（毫秒，所有尝试合计）
 }
 
 // ToJSON 将MetaResult序列化为JSON字符串
@@ -271,7 +271,8 @@ type PipelineListResponse struct {
 	Total     int                 `json:"total"`     // 总数
 }
 
-// PipelineListItem Pipeline列表单条（含步骤进度摘要）
+// PipelineListItem Pipeline列表单条（含步骤进度摘要+各阶段分数）
+// P4.5-A增强：新增EvalAvgScore/MetaScore/TranslatorScore三个分数字段
 type PipelineListItem struct {
 	ID               string     `json:"id"`                 // UUID
 	CourseCode       string     `json:"course_code"`        // 课程编号
@@ -289,6 +290,10 @@ type PipelineListItem struct {
 	StartedAt        *time.Time `json:"started_at"`         // 启动时间
 	CompletedAt      *time.Time `json:"completed_at"`       // 完成时间
 	CreatedAt        *time.Time `json:"created_at"`         // 创建时间
+	// P4.5-A新增：从pipeline_steps.step_data JSONB提取的各阶段分数
+	EvalAvgScore    *float64 `json:"eval_avg_score"`    // Evaluator均分（step_data->'avg_total'）
+	MetaScore       *float64 `json:"meta_score"`        // Meta仲裁分（step_data->'total_final'）
+	TranslatorScore *float64 `json:"translator_score"`  // Translator最终分（step_data->'final_score'）
 }
 
 // PipelineDetailResponse Pipeline详情响应（含完整步骤列表）
@@ -436,30 +441,29 @@ const TotalSteps = 7
 // MinIndexLength 索引最小有效长度（字符数，低于此值认为无效）
 const MinIndexLength = 50
 
-
 // ==================== Translator+Reviewer 步骤数据结构（P4-5新增）====================
 
 // TranslatorRoundRecord Translator-Reviewer单轮循环记录
 // 每轮包含一次Translator调用和一次Reviewer调用的结果
 type TranslatorRoundRecord struct {
-	Round          int     `json:"round"`                      // 循环轮次（从1开始）
-	TransOutput    string  `json:"trans_output,omitempty"`     // Translator AI输出（截断保存）
-	TransTokens    int     `json:"trans_tokens"`               // Translator消耗Token数
-	TransLatencyMs int64   `json:"trans_latency_ms"`           // Translator调用耗时（毫秒）
-	TransError     string  `json:"trans_error,omitempty"`      // Translator错误信息（如有）
-	ReviewOutput   string  `json:"review_output,omitempty"`    // Reviewer AI输出（截断保存）
-	ReviewTokens   int     `json:"review_tokens"`              // Reviewer消耗Token数
-	ReviewLatencyMs int64  `json:"review_latency_ms"`          // Reviewer调用耗时（毫秒）
-	ReviewError    string  `json:"review_error,omitempty"`     // Reviewer错误信息（如有）
-	Score          float64 `json:"score"`                      // Reviewer评分（TOTAL）
-	QualityGate    string  `json:"quality_gate,omitempty"`     // QUALITY_GATE: PASS/FAIL
-	HardCheck      string  `json:"hard_check,omitempty"`       // HARD_CHECK: PASS/FAIL
-	Grade          string  `json:"grade,omitempty"`            // 评级: A/B/C/D
-	E1             float64 `json:"e1"`                         // E1维度评分
-	E2             float64 `json:"e2"`                         // E2维度评分
-	E3             float64 `json:"e3"`                         // E3维度评分
-	E4             float64 `json:"e4"`                         // E4维度评分
-	Passed         bool    `json:"passed"`                     // 本轮是否通过
+	Round           int     `json:"round"`                      // 循环轮次（从1开始）
+	TransOutput     string  `json:"trans_output,omitempty"`     // Translator AI输出（截断保存）
+	TransTokens     int     `json:"trans_tokens"`               // Translator消耗Token数
+	TransLatencyMs  int64   `json:"trans_latency_ms"`           // Translator调用耗时（毫秒）
+	TransError      string  `json:"trans_error,omitempty"`      // Translator错误信息（如有）
+	ReviewOutput    string  `json:"review_output,omitempty"`    // Reviewer AI输出（截断保存）
+	ReviewTokens    int     `json:"review_tokens"`              // Reviewer消耗Token数
+	ReviewLatencyMs int64   `json:"review_latency_ms"`          // Reviewer调用耗时（毫秒）
+	ReviewError     string  `json:"review_error,omitempty"`     // Reviewer错误信息（如有）
+	Score           float64 `json:"score"`                      // Reviewer评分（TOTAL）
+	QualityGate     string  `json:"quality_gate,omitempty"`     // QUALITY_GATE: PASS/FAIL
+	HardCheck       string  `json:"hard_check,omitempty"`       // HARD_CHECK: PASS/FAIL
+	Grade           string  `json:"grade,omitempty"`            // 评级: A/B/C/D
+	E1              float64 `json:"e1"`                         // E1维度评分
+	E2              float64 `json:"e2"`                         // E2维度评分
+	E3              float64 `json:"e3"`                         // E3维度评分
+	E4              float64 `json:"e4"`                         // E4维度评分
+	Passed          bool    `json:"passed"`                     // 本轮是否通过
 }
 
 // TranslatorResult Translator+Reviewer步骤的汇总数据（存入pipeline_steps.step_data JSONB字段）
@@ -470,13 +474,13 @@ type TranslatorResult struct {
 	Threshold float64 `json:"threshold"`  // 通过阈值
 
 	// 最终结果
-	Passed           bool    `json:"passed"`                       // 是否通过
-	FinalScore       float64 `json:"final_score"`                  // 最终Reviewer评分
-	FinalQualityGate string  `json:"final_quality_gate,omitempty"` // 最终QUALITY_GATE
-	FinalGrade       string  `json:"final_grade,omitempty"`        // 最终评级
-	FinalRound       int     `json:"final_round"`                  // 最终轮次（在第几轮结束）
-	FinalTransOutput string  `json:"final_trans_output,omitempty"` // 最终Translator输出（截断）
-	FinalReviewOutput string `json:"final_review_output,omitempty"` // 最终Reviewer输出（截断）
+	Passed            bool    `json:"passed"`                        // 是否通过
+	FinalScore        float64 `json:"final_score"`                   // 最终Reviewer评分
+	FinalQualityGate  string  `json:"final_quality_gate,omitempty"`  // 最终QUALITY_GATE
+	FinalGrade        string  `json:"final_grade,omitempty"`         // 最终评级
+	FinalRound        int     `json:"final_round"`                   // 最终轮次（在第几轮结束）
+	FinalTransOutput  string  `json:"final_trans_output,omitempty"`  // 最终Translator输出（截断）
+	FinalReviewOutput string  `json:"final_review_output,omitempty"` // 最终Reviewer输出（截断）
 
 	// 循环历史
 	Rounds []*TranslatorRoundRecord `json:"rounds"` // 各轮记录
@@ -496,24 +500,23 @@ func (r *TranslatorResult) ToJSON() string {
 	return string(data)
 }
 
-
 // ==================== Generator 步骤数据结构（P4-6新增）====================
 
 // GeneratorPageRecord Generator单页生成记录
 // 记录每个页面的操作类型、原始HTML、生成HTML等信息
 type GeneratorPageRecord struct {
-	PageNumber   int      `json:"page_number"`             // 页码（从1开始）
-	PageTitle    string   `json:"page_title"`              // 页面标题
-	Operation    string   `json:"operation"`               // 操作类型：keep/modify/create/merge/delete
-	LessonID     int      `json:"lesson_id,omitempty"`     // 原始课时ID（OSS中的lesson_id）
-	HasOrigHTML  bool     `json:"has_orig_html"`           // 是否有原始HTML
-	OrigHTMLLen  int      `json:"orig_html_len"`           // 原始HTML字符数
-	GenHTMLLen   int      `json:"gen_html_len"`            // 生成HTML字符数
-	MergeSources []int    `json:"merge_sources,omitempty"` // 合并源页码列表（merge操作）
-	TokensUsed   int      `json:"tokens_used"`             // 本页AI消耗Token数
-	LatencyMs    int64    `json:"latency_ms"`              // 本页AI调用耗时（毫秒）
-	Status       string   `json:"status"`                  // 状态：done/failed/skipped
-	Error        string   `json:"error,omitempty"`         // 错误信息
+	PageNumber   int    `json:"page_number"`             // 页码（从1开始）
+	PageTitle    string `json:"page_title"`              // 页面标题
+	Operation    string `json:"operation"`               // 操作类型：keep/modify/create/merge/delete
+	LessonID     int    `json:"lesson_id,omitempty"`     // 原始课时ID（OSS中的lesson_id）
+	HasOrigHTML  bool   `json:"has_orig_html"`           // 是否有原始HTML
+	OrigHTMLLen  int    `json:"orig_html_len"`           // 原始HTML字符数
+	GenHTMLLen   int    `json:"gen_html_len"`            // 生成HTML字符数
+	MergeSources []int  `json:"merge_sources,omitempty"` // 合并源页码列表（merge操作）
+	TokensUsed   int    `json:"tokens_used"`             // 本页AI消耗Token数
+	LatencyMs    int64  `json:"latency_ms"`              // 本页AI调用耗时（毫秒）
+	Status       string `json:"status"`                  // 状态：done/failed/skipped
+	Error        string `json:"error,omitempty"`         // 错误信息
 }
 
 // GeneratorResult Generator步骤的汇总数据（存入pipeline_steps.step_data JSONB字段）

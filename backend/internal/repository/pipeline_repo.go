@@ -101,18 +101,71 @@ func GetPipelineByID(id string) (*models.Pipeline, error) {
 	return p, nil
 }
 
+// pipelineListSelectSQL P4.5-A: Pipeline列表查询的SELECT子句（含3个分数子查询）
+// 从pipeline_steps.step_data JSONB字段提取evaluator均分/meta仲裁分/translator最终分
+// 注意：JSONB提取用->>返回text，需要::numeric转换为数值类型
+const pipelineListSelectSQL = `SELECT p.id, p.course_code, p.course_name, p.external_module_id,
+	p.current_step, p.status, p.auto_mode, p.error_message,
+	p.started_by, p.started_at, p.completed_at, p.created_at,
+	COALESCE((SELECT COUNT(*) FROM pipeline_steps ps
+		WHERE ps.pipeline_id = p.id AND ps.status = 'done'), 0) AS steps_completed,
+	(SELECT (ps_eval.step_data->>'avg_total')::numeric
+	 FROM pipeline_steps ps_eval
+	 WHERE ps_eval.pipeline_id = p.id AND ps_eval.step_name = 'evaluator'
+		AND ps_eval.status = 'done' AND ps_eval.step_data IS NOT NULL
+	 LIMIT 1) AS eval_avg_score,
+	(SELECT (ps_meta.step_data->>'total_final')::numeric
+	 FROM pipeline_steps ps_meta
+	 WHERE ps_meta.pipeline_id = p.id AND ps_meta.step_name = 'meta'
+		AND ps_meta.status = 'done' AND ps_meta.step_data IS NOT NULL
+	 LIMIT 1) AS meta_score,
+	(SELECT (ps_trans.step_data->>'final_score')::numeric
+	 FROM pipeline_steps ps_trans
+	 WHERE ps_trans.pipeline_id = p.id AND ps_trans.step_name = 'translator'
+		AND ps_trans.status = 'done' AND ps_trans.step_data IS NOT NULL
+	 LIMIT 1) AS translator_score
+FROM pipelines p`
+
+// scanPipelineListRow 扫描Pipeline列表行（含3个分数字段）
+// P4.5-A: 统一扫描逻辑，ListPipelines和ListPipelinesForUser共用
+func scanPipelineListRow(rows interface{ Scan(dest ...interface{}) error }) (*models.PipelineListItem, error) {
+	item := &models.PipelineListItem{}
+	var courseName, errorMsg *string
+
+	err := rows.Scan(
+		&item.ID, &item.CourseCode, &courseName, &item.ExternalModuleID,
+		&item.CurrentStep, &item.Status, &item.AutoMode, &errorMsg,
+		&item.StartedBy, &item.StartedAt, &item.CompletedAt, &item.CreatedAt,
+		&item.StepsCompleted,
+		&item.EvalAvgScore,    // P4.5-A: evaluator均分（*float64，NULL自动映射为nil）
+		&item.MetaScore,       // P4.5-A: meta仲裁分
+		&item.TranslatorScore, // P4.5-A: translator最终分
+	)
+	if err != nil {
+		return nil, fmt.Errorf("扫描Pipeline行失败: %w", err)
+	}
+
+	// 处理NULL字段
+	if courseName != nil {
+		item.CourseName = *courseName
+	}
+	if errorMsg != nil {
+		item.ErrorMessage = *errorMsg
+	}
+
+	// 附加中文名
+	item.CurrentStepName = models.StepNameMap[item.CurrentStep]
+	item.StatusName = models.PipelineStatusNameMap[item.Status]
+	item.StepsTotal = models.TotalSteps
+
+	return item, nil
+}
+
 // ListPipelines 获取Pipeline列表（按创建时间倒序）
-// 含每个Pipeline已完成步骤数的统计
+// P4.5-A增强：含每个Pipeline的evaluator均分、meta仲裁分、translator最终分
 func ListPipelines() ([]*models.PipelineListItem, error) {
 	ctx := context.Background()
-	rows, err := database.DB.Query(ctx,
-		`SELECT p.id, p.course_code, p.course_name, p.external_module_id,
-			p.current_step, p.status, p.auto_mode, p.error_message,
-			p.started_by, p.started_at, p.completed_at, p.created_at,
-			COALESCE((SELECT COUNT(*) FROM pipeline_steps ps
-				WHERE ps.pipeline_id = p.id AND ps.status = 'done'), 0) AS steps_completed
-		 FROM pipelines p
-		 ORDER BY p.created_at DESC`)
+	rows, err := database.DB.Query(ctx, pipelineListSelectSQL+" ORDER BY p.created_at DESC")
 	if err != nil {
 		return nil, fmt.Errorf("查询Pipeline列表失败: %w", err)
 	}
@@ -120,32 +173,10 @@ func ListPipelines() ([]*models.PipelineListItem, error) {
 
 	var items []*models.PipelineListItem
 	for rows.Next() {
-		item := &models.PipelineListItem{}
-		var courseName, errorMsg *string
-
-		err := rows.Scan(
-			&item.ID, &item.CourseCode, &courseName, &item.ExternalModuleID,
-			&item.CurrentStep, &item.Status, &item.AutoMode, &errorMsg,
-			&item.StartedBy, &item.StartedAt, &item.CompletedAt, &item.CreatedAt,
-			&item.StepsCompleted,
-		)
+		item, err := scanPipelineListRow(rows)
 		if err != nil {
-			return nil, fmt.Errorf("扫描Pipeline行失败: %w", err)
+			return nil, err
 		}
-
-		// 处理NULL字段
-		if courseName != nil {
-			item.CourseName = *courseName
-		}
-		if errorMsg != nil {
-			item.ErrorMessage = *errorMsg
-		}
-
-		// 附加中文名
-		item.CurrentStepName = models.StepNameMap[item.CurrentStep]
-		item.StatusName = models.PipelineStatusNameMap[item.Status]
-		item.StepsTotal = models.TotalSteps
-
 		items = append(items, item)
 	}
 	return items, nil
@@ -153,6 +184,7 @@ func ListPipelines() ([]*models.PipelineListItem, error) {
 
 // ListPipelinesForUser 获取指定用户可见的Pipeline列表
 // admin看所有，非admin只看自己发起的或分配课程的Pipeline
+// P4.5-A增强：含3个分数字段
 func ListPipelinesForUser(userID string, role string) ([]*models.PipelineListItem, error) {
 	ctx := context.Background()
 	var query string
@@ -160,24 +192,13 @@ func ListPipelinesForUser(userID string, role string) ([]*models.PipelineListIte
 
 	if role == "admin" {
 		// admin看所有Pipeline
-		query = `SELECT p.id, p.course_code, p.course_name, p.external_module_id,
-				p.current_step, p.status, p.auto_mode, p.error_message,
-				p.started_by, p.started_at, p.completed_at, p.created_at,
-				COALESCE((SELECT COUNT(*) FROM pipeline_steps ps
-					WHERE ps.pipeline_id = p.id AND ps.status = 'done'), 0) AS steps_completed
-			 FROM pipelines p
-			 ORDER BY p.created_at DESC`
+		query = pipelineListSelectSQL + " ORDER BY p.created_at DESC"
 	} else {
 		// 非admin：看自己发起的 + 分配给自己课程的Pipeline
-		query = `SELECT p.id, p.course_code, p.course_name, p.external_module_id,
-				p.current_step, p.status, p.auto_mode, p.error_message,
-				p.started_by, p.started_at, p.completed_at, p.created_at,
-				COALESCE((SELECT COUNT(*) FROM pipeline_steps ps
-					WHERE ps.pipeline_id = p.id AND ps.status = 'done'), 0) AS steps_completed
-			 FROM pipelines p
-			 WHERE p.started_by = $1
-				OR p.course_code IN (SELECT uca.course_code FROM user_course_assignments uca WHERE uca.user_id = $1)
-			 ORDER BY p.created_at DESC`
+		query = pipelineListSelectSQL + `
+		 WHERE p.started_by = $1
+			OR p.course_code IN (SELECT uca.course_code FROM user_course_assignments uca WHERE uca.user_id = $1)
+		 ORDER BY p.created_at DESC`
 		args = append(args, userID)
 	}
 
@@ -189,29 +210,10 @@ func ListPipelinesForUser(userID string, role string) ([]*models.PipelineListIte
 
 	var items []*models.PipelineListItem
 	for rows.Next() {
-		item := &models.PipelineListItem{}
-		var courseName, errorMsg *string
-
-		err := rows.Scan(
-			&item.ID, &item.CourseCode, &courseName, &item.ExternalModuleID,
-			&item.CurrentStep, &item.Status, &item.AutoMode, &errorMsg,
-			&item.StartedBy, &item.StartedAt, &item.CompletedAt, &item.CreatedAt,
-			&item.StepsCompleted,
-		)
+		item, err := scanPipelineListRow(rows)
 		if err != nil {
-			return nil, fmt.Errorf("扫描Pipeline行失败: %w", err)
+			return nil, err
 		}
-
-		if courseName != nil {
-			item.CourseName = *courseName
-		}
-		if errorMsg != nil {
-			item.ErrorMessage = *errorMsg
-		}
-		item.CurrentStepName = models.StepNameMap[item.CurrentStep]
-		item.StatusName = models.PipelineStatusNameMap[item.Status]
-		item.StepsTotal = models.TotalSteps
-
 		items = append(items, item)
 	}
 	return items, nil
@@ -542,7 +544,6 @@ func DeleteEvalRoundsByPipelineID(pipelineID string) error {
 	}
 	return nil
 }
-
 
 // ==================== Generated Pages CRUD（P4-6新增）====================
 

@@ -1,6 +1,7 @@
 /**
  * Pipeline管理API封装
  * P4-7: Pipeline列表 + 详情 + 步骤详情 + 操作（创建/启动/取消/删除）
+ * P4.5-A增强: PipelineListItem增加eval_avg_score/meta_score/translator_score三个分数字段
  */
 import client from './client'
 
@@ -15,7 +16,7 @@ export interface PipelineConfig {
   max_tr_loop: number
 }
 
-/** Pipeline列表单条 */
+/** Pipeline列表单条（P4.5-A增强：含3个分数字段） */
 export interface PipelineListItem {
   id: string
   course_code: string
@@ -33,6 +34,12 @@ export interface PipelineListItem {
   started_at: string | null
   completed_at: string | null
   created_at: string | null
+  /** P4.5-A新增：Evaluator均分（从step_data.avg_total提取，可能为null） */
+  eval_avg_score: number | null
+  /** P4.5-A新增：Meta仲裁分（从step_data.total_final提取，可能为null） */
+  meta_score: number | null
+  /** P4.5-A新增：Translator最终分（从step_data.final_score提取，可能为null） */
+  translator_score: number | null
 }
 
 /** Pipeline列表响应 */
