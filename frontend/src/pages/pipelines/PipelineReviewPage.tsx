@@ -1,6 +1,7 @@
 /**
  * Pipeline审核页面
  * P4.5-C: 生成页面预览 + 原版vs修改版对比 + 逐页审核决策 + 定稿归档
+ * P4.5-C增强: 全屏预览功能（支持单视图/对比模式全屏 + ESC退出）
  *
  * 功能：
  * 1. 页面列表侧边栏（含操作类型彩色标记 + 决策状态）
@@ -8,6 +9,7 @@
  * 3. 原版 vs 生成版 对比视图
  * 4. 逐页决策（approve采用/reject拒绝/edit编辑）
  * 5. 全部决策后可定稿归档
+ * 6. 全屏预览（单视图/对比模式，ESC或关闭按钮退出）
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
@@ -20,7 +22,7 @@ import {
   type GeneratedPageFull,
   type UpdatePageDecisionRequest,
 } from '@/api/pipelines'
-import { ArrowLeft, RefreshCw, Check, X, Edit3, CheckCircle, Send } from 'lucide-react'
+import { ArrowLeft, RefreshCw, Check, X, Edit3, CheckCircle, Send, Maximize2, Minimize2 } from 'lucide-react'
 
 // ==================== 常量定义 ====================
 
@@ -75,6 +77,9 @@ export default function PipelineReviewPage() {
   const [deciding, setDeciding] = useState(false)
   const [editingHTML, setEditingHTML] = useState(false)
   const [editContent, setEditContent] = useState('')
+  // 全屏预览状态
+  const [fullscreen, setFullscreen] = useState(false)
+  const [fullscreenMode, setFullscreenMode] = useState<'generated' | 'original' | 'compare'>('generated')
 
   /** 加载数据 */
   const loadData = useCallback(async () => {
@@ -95,6 +100,17 @@ export default function PipelineReviewPage() {
   }, [id])
 
   useEffect(() => { loadData() }, [loadData])
+
+  /** ESC键退出全屏 */
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && fullscreen) {
+        setFullscreen(false)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [fullscreen])
 
   /** 当前选中的页面 */
   const currentPage = pages[selectedIdx] || null
@@ -158,6 +174,12 @@ export default function PipelineReviewPage() {
   /** 提交编辑 */
   const submitEdit = () => {
     handleDecision('edit', editContent)
+  }
+
+  /** 打开全屏预览 */
+  const openFullscreen = () => {
+    setFullscreenMode(viewMode)
+    setFullscreen(true)
   }
 
   // 通用按钮样式
@@ -317,6 +339,21 @@ export default function PipelineReviewPage() {
                   ))}
                 </div>
 
+                {/* 全屏按钮 */}
+                {!editingHTML && (
+                  <button
+                    onClick={openFullscreen}
+                    style={{
+                      padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(0,0,0,0.08)',
+                      background: '#fff', cursor: 'pointer', display: 'inline-flex',
+                      alignItems: 'center', gap: 4, fontSize: 12, fontWeight: 500, color: '#3c3c43',
+                    }}
+                    title="全屏预览"
+                  >
+                    <Maximize2 size={13} /> 全屏
+                  </button>
+                )}
+
                 <div style={{ flex: 1 }} />
 
                 {/* 页面信息 */}
@@ -418,6 +455,136 @@ export default function PipelineReviewPage() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* 全屏预览遮罩层 */}
+      {fullscreen && currentPage && (
+        <FullscreenPreview
+          page={currentPage}
+          mode={fullscreenMode}
+          onModeChange={setFullscreenMode}
+          onClose={() => setFullscreen(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+// ==================== 全屏预览组件 ====================
+
+/**
+ * FullscreenPreview — 全屏遮罩层预览HTML
+ * 支持单视图（生成版/原版）和对比模式
+ * ESC键或关闭按钮退出
+ */
+function FullscreenPreview({
+  page,
+  mode,
+  onModeChange,
+  onClose,
+}: {
+  page: GeneratedPageFull
+  mode: 'generated' | 'original' | 'compare'
+  onModeChange: (m: 'generated' | 'original' | 'compare') => void
+  onClose: () => void
+}) {
+  return (
+    <div
+      style={{
+        position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+        zIndex: 9999, background: 'rgba(0,0,0,0.6)',
+        backdropFilter: 'blur(8px)',
+        display: 'flex', flexDirection: 'column',
+        animation: 'fadeIn 0.2s ease',
+      }}
+      onClick={(e) => {
+        // 点击遮罩背景（非内容区域）关闭
+        if (e.target === e.currentTarget) onClose()
+      }}
+    >
+      {/* 全屏顶部工具栏 */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 12, padding: '12px 24px',
+        background: 'rgba(255,255,255,0.95)', backdropFilter: 'blur(20px)',
+        borderBottom: '1px solid rgba(0,0,0,0.08)', flexShrink: 0,
+      }}>
+        {/* 页面标题 */}
+        <div style={{ fontSize: 15, fontWeight: 600, color: '#1c1c1e' }}>
+          P{page.page_number}. {page.page_title || '无标题'}
+        </div>
+        <span style={{
+          fontSize: 10, fontWeight: 600, color: '#fff', padding: '2px 8px',
+          borderRadius: 4, background: OP_COLORS[page.operation] || '#aeaeb2',
+        }}>
+          {OP_NAMES[page.operation] || page.operation}
+        </span>
+
+        <div style={{ flex: 1 }} />
+
+        {/* 视图切换 */}
+        <div style={{ display: 'flex', gap: 0, borderRadius: 8, overflow: 'hidden', border: '1px solid rgba(0,0,0,0.1)' }}>
+          {(['generated', 'original', 'compare'] as const).map(m => (
+            <button
+              key={m}
+              onClick={() => onModeChange(m)}
+              style={{
+                padding: '6px 16px', border: 'none', fontSize: 13, fontWeight: 500,
+                cursor: 'pointer',
+                background: mode === m ? '#007aff' : '#fff',
+                color: mode === m ? '#fff' : '#3c3c43',
+              }}
+            >
+              {m === 'generated' ? '生成版' : m === 'original' ? '原版' : '对比'}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ flex: 1 }} />
+
+        {/* 关闭按钮 */}
+        <button
+          onClick={onClose}
+          style={{
+            padding: '6px 14px', borderRadius: 8, border: '1px solid rgba(0,0,0,0.1)',
+            background: '#fff', cursor: 'pointer', display: 'inline-flex',
+            alignItems: 'center', gap: 5, fontSize: 13, fontWeight: 500, color: '#3c3c43',
+          }}
+          title="退出全屏 (ESC)"
+        >
+          <Minimize2 size={14} /> 退出全屏
+        </button>
+      </div>
+
+      {/* 全屏预览内容 */}
+      <div style={{ flex: 1, overflow: 'hidden', background: '#fff' }}>
+        {mode === 'compare' ? (
+          /* 对比模式 */
+          <div style={{ display: 'flex', height: '100%' }}>
+            <div style={{ flex: 1, borderRight: '2px solid rgba(0,0,0,0.08)', display: 'flex', flexDirection: 'column' }}>
+              <div style={{
+                padding: '10px 16px', fontSize: 13, fontWeight: 600, color: '#8e8e93',
+                background: '#f9f9f9', flexShrink: 0, borderBottom: '1px solid rgba(0,0,0,0.04)',
+              }}>
+                原版 ({page.original_html.length.toLocaleString()} 字符)
+              </div>
+              <HTMLPreview html={page.original_html} />
+            </div>
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+              <div style={{
+                padding: '10px 16px', fontSize: 13, fontWeight: 600, color: '#007aff',
+                background: '#f0f7ff', flexShrink: 0, borderBottom: '1px solid rgba(0,0,0,0.04)',
+              }}>
+                生成版 ({page.generated_html.length.toLocaleString()} 字符)
+              </div>
+              <HTMLPreview html={page.generated_html} />
+            </div>
+          </div>
+        ) : (
+          /* 单视图模式 */
+          <HTMLPreview
+            html={mode === 'original' ? page.original_html : page.generated_html}
+          />
+        )}
       </div>
     </div>
   )
