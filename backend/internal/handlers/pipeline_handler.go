@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"tedna/internal/middleware"
@@ -229,6 +230,124 @@ func (h *PipelineHandler) GetStepDetail(w http.ResponseWriter, r *http.Request) 
 	utils.Success(w, resp)
 }
 
+// GetEvalRounds GET /api/v1/pipelines/{id}/eval-rounds
+// 获取Pipeline的评估轮次详情列表（含每轮AI原始输出）
+func (h *PipelineHandler) GetEvalRounds(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		return
+	}
+
+	id := extractPipelineIDWithSuffix(r.URL.Path, "/eval-rounds")
+	if id == "" {
+		utils.BadRequest(w, "缺少Pipeline ID")
+		return
+	}
+
+	rounds, err := h.pipelineService.GetEvalRounds(id)
+	if err != nil {
+		handlePipelineError(w, err)
+		return
+	}
+
+	utils.Success(w, map[string]interface{}{
+		"pipeline_id": id,
+		"rounds":      rounds,
+		"total":       len(rounds),
+	})
+}
+
+// ==================== P4.5-C 审核决策接口 ====================
+
+// GetGeneratedPages GET /api/v1/pipelines/{id}/pages
+// 获取Pipeline的生成页面列表（含完整HTML内容，用于审核预览）
+func (h *PipelineHandler) GetGeneratedPages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		return
+	}
+
+	id := extractPipelineIDWithSuffix(r.URL.Path, "/pages")
+	if id == "" {
+		utils.BadRequest(w, "缺少Pipeline ID")
+		return
+	}
+
+	pages, err := h.pipelineService.GetGeneratedPages(id)
+	if err != nil {
+		handlePipelineError(w, err)
+		return
+	}
+
+	utils.Success(w, map[string]interface{}{
+		"pipeline_id": id,
+		"pages":       pages,
+		"total":       len(pages),
+	})
+}
+
+// UpdatePageDecision PUT /api/v1/pipelines/{id}/pages/{pageNumber}/decision
+// 更新单页审核决策（approve/reject/edit）
+func (h *PipelineHandler) UpdatePageDecision(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		return
+	}
+
+	// 从路径提取pipeline_id和pageNumber
+	// 路径格式: /api/v1/pipelines/{id}/pages/{pageNumber}/decision
+	pipelineID, pageNumber := extractPipelineIDAndPageNumber(r.URL.Path)
+	if pipelineID == "" || pageNumber <= 0 {
+		utils.BadRequest(w, "缺少Pipeline ID或页码")
+		return
+	}
+
+	// 解析请求体
+	var req struct {
+		Decision  string  `json:"decision"`   // approve / reject / edit
+		FinalHTML *string `json:"final_html"`  // edit时提供修改后的HTML
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+
+	if err := h.pipelineService.UpdatePageDecision(pipelineID, pageNumber, req.Decision, req.FinalHTML); err != nil {
+		handlePipelineError(w, err)
+		return
+	}
+
+	utils.Success(w, map[string]interface{}{
+		"message":     "决策已更新",
+		"page_number": pageNumber,
+		"decision":    req.Decision,
+	})
+}
+
+// FinalizePipeline POST /api/v1/pipelines/{id}/finalize
+// 定稿归档Pipeline（所有页面必须已决策）
+func (h *PipelineHandler) FinalizePipeline(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+
+	id := extractPipelineIDWithSuffix(r.URL.Path, "/finalize")
+	if id == "" {
+		utils.BadRequest(w, "缺少Pipeline ID")
+		return
+	}
+
+	if err := h.pipelineService.FinalizePipeline(id); err != nil {
+		handlePipelineError(w, err)
+		return
+	}
+
+	utils.Success(w, map[string]interface{}{
+		"message": "Pipeline已定稿归档",
+	})
+}
+
 // ==================== 路径解析辅助函数 ====================
 
 // extractPipelineID 从路径提取Pipeline ID
@@ -280,6 +399,39 @@ func extractPipelineIDAndStepName(path string) (string, string) {
 	return pipelineID, stepName
 }
 
+// extractPipelineIDAndPageNumber 从路径提取Pipeline ID和页码
+// P4.5-C新增
+// 路径格式: /api/v1/pipelines/{id}/pages/{pageNumber}/decision
+func extractPipelineIDAndPageNumber(path string) (string, int) {
+	// 查找 /pages/ 的位置
+	pagesIdx := strings.Index(path, "/pages/")
+	if pagesIdx < 0 {
+		return "", 0
+	}
+
+	// Pipeline ID: /pages/ 之前的路径的最后一段
+	beforePages := path[:pagesIdx]
+	pipelineID := extractPipelineID(beforePages)
+	if pipelineID == "" {
+		return "", 0
+	}
+
+	// 页码: /pages/ 之后到 /decision 之前的部分
+	afterPages := path[pagesIdx+len("/pages/"):]
+	// 去掉 /decision 后缀
+	decisionIdx := strings.Index(afterPages, "/decision")
+	if decisionIdx < 0 {
+		return pipelineID, 0
+	}
+	pageNumStr := afterPages[:decisionIdx]
+	pageNum, err := strconv.Atoi(pageNumStr)
+	if err != nil || pageNum <= 0 {
+		return pipelineID, 0
+	}
+
+	return pipelineID, pageNum
+}
+
 // ==================== 错误处理 ====================
 
 // handlePipelineError Pipeline统一错误处理
@@ -288,57 +440,45 @@ func handlePipelineError(w http.ResponseWriter, err error) {
 
 	switch {
 	// 参数错误 (400)
-	case err == services.ErrPipelineCourseRequired:
+	case err == services.ErrPipelineCourseRequired,
+		err == services.ErrInvalidDecision:
 		utils.BadRequest(w, errMsg)
 
 	// 未找到 (404)
 	case err == services.ErrPipelineNotFound,
-		err == services.ErrPipelineCourseNotFound:
+		err == services.ErrPipelineCourseNotFound,
+		err == services.ErrPageNotFound:
 		utils.Fail(w, http.StatusNotFound, errMsg)
 
 	// 状态冲突 (409)
 	case strings.Contains(errMsg, "已有运行中的Pipeline"),
 		err == services.ErrPipelineNotPending,
 		err == services.ErrPipelineNotCancellable,
-		err == services.ErrPipelineNotDeletable:
+		err == services.ErrPipelineNotDeletable,
+		err == services.ErrPipelineNotReviewable,
+		err == services.ErrFinalizeIncomplete:
 		utils.Fail(w, http.StatusConflict, errMsg)
 
-	// dbCheck验证失败 -> 返回200但Pipeline状态是failed（不是HTTP错误）
+	// dbCheck验证失败 -> 返回422
 	case err == services.ErrDbCheckIndexMissing,
 		err == services.ErrDbCheckIndexTooShort,
 		err == services.ErrDbCheckIndexHashMismatch:
-		// 这些错误不应该到这里，因为StartPipeline已经处理了
 		utils.Fail(w, http.StatusUnprocessableEntity, errMsg)
+
+	// 包含"尚有未决策"的文字（ErrFinalizeIncomplete带详情）
+	case strings.Contains(errMsg, "尚有未决策"):
+		utils.Fail(w, http.StatusConflict, errMsg)
+
+	// 包含"edit决策必须提供"的文字
+	case strings.Contains(errMsg, "edit决策必须提供"):
+		utils.BadRequest(w, errMsg)
+
+	// 包含"没有生成页面"的文字
+	case strings.Contains(errMsg, "没有生成页面"):
+		utils.BadRequest(w, errMsg)
 
 	// 其他服务器错误 (500)
 	default:
 		utils.InternalError(w, errMsg)
 	}
-}
-
-// GetEvalRounds GET /api/v1/pipelines/{id}/eval-rounds
-// 获取Pipeline的评估轮次详情列表（含每轮AI原始输出）
-func (h *PipelineHandler) GetEvalRounds(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
-		return
-	}
-
-	id := extractPipelineIDWithSuffix(r.URL.Path, "/eval-rounds")
-	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
-		return
-	}
-
-	rounds, err := h.pipelineService.GetEvalRounds(id)
-	if err != nil {
-		handlePipelineError(w, err)
-		return
-	}
-
-	utils.Success(w, map[string]interface{}{
-		"pipeline_id": id,
-		"rounds":      rounds,
-		"total":       len(rounds),
-	})
 }

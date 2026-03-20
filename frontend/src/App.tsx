@@ -5,6 +5,7 @@
  * - 路由守卫：未登录跳转登录页
  * - 角色守卫：按角色控制页面访问
  * - P4-7新增：Pipeline列表+详情路由
+ * - P4.5-C新增：Pipeline审核路由
  */
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AuthContext } from '@/store/auth'
@@ -22,6 +23,7 @@ import ExternalDataPage from '@/pages/external-data/ExternalDataPage'
 import CoursesPage from '@/pages/courses/CoursesPage'
 import PipelinesPage from '@/pages/pipelines/PipelinesPage'
 import PipelineDetailPage from '@/pages/pipelines/PipelineDetailPage'
+import PipelineReviewPage from '@/pages/pipelines/PipelineReviewPage'
 
 /**
  * 路由守卫组件
@@ -154,8 +156,12 @@ export default function App() {
               </RoleGuard>
             } />
 
-            {/* TODO: P6 审核中心 */}
-            {/* <Route path="review" element={<ReviewPage />} /> */}
+            {/* P4.5-C Pipeline审核（admin + operator） */}
+            <Route path="pipelines/:id/review" element={
+              <RoleGuard roles={['admin', 'operator']}>
+                <PipelineReviewPage />
+              </RoleGuard>
+            } />
 
             {/* 未匹配路由 -> 重定向到首页 */}
             <Route path="*" element={<Navigate to="/" replace />} />

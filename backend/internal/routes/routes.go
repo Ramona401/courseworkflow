@@ -12,7 +12,7 @@ import (
 )
 
 // Setup 注册所有路由并返回根Handler
-// 版本：0.13.0（P4-2新增Scanner步骤+AI调用客户端）
+// 版本：0.18.0（P4.5-C新增pages/decision/finalize路由）
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -219,12 +219,16 @@ func Setup(cfg *config.Config) http.Handler {
 	}), authMW))
 
 	// /api/v1/pipelines/ 子路径分发
-	// GET    /api/v1/pipelines/{id}           — Pipeline详情
-	// DELETE /api/v1/pipelines/{id}           — 删除Pipeline（仅admin）
-	// POST   /api/v1/pipelines/{id}/start     — 启动Pipeline（admin/operator）
-	// POST   /api/v1/pipelines/{id}/cancel    — 取消Pipeline（仅admin）
-	// GET    /api/v1/pipelines/{id}/steps     — 步骤列表
-	// GET    /api/v1/pipelines/{id}/steps/{n} — 步骤详情
+	// GET    /api/v1/pipelines/{id}                         — Pipeline详情
+	// DELETE /api/v1/pipelines/{id}                         — 删除Pipeline（仅admin）
+	// POST   /api/v1/pipelines/{id}/start                   — 启动Pipeline（admin/operator）
+	// POST   /api/v1/pipelines/{id}/cancel                  — 取消Pipeline（仅admin）
+	// GET    /api/v1/pipelines/{id}/steps                   — 步骤列表
+	// GET    /api/v1/pipelines/{id}/steps/{n}               — 步骤详情
+	// GET    /api/v1/pipelines/{id}/eval-rounds             — 评估轮次详情（P4.5-B）
+	// GET    /api/v1/pipelines/{id}/pages                   — 生成页面列表（P4.5-C）
+	// PUT    /api/v1/pipelines/{id}/pages/{n}/decision      — 更新页面决策（P4.5-C）
+	// POST   /api/v1/pipelines/{id}/finalize                — 定稿归档（P4.5-C）
 	mux.Handle("/api/v1/pipelines/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
@@ -250,11 +254,37 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.CancelPipeline(w, r)
 
-		// GET /pipelines/{id}/steps/{name} — 步骤详情（必须在 /steps 之前匹配）
-				// GET /pipelines/{id}/eval-rounds — 评估轮次详情（P4.5-B新增）
-				case hasSuffix(path, "/eval-rounds"):
-					pipelineHandler.GetEvalRounds(w, r)
+		// POST /pipelines/{id}/finalize — 定稿归档（P4.5-C新增）
+		case hasSuffix(path, "/finalize"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可定稿Pipeline"})
+				return
+			}
+			pipelineHandler.FinalizePipeline(w, r)
 
+		// GET /pipelines/{id}/eval-rounds — 评估轮次详情（P4.5-B）
+		case hasSuffix(path, "/eval-rounds"):
+			pipelineHandler.GetEvalRounds(w, r)
+
+		// PUT /pipelines/{id}/pages/{n}/decision — 更新页面决策（P4.5-C新增）
+		case containsPagesDecision(path):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可审核页面"})
+				return
+			}
+			pipelineHandler.UpdatePageDecision(w, r)
+
+		// GET /pipelines/{id}/pages — 生成页面列表（P4.5-C新增）
+		case hasSuffix(path, "/pages"):
+			pipelineHandler.GetGeneratedPages(w, r)
+
+		// GET /pipelines/{id}/steps/{name} — 步骤详情（必须在 /steps 之前匹配）
 		case containsStepsWithName(path):
 			pipelineHandler.GetStepDetail(w, r)
 
@@ -307,6 +337,14 @@ func containsStepsWithName(path string) bool {
 	return len(remaining) > 0 && remaining != "/"
 }
 
+// containsPagesDecision 检查路径是否匹配 /pages/{n}/decision 模式
+// P4.5-C新增
+// 例如: /api/v1/pipelines/xxx/pages/3/decision → true
+// 例如: /api/v1/pipelines/xxx/pages → false
+func containsPagesDecision(path string) bool {
+	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/decision")
+}
+
 // indexOf 查找子串位置（简化版strings.Index）
 func indexOf(s string, sub string) int {
 	for i := 0; i <= len(s)-len(sub); i++ {
@@ -338,7 +376,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.17.0",
+		"version": "0.18.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

@@ -2,6 +2,8 @@
  * Pipeline管理API封装
  * P4-7: Pipeline列表 + 详情 + 步骤详情 + 操作（创建/启动/取消/删除）
  * P4.5-A增强: PipelineListItem增加eval_avg_score/meta_score/translator_score三个分数字段
+ * P4.5-B增强: 新增getEvalRounds API + EvalRoundDetail类型
+ * P4.5-C增强: 新增getGeneratedPages/updatePageDecision/finalizePipeline API
  */
 import client from './client'
 
@@ -264,6 +266,31 @@ export interface DbCheckStepData {
   error_detail: string
 }
 
+// ==================== P4.5-C 审核相关类型 ====================
+
+/** 生成页面完整数据（含HTML内容，用于审核预览） */
+export interface GeneratedPageFull {
+  id: string
+  pipeline_id: string
+  page_number: number
+  page_title: string
+  operation: string
+  original_html: string
+  generated_html: string
+  final_html: string
+  decision: string
+  lesson_id: number | null
+  merge_sources: string
+  created_at: string | null
+  updated_at: string | null
+}
+
+/** 更新页面决策请求 */
+export interface UpdatePageDecisionRequest {
+  decision: 'approve' | 'reject' | 'edit'
+  final_html?: string
+}
+
 // ==================== API方法 ====================
 
 /** 获取Pipeline列表 */
@@ -334,4 +361,25 @@ export async function getEvalRounds(pipelineId: string) {
   const res = await client.get('/pipelines/' + pipelineId + '/eval-rounds')
   const data = (res.data as any).data
   return data.rounds as EvalRoundDetail[]
+}
+
+// ==================== P4.5-C 审核相关API ====================
+
+/** 获取生成页面列表（含完整HTML） */
+export async function getGeneratedPages(pipelineId: string) {
+  const res = await client.get('/pipelines/' + pipelineId + '/pages')
+  const data = (res.data as any).data
+  return data.pages as GeneratedPageFull[]
+}
+
+/** 更新单页审核决策 */
+export async function updatePageDecision(pipelineId: string, pageNumber: number, req: UpdatePageDecisionRequest) {
+  const res = await client.put('/pipelines/' + pipelineId + '/pages/' + pageNumber + '/decision', req)
+  return (res.data as any).data
+}
+
+/** 定稿归档Pipeline */
+export async function finalizePipeline(pipelineId: string) {
+  const res = await client.post('/pipelines/' + pipelineId + '/finalize')
+  return (res.data as any).data
 }

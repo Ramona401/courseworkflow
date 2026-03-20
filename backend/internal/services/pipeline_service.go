@@ -40,13 +40,18 @@ var (
 	ErrEvalScannerNotDone       = errors.New("Scanner步骤未完成，无法执行Evaluator")
 	ErrEvalAllRoundsFailed      = errors.New("所有评估轮次均失败")
 	// P4-4新增：Meta步骤错误常量
-	ErrMetaPromptMissing        = errors.New("Prompt E未配置，请先在提示词管理中设置prompt_e")
-	ErrMetaDictMissing          = errors.New("解压缩字典未配置（Meta需要dict）")
-	ErrMetaEvalNotDone          = errors.New("Evaluator步骤未完成，无法执行Meta")
-	ErrMetaScannerNotDone       = errors.New("Scanner步骤未完成，无法执行Meta")
-	ErrMetaAllRetriesFailed     = errors.New("Meta所有重试均未达标")
-	ErrMetaAIFailed             = errors.New("Meta AI调用失败")
-	ErrMetaScoreExtractFailed   = errors.New("Meta未能从AI输出中提取META_SCORE评分")
+	ErrMetaPromptMissing      = errors.New("Prompt E未配置，请先在提示词管理中设置prompt_e")
+	ErrMetaDictMissing        = errors.New("解压缩字典未配置（Meta需要dict）")
+	ErrMetaEvalNotDone        = errors.New("Evaluator步骤未完成，无法执行Meta")
+	ErrMetaScannerNotDone     = errors.New("Scanner步骤未完成，无法执行Meta")
+	ErrMetaAllRetriesFailed   = errors.New("Meta所有重试均未达标")
+	ErrMetaAIFailed           = errors.New("Meta AI调用失败")
+	ErrMetaScoreExtractFailed = errors.New("Meta未能从AI输出中提取META_SCORE评分")
+	// P4.5-C新增：审核决策错误常量
+	ErrPipelineNotReviewable = errors.New("Pipeline不在审核状态，无法进行审核操作")
+	ErrPageNotFound          = errors.New("页面不存在")
+	ErrInvalidDecision       = errors.New("无效的决策值，必须是approve/reject/edit之一")
+	ErrFinalizeIncomplete    = errors.New("尚有未决策的页面，无法定稿")
 )
 
 // ==================== PipelineService ====================
@@ -400,22 +405,22 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 			return nil, fmt.Errorf("推进到Generator失败: %w", err)
 		}
 
-			// P4-6：autoMode时继续执行generator（Prompt F × 每页）
-			pipeline, err = repository.GetPipelineByID(id)
-			if err != nil {
-				return s.GetPipelineDetail(id)
-			}
+		// P4-6：autoMode时继续执行generator（Prompt F × 每页）
+		pipeline, err = repository.GetPipelineByID(id)
+		if err != nil {
+			return s.GetPipelineDetail(id)
+		}
 
-			genErr := s.executeGenerator(pipeline)
-			if genErr != nil {
-				_ = repository.UpdatePipelineError(id, models.StepGenerator, genErr.Error())
-				return s.GetPipelineDetail(id)
-			}
+		genErr := s.executeGenerator(pipeline)
+		if genErr != nil {
+			_ = repository.UpdatePipelineError(id, models.StepGenerator, genErr.Error())
+			return s.GetPipelineDetail(id)
+		}
 
-			// generator成功 → 推进到review（等待人工审核）
-			if err := repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue); err != nil {
-				return nil, fmt.Errorf("推进到Review失败: %w", err)
-			}
+		// generator成功 → 推进到review（等待人工审核）
+		if err := repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue); err != nil {
+			return nil, fmt.Errorf("推进到Review失败: %w", err)
+		}
 	}
 
 	return s.GetPipelineDetail(id)
@@ -831,8 +836,8 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 
 	// 解析Pipeline配置
 	pCfg := models.ParsePipelineConfig(pipeline.Config)
-	threshold := pCfg.Threshold     // 默认9.0
-	maxRetry := pCfg.MaxMetaRetry   // 默认3
+	threshold := pCfg.Threshold   // 默认9.0
+	maxRetry := pCfg.MaxMetaRetry // 默认3
 
 	// 1. 加载 Prompt E
 	promptE, err := repository.GetCurrentPromptByKey("prompt_e")
@@ -1069,16 +1074,17 @@ type metaScoreResult struct {
 
 // extractMetaScores 从AI Meta输出中提取<<<META_SCORE>>>块中的评分
 // 格式（与HTML parseMetaScore一致）：
-//   <<<META_SCORE>>>
-//   E1_R1:{} E1_R2:{} E1_R3:{}
-//   E2_R1:{} E2_R2:{} E2_R3:{}
-//   E3_R1:{} E3_R2:{} E3_R3:{}
-//   E4_R1:{} E4_R2:{} E4_R3:{}
-//   E1_FINAL:{} E2_FINAL:{} E3_FINAL:{} E4_FINAL:{}
-//   TOTAL_FINAL:{}
-//   HARD_CONSTRAINT:{PASS/FAIL}
-//   GRADE:{}
-//   <<<END_META_SCORE>>>
+//
+//	<<<META_SCORE>>>
+//	E1_R1:{} E1_R2:{} E1_R3:{}
+//	E2_R1:{} E2_R2:{} E2_R3:{}
+//	E3_R1:{} E3_R2:{} E3_R3:{}
+//	E4_R1:{} E4_R2:{} E4_R3:{}
+//	E1_FINAL:{} E2_FINAL:{} E3_FINAL:{} E4_FINAL:{}
+//	TOTAL_FINAL:{}
+//	HARD_CONSTRAINT:{PASS/FAIL}
+//	GRADE:{}
+//	<<<END_META_SCORE>>>
 func extractMetaScores(output string) *metaScoreResult {
 	result := &metaScoreResult{}
 
@@ -1150,8 +1156,8 @@ func extractMetaScores(output string) *metaScoreResult {
 	}
 	maxRound := 0
 	for _, m := range allRoundMatches {
-		dim, _ := strconv.Atoi(m[1])    // 1~4
-		rn, _ := strconv.Atoi(m[2])     // 轮次序号
+		dim, _ := strconv.Atoi(m[1]) // 1~4
+		rn, _ := strconv.Atoi(m[2])  // 轮次序号
 		score := safeParseFloat(m[3])
 		if dim >= 1 && dim <= 4 && rn >= 1 {
 			roundMap[dim][rn] = score
@@ -1171,6 +1177,103 @@ func extractMetaScores(output string) *metaScoreResult {
 
 	result.parseOk = true
 	return result
+}
+
+// ==================== P4.5-C 审核决策方法 ====================
+
+// GetGeneratedPages 获取Pipeline的生成页面列表（含完整HTML）
+// P4.5-C新增：审核页面需要完整HTML用于预览和对比
+func (s *PipelineService) GetGeneratedPages(pipelineID string) ([]*repository.GeneratedPageFullRow, error) {
+	// 验证Pipeline存在
+	_, err := repository.GetPipelineByID(pipelineID)
+	if err != nil {
+		return nil, ErrPipelineNotFound
+	}
+
+	pages, err := repository.GetGeneratedPagesWithHTML(pipelineID)
+	if err != nil {
+		return nil, fmt.Errorf("获取生成页面失败: %w", err)
+	}
+
+	if pages == nil {
+		pages = []*repository.GeneratedPageFullRow{}
+	}
+	return pages, nil
+}
+
+// UpdatePageDecision 更新单页审核决策
+// P4.5-C新增：支持approve（采用AI生成）/reject（保留原版）/edit（使用编辑后的HTML）
+func (s *PipelineService) UpdatePageDecision(pipelineID string, pageNumber int, decision string, finalHTML *string) error {
+	// 验证Pipeline存在且状态允许审核
+	pipeline, err := repository.GetPipelineByID(pipelineID)
+	if err != nil {
+		return ErrPipelineNotFound
+	}
+	// 允许在review_queue或needs_human状态下进行审核操作
+	if pipeline.Status != models.PipelineStatusReviewQueue && pipeline.Status != models.PipelineStatusNeedsHuman {
+		return ErrPipelineNotReviewable
+	}
+
+	// 验证决策值有效性
+	validDecisions := map[string]bool{"approve": true, "reject": true, "edit": true}
+	if !validDecisions[decision] {
+		return ErrInvalidDecision
+	}
+
+	// edit决策必须提供finalHTML
+	if decision == "edit" && (finalHTML == nil || *finalHTML == "") {
+		return fmt.Errorf("edit决策必须提供修改后的HTML内容")
+	}
+
+	// 执行数据库更新
+	if err := repository.UpdatePageDecision(pipelineID, pageNumber, decision, finalHTML); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// FinalizePipeline 定稿归档Pipeline
+// P4.5-C新增：检查所有页面都已决策后，将Pipeline标记为finalized
+func (s *PipelineService) FinalizePipeline(pipelineID string) error {
+	// 验证Pipeline存在且状态允许定稿
+	pipeline, err := repository.GetPipelineByID(pipelineID)
+	if err != nil {
+		return ErrPipelineNotFound
+	}
+	if pipeline.Status != models.PipelineStatusReviewQueue && pipeline.Status != models.PipelineStatusNeedsHuman {
+		return ErrPipelineNotReviewable
+	}
+
+	// 检查是否所有页面都已决策
+	total, decided, err := repository.GetPageDecisionStats(pipelineID)
+	if err != nil {
+		return fmt.Errorf("检查页面决策状态失败: %w", err)
+	}
+	if total == 0 {
+		return fmt.Errorf("该Pipeline没有生成页面，无法定稿")
+	}
+	if decided < total {
+		return fmt.Errorf("%w (总页面: %d, 已决策: %d, 未决策: %d)",
+			ErrFinalizeIncomplete, total, decided, total-decided)
+	}
+
+	// 标记review步骤完成
+	reviewStep, err := repository.GetStepByName(pipelineID, models.StepReview)
+	if err == nil && reviewStep.Status != models.StepStatusDone {
+		_ = repository.StartStep(pipelineID, models.StepReview)
+		// review步骤的step_data记录定稿统计
+		statsJSON := fmt.Sprintf(`{"total_pages":%d,"decided_pages":%d,"finalized_at":"%s"}`,
+			total, decided, time.Now().Format(time.RFC3339))
+		_ = repository.CompleteStep(pipelineID, models.StepReview, 0, statsJSON, "", 0)
+	}
+
+	// 更新Pipeline状态为finalized
+	if err := repository.CompletePipeline(pipelineID, models.PipelineStatusFinalized); err != nil {
+		return fmt.Errorf("定稿失败: %w", err)
+	}
+
+	return nil
 }
 
 // ==================== 公共工具方法 ====================

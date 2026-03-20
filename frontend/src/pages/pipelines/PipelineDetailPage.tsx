@@ -1,12 +1,13 @@
 /**
  * Pipeline详情页面
  * P4.5-B: 重构为主页面 + 6个独立步骤面板组件
+ * P4.5-C: 新增审核入口按钮（review_queue/needs_human状态时显示）
  * 7步进度可视化 + StepCard懒加载展开 + 各步骤调试面板
  */
 import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { getPipelineDetail, getStepDetail, type PipelineDetailResponse, type StepListItem } from '@/api/pipelines'
-import { ArrowLeft, RefreshCw } from 'lucide-react'
+import { ArrowLeft, RefreshCw, ClipboardCheck } from 'lucide-react'
 
 // 导入各步骤面板组件
 import DbCheckPanel from './steps/DbCheckPanel'
@@ -48,6 +49,11 @@ export default function PipelineDetailPage() {
     display: 'inline-flex', alignItems: 'center', gap: 6,
   }
 
+  /** 是否显示审核入口按钮 */
+  const showReviewBtn = detail && (
+    detail.status === 'review_queue' || detail.status === 'needs_human' || detail.status === 'finalized'
+  )
+
   // 加载中
   if (loading) {
     return <div style={{ textAlign: 'center', padding: 60, color: '#8e8e93' }}>加载中...</div>
@@ -87,6 +93,21 @@ export default function PipelineDetailPage() {
             )}
           </div>
         </div>
+        {/* P4.5-C: 审核入口按钮 */}
+        {showReviewBtn && (
+          <button
+            style={{
+              ...btn,
+              background: detail.status === 'finalized' ? '#34c759' : '#007aff',
+              color: '#fff',
+              border: 'none',
+            }}
+            onClick={() => navigate('/pipelines/' + id + '/review')}
+          >
+            <ClipboardCheck size={14} />
+            {detail.status === 'finalized' ? '查看审核结果' : '进入审核'}
+          </button>
+        )}
         <button style={btn} onClick={loadDetail}>
           <RefreshCw size={14} /> 刷新
         </button>

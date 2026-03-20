@@ -572,7 +572,7 @@ func CreateGeneratedPage(pipelineID string, pageNumber int, pageTitle string,
 	return nil
 }
 
-// GetGeneratedPagesByPipelineID 获取指定Pipeline的所有生成页面（按页码排序）
+// GetGeneratedPagesByPipelineID 获取指定Pipeline的所有生成页面（按页码排序，不含完整HTML，只含长度）
 func GetGeneratedPagesByPipelineID(pipelineID string) ([]*GeneratedPageRow, error) {
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
@@ -621,6 +621,99 @@ func GetGeneratedPagesByPipelineID(pipelineID string) ([]*GeneratedPageRow, erro
 	return pages, nil
 }
 
+// GetGeneratedPagesWithHTML 获取指定Pipeline的所有生成页面（含完整HTML内容）
+// P4.5-C新增：审核页面需要展示完整HTML预览和对比
+func GetGeneratedPagesWithHTML(pipelineID string) ([]*GeneratedPageFullRow, error) {
+	ctx := context.Background()
+	rows, err := database.DB.Query(ctx,
+		`SELECT id, pipeline_id, page_number, page_title, operation,
+			COALESCE(original_html, '') as original_html,
+			COALESCE(generated_html, '') as generated_html,
+			COALESCE(final_html, '') as final_html,
+			decision, lesson_id, merge_sources::text,
+			created_at, updated_at
+		 FROM generated_pages
+		 WHERE pipeline_id = $1
+		 ORDER BY page_number ASC`, pipelineID)
+	if err != nil {
+		return nil, fmt.Errorf("查询生成页面（含HTML）失败: %w", err)
+	}
+	defer rows.Close()
+
+	var pages []*GeneratedPageFullRow
+	for rows.Next() {
+		p := &GeneratedPageFullRow{}
+		var pageTitle, decision, mergeSources *string
+		var lessonID *int
+		err := rows.Scan(
+			&p.ID, &p.PipelineID, &p.PageNumber, &pageTitle, &p.Operation,
+			&p.OriginalHTML, &p.GeneratedHTML, &p.FinalHTML,
+			&decision, &lessonID, &mergeSources,
+			&p.CreatedAt, &p.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("扫描生成页面行（含HTML）失败: %w", err)
+		}
+		if pageTitle != nil {
+			p.PageTitle = *pageTitle
+		}
+		if decision != nil {
+			p.Decision = *decision
+		}
+		if lessonID != nil {
+			p.LessonID = lessonID
+		}
+		if mergeSources != nil {
+			p.MergeSources = *mergeSources
+		}
+		pages = append(pages, p)
+	}
+	return pages, nil
+}
+
+// UpdatePageDecision 更新单页审核决策
+// P4.5-C新增：支持approve/reject/edit决策，edit时同时更新final_html
+func UpdatePageDecision(pipelineID string, pageNumber int, decision string, finalHTML *string) error {
+	ctx := context.Background()
+
+	if finalHTML != nil {
+		// 带HTML更新（edit模式：审核员手动修改了HTML内容）
+		_, err := database.DB.Exec(ctx,
+			`UPDATE generated_pages
+			 SET decision = $3, final_html = $4, updated_at = NOW()
+			 WHERE pipeline_id = $1 AND page_number = $2`,
+			pipelineID, pageNumber, decision, *finalHTML)
+		if err != nil {
+			return fmt.Errorf("更新页面P%d决策（含HTML）失败: %w", pageNumber, err)
+		}
+	} else {
+		// 不带HTML更新（approve/reject模式）
+		_, err := database.DB.Exec(ctx,
+			`UPDATE generated_pages
+			 SET decision = $3, updated_at = NOW()
+			 WHERE pipeline_id = $1 AND page_number = $2`,
+			pipelineID, pageNumber, decision)
+		if err != nil {
+			return fmt.Errorf("更新页面P%d决策失败: %w", pageNumber, err)
+		}
+	}
+	return nil
+}
+
+// GetPageDecisionStats 获取Pipeline页面审核决策统计
+// P4.5-C新增：用于判断是否所有页面都已决策（支持定稿检查）
+func GetPageDecisionStats(pipelineID string) (total int, decided int, err error) {
+	ctx := context.Background()
+	err = database.DB.QueryRow(ctx,
+		`SELECT COUNT(*),
+			COUNT(*) FILTER (WHERE decision IN ('approve', 'reject', 'edit'))
+		 FROM generated_pages WHERE pipeline_id = $1`, pipelineID).Scan(&total, &decided)
+	if err != nil {
+		return 0, 0, fmt.Errorf("查询页面决策统计失败: %w", err)
+	}
+	return total, decided, nil
+}
+
 // DeleteGeneratedPagesByPipelineID 删除指定Pipeline的所有生成页面（重跑时清理）
 func DeleteGeneratedPagesByPipelineID(pipelineID string) error {
 	ctx := context.Background()
@@ -647,4 +740,22 @@ type GeneratedPageRow struct {
 	MergeSources string     `json:"merge_sources"`
 	CreatedAt    *time.Time `json:"created_at"`
 	UpdatedAt    *time.Time `json:"updated_at"`
+}
+
+// GeneratedPageFullRow 生成页面查询行（含完整HTML内容）
+// P4.5-C新增：审核页面需要完整HTML用于预览和对比
+type GeneratedPageFullRow struct {
+	ID            string     `json:"id"`
+	PipelineID    string     `json:"pipeline_id"`
+	PageNumber    int        `json:"page_number"`
+	PageTitle     string     `json:"page_title"`
+	Operation     string     `json:"operation"`
+	OriginalHTML  string     `json:"original_html"`
+	GeneratedHTML string     `json:"generated_html"`
+	FinalHTML     string     `json:"final_html"`
+	Decision      string     `json:"decision"`
+	LessonID      *int       `json:"lesson_id"`
+	MergeSources  string     `json:"merge_sources"`
+	CreatedAt     *time.Time `json:"created_at"`
+	UpdatedAt     *time.Time `json:"updated_at"`
 }
