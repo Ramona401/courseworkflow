@@ -24,6 +24,25 @@ func NewPipelineHandler(pipelineService *services.PipelineService) *PipelineHand
 	return &PipelineHandler{pipelineService: pipelineService}
 }
 
+// ==================== Dashboard 统计接口（P4.5-D新增）====================
+
+// GetDashboardStats GET /api/v1/dashboard/stats
+// 获取仪表盘统计数据（课程数/Pipeline各状态/达标数/AI消耗）
+func (h *PipelineHandler) GetDashboardStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		return
+	}
+
+	stats, err := h.pipelineService.GetDashboardStats()
+	if err != nil {
+		utils.InternalError(w, "获取统计数据失败: "+err.Error())
+		return
+	}
+
+	utils.Success(w, stats)
+}
+
 // ==================== Pipeline 接口 ====================
 
 // CreatePipeline POST /api/v1/pipelines
@@ -214,7 +233,6 @@ func (h *PipelineHandler) GetStepDetail(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// 从路径中提取pipeline_id和step_name
-	// 路径格式: /api/v1/pipelines/{id}/steps/{name}
 	pipelineID, stepName := extractPipelineIDAndStepName(r.URL.Path)
 	if pipelineID == "" || stepName == "" {
 		utils.BadRequest(w, "缺少Pipeline ID或步骤名称")
@@ -295,7 +313,6 @@ func (h *PipelineHandler) UpdatePageDecision(w http.ResponseWriter, r *http.Requ
 	}
 
 	// 从路径提取pipeline_id和pageNumber
-	// 路径格式: /api/v1/pipelines/{id}/pages/{pageNumber}/decision
 	pipelineID, pageNumber := extractPipelineIDAndPageNumber(r.URL.Path)
 	if pipelineID == "" || pageNumber <= 0 {
 		utils.BadRequest(w, "缺少Pipeline ID或页码")
@@ -304,8 +321,8 @@ func (h *PipelineHandler) UpdatePageDecision(w http.ResponseWriter, r *http.Requ
 
 	// 解析请求体
 	var req struct {
-		Decision  string  `json:"decision"`   // approve / reject / edit
-		FinalHTML *string `json:"final_html"`  // edit时提供修改后的HTML
+		Decision  string  `json:"decision"`  // approve / reject / edit
+		FinalHTML *string `json:"final_html"` // edit时提供修改后的HTML
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, "请求参数格式错误")
@@ -348,10 +365,35 @@ func (h *PipelineHandler) FinalizePipeline(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+// ==================== P4.5-D 快捷通过接口 ====================
+
+// MarkPassed POST /api/v1/pipelines/{id}/mark-passed
+// 快捷通过Pipeline（评估达标直接标记为finalized，跳过后续步骤）
+func (h *PipelineHandler) MarkPassed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+
+	id := extractPipelineIDWithSuffix(r.URL.Path, "/mark-passed")
+	if id == "" {
+		utils.BadRequest(w, "缺少Pipeline ID")
+		return
+	}
+
+	if err := h.pipelineService.MarkPassed(id); err != nil {
+		handlePipelineError(w, err)
+		return
+	}
+
+	utils.Success(w, map[string]interface{}{
+		"message": "Pipeline已快捷通过并归档",
+	})
+}
+
 // ==================== 路径解析辅助函数 ====================
 
 // extractPipelineID 从路径提取Pipeline ID
-// 路径格式: /api/v1/pipelines/{id}
 func extractPipelineID(path string) string {
 	path = strings.TrimSuffix(path, "/")
 	lastSlash := strings.LastIndex(path, "/")
@@ -366,59 +408,43 @@ func extractPipelineID(path string) string {
 }
 
 // extractPipelineIDWithSuffix 从带后缀的路径提取Pipeline ID
-// 路径格式: /api/v1/pipelines/{id}/start 或 /api/v1/pipelines/{id}/cancel
 func extractPipelineIDWithSuffix(path string, suffix string) string {
 	idx := strings.LastIndex(path, suffix)
 	if idx <= 0 {
 		return ""
 	}
-	// 去掉后缀部分，得到 /api/v1/pipelines/{id}
 	path = path[:idx]
 	return extractPipelineID(path)
 }
 
 // extractPipelineIDAndStepName 从路径提取Pipeline ID和步骤名称
-// 路径格式: /api/v1/pipelines/{id}/steps/{name}
 func extractPipelineIDAndStepName(path string) (string, string) {
-	// 查找 /steps/ 的位置
 	stepsIdx := strings.Index(path, "/steps/")
 	if stepsIdx < 0 {
 		return "", ""
 	}
-
-	// 步骤名称: /steps/ 之后的部分
 	stepName := strings.TrimSuffix(path[stepsIdx+len("/steps/"):], "/")
 	if stepName == "" {
 		return "", ""
 	}
-
-	// Pipeline ID: /steps/ 之前的路径的最后一段
 	beforeSteps := path[:stepsIdx]
 	pipelineID := extractPipelineID(beforeSteps)
-
 	return pipelineID, stepName
 }
 
 // extractPipelineIDAndPageNumber 从路径提取Pipeline ID和页码
 // P4.5-C新增
-// 路径格式: /api/v1/pipelines/{id}/pages/{pageNumber}/decision
 func extractPipelineIDAndPageNumber(path string) (string, int) {
-	// 查找 /pages/ 的位置
 	pagesIdx := strings.Index(path, "/pages/")
 	if pagesIdx < 0 {
 		return "", 0
 	}
-
-	// Pipeline ID: /pages/ 之前的路径的最后一段
 	beforePages := path[:pagesIdx]
 	pipelineID := extractPipelineID(beforePages)
 	if pipelineID == "" {
 		return "", 0
 	}
-
-	// 页码: /pages/ 之后到 /decision 之前的部分
 	afterPages := path[pagesIdx+len("/pages/"):]
-	// 去掉 /decision 后缀
 	decisionIdx := strings.Index(afterPages, "/decision")
 	if decisionIdx < 0 {
 		return pipelineID, 0
@@ -428,7 +454,6 @@ func extractPipelineIDAndPageNumber(path string) (string, int) {
 	if err != nil || pageNum <= 0 {
 		return pipelineID, 0
 	}
-
 	return pipelineID, pageNum
 }
 
@@ -456,8 +481,13 @@ func handlePipelineError(w http.ResponseWriter, err error) {
 		err == services.ErrPipelineNotCancellable,
 		err == services.ErrPipelineNotDeletable,
 		err == services.ErrPipelineNotReviewable,
-		err == services.ErrFinalizeIncomplete:
+		err == services.ErrFinalizeIncomplete,
+		err == services.ErrMarkPassedNotAllowed:
 		utils.Fail(w, http.StatusConflict, errMsg)
+
+	// P4.5-D: 快捷通过未达标 (422)
+	case err == services.ErrMarkPassedNotMet:
+		utils.Fail(w, http.StatusUnprocessableEntity, errMsg)
 
 	// dbCheck验证失败 -> 返回422
 	case err == services.ErrDbCheckIndexMissing,
@@ -476,6 +506,10 @@ func handlePipelineError(w http.ResponseWriter, err error) {
 	// 包含"没有生成页面"的文字
 	case strings.Contains(errMsg, "没有生成页面"):
 		utils.BadRequest(w, errMsg)
+
+	// 包含"评估未达标"的文字（MarkPassed带详情）
+	case strings.Contains(errMsg, "评估未达标"):
+		utils.Fail(w, http.StatusUnprocessableEntity, errMsg)
 
 	// 其他服务器错误 (500)
 	default:

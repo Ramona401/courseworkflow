@@ -12,7 +12,7 @@ import (
 )
 
 // Setup 注册所有路由并返回根Handler
-// 版本：0.18.0（P4.5-C新增pages/decision/finalize路由）
+// 版本：0.19.0（P4.5-D新增dashboard/stats+mark-passed路由）
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -45,6 +45,10 @@ func Setup(cfg *config.Config) http.Handler {
 	// ==================== 认证路由 ====================
 	mux.Handle("/api/v1/auth/me", middleware.Chain(http.HandlerFunc(authHandler.GetMe), authMW))
 	mux.Handle("/api/v1/auth/logout", middleware.Chain(http.HandlerFunc(authHandler.Logout), authMW))
+
+	// ==================== 仪表盘路由（P4.5-D新增） ====================
+	// GET /api/v1/dashboard/stats — 获取仪表盘统计数据（登录即可）
+	mux.Handle("/api/v1/dashboard/stats", middleware.Chain(http.HandlerFunc(pipelineHandler.GetDashboardStats), authMW))
 
 	// ==================== 用户管理路由（仅admin） ====================
 	mux.Handle("/api/v1/users", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -195,14 +199,11 @@ func Setup(cfg *config.Config) http.Handler {
 	}), authMW))
 
 	// ==================== Pipeline路由（P4-1新增） ====================
-	// POST /api/v1/pipelines — 创建Pipeline（admin/operator）
-	// GET  /api/v1/pipelines — Pipeline列表（登录即可）
 	mux.Handle("/api/v1/pipelines", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			pipelineHandler.ListPipelines(w, r)
 		case http.MethodPost:
-			// 创建Pipeline需要admin或operator角色
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
 				w.Header().Set("Content-Type", "application/json")
@@ -219,16 +220,6 @@ func Setup(cfg *config.Config) http.Handler {
 	}), authMW))
 
 	// /api/v1/pipelines/ 子路径分发
-	// GET    /api/v1/pipelines/{id}                         — Pipeline详情
-	// DELETE /api/v1/pipelines/{id}                         — 删除Pipeline（仅admin）
-	// POST   /api/v1/pipelines/{id}/start                   — 启动Pipeline（admin/operator）
-	// POST   /api/v1/pipelines/{id}/cancel                  — 取消Pipeline（仅admin）
-	// GET    /api/v1/pipelines/{id}/steps                   — 步骤列表
-	// GET    /api/v1/pipelines/{id}/steps/{n}               — 步骤详情
-	// GET    /api/v1/pipelines/{id}/eval-rounds             — 评估轮次详情（P4.5-B）
-	// GET    /api/v1/pipelines/{id}/pages                   — 生成页面列表（P4.5-C）
-	// PUT    /api/v1/pipelines/{id}/pages/{n}/decision      — 更新页面决策（P4.5-C）
-	// POST   /api/v1/pipelines/{id}/finalize                — 定稿归档（P4.5-C）
 	mux.Handle("/api/v1/pipelines/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
@@ -264,6 +255,17 @@ func Setup(cfg *config.Config) http.Handler {
 				return
 			}
 			pipelineHandler.FinalizePipeline(w, r)
+
+		// POST /pipelines/{id}/mark-passed — 快捷通过（P4.5-D新增）
+		case hasSuffix(path, "/mark-passed"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可快捷通过Pipeline"})
+				return
+			}
+			pipelineHandler.MarkPassed(w, r)
 
 		// GET /pipelines/{id}/eval-rounds — 评估轮次详情（P4.5-B）
 		case hasSuffix(path, "/eval-rounds"):
@@ -325,22 +327,17 @@ func hasSuffix(path string, suffix string) bool {
 }
 
 // containsStepsWithName 检查路径是否匹配 /steps/{name} 模式
-// 例如: /api/v1/pipelines/xxx/steps/dbCheck → true
-// 例如: /api/v1/pipelines/xxx/steps → false
 func containsStepsWithName(path string) bool {
 	idx := indexOf(path, "/steps/")
 	if idx < 0 {
 		return false
 	}
-	// /steps/ 后面必须有内容（步骤名称）
 	remaining := path[idx+len("/steps/"):]
 	return len(remaining) > 0 && remaining != "/"
 }
 
 // containsPagesDecision 检查路径是否匹配 /pages/{n}/decision 模式
 // P4.5-C新增
-// 例如: /api/v1/pipelines/xxx/pages/3/decision → true
-// 例如: /api/v1/pipelines/xxx/pages → false
 func containsPagesDecision(path string) bool {
 	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/decision")
 }
@@ -376,7 +373,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.18.0",
+		"version": "0.19.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

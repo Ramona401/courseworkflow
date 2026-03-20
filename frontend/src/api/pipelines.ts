@@ -4,6 +4,7 @@
  * P4.5-A增强: PipelineListItem增加eval_avg_score/meta_score/translator_score三个分数字段
  * P4.5-B增强: 新增getEvalRounds API + EvalRoundDetail类型
  * P4.5-C增强: 新增getGeneratedPages/updatePageDecision/finalizePipeline API
+ * P4.5-D增强: 新增markPassed API（快捷通过）
  */
 import client from './client'
 
@@ -381,5 +382,13 @@ export async function updatePageDecision(pipelineId: string, pageNumber: number,
 /** 定稿归档Pipeline */
 export async function finalizePipeline(pipelineId: string) {
   const res = await client.post('/pipelines/' + pipelineId + '/finalize')
+  return (res.data as any).data
+}
+
+// ==================== P4.5-D 快捷通过API ====================
+
+/** 快捷通过Pipeline（评估达标直接标记为finalized） */
+export async function markPassed(pipelineId: string) {
+  const res = await client.post('/pipelines/' + pipelineId + '/mark-passed')
   return (res.data as any).data
 }

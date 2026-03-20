@@ -2,6 +2,7 @@
  * Pipeline列表页面
  * P4.5-A增强: 从卡片列表改为数据表格视图
  * 新增：各阶段分数列（颜色标记）+ 状态筛选按钮行 + 达标数统计
+ * P4.5-D增强: 新增快捷通过按钮（评估达标Pipeline可直接标记为finalized）
  * Apple风格内联CSS
  */
 import { useState, useEffect, useCallback } from 'react'
@@ -9,11 +10,12 @@ import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import {
   getPipelines, createPipeline, startPipeline, cancelPipeline, deletePipeline,
+  markPassed,
   type PipelineListItem, type CreatePipelineRequest,
 } from '@/api/pipelines'
 import {
   Workflow, Play, Square, Trash2, RefreshCw, Plus,
-  CheckCircle, XCircle, Clock, AlertTriangle, Loader, Eye,
+  CheckCircle, XCircle, Clock, AlertTriangle, Loader, Eye, Zap,
 } from 'lucide-react'
 
 // ==================== Toast组件 ====================
@@ -72,22 +74,16 @@ function ProgressBar({ completed, total }: { completed: number; total: number })
   )
 }
 
-// ==================== 分数单元格组件（P4.5-A新增） ====================
-/** 根据分数值显示颜色标记：≥9.0绿色 / ≥7.0橙色 / <7.0红色 / 无数据灰色 */
+// ==================== 分数单元格组件 ====================
 function ScoreCell({ value }: { value: number | null }) {
   if (value === null || value === undefined) {
     return <span style={{ color: '#c7c7cc', fontSize: 12 }}>-</span>
   }
-  let color = '#ff3b30' // <7.0 红色
-  if (value >= 9.0) {
-    color = '#34c759' // ≥9.0 绿色
-  } else if (value >= 7.0) {
-    color = '#ff9500' // ≥7.0 橙色
-  }
+  let color = '#ff3b30'
+  if (value >= 9.0) color = '#34c759'
+  else if (value >= 7.0) color = '#ff9500'
   return (
-    <span style={{
-      color, fontSize: 13, fontWeight: 600, fontVariantNumeric: 'tabular-nums',
-    }}>
+    <span style={{ color, fontSize: 13, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>
       {value.toFixed(1)}
     </span>
   )
@@ -171,7 +167,6 @@ function CreateDialog({ onClose, onCreate }: { onClose: () => void; onCreate: (r
 
 // ==================== 格式化工具函数 ====================
 
-/** 格式化时间为相对或绝对显示 */
 function formatTime(t: string | null): string {
   if (!t) return '-'
   const d = new Date(t)
@@ -183,8 +178,7 @@ function formatTime(t: string | null): string {
   return d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
-// ==================== 筛选按钮定义（P4.5-A新增） ====================
-/** 筛选选项：value为空字符串表示"全部" */
+// ==================== 筛选按钮定义 ====================
 const FILTER_OPTIONS = [
   { label: '全部',   value: '' },
   { label: '运行中', value: 'running' },
@@ -194,6 +188,16 @@ const FILTER_OPTIONS = [
   { label: '待启动', value: 'pending' },
   { label: '已取消', value: 'cancelled' },
 ]
+
+// ==================== 判断是否可快捷通过 ====================
+/** P4.5-D: Pipeline可快捷通过的条件：
+ *  1. 状态为review_queue/needs_human/failed
+ *  2. meta_score ≥ 9.0（达标）
+ */
+function canMarkPassed(p: PipelineListItem): boolean {
+  const allowedStatuses = ['review_queue', 'needs_human', 'failed']
+  return allowedStatuses.includes(p.status) && p.meta_score !== null && p.meta_score >= 9.0
+}
 
 // ==================== 主页面组件 ====================
 
@@ -208,10 +212,8 @@ export default function PipelinesPage() {
   const [showCreate, setShowCreate] = useState(false)
   const [operating, setOperating] = useState<string | null>(null)
   const [toast, setToast] = useState<{ message: string; type: 'ok' | 'err' | 'info' } | null>(null)
-  // P4.5-A新增：状态筛选
   const [statusFilter, setStatusFilter] = useState('')
 
-  // 加载Pipeline列表
   const loadPipelines = useCallback(async () => {
     setLoading(true)
     try {
@@ -225,7 +227,6 @@ export default function PipelinesPage() {
 
   useEffect(() => { loadPipelines() }, [loadPipelines])
 
-  // 创建Pipeline
   const handleCreate = async (req: CreatePipelineRequest) => {
     try {
       await createPipeline(req)
@@ -237,7 +238,6 @@ export default function PipelinesPage() {
     }
   }
 
-  // 启动Pipeline
   const handleStart = async (p: PipelineListItem) => {
     if (!confirm('确认启动 ' + p.course_code + ' Pipeline？\n全链路AI调用约需10-30分钟。')) return
     setOperating(p.id)
@@ -253,7 +253,6 @@ export default function PipelinesPage() {
     setOperating(null)
   }
 
-  // 取消Pipeline
   const handleCancel = async (p: PipelineListItem) => {
     if (!confirm('确认取消 ' + p.course_code + ' Pipeline？')) return
     try {
@@ -265,7 +264,6 @@ export default function PipelinesPage() {
     }
   }
 
-  // 删除Pipeline
   const handleDelete = async (p: PipelineListItem) => {
     if (!confirm('确认删除 ' + p.course_code + ' Pipeline？\n此操作不可恢复。')) return
     try {
@@ -277,31 +275,37 @@ export default function PipelinesPage() {
     }
   }
 
-  // P4.5-A: 按状态筛选后的列表
+  // P4.5-D: 快捷通过
+  const handleMarkPassed = async (p: PipelineListItem) => {
+    if (!confirm('确认快捷通过 ' + p.course_code + ' Pipeline？\n将跳过审核流程直接标记为已定稿。')) return
+    try {
+      await markPassed(p.id)
+      setToast({ message: p.course_code + ' 已快捷通过并归档', type: 'ok' })
+      loadPipelines()
+    } catch (e: any) {
+      setToast({ message: '快捷通过失败: ' + (e.message || ''), type: 'err' })
+    }
+  }
+
   const filteredPipelines = statusFilter
     ? pipelines.filter(p => p.status === statusFilter)
     : pipelines
 
-  // 统计数据
   const total = pipelines.length
   const running = pipelines.filter(p => p.status === 'running').length
   const reviewQueue = pipelines.filter(p => p.status === 'review_queue').length
   const failed = pipelines.filter(p => p.status === 'failed').length
-  // P4.5-A新增：达标数（evaluator均分≥9.0的Pipeline数量）
   const passedCount = pipelines.filter(p => p.eval_avg_score !== null && p.eval_avg_score >= 9.0).length
 
-  // 通用样式
   const stat: React.CSSProperties = { background: 'rgba(255,255,255,0.72)', backdropFilter: 'blur(20px)', border: '1px solid rgba(0,0,0,0.06)', borderRadius: 14, padding: '16px 20px', flex: 1, minWidth: 100 }
   const btn: React.CSSProperties = { padding: '8px 16px', borderRadius: 10, border: '1px solid rgba(0,0,0,0.08)', background: '#fff', fontSize: 13, fontWeight: 500, cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6, transition: 'all 0.15s ease' }
   const btnP: React.CSSProperties = { ...btn, background: '#007aff', color: '#fff', border: '1px solid #007aff' }
-
-  // 表头样式
   const th: React.CSSProperties = { padding: '10px 12px', textAlign: 'left', fontSize: 11, fontWeight: 600, color: '#8e8e93', textTransform: 'uppercase', letterSpacing: '0.02em', borderBottom: '1px solid rgba(0,0,0,0.06)', whiteSpace: 'nowrap' }
   const td: React.CSSProperties = { padding: '12px 12px', fontSize: 13, color: '#1c1c1e', borderBottom: '1px solid rgba(0,0,0,0.04)', verticalAlign: 'middle' }
 
   return (
     <div>
-      {/* 统计卡片（P4.5-A：增加达标数） */}
+      {/* 统计卡片 */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 20, flexWrap: 'wrap' }}>
         <div style={stat}>
           <div style={{ fontSize: 11, color: '#8e8e93', fontWeight: 600, marginBottom: 4 }}>总Pipeline</div>
@@ -336,7 +340,7 @@ export default function PipelinesPage() {
         </div>
       </div>
 
-      {/* P4.5-A新增：筛选按钮行 */}
+      {/* 筛选按钮行 */}
       <div style={{ display: 'flex', gap: 6, marginBottom: 16, flexWrap: 'wrap' }}>
         {FILTER_OPTIONS.map(opt => (
           <button key={opt.value} onClick={() => setStatusFilter(opt.value)} style={{
@@ -347,7 +351,6 @@ export default function PipelinesPage() {
             transition: 'all 0.15s ease',
           }}>
             {opt.label}
-            {/* 筛选项显示对应数量 */}
             {opt.value && <span style={{ marginLeft: 4, opacity: 0.6 }}>
               {pipelines.filter(p => p.status === opt.value).length}
             </span>}
@@ -355,7 +358,7 @@ export default function PipelinesPage() {
         ))}
       </div>
 
-      {/* P4.5-A: Pipeline数据表格（替代原卡片列表） */}
+      {/* Pipeline数据表格 */}
       <div style={{
         background: 'rgba(255,255,255,0.72)', backdropFilter: 'blur(20px)',
         border: '1px solid rgba(0,0,0,0.06)', borderRadius: 16, overflow: 'hidden',
@@ -398,30 +401,20 @@ export default function PipelinesPage() {
                     onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(0,122,255,0.03)' }}
                     onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}
                   >
-                    {/* 课程编号 */}
                     <td style={{ ...td, fontWeight: 600, whiteSpace: 'nowrap' }}>{p.course_code}</td>
-                    {/* 课程名称 */}
                     <td style={{ ...td, color: '#8e8e93', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       {p.course_name || p.course_code}
                     </td>
-                    {/* 状态 */}
                     <td style={td}><StatusBadge status={p.status} statusName={p.status_name} /></td>
-                    {/* 当前步骤 */}
                     <td style={{ ...td, fontSize: 12, color: '#636366', whiteSpace: 'nowrap' }}>{p.current_step_name}</td>
-                    {/* 评估均分（P4.5-A新增） */}
                     <td style={{ ...td, textAlign: 'center' }}><ScoreCell value={p.eval_avg_score} /></td>
-                    {/* Meta分（P4.5-A新增） */}
                     <td style={{ ...td, textAlign: 'center' }}><ScoreCell value={p.meta_score} /></td>
-                    {/* 翻译分（P4.5-A新增） */}
                     <td style={{ ...td, textAlign: 'center' }}><ScoreCell value={p.translator_score} /></td>
-                    {/* 进度条 */}
                     <td style={{ ...td, minWidth: 100 }}><ProgressBar completed={p.steps_completed} total={p.steps_total} /></td>
-                    {/* 创建时间 */}
                     <td style={{ ...td, fontSize: 12, color: '#aeaeb2', whiteSpace: 'nowrap' }}>{formatTime(p.created_at)}</td>
-                    {/* 操作按钮 */}
                     <td style={{ ...td, textAlign: 'center' }} onClick={e => e.stopPropagation()}>
                       <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
-                        {/* 启动按钮：仅pending状态且有操作权限 */}
+                        {/* 启动按钮 */}
                         {p.status === 'pending' && canOperate && (
                           <button title="启动" onClick={() => handleStart(p)}
                             disabled={operating === p.id}
@@ -429,14 +422,21 @@ export default function PipelinesPage() {
                             {operating === p.id ? <Loader size={12} style={{ animation: 'spin 1s linear infinite' }} /> : <Play size={12} />}
                           </button>
                         )}
-                        {/* 取消按钮：pending或running状态，仅admin */}
+                        {/* P4.5-D: 快捷通过按钮（评估达标的Pipeline） */}
+                        {canMarkPassed(p) && canOperate && (
+                          <button title="快捷通过（评估达标）" onClick={() => handleMarkPassed(p)}
+                            style={{ width: 28, height: 28, borderRadius: 7, border: '1px solid rgba(52,199,89,0.3)', background: 'rgba(52,199,89,0.1)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#34c759', padding: 0 }}>
+                            <Zap size={12} />
+                          </button>
+                        )}
+                        {/* 取消按钮 */}
                         {(p.status === 'pending' || p.status === 'running') && isAdmin && (
                           <button title="取消" onClick={() => handleCancel(p)}
                             style={{ width: 28, height: 28, borderRadius: 7, border: '1px solid rgba(255,149,0,0.3)', background: 'rgba(255,149,0,0.1)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#ff9500', padding: 0 }}>
                             <Square size={12} />
                           </button>
                         )}
-                        {/* 删除按钮：非running状态，仅admin */}
+                        {/* 删除按钮 */}
                         {p.status !== 'running' && isAdmin && (
                           <button title="删除" onClick={() => handleDelete(p)}
                             style={{ width: 28, height: 28, borderRadius: 7, border: '1px solid rgba(255,59,48,0.2)', background: 'rgba(255,59,48,0.06)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#ff3b30', padding: 0 }}>
@@ -453,10 +453,7 @@ export default function PipelinesPage() {
         )}
       </div>
 
-      {/* 创建弹窗 */}
       {showCreate && <CreateDialog onClose={() => setShowCreate(false)} onCreate={handleCreate} />}
-
-      {/* Toast提示 */}
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )

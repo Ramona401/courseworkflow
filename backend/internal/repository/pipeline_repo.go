@@ -17,6 +17,77 @@ var (
 	ErrStepNotFound     = errors.New("Pipeline步骤不存在")
 )
 
+// ==================== Dashboard 统计（P4.5-D新增）====================
+
+// DashboardStats 仪表盘统计数据
+type DashboardStats struct {
+	// 课程统计
+	TotalCourses     int `json:"total_courses"`
+	CoursesWithIndex int `json:"courses_with_index"`
+	// Pipeline统计
+	TotalPipelines   int `json:"total_pipelines"`
+	RunningPipelines int `json:"running_pipelines"`
+	ReviewQueue      int `json:"review_queue"`
+	Finalized        int `json:"finalized"`
+	Failed           int `json:"failed"`
+	// 达标统计（evaluator均分≥9.0）
+	PassedCount int `json:"passed_count"`
+	// AI消耗统计
+	TotalTokensUsed int64 `json:"total_tokens_used"`
+}
+
+// GetDashboardStats 获取仪表盘统计数据
+// P4.5-D新增：一次查询获取所有统计数据，避免多次查询
+func GetDashboardStats() (*DashboardStats, error) {
+	ctx := context.Background()
+	stats := &DashboardStats{}
+
+	// 1. 课程统计
+	err := database.DB.QueryRow(ctx,
+		`SELECT COUNT(*),
+		        COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM course_indexes ci WHERE ci.course_id = c.id))
+		 FROM courses c`).Scan(&stats.TotalCourses, &stats.CoursesWithIndex)
+	if err != nil {
+		return nil, fmt.Errorf("查询课程统计失败: %w", err)
+	}
+
+	// 2. Pipeline各状态统计 + 达标数
+	err = database.DB.QueryRow(ctx,
+		`SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE status = 'running'),
+			COUNT(*) FILTER (WHERE status = 'review_queue'),
+			COUNT(*) FILTER (WHERE status = 'finalized'),
+			COUNT(*) FILTER (WHERE status = 'failed'),
+			COUNT(*) FILTER (WHERE EXISTS (
+				SELECT 1 FROM pipeline_steps ps
+				WHERE ps.pipeline_id = p.id AND ps.step_name = 'evaluator'
+					AND ps.status = 'done' AND ps.step_data IS NOT NULL
+					AND (ps.step_data->>'avg_total')::numeric >= 9.0
+			))
+		 FROM pipelines p`).Scan(
+		&stats.TotalPipelines,
+		&stats.RunningPipelines,
+		&stats.ReviewQueue,
+		&stats.Finalized,
+		&stats.Failed,
+		&stats.PassedCount,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("查询Pipeline统计失败: %w", err)
+	}
+
+	// 3. AI token消耗统计
+	err = database.DB.QueryRow(ctx,
+		`SELECT COALESCE(SUM(tokens_used), 0) FROM pipeline_steps WHERE tokens_used > 0`).Scan(&stats.TotalTokensUsed)
+	if err != nil {
+		// token统计非关键，失败不影响其他
+		stats.TotalTokensUsed = 0
+	}
+
+	return stats, nil
+}
+
 // ==================== Pipeline CRUD ====================
 
 // CreatePipeline 创建Pipeline主记录

@@ -52,6 +52,9 @@ var (
 	ErrPageNotFound          = errors.New("页面不存在")
 	ErrInvalidDecision       = errors.New("无效的决策值，必须是approve/reject/edit之一")
 	ErrFinalizeIncomplete    = errors.New("尚有未决策的页面，无法定稿")
+	// P4.5-D新增：快捷通过错误常量
+	ErrMarkPassedNotAllowed = errors.New("Pipeline不在可快捷通过的状态")
+	ErrMarkPassedNotMet     = errors.New("Pipeline评估未达标，无法快捷通过")
 )
 
 // ==================== PipelineService ====================
@@ -64,6 +67,13 @@ type PipelineService struct {
 // NewPipelineService 创建Pipeline服务实例
 func NewPipelineService(cfg *config.Config) *PipelineService {
 	return &PipelineService{cfg: cfg}
+}
+
+// ==================== Dashboard 统计（P4.5-D新增）====================
+
+// GetDashboardStats 获取仪表盘统计数据
+func (s *PipelineService) GetDashboardStats() (*repository.DashboardStats, error) {
+	return repository.GetDashboardStats()
 }
 
 // ==================== Pipeline CRUD 方法 ====================
@@ -260,6 +270,70 @@ func (s *PipelineService) DeletePipeline(id string) error {
 		return ErrPipelineNotDeletable
 	}
 	return repository.DeletePipeline(id)
+}
+
+// ==================== P4.5-D 快捷通过（MarkPassed）====================
+
+// MarkPassed 快捷通过Pipeline
+// P4.5-D新增：评估达标的Pipeline，跳过后续步骤直接标记为finalized
+// 适用条件：Pipeline状态为review_queue/needs_human，或evaluator/meta已完成且达标
+func (s *PipelineService) MarkPassed(pipelineID string) error {
+	// 1. 获取Pipeline
+	pipeline, err := repository.GetPipelineByID(pipelineID)
+	if err != nil {
+		return ErrPipelineNotFound
+	}
+
+	// 2. 检查状态是否允许快捷通过
+	// 允许的状态：review_queue / needs_human / running（但meta已完成）/ failed（但meta已完成）
+	allowedStatuses := map[string]bool{
+		models.PipelineStatusReviewQueue: true,
+		models.PipelineStatusNeedsHuman:  true,
+		models.PipelineStatusFailed:      true,
+	}
+	if !allowedStatuses[pipeline.Status] {
+		return ErrMarkPassedNotAllowed
+	}
+
+	// 3. 检查meta步骤是否完成且达标
+	metaStep, err := repository.GetStepByName(pipelineID, models.StepMeta)
+	if err != nil || metaStep.Status != models.StepStatusDone {
+		return ErrMarkPassedNotMet
+	}
+
+	// 从meta的step_data中提取total_final
+	var metaData map[string]interface{}
+	if metaStep.StepData != "" && metaStep.StepData != "null" {
+		if jsonErr := json.Unmarshal([]byte(metaStep.StepData), &metaData); jsonErr != nil {
+			return ErrMarkPassedNotMet
+		}
+	}
+	totalFinal, ok := metaData["total_final"].(float64)
+	if !ok || totalFinal <= 0 {
+		return ErrMarkPassedNotMet
+	}
+
+	// 获取Pipeline配置中的阈值
+	pCfg := models.ParsePipelineConfig(pipeline.Config)
+	if totalFinal < pCfg.Threshold {
+		return fmt.Errorf("%w (得分: %.1f, 阈值: %.1f)", ErrMarkPassedNotMet, totalFinal, pCfg.Threshold)
+	}
+
+	// 4. 标记review步骤完成（如果存在）
+	reviewStep, err := repository.GetStepByName(pipelineID, models.StepReview)
+	if err == nil && reviewStep.Status != models.StepStatusDone {
+		_ = repository.StartStep(pipelineID, models.StepReview)
+		statsJSON := fmt.Sprintf(`{"mark_passed":true,"meta_score":%.1f,"threshold":%.1f,"finalized_at":"%s"}`,
+			totalFinal, pCfg.Threshold, time.Now().Format(time.RFC3339))
+		_ = repository.CompleteStep(pipelineID, models.StepReview, 0, statsJSON, "", 0)
+	}
+
+	// 5. 更新Pipeline状态为finalized
+	if err := repository.CompletePipeline(pipelineID, models.PipelineStatusFinalized); err != nil {
+		return fmt.Errorf("快捷通过失败: %w", err)
+	}
+
+	return nil
 }
 
 // ==================== Pipeline 执行引擎 ====================
@@ -1073,18 +1147,6 @@ type metaScoreResult struct {
 }
 
 // extractMetaScores 从AI Meta输出中提取<<<META_SCORE>>>块中的评分
-// 格式（与HTML parseMetaScore一致）：
-//
-//	<<<META_SCORE>>>
-//	E1_R1:{} E1_R2:{} E1_R3:{}
-//	E2_R1:{} E2_R2:{} E2_R3:{}
-//	E3_R1:{} E3_R2:{} E3_R3:{}
-//	E4_R1:{} E4_R2:{} E4_R3:{}
-//	E1_FINAL:{} E2_FINAL:{} E3_FINAL:{} E4_FINAL:{}
-//	TOTAL_FINAL:{}
-//	HARD_CONSTRAINT:{PASS/FAIL}
-//	GRADE:{}
-//	<<<END_META_SCORE>>>
 func extractMetaScores(output string) *metaScoreResult {
 	result := &metaScoreResult{}
 
@@ -1146,7 +1208,7 @@ func extractMetaScores(output string) *metaScoreResult {
 		result.grade = gm[1]
 	}
 
-	// 提取各轮分数：E1_R1:{值} E1_R2:{值} ... （与HTML parseMetaScore的matchAll一致）
+	// 提取各轮分数：E1_R1:{值} E1_R2:{值} ...
 	roundRe := regexp.MustCompile(`(?i)E([1-4])_R(\d+):\s*([\d.]+)`)
 	allRoundMatches := roundRe.FindAllStringSubmatch(block, -1)
 
@@ -1279,12 +1341,10 @@ func (s *PipelineService) FinalizePipeline(pipelineID string) error {
 // ==================== 公共工具方法 ====================
 
 // extractScannerParsed 从scanner的step_data JSON中提取parsed字段
-// 返回课程定位JSON字符串（供evaluator和meta的用户消息使用）
 func extractScannerParsed(stepData string) string {
 	if stepData == "" || stepData == "null" {
 		return "（无课程定位数据）"
 	}
-	// step_data格式：{"raw_output":"...","parsed":{...},"is_valid":true,...}
 	var data map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(stepData), &data); err != nil {
 		return "（课程定位数据解析失败）"
@@ -1293,7 +1353,6 @@ func extractScannerParsed(stepData string) string {
 	if !ok || string(parsed) == "null" {
 		return "（无课程定位数据）"
 	}
-	// 格式化输出（美化JSON）
 	var obj interface{}
 	if err := json.Unmarshal(parsed, &obj); err != nil {
 		return string(parsed)
@@ -1370,7 +1429,6 @@ func extractEvalScores(output string) (float64, float64, float64, float64, float
 	}
 
 	if dimCount >= 3 {
-		// 至少提取到3个维度分，计算综合分
 		vals := []float64{scoreE1, scoreE2, scoreE3, scoreE4}
 		sum := 0.0
 		cnt := 0
