@@ -251,6 +251,10 @@ func Setup(cfg *config.Config) http.Handler {
 			pipelineHandler.CancelPipeline(w, r)
 
 		// GET /pipelines/{id}/steps/{name} — 步骤详情（必须在 /steps 之前匹配）
+				// GET /pipelines/{id}/eval-rounds — 评估轮次详情（P4.5-B新增）
+				case hasSuffix(path, "/eval-rounds"):
+					pipelineHandler.GetEvalRounds(w, r)
+
 		case containsStepsWithName(path):
 			pipelineHandler.GetStepDetail(w, r)
 
@@ -334,7 +338,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.16.0",
+		"version": "0.17.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }
