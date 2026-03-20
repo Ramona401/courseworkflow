@@ -1338,3 +1338,70 @@ func getSubmatch(m []string) string {
 	}
 	return ""
 }
+
+// ==================== Eval Rounds 查询（P4.5-B新增）====================
+
+// EvalRoundDetail 评估轮次详情（返回给前端）
+type EvalRoundDetail struct {
+	ID             string   `json:"id"`
+	RoundNumber    int      `json:"round_number"`
+	Status         string   `json:"status"`
+	Output         string   `json:"output"`
+	ScoreTotal     *float64 `json:"score_total"`
+	ScoreE1        *float64 `json:"score_e1"`
+	ScoreE2        *float64 `json:"score_e2"`
+	ScoreE3        *float64 `json:"score_e3"`
+	ScoreE4        *float64 `json:"score_e4"`
+	HardConstraint string   `json:"hard_constraint"`
+	Grade          string   `json:"grade"`
+	ModelUsed      string   `json:"model_used"`
+	TokensUsed     int      `json:"tokens_used"`
+}
+
+// GetEvalRounds 获取Pipeline的评估轮次详情列表
+func (s *PipelineService) GetEvalRounds(pipelineID string) ([]*EvalRoundDetail, error) {
+	_, err := repository.GetPipelineByID(pipelineID)
+	if err != nil {
+		return nil, ErrPipelineNotFound
+	}
+
+	rounds, err := repository.GetEvalRoundsByPipelineID(pipelineID)
+	if err != nil {
+		return nil, fmt.Errorf("获取评估轮次失败: %w", err)
+	}
+
+	var details []*EvalRoundDetail
+	for _, r := range rounds {
+		detail := &EvalRoundDetail{
+			ID:          r.ID,
+			RoundNumber: r.RoundNumber,
+			Status:      r.Status,
+			Output:      r.Output,
+			ScoreTotal:  r.ScoreTotal,
+			ScoreE1:     r.ScoreE1,
+			ScoreE2:     r.ScoreE2,
+			ScoreE3:     r.ScoreE3,
+			ScoreE4:     r.ScoreE4,
+			ModelUsed:   r.ModelUsed,
+			TokensUsed:  r.TokensUsed,
+		}
+		// 从dimensions JSON提取hard_constraint和grade
+		if r.Dimensions != "" && r.Dimensions != "null" {
+			var dims map[string]interface{}
+			if jsonErr := json.Unmarshal([]byte(r.Dimensions), &dims); jsonErr == nil {
+				if hc, ok := dims["hard_constraint"].(string); ok {
+					detail.HardConstraint = hc
+				}
+				if g, ok := dims["grade"].(string); ok {
+					detail.Grade = g
+				}
+			}
+		}
+		details = append(details, detail)
+	}
+
+	if details == nil {
+		details = []*EvalRoundDetail{}
+	}
+	return details, nil
+}

@@ -315,3 +315,30 @@ func handlePipelineError(w http.ResponseWriter, err error) {
 		utils.InternalError(w, errMsg)
 	}
 }
+
+// GetEvalRounds GET /api/v1/pipelines/{id}/eval-rounds
+// 获取Pipeline的评估轮次详情列表（含每轮AI原始输出）
+func (h *PipelineHandler) GetEvalRounds(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		return
+	}
+
+	id := extractPipelineIDWithSuffix(r.URL.Path, "/eval-rounds")
+	if id == "" {
+		utils.BadRequest(w, "缺少Pipeline ID")
+		return
+	}
+
+	rounds, err := h.pipelineService.GetEvalRounds(id)
+	if err != nil {
+		handlePipelineError(w, err)
+		return
+	}
+
+	utils.Success(w, map[string]interface{}{
+		"pipeline_id": id,
+		"rounds":      rounds,
+		"total":       len(rounds),
+	})
+}

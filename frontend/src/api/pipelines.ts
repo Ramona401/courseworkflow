@@ -309,3 +309,29 @@ export async function getStepDetail(pipelineId: string, stepName: string) {
   const res = await client.get('/pipelines/' + pipelineId + '/steps/' + stepName)
   return (res.data as any).data as StepDetailResponse
 }
+
+// ==================== Eval Rounds API（P4.5-B新增）====================
+
+/** 评估轮次详情 */
+export interface EvalRoundDetail {
+  id: string
+  round_number: number
+  status: string
+  output: string
+  score_total: number | null
+  score_e1: number | null
+  score_e2: number | null
+  score_e3: number | null
+  score_e4: number | null
+  hard_constraint: string
+  grade: string
+  model_used: string
+  tokens_used: number
+}
+
+/** 获取评估轮次详情列表 */
+export async function getEvalRounds(pipelineId: string) {
+  const res = await client.get('/pipelines/' + pipelineId + '/eval-rounds')
+  const data = (res.data as any).data
+  return data.rounds as EvalRoundDetail[]
+}
