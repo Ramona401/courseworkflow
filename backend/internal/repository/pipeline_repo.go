@@ -542,3 +542,108 @@ func DeleteEvalRoundsByPipelineID(pipelineID string) error {
 	}
 	return nil
 }
+
+
+// ==================== Generated Pages CRUD（P4-6新增）====================
+
+// CreateGeneratedPage 创建生成页面记录
+func CreateGeneratedPage(pipelineID string, pageNumber int, pageTitle string,
+	operation string, originalHTML string, generatedHTML string, finalHTML string,
+	lessonID *int, mergeSources string) error {
+	ctx := context.Background()
+
+	var mergeParam interface{}
+	if mergeSources != "" && mergeSources != "null" {
+		mergeParam = mergeSources
+	}
+
+	_, err := database.DB.Exec(ctx,
+		`INSERT INTO generated_pages (pipeline_id, page_number, page_title,
+			operation, original_html, generated_html, final_html,
+			decision, lesson_id, merge_sources)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9::jsonb)`,
+		pipelineID, pageNumber, pageTitle,
+		operation, originalHTML, generatedHTML, finalHTML,
+		lessonID, mergeParam)
+	if err != nil {
+		return fmt.Errorf("创建生成页面P%d失败: %w", pageNumber, err)
+	}
+	return nil
+}
+
+// GetGeneratedPagesByPipelineID 获取指定Pipeline的所有生成页面（按页码排序）
+func GetGeneratedPagesByPipelineID(pipelineID string) ([]*GeneratedPageRow, error) {
+	ctx := context.Background()
+	rows, err := database.DB.Query(ctx,
+		`SELECT id, pipeline_id, page_number, page_title, operation,
+			LENGTH(COALESCE(original_html,'')) as orig_len,
+			LENGTH(COALESCE(generated_html,'')) as gen_len,
+			LENGTH(COALESCE(final_html,'')) as final_len,
+			decision, lesson_id, merge_sources::text,
+			created_at, updated_at
+		 FROM generated_pages
+		 WHERE pipeline_id = $1
+		 ORDER BY page_number ASC`, pipelineID)
+	if err != nil {
+		return nil, fmt.Errorf("查询生成页面失败: %w", err)
+	}
+	defer rows.Close()
+
+	var pages []*GeneratedPageRow
+	for rows.Next() {
+		p := &GeneratedPageRow{}
+		var pageTitle, decision, mergeSources *string
+		var lessonID *int
+		err := rows.Scan(
+			&p.ID, &p.PipelineID, &p.PageNumber, &pageTitle, &p.Operation,
+			&p.OrigLen, &p.GenLen, &p.FinalLen,
+			&decision, &lessonID, &mergeSources,
+			&p.CreatedAt, &p.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("扫描生成页面行失败: %w", err)
+		}
+		if pageTitle != nil {
+			p.PageTitle = *pageTitle
+		}
+		if decision != nil {
+			p.Decision = *decision
+		}
+		if lessonID != nil {
+			p.LessonID = lessonID
+		}
+		if mergeSources != nil {
+			p.MergeSources = *mergeSources
+		}
+		pages = append(pages, p)
+	}
+	return pages, nil
+}
+
+// DeleteGeneratedPagesByPipelineID 删除指定Pipeline的所有生成页面（重跑时清理）
+func DeleteGeneratedPagesByPipelineID(pipelineID string) error {
+	ctx := context.Background()
+	_, err := database.DB.Exec(ctx,
+		`DELETE FROM generated_pages WHERE pipeline_id = $1`, pipelineID)
+	if err != nil {
+		return fmt.Errorf("删除生成页面失败: %w", err)
+	}
+	return nil
+}
+
+// GeneratedPageRow 生成页面查询行（不含完整HTML，只含长度）
+type GeneratedPageRow struct {
+	ID           string     `json:"id"`
+	PipelineID   string     `json:"pipeline_id"`
+	PageNumber   int        `json:"page_number"`
+	PageTitle    string     `json:"page_title"`
+	Operation    string     `json:"operation"`
+	OrigLen      int        `json:"orig_len"`
+	GenLen       int        `json:"gen_len"`
+	FinalLen     int        `json:"final_len"`
+	Decision     string     `json:"decision"`
+	LessonID     *int       `json:"lesson_id"`
+	MergeSources string     `json:"merge_sources"`
+	CreatedAt    *time.Time `json:"created_at"`
+	UpdatedAt    *time.Time `json:"updated_at"`
+}

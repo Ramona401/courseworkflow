@@ -280,6 +280,82 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 		return nil, fmt.Errorf("更新Pipeline状态失败: %w", err)
 	}
 
+	// P4-6修复：检测已完成的步骤，从第一个未完成的步骤开始执行
+	// 这样重跑Pipeline时不会重复执行已done的步骤
+	steps, stepsErr := repository.GetStepsByPipelineID(id)
+	if stepsErr == nil {
+		// 找到第一个非done的步骤
+		var resumeStep string
+		for _, st := range steps {
+			if st.Status != models.StepStatusDone {
+				resumeStep = st.StepName
+				break
+			}
+		}
+		if resumeStep != "" && resumeStep != models.StepDbCheck {
+			// 有已完成的步骤，从未完成的步骤恢复
+			if err := repository.UpdatePipelineStatus(id, resumeStep, models.PipelineStatusRunning); err != nil {
+				return nil, fmt.Errorf("恢复Pipeline到%s失败: %w", resumeStep, err)
+			}
+			pipeline, _ = repository.GetPipelineByID(id)
+
+			switch resumeStep {
+			case models.StepGenerator:
+				genErr := s.executeGenerator(pipeline)
+				if genErr != nil {
+					_ = repository.UpdatePipelineError(id, models.StepGenerator, genErr.Error())
+					return s.GetPipelineDetail(id)
+				}
+				_ = repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue)
+				return s.GetPipelineDetail(id)
+
+			case models.StepReview:
+				// review是人工步骤，标记为等待审核
+				_ = repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue)
+				return s.GetPipelineDetail(id)
+			}
+			// 其他步骤（scanner/evaluator/meta/translator）走正常全链路
+		}
+	}
+
+	// P4-6修复：检测已完成的步骤，从第一个未完成的步骤开始执行
+	// 这样重跑Pipeline时不会重复执行已done的步骤
+	steps, stepsErr := repository.GetStepsByPipelineID(id)
+	if stepsErr == nil {
+		// 找到第一个非done的步骤
+		var resumeStep string
+		for _, st := range steps {
+			if st.Status != models.StepStatusDone {
+				resumeStep = st.StepName
+				break
+			}
+		}
+		if resumeStep != "" && resumeStep != models.StepDbCheck {
+			// 有已完成的步骤，从未完成的步骤恢复
+			if err := repository.UpdatePipelineStatus(id, resumeStep, models.PipelineStatusRunning); err != nil {
+				return nil, fmt.Errorf("恢复Pipeline到%s失败: %w", resumeStep, err)
+			}
+			pipeline, _ = repository.GetPipelineByID(id)
+
+			switch resumeStep {
+			case models.StepGenerator:
+				genErr := s.executeGenerator(pipeline)
+				if genErr != nil {
+					_ = repository.UpdatePipelineError(id, models.StepGenerator, genErr.Error())
+					return s.GetPipelineDetail(id)
+				}
+				_ = repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue)
+				return s.GetPipelineDetail(id)
+
+			case models.StepReview:
+				// review是人工步骤，标记为等待审核
+				_ = repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue)
+				return s.GetPipelineDetail(id)
+			}
+			// 其他步骤（scanner/evaluator/meta/translator）走正常全链路
+		}
+	}
+
 	// 执行dbCheck
 	dbCheckErr := s.executeDbCheck(pipeline)
 	if dbCheckErr != nil {
@@ -361,6 +437,23 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 		if err := repository.UpdatePipelineStatus(id, models.StepGenerator, models.PipelineStatusRunning); err != nil {
 			return nil, fmt.Errorf("推进到Generator失败: %w", err)
 		}
+
+			// P4-6：autoMode时继续执行generator（Prompt F × 每页）
+			pipeline, err = repository.GetPipelineByID(id)
+			if err != nil {
+				return s.GetPipelineDetail(id)
+			}
+
+			genErr := s.executeGenerator(pipeline)
+			if genErr != nil {
+				_ = repository.UpdatePipelineError(id, models.StepGenerator, genErr.Error())
+				return s.GetPipelineDetail(id)
+			}
+
+			// generator成功 → 推进到review（等待人工审核）
+			if err := repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue); err != nil {
+				return nil, fmt.Errorf("推进到Review失败: %w", err)
+			}
 	}
 
 	return s.GetPipelineDetail(id)

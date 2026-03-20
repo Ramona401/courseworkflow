@@ -495,3 +495,73 @@ func (r *TranslatorResult) ToJSON() string {
 	}
 	return string(data)
 }
+
+
+// ==================== Generator 步骤数据结构（P4-6新增）====================
+
+// GeneratorPageRecord Generator单页生成记录
+// 记录每个页面的操作类型、原始HTML、生成HTML等信息
+type GeneratorPageRecord struct {
+	PageNumber   int      `json:"page_number"`             // 页码（从1开始）
+	PageTitle    string   `json:"page_title"`              // 页面标题
+	Operation    string   `json:"operation"`               // 操作类型：keep/modify/create/merge/delete
+	LessonID     int      `json:"lesson_id,omitempty"`     // 原始课时ID（OSS中的lesson_id）
+	HasOrigHTML  bool     `json:"has_orig_html"`           // 是否有原始HTML
+	OrigHTMLLen  int      `json:"orig_html_len"`           // 原始HTML字符数
+	GenHTMLLen   int      `json:"gen_html_len"`            // 生成HTML字符数
+	MergeSources []int    `json:"merge_sources,omitempty"` // 合并源页码列表（merge操作）
+	TokensUsed   int      `json:"tokens_used"`             // 本页AI消耗Token数
+	LatencyMs    int64    `json:"latency_ms"`              // 本页AI调用耗时（毫秒）
+	Status       string   `json:"status"`                  // 状态：done/failed/skipped
+	Error        string   `json:"error,omitempty"`         // 错误信息
+}
+
+// GeneratorResult Generator步骤的汇总数据（存入pipeline_steps.step_data JSONB字段）
+// 汇总所有页面的生成结果
+type GeneratorResult struct {
+	// 页面统计
+	TotalPages    int `json:"total_pages"`    // 总页面数
+	KeptPages     int `json:"kept_pages"`     // 保留（keep）页面数
+	ModifiedPages int `json:"modified_pages"` // 修改（modify）页面数
+	CreatedPages  int `json:"created_pages"`  // 新建（create）页面数
+	MergedPages   int `json:"merged_pages"`   // 合并（merge）页面数
+	DeletedPages  int `json:"deleted_pages"`  // 删除（delete）页面数
+	FailedPages   int `json:"failed_pages"`   // 失败页面数
+
+	// 各页记录
+	Pages []*GeneratorPageRecord `json:"pages"` // 各页记录
+
+	// 执行信息
+	TotalTokens    int    `json:"total_tokens"`     // 累计Token消耗
+	TotalLatencyMs int64  `json:"total_latency_ms"` // 累计耗时（毫秒）
+	ModelUsed      string `json:"model_used"`       // 使用的模型（取最后一次）
+}
+
+// ToJSON 将GeneratorResult序列化为JSON字符串
+func (r *GeneratorResult) ToJSON() string {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+// ==================== Generator 页面操作常量（P4-6新增）====================
+
+// 页面操作类型常量
+const (
+	PageOpKeep   = "keep"   // 保留原样
+	PageOpModify = "modify" // 在原始HTML上修改
+	PageOpCreate = "create" // 新建页面
+	PageOpMerge  = "merge"  // 合并多页为一页
+	PageOpDelete = "delete" // 删除页面
+)
+
+// PageOperation 解析后的单页操作指令
+type PageOperation struct {
+	PageNumber   int    `json:"page_number"`             // 页码
+	Operation    string `json:"operation"`               // 操作类型
+	Title        string `json:"title"`                   // 页面标题
+	Description  string `json:"description"`             // 操作描述（Translator指令原文）
+	MergeSources []int  `json:"merge_sources,omitempty"` // 合并源页码（merge操作时有值）
+}

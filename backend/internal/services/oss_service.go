@@ -303,3 +303,66 @@ func (s *OSSService) GetCatalogWithStatus() (*models.OSSCatalogResponse, error) 
 		GeneratedAt: catalog.GeneratedAt,
 	}, nil
 }
+
+
+// ==================== Generator所需的OSS读取（P4-6新增）====================
+
+// FetchModuleDetail 从OSS拉取模块详情（含lessons列表，用于建立页码→lesson_id映射）
+// 对应 OSS路径：edupkuailab/modules/{module_id}.json
+func (s *OSSService) FetchModuleDetail(moduleID int) (*models.OSSModuleDetail, error) {
+	cfg, err := s.getOSSConfig()
+	if err != nil {
+		return nil, err
+	}
+	objectKey := fmt.Sprintf("%smodules/%d.json", cfg.IndexPrefix, moduleID)
+	data, err := s.signAndGet(cfg, objectKey)
+	if err != nil {
+		return nil, fmt.Errorf("拉取模块详情失败(module=%d): %w", moduleID, err)
+	}
+	var detail models.OSSModuleDetail
+	if err := json.Unmarshal(data, &detail); err != nil {
+		return nil, fmt.Errorf("解析模块详情失败(module=%d): %w", moduleID, err)
+	}
+	return &detail, nil
+}
+
+// FetchLessonHTML 从OSS读取单个课时的HTML内容
+// 对应 OSS路径：edupkuailab/lessons/{lesson_id}.html
+func (s *OSSService) FetchLessonHTML(lessonID int) (string, error) {
+	cfg, err := s.getOSSConfig()
+	if err != nil {
+		return "", err
+	}
+	objectKey := fmt.Sprintf("%s%d.html", cfg.HTMLPrefix, lessonID)
+	data, err := s.signAndGet(cfg, objectKey)
+	if err != nil {
+		return "", fmt.Errorf("读取课件HTML失败(lesson=%d): %w", lessonID, err)
+	}
+	return string(data), nil
+}
+
+// BuildPageLessonMap 建立页码→lesson_id的映射（按order排序）
+// 返回：map[页码(从1开始)]lesson_id
+func (s *OSSService) BuildPageLessonMap(moduleID int) (map[int]int, error) {
+	detail, err := s.FetchModuleDetail(moduleID)
+	if err != nil {
+		return nil, err
+	}
+	if len(detail.Lessons) == 0 {
+		return nil, fmt.Errorf("模块%d无课时数据", moduleID)
+	}
+
+	// 按order排序
+	lessons := make([]*models.OSSLesson, len(detail.Lessons))
+	copy(lessons, detail.Lessons)
+	sort.Slice(lessons, func(i, j int) bool {
+		return lessons[i].Order < lessons[j].Order
+	})
+
+	// 页码从1开始
+	pageMap := make(map[int]int)
+	for i, lesson := range lessons {
+		pageMap[i+1] = lesson.ID
+	}
+	return pageMap, nil
+}
