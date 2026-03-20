@@ -282,11 +282,11 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 
 	// P4-6修复：检测已完成的步骤，从第一个未完成的步骤开始执行
 	// 这样重跑Pipeline时不会重复执行已done的步骤
-	steps, stepsErr := repository.GetStepsByPipelineID(id)
+	existingSteps, stepsErr := repository.GetStepsByPipelineID(id)
 	if stepsErr == nil {
 		// 找到第一个非done的步骤
 		var resumeStep string
-		for _, st := range steps {
+		for _, st := range existingSteps {
 			if st.Status != models.StepStatusDone {
 				resumeStep = st.StepName
 				break
@@ -320,11 +320,11 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 
 	// P4-6修复：检测已完成的步骤，从第一个未完成的步骤开始执行
 	// 这样重跑Pipeline时不会重复执行已done的步骤
-	steps, stepsErr := repository.GetStepsByPipelineID(id)
+	existingSteps, stepsErr := repository.GetStepsByPipelineID(id)
 	if stepsErr == nil {
 		// 找到第一个非done的步骤
 		var resumeStep string
-		for _, st := range steps {
+		for _, st := range existingSteps {
 			if st.Status != models.StepStatusDone {
 				resumeStep = st.StepName
 				break
