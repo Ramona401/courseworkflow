@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +38,13 @@ type TestConnectionResult struct {
 	LatencyMs  int64  `json:"latency_ms"`   // 延迟（毫秒）
 	Model      string `json:"model"`        // 测试使用的模型
 	APIBaseURL string `json:"api_base_url"` // 测试使用的API地址
+}
+
+// ==================== 可用模型信息 ====================
+
+// ModelInfo 单个可用模型信息
+type ModelInfo struct {
+	ID string `json:"id"` // 模型ID（如 anthropic/claude-haiku-4.5）
 }
 
 // ==================== AIConfigService ====================
@@ -264,8 +272,8 @@ func (s *AIConfigService) TestConnection() (*TestConnectionResult, error) {
 		"messages": []map[string]string{
 			{"role": "user", "content": "Hi"},
 		},
-		"max_tokens": 10,         // 限制响应长度，节省Token
-		"temperature": 0.0,       // 确定性输出
+		"max_tokens":  10,  // 限制响应长度，节省Token
+		"temperature": 0.0, // 确定性输出
 	}
 
 	jsonBody, err := json.Marshal(requestBody)
@@ -417,6 +425,80 @@ func (s *AIConfigService) extractAPIErrorMessage(body []byte) string {
 		return raw
 	}
 	return ""
+}
+
+// ==================== 可用模型查询方法 ====================
+
+// ListModels 查询当前 Key 下可用的模型列表
+// 调用上游 {api_base_url}/models 接口（OpenAI兼容），返回模型ID列表（按字母排序）
+func (s *AIConfigService) ListModels() ([]ModelInfo, error) {
+	// 1. 获取API Base URL
+	baseURLConfig, err := repository.GetConfigByKey(models.ConfigKeyAPIBaseURL)
+	if err != nil || strings.TrimSpace(baseURLConfig.ConfigValue) == "" {
+		return nil, errors.New("API基础地址未配置")
+	}
+	apiBaseURL := strings.TrimRight(strings.TrimSpace(baseURLConfig.ConfigValue), "/")
+
+	// 2. 获取解密后的API Key
+	apiKey, err := s.GetDecryptedAPIKey()
+	if err != nil {
+		return nil, ErrAPIKeyNotSet
+	}
+
+	// 3. 调用 GET {base_url}/models 接口（OpenAI兼容标准端点）
+	endpoint := apiBaseURL + "/models"
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	// 15秒超时，模型列表查询通常很快
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("网络请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 4. 读取响应体
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	// 5. 处理非200状态码
+	if resp.StatusCode != http.StatusOK {
+		errMsg := s.extractAPIErrorMessage(body)
+		if errMsg != "" {
+			return nil, fmt.Errorf("API返回错误(HTTP %d): %s", resp.StatusCode, errMsg)
+		}
+		return nil, fmt.Errorf("API返回错误(HTTP %d)，该Key可能无权查询模型列表", resp.StatusCode)
+	}
+
+	// 6. 解析 OpenAI 兼容格式：{"object":"list","data":[{"id":"..."},...]}
+	var listResp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &listResp); err != nil {
+		return nil, fmt.Errorf("解析模型列表响应失败: %w", err)
+	}
+
+	// 7. 提取模型ID并按字母排序，过滤空ID
+	result := make([]ModelInfo, 0, len(listResp.Data))
+	for _, m := range listResp.Data {
+		if strings.TrimSpace(m.ID) != "" {
+			result = append(result, ModelInfo{ID: m.ID})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].ID < result[j].ID
+	})
+
+	return result, nil
 }
 
 // ==================== 场景配置方法 ====================

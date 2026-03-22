@@ -3,6 +3,7 @@
  * - 全局配置：读取/更新（API地址、Key、模型、温度、Token数）
  * - 场景配置：读取/更新（6个Pipeline步骤各自的AI参数）
  * - 连通性测试：验证AI API连接状态（P2-2新增）
+ * - 可用模型查询：查询当前Key下可用模型列表（v19.1新增）
  * - 仅 admin 可调用
  */
 import client from './client'
@@ -60,6 +61,17 @@ export interface TestConnectionResult {
   api_base_url: string    // 测试使用的API地址
 }
 
+/** 单个可用模型信息（v19.1新增） */
+export interface ModelInfo {
+  id: string              // 模型ID（如 anthropic/claude-haiku-4.5）
+}
+
+/** 可用模型列表响应（v19.1新增） */
+export interface ListModelsResult {
+  models: ModelInfo[]     // 模型列表（按字母排序）
+  total: number           // 模型总数
+}
+
 // ==================== API 方法 ====================
 
 /** 获取全局AI配置 */
@@ -89,5 +101,11 @@ export async function updateSceneConfig(code: string, req: UpdateSceneConfigRequ
 /** 测试AI API连通性（P2-2新增） */
 export async function testConnection(): Promise<TestConnectionResult> {
   const res = await client.post<{ code: number; data: TestConnectionResult }>('/ai-config/test')
+  return res.data.data
+}
+
+/** 查询当前Key下可用模型列表（v19.1新增） */
+export async function listModels(): Promise<ListModelsResult> {
+  const res = await client.get<{ code: number; data: ListModelsResult }>('/ai-config/models')
   return res.data.data
 }

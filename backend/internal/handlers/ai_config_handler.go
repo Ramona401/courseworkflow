@@ -99,6 +99,31 @@ func (h *AIConfigHandler) TestConnection(w http.ResponseWriter, r *http.Request)
 	utils.Success(w, result)
 }
 
+// ==================== 可用模型查询接口 ====================
+
+// ListModels 查询当前Key下可用的模型列表
+// GET /api/v1/ai-config/models
+// 调用上游 {api_base_url}/models 接口，返回模型ID列表（按字母排序）
+func (h *AIConfigHandler) ListModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		return
+	}
+
+	// 查询可用模型列表
+	modelList, err := h.aiConfigService.ListModels()
+	if err != nil {
+		handleAIConfigError(w, err)
+		return
+	}
+
+	// 返回模型列表及总数
+	utils.Success(w, map[string]interface{}{
+		"models": modelList,
+		"total":  len(modelList),
+	})
+}
+
 // ==================== 场景配置接口 ====================
 
 // GetSceneConfigs 获取所有场景配置

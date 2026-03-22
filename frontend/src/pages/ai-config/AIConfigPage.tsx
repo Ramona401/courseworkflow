@@ -1,14 +1,15 @@
 /**
  * AI配置中心页面（仅admin可访问）
- * - 全局配置区：API地址、Key、模型（自由填写，不限制选项）、温度、Token数
+ * - 全局配置区：API地址、Key、模型（自由填写）、温度、Token数
  * - AI连通性测试：测试按钮+结果显示（P2-2新增）
+ * - 可用模型查询：查询并展示当前Key可用模型列表（v19.1新增）
  * - 场景配置区：6个Pipeline步骤各自的AI参数（模型自由填写）
  * - Apple 风格：毛玻璃卡片 + 渐变 + 圆角 + 微动效
  */
 import { useState, useEffect, useCallback } from 'react'
-import { getGlobalConfig, updateGlobalConfig, getSceneConfigs, updateSceneConfig, testConnection } from '@/api/ai-config'
-import type { GlobalConfig, SceneConfig, UpdateSceneConfigRequest, TestConnectionResult } from '@/api/ai-config'
-import { Bot, Save, Eye, EyeOff, RefreshCw, Zap, Wifi, WifiOff, Clock } from 'lucide-react'
+import { getGlobalConfig, updateGlobalConfig, getSceneConfigs, updateSceneConfig, testConnection, listModels } from '@/api/ai-config'
+import type { GlobalConfig, SceneConfig, UpdateSceneConfigRequest, TestConnectionResult, ModelInfo } from '@/api/ai-config'
+import { Bot, Save, Eye, EyeOff, RefreshCw, Zap, Wifi, WifiOff, Clock, List, ChevronDown, ChevronUp } from 'lucide-react'
 
 // ==================== 样式常量 ====================
 
@@ -110,6 +111,114 @@ function Toast({ message, type, onClose }: { message: string; type: 'success' | 
   )
 }
 
+// ==================== 可用模型列表组件（v19.1新增）====================
+
+function ModelsPanel({
+  models,
+  loading,
+  error,
+  expanded,
+  onToggle,
+  onUseModel,
+}: {
+  models: ModelInfo[]
+  loading: boolean
+  error: string | null
+  expanded: boolean
+  onToggle: () => void
+  onUseModel: (id: string) => void
+}) {
+  return (
+    <div style={{
+      marginTop: '16px',
+      borderRadius: '12px',
+      border: '1px solid rgba(0,122,255,0.2)',
+      background: 'rgba(0,122,255,0.03)',
+      overflow: 'hidden',
+    }}>
+      {/* 头部：展开/收起按钮 */}
+      <div
+        onClick={onToggle}
+        style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '12px 16px', cursor: 'pointer',
+          borderBottom: expanded ? '1px solid rgba(0,122,255,0.1)' : 'none',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <List size={15} color="#007aff" />
+          <span style={{ fontSize: '13px', fontWeight: 600, color: '#007aff' }}>
+            {loading ? '查询中...' : error ? '查询失败' : `可用模型（${models.length} 个）`}
+          </span>
+        </div>
+        {expanded ? <ChevronUp size={15} color="#8e8e93" /> : <ChevronDown size={15} color="#8e8e93" />}
+      </div>
+
+      {/* 展开内容 */}
+      {expanded && (
+        <div style={{ padding: '12px 16px' }}>
+          {/* 错误提示 */}
+          {error && (
+            <div style={{
+              padding: '10px 14px', borderRadius: '8px',
+              background: 'rgba(255,59,48,0.06)', border: '1px solid rgba(255,59,48,0.2)',
+              fontSize: '13px', color: '#ff3b30',
+            }}>
+              {error}
+            </div>
+          )}
+
+          {/* 模型列表 */}
+          {!error && models.length === 0 && !loading && (
+            <div style={{ fontSize: '13px', color: '#8e8e93', textAlign: 'center', padding: '8px 0' }}>
+              未查询到可用模型
+            </div>
+          )}
+          {!error && models.length > 0 && (
+            <div style={{
+              display: 'flex', flexWrap: 'wrap', gap: '8px',
+              maxHeight: '200px', overflowY: 'auto',
+            }}>
+              {models.map(m => (
+                <div
+                  key={m.id}
+                  title="点击填入默认模型"
+                  onClick={() => onUseModel(m.id)}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: '6px',
+                    padding: '5px 12px', borderRadius: '8px',
+                    border: '1px solid rgba(0,122,255,0.25)',
+                    background: '#fff',
+                    fontSize: '12px', fontFamily: 'monospace', color: '#1d1d1f',
+                    cursor: 'pointer', transition: 'all 0.15s',
+                    userSelect: 'none' as const,
+                  }}
+                  onMouseEnter={e => {
+                    (e.currentTarget as HTMLElement).style.background = 'rgba(0,122,255,0.08)'
+                    ;(e.currentTarget as HTMLElement).style.borderColor = '#007aff'
+                  }}
+                  onMouseLeave={e => {
+                    (e.currentTarget as HTMLElement).style.background = '#fff'
+                    ;(e.currentTarget as HTMLElement).style.borderColor = 'rgba(0,122,255,0.25)'
+                  }}
+                >
+                  {m.id}
+                </div>
+              ))}
+            </div>
+          )}
+          {/* 提示文字 */}
+          {!error && models.length > 0 && (
+            <div style={{ marginTop: '8px', fontSize: '11px', color: '#aeaeb2' }}>
+              点击模型名称可快速填入「默认模型」输入框
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ==================== 主组件 ====================
 
 export default function AIConfigPage() {
@@ -128,6 +237,12 @@ export default function AIConfigPage() {
   // AI连通性测试状态（P2-2新增）
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<TestConnectionResult | null>(null)
+
+  // 可用模型查询状态（v19.1新增）
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const [modelsList, setModelsList] = useState<ModelInfo[]>([])
+  const [modelsError, setModelsError] = useState<string | null>(null)
+  const [modelsExpanded, setModelsExpanded] = useState(false)
 
   // 场景配置状态
   const [scenes, setScenes] = useState<SceneConfig[]>([])
@@ -204,6 +319,32 @@ export default function AIConfigPage() {
     } finally {
       setTesting(false)
     }
+  }
+
+  // ==================== 可用模型查询（v19.1新增）====================
+
+  // 查询可用模型列表，展开面板展示结果
+  const handleListModels = async () => {
+    try {
+      setModelsLoading(true)
+      setModelsError(null)
+      setModelsExpanded(true)  // 自动展开面板
+      const result = await listModels()
+      setModelsList(result.models || [])
+      setToast({ message: `查询成功，共 ${result.total} 个可用模型`, type: 'success' })
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '查询失败'
+      setModelsError(msg)
+      setModelsList([])
+    } finally {
+      setModelsLoading(false)
+    }
+  }
+
+  // 点击模型名称快速填入默认模型输入框
+  const handleUseModel = (modelId: string) => {
+    setGlobalForm(prev => ({ ...prev, default_model: modelId }))
+    setToast({ message: `已填入：${modelId}`, type: 'success' })
   }
 
   // ==================== 场景配置编辑 ====================
@@ -340,9 +481,9 @@ export default function AIConfigPage() {
         </div>
 
         {/* 默认模型（自由填写）+ 温度 + Token数（三列） */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '16px', marginBottom: '24px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '16px', marginBottom: '16px' }}>
           <div>
-            {/* 模型改为自由填写文本框，不限制可选模型范围 */}
+            {/* 模型自由填写，可通过下方模型列表点击快速填入 */}
             <label style={labelStyle}>默认模型</label>
             <input
               style={inputStyle}
@@ -381,22 +522,47 @@ export default function AIConfigPage() {
           </div>
         </div>
 
-        {/* 操作按钮行：重置 + 测试连接 + 保存 */}
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px', alignItems: 'center' }}>
+        {/* 可用模型查询面板（v19.1新增）*/}
+        <ModelsPanel
+          models={modelsList}
+          loading={modelsLoading}
+          error={modelsError}
+          expanded={modelsExpanded}
+          onToggle={() => setModelsExpanded(prev => !prev)}
+          onUseModel={handleUseModel}
+        />
+
+        {/* 操作按钮行：重置 + 查询模型 + 测试连接 + 保存 */}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px', alignItems: 'center', marginTop: '20px' }}>
           <button
             onClick={loadData}
-            style={{
-              ...btnPrimary,
-              background: '#f5f5f7',
-              color: '#1d1d1f',
-              boxShadow: 'none',
-            }}
+            style={{ ...btnPrimary, background: '#f5f5f7', color: '#1d1d1f', boxShadow: 'none' }}
             onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = '#e8e8ed' }}
             onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = '#f5f5f7' }}
           >
             <RefreshCw size={15} />
             重置
           </button>
+
+          {/* 查询可用模型按钮（v19.1新增） */}
+          <button
+            onClick={handleListModels}
+            disabled={modelsLoading}
+            style={{
+              ...btnPrimary,
+              background: modelsLoading
+                ? 'linear-gradient(135deg, #8e8e93, #aeaeb2)'
+                : 'linear-gradient(135deg, #34c759, #30d158)',
+              boxShadow: modelsLoading ? 'none' : '0 2px 8px rgba(52,199,89,0.3)',
+              opacity: modelsLoading ? 0.7 : 1,
+            }}
+            onMouseEnter={e => { if (!modelsLoading) (e.currentTarget as HTMLElement).style.transform = 'translateY(-1px)' }}
+            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.transform = 'none' }}
+          >
+            <List size={15} />
+            {modelsLoading ? '查询中...' : '查询可用模型'}
+          </button>
+
           {/* 测试连接按钮（P2-2新增） */}
           <button
             onClick={handleTestConnection}
@@ -415,6 +581,7 @@ export default function AIConfigPage() {
             <Wifi size={15} />
             {testing ? '测试中...' : '测试连接'}
           </button>
+
           <button
             onClick={handleSaveGlobal}
             disabled={globalSaving}
@@ -440,18 +607,13 @@ export default function AIConfigPage() {
               ? 'rgba(52,199,89,0.06)'
               : 'rgba(255,59,48,0.06)',
           }}>
-            {/* 结果标题行 */}
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
               {testResult.success ? (
                 <Wifi size={18} color="#34c759" />
               ) : (
                 <WifiOff size={18} color="#ff3b30" />
               )}
-              <span style={{
-                fontSize: '15px',
-                fontWeight: 600,
-                color: testResult.success ? '#34c759' : '#ff3b30',
-              }}>
+              <span style={{ fontSize: '15px', fontWeight: 600, color: testResult.success ? '#34c759' : '#ff3b30' }}>
                 {testResult.success ? '连接成功' : '连接失败'}
               </span>
               {testResult.latency_ms > 0 && (
@@ -466,26 +628,19 @@ export default function AIConfigPage() {
                 </span>
               )}
             </div>
-            {/* 详细信息 */}
             <div style={{ fontSize: '13px', color: '#1d1d1f', lineHeight: '1.6' }}>
               <div>{testResult.message}</div>
               {testResult.model && (
-                <div style={{ color: '#8e8e93', marginTop: '4px' }}>
-                  模型：{testResult.model}
-                </div>
+                <div style={{ color: '#8e8e93', marginTop: '4px' }}>模型：{testResult.model}</div>
               )}
               {testResult.api_base_url && (
-                <div style={{ color: '#8e8e93' }}>
-                  地址：{testResult.api_base_url}
-                </div>
+                <div style={{ color: '#8e8e93' }}>地址：{testResult.api_base_url}</div>
               )}
             </div>
-            {/* 关闭按钮 */}
             <button
               onClick={() => setTestResult(null)}
               style={{
-                marginTop: '10px',
-                padding: '4px 12px', borderRadius: '6px',
+                marginTop: '10px', padding: '4px 12px', borderRadius: '6px',
                 border: '1px solid #d2d2d7', background: '#fff',
                 fontSize: '12px', color: '#8e8e93', cursor: 'pointer',
               }}
@@ -504,11 +659,9 @@ export default function AIConfigPage() {
           <span style={{ fontSize: '12px', color: '#8e8e93' }}>（每个场景可独立覆盖全局配置，留空则继承全局）</span>
         </div>
 
-        {/* 场景列表 */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
           {scenes.map(scene => {
             const isEditing = editingScene === scene.scene_code
-
             return (
               <div key={scene.scene_code} style={{
                 padding: '16px 20px',
@@ -555,7 +708,7 @@ export default function AIConfigPage() {
                   <div>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 120px', gap: '12px', marginBottom: '16px' }}>
                       <div>
-                        {/* 场景模型改为自由填写，留空则继承全局配置 */}
+                        {/* 场景模型自由填写，留空则继承全局 */}
                         <label style={{ ...labelStyle, fontSize: '12px' }}>模型</label>
                         <input
                           style={{ ...inputStyle, padding: '8px 12px', fontSize: '13px' }}
