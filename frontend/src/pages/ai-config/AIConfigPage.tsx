@@ -1,8 +1,8 @@
 /**
  * AI配置中心页面（仅admin可访问）
- * - 全局配置区：API地址、Key、模型、温度、Token数
+ * - 全局配置区：API地址、Key、模型（自由填写，不限制选项）、温度、Token数
  * - AI连通性测试：测试按钮+结果显示（P2-2新增）
- * - 场景配置区：6个Pipeline步骤各自的AI参数
+ * - 场景配置区：6个Pipeline步骤各自的AI参数（模型自由填写）
  * - Apple 风格：毛玻璃卡片 + 渐变 + 圆角 + 微动效
  */
 import { useState, useEffect, useCallback } from 'react'
@@ -79,15 +79,6 @@ const selectStyle: React.CSSProperties = {
   backgroundPosition: 'right 12px center',
   paddingRight: '36px',
 }
-
-// ==================== 可选模型列表 ====================
-
-const MODEL_OPTIONS = [
-  'anthropic/claude-sonnet-4.6',
-  'anthropic/claude-haiku-4.5',
-  'google/gemini-3-flash-preview',
-  'google/gemini-3.1-flash-lite-preview',
-]
 
 // ==================== Toast 组件 ====================
 
@@ -348,18 +339,19 @@ export default function AIConfigPage() {
           </div>
         </div>
 
-        {/* 默认模型 + 温度 + Token数（三列） */}
+        {/* 默认模型（自由填写）+ 温度 + Token数（三列） */}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '16px', marginBottom: '24px' }}>
           <div>
+            {/* 模型改为自由填写文本框，不限制可选模型范围 */}
             <label style={labelStyle}>默认模型</label>
-            <select
-              style={selectStyle}
+            <input
+              style={inputStyle}
+              type="text"
               value={globalForm.default_model}
               onChange={e => setGlobalForm(prev => ({ ...prev, default_model: e.target.value }))}
+              placeholder="如 anthropic/claude-haiku-4.5"
               {...inputFocusProps}
-            >
-              {MODEL_OPTIONS.map(m => <option key={m} value={m}>{m}</option>)}
-            </select>
+            />
           </div>
           <div>
             <label style={labelStyle}>默认温度</label>
@@ -563,16 +555,16 @@ export default function AIConfigPage() {
                   <div>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 120px', gap: '12px', marginBottom: '16px' }}>
                       <div>
+                        {/* 场景模型改为自由填写，留空则继承全局配置 */}
                         <label style={{ ...labelStyle, fontSize: '12px' }}>模型</label>
-                        <select
-                          style={{ ...selectStyle, padding: '8px 12px', fontSize: '13px' }}
+                        <input
+                          style={{ ...inputStyle, padding: '8px 12px', fontSize: '13px' }}
+                          type="text"
                           value={sceneForm.model || ''}
                           onChange={e => setSceneForm(prev => ({ ...prev, model: e.target.value || null }))}
+                          placeholder="留空继承全局"
                           {...inputFocusProps}
-                        >
-                          <option value="">继承全局</option>
-                          {MODEL_OPTIONS.map(m => <option key={m} value={m}>{m}</option>)}
-                        </select>
+                        />
                       </div>
                       <div>
                         <label style={{ ...labelStyle, fontSize: '12px' }}>温度</label>
