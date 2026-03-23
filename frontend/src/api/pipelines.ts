@@ -43,6 +43,8 @@ export interface PipelineListItem {
   meta_score: number | null
   /** P4.5-A新增：Translator最终分（从step_data.final_score提取，可能为null） */
   translator_score: number | null
+  /** P4.6新增：审核轮次（1=初审，2=2审） */
+  review_round: number
 }
 
 /** Pipeline列表响应 */
@@ -87,6 +89,8 @@ export interface PipelineDetailResponse {
   completed_at: string | null
   created_at: string | null
   updated_at: string | null
+  /** P4.6新增：审核轮次（1=初审，2=2审） */
+  review_round: number
   steps: StepListItem[]
 }
 

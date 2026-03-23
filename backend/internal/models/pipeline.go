@@ -8,7 +8,7 @@ import (
 // ==================== Pipeline 模型（对应 pipelines 表） ====================
 
 // Pipeline Pipeline主记录（对应 pipelines 表）
-// 一个Pipeline对应一门课程的完整7步评估流程
+// 一个Pipeline对应一门课程的完整评估流程（8步，含verify验收）
 type Pipeline struct {
 	ID               string     `json:"id"`                 // UUID主键
 	CourseCode       string     `json:"course_code"`        // 课程编号（如 G1-01）
@@ -22,17 +22,18 @@ type Pipeline struct {
 	AutoMode         bool       `json:"auto_mode"`          // 是否自动模式（自动推进到下一步）
 	ErrorMessage     string     `json:"error_message"`      // 错误信息
 	Config           string     `json:"config"`             // 配置JSON（JSONB存储）
+	ReviewRound      int        `json:"review_round"`       // P4.6新增：审核轮次（1=初审，2=2审）
 	CreatedAt        *time.Time `json:"created_at"`         // 创建时间
 	UpdatedAt        *time.Time `json:"updated_at"`         // 更新时间
 }
 
 // PipelineStep Pipeline步骤记录（对应 pipeline_steps 表）
-// 每个Pipeline有7个步骤，每步独立记录状态和数据
+// 每个Pipeline有8个步骤（含verify），每步独立记录状态和数据
 type PipelineStep struct {
 	ID           string     `json:"id"`            // UUID主键
 	PipelineID   string     `json:"pipeline_id"`   // 关联Pipeline ID
 	StepName     string     `json:"step_name"`     // 步骤名称（如 dbCheck/scanner/evaluator等）
-	StepOrder    int        `json:"step_order"`    // 步骤序号（1-7）
+	StepOrder    int        `json:"step_order"`    // 步骤序号（1-8）
 	Status       string     `json:"status"`        // 步骤状态
 	StartedAt    *time.Time `json:"started_at"`    // 开始时间
 	CompletedAt  *time.Time `json:"completed_at"`  // 完成时间
@@ -221,7 +222,7 @@ func (r *EvaluatorResult) ToJSON() string {
 // Meta步骤执行元评估仲裁：综合N轮评估报告，输出仲裁分数+修改方案+修改后完整索引
 type MetaResult struct {
 	// 仲裁评分（从<<<META_SCORE>>>块提取）
-	TotalFinal     float64 `json:"total_final"`    // 仲裁综合评分
+	TotalFinal     float64 `json:"total_final"`     // 仲裁综合评分
 	E1Final        float64 `json:"e1_final"`        // E1仲裁评分
 	E2Final        float64 `json:"e2_final"`        // E2仲裁评分
 	E3Final        float64 `json:"e3_final"`        // E3仲裁评分
@@ -273,6 +274,7 @@ type PipelineListResponse struct {
 
 // PipelineListItem Pipeline列表单条（含步骤进度摘要+各阶段分数）
 // P4.5-A增强：新增EvalAvgScore/MetaScore/TranslatorScore三个分数字段
+// P4.6增强：新增ReviewRound审核轮次字段
 type PipelineListItem struct {
 	ID               string     `json:"id"`                 // UUID
 	CourseCode       string     `json:"course_code"`        // 课程编号
@@ -284,12 +286,13 @@ type PipelineListItem struct {
 	StatusName       string     `json:"status_name"`        // 状态中文名
 	AutoMode         bool       `json:"auto_mode"`          // 自动模式
 	StepsCompleted   int        `json:"steps_completed"`    // 已完成步骤数
-	StepsTotal       int        `json:"steps_total"`        // 总步骤数（7）
+	StepsTotal       int        `json:"steps_total"`        // 总步骤数（8）
 	ErrorMessage     string     `json:"error_message"`      // 错误信息
 	StartedBy        *string    `json:"started_by"`         // 发起者ID
 	StartedAt        *time.Time `json:"started_at"`         // 启动时间
 	CompletedAt      *time.Time `json:"completed_at"`       // 完成时间
 	CreatedAt        *time.Time `json:"created_at"`         // 创建时间
+	ReviewRound      int        `json:"review_round"`       // P4.6新增：审核轮次（1=初审，2=2审）
 	// P4.5-A新增：从pipeline_steps.step_data JSONB提取的各阶段分数
 	EvalAvgScore    *float64 `json:"eval_avg_score"`    // Evaluator均分（step_data->'avg_total'）
 	MetaScore       *float64 `json:"meta_score"`        // Meta仲裁分（step_data->'total_final'）
@@ -297,6 +300,7 @@ type PipelineListItem struct {
 }
 
 // PipelineDetailResponse Pipeline详情响应（含完整步骤列表）
+// P4.6增强：新增ReviewRound审核轮次字段
 type PipelineDetailResponse struct {
 	ID               string          `json:"id"`                 // UUID
 	CourseCode       string          `json:"course_code"`        // 课程编号
@@ -314,6 +318,7 @@ type PipelineDetailResponse struct {
 	CompletedAt      *time.Time      `json:"completed_at"`       // 完成时间
 	CreatedAt        *time.Time      `json:"created_at"`         // 创建时间
 	UpdatedAt        *time.Time      `json:"updated_at"`         // 更新时间
+	ReviewRound      int             `json:"review_round"`       // P4.6新增：审核轮次（1=初审，2=2审）
 	Steps            []*StepListItem `json:"steps"`              // 步骤列表
 }
 
@@ -360,13 +365,15 @@ type StepDetailResponse struct {
 
 // Pipeline 状态常量
 const (
-	PipelineStatusPending     = "pending"      // 待启动
-	PipelineStatusRunning     = "running"      // 运行中
-	PipelineStatusReviewQueue = "review_queue" // 等待人工审核
-	PipelineStatusFinalized   = "finalized"    // 已定稿
-	PipelineStatusNeedsHuman  = "needs_human"  // 需要人工干预
-	PipelineStatusFailed      = "failed"       // 失败
-	PipelineStatusCancelled   = "cancelled"    // 已取消
+	PipelineStatusPending      = "pending"       // 待启动
+	PipelineStatusRunning      = "running"       // 运行中
+	PipelineStatusReviewQueue  = "review_queue"  // 等待人工审核
+	PipelineStatusFinalized    = "finalized"     // 已定稿
+	PipelineStatusNeedsHuman   = "needs_human"   // 需要人工干预
+	PipelineStatusFailed       = "failed"        // 失败
+	PipelineStatusCancelled    = "cancelled"     // 已取消
+	PipelineStatusVerified     = "verified"      // P4.6新增：验收通过
+	PipelineStatusVerifyFailed = "verify_failed" // P4.6新增：验收未通过
 )
 
 // Pipeline 步骤状态常量
@@ -378,7 +385,8 @@ const (
 	StepStatusSkipped = "skipped" // 已跳过
 )
 
-// Pipeline 7步名称常量（严格按执行顺序）
+// Pipeline 8步名称常量（严格按执行顺序）
+// P4.6新增：第8步verify（验收评估）
 const (
 	StepDbCheck    = "dbCheck"    // 步骤1：数据库检查（验证索引）
 	StepScanner    = "scanner"    // 步骤2：扫描定位（Prompt A）
@@ -387,10 +395,12 @@ const (
 	StepTranslator = "translator" // 步骤5：翻译转换+审核（Prompt C + D）
 	StepGenerator  = "generator"  // 步骤6：页面生成（Prompt F × 每页）
 	StepReview     = "review"     // 步骤7：人工终审
+	StepVerify     = "verify"     // 步骤8：验收评估（P4.6新增，Prompt G + Prompt B）
 )
 
-// StepDefinitions 7步定义列表（有序，step_order从1开始）
+// StepDefinitions 8步定义列表（有序，step_order从1开始）
 // 用于创建Pipeline时批量插入pipeline_steps记录
+// P4.6更新：从7步扩展为8步（新增verify）
 var StepDefinitions = []struct {
 	Name  string // 步骤标识
 	Order int    // 步骤序号
@@ -402,9 +412,11 @@ var StepDefinitions = []struct {
 	{StepTranslator, 5},
 	{StepGenerator, 6},
 	{StepReview, 7},
+	{StepVerify, 8},
 }
 
 // StepNameMap 步骤标识→中文名映射
+// P4.6更新：新增verify步骤
 var StepNameMap = map[string]string{
 	StepDbCheck:    "数据库检查",
 	StepScanner:    "扫描定位",
@@ -413,17 +425,21 @@ var StepNameMap = map[string]string{
 	StepTranslator: "翻译转换+审核",
 	StepGenerator:  "页面生成",
 	StepReview:     "人工终审",
+	StepVerify:     "验收评估",
 }
 
 // PipelineStatusNameMap Pipeline状态→中文名映射
+// P4.6更新：新增verified/verify_failed状态
 var PipelineStatusNameMap = map[string]string{
-	PipelineStatusPending:     "待启动",
-	PipelineStatusRunning:     "运行中",
-	PipelineStatusReviewQueue: "等待审核",
-	PipelineStatusFinalized:   "已定稿",
-	PipelineStatusNeedsHuman:  "需人工干预",
-	PipelineStatusFailed:      "失败",
-	PipelineStatusCancelled:   "已取消",
+	PipelineStatusPending:      "待启动",
+	PipelineStatusRunning:      "运行中",
+	PipelineStatusReviewQueue:  "等待审核",
+	PipelineStatusFinalized:    "已定稿",
+	PipelineStatusNeedsHuman:   "需人工干预",
+	PipelineStatusFailed:       "失败",
+	PipelineStatusCancelled:    "已取消",
+	PipelineStatusVerified:     "验收通过",
+	PipelineStatusVerifyFailed: "验收未通过",
 }
 
 // StepStatusNameMap 步骤状态→中文名映射
@@ -436,7 +452,8 @@ var StepStatusNameMap = map[string]string{
 }
 
 // TotalSteps Pipeline总步骤数
-const TotalSteps = 7
+// P4.6更新：从7步增加为8步（含verify）
+const TotalSteps = 8
 
 // MinIndexLength 索引最小有效长度（字符数，低于此值认为无效）
 const MinIndexLength = 50
@@ -542,6 +559,34 @@ type GeneratorResult struct {
 
 // ToJSON 将GeneratorResult序列化为JSON字符串
 func (r *GeneratorResult) ToJSON() string {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+// ==================== Verify 步骤数据结构（P4.6新增）====================
+
+// VerifyResult 验收评估步骤的输出数据（存入pipeline_steps.step_data JSONB字段）
+// 收集最终HTML→索引生成器压缩→Evaluator 1轮评估→判定通过/失败
+type VerifyResult struct {
+	GeneratedIndex string  `json:"generated_index"`  // 索引生成器压缩后的索引内容
+	EvalScore      float64 `json:"eval_score"`       // Evaluator评估综合分
+	EvalOutput     string  `json:"eval_output"`      // Evaluator评估报告全文
+	EvalE1         float64 `json:"eval_e1"`          // E1维度评分
+	EvalE2         float64 `json:"eval_e2"`          // E2维度评分
+	EvalE3         float64 `json:"eval_e3"`          // E3维度评分
+	EvalE4         float64 `json:"eval_e4"`          // E4维度评分
+	Passed         bool    `json:"passed"`           // 是否通过验收（eval_score >= threshold）
+	ReviewRound    int     `json:"review_round"`     // 当前审核轮次（1=初审验收，2=2审验收）
+	ModelUsed      string  `json:"model_used"`       // 使用的AI模型
+	TokensUsed     int     `json:"tokens_used"`      // 累计Token消耗
+	LatencyMs      int64   `json:"latency_ms"`       // 累计耗时（毫秒）
+}
+
+// ToJSON 将VerifyResult序列化为JSON字符串
+func (r *VerifyResult) ToJSON() string {
 	data, err := json.Marshal(r)
 	if err != nil {
 		return "{}"

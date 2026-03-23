@@ -12,7 +12,7 @@ import (
 )
 
 // Setup 注册所有路由并返回根Handler
-// 版本：0.20.0（P4.5-E-2新增ai-fix路由）（P4.5-D新增dashboard/stats+mark-passed路由）
+// 版本：0.21.0（P4.6-1新增verify步骤基础设施+review_round）（P4.5-E-2新增ai-fix路由）
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -381,7 +381,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.20.0",
+		"version": "0.21.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

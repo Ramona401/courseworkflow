@@ -91,11 +91,12 @@ func GetDashboardStats() (*DashboardStats, error) {
 // ==================== Pipeline CRUD ====================
 
 // CreatePipeline 创建Pipeline主记录
-// 同时批量创建7个步骤记录（在事务中执行）
+// 同时批量创建8个步骤记录（在事务中执行）
+// P4.6更新：从7步扩展为8步（自动跟随StepDefinitions）
 func CreatePipeline(p *models.Pipeline) error {
 	ctx := context.Background()
 
-	// 开启事务：Pipeline和7个步骤必须原子创建
+	// 开启事务：Pipeline和步骤必须原子创建
 	tx, err := database.DB.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("开启事务失败: %w", err)
@@ -105,17 +106,17 @@ func CreatePipeline(p *models.Pipeline) error {
 	// 1. 插入Pipeline主记录
 	err = tx.QueryRow(ctx,
 		`INSERT INTO pipelines (course_code, course_name, external_module_id, started_by,
-			current_step, status, auto_mode, config)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+			current_step, status, auto_mode, config, review_round)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
 		 RETURNING id, started_at, created_at, updated_at`,
 		p.CourseCode, p.CourseName, p.ExternalModuleID, p.StartedBy,
-		p.CurrentStep, p.Status, p.AutoMode, p.Config,
+		p.CurrentStep, p.Status, p.AutoMode, p.Config, p.ReviewRound,
 	).Scan(&p.ID, &p.StartedAt, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("插入Pipeline失败: %w", err)
 	}
 
-	// 2. 批量插入7个步骤记录（全部初始状态为pending）
+	// 2. 批量插入步骤记录（全部初始状态为pending，数量由StepDefinitions决定）
 	for _, sd := range models.StepDefinitions {
 		_, err = tx.Exec(ctx,
 			`INSERT INTO pipeline_steps (pipeline_id, step_name, step_order, status)
@@ -136,6 +137,7 @@ func CreatePipeline(p *models.Pipeline) error {
 }
 
 // GetPipelineByID 根据ID获取Pipeline主记录
+// P4.6更新：读取review_round字段
 func GetPipelineByID(id string) (*models.Pipeline, error) {
 	ctx := context.Background()
 	p := &models.Pipeline{}
@@ -148,11 +150,11 @@ func GetPipelineByID(id string) (*models.Pipeline, error) {
 	err := database.DB.QueryRow(ctx,
 		`SELECT id, course_code, course_name, external_module_id, started_by,
 			started_at, completed_at, current_step, status, auto_mode,
-			error_message, config::text, created_at, updated_at
+			error_message, config::text, review_round, created_at, updated_at
 		 FROM pipelines WHERE id = $1`, id).Scan(
 		&p.ID, &p.CourseCode, &courseName, &p.ExternalModuleID, &p.StartedBy,
 		&p.StartedAt, &p.CompletedAt, &p.CurrentStep, &p.Status, &p.AutoMode,
-		&errorMsg, &configStr, &p.CreatedAt, &p.UpdatedAt,
+		&errorMsg, &configStr, &p.ReviewRound, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {
 		return nil, ErrPipelineNotFound
@@ -174,10 +176,12 @@ func GetPipelineByID(id string) (*models.Pipeline, error) {
 
 // pipelineListSelectSQL P4.5-A: Pipeline列表查询的SELECT子句（含3个分数子查询）
 // 从pipeline_steps.step_data JSONB字段提取evaluator均分/meta仲裁分/translator最终分
+// P4.6更新：新增review_round字段
 // 注意：JSONB提取用->>返回text，需要::numeric转换为数值类型
 const pipelineListSelectSQL = `SELECT p.id, p.course_code, p.course_name, p.external_module_id,
 	p.current_step, p.status, p.auto_mode, p.error_message,
 	p.started_by, p.started_at, p.completed_at, p.created_at,
+	p.review_round,
 	COALESCE((SELECT COUNT(*) FROM pipeline_steps ps
 		WHERE ps.pipeline_id = p.id AND ps.status = 'done'), 0) AS steps_completed,
 	(SELECT (ps_eval.step_data->>'avg_total')::numeric
@@ -197,8 +201,9 @@ const pipelineListSelectSQL = `SELECT p.id, p.course_code, p.course_name, p.exte
 	 LIMIT 1) AS translator_score
 FROM pipelines p`
 
-// scanPipelineListRow 扫描Pipeline列表行（含3个分数字段）
+// scanPipelineListRow 扫描Pipeline列表行（含3个分数字段+review_round）
 // P4.5-A: 统一扫描逻辑，ListPipelines和ListPipelinesForUser共用
+// P4.6更新：新增review_round字段扫描
 func scanPipelineListRow(rows interface{ Scan(dest ...interface{}) error }) (*models.PipelineListItem, error) {
 	item := &models.PipelineListItem{}
 	var courseName, errorMsg *string
@@ -207,6 +212,7 @@ func scanPipelineListRow(rows interface{ Scan(dest ...interface{}) error }) (*mo
 		&item.ID, &item.CourseCode, &courseName, &item.ExternalModuleID,
 		&item.CurrentStep, &item.Status, &item.AutoMode, &errorMsg,
 		&item.StartedBy, &item.StartedAt, &item.CompletedAt, &item.CreatedAt,
+		&item.ReviewRound,
 		&item.StepsCompleted,
 		&item.EvalAvgScore,    // P4.5-A: evaluator均分（*float64，NULL自动映射为nil）
 		&item.MetaScore,       // P4.5-A: meta仲裁分

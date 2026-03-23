@@ -133,6 +133,7 @@ func (s *PipelineService) CreatePipeline(req *models.CreatePipelineRequest, user
 		Status:           models.PipelineStatusPending,
 		AutoMode:         autoMode,
 		Config:           pipelineCfg.ToJSON(),
+		ReviewRound:      1,
 	}
 
 	if err := repository.CreatePipeline(pipeline); err != nil {
@@ -206,6 +207,7 @@ func (s *PipelineService) GetPipelineDetail(id string) (*models.PipelineDetailRe
 		CompletedAt:      pipeline.CompletedAt,
 		CreatedAt:        pipeline.CreatedAt,
 		UpdatedAt:        pipeline.UpdatedAt,
+		ReviewRound:      pipeline.ReviewRound,
 		Steps:            stepItems,
 	}, nil
 }

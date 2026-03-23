@@ -50,8 +50,10 @@ export default function PipelineDetailPage() {
   }
 
   /** 是否显示审核入口按钮 */
+  /** 是否显示审核入口按钮（P4.6更新：verified/verify_failed状态也显示） */
   const showReviewBtn = detail && (
     detail.status === 'review_queue' || detail.status === 'needs_human' || detail.status === 'finalized'
+    || detail.status === 'verified' || detail.status === 'verify_failed'
   )
 
   // 加载中
@@ -85,7 +87,7 @@ export default function PipelineDetailPage() {
             {detail.course_code} — {detail.course_name}
           </div>
           <div style={{ fontSize: 13, color: '#8e8e93', marginTop: 2 }}>
-            状态: {detail.status_name} · 当前步骤: {detail.current_step_name}
+            状态: {detail.status_name}{detail.review_round > 1 ? ` (第${detail.review_round}审)` : ''} · 当前步骤: {detail.current_step_name}
             {detail.config && (
               <span style={{ marginLeft: 12, color: '#aeaeb2' }}>
                 阈值: {detail.config.threshold} · 评估轮: {detail.config.eval_rounds} · TR循环: {detail.config.max_tr_loop}
@@ -98,14 +100,15 @@ export default function PipelineDetailPage() {
           <button
             style={{
               ...btn,
-              background: detail.status === 'finalized' ? '#34c759' : '#007aff',
+              background: (detail.status === 'finalized' || detail.status === 'verified') ? '#34c759'
+                : detail.status === 'verify_failed' ? '#ff9500' : '#007aff',
               color: '#fff',
               border: 'none',
             }}
             onClick={() => navigate('/pipelines/' + id + '/review')}
           >
             <ClipboardCheck size={14} />
-            {detail.status === 'finalized' ? '查看审核结果' : '进入审核'}
+            {detail.status === 'finalized' || detail.status === 'verified' || detail.status === 'verify_failed' ? '查看审核结果' : '进入审核'}
           </button>
         )}
         <button style={btn} onClick={loadDetail}>
@@ -267,6 +270,15 @@ function StepPanelRouter({ stepName, data }: { stepName: string; data: any }) {
     case 'meta':       return <MetaPanel data={data} />
     case 'translator': return <TranslatorPanel data={data} />
     case 'generator':  return <GeneratorPanel data={data} />
+    case 'verify':
+      return (
+        <pre style={{
+          fontSize: 12, color: '#3c3c43', overflow: 'auto', maxHeight: 400,
+          margin: 0, whiteSpace: 'pre-wrap',
+        }}>
+          {JSON.stringify(data, null, 2)}
+        </pre>
+      )
     default:
       return (
         <pre style={{
