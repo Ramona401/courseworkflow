@@ -57,18 +57,34 @@ var (
 	ErrMarkPassedNotMet     = errors.New("Pipeline评估未达标，无法快捷通过")
 	// P4.5-E-2新增：AI快修错误常量
 	ErrAIFixFailed = errors.New("AI快修失败")
+	// P5-2新增：并发引擎错误常量
+	ErrEngineQueueFull = errors.New("执行队列已满，请稍后再试")
 )
 
 // ==================== PipelineService ====================
 
 // PipelineService Pipeline业务逻辑层
+// P5-2更新：新增engine字段，支持并发执行和AI限流
 type PipelineService struct {
-	cfg *config.Config
+	cfg    *config.Config
+	engine *Engine // P5-2新增：并发执行引擎（由routes.Setup注入）
 }
 
 // NewPipelineService 创建Pipeline服务实例
 func NewPipelineService(cfg *config.Config) *PipelineService {
 	return &PipelineService{cfg: cfg}
+}
+
+// SetEngine 注入并发执行引擎（P5-2新增）
+// 在routes.Setup中创建Engine后调用此方法注入
+func (s *PipelineService) SetEngine(engine *Engine) {
+	s.engine = engine
+}
+
+// GetEngine 获取并发执行引擎（P5-2新增）
+// 供handler层查询引擎状态使用
+func (s *PipelineService) GetEngine() *Engine {
+	return s.engine
 }
 
 // ==================== Dashboard 统计（P4.5-D新增）====================
@@ -289,7 +305,6 @@ func (s *PipelineService) MarkPassed(pipelineID string) error {
 	}
 
 	// 2. 检查状态是否允许快捷通过
-	// 允许的状态：review_queue / needs_human / running（但meta已完成）/ failed（但meta已完成）
 	allowedStatuses := map[string]bool{
 		models.PipelineStatusReviewQueue: true,
 		models.PipelineStatusNeedsHuman:  true,
@@ -342,9 +357,9 @@ func (s *PipelineService) MarkPassed(pipelineID string) error {
 
 // ==================== Pipeline 执行引擎 ====================
 
-// StartPipeline 启动Pipeline执行（P5-1改造：异步执行）
-// 改造前：同步执行全链路，HTTP请求阻塞45-55分钟
-// 改造后：立即返回running状态，goroutine后台执行全链路，前端轮询刷新
+// StartPipeline 启动Pipeline执行
+// P5-1改造：异步执行，立即返回running状态
+// P5-2改造：通过Engine并发引擎提交任务，支持队列排队和AI限流
 func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailResponse, error) {
 	pipeline, err := repository.GetPipelineByID(id)
 	if err != nil {
@@ -360,16 +375,30 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 		return nil, fmt.Errorf("更新Pipeline状态失败: %w", err)
 	}
 
-	// P5-1改造：在goroutine中异步执行全链路
-	// 立即返回，前端通过轮询获取最新状态
-	go s.executePipelineAsync(id)
+	// P5-2改造：通过Engine提交任务（如果Engine已注入）
+	if s.engine != nil {
+		task := &EngineTask{
+			Type:       TaskTypePipeline,
+			PipelineID: id,
+			ExecFunc:   func() { s.executePipelineAsync(id) },
+		}
+		if !s.engine.Submit(task) {
+			// 队列已满，回滚状态为pending
+			_ = repository.UpdatePipelineStatus(id, models.StepDbCheck, models.PipelineStatusPending)
+			return nil, ErrEngineQueueFull
+		}
+	} else {
+		// 兼容模式：无Engine时直接goroutine执行（P5-1原行为）
+		go s.executePipelineAsync(id)
+	}
 
 	// 返回当前状态（running）
 	return s.GetPipelineDetail(id)
 }
 
-// executePipelineAsync 异步执行Pipeline全链路（goroutine中运行）
+// executePipelineAsync 异步执行Pipeline全链路（goroutine/Engine Worker中运行）
 // P5-1新增：将原StartPipeline中的同步执行逻辑抽取为独立方法
+// P5-2更新：AI调用前后加信号量控制（AcquireAI/ReleaseAI）
 // 注意：goroutine中的错误通过UpdatePipelineError记录到数据库，不会返回给HTTP调用者
 func (s *PipelineService) executePipelineAsync(id string) {
 	// 重新读取Pipeline（goroutine中需要独立读取，不依赖外部变量）
@@ -380,7 +409,6 @@ func (s *PipelineService) executePipelineAsync(id string) {
 	}
 
 	// P4-6修复：检测已完成的步骤，从第一个未完成的步骤开始执行
-	// 这样重跑Pipeline时不会重复执行已done的步骤
 	existingSteps, stepsErr := repository.GetStepsByPipelineID(id)
 	if stepsErr == nil {
 		// 找到第一个非done的步骤
@@ -410,11 +438,9 @@ func (s *PipelineService) executePipelineAsync(id string) {
 				return
 
 			case models.StepReview:
-				// review是人工步骤，标记为等待审核
 				_ = repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue)
 				return
 			}
-			// 其他步骤（scanner/evaluator/meta/translator）走正常全链路
 		}
 	}
 
@@ -446,7 +472,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 			return
 		}
 
-		// scanner成功 → 推进到evaluator
+		// scanner成功 -> 推进到evaluator
 		if err := repository.UpdatePipelineStatus(id, models.StepEvaluator, models.PipelineStatusRunning); err != nil {
 			_ = repository.UpdatePipelineError(id, models.StepEvaluator, "推进到Evaluator失败: "+err.Error())
 			return
@@ -465,7 +491,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 			return
 		}
 
-		// evaluator成功 → 推进到meta
+		// evaluator成功 -> 推进到meta
 		if err := repository.UpdatePipelineStatus(id, models.StepMeta, models.PipelineStatusRunning); err != nil {
 			_ = repository.UpdatePipelineError(id, models.StepMeta, "推进到Meta失败: "+err.Error())
 			return
@@ -484,7 +510,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 			return
 		}
 
-		// meta成功 → 推进到translator
+		// meta成功 -> 推进到translator
 		if err := repository.UpdatePipelineStatus(id, models.StepTranslator, models.PipelineStatusRunning); err != nil {
 			_ = repository.UpdatePipelineError(id, models.StepTranslator, "推进到Translator失败: "+err.Error())
 			return
@@ -503,7 +529,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 			return
 		}
 
-		// translator成功 → 推进到generator
+		// translator成功 -> 推进到generator
 		if err := repository.UpdatePipelineStatus(id, models.StepGenerator, models.PipelineStatusRunning); err != nil {
 			_ = repository.UpdatePipelineError(id, models.StepGenerator, "推进到Generator失败: "+err.Error())
 			return
@@ -522,12 +548,25 @@ func (s *PipelineService) executePipelineAsync(id string) {
 			return
 		}
 
-		// generator成功 → 推进到review（等待人工审核）
+		// generator成功 -> 推进到review（等待人工审核）
 		if err := repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue); err != nil {
 			_ = repository.UpdatePipelineError(id, models.StepReview, "推进到Review失败: "+err.Error())
 			return
 		}
 	}
+}
+
+// ==================== AI调用包装方法（P5-2新增）====================
+
+// callAIWithSemaphore 带信号量控制的AI调用包装方法
+// P5-2新增：在AI调用前获取信号量，调用完毕后释放，防止并发超限
+// 如果Engine未注入则直接调用（兼容模式）
+func (s *PipelineService) callAIWithSemaphore(cfg *ai.EffectiveConfig, systemPrompt string, userPrompt string) (*ai.CallResult, error) {
+	if s.engine != nil {
+		s.engine.AcquireAI()
+		defer s.engine.ReleaseAI()
+	}
+	return ai.CallAI(cfg, systemPrompt, userPrompt)
 }
 
 // ==================== dbCheck 步骤（P4-1）====================
@@ -598,6 +637,7 @@ func (s *PipelineService) doDbCheck(pipeline *models.Pipeline, result *models.Db
 // ==================== Scanner 步骤（P4-2）====================
 
 // executeScanner 执行scanner步骤：调用Prompt A进行K12课程定位分析
+// P5-2更新：AI调用改用callAIWithSemaphore（信号量控制）
 func (s *PipelineService) executeScanner(pipeline *models.Pipeline) error {
 	startTime := time.Now()
 	stepName := models.StepScanner
@@ -628,10 +668,11 @@ func (s *PipelineService) executeScanner(pipeline *models.Pipeline) error {
 }
 
 // doScanner 调用AI执行课程定位分析
+// P5-2更新：AI调用改用callAIWithSemaphore
 func (s *PipelineService) doScanner(pipeline *models.Pipeline) (*models.ScannerResult, error) {
 	result := &models.ScannerResult{}
 
-	// 1. 加载 Prompt A（使用正确的函数名 GetCurrentPromptByKey）
+	// 1. 加载 Prompt A
 	promptA, err := repository.GetCurrentPromptByKey("prompt_a")
 	if err != nil || promptA == nil {
 		return nil, ErrScannerPromptMissing
@@ -647,7 +688,7 @@ func (s *PipelineService) doScanner(pipeline *models.Pipeline) (*models.ScannerR
 		return nil, fmt.Errorf("scanner: 课程索引不存在，请先执行dbCheck")
 	}
 
-	// 3. 获取AI有效配置（三级回退：场景→全局→.env）
+	// 3. 获取AI有效配置（三级回退：场景->全局->.env）
 	aiCfg, err := ai.GetEffectiveConfig(
 		s.cfg.AESKey,
 		"scanner",
@@ -663,8 +704,8 @@ func (s *PipelineService) doScanner(pipeline *models.Pipeline) (*models.ScannerR
 	systemPrompt := promptA.Content
 	userPrompt := fmt.Sprintf("请分析以下课程索引内容，按照要求输出JSON格式的定位信息：\n\n%s", courseIndex.IndexContent)
 
-	// 5. 调用AI API
-	callResult, err := ai.CallAI(aiCfg, systemPrompt, userPrompt)
+	// 5. 调用AI API（P5-2：带信号量控制）
+	callResult, err := s.callAIWithSemaphore(aiCfg, systemPrompt, userPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrScannerAIFailed, err.Error())
 	}
@@ -702,7 +743,8 @@ func (s *PipelineService) doScanner(pipeline *models.Pipeline) (*models.ScannerR
 
 // ==================== Evaluator 步骤（P4-3）====================
 
-// executeEvaluator 执行evaluator步骤：多轮独立评估（Prompt B × N轮）
+// executeEvaluator 执行evaluator步骤：多轮独立评估（Prompt B * N轮）
+// P5-2更新：每轮AI调用改用callAIWithSemaphore（信号量控制）
 func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 	startTime := time.Now()
 	stepName := models.StepEvaluator
@@ -756,7 +798,6 @@ func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, ErrEvalScannerNotDone.Error())
 		return ErrEvalScannerNotDone
 	}
-	// 从scanner的step_data中提取parsed字段作为课程定位
 	scannerLocationJSON := extractScannerParsed(scannerStep.StepData)
 
 	// 4. 获取AI配置（使用evaluator场景）
@@ -777,7 +818,6 @@ func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 	// 5. 构造系统提示词和用户消息
 	systemPrompt := promptB.Content
 
-	// 用户消息：课程定位 + 待评估索引 + 解压缩字典
 	userPromptParts := []string{
 		"【课程定位】",
 		scannerLocationJSON,
@@ -788,7 +828,6 @@ func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 		"【TE-DNA解压缩字典】",
 		dict.Content,
 	}
-	// 如果有能力定位表，追加到用户消息
 	if abilityTable != nil && len(abilityTable.Content) > 20 {
 		userPromptParts = append(userPromptParts, "", "【能力定位表】", abilityTable.Content)
 	}
@@ -818,8 +857,8 @@ func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 		// 标记为运行中
 		_ = repository.UpdateEvalRoundRunning(roundRec.ID)
 
-		// 调用AI
-		callResult, callErr := ai.CallAI(aiCfg, systemPrompt, userPrompt)
+		// 调用AI（P5-2：带信号量控制）
+		callResult, callErr := s.callAIWithSemaphore(aiCfg, systemPrompt, userPrompt)
 		if callErr != nil {
 			_ = repository.FailEvalRound(roundRec.ID, "", callErr.Error())
 			failCount++
@@ -834,7 +873,6 @@ func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 		scoreTotal, scoreE1, scoreE2, scoreE3, scoreE4, hardConstraint, grade, parseOk := extractEvalScores(output)
 
 		if !parseOk || scoreTotal < 0 {
-			// 评分提取失败，标记轮次失败但保存输出
 			_ = repository.FailEvalRound(roundRec.ID, truncate(output, 5000), "评分提取失败")
 			failCount++
 			continue
@@ -928,8 +966,7 @@ func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 // ==================== Meta 步骤（P4-4新增）====================
 
 // executeMeta 执行meta步骤：元评估仲裁（Prompt E）
-// 综合N轮评估报告，输出仲裁分数+修改方案+修改后完整索引
-// 评分≥threshold(9.0)通过 | <threshold重试(最多max_meta_retry次)
+// P5-2更新：AI调用改用callAIWithSemaphore（信号量控制）
 func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 	startTime := time.Now()
 	stepName := models.StepMeta
@@ -940,8 +977,8 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 
 	// 解析Pipeline配置
 	pCfg := models.ParsePipelineConfig(pipeline.Config)
-	threshold := pCfg.Threshold   // 默认9.0
-	maxRetry := pCfg.MaxMetaRetry // 默认3
+	threshold := pCfg.Threshold
+	maxRetry := pCfg.MaxMetaRetry
 
 	// 1. 加载 Prompt E
 	promptE, err := repository.GetCurrentPromptByKey("prompt_e")
@@ -951,7 +988,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 		return ErrMetaPromptMissing
 	}
 
-	// 2. 加载解压缩字典（Meta也需要dict）
+	// 2. 加载解压缩字典
 	dict, err := repository.GetCurrentPromptByKey("dict")
 	if err != nil || dict == nil {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -959,7 +996,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 		return ErrMetaDictMissing
 	}
 
-	// 3. 获取课程索引（原始索引，作为Meta的输入）
+	// 3. 获取课程索引
 	course, err := repository.GetCourseByCode(pipeline.CourseCode)
 	if err != nil {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -975,7 +1012,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 		return fmt.Errorf(errMsg)
 	}
 
-	// 4. 获取Scanner步骤的parsed结果（课程定位JSON）
+	// 4. 获取Scanner步骤的parsed结果
 	scannerStep, err := repository.GetStepByName(pipeline.ID, models.StepScanner)
 	if err != nil || scannerStep.Status != models.StepStatusDone {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -984,7 +1021,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 	}
 	scannerLocationJSON := extractScannerParsed(scannerStep.StepData)
 
-	// 5. 获取Evaluator步骤的N轮评估报告（eval_rounds表中的output字段）
+	// 5. 获取Evaluator步骤的N轮评估报告
 	evalStep, err := repository.GetStepByName(pipeline.ID, models.StepEvaluator)
 	if err != nil || evalStep.Status != models.StepStatusDone {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -1057,7 +1094,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 	}
 	userPrompt := strings.Join(userPromptParts, "\n")
 
-	// 9. 重试循环：最多maxRetry次，每次调用AI并提取评分，达标即通过
+	// 9. 重试循环：最多maxRetry次
 	metaResult := &models.MetaResult{
 		TotalRetries: maxRetry,
 	}
@@ -1069,13 +1106,11 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 	for attempt := 1; attempt <= maxRetry; attempt++ {
 		metaResult.Attempt = attempt
 
-		// 调用AI
-		callResult, callErr := ai.CallAI(aiCfg, systemPrompt, userPrompt)
+		// 调用AI（P5-2：带信号量控制）
+		callResult, callErr := s.callAIWithSemaphore(aiCfg, systemPrompt, userPrompt)
 		if callErr != nil {
-			// AI调用失败，继续重试
 			totalLatencyMs += time.Since(startTime).Milliseconds() - totalLatencyMs
 			if attempt == maxRetry {
-				// 最后一次也失败
 				durationMs := time.Since(startTime).Milliseconds()
 				errMsg := fmt.Sprintf("%s (第%d次): %s", ErrMetaAIFailed.Error(), attempt, callErr.Error())
 				_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
@@ -1093,7 +1128,6 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 		scoreResult := extractMetaScores(lastOutput)
 
 		if !scoreResult.parseOk {
-			// 评分提取失败，继续重试
 			if attempt == maxRetry {
 				durationMs := time.Since(startTime).Milliseconds()
 				metaResult.RawOutput = truncate(lastOutput, 50000)
@@ -1129,7 +1163,6 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 		metaResult.LatencyMs = totalLatencyMs
 
 		if passed {
-			// 通过！保存结果并退出重试循环
 			durationMs := time.Since(startTime).Milliseconds()
 			if err := repository.CompleteStep(
 				pipeline.ID, stepName, durationMs,
@@ -1142,7 +1175,6 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 
 		// 未通过，如果还有重试次数则继续
 		if attempt == maxRetry {
-			// 所有重试用完，仍未达标
 			durationMs := time.Since(startTime).Milliseconds()
 			s.saveStepData(pipeline.ID, stepName, metaResult.ToJSON())
 			errMsg := fmt.Sprintf("%s (最终得分: %.1f, 阈值: %.1f, 共%d次尝试)",
@@ -1152,7 +1184,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 		}
 	}
 
-	// 理论上不会走到这里，但保险起见
+	// 理论上不会走到这里
 	durationMs := time.Since(startTime).Milliseconds()
 	_ = repository.FailStep(pipeline.ID, stepName, durationMs, "meta: 异常退出重试循环")
 	return fmt.Errorf("meta: 异常退出重试循环")
@@ -1162,18 +1194,18 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 
 // metaScoreResult Meta评分提取结果（内部使用）
 type metaScoreResult struct {
-	totalFinal     float64   // TOTAL_FINAL
-	e1Final        float64   // E1_FINAL
-	e2Final        float64   // E2_FINAL
-	e3Final        float64   // E3_FINAL
-	e4Final        float64   // E4_FINAL
-	hardConstraint string    // HARD_CONSTRAINT: PASS/FAIL
-	grade          string    // GRADE: A/B/C/D
-	e1Rounds       []float64 // 各轮E1分数 [R1,R2,...RN]
-	e2Rounds       []float64 // 各轮E2分数
-	e3Rounds       []float64 // 各轮E3分数
-	e4Rounds       []float64 // 各轮E4分数
-	parseOk        bool      // 是否成功提取
+	totalFinal     float64
+	e1Final        float64
+	e2Final        float64
+	e3Final        float64
+	e4Final        float64
+	hardConstraint string
+	grade          string
+	e1Rounds       []float64
+	e2Rounds       []float64
+	e3Rounds       []float64
+	e4Rounds       []float64
+	parseOk        bool
 }
 
 // extractMetaScores 从AI Meta输出中提取<<<META_SCORE>>>块中的评分
@@ -1185,7 +1217,6 @@ func extractMetaScores(output string) *metaScoreResult {
 	blockMatch := metaBlockRe.FindStringSubmatch(output)
 
 	if len(blockMatch) < 2 {
-		// 未找到META_SCORE块，尝试备用提取TOTAL_FINAL
 		totalFallbackRe := regexp.MustCompile(`(?i)TOTAL_FINAL:\s*([\d.]+)`)
 		tfm := totalFallbackRe.FindStringSubmatch(output)
 		if tfm != nil {
@@ -1203,7 +1234,7 @@ func extractMetaScores(output string) *metaScoreResult {
 	totalRe := regexp.MustCompile(`(?i)TOTAL_FINAL:\s*([\d.]+)`)
 	tm := totalRe.FindStringSubmatch(block)
 	if tm == nil {
-		return result // 没有TOTAL_FINAL视为解析失败
+		return result
 	}
 	result.totalFinal = safeParseFloat(tm[1])
 
@@ -1238,18 +1269,17 @@ func extractMetaScores(output string) *metaScoreResult {
 		result.grade = gm[1]
 	}
 
-	// 提取各轮分数：E1_R1:{值} E1_R2:{值} ...
+	// 提取各轮分数
 	roundRe := regexp.MustCompile(`(?i)E([1-4])_R(\d+):\s*([\d.]+)`)
 	allRoundMatches := roundRe.FindAllStringSubmatch(block, -1)
 
-	// 用map暂存：dim -> roundNum -> score
 	roundMap := map[int]map[int]float64{
 		1: {}, 2: {}, 3: {}, 4: {},
 	}
 	maxRound := 0
 	for _, m := range allRoundMatches {
-		dim, _ := strconv.Atoi(m[1]) // 1~4
-		rn, _ := strconv.Atoi(m[2])  // 轮次序号
+		dim, _ := strconv.Atoi(m[1])
+		rn, _ := strconv.Atoi(m[2])
 		score := safeParseFloat(m[3])
 		if dim >= 1 && dim <= 4 && rn >= 1 {
 			roundMap[dim][rn] = score
@@ -1259,7 +1289,6 @@ func extractMetaScores(output string) *metaScoreResult {
 		}
 	}
 
-	// 转换为有序数组
 	for rn := 1; rn <= maxRound; rn++ {
 		result.e1Rounds = append(result.e1Rounds, roundMap[1][rn])
 		result.e2Rounds = append(result.e2Rounds, roundMap[2][rn])
@@ -1267,9 +1296,7 @@ func extractMetaScores(output string) *metaScoreResult {
 		result.e4Rounds = append(result.e4Rounds, roundMap[4][rn])
 	}
 
-	// P4.5-D修复：从Meta完整输出末尾提取「综合评分：X→Y/10」中的Y值（修改后预期分）
-	// META_SCORE块中的TOTAL_FINAL是原始索引的仲裁分，末尾的综合评分才是修改后的预期分
-	// 格式示例：综合评分：8.3→9.9/10
+	// P4.5-D修复：从Meta完整输出末尾提取综合评分Y值（修改后预期分）
 	finalScoreRe := regexp.MustCompile(`(?:综合评分|综合)[：:]\s*[\d.]+\s*→\s*([\d.]+)\s*/\s*10`)
 	if fsm := finalScoreRe.FindStringSubmatch(output); fsm != nil {
 		newScore := safeParseFloat(fsm[1])
@@ -1285,9 +1312,7 @@ func extractMetaScores(output string) *metaScoreResult {
 // ==================== P4.5-C 审核决策方法 ====================
 
 // GetGeneratedPages 获取Pipeline的生成页面列表（含完整HTML）
-// P4.5-C新增：审核页面需要完整HTML用于预览和对比
 func (s *PipelineService) GetGeneratedPages(pipelineID string) ([]*repository.GeneratedPageFullRow, error) {
-	// 验证Pipeline存在
 	_, err := repository.GetPipelineByID(pipelineID)
 	if err != nil {
 		return nil, ErrPipelineNotFound
@@ -1305,30 +1330,24 @@ func (s *PipelineService) GetGeneratedPages(pipelineID string) ([]*repository.Ge
 }
 
 // UpdatePageDecision 更新单页审核决策
-// P4.5-C新增：支持approve（采用AI生成）/reject（保留原版）/edit（使用编辑后的HTML）
 func (s *PipelineService) UpdatePageDecision(pipelineID string, pageNumber int, decision string, finalHTML *string) error {
-	// 验证Pipeline存在且状态允许审核
 	pipeline, err := repository.GetPipelineByID(pipelineID)
 	if err != nil {
 		return ErrPipelineNotFound
 	}
-	// 允许在review_queue或needs_human状态下进行审核操作
 	if pipeline.Status != models.PipelineStatusReviewQueue && pipeline.Status != models.PipelineStatusNeedsHuman {
 		return ErrPipelineNotReviewable
 	}
 
-	// 验证决策值有效性
 	validDecisions := map[string]bool{"approve": true, "reject": true, "edit": true}
 	if !validDecisions[decision] {
 		return ErrInvalidDecision
 	}
 
-	// edit决策必须提供finalHTML
 	if decision == "edit" && (finalHTML == nil || *finalHTML == "") {
 		return fmt.Errorf("edit决策必须提供修改后的HTML内容")
 	}
 
-	// 执行数据库更新
 	if err := repository.UpdatePageDecision(pipelineID, pageNumber, decision, finalHTML); err != nil {
 		return err
 	}
@@ -1337,9 +1356,7 @@ func (s *PipelineService) UpdatePageDecision(pipelineID string, pageNumber int, 
 }
 
 // FinalizePipeline 定稿归档Pipeline
-// P4.5-C新增：检查所有页面都已决策后，将Pipeline标记为finalized
 func (s *PipelineService) FinalizePipeline(pipelineID string) error {
-	// 验证Pipeline存在且状态允许定稿
 	pipeline, err := repository.GetPipelineByID(pipelineID)
 	if err != nil {
 		return ErrPipelineNotFound
@@ -1348,7 +1365,6 @@ func (s *PipelineService) FinalizePipeline(pipelineID string) error {
 		return ErrPipelineNotReviewable
 	}
 
-	// 检查是否所有页面都已决策
 	total, decided, err := repository.GetPageDecisionStats(pipelineID)
 	if err != nil {
 		return fmt.Errorf("检查页面决策状态失败: %w", err)
@@ -1361,17 +1377,14 @@ func (s *PipelineService) FinalizePipeline(pipelineID string) error {
 			ErrFinalizeIncomplete, total, decided, total-decided)
 	}
 
-	// 标记review步骤完成
 	reviewStep, err := repository.GetStepByName(pipelineID, models.StepReview)
 	if err == nil && reviewStep.Status != models.StepStatusDone {
 		_ = repository.StartStep(pipelineID, models.StepReview)
-		// review步骤的step_data记录定稿统计
 		statsJSON := fmt.Sprintf(`{"total_pages":%d,"decided_pages":%d,"finalized_at":"%s"}`,
 			total, decided, time.Now().Format(time.RFC3339))
 		_ = repository.CompleteStep(pipelineID, models.StepReview, 0, statsJSON, "", 0)
 	}
 
-	// 更新Pipeline状态为finalized
 	if err := repository.CompletePipeline(pipelineID, models.PipelineStatusFinalized); err != nil {
 		return fmt.Errorf("定稿失败: %w", err)
 	}
@@ -1406,9 +1419,7 @@ func extractScannerParsed(stepData string) string {
 }
 
 // extractEvalScores 从AI评估输出中提取SCORE_BLOCK评分
-// 返回：scoreTotal, scoreE1, scoreE2, scoreE3, scoreE4, hardConstraint, grade, parseOk
 func extractEvalScores(output string) (float64, float64, float64, float64, float64, string, string, bool) {
-	// 主要格式：<<<SCORE_BLOCK>>>...<<<END_SCORE_BLOCK>>>
 	scoreBlockRe := regexp.MustCompile(`(?s)<<<SCORE_BLOCK>>>(.*?)<<<END_SCORE_BLOCK>>>`)
 	sbMatch := scoreBlockRe.FindStringSubmatch(output)
 
@@ -1485,13 +1496,12 @@ func extractEvalScores(output string) (float64, float64, float64, float64, float
 		}
 	}
 
-	// 提取失败
 	return -1, 0, 0, 0, 0, "", "", false
 }
 
 // ==================== 工具方法 ====================
 
-// saveStepData 单独更新步骤的step_data字段（用于失败后保存诊断数据）
+// saveStepData 单独更新步骤的step_data字段
 func (s *PipelineService) saveStepData(pipelineID string, stepName string, data string) {
 	if data == "" || data == "{}" {
 		return
@@ -1512,7 +1522,7 @@ func truncate(s string, maxLen int) string {
 	return string(runes[:maxLen]) + "..."
 }
 
-// getMapKeys 获取map的key列表（供错误诊断）
+// getMapKeys 获取map的key列表
 func getMapKeys(m map[string]interface{}) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -1587,7 +1597,6 @@ func (s *PipelineService) GetEvalRounds(pipelineID string) ([]*EvalRoundDetail, 
 			ModelUsed:   r.ModelUsed,
 			TokensUsed:  r.TokensUsed,
 		}
-		// 从dimensions JSON提取hard_constraint和grade
 		if r.Dimensions != "" && r.Dimensions != "null" {
 			var dims map[string]interface{}
 			if jsonErr := json.Unmarshal([]byte(r.Dimensions), &dims); jsonErr == nil {
@@ -1611,14 +1620,13 @@ func (s *PipelineService) GetEvalRounds(pipelineID string) ([]*EvalRoundDetail, 
 // ==================== P4.5-E-2 AI快修方法 ====================
 
 // AIFixPage 审核员在全屏预览中发现生成HTML有问题时，输入修改指令让AI修复
-// 流程：读取当前页generated_html + prompt_f + fix_instruction → 调AI → 返回新HTML → 更新数据库
+// P5-2更新：AI调用改用callAIWithSemaphore（信号量控制）
 func (s *PipelineService) AIFixPage(pipelineID string, pageNumber int, fixInstruction string) (string, error) {
 	// 1. 验证Pipeline存在且状态允许审核操作
 	pipeline, err := repository.GetPipelineByID(pipelineID)
 	if err != nil {
 		return "", ErrPipelineNotFound
 	}
-	// 允许在 review_queue / needs_human / finalized 状态下使用AI快修
 	allowedStatuses := map[string]bool{
 		models.PipelineStatusReviewQueue: true,
 		models.PipelineStatusNeedsHuman:  true,
@@ -1644,7 +1652,6 @@ func (s *PipelineService) AIFixPage(pipelineID string, pageNumber int, fixInstru
 		return "", ErrPageNotFound
 	}
 
-	// 取当前最佳HTML：优先final_html，其次generated_html，最后original_html
 	currentHTML := currentPage.FinalHTML
 	if currentHTML == "" {
 		currentHTML = currentPage.GeneratedHTML
@@ -1656,13 +1663,13 @@ func (s *PipelineService) AIFixPage(pipelineID string, pageNumber int, fixInstru
 		return "", fmt.Errorf("页面P%d无可用HTML内容", pageNumber)
 	}
 
-	// 3. 加载 Prompt F（作为系统提示词）
+	// 3. 加载 Prompt F
 	promptF, err := repository.GetCurrentPromptByKey("prompt_f")
 	if err != nil || promptF == nil {
 		return "", fmt.Errorf("Prompt F未配置，无法执行AI快修")
 	}
 
-	// 4. 获取AI配置（使用generator场景）
+	// 4. 获取AI配置
 	aiCfg, err := ai.GetEffectiveConfig(
 		s.cfg.AESKey,
 		"generator",
@@ -1674,21 +1681,21 @@ func (s *PipelineService) AIFixPage(pipelineID string, pageNumber int, fixInstru
 		return "", fmt.Errorf("获取AI配置失败: %w", err)
 	}
 
-	// 5. 构建用户消息：原始HTML + 修复指令
-	userPrompt := "【⚠️⚠️⚠️ 最重要 — 当前页面HTML，你必须在此基础上修复，禁止重写】\n" +
+	// 5. 构建用户消息
+	userPrompt := "【\u26a0\ufe0f\u26a0\ufe0f\u26a0\ufe0f 最重要 \u2014 当前页面HTML，你必须在此基础上修复，禁止重写】\n" +
 		"以下是当前页面的完整HTML。你的输出必须以此为基础，只修改下方修复指令要求的部分，其余代码原封不动保留。\n\n" +
 		currentHTML + "\n\n" +
-		"══════════════════════════════════════════════\n" +
-		"▲ 以上是当前HTML（必须作为修改基础） ▼ 以下是修复指令\n" +
-		"══════════════════════════════════════════════\n\n" +
-		fmt.Sprintf("【页面】P%02d — %s\n", pageNumber, currentPage.PageTitle) +
+		"\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n" +
+		"\u25b2 以上是当前HTML（必须作为修改基础） \u25bc 以下是修复指令\n" +
+		"\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\n" +
+		fmt.Sprintf("【页面】P%02d \u2014 %s\n", pageNumber, currentPage.PageTitle) +
 		"【操作类型】AI快修（在当前HTML基础上修复指定问题）\n\n" +
 		"【审核员修复指令（必须严格执行）】\n" +
 		fixInstruction + "\n\n" +
-		"【⚠️ 最终提醒】你的输出必须与上方HTML有90%以上代码重合。只改指令要求的部分。导航栏、视频、图片不允许任何改动。输出完整HTML。"
+		"【\u26a0\ufe0f 最终提醒】你的输出必须与上方HTML有90%以上代码重合。只改指令要求的部分。导航栏、视频、图片不允许任何改动。输出完整HTML。"
 
-	// 6. 调用AI
-	callResult, callErr := ai.CallAI(aiCfg, promptF.Content, userPrompt)
+	// 6. 调用AI（P5-2：带信号量控制）
+	callResult, callErr := s.callAIWithSemaphore(aiCfg, promptF.Content, userPrompt)
 	if callErr != nil {
 		return "", fmt.Errorf("%w: %s", ErrAIFixFailed, callErr.Error())
 	}
@@ -1699,7 +1706,7 @@ func (s *PipelineService) AIFixPage(pipelineID string, pageNumber int, fixInstru
 		return "", fmt.Errorf("%w: AI输出HTML过短(%d字符)", ErrAIFixFailed, len(newHTML))
 	}
 
-	// 8. 更新数据库：同时更新generated_html和final_html
+	// 8. 更新数据库
 	if err := repository.UpdateGeneratedPageHTML(pipelineID, pageNumber, newHTML, newHTML); err != nil {
 		return "", fmt.Errorf("保存修复后HTML失败: %w", err)
 	}

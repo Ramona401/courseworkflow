@@ -1,9 +1,11 @@
 package services
 
 // ==================== P4.6-2 验收执行逻辑 + P4.6-3 2审自动流程 ====================
-// P4.6-2：executeVerify方法：收集最终HTML → 调索引生成器(prompt_g) → 调Evaluator(prompt_b) 1轮 → 判定
+// P4.6-2：executeVerify方法：收集最终HTML -> 调索引生成器(prompt_g) -> 调Evaluator(prompt_b) 1轮 -> 判定
 // P4.6-2：VerifyPipeline入口方法：手动触发验收（POST /pipelines/{id}/verify）
-// P4.6-3：startRetrialPipeline方法：验收失败后自动启动2审（evaluator 2轮→meta→translator→generator→审核队列）
+// P4.6-3：startRetrialPipeline方法：验收失败后自动启动2审
+// P5-2更新：AI调用改用callAIWithSemaphore（信号量控制）
+// P5-2更新：startRetrialPipeline和BatchVerify改用Engine提交任务
 
 import (
 	"fmt"
@@ -40,10 +42,7 @@ var (
 // VerifyPipeline 手动触发验收流程
 // P4.6-2新增：POST /pipelines/{id}/verify 的业务逻辑入口
 // P4.6-3增强：验收失败后根据review_round自动决定后续动作
-//   - review_round=1 且 verify_failed → 自动启动2审流程（goroutine异步执行）
-//   - review_round≥2 且 verify_failed → 标记needs_human（严重质量问题，不再自动重试）
-// 前置条件：Pipeline状态必须是 finalized
-// 流程：更新状态为running → 执行verify步骤 → 根据评分设置verified/verify_failed → 判断是否触发2审
+// P5-2更新：2审流程通过Engine提交任务（如果Engine已注入）
 func (s *PipelineService) VerifyPipeline(pipelineID string) (*models.PipelineDetailResponse, error) {
 	// 1. 获取Pipeline并检查状态
 	pipeline, err := repository.GetPipelineByID(pipelineID)
@@ -78,36 +77,47 @@ func (s *PipelineService) VerifyPipeline(pipelineID string) (*models.PipelineDet
 	// 5. 验收步骤执行成功后，根据verify步骤的step_data判断通过/失败
 	verifyStep, stepErr := repository.GetStepByName(pipelineID, models.StepVerify)
 	if stepErr != nil || verifyStep.Status != models.StepStatusDone {
-		// 异常情况：步骤未正确完成
 		_ = repository.UpdatePipelineError(pipelineID, models.StepVerify, "验收步骤未正确完成")
 		return s.GetPipelineDetail(pipelineID)
 	}
 
 	// 从verify步骤的step_data提取passed字段
 	if verifyStep.StepData != "" && verifyStep.StepData != "null" {
-		// 使用简单的字符串匹配方式（避免重复导入encoding/json）
-		if strings.Contains(verifyStep.StepData, `"passed":true`) {
-			// ===== 验收通过 → verified =====
+		if strings.Contains(verifyStep.StepData, "\"passed\":true") {
+			// ===== 验收通过 -> verified =====
 			if err := repository.CompletePipeline(pipelineID, models.PipelineStatusVerified); err != nil {
 				return nil, fmt.Errorf("标记验收通过失败: %w", err)
 			}
 		} else {
-			// ===== 验收未通过 → verify_failed =====
+			// ===== 验收未通过 -> verify_failed =====
 			if err := repository.CompletePipeline(pipelineID, models.PipelineStatusVerifyFailed); err != nil {
 				return nil, fmt.Errorf("标记验收未通过失败: %w", err)
 			}
 
 			// P4.6-3：根据review_round决定后续动作
 			if pipeline.ReviewRound <= 1 {
-				// 初审验收失败 → 自动启动2审流程（goroutine异步执行，不阻塞当前请求）
-				go s.startRetrialPipeline(pipelineID)
+				// 初审验收失败 -> 自动启动2审流程
+				// P5-2改造：通过Engine提交任务（如果Engine已注入）
+				if s.engine != nil {
+					task := &EngineTask{
+						Type:       TaskTypeRetrial,
+						PipelineID: pipelineID,
+						ExecFunc:   func() { s.startRetrialPipeline(pipelineID) },
+					}
+					if !s.engine.Submit(task) {
+						// 队列已满，记录错误但不阻塞验收返回
+						fmt.Printf("[验收] 2审任务提交失败（队列已满）: pipeline=%s\n", pipelineID)
+					}
+				} else {
+					// 兼容模式：无Engine时直接goroutine执行
+					go s.startRetrialPipeline(pipelineID)
+				}
 			} else {
-				// 2审验收仍然失败 → 标记"严重质量问题"，需要人工介入
+				// 2审验收仍然失败 -> 标记"严重质量问题"，需要人工介入
 				_ = repository.UpdatePipelineStatus(pipelineID, models.StepVerify, models.PipelineStatusNeedsHuman)
 			}
 		}
 	} else {
-		// step_data为空，异常情况
 		_ = repository.UpdatePipelineError(pipelineID, models.StepVerify, "验收步骤输出数据为空")
 		return s.GetPipelineDetail(pipelineID)
 	}
@@ -118,15 +128,8 @@ func (s *PipelineService) VerifyPipeline(pipelineID string) (*models.PipelineDet
 // ==================== P4.6-3 2审自动流程 ====================
 
 // startRetrialPipeline 验收失败后自动启动2审流程
-// P4.6-3新增：异步执行（在goroutine中调用），不阻塞验收接口返回
-// 流程：
-//  1. 设置review_round=2
-//  2. 清理旧的eval_rounds和generated_pages
-//  3. 重置evaluator/meta/translator/generator/review/verify步骤为pending
-//  4. 更新Pipeline状态为running
-//  5. 依次执行：evaluator(2轮) → meta → translator → generator
-//  6. 成功后放入审核队列（review_queue），标记为2审待审核
-//  7. 失败则标记Pipeline为failed并记录错误
+// P4.6-3新增：异步执行（在Engine Worker或goroutine中调用）
+// 流程：设review_round=2 -> 清旧数据 -> 重置步骤 -> evaluator(2轮)+meta+translator+generator -> review_queue
 func (s *PipelineService) startRetrialPipeline(pipelineID string) {
 	// 1. 更新review_round为2
 	if err := repository.UpdatePipelineReviewRound(pipelineID, 2); err != nil {
@@ -139,8 +142,7 @@ func (s *PipelineService) startRetrialPipeline(pipelineID string) {
 	_ = repository.DeleteEvalRoundsByPipelineID(pipelineID)
 	_ = repository.DeleteGeneratedPagesByPipelineID(pipelineID)
 
-	// 3. 重置需要重跑的步骤为pending状态（evaluator/meta/translator/generator/review/verify）
-	// 注意：dbCheck和scanner不需要重跑（课程索引和定位信息不变）
+	// 3. 重置需要重跑的步骤为pending状态
 	resetSteps := []string{
 		models.StepEvaluator,
 		models.StepMeta,
@@ -155,14 +157,14 @@ func (s *PipelineService) startRetrialPipeline(pipelineID string) {
 		return
 	}
 
-	// 4. 更新Pipeline状态为running，当前步骤为evaluator
+	// 4. 更新Pipeline状态为running
 	if err := repository.UpdatePipelineStatus(pipelineID, models.StepEvaluator, models.PipelineStatusRunning); err != nil {
 		_ = repository.UpdatePipelineError(pipelineID, models.StepEvaluator,
 			fmt.Sprintf("2审启动失败: 更新状态失败: %s", err.Error()))
 		return
 	}
 
-	// 5. 重新读取Pipeline（review_round已更新为2）
+	// 5. 重新读取Pipeline
 	pipeline, err := repository.GetPipelineByID(pipelineID)
 	if err != nil {
 		_ = repository.UpdatePipelineError(pipelineID, models.StepEvaluator,
@@ -170,17 +172,15 @@ func (s *PipelineService) startRetrialPipeline(pipelineID string) {
 		return
 	}
 
-	// ===== 阶段A：执行Evaluator（2轮评估，比初审的3轮少1轮以节省时间） =====
-	// 临时修改Pipeline config中的eval_rounds为2
+	// ===== 阶段A：执行Evaluator（2轮评估） =====
 	pCfg := models.ParsePipelineConfig(pipeline.Config)
 	originalEvalRounds := pCfg.EvalRounds
 	pCfg.EvalRounds = 2
 	pipeline.Config = pCfg.ToJSON()
-	// 注意：这里只修改内存中的config，不写回数据库，因为executeEvaluator从pipeline.Config读取
 
 	evalErr := s.executeEvaluator(pipeline)
 
-	// 恢复原始eval_rounds（避免影响后续步骤读取config）
+	// 恢复原始eval_rounds
 	pCfg.EvalRounds = originalEvalRounds
 	pipeline.Config = pCfg.ToJSON()
 
@@ -197,7 +197,6 @@ func (s *PipelineService) startRetrialPipeline(pipelineID string) {
 		return
 	}
 
-	// 重新读取Pipeline（current_step已更新）
 	pipeline, err = repository.GetPipelineByID(pipelineID)
 	if err != nil {
 		_ = repository.UpdatePipelineError(pipelineID, models.StepMeta, "2审读取Pipeline失败")
@@ -257,15 +256,12 @@ func (s *PipelineService) startRetrialPipeline(pipelineID string) {
 			fmt.Sprintf("2审推进到Review失败: %s", err.Error()))
 		return
 	}
-
-	// 2审流程成功完成，Pipeline现在处于review_queue状态，等待人工审核
-	// 人工审核后定稿 → 再次触发验收 → 通过则verified，不通过则needs_human
 }
 
 // ==================== executeVerify 核心执行方法 ====================
 
-// executeVerify 执行验收步骤：收集最终HTML → 索引生成器(prompt_g) → Evaluator(prompt_b) 1轮 → 判定
-// P4.6-2新增：验收步骤的核心执行逻辑
+// executeVerify 执行验收步骤：收集最终HTML -> 索引生成器(prompt_g) -> Evaluator(prompt_b) 1轮 -> 判定
+// P5-2更新：AI调用改用callAIWithSemaphore（信号量控制）
 func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 	startTime := time.Now()
 	stepName := models.StepVerify
@@ -277,11 +273,10 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 
 	// 解析Pipeline配置获取阈值
 	pCfg := models.ParsePipelineConfig(pipeline.Config)
-	threshold := pCfg.Threshold // 默认9.0
+	threshold := pCfg.Threshold
 
 	// ===== 阶段1：加载所需提示词 =====
 
-	// 1a. 加载 Prompt G（索引生成器 v4.8）
 	promptG, err := repository.GetCurrentPromptByKey("prompt_g")
 	if err != nil || promptG == nil {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -289,7 +284,6 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 		return ErrVerifyPromptGMissing
 	}
 
-	// 1b. 加载 Prompt B（评估器）
 	promptB, err := repository.GetCurrentPromptByKey("prompt_b")
 	if err != nil || promptB == nil {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -297,7 +291,6 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 		return ErrVerifyPromptBMissing
 	}
 
-	// 1c. 加载解压缩字典
 	dict, err := repository.GetCurrentPromptByKey("dict")
 	if err != nil || dict == nil {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -305,7 +298,6 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 		return ErrVerifyDictMissing
 	}
 
-	// 1d. ability_table可选
 	abilityTable, _ := repository.GetCurrentPromptByKey("ability_table")
 
 	// ===== 阶段2：获取Scanner课程定位 =====
@@ -327,7 +319,6 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 
 	// ===== 阶段4：调用索引生成器(prompt_g)压缩索引 =====
 
-	// 4a. 获取AI配置（使用evaluator场景，因为索引生成器也是评估类任务）
 	aiCfg, err := ai.GetEffectiveConfig(
 		s.cfg.AESKey,
 		"evaluator",
@@ -342,7 +333,6 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 		return fmt.Errorf(errMsg)
 	}
 
-	// 4b. 构造索引生成器的用户消息：课程定位 + 最终HTML
 	indexGenUserParts := []string{
 		"【课程定位】",
 		scannerLocationJSON,
@@ -356,11 +346,11 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 	}
 	indexGenUserPrompt := strings.Join(indexGenUserParts, "\n")
 
-	// 4c. 调用AI索引生成器
 	var totalTokens int
 	var lastModelUsed string
 
-	indexCallResult, indexCallErr := ai.CallAI(aiCfg, promptG.Content, indexGenUserPrompt)
+	// P5-2：AI调用使用信号量控制
+	indexCallResult, indexCallErr := s.callAIWithSemaphore(aiCfg, promptG.Content, indexGenUserPrompt)
 	if indexCallErr != nil {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("%s: %s", ErrVerifyIndexGenFailed.Error(), indexCallErr.Error())
@@ -372,7 +362,6 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 	totalTokens += indexCallResult.TokensUsed
 	lastModelUsed = indexCallResult.ModelUsed
 
-	// 4d. 验证索引生成结果（至少应有一定长度）
 	if len(generatedIndex) < 200 {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("%s (输出长度: %d字符)", ErrVerifyIndexTooShort.Error(), len(generatedIndex))
@@ -382,7 +371,6 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 
 	// ===== 阶段5：调用Evaluator(prompt_b) 1轮评估 =====
 
-	// 5a. 构造Evaluator的用户消息：课程定位 + 新索引 + 解压缩字典
 	evalUserParts := []string{
 		"【课程定位】",
 		scannerLocationJSON,
@@ -393,19 +381,17 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 		"【TE-DNA解压缩字典】",
 		dict.Content,
 	}
-	// 如果有能力定位表，追加
 	if abilityTable != nil && len(abilityTable.Content) > 20 {
 		evalUserParts = append(evalUserParts, "", "【能力定位表】", abilityTable.Content)
 	}
 	evalUserParts = append(evalUserParts, "", "禁止输出<thinking>标签或任何思维过程标记。")
 	evalUserPrompt := strings.Join(evalUserParts, "\n")
 
-	// 5b. 调用AI评估
-	evalCallResult, evalCallErr := ai.CallAI(aiCfg, promptB.Content, evalUserPrompt)
+	// P5-2：AI调用使用信号量控制
+	evalCallResult, evalCallErr := s.callAIWithSemaphore(aiCfg, promptB.Content, evalUserPrompt)
 	if evalCallErr != nil {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("%s: %s", ErrVerifyEvalFailed.Error(), evalCallErr.Error())
-		// 即使评估调用失败，也保存已生成的索引到step_data
 		verifyResult := &models.VerifyResult{
 			GeneratedIndex: truncate(generatedIndex, 50000),
 			ReviewRound:    pipeline.ReviewRound,
@@ -422,11 +408,9 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 	totalTokens += evalCallResult.TokensUsed
 	lastModelUsed = evalCallResult.ModelUsed
 
-	// 5c. 提取评估评分（复用extractEvalScores方法，从SCORE_BLOCK中提取）
 	scoreTotal, scoreE1, scoreE2, scoreE3, scoreE4, _, _, parseOk := extractEvalScores(evalOutput)
 	if !parseOk || scoreTotal < 0 {
 		durationMs := time.Since(startTime).Milliseconds()
-		// 评分提取失败，保存诊断数据
 		verifyResult := &models.VerifyResult{
 			GeneratedIndex: truncate(generatedIndex, 50000),
 			EvalOutput:     truncate(evalOutput, 50000),
@@ -458,7 +442,6 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 		LatencyMs:      time.Since(startTime).Milliseconds(),
 	}
 
-	// 保存verify步骤完成
 	durationMs := time.Since(startTime).Milliseconds()
 	if err := repository.CompleteStep(
 		pipeline.ID, stepName, durationMs,
@@ -473,10 +456,7 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 // ==================== 收集最终HTML辅助方法 ====================
 
 // collectFinalHTML 收集Pipeline的所有最终HTML页面内容
-// P4.6-2新增：遍历generated_pages，根据decision选择最终HTML版本
-// 返回：拼接后的HTML内容字符串、有效页面数、错误
 func (s *PipelineService) collectFinalHTML(pipelineID string) (string, int, error) {
-	// 从数据库获取所有生成页面（含完整HTML）
 	pages, err := repository.GetGeneratedPagesWithHTML(pipelineID)
 	if err != nil {
 		return "", 0, fmt.Errorf("获取生成页面失败: %w", err)
@@ -485,39 +465,32 @@ func (s *PipelineService) collectFinalHTML(pipelineID string) (string, int, erro
 		return "", 0, ErrVerifyNoPages
 	}
 
-	// 遍历页面，根据decision选择最终HTML版本
 	var htmlParts []string
 	validCount := 0
 
 	for _, page := range pages {
-		// 跳过删除的页面
 		if page.Operation == models.PageOpDelete {
 			continue
 		}
 
-		// 根据decision选择HTML版本
 		var html string
 		switch page.Decision {
 		case "approve":
-			// 采用AI生成版本：优先generated_html，回退到final_html
 			html = page.GeneratedHTML
 			if html == "" {
 				html = page.FinalHTML
 			}
 		case "reject":
-			// 保留原版：优先original_html，回退到final_html
 			html = page.OriginalHTML
 			if html == "" {
 				html = page.FinalHTML
 			}
 		case "edit":
-			// 使用编辑后版本：优先final_html
 			html = page.FinalHTML
 			if html == "" {
 				html = page.GeneratedHTML
 			}
 		default:
-			// pending或其他状态：取final_html → generated_html → original_html
 			html = page.FinalHTML
 			if html == "" {
 				html = page.GeneratedHTML
@@ -527,7 +500,6 @@ func (s *PipelineService) collectFinalHTML(pipelineID string) (string, int, erro
 			}
 		}
 
-		// 只收集有内容的页面
 		if len(html) > 100 {
 			htmlParts = append(htmlParts,
 				fmt.Sprintf("═══ 【P%02d %s】 ═══", page.PageNumber, page.PageTitle),
@@ -547,21 +519,19 @@ func (s *PipelineService) collectFinalHTML(pipelineID string) (string, int, erro
 
 // ==================== P4.6-4 批量验收+夜间定时任务 ====================
 
-// BatchVerifyResult 批量验收结果（返回给前端/日志）
+// BatchVerifyResult 批量验收结果
 type BatchVerifyResult struct {
-	TotalFound   int      `json:"total_found"`   // 找到的finalized Pipeline数量
-	StartedIDs   []string `json:"started_ids"`   // 已启动验收的Pipeline ID列表
-	SkippedIDs   []string `json:"skipped_ids"`   // 跳过的Pipeline ID列表（状态已变化等）
-	ErrorMessage string   `json:"error_message"` // 整体错误信息（如有）
+	TotalFound   int      `json:"total_found"`
+	StartedIDs   []string `json:"started_ids"`
+	SkippedIDs   []string `json:"skipped_ids"`
+	ErrorMessage string   `json:"error_message"`
 }
 
 // BatchVerify 批量触发验收：扫描所有finalized状态的Pipeline，逐个触发验收
-// P4.6-4新增：手动批量验收接口(POST /pipelines/batch-verify)和夜间定时任务共用
-// 每个Pipeline的验收在独立goroutine中执行，不阻塞批量接口返回
+// P5-2更新：每个验收通过Engine提交任务（如果Engine已注入）
 func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 	result := &BatchVerifyResult{}
 
-	// 1. 查询所有finalized状态的Pipeline
 	ids, err := repository.ListFinalizedPipelineIDs()
 	if err != nil {
 		result.ErrorMessage = fmt.Sprintf("查询finalized Pipeline失败: %s", err.Error())
@@ -573,9 +543,7 @@ func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 		return result, nil
 	}
 
-	// 2. 逐个检查并启动验收（每个在独立goroutine中异步执行）
 	for _, id := range ids {
-		// 再次确认状态仍为finalized（防止并发修改）
 		pipeline, pErr := repository.GetPipelineByID(id)
 		if pErr != nil || pipeline.Status != models.PipelineStatusFinalized {
 			result.SkippedIDs = append(result.SkippedIDs, id)
@@ -584,24 +552,34 @@ func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 
 		result.StartedIDs = append(result.StartedIDs, id)
 
-		// 异步执行验收（复用VerifyPipeline方法，内部会处理verify_failed→2审等逻辑）
-		go s.VerifyPipeline(id)
+		// P5-2改造：通过Engine提交验收任务
+		capturedID := id // 闭包捕获
+		if s.engine != nil {
+			task := &EngineTask{
+				Type:       TaskTypeVerify,
+				PipelineID: capturedID,
+				ExecFunc:   func() { s.VerifyPipeline(capturedID) },
+			}
+			if !s.engine.Submit(task) {
+				fmt.Printf("[批量验收] 任务提交失败（队列已满）: pipeline=%s\n", capturedID)
+				result.SkippedIDs = append(result.SkippedIDs, capturedID)
+			}
+		} else {
+			// 兼容模式：无Engine时直接goroutine执行
+			go s.VerifyPipeline(capturedID)
+		}
 	}
 
 	return result, nil
 }
 
 // StartNightlyVerifyScheduler 启动夜间批量验收定时任务
-// P4.6-4新增：在main.go中调用，每晚凌晨2:00（UTC+8）扫描finalized Pipeline批量验收
-// 使用goroutine + time.Timer实现，无需外部cron依赖
+// P4.6-4新增：每晚凌晨2:00（UTC+8）扫描finalized Pipeline批量验收
 func (s *PipelineService) StartNightlyVerifyScheduler() {
 	go func() {
 		for {
-			// 计算距离下一个凌晨2:00的时间间隔
 			now := time.Now()
-			// 构造今天凌晨2:00（东八区，服务器本地时区）
 			next := time.Date(now.Year(), now.Month(), now.Day(), 2, 0, 0, 0, now.Location())
-			// 如果当前时间已过凌晨2:00，则设为明天凌晨2:00
 			if now.After(next) {
 				next = next.Add(24 * time.Hour)
 			}
@@ -609,18 +587,16 @@ func (s *PipelineService) StartNightlyVerifyScheduler() {
 
 			fmt.Printf("[夜间验收] 下次执行时间: %s（等待 %s）\n", next.Format("2006-01-02 15:04:05"), waitDuration)
 
-			// 等待到目标时间
 			timer := time.NewTimer(waitDuration)
 			<-timer.C
 
-			// 执行批量验收
 			fmt.Printf("[夜间验收] %s 开始执行批量验收...\n", time.Now().Format("2006-01-02 15:04:05"))
-			result, err := s.BatchVerify()
-			if err != nil {
-				fmt.Printf("[夜间验收] 执行失败: %s\n", err.Error())
+			batchResult, batchErr := s.BatchVerify()
+			if batchErr != nil {
+				fmt.Printf("[夜间验收] 执行失败: %s\n", batchErr.Error())
 			} else {
 				fmt.Printf("[夜间验收] 执行完成: 找到%d个finalized Pipeline，已启动%d个验收，跳过%d个\n",
-					result.TotalFound, len(result.StartedIDs), len(result.SkippedIDs))
+					batchResult.TotalFound, len(batchResult.StartedIDs), len(batchResult.SkippedIDs))
 			}
 		}
 	}()

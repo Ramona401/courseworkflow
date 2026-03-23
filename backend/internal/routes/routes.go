@@ -12,7 +12,7 @@ import (
 )
 
 // Setup 注册所有路由并返回根Handler
-// 版本：0.25.0（P4.6-4新增batch-verify批量验收路由+夜间定时任务）
+// 版本：0.26.0（P5-2新增并发引擎+AI限流+引擎状态接口）
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -23,7 +23,12 @@ func Setup(cfg *config.Config) http.Handler {
 	promptService := services.NewPromptService()
 	edService := services.NewExternalDataService(cfg)
 	courseService := services.NewCourseService(cfg)
-	pipelineService := services.NewPipelineService(cfg) // P4-1新增
+	pipelineService := services.NewPipelineService(cfg)
+
+	// ==================== P5-2新增：创建并发引擎并注入PipelineService ====================
+	// 参数：maxWorkers=3（同时执行3个Pipeline），maxAIConcurrency=2（同时2个AI调用），queueSize=50
+	engine := services.NewEngine(3, 2, 50)
+	pipelineService.SetEngine(engine)
 
 	// ==================== P4.6-4新增：启动夜间批量验收定时任务 ====================
 	pipelineService.StartNightlyVerifyScheduler()
@@ -35,7 +40,7 @@ func Setup(cfg *config.Config) http.Handler {
 	promptHandler := handlers.NewPromptHandler(promptService)
 	edHandler := handlers.NewExternalDataHandler(edService)
 	courseHandler := handlers.NewCourseHandler(courseService)
-	pipelineHandler := handlers.NewPipelineHandler(pipelineService) // P4-1新增
+	pipelineHandler := handlers.NewPipelineHandler(pipelineService)
 
 	// ==================== 中间件 ====================
 	authMW := middleware.AuthMiddleware(authService)
@@ -50,8 +55,35 @@ func Setup(cfg *config.Config) http.Handler {
 	mux.Handle("/api/v1/auth/logout", middleware.Chain(http.HandlerFunc(authHandler.Logout), authMW))
 
 	// ==================== 仪表盘路由（P4.5-D新增） ====================
-	// GET /api/v1/dashboard/stats — 获取仪表盘统计数据（登录即可）
 	mux.Handle("/api/v1/dashboard/stats", middleware.Chain(http.HandlerFunc(pipelineHandler.GetDashboardStats), authMW))
+
+	// ==================== P5-2新增：引擎状态查询路由 ====================
+	// GET /api/v1/engine/stats — 获取并发引擎运行统计（仅admin）
+	mux.Handle("/api/v1/engine/stats", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅支持GET请求"})
+			return
+		}
+		stats := engine.GetStats()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"code": 0,
+			"data": map[string]interface{}{
+				"total_submitted":   stats.TotalSubmitted,
+				"total_completed":   stats.TotalCompleted,
+				"total_failed":      stats.TotalFailed,
+				"current_running":   stats.CurrentRunning,
+				"current_ai_active": stats.CurrentAIActive,
+				"queue_length":      stats.QueueLength,
+				"max_workers":       3,
+				"max_ai_concurrency": 2,
+				"queue_capacity":    50,
+			},
+		})
+	}), authMW, adminOnly))
 
 	// ==================== 用户管理路由（仅admin） ====================
 	mux.Handle("/api/v1/users", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -105,7 +137,6 @@ func Setup(cfg *config.Config) http.Handler {
 	}), authMW, adminOnly))
 
 	mux.Handle("/api/v1/ai-config/test", middleware.Chain(http.HandlerFunc(aiConfigHandler.TestConnection), authMW, adminOnly))
-	// GET /api/v1/ai-config/models — 查询当前Key下可用模型列表
 	mux.Handle("/api/v1/ai-config/models", middleware.Chain(http.HandlerFunc(aiConfigHandler.ListModels), authMW, adminOnly))
 	mux.Handle("/api/v1/ai-config/scenes", middleware.Chain(http.HandlerFunc(aiConfigHandler.GetSceneConfigs), authMW, adminOnly))
 	mux.Handle("/api/v1/ai-config/scenes/", middleware.Chain(http.HandlerFunc(aiConfigHandler.UpdateSceneConfig), authMW, adminOnly))
@@ -229,7 +260,7 @@ func Setup(cfg *config.Config) http.Handler {
 		path := r.URL.Path
 
 		switch {
-		// POST /pipelines/batch-verify — 批量验收（P4.6-4新增，必须在/{id}路由之前匹配）
+		// POST /pipelines/batch-verify — 批量验收（必须在/{id}路由之前匹配）
 		case hasSuffix(path, "/batch-verify"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || claims.Role != "admin" {
@@ -240,7 +271,7 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.BatchVerify(w, r)
 
-		// POST /pipelines/{id}/start — 启动Pipeline
+		// POST /pipelines/{id}/start
 		case hasSuffix(path, "/start"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
@@ -251,7 +282,7 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.StartPipeline(w, r)
 
-		// POST /pipelines/{id}/cancel — 取消Pipeline
+		// POST /pipelines/{id}/cancel
 		case hasSuffix(path, "/cancel"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || claims.Role != "admin" {
@@ -262,7 +293,7 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.CancelPipeline(w, r)
 
-		// POST /pipelines/{id}/finalize — 定稿归档（P4.5-C新增）
+		// POST /pipelines/{id}/finalize
 		case hasSuffix(path, "/finalize"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
@@ -273,7 +304,7 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.FinalizePipeline(w, r)
 
-		// POST /pipelines/{id}/mark-passed — 快捷通过（P4.5-D新增）
+		// POST /pipelines/{id}/mark-passed
 		case hasSuffix(path, "/mark-passed"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
@@ -284,7 +315,7 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.MarkPassed(w, r)
 
-		// POST /pipelines/{id}/verify — 手动触发验收（P4.6-2新增）
+		// POST /pipelines/{id}/verify
 		case hasSuffix(path, "/verify"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
@@ -295,12 +326,11 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.VerifyPipeline(w, r)
 
-		// GET /pipelines/{id}/eval-rounds — 评估轮次详情（P4.5-B）
+		// GET /pipelines/{id}/eval-rounds
 		case hasSuffix(path, "/eval-rounds"):
 			pipelineHandler.GetEvalRounds(w, r)
 
-		// POST /pipelines/{id}/pages/{n}/ai-fix — AI快修（P4.5-E-2新增）
-		// 注意：ai-fix路由必须在/pages路由之前匹配，因为/pages是后缀匹配
+		// POST /pipelines/{id}/pages/{n}/ai-fix
 		case containsPagesAIFix(path):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
@@ -311,7 +341,7 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.AIFixPage(w, r)
 
-		// PUT /pipelines/{id}/pages/{n}/decision — 更新页面决策（P4.5-C新增）
+		// PUT /pipelines/{id}/pages/{n}/decision
 		case containsPagesDecision(path):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
@@ -322,19 +352,19 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.UpdatePageDecision(w, r)
 
-		// GET /pipelines/{id}/pages — 生成页面列表（P4.5-C新增）
+		// GET /pipelines/{id}/pages
 		case hasSuffix(path, "/pages"):
 			pipelineHandler.GetGeneratedPages(w, r)
 
-		// GET /pipelines/{id}/steps/{name} — 步骤详情（必须在 /steps 之前匹配）
+		// GET /pipelines/{id}/steps/{name}
 		case containsStepsWithName(path):
 			pipelineHandler.GetStepDetail(w, r)
 
-		// GET /pipelines/{id}/steps — 步骤列表
+		// GET /pipelines/{id}/steps
 		case hasSuffix(path, "/steps"):
 			pipelineHandler.GetSteps(w, r)
 
-		// GET/DELETE /pipelines/{id} — 详情或删除
+		// GET/DELETE /pipelines/{id}
 		default:
 			switch r.Method {
 			case http.MethodGet:
@@ -377,18 +407,16 @@ func containsStepsWithName(path string) bool {
 }
 
 // containsPagesDecision 检查路径是否匹配 /pages/{n}/decision 模式
-// P4.5-C新增
 func containsPagesDecision(path string) bool {
 	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/decision")
 }
 
 // containsPagesAIFix 检查路径是否匹配 /pages/{n}/ai-fix 模式
-// P4.5-E-2新增
 func containsPagesAIFix(path string) bool {
 	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/ai-fix")
 }
 
-// indexOf 查找子串位置（简化版strings.Index）
+// indexOf 查找子串位置
 func indexOf(s string, sub string) int {
 	for i := 0; i <= len(s)-len(sub); i++ {
 		if s[i:i+len(sub)] == sub {
@@ -419,7 +447,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.25.0",
+		"version": "0.26.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }
