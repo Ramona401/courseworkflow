@@ -78,7 +78,7 @@ const (
 // ValidPromptKeys 有效提示词标识列表
 var ValidPromptKeys = []string{
 	PromptKeyA, PromptKeyB, PromptKeyC, PromptKeyD,
-	PromptKeyE, PromptKeyF, PromptKeyDict, PromptKeyAbilityTable,
+	PromptKeyE, PromptKeyF, PromptKeyDict, PromptKeyAbilityTable, PromptKeyG,
 }
 
 // PromptNameMap 提示词标识→中文名映射
