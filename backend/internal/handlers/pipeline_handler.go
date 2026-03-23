@@ -124,7 +124,9 @@ func (h *PipelineHandler) GetPipelineDetail(w http.ResponseWriter, r *http.Reque
 }
 
 // StartPipeline POST /api/v1/pipelines/{id}/start
-// 启动Pipeline执行（从dbCheck开始）
+// 启动Pipeline执行（P5-1改造：异步执行，立即返回running状态）
+// 改造前：同步执行全链路45-55分钟，HTTP连接阻塞
+// 改造后：立即返回{status:"running"}，goroutine后台执行，前端轮询刷新
 func (h *PipelineHandler) StartPipeline(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
@@ -321,7 +323,7 @@ func (h *PipelineHandler) UpdatePageDecision(w http.ResponseWriter, r *http.Requ
 
 	// 解析请求体
 	var req struct {
-		Decision  string  `json:"decision"`   // approve / reject / edit
+		Decision  string  `json:"decision"`  // approve / reject / edit
 		FinalHTML *string `json:"final_html"` // edit时提供修改后的HTML
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

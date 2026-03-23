@@ -12,7 +12,7 @@ import (
 )
 
 // Setup 注册所有路由并返回根Handler
-// 版本：0.24.0（P4.6-4新增batch-verify批量验收路由+夜间定时任务）
+// 版本：0.25.0（P4.6-4新增batch-verify批量验收路由+夜间定时任务）
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -419,7 +419,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.24.0",
+		"version": "0.25.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

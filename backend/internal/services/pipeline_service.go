@@ -342,12 +342,9 @@ func (s *PipelineService) MarkPassed(pipelineID string) error {
 
 // ==================== Pipeline 执行引擎 ====================
 
-// StartPipeline 启动Pipeline执行
-// P4-1：执行dbCheck → 推进到scanner
-// P4-2：autoMode时继续执行scanner → 推进到evaluator
-// P4-3：autoMode时继续执行evaluator → 推进到meta
-// P4-4：autoMode时继续执行meta → 通过则推进到translator
-// P4-5：autoMode时继续执行translator（Prompt C+D循环） → 通过则推进到generator
+// StartPipeline 启动Pipeline执行（P5-1改造：异步执行）
+// 改造前：同步执行全链路，HTTP请求阻塞45-55分钟
+// 改造后：立即返回running状态，goroutine后台执行全链路，前端轮询刷新
 func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailResponse, error) {
 	pipeline, err := repository.GetPipelineByID(id)
 	if err != nil {
@@ -361,6 +358,25 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 	// 更新为running状态
 	if err := repository.UpdatePipelineStatus(id, models.StepDbCheck, models.PipelineStatusRunning); err != nil {
 		return nil, fmt.Errorf("更新Pipeline状态失败: %w", err)
+	}
+
+	// P5-1改造：在goroutine中异步执行全链路
+	// 立即返回，前端通过轮询获取最新状态
+	go s.executePipelineAsync(id)
+
+	// 返回当前状态（running）
+	return s.GetPipelineDetail(id)
+}
+
+// executePipelineAsync 异步执行Pipeline全链路（goroutine中运行）
+// P5-1新增：将原StartPipeline中的同步执行逻辑抽取为独立方法
+// 注意：goroutine中的错误通过UpdatePipelineError记录到数据库，不会返回给HTTP调用者
+func (s *PipelineService) executePipelineAsync(id string) {
+	// 重新读取Pipeline（goroutine中需要独立读取，不依赖外部变量）
+	pipeline, err := repository.GetPipelineByID(id)
+	if err != nil {
+		_ = repository.UpdatePipelineError(id, models.StepDbCheck, "异步执行: 读取Pipeline失败: "+err.Error())
+		return
 	}
 
 	// P4-6修复：检测已完成的步骤，从第一个未完成的步骤开始执行
@@ -378,7 +394,8 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 		if resumeStep != "" && resumeStep != models.StepDbCheck {
 			// 有已完成的步骤，从未完成的步骤恢复
 			if err := repository.UpdatePipelineStatus(id, resumeStep, models.PipelineStatusRunning); err != nil {
-				return nil, fmt.Errorf("恢复Pipeline到%s失败: %w", resumeStep, err)
+				_ = repository.UpdatePipelineError(id, resumeStep, "恢复Pipeline失败: "+err.Error())
+				return
 			}
 			pipeline, _ = repository.GetPipelineByID(id)
 
@@ -387,121 +404,130 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 				genErr := s.executeGenerator(pipeline)
 				if genErr != nil {
 					_ = repository.UpdatePipelineError(id, models.StepGenerator, genErr.Error())
-					return s.GetPipelineDetail(id)
+					return
 				}
 				_ = repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue)
-				return s.GetPipelineDetail(id)
+				return
 
 			case models.StepReview:
 				// review是人工步骤，标记为等待审核
 				_ = repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue)
-				return s.GetPipelineDetail(id)
+				return
 			}
 			// 其他步骤（scanner/evaluator/meta/translator）走正常全链路
 		}
 	}
 
-	// 执行dbCheck
+	// ===== 执行dbCheck =====
 	dbCheckErr := s.executeDbCheck(pipeline)
 	if dbCheckErr != nil {
 		_ = repository.UpdatePipelineError(id, models.StepDbCheck, dbCheckErr.Error())
-		return s.GetPipelineDetail(id)
+		return
 	}
 
 	// 推进到scanner
 	if err := repository.UpdatePipelineStatus(id, models.StepScanner, models.PipelineStatusRunning); err != nil {
-		return nil, fmt.Errorf("推进到Scanner失败: %w", err)
+		_ = repository.UpdatePipelineError(id, models.StepScanner, "推进到Scanner失败: "+err.Error())
+		return
 	}
 
-	// autoMode：自动执行scanner
+	// autoMode：自动执行后续步骤
 	if pipeline.AutoMode {
-		// 重新读取最新Pipeline（current_step已更新）
+		// ===== 执行scanner =====
 		pipeline, err = repository.GetPipelineByID(id)
 		if err != nil {
-			return s.GetPipelineDetail(id)
+			_ = repository.UpdatePipelineError(id, models.StepScanner, "读取Pipeline失败: "+err.Error())
+			return
 		}
 
 		scannerErr := s.executeScanner(pipeline)
 		if scannerErr != nil {
 			_ = repository.UpdatePipelineError(id, models.StepScanner, scannerErr.Error())
-			return s.GetPipelineDetail(id)
+			return
 		}
 
 		// scanner成功 → 推进到evaluator
 		if err := repository.UpdatePipelineStatus(id, models.StepEvaluator, models.PipelineStatusRunning); err != nil {
-			return nil, fmt.Errorf("推进到Evaluator失败: %w", err)
+			_ = repository.UpdatePipelineError(id, models.StepEvaluator, "推进到Evaluator失败: "+err.Error())
+			return
 		}
 
-		// P4-3：autoMode时继续执行evaluator
+		// ===== 执行evaluator =====
 		pipeline, err = repository.GetPipelineByID(id)
 		if err != nil {
-			return s.GetPipelineDetail(id)
+			_ = repository.UpdatePipelineError(id, models.StepEvaluator, "读取Pipeline失败: "+err.Error())
+			return
 		}
 
 		evalErr := s.executeEvaluator(pipeline)
 		if evalErr != nil {
 			_ = repository.UpdatePipelineError(id, models.StepEvaluator, evalErr.Error())
-			return s.GetPipelineDetail(id)
+			return
 		}
 
 		// evaluator成功 → 推进到meta
 		if err := repository.UpdatePipelineStatus(id, models.StepMeta, models.PipelineStatusRunning); err != nil {
-			return nil, fmt.Errorf("推进到Meta失败: %w", err)
+			_ = repository.UpdatePipelineError(id, models.StepMeta, "推进到Meta失败: "+err.Error())
+			return
 		}
 
-		// P4-4：autoMode时继续执行meta
+		// ===== 执行meta =====
 		pipeline, err = repository.GetPipelineByID(id)
 		if err != nil {
-			return s.GetPipelineDetail(id)
+			_ = repository.UpdatePipelineError(id, models.StepMeta, "读取Pipeline失败: "+err.Error())
+			return
 		}
 
 		metaErr := s.executeMeta(pipeline)
 		if metaErr != nil {
 			_ = repository.UpdatePipelineError(id, models.StepMeta, metaErr.Error())
-			return s.GetPipelineDetail(id)
+			return
 		}
 
-		// meta成功（通过阈值） → 推进到translator
+		// meta成功 → 推进到translator
 		if err := repository.UpdatePipelineStatus(id, models.StepTranslator, models.PipelineStatusRunning); err != nil {
-			return nil, fmt.Errorf("推进到Translator失败: %w", err)
+			_ = repository.UpdatePipelineError(id, models.StepTranslator, "推进到Translator失败: "+err.Error())
+			return
 		}
 
-		// P4-5：autoMode时继续执行translator（Prompt C + D循环）
+		// ===== 执行translator =====
 		pipeline, err = repository.GetPipelineByID(id)
 		if err != nil {
-			return s.GetPipelineDetail(id)
+			_ = repository.UpdatePipelineError(id, models.StepTranslator, "读取Pipeline失败: "+err.Error())
+			return
 		}
 
 		transErr := s.executeTranslator(pipeline)
 		if transErr != nil {
 			_ = repository.UpdatePipelineError(id, models.StepTranslator, transErr.Error())
-			return s.GetPipelineDetail(id)
+			return
 		}
 
-		// translator成功 → 推进到generator（P4-6实现时继续执行）
+		// translator成功 → 推进到generator
 		if err := repository.UpdatePipelineStatus(id, models.StepGenerator, models.PipelineStatusRunning); err != nil {
-			return nil, fmt.Errorf("推进到Generator失败: %w", err)
+			_ = repository.UpdatePipelineError(id, models.StepGenerator, "推进到Generator失败: "+err.Error())
+			return
 		}
 
-		// P4-6：autoMode时继续执行generator（Prompt F × 每页）
+		// ===== 执行generator =====
 		pipeline, err = repository.GetPipelineByID(id)
 		if err != nil {
-			return s.GetPipelineDetail(id)
+			_ = repository.UpdatePipelineError(id, models.StepGenerator, "读取Pipeline失败: "+err.Error())
+			return
 		}
 
 		genErr := s.executeGenerator(pipeline)
 		if genErr != nil {
 			_ = repository.UpdatePipelineError(id, models.StepGenerator, genErr.Error())
-			return s.GetPipelineDetail(id)
+			return
 		}
 
 		// generator成功 → 推进到review（等待人工审核）
 		if err := repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue); err != nil {
-			return nil, fmt.Errorf("推进到Review失败: %w", err)
+			_ = repository.UpdatePipelineError(id, models.StepReview, "推进到Review失败: "+err.Error())
+			return
 		}
 	}
-
-	return s.GetPipelineDetail(id)
 }
 
 // ==================== dbCheck 步骤（P4-1）====================
@@ -1581,7 +1607,6 @@ func (s *PipelineService) GetEvalRounds(pipelineID string) ([]*EvalRoundDetail, 
 	}
 	return details, nil
 }
-
 
 // ==================== P4.5-E-2 AI快修方法 ====================
 

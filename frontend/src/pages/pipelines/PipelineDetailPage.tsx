@@ -4,9 +4,10 @@
  * P4.5-C: 新增审核入口按钮（review_queue/needs_human状态时显示）
  * P4.6-1: 新增verified/verify_failed状态适配+审核轮次显示+verify临时面板
  * P4.6-5: 新增VerifyPanel专用面板+启动验收按钮（finalized状态）
+ * P5-1: 新增running状态自动轮询（每5秒刷新，状态变化后停止）
  * 8步进度可视化 + StepCard懒加载展开 + 各步骤调试面板
  */
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { getPipelineDetail, getStepDetail, verifyPipeline, type PipelineDetailResponse, type StepListItem } from '@/api/pipelines'
 import { ArrowLeft, RefreshCw, ClipboardCheck, ShieldCheck } from 'lucide-react'
@@ -20,6 +21,10 @@ import TranslatorPanel from './steps/TranslatorPanel'
 import GeneratorPanel from './steps/GeneratorPanel'
 import VerifyPanel from './steps/VerifyPanel'
 
+// ==================== 轮询间隔常量 ====================
+/** P5-1新增：running状态下自动轮询间隔（毫秒） */
+const POLL_INTERVAL_MS = 5000
+
 // ==================== 主页面组件 ====================
 
 export default function PipelineDetailPage() {
@@ -31,6 +36,8 @@ export default function PipelineDetailPage() {
   // P4.6-5新增：验收操作状态
   const [verifying, setVerifying] = useState(false)
   const [verifyMsg, setVerifyMsg] = useState('')
+  // P5-1新增：轮询定时器引用
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   /** 加载Pipeline详情 */
   const loadDetail = useCallback(async () => {
@@ -46,7 +53,42 @@ export default function PipelineDetailPage() {
     setLoading(false)
   }, [id])
 
+  /** P5-1新增：静默刷新（不显示loading状态，用于轮询） */
+  const silentRefresh = useCallback(async () => {
+    if (!id) return
+    try {
+      const data = await getPipelineDetail(id)
+      setDetail(data)
+    } catch {
+      // 轮询失败时静默忽略，下次继续
+    }
+  }, [id])
+
   useEffect(() => { loadDetail() }, [loadDetail])
+
+  // P5-1新增：running状态自动轮询
+  // 当Pipeline处于running状态时，每5秒自动刷新一次
+  // 状态变化（非running）后自动停止轮询
+  useEffect(() => {
+    // 清除之前的定时器
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current)
+      pollTimerRef.current = null
+    }
+
+    // 仅running状态启动轮询
+    if (detail && detail.status === 'running') {
+      pollTimerRef.current = setInterval(silentRefresh, POLL_INTERVAL_MS)
+    }
+
+    // 组件卸载时清除定时器
+    return () => {
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current)
+        pollTimerRef.current = null
+      }
+    }
+  }, [detail?.status, silentRefresh])
 
   /** P4.6-5新增：启动验收 */
   const handleVerify = async () => {
@@ -160,6 +202,23 @@ export default function PipelineDetailPage() {
         </button>
       </div>
 
+      {/* P5-1新增：running状态自动轮询提示横幅 */}
+      {detail.status === 'running' && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10,
+          padding: '10px 16px', borderRadius: 10, marginBottom: 16,
+          background: 'rgba(0,122,255,0.06)', border: '1px solid rgba(0,122,255,0.15)',
+        }}>
+          <RefreshCw size={16} color="#007aff" style={{ animation: 'spin 2s linear infinite' }} />
+          <div style={{ fontSize: 13, color: '#007aff', fontWeight: 500 }}>
+            Pipeline正在执行中，页面每5秒自动刷新...
+          </div>
+          <div style={{ fontSize: 12, color: '#8e8e93' }}>
+            当前步骤: {detail.current_step_name}
+          </div>
+        </div>
+      )}
+
       {/* P4.6-5新增：验收操作消息提示 */}
       {verifyMsg && (
         <div style={{
@@ -259,7 +318,7 @@ export default function PipelineDetailPage() {
         ))}
       </div>
 
-      {/* P4.6-5: 旋转动画CSS（用于验收中按钮图标） */}
+      {/* P4.6-5: 旋转动画CSS（用于验收中按钮图标和轮询图标） */}
       <style>{`
         @keyframes spin {
           from { transform: rotate(0deg); }
