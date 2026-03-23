@@ -28,6 +28,7 @@ const PROMPT_DESCRIPTIONS: Record<string, string> = {
   prompt_f: 'HTML最小侵入修改 + 5种op分流（约2K字）',
   dict: 'TE-DNA编码格式解压缩速查表（约3K字）',
   ability_table: '156门课×能力等级对照表，Tab分隔（约20K字）',
+  prompt_g: '验收用索引压缩：HTML→课程页面索引+模块索引（约17K字）',
 }
 
 // ==================== Toast 组件 ====================

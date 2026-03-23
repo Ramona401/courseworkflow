@@ -71,7 +71,8 @@ const (
 	PromptKeyE            = "prompt_e"      // Meta 元评估仲裁提示词
 	PromptKeyF            = "prompt_f"      // Generator 页面生成提示词
 	PromptKeyDict         = "dict"          // TE-DNA 解压缩字典
-	PromptKeyAbilityTable = "ability_table" // 能力定位表
+	PromptKeyAbilityTable = "ability_table"
+	PromptKeyG            = "prompt_g" // 能力定位表
 )
 
 // ValidPromptKeys 有效提示词标识列表
@@ -90,6 +91,7 @@ var PromptNameMap = map[string]string{
 	PromptKeyF:            "Prompt F — Generator 页面生成",
 	PromptKeyDict:         "TE-DNA 解压缩字典",
 	PromptKeyAbilityTable: "能力定位表",
+	PromptKeyG:            "Prompt G — IndexGen 索引生成器",
 }
 
 // PromptDescriptionMap 提示词标识→用途说明映射
@@ -102,6 +104,7 @@ var PromptDescriptionMap = map[string]string{
 	PromptKeyF:            "HTML最小侵入修改 + 5种op分流（约2K字）",
 	PromptKeyDict:         "TE-DNA编码格式解压缩速查表（约3K字）",
 	PromptKeyAbilityTable: "156门课×能力等级对照表，Tab分隔（约20K字）",
+	PromptKeyG:            "验收用索引压缩：HTML→课程页面索引+模块索引（约17K字）",
 }
 
 // IsValidPromptKey 检查提示词标识是否有效
