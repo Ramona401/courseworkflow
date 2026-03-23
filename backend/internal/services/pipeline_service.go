@@ -55,6 +55,8 @@ var (
 	// P4.5-D新增：快捷通过错误常量
 	ErrMarkPassedNotAllowed = errors.New("Pipeline不在可快捷通过的状态")
 	ErrMarkPassedNotMet     = errors.New("Pipeline评估未达标，无法快捷通过")
+	// P4.5-E-2新增：AI快修错误常量
+	ErrAIFixFailed = errors.New("AI快修失败")
 )
 
 // ==================== PipelineService ====================
@@ -1576,4 +1578,104 @@ func (s *PipelineService) GetEvalRounds(pipelineID string) ([]*EvalRoundDetail, 
 		details = []*EvalRoundDetail{}
 	}
 	return details, nil
+}
+
+
+// ==================== P4.5-E-2 AI快修方法 ====================
+
+// AIFixPage 审核员在全屏预览中发现生成HTML有问题时，输入修改指令让AI修复
+// 流程：读取当前页generated_html + prompt_f + fix_instruction → 调AI → 返回新HTML → 更新数据库
+func (s *PipelineService) AIFixPage(pipelineID string, pageNumber int, fixInstruction string) (string, error) {
+	// 1. 验证Pipeline存在且状态允许审核操作
+	pipeline, err := repository.GetPipelineByID(pipelineID)
+	if err != nil {
+		return "", ErrPipelineNotFound
+	}
+	// 允许在 review_queue / needs_human / finalized 状态下使用AI快修
+	allowedStatuses := map[string]bool{
+		models.PipelineStatusReviewQueue: true,
+		models.PipelineStatusNeedsHuman:  true,
+		models.PipelineStatusFinalized:   true,
+	}
+	if !allowedStatuses[pipeline.Status] {
+		return "", ErrPipelineNotReviewable
+	}
+
+	// 2. 获取当前页面的完整HTML
+	pages, err := repository.GetGeneratedPagesWithHTML(pipelineID)
+	if err != nil {
+		return "", fmt.Errorf("获取页面数据失败: %w", err)
+	}
+	var currentPage *repository.GeneratedPageFullRow
+	for _, p := range pages {
+		if p.PageNumber == pageNumber {
+			currentPage = p
+			break
+		}
+	}
+	if currentPage == nil {
+		return "", ErrPageNotFound
+	}
+
+	// 取当前最佳HTML：优先final_html，其次generated_html，最后original_html
+	currentHTML := currentPage.FinalHTML
+	if currentHTML == "" {
+		currentHTML = currentPage.GeneratedHTML
+	}
+	if currentHTML == "" {
+		currentHTML = currentPage.OriginalHTML
+	}
+	if currentHTML == "" {
+		return "", fmt.Errorf("页面P%d无可用HTML内容", pageNumber)
+	}
+
+	// 3. 加载 Prompt F（作为系统提示词）
+	promptF, err := repository.GetCurrentPromptByKey("prompt_f")
+	if err != nil || promptF == nil {
+		return "", fmt.Errorf("Prompt F未配置，无法执行AI快修")
+	}
+
+	// 4. 获取AI配置（使用generator场景）
+	aiCfg, err := ai.GetEffectiveConfig(
+		s.cfg.AESKey,
+		"generator",
+		s.cfg.AIAPIBaseURL,
+		s.cfg.AIAPIKey,
+		s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		return "", fmt.Errorf("获取AI配置失败: %w", err)
+	}
+
+	// 5. 构建用户消息：原始HTML + 修复指令
+	userPrompt := "【⚠️⚠️⚠️ 最重要 — 当前页面HTML，你必须在此基础上修复，禁止重写】\n" +
+		"以下是当前页面的完整HTML。你的输出必须以此为基础，只修改下方修复指令要求的部分，其余代码原封不动保留。\n\n" +
+		currentHTML + "\n\n" +
+		"══════════════════════════════════════════════\n" +
+		"▲ 以上是当前HTML（必须作为修改基础） ▼ 以下是修复指令\n" +
+		"══════════════════════════════════════════════\n\n" +
+		fmt.Sprintf("【页面】P%02d — %s\n", pageNumber, currentPage.PageTitle) +
+		"【操作类型】AI快修（在当前HTML基础上修复指定问题）\n\n" +
+		"【审核员修复指令（必须严格执行）】\n" +
+		fixInstruction + "\n\n" +
+		"【⚠️ 最终提醒】你的输出必须与上方HTML有90%以上代码重合。只改指令要求的部分。导航栏、视频、图片不允许任何改动。输出完整HTML。"
+
+	// 6. 调用AI
+	callResult, callErr := ai.CallAI(aiCfg, promptF.Content, userPrompt)
+	if callErr != nil {
+		return "", fmt.Errorf("%w: %s", ErrAIFixFailed, callErr.Error())
+	}
+
+	// 7. 提取生成的HTML
+	newHTML := extractGeneratedHTML(callResult.Content)
+	if len(newHTML) < 100 {
+		return "", fmt.Errorf("%w: AI输出HTML过短(%d字符)", ErrAIFixFailed, len(newHTML))
+	}
+
+	// 8. 更新数据库：同时更新generated_html和final_html
+	if err := repository.UpdateGeneratedPageHTML(pipelineID, pageNumber, newHTML, newHTML); err != nil {
+		return "", fmt.Errorf("保存修复后HTML失败: %w", err)
+	}
+
+	return newHTML, nil
 }

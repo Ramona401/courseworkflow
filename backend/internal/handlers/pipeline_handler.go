@@ -391,6 +391,76 @@ func (h *PipelineHandler) MarkPassed(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ==================== P4.5-E-2 AI快修接口 ====================
+
+// AIFixPage POST /api/v1/pipelines/{id}/pages/{n}/ai-fix
+// 审核员在全屏预览中输入修改指令，AI基于当前HTML修复并返回新HTML
+func (h *PipelineHandler) AIFixPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+
+	// 从路径提取pipeline_id和pageNumber
+	pipelineID, pageNumber := extractPipelineIDAndPageNumberForAIFix(r.URL.Path)
+	if pipelineID == "" || pageNumber <= 0 {
+		utils.BadRequest(w, "缺少Pipeline ID或页码")
+		return
+	}
+
+	// 解析请求体
+	var req struct {
+		FixInstruction string `json:"fix_instruction"` // 修复指令文本
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+	if req.FixInstruction == "" {
+		utils.BadRequest(w, "修复指令不能为空")
+		return
+	}
+
+	// 调用服务层执行AI快修
+	newHTML, err := h.pipelineService.AIFixPage(pipelineID, pageNumber, req.FixInstruction)
+	if err != nil {
+		handlePipelineError(w, err)
+		return
+	}
+
+	utils.Success(w, map[string]interface{}{
+		"message":      "AI快修完成",
+		"page_number":  pageNumber,
+		"new_html":     newHTML,
+		"html_length":  len(newHTML),
+	})
+}
+
+// extractPipelineIDAndPageNumberForAIFix 从ai-fix路径提取Pipeline ID和页码
+// P4.5-E-2新增：路径格式 /api/v1/pipelines/{id}/pages/{n}/ai-fix
+func extractPipelineIDAndPageNumberForAIFix(path string) (string, int) {
+	pagesIdx := strings.Index(path, "/pages/")
+	if pagesIdx < 0 {
+		return "", 0
+	}
+	beforePages := path[:pagesIdx]
+	pipelineID := extractPipelineID(beforePages)
+	if pipelineID == "" {
+		return "", 0
+	}
+	afterPages := path[pagesIdx+len("/pages/"):]
+	aiFixIdx := strings.Index(afterPages, "/ai-fix")
+	if aiFixIdx < 0 {
+		return pipelineID, 0
+	}
+	pageNumStr := afterPages[:aiFixIdx]
+	pageNum, err := strconv.Atoi(pageNumStr)
+	if err != nil || pageNum <= 0 {
+		return pipelineID, 0
+	}
+	return pipelineID, pageNum
+}
+
 // ==================== 路径解析辅助函数 ====================
 
 // extractPipelineID 从路径提取Pipeline ID
@@ -485,6 +555,10 @@ func handlePipelineError(w http.ResponseWriter, err error) {
 		err == services.ErrMarkPassedNotAllowed:
 		utils.Fail(w, http.StatusConflict, errMsg)
 
+	// P4.5-E-2: AI快修失败 (502)
+	case err == services.ErrAIFixFailed:
+		utils.Fail(w, http.StatusBadGateway, errMsg)
+
 	// P4.5-D: 快捷通过未达标 (422)
 	case err == services.ErrMarkPassedNotMet:
 		utils.Fail(w, http.StatusUnprocessableEntity, errMsg)
@@ -506,6 +580,10 @@ func handlePipelineError(w http.ResponseWriter, err error) {
 	// 包含"没有生成页面"的文字
 	case strings.Contains(errMsg, "没有生成页面"):
 		utils.BadRequest(w, errMsg)
+
+	// 包含"AI快修失败"的文字（AIFixPage带详情）
+	case strings.Contains(errMsg, "AI快修失败"):
+		utils.Fail(w, http.StatusBadGateway, errMsg)
 
 	// 包含"评估未达标"的文字（MarkPassed带详情）
 	case strings.Contains(errMsg, "评估未达标"):

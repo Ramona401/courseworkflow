@@ -836,3 +836,18 @@ type GeneratedPageFullRow struct {
 	CreatedAt     *time.Time `json:"created_at"`
 	UpdatedAt     *time.Time `json:"updated_at"`
 }
+
+// UpdateGeneratedPageHTML 更新指定页面的generated_html和final_html
+// P4.5-E-2新增：AI快修功能，审核员输入修改指令后AI重新生成HTML，需要更新数据库
+func UpdateGeneratedPageHTML(pipelineID string, pageNumber int, generatedHTML string, finalHTML string) error {
+	ctx := context.Background()
+	_, err := database.DB.Exec(ctx,
+		`UPDATE generated_pages
+		 SET generated_html = $3, final_html = $4, updated_at = NOW()
+		 WHERE pipeline_id = $1 AND page_number = $2`,
+		pipelineID, pageNumber, generatedHTML, finalHTML)
+	if err != nil {
+		return fmt.Errorf("更新页面P%d的HTML失败: %w", pageNumber, err)
+	}
+	return nil
+}

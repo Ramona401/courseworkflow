@@ -12,7 +12,7 @@ import (
 )
 
 // Setup 注册所有路由并返回根Handler
-// 版本：0.19.0（P4.5-D新增dashboard/stats+mark-passed路由）
+// 版本：0.20.0（P4.5-E-2新增ai-fix路由）（P4.5-D新增dashboard/stats+mark-passed路由）
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -344,6 +344,12 @@ func containsPagesDecision(path string) bool {
 	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/decision")
 }
 
+// containsPagesAIFix 检查路径是否匹配 /pages/{n}/ai-fix 模式
+// P4.5-E-2新增
+func containsPagesAIFix(path string) bool {
+	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/ai-fix")
+}
+
 // indexOf 查找子串位置（简化版strings.Index）
 func indexOf(s string, sub string) int {
 	for i := 0; i <= len(s)-len(sub); i++ {
@@ -375,7 +381,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.19.0",
+		"version": "0.20.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

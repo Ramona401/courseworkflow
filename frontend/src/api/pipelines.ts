@@ -394,3 +394,27 @@ export async function markPassed(pipelineId: string) {
   const res = await client.post('/pipelines/' + pipelineId + '/mark-passed')
   return (res.data as any).data
 }
+
+
+// ==================== P4.5-E-2 AI快修API ====================
+
+/** AI快修请求参数 */
+export interface AIFixPageRequest {
+  fix_instruction: string
+}
+
+/** AI快修响应 */
+export interface AIFixPageResponse {
+  message: string
+  page_number: number
+  new_html: string
+  html_length: number
+}
+
+/** AI快修页面（审核员输入修改指令，AI基于当前HTML修复） */
+export async function aiFixPage(pipelineId: string, pageNumber: number, req: AIFixPageRequest) {
+  const res = await client.post('/pipelines/' + pipelineId + '/pages/' + pageNumber + '/ai-fix', req, {
+    timeout: 600000, // 10分钟超时（AI修复可能较慢）
+  })
+  return (res.data as any).data as AIFixPageResponse
+}

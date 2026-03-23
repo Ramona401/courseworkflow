@@ -1,5 +1,5 @@
 /**
- * Pipeline审核页面（P4.5-E 重构版 v3）
+ * Pipeline审核页面（P4.5-E 重构版 v3.2）
  *
  * 核心设计：
  * 1. 左侧列表按页码顺序排列（保持课程逻辑连贯性）
@@ -7,6 +7,8 @@
  * 3. 每页显示修改理由面板（change_reason）
  * 4. 全屏预览支持左右翻页 + 原版/修改版切换按钮
  * 5. 所有页面（含keep）都逐个审核
+ * 6. 全屏修改理由弹窗（P4.5-E-1）：点击按钮弹出模态框显示完整修改理由
+ * 7. 全屏AI快修功能（P4.5-E-2）：审核员输入修改指令，AI基于当前HTML修复
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
@@ -18,10 +20,11 @@ import {
   type PipelineDetailResponse,
   type GeneratedPageFull,
   type UpdatePageDecisionRequest,
+  aiFixPage,
 } from '@/api/pipelines'
 import {
   ArrowLeft, RefreshCw, Check, X, Edit3, CheckCircle, Send,
-  Maximize2, Minimize2, ChevronLeft, ChevronRight, FileText, Columns,
+  Maximize2, Minimize2, ChevronLeft, ChevronRight, FileText, Columns, Wand2, Loader,
 } from 'lucide-react'
 
 // ==================== 常量 ====================
@@ -380,8 +383,14 @@ export default function PipelineReviewPage() {
       {fullscreen && currentPage && (
         <FullscreenPreview
           page={currentPage} pages={pages} currentIdx={selectedIdx}
+          pipelineId={id || ''}
           onNavigate={(idx) => { setSelectedIdx(idx); setMergeSourceTab(0) }}
           onClose={() => setFullscreen(false)}
+          onPageUpdated={(pageNumber, newHTML) => {
+            setPages(prev => prev.map(p =>
+              p.page_number === pageNumber ? { ...p, generated_html: newHTML, final_html: newHTML } : p
+            ))
+          }}
         />
       )}
     </div>
@@ -442,14 +451,214 @@ function MergeCompareView({ page, mergeSourceTab, onTabChange }: {
   )
 }
 
-// ==================== 全屏预览（支持翻页 + 原版/修改版切换） ====================
+// ==================== AI快修弹窗组件（P4.5-E-2新增） ====================
 
-function FullscreenPreview({ page, pages, currentIdx, onNavigate, onClose }: {
+/**
+ * 全屏模式下的AI快修模态框
+ * 审核员输入修改指令，调用后端AI接口修复当前页面HTML
+ */
+function AIFixModal({ pipelineId, pageNumber, pageTitle, loading, instruction, onInstructionChange, onSubmit, onClose }: {
+  pipelineId: string; pageNumber: number; pageTitle: string
+  loading: boolean; instruction: string
+  onInstructionChange: (v: string) => void
+  onSubmit: () => void; onClose: () => void
+}) {
+  // 阻止ESC冒泡（同ReasonModal）
+  useEffect(() => {
+    const stopPropagation = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !loading) {
+        e.stopPropagation()
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', stopPropagation, true)
+    return () => window.removeEventListener('keydown', stopPropagation, true)
+  }, [onClose, loading])
+
+  return (
+    <div
+      onClick={(e) => { if (e.target === e.currentTarget && !loading) onClose() }}
+      style={{
+        position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+        zIndex: 10001, background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(4px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 40,
+      }}
+    >
+      <div style={{
+        background: '#fff', borderRadius: 16, padding: 0,
+        maxWidth: 640, width: '100%',
+        display: 'flex', flexDirection: 'column',
+        boxShadow: '0 20px 60px rgba(0,0,0,0.2), 0 0 0 1px rgba(0,0,0,0.05)',
+      }}>
+        {/* 标题栏 */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, padding: '16px 20px',
+          borderBottom: '1px solid rgba(0,0,0,0.06)', flexShrink: 0,
+        }}>
+          <Wand2 size={16} color="#e65100" />
+          <span style={{ fontSize: 15, fontWeight: 600, color: '#1c1c1e', flex: 1 }}>
+            AI快修 — P{pageNumber}. {pageTitle || '无标题'}
+          </span>
+          <button
+            onClick={onClose} disabled={loading}
+            style={{
+              padding: '4px 12px', borderRadius: 8, border: '1px solid rgba(0,0,0,0.08)',
+              background: '#f5f5f5', fontSize: 12, fontWeight: 500, color: '#3c3c43',
+              cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.5 : 1,
+              display: 'inline-flex', alignItems: 'center', gap: 4,
+            }}
+          ><X size={12} /> 关闭</button>
+        </div>
+
+        {/* 说明 */}
+        <div style={{
+          padding: '12px 20px', background: '#fff8e1',
+          borderBottom: '1px solid rgba(230,81,0,0.08)', fontSize: 12, color: '#e65100', lineHeight: 1.6,
+        }}>
+          输入修改指令，AI将基于当前页面HTML进行修复。修复完成后HTML会自动更新。
+          <br />示例：&ldquo;修复第3个按钮点击无反应的问题&rdquo;、&ldquo;将标题字号从18px改为24px&rdquo;
+        </div>
+
+        {/* 输入区 */}
+        <div style={{ padding: '16px 20px' }}>
+          <textarea
+            value={instruction}
+            onChange={(e) => onInstructionChange(e.target.value)}
+            placeholder="请输入修复指令，例如：修复互动按钮点击无反应的问题..."
+            disabled={loading}
+            style={{
+              width: '100%', minHeight: 120, border: '1px solid rgba(0,0,0,0.1)',
+              borderRadius: 10, padding: 12, fontSize: 13, lineHeight: 1.6,
+              fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+              resize: 'vertical', outline: 'none', boxSizing: 'border-box',
+              background: loading ? '#f9f9f9' : '#fff', color: '#1c1c1e',
+            }}
+            onFocus={(e) => { e.target.style.borderColor = 'rgba(0,122,255,0.4)' }}
+            onBlur={(e) => { e.target.style.borderColor = 'rgba(0,0,0,0.1)' }}
+          />
+        </div>
+
+        {/* 操作栏 */}
+        <div style={{
+          display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '12px 20px',
+          borderTop: '1px solid rgba(0,0,0,0.06)',
+        }}>
+          <button
+            onClick={onClose} disabled={loading}
+            style={{
+              padding: '8px 20px', borderRadius: 10, border: '1px solid rgba(0,0,0,0.08)',
+              background: '#fff', fontSize: 13, fontWeight: 500, color: '#3c3c43',
+              cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.5 : 1,
+            }}
+          >取消</button>
+          <button
+            onClick={onSubmit} disabled={loading || !instruction.trim()}
+            style={{
+              padding: '8px 24px', borderRadius: 10, border: 'none',
+              background: loading || !instruction.trim() ? '#e5e5ea' : '#e65100',
+              color: loading || !instruction.trim() ? '#aeaeb2' : '#fff',
+              fontSize: 13, fontWeight: 600,
+              cursor: loading || !instruction.trim() ? 'not-allowed' : 'pointer',
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+            }}
+          >
+            {loading ? <><Loader size={14} style={{ animation: 'spin 1s linear infinite' }} /> AI修复中...</> : <><Wand2 size={14} /> 执行修复</>}
+          </button>
+        </div>
+      </div>
+
+      {/* loading动画CSS */}
+      {loading && (
+        <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+      )}
+    </div>
+  )
+}
+
+// ==================== 修改理由弹窗组件（P4.5-E-1新增） ====================
+
+/**
+ * 全屏模式下的修改理由模态框
+ * 点击后弹出完整修改理由文本，支持ESC或点击遮罩关闭
+ */
+function ReasonModal({ reason, onClose }: { reason: string; onClose: () => void }) {
+  // 阻止键盘事件冒泡到全屏翻页（避免ESC关闭弹窗时同时关闭全屏）
+  useEffect(() => {
+    const stopPropagation = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        onClose()
+      }
+    }
+    // 用capture阶段拦截，优先于全屏的keydown处理
+    window.addEventListener('keydown', stopPropagation, true)
+    return () => window.removeEventListener('keydown', stopPropagation, true)
+  }, [onClose])
+
+  return (
+    <div
+      onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
+      style={{
+        position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+        zIndex: 10001, background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(4px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 40,
+      }}
+    >
+      <div style={{
+        background: '#fff', borderRadius: 16, padding: 0,
+        maxWidth: 680, width: '100%', maxHeight: '70vh',
+        display: 'flex', flexDirection: 'column',
+        boxShadow: '0 20px 60px rgba(0,0,0,0.2), 0 0 0 1px rgba(0,0,0,0.05)',
+      }}>
+        {/* 弹窗标题栏 */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, padding: '16px 20px',
+          borderBottom: '1px solid rgba(0,0,0,0.06)', flexShrink: 0,
+        }}>
+          <FileText size={16} color="#007aff" />
+          <span style={{ fontSize: 15, fontWeight: 600, color: '#1c1c1e', flex: 1 }}>
+            修改理由（Translator指令）
+          </span>
+          <button
+            onClick={onClose}
+            style={{
+              padding: '4px 12px', borderRadius: 8, border: '1px solid rgba(0,0,0,0.08)',
+              background: '#f5f5f5', fontSize: 12, fontWeight: 500, color: '#3c3c43',
+              cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4,
+            }}
+          ><X size={12} /> 关闭</button>
+        </div>
+        {/* 弹窗内容区（可滚动） */}
+        <div style={{
+          padding: '20px 24px', overflow: 'auto', flex: 1,
+          fontSize: 13, color: '#3c3c43', lineHeight: 1.8,
+          whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+        }}>
+          {reason}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ==================== 全屏预览（支持翻页 + 原版/修改版切换 + 修改理由弹窗） ====================
+
+function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavigate, onClose, onPageUpdated }: {
   page: GeneratedPageFull; pages: GeneratedPageFull[]; currentIdx: number
+  pipelineId: string
   onNavigate: (idx: number) => void; onClose: () => void
+  onPageUpdated: (pageNumber: number, newHTML: string) => void
 }) {
   // 全屏视图模式：generated=修改后/生成版，original=原版，compare=左右对比
   const [fsMode, setFsMode] = useState<'generated' | 'original' | 'compare'>('generated')
+  // P4.5-E-1：修改理由弹窗显示状态
+  const [showReasonModal, setShowReasonModal] = useState(false)
+  // P4.5-E-2：AI快修相关状态
+  const [showAIFixModal, setShowAIFixModal] = useState(false)
+  const [aiFixInstruction, setAIFixInstruction] = useState('')
+  const [aiFixLoading, setAIFixLoading] = useState(false)
 
   const hasPrev = currentIdx > 0
   const hasNext = currentIdx < pages.length - 1
@@ -468,6 +677,10 @@ function FullscreenPreview({ page, pages, currentIdx, onNavigate, onClose }: {
     } else {
       setFsMode('generated')
     }
+    // 翻页时关闭修改理由弹窗和AI快修弹窗
+    setShowReasonModal(false)
+    setShowAIFixModal(false)
+    setAIFixInstruction('')
   }, [page.page_number, page.operation])
 
   const navBtn: React.CSSProperties = {
@@ -536,17 +749,37 @@ function FullscreenPreview({ page, pages, currentIdx, onNavigate, onClose }: {
           <span style={{ fontSize: 12, color: '#8e8e93', fontStyle: 'italic' }}>仅生成版（新建）</span>
         )}
 
-        <div style={{ flex: 1 }} />
-
-        {/* 修改理由简要 */}
+        {/* P4.5-E-1：修改理由按钮（替换原来的缩略文本，改为点击弹窗） */}
         {page.change_reason && (
-          <div style={{
-            maxWidth: 400, fontSize: 11, color: '#007aff', lineHeight: 1.4,
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-          }} title={page.change_reason}>
-            修改理由: {page.change_reason.substring(0, 100)}...
-          </div>
+          <button
+            onClick={() => setShowReasonModal(true)}
+            style={{
+              ...navBtn,
+              padding: '6px 14px',
+              background: '#f0f7ff',
+              color: '#007aff',
+              border: '1px solid rgba(0,122,255,0.15)',
+            }}
+            title="点击查看完整修改理由"
+          >
+            <FileText size={13} /> 修改理由
+          </button>
         )}
+
+        {/* P4.5-E-2：AI快修按钮 */}
+        <button
+          onClick={() => { setShowAIFixModal(true); setAIFixInstruction('') }}
+          style={{
+            ...navBtn,
+            padding: '6px 14px',
+            background: '#fff3e0',
+            color: '#e65100',
+            border: '1px solid rgba(230,81,0,0.15)',
+          }}
+          title="AI快修：输入修改指令让AI修复当前页面"
+        >
+          <Wand2 size={13} /> AI快修
+        </button>
 
         {/* 关闭 */}
         <button onClick={onClose} style={{ ...navBtn, padding: '6px 14px' }} title="退出 (ESC)">
@@ -597,6 +830,38 @@ function FullscreenPreview({ page, pages, currentIdx, onNavigate, onClose }: {
           }}><ChevronRight size={24} color="#8e8e93" /></div>
         )}
       </div>
+
+      {/* P4.5-E-1：修改理由弹窗 */}
+      {showReasonModal && page.change_reason && (
+        <ReasonModal reason={page.change_reason} onClose={() => setShowReasonModal(false)} />
+      )}
+
+      {/* P4.5-E-2：AI快修弹窗 */}
+      {showAIFixModal && (
+        <AIFixModal
+          pipelineId={pipelineId}
+          pageNumber={page.page_number}
+          pageTitle={page.page_title}
+          loading={aiFixLoading}
+          instruction={aiFixInstruction}
+          onInstructionChange={setAIFixInstruction}
+          onSubmit={async () => {
+            if (!aiFixInstruction.trim()) { alert('请输入修复指令'); return }
+            setAIFixLoading(true)
+            try {
+              const resp = await aiFixPage(pipelineId, page.page_number, { fix_instruction: aiFixInstruction.trim() })
+              onPageUpdated(page.page_number, resp.new_html)
+              alert('AI快修完成！新HTML已更新（' + resp.html_length + '字符）')
+              setShowAIFixModal(false)
+              setAIFixInstruction('')
+            } catch (e: any) {
+              alert('AI快修失败: ' + (e?.response?.data?.message || e.message || '未知错误'))
+            }
+            setAIFixLoading(false)
+          }}
+          onClose={() => { if (!aiFixLoading) { setShowAIFixModal(false); setAIFixInstruction('') } }}
+        />
+      )}
     </div>
   )
 }
