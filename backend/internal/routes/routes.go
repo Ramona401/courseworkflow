@@ -276,6 +276,28 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.BatchVerify(w, r)
 
+			// POST /pipelines/batch-create — 批量创建Pipeline（P5-3新增）
+			case hasSuffix(path, "/batch-create"):
+				claims, ok := middleware.GetClaims(r.Context())
+				if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusForbidden)
+					json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可批量创建Pipeline"})
+					return
+				}
+				pipelineHandler.BatchCreate(w, r)
+
+			// POST /pipelines/batch-start — 批量启动Pipeline（P5-3新增）
+			case hasSuffix(path, "/batch-start"):
+				claims, ok := middleware.GetClaims(r.Context())
+				if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusForbidden)
+					json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可批量启动Pipeline"})
+					return
+				}
+				pipelineHandler.BatchStart(w, r)
+
 		// POST /pipelines/{id}/start
 		case hasSuffix(path, "/start"):
 			claims, ok := middleware.GetClaims(r.Context())
