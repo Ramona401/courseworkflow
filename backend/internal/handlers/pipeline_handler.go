@@ -673,3 +673,81 @@ func handlePipelineError(w http.ResponseWriter, err error) {
 		utils.InternalError(w, errMsg)
 	}
 }
+
+// ==================== P5-3 批量创建+批量启动接口 ====================
+
+// BatchCreate POST /api/v1/pipelines/batch-create
+// 批量创建Pipeline：从课程编号列表批量创建，跳过已有活跃Pipeline的课程
+// P5-3新增：仅admin/operator可操作
+func (h *PipelineHandler) BatchCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	// 解析请求体
+	var req struct {
+		CourseCodes []string `json:"course_codes"` // 课程编号列表
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+	if len(req.CourseCodes) == 0 {
+		utils.BadRequest(w, "课程编号列表不能为空")
+		return
+	}
+	if len(req.CourseCodes) > 100 {
+		utils.BadRequest(w, "单次批量创建上限100个课程")
+		return
+	}
+
+	result, err := h.pipelineService.BatchCreatePipelines(req.CourseCodes, claims.UserID)
+	if err != nil {
+		utils.InternalError(w, "批量创建失败: "+err.Error())
+		return
+	}
+
+	utils.Success(w, result)
+}
+
+// BatchStart POST /api/v1/pipelines/batch-start
+// 批量启动Pipeline：批量启动多个pending状态的Pipeline
+// P5-3新增：仅admin/operator可操作
+func (h *PipelineHandler) BatchStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+
+	// 解析请求体
+	var req struct {
+		PipelineIDs []string `json:"pipeline_ids"` // Pipeline ID列表
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+	if len(req.PipelineIDs) == 0 {
+		utils.BadRequest(w, "Pipeline ID列表不能为空")
+		return
+	}
+	if len(req.PipelineIDs) > 50 {
+		utils.BadRequest(w, "单次批量启动上限50个Pipeline")
+		return
+	}
+
+	result, err := h.pipelineService.BatchStartPipelines(req.PipelineIDs)
+	if err != nil {
+		utils.InternalError(w, "批量启动失败: "+err.Error())
+		return
+	}
+
+	utils.Success(w, result)
+}

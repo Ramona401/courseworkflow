@@ -453,3 +453,37 @@ export async function verifyPipeline(pipelineId: string) {
   })
   return (res.data as any).data as PipelineDetailResponse
 }
+
+// ==================== P5-3 批量创建+批量启动API ====================
+
+/** 批量创建结果 */
+export interface BatchCreateResult {
+  total_requested: number
+  created_ids: string[]
+  skipped_codes: string[]
+  skipped_reasons: string[]
+  failed_codes: string[]
+  failed_reasons: string[]
+}
+
+/** 批量启动结果 */
+export interface BatchStartResult {
+  total_requested: number
+  started_ids: string[]
+  skipped_ids: string[]
+  skipped_reasons: string[]
+  failed_ids: string[]
+  failed_reasons: string[]
+}
+
+/** 批量创建Pipeline（从课程编号列表） */
+export async function batchCreatePipelines(courseCodes: string[]) {
+  const res = await client.post('/pipelines/batch-create', { course_codes: courseCodes })
+  return (res.data as any).data as BatchCreateResult
+}
+
+/** 批量启动Pipeline（从Pipeline ID列表） */
+export async function batchStartPipelines(pipelineIds: string[]) {
+  const res = await client.post('/pipelines/batch-start', { pipeline_ids: pipelineIds })
+  return (res.data as any).data as BatchStartResult
+}

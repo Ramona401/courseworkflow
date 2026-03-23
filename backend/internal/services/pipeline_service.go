@@ -1713,3 +1713,111 @@ func (s *PipelineService) AIFixPage(pipelineID string, pageNumber int, fixInstru
 
 	return newHTML, nil
 }
+
+// ==================== P5-3 批量创建+批量启动 ====================
+
+// BatchCreateResult 批量创建结果
+type BatchCreateResult struct {
+	TotalRequested int      `json:"total_requested"` // 请求创建的课程数量
+	CreatedIDs     []string `json:"created_ids"`     // 成功创建的Pipeline ID列表
+	SkippedCodes   []string `json:"skipped_codes"`   // 跳过的课程编号（已有活跃Pipeline或课程不存在）
+	SkippedReasons []string `json:"skipped_reasons"` // 跳过原因详情
+	FailedCodes    []string `json:"failed_codes"`    // 创建失败的课程编号
+	FailedReasons  []string `json:"failed_reasons"`  // 失败原因详情
+}
+
+// BatchCreatePipelines 批量创建Pipeline
+// P5-3新增：从课程编号列表批量创建Pipeline，跳过已有活跃Pipeline的课程
+func (s *PipelineService) BatchCreatePipelines(courseCodes []string, userID string) (*BatchCreateResult, error) {
+	result := &BatchCreateResult{
+		TotalRequested: len(courseCodes),
+		CreatedIDs:     []string{},
+		SkippedCodes:   []string{},
+		SkippedReasons: []string{},
+		FailedCodes:    []string{},
+		FailedReasons:  []string{},
+	}
+
+	// 去重
+	seen := make(map[string]bool)
+	var uniqueCodes []string
+	for _, code := range courseCodes {
+		code = strings.TrimSpace(code)
+		if code == "" {
+			continue
+		}
+		if seen[code] {
+			continue
+		}
+		seen[code] = true
+		uniqueCodes = append(uniqueCodes, code)
+	}
+
+	for _, code := range uniqueCodes {
+		req := &models.CreatePipelineRequest{
+			CourseCode: code,
+		}
+		resp, err := s.CreatePipeline(req, userID)
+		if err != nil {
+			errMsg := err.Error()
+			// 区分"跳过"和"失败"
+			if strings.Contains(errMsg, "已有运行中的Pipeline") ||
+				strings.Contains(errMsg, "课程不存在") {
+				result.SkippedCodes = append(result.SkippedCodes, code)
+				result.SkippedReasons = append(result.SkippedReasons, code+": "+errMsg)
+			} else {
+				result.FailedCodes = append(result.FailedCodes, code)
+				result.FailedReasons = append(result.FailedReasons, code+": "+errMsg)
+			}
+			continue
+		}
+		result.CreatedIDs = append(result.CreatedIDs, resp.ID)
+	}
+
+	return result, nil
+}
+
+// BatchStartResult 批量启动结果
+type BatchStartResult struct {
+	TotalRequested int      `json:"total_requested"` // 请求启动的Pipeline数量
+	StartedIDs     []string `json:"started_ids"`     // 成功提交到引擎的Pipeline ID列表
+	SkippedIDs     []string `json:"skipped_ids"`     // 跳过的Pipeline ID（非pending状态）
+	SkippedReasons []string `json:"skipped_reasons"` // 跳过原因详情
+	FailedIDs      []string `json:"failed_ids"`      // 启动失败的Pipeline ID
+	FailedReasons  []string `json:"failed_reasons"`  // 失败原因详情
+}
+
+// BatchStartPipelines 批量启动Pipeline
+// P5-3新增：批量启动多个pending状态的Pipeline，逐个通过Engine.Submit提交
+func (s *PipelineService) BatchStartPipelines(ids []string) (*BatchStartResult, error) {
+	result := &BatchStartResult{
+		TotalRequested: len(ids),
+		StartedIDs:     []string{},
+		SkippedIDs:     []string{},
+		SkippedReasons: []string{},
+		FailedIDs:      []string{},
+		FailedReasons:  []string{},
+	}
+
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		_, err := s.StartPipeline(id)
+		if err != nil {
+			errMsg := err.Error()
+			if err == ErrPipelineNotPending || err == ErrPipelineNotFound {
+				result.SkippedIDs = append(result.SkippedIDs, id)
+				result.SkippedReasons = append(result.SkippedReasons, id+": "+errMsg)
+			} else {
+				result.FailedIDs = append(result.FailedIDs, id)
+				result.FailedReasons = append(result.FailedReasons, id+": "+errMsg)
+			}
+			continue
+		}
+		result.StartedIDs = append(result.StartedIDs, id)
+	}
+
+	return result, nil
+}
