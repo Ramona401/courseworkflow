@@ -5,6 +5,8 @@
  * P4.5-B增强: 新增getEvalRounds API + EvalRoundDetail类型
  * P4.5-C增强: 新增getGeneratedPages/updatePageDecision/finalizePipeline API
  * P4.5-D增强: 新增markPassed API（快捷通过）
+ * P4.5-E-2增强: 新增aiFixPage API（AI快修）
+ * P4.6-2增强: 新增verifyPipeline API（手动触发验收）
  */
 import client from './client'
 
@@ -298,6 +300,24 @@ export interface UpdatePageDecisionRequest {
   final_html?: string
 }
 
+// ==================== P4.6-2 验收相关类型 ====================
+
+/** Verify步骤step_data（P4.6-2新增） */
+export interface VerifyStepData {
+  generated_index: string
+  eval_score: number
+  eval_output: string
+  eval_e1: number
+  eval_e2: number
+  eval_e3: number
+  eval_e4: number
+  passed: boolean
+  review_round: number
+  model_used: string
+  tokens_used: number
+  latency_ms: number
+}
+
 // ==================== API方法 ====================
 
 /** 获取Pipeline列表 */
@@ -399,7 +419,6 @@ export async function markPassed(pipelineId: string) {
   return (res.data as any).data
 }
 
-
 // ==================== P4.5-E-2 AI快修API ====================
 
 /** AI快修请求参数 */
@@ -421,4 +440,16 @@ export async function aiFixPage(pipelineId: string, pageNumber: number, req: AIF
     timeout: 600000, // 10分钟超时（AI修复可能较慢）
   })
   return (res.data as any).data as AIFixPageResponse
+}
+
+// ==================== P4.6-2 验收API ====================
+
+/** 手动触发验收评估（finalized状态的Pipeline） */
+// P4.6-2新增：收集最终HTML → 索引生成器压缩 → Evaluator评估 → 判定通过/失败
+// 验收过程包含2次AI调用（索引生成+评估），预计耗时5-15分钟
+export async function verifyPipeline(pipelineId: string) {
+  const res = await client.post('/pipelines/' + pipelineId + '/verify', null, {
+    timeout: 1800000, // 30分钟超时（索引生成+评估两次AI调用）
+  })
+  return (res.data as any).data as PipelineDetailResponse
 }

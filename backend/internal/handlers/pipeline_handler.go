@@ -436,6 +436,35 @@ func (h *PipelineHandler) AIFixPage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ==================== P4.6-2 验收接口 ====================
+
+// VerifyPipeline POST /api/v1/pipelines/{id}/verify
+// 手动触发验收评估（finalized状态的Pipeline，收集HTML→索引生成→评估→判定通过/失败）
+// P4.6-2新增：验收流程入口接口
+func (h *PipelineHandler) VerifyPipeline(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+
+	id := extractPipelineIDWithSuffix(r.URL.Path, "/verify")
+	if id == "" {
+		utils.BadRequest(w, "缺少Pipeline ID")
+		return
+	}
+
+	// 调用服务层执行验收（可能耗时较长：索引生成+评估两次AI调用）
+	resp, err := h.pipelineService.VerifyPipeline(id)
+	if err != nil {
+		handlePipelineError(w, err)
+		return
+	}
+
+	utils.Success(w, resp)
+}
+
+// ==================== 路径解析辅助函数 ====================
+
 // extractPipelineIDAndPageNumberForAIFix 从ai-fix路径提取Pipeline ID和页码
 // P4.5-E-2新增：路径格式 /api/v1/pipelines/{id}/pages/{n}/ai-fix
 func extractPipelineIDAndPageNumberForAIFix(path string) (string, int) {
@@ -460,8 +489,6 @@ func extractPipelineIDAndPageNumberForAIFix(path string) (string, int) {
 	}
 	return pipelineID, pageNum
 }
-
-// ==================== 路径解析辅助函数 ====================
 
 // extractPipelineID 从路径提取Pipeline ID
 func extractPipelineID(path string) string {
@@ -530,6 +557,7 @@ func extractPipelineIDAndPageNumber(path string) (string, int) {
 // ==================== 错误处理 ====================
 
 // handlePipelineError Pipeline统一错误处理
+// P4.6-2更新：新增验收相关错误处理
 func handlePipelineError(w http.ResponseWriter, err error) {
 	errMsg := err.Error()
 
@@ -552,15 +580,35 @@ func handlePipelineError(w http.ResponseWriter, err error) {
 		err == services.ErrPipelineNotDeletable,
 		err == services.ErrPipelineNotReviewable,
 		err == services.ErrFinalizeIncomplete,
-		err == services.ErrMarkPassedNotAllowed:
+		err == services.ErrMarkPassedNotAllowed,
+		err == services.ErrVerifyNotFinalized:
 		utils.Fail(w, http.StatusConflict, errMsg)
 
 	// P4.5-E-2: AI快修失败 (502)
 	case err == services.ErrAIFixFailed:
 		utils.Fail(w, http.StatusBadGateway, errMsg)
 
+	// P4.6-2: 验收AI调用失败 (502)
+	case err == services.ErrVerifyIndexGenFailed,
+		err == services.ErrVerifyEvalFailed:
+		utils.Fail(w, http.StatusBadGateway, errMsg)
+
 	// P4.5-D: 快捷通过未达标 (422)
 	case err == services.ErrMarkPassedNotMet:
+		utils.Fail(w, http.StatusUnprocessableEntity, errMsg)
+
+	// P4.6-2: 验收前置条件不满足 (422)
+	case err == services.ErrVerifyNoPages,
+		err == services.ErrVerifyNoValidHTML,
+		err == services.ErrVerifyIndexTooShort,
+		err == services.ErrVerifyScoreExtractFail,
+		err == services.ErrVerifyScannerNotDone:
+		utils.Fail(w, http.StatusUnprocessableEntity, errMsg)
+
+	// P4.6-2: 验收提示词缺失 (422)
+	case err == services.ErrVerifyPromptGMissing,
+		err == services.ErrVerifyPromptBMissing,
+		err == services.ErrVerifyDictMissing:
 		utils.Fail(w, http.StatusUnprocessableEntity, errMsg)
 
 	// dbCheck验证失败 -> 返回422
@@ -588,6 +636,14 @@ func handlePipelineError(w http.ResponseWriter, err error) {
 	// 包含"评估未达标"的文字（MarkPassed带详情）
 	case strings.Contains(errMsg, "评估未达标"):
 		utils.Fail(w, http.StatusUnprocessableEntity, errMsg)
+
+	// P4.6-2: 包含验收相关错误文字的模糊匹配
+	case strings.Contains(errMsg, "索引生成器AI调用失败"),
+		strings.Contains(errMsg, "验收评估AI调用失败"):
+		utils.Fail(w, http.StatusBadGateway, errMsg)
+
+	case strings.Contains(errMsg, "不是finalized状态"):
+		utils.Fail(w, http.StatusConflict, errMsg)
 
 	// 其他服务器错误 (500)
 	default:

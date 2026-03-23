@@ -12,7 +12,7 @@ import (
 )
 
 // Setup 注册所有路由并返回根Handler
-// 版本：0.21.0（P4.6-1新增verify步骤基础设施+review_round）（P4.5-E-2新增ai-fix路由）
+// 版本：0.22.0（P4.6-2新增verify验收路由+修复ai-fix路由）
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -269,9 +269,32 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.MarkPassed(w, r)
 
+		// POST /pipelines/{id}/verify — 手动触发验收（P4.6-2新增）
+		case hasSuffix(path, "/verify"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可触发验收"})
+				return
+			}
+			pipelineHandler.VerifyPipeline(w, r)
+
 		// GET /pipelines/{id}/eval-rounds — 评估轮次详情（P4.5-B）
 		case hasSuffix(path, "/eval-rounds"):
 			pipelineHandler.GetEvalRounds(w, r)
+
+		// POST /pipelines/{id}/pages/{n}/ai-fix — AI快修（P4.5-E-2新增）
+		// 注意：ai-fix路由必须在/pages路由之前匹配，因为/pages是后缀匹配
+		case containsPagesAIFix(path):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可使用AI快修"})
+				return
+			}
+			pipelineHandler.AIFixPage(w, r)
 
 		// PUT /pipelines/{id}/pages/{n}/decision — 更新页面决策（P4.5-C新增）
 		case containsPagesDecision(path):
@@ -381,7 +404,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.21.0",
+		"version": "0.22.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }
