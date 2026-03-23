@@ -12,7 +12,7 @@ import (
 )
 
 // Setup 注册所有路由并返回根Handler
-// 版本：0.27.0（P5-3新增批量创建+批量启动+并发引擎+AI限流+引擎状态接口）
+// 版本：0.28.0（P5-4新增SSE实时进度推送+批量创建+批量启动+并发引擎+AI限流）
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -41,6 +41,7 @@ func Setup(cfg *config.Config) http.Handler {
 	edHandler := handlers.NewExternalDataHandler(edService)
 	courseHandler := handlers.NewCourseHandler(courseService)
 	pipelineHandler := handlers.NewPipelineHandler(pipelineService)
+	sseHandler := handlers.NewSSEHandler() // P5-4新增：SSE实时推送处理器
 
 	// ==================== 中间件 ====================
 	authMW := middleware.AuthMiddleware(authService)
@@ -327,6 +328,10 @@ func Setup(cfg *config.Config) http.Handler {
 			pipelineHandler.VerifyPipeline(w, r)
 
 		// GET /pipelines/{id}/eval-rounds
+			// GET /pipelines/{id}/stream — SSE实时进度推送（P5-4新增）
+			case hasSuffix(path, "/stream"):
+				sseHandler.StreamPipeline(w, r)
+
 		case hasSuffix(path, "/eval-rounds"):
 			pipelineHandler.GetEvalRounds(w, r)
 
@@ -447,7 +452,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.27.0",
+		"version": "0.28.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

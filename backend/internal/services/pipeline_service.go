@@ -448,6 +448,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 	dbCheckErr := s.executeDbCheck(pipeline)
 	if dbCheckErr != nil {
 		_ = repository.UpdatePipelineError(id, models.StepDbCheck, dbCheckErr.Error())
+		s.broadcastStepUpdate(id, "pipeline_error", "dbCheck", "failed", "failed", dbCheckErr.Error())
 		return
 	}
 
@@ -456,6 +457,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 		_ = repository.UpdatePipelineError(id, models.StepScanner, "推进到Scanner失败: "+err.Error())
 		return
 	}
+	s.broadcastStepUpdate(id, "step_update", "scanner", "running", "running", "dbCheck完成，开始Scanner")
 
 	// autoMode：自动执行后续步骤
 	if pipeline.AutoMode {
@@ -469,6 +471,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 		scannerErr := s.executeScanner(pipeline)
 		if scannerErr != nil {
 			_ = repository.UpdatePipelineError(id, models.StepScanner, scannerErr.Error())
+			s.broadcastStepUpdate(id, "pipeline_error", "scanner", "failed", "failed", scannerErr.Error())
 			return
 		}
 
@@ -477,6 +480,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 			_ = repository.UpdatePipelineError(id, models.StepEvaluator, "推进到Evaluator失败: "+err.Error())
 			return
 		}
+		s.broadcastStepUpdate(id, "step_update", "evaluator", "running", "running", "Scanner完成，开始Evaluator")
 
 		// ===== 执行evaluator =====
 		pipeline, err = repository.GetPipelineByID(id)
@@ -488,6 +492,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 		evalErr := s.executeEvaluator(pipeline)
 		if evalErr != nil {
 			_ = repository.UpdatePipelineError(id, models.StepEvaluator, evalErr.Error())
+			s.broadcastStepUpdate(id, "pipeline_error", "evaluator", "failed", "failed", evalErr.Error())
 			return
 		}
 
@@ -496,6 +501,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 			_ = repository.UpdatePipelineError(id, models.StepMeta, "推进到Meta失败: "+err.Error())
 			return
 		}
+		s.broadcastStepUpdate(id, "step_update", "meta", "running", "running", "Evaluator完成，开始Meta")
 
 		// ===== 执行meta =====
 		pipeline, err = repository.GetPipelineByID(id)
@@ -507,6 +513,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 		metaErr := s.executeMeta(pipeline)
 		if metaErr != nil {
 			_ = repository.UpdatePipelineError(id, models.StepMeta, metaErr.Error())
+			s.broadcastStepUpdate(id, "pipeline_error", "meta", "failed", "failed", metaErr.Error())
 			return
 		}
 
@@ -515,6 +522,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 			_ = repository.UpdatePipelineError(id, models.StepTranslator, "推进到Translator失败: "+err.Error())
 			return
 		}
+		s.broadcastStepUpdate(id, "step_update", "translator", "running", "running", "Meta完成，开始Translator")
 
 		// ===== 执行translator =====
 		pipeline, err = repository.GetPipelineByID(id)
@@ -526,6 +534,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 		transErr := s.executeTranslator(pipeline)
 		if transErr != nil {
 			_ = repository.UpdatePipelineError(id, models.StepTranslator, transErr.Error())
+			s.broadcastStepUpdate(id, "pipeline_error", "translator", "failed", "failed", transErr.Error())
 			return
 		}
 
@@ -534,6 +543,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 			_ = repository.UpdatePipelineError(id, models.StepGenerator, "推进到Generator失败: "+err.Error())
 			return
 		}
+		s.broadcastStepUpdate(id, "step_update", "generator", "running", "running", "Translator完成，开始Generator")
 
 		// ===== 执行generator =====
 		pipeline, err = repository.GetPipelineByID(id)
@@ -545,6 +555,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 		genErr := s.executeGenerator(pipeline)
 		if genErr != nil {
 			_ = repository.UpdatePipelineError(id, models.StepGenerator, genErr.Error())
+			s.broadcastStepUpdate(id, "pipeline_error", "generator", "failed", "failed", genErr.Error())
 			return
 		}
 
@@ -553,6 +564,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 			_ = repository.UpdatePipelineError(id, models.StepReview, "推进到Review失败: "+err.Error())
 			return
 		}
+		s.broadcastStepUpdate(id, "pipeline_done", "review", "done", "review_queue", "Pipeline执行完成，等待审核")
 	}
 }
 
@@ -568,6 +580,23 @@ func (s *PipelineService) callAIWithSemaphore(cfg *ai.EffectiveConfig, systemPro
 	}
 	return ai.CallAI(cfg, systemPrompt, userPrompt)
 }
+
+// ==================== P5-4 SSE事件广播辅助方法 ====================
+
+// broadcastStepUpdate 广播步骤更新事件到SSE订阅者
+// P5-4新增：每个步骤完成/失败/推进时调用，推送实时进度给前端
+func (s *PipelineService) broadcastStepUpdate(pipelineID string, eventType string, currentStep string, stepStatus string, pipelineStatus string, message string) {
+	event := SSEEvent{
+		EventType:   eventType,
+		PipelineID:  pipelineID,
+		CurrentStep: currentStep,
+		StepStatus:  stepStatus,
+		Status:      pipelineStatus,
+		Message:     message,
+	}
+	GlobalSSEHub.Broadcast(pipelineID, event)
+}
+
 
 // ==================== dbCheck 步骤（P4-1）====================
 
