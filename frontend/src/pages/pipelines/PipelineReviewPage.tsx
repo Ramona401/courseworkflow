@@ -1,5 +1,5 @@
 /**
- * Pipeline审核页面（P4.5-E 重构版 v3.2）
+ * Pipeline审核页面（P4.5-E 重构版 v3.3）
  *
  * 核心设计：
  * 1. 左侧列表按页码顺序排列（保持课程逻辑连贯性）
@@ -9,6 +9,7 @@
  * 5. 所有页面（含keep）都逐个审核
  * 6. 全屏修改理由弹窗（P4.5-E-1）：点击按钮弹出模态框显示完整修改理由
  * 7. 全屏AI快修功能（P4.5-E-2）：审核员输入修改指令，AI基于当前HTML修复
+ * 8. 全屏纯净预览模式（P4.5-E-2b）：隐藏所有UI，只显示课件HTML，查看真实格式效果
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
@@ -24,7 +25,7 @@ import {
 } from '@/api/pipelines'
 import {
   ArrowLeft, RefreshCw, Check, X, Edit3, CheckCircle, Send,
-  Maximize2, Minimize2, ChevronLeft, ChevronRight, FileText, Columns, Wand2, Loader,
+  Maximize2, Minimize2, ChevronLeft, ChevronRight, FileText, Columns, Wand2, Loader, Eye, EyeOff,
 } from 'lucide-react'
 
 // ==================== 常量 ====================
@@ -659,6 +660,8 @@ function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavigate, on
   const [showAIFixModal, setShowAIFixModal] = useState(false)
   const [aiFixInstruction, setAIFixInstruction] = useState('')
   const [aiFixLoading, setAIFixLoading] = useState(false)
+  // P4.5-E-2b：纯净预览模式（隐藏所有UI，只显示课件HTML）
+  const [purePreview, setPurePreview] = useState(false)
 
   const hasPrev = currentIdx > 0
   const hasNext = currentIdx < pages.length - 1
@@ -681,6 +684,7 @@ function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavigate, on
     setShowReasonModal(false)
     setShowAIFixModal(false)
     setAIFixInstruction('')
+    setPurePreview(false)
   }, [page.page_number, page.operation])
 
   const navBtn: React.CSSProperties = {
@@ -692,12 +696,13 @@ function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavigate, on
   return (
     <div style={{
       position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-      zIndex: 9999, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)',
+      zIndex: 9999, background: purePreview ? '#fff' : 'rgba(0,0,0,0.6)',
+      backdropFilter: purePreview ? 'none' : 'blur(8px)',
       display: 'flex', flexDirection: 'column',
-    }} onClick={(e) => { if (e.target === e.currentTarget) onClose() }}>
+    }} onClick={(e) => { if (e.target === e.currentTarget) { purePreview ? setPurePreview(false) : onClose() } }}>
 
-      {/* 顶部工具栏 */}
-      <div style={{
+      {/* 顶部工具栏（纯净预览模式下隐藏） */}
+      {!purePreview && <div style={{
         display: 'flex', alignItems: 'center', gap: 10, padding: '10px 20px',
         background: 'rgba(255,255,255,0.95)', backdropFilter: 'blur(20px)',
         borderBottom: '1px solid rgba(0,0,0,0.08)', flexShrink: 0,
@@ -766,6 +771,21 @@ function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavigate, on
           </button>
         )}
 
+        {/* P4.5-E-2b：纯净预览按钮 */}
+        <button
+          onClick={() => setPurePreview(true)}
+          style={{
+            ...navBtn,
+            padding: '6px 14px',
+            background: '#f0faf0',
+            color: '#2e7d32',
+            border: '1px solid rgba(46,125,50,0.15)',
+          }}
+          title="纯净预览：隐藏所有UI，只显示课件（点击任意位置退出）"
+        >
+          <Eye size={13} /> 纯净预览
+        </button>
+
         {/* P4.5-E-2：AI快修按钮 */}
         <button
           onClick={() => { setShowAIFixModal(true); setAIFixInstruction('') }}
@@ -785,7 +805,7 @@ function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavigate, on
         <button onClick={onClose} style={{ ...navBtn, padding: '6px 14px' }} title="退出 (ESC)">
           <Minimize2 size={14} /> 退出
         </button>
-      </div>
+      </div>}
 
       {/* 全屏内容区 */}
       <div style={{ flex: 1, overflow: 'hidden', background: '#fff', position: 'relative' }}>
@@ -814,15 +834,15 @@ function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavigate, on
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#aeaeb2' }}>（无内容）</div>
         )}
 
-        {/* 左右翻页热区 */}
-        {hasPrev && (
+        {/* 左右翻页热区（纯净预览模式下隐藏） */}
+        {hasPrev && !purePreview && (
           <div onClick={() => onNavigate(currentIdx - 1)} style={{
             position: 'absolute', left: 0, top: 0, bottom: 0, width: 60, cursor: 'pointer',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             background: 'linear-gradient(to right, rgba(0,0,0,0.05), transparent)',
           }}><ChevronLeft size={24} color="#8e8e93" /></div>
         )}
-        {hasNext && (
+        {hasNext && !purePreview && (
           <div onClick={() => onNavigate(currentIdx + 1)} style={{
             position: 'absolute', right: 0, top: 0, bottom: 0, width: 60, cursor: 'pointer',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -830,6 +850,24 @@ function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavigate, on
           }}><ChevronRight size={24} color="#8e8e93" /></div>
         )}
       </div>
+
+      {/* P4.5-E-2b：纯净预览退出提示（悬浮在底部，点击或按ESC退出） */}
+      {purePreview && (
+        <div
+          onClick={() => setPurePreview(false)}
+          style={{
+            position: 'fixed', bottom: 20, left: '50%', transform: 'translateX(-50%)',
+            zIndex: 10002, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)',
+            color: '#fff', fontSize: 12, fontWeight: 500, padding: '8px 20px',
+            borderRadius: 20, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6,
+            opacity: 0.7, transition: 'opacity 0.2s',
+          }}
+          onMouseEnter={(e) => { (e.target as HTMLElement).style.opacity = '1' }}
+          onMouseLeave={(e) => { (e.target as HTMLElement).style.opacity = '0.7' }}
+        >
+          <EyeOff size={13} /> 点击此处或按 ESC 退出纯净预览
+        </div>
+      )}
 
       {/* P4.5-E-1：修改理由弹窗 */}
       {showReasonModal && page.change_reason && (
