@@ -12,6 +12,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { getPipelineDetail, getStepDetail, verifyPipeline, type PipelineDetailResponse, type StepListItem } from '@/api/pipelines'
 import { ArrowLeft, RefreshCw, ClipboardCheck, ShieldCheck, Radio } from 'lucide-react'
+import { useAuth } from '@/store/auth'
 
 // 导入各步骤面板组件
 import DbCheckPanel from './steps/DbCheckPanel'
@@ -26,13 +27,14 @@ import VerifyPanel from './steps/VerifyPanel'
 /** 轮询间隔（SSE回退模式使用） */
 const POLL_INTERVAL_MS = 5000
 /** SSE基础URL */
-const SSE_BASE_URL = '/api/v1/pipelines'
+const SSE_BASE_URL = '/api/v1/sse/pipelines'
 
 // ==================== 主页面组件 ====================
 
 export default function PipelineDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const { token } = useAuth()
   const [detail, setDetail] = useState<PipelineDetailResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -99,7 +101,7 @@ export default function PipelineDetailPage() {
     // 尝试建立SSE连接
     const connectSSE = () => {
       try {
-        const url = SSE_BASE_URL + '/' + id + '/stream'
+        const url = SSE_BASE_URL + '/' + id + '/stream?token=' + encodeURIComponent(token || '')
         const es = new EventSource(url)
         eventSourceRef.current = es
 

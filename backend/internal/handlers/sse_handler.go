@@ -1,8 +1,9 @@
 package handlers
 
 // ==================== P5-4 SSE实时推送处理器 ====================
-// GET /api/v1/pipelines/{id}/stream — SSE长连接
-// 前端通过EventSource连接此接口，接收Pipeline执行进度事件
+// GET /api/v1/pipelines/{id}/stream?token=xxx — SSE长连接
+// 由于浏览器EventSource不支持自定义header，通过URL query参数传递JWT token
+// 此接口不走authMW中间件，内部手动验证token
 
 import (
 	"encoding/json"
@@ -14,23 +15,40 @@ import (
 )
 
 // SSEHandler SSE推送处理器
-type SSEHandler struct{}
-
-// NewSSEHandler 创建SSE处理器实例
-func NewSSEHandler() *SSEHandler {
-	return &SSEHandler{}
+type SSEHandler struct {
+	authService *services.AuthService // 用于验证JWT token
 }
 
-// StreamPipeline GET /api/v1/pipelines/{id}/stream
+// NewSSEHandler 创建SSE处理器实例
+// P5-4修复：需要注入AuthService用于手动验证token
+func NewSSEHandler(authService *services.AuthService) *SSEHandler {
+	return &SSEHandler{authService: authService}
+}
+
+// StreamPipeline GET /api/v1/pipelines/{id}/stream?token=xxx
 // SSE长连接：推送Pipeline执行进度事件
-// 事件格式：data: {"type":"step_update","pipeline_id":"xxx","current_step":"scanner","step_status":"done","status":"running"}
+// token通过URL query参数传递（EventSource不支持自定义header）
 func (h *SSEHandler) StreamPipeline(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "仅支持GET请求", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// 从路径提取Pipeline ID（路径格式：/api/v1/pipelines/{id}/stream）
+	// 从query参数获取token并验证
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Error(w, `{"code":-1,"message":"缺少token参数"}`, http.StatusUnauthorized)
+		return
+	}
+
+	// 验证JWT token
+	_, err := h.authService.ValidateToken(token)
+	if err != nil {
+		http.Error(w, `{"code":-1,"message":"token无效或已过期"}`, http.StatusUnauthorized)
+		return
+	}
+
+	// 从路径提取Pipeline ID
 	pipelineID := extractPipelineIDForSSE(r.URL.Path)
 	if pipelineID == "" {
 		http.Error(w, "缺少Pipeline ID", http.StatusBadRequest)
@@ -68,18 +86,15 @@ func (h *SSEHandler) StreamPipeline(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-ctx.Done():
-			// 客户端断开连接
 			fmt.Printf("[SSE Handler] 客户端断开: pipeline=%s\n", pipelineID)
 			return
 
 		case event, ok := <-ch:
 			if !ok {
-				// channel被关闭（Unsubscribe时）
 				return
 			}
 			writeSSEEvent(w, flusher, event)
 
-			// pipeline_done 或 pipeline_error 事件后关闭连接
 			if event.EventType == "pipeline_done" || event.EventType == "pipeline_error" {
 				return
 			}
@@ -93,13 +108,11 @@ func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, event services.S
 	if err != nil {
 		return
 	}
-	// SSE格式：event: {eventType}\ndata: {json}\n\n
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.EventType, string(data))
 	flusher.Flush()
 }
 
 // extractPipelineIDForSSE 从SSE路径中提取Pipeline ID
-// 路径格式：/api/v1/pipelines/{id}/stream
 func extractPipelineIDForSSE(path string) string {
 	streamIdx := strings.LastIndex(path, "/stream")
 	if streamIdx <= 0 {

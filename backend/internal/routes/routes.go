@@ -41,7 +41,7 @@ func Setup(cfg *config.Config) http.Handler {
 	edHandler := handlers.NewExternalDataHandler(edService)
 	courseHandler := handlers.NewCourseHandler(courseService)
 	pipelineHandler := handlers.NewPipelineHandler(pipelineService)
-	sseHandler := handlers.NewSSEHandler() // P5-4新增：SSE实时推送处理器
+	sseHandler := handlers.NewSSEHandler(authService) // P5-4修复：传入authService用于token验证
 
 	// ==================== 中间件 ====================
 	authMW := middleware.AuthMiddleware(authService)
@@ -256,6 +256,10 @@ func Setup(cfg *config.Config) http.Handler {
 		}
 	}), authMW))
 
+	// ==================== P5-4新增：SSE实时推送路由（不走authMW，内部验证token） ====================
+	// GET /api/v1/pipelines/{id}/stream?token=xxx — EventSource不支持自定义header，token通过query传递
+	mux.HandleFunc("/api/v1/sse/pipelines/", sseHandler.StreamPipeline)
+
 	// /api/v1/pipelines/ 子路径分发
 	mux.Handle("/api/v1/pipelines/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -328,10 +332,6 @@ func Setup(cfg *config.Config) http.Handler {
 			pipelineHandler.VerifyPipeline(w, r)
 
 		// GET /pipelines/{id}/eval-rounds
-			// GET /pipelines/{id}/stream — SSE实时进度推送（P5-4新增）
-			case hasSuffix(path, "/stream"):
-				sseHandler.StreamPipeline(w, r)
-
 		case hasSuffix(path, "/eval-rounds"):
 			pipelineHandler.GetEvalRounds(w, r)
 
