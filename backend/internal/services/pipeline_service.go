@@ -1237,6 +1237,17 @@ func extractMetaScores(output string) *metaScoreResult {
 		result.e4Rounds = append(result.e4Rounds, roundMap[4][rn])
 	}
 
+	// P4.5-D修复：从Meta完整输出末尾提取「综合评分：X→Y/10」中的Y值（修改后预期分）
+	// META_SCORE块中的TOTAL_FINAL是原始索引的仲裁分，末尾的综合评分才是修改后的预期分
+	// 格式示例：综合评分：8.3→9.9/10
+	finalScoreRe := regexp.MustCompile(`(?:综合评分|综合)[：:]\s*[\d.]+\s*→\s*([\d.]+)\s*/\s*10`)
+	if fsm := finalScoreRe.FindStringSubmatch(output); fsm != nil {
+		newScore := safeParseFloat(fsm[1])
+		if newScore > 0 {
+			result.totalFinal = newScore
+		}
+	}
+
 	result.parseOk = true
 	return result
 }

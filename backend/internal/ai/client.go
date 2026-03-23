@@ -195,7 +195,7 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 	httpReq.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 
 	// 超时时间120秒（AI生成可能较慢）
-	httpClient := &http.Client{Timeout: 120 * time.Second}
+	httpClient := &http.Client{Timeout: 600 * time.Second}
 	startTime := time.Now()
 
 	resp, err := httpClient.Do(httpReq)

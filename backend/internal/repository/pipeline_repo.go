@@ -45,7 +45,7 @@ func GetDashboardStats() (*DashboardStats, error) {
 	// 1. 课程统计
 	err := database.DB.QueryRow(ctx,
 		`SELECT COUNT(*),
-		        COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM course_indexes ci WHERE ci.course_id = c.id))
+			COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM course_indexes ci WHERE ci.course_id = c.id))
 		 FROM courses c`).Scan(&stats.TotalCourses, &stats.CoursesWithIndex)
 	if err != nil {
 		return nil, fmt.Errorf("查询课程统计失败: %w", err)
@@ -619,9 +619,10 @@ func DeleteEvalRoundsByPipelineID(pipelineID string) error {
 // ==================== Generated Pages CRUD（P4-6新增）====================
 
 // CreateGeneratedPage 创建生成页面记录
+// P4.5-E更新：新增changeReason参数，存储Translator给出的修改理由和指令
 func CreateGeneratedPage(pipelineID string, pageNumber int, pageTitle string,
 	operation string, originalHTML string, generatedHTML string, finalHTML string,
-	lessonID *int, mergeSources string) error {
+	lessonID *int, mergeSources string, changeReason string) error {
 	ctx := context.Background()
 
 	var mergeParam interface{}
@@ -632,11 +633,11 @@ func CreateGeneratedPage(pipelineID string, pageNumber int, pageTitle string,
 	_, err := database.DB.Exec(ctx,
 		`INSERT INTO generated_pages (pipeline_id, page_number, page_title,
 			operation, original_html, generated_html, final_html,
-			decision, lesson_id, merge_sources)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9::jsonb)`,
+			decision, lesson_id, merge_sources, change_reason)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9::jsonb, $10)`,
 		pipelineID, pageNumber, pageTitle,
 		operation, originalHTML, generatedHTML, finalHTML,
-		lessonID, mergeParam)
+		lessonID, mergeParam, changeReason)
 	if err != nil {
 		return fmt.Errorf("创建生成页面P%d失败: %w", pageNumber, err)
 	}
@@ -692,8 +693,9 @@ func GetGeneratedPagesByPipelineID(pipelineID string) ([]*GeneratedPageRow, erro
 	return pages, nil
 }
 
-// GetGeneratedPagesWithHTML 获取指定Pipeline的所有生成页面（含完整HTML内容）
+// GetGeneratedPagesWithHTML 获取指定Pipeline的所有生成页面（含完整HTML内容+修改理由）
 // P4.5-C新增：审核页面需要展示完整HTML预览和对比
+// P4.5-E更新：返回change_reason字段供审核页面展示修改意图
 func GetGeneratedPagesWithHTML(pipelineID string) ([]*GeneratedPageFullRow, error) {
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
@@ -702,6 +704,7 @@ func GetGeneratedPagesWithHTML(pipelineID string) ([]*GeneratedPageFullRow, erro
 			COALESCE(generated_html, '') as generated_html,
 			COALESCE(final_html, '') as final_html,
 			decision, lesson_id, merge_sources::text,
+			COALESCE(change_reason, '') as change_reason,
 			created_at, updated_at
 		 FROM generated_pages
 		 WHERE pipeline_id = $1
@@ -720,6 +723,7 @@ func GetGeneratedPagesWithHTML(pipelineID string) ([]*GeneratedPageFullRow, erro
 			&p.ID, &p.PipelineID, &p.PageNumber, &pageTitle, &p.Operation,
 			&p.OriginalHTML, &p.GeneratedHTML, &p.FinalHTML,
 			&decision, &lessonID, &mergeSources,
+			&p.ChangeReason,
 			&p.CreatedAt, &p.UpdatedAt,
 		)
 		if err != nil {
@@ -813,8 +817,9 @@ type GeneratedPageRow struct {
 	UpdatedAt    *time.Time `json:"updated_at"`
 }
 
-// GeneratedPageFullRow 生成页面查询行（含完整HTML内容）
+// GeneratedPageFullRow 生成页面查询行（含完整HTML内容+修改理由）
 // P4.5-C新增：审核页面需要完整HTML用于预览和对比
+// P4.5-E更新：新增ChangeReason字段，存储Translator给出的修改理由
 type GeneratedPageFullRow struct {
 	ID            string     `json:"id"`
 	PipelineID    string     `json:"pipeline_id"`
@@ -827,6 +832,7 @@ type GeneratedPageFullRow struct {
 	Decision      string     `json:"decision"`
 	LessonID      *int       `json:"lesson_id"`
 	MergeSources  string     `json:"merge_sources"`
+	ChangeReason  string     `json:"change_reason"`
 	CreatedAt     *time.Time `json:"created_at"`
 	UpdatedAt     *time.Time `json:"updated_at"`
 }

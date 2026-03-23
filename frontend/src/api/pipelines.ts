@@ -282,6 +282,8 @@ export interface GeneratedPageFull {
   decision: string
   lesson_id: number | null
   merge_sources: string
+  /** P4.5-E新增：Translator给出的修改理由和指令（审核页面展示用） */
+  change_reason: string
   created_at: string | null
   updated_at: string | null
 }

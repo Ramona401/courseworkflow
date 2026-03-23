@@ -30,6 +30,7 @@ var (
 
 // executeGenerator 执行generator步骤：根据Translator输出逐页生成/修改HTML
 // 流程：解析页面操作 → 建立页码→lesson_id映射 → 逐页执行5种操作 → 存入generated_pages表
+// P4.5-E更新：每页存入change_reason（Translator的修改理由/指令），供审核页面展示
 func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 	startTime := time.Now()
 	stepName := models.StepGenerator
@@ -132,6 +133,10 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 			Operation:  op.Operation,
 		}
 
+		// P4.5-E: 提取修改理由（Translator给出的逐页修改指令）
+		// 对于keep/delete页面也保留Description，作为衔接说明
+		changeReason := op.Description
+
 		// 获取当前页的lesson_id
 		lessonID, hasLesson := pageLessonMap[op.PageNumber]
 		if hasLesson {
@@ -152,7 +157,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 					_ = repository.CreateGeneratedPage(
 						pipeline.ID, op.PageNumber, op.Title,
 						"keep", origHTML, "", origHTML,
-						lidPtr, "",
+						lidPtr, "", changeReason,
 					)
 				} else {
 					pageRec.Status = "done"
@@ -160,7 +165,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 					_ = repository.CreateGeneratedPage(
 						pipeline.ID, op.PageNumber, op.Title,
 						"keep", "", "", "",
-						nil, "",
+						nil, "", changeReason,
 					)
 				}
 			} else {
@@ -168,7 +173,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				_ = repository.CreateGeneratedPage(
 					pipeline.ID, op.PageNumber, op.Title,
 					"keep", "", "", "",
-					nil, "",
+					nil, "", changeReason,
 				)
 			}
 
@@ -179,7 +184,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 			_ = repository.CreateGeneratedPage(
 				pipeline.ID, op.PageNumber, op.Title,
 				"delete", "", "", "",
-				nil, "",
+				nil, "", changeReason,
 			)
 
 		case models.PageOpModify:
@@ -192,7 +197,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				_ = repository.CreateGeneratedPage(
 					pipeline.ID, op.PageNumber, op.Title,
 					"modify", "", "", "",
-					nil, "",
+					nil, "", changeReason,
 				)
 				result.Pages = append(result.Pages, pageRec)
 				continue
@@ -206,7 +211,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				_ = repository.CreateGeneratedPage(
 					pipeline.ID, op.PageNumber, op.Title,
 					"modify", "", "", "",
-					&lessonID, "",
+					&lessonID, "", changeReason,
 				)
 				result.Pages = append(result.Pages, pageRec)
 				continue
@@ -228,7 +233,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				_ = repository.CreateGeneratedPage(
 					pipeline.ID, op.PageNumber, op.Title,
 					"modify", origHTML, "", origHTML,
-					&lessonID, "",
+					&lessonID, "", changeReason,
 				)
 			} else {
 				genHTML := extractGeneratedHTML(callResult.Content)
@@ -240,7 +245,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				_ = repository.CreateGeneratedPage(
 					pipeline.ID, op.PageNumber, op.Title,
 					"modify", origHTML, genHTML, genHTML,
-					&lessonID, "",
+					&lessonID, "", changeReason,
 				)
 			}
 
@@ -261,7 +266,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				_ = repository.CreateGeneratedPage(
 					pipeline.ID, op.PageNumber, op.Title,
 					"create", "", "", "",
-					nil, "",
+					nil, "", changeReason,
 				)
 			} else {
 				genHTML := extractGeneratedHTML(callResult.Content)
@@ -273,7 +278,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				_ = repository.CreateGeneratedPage(
 					pipeline.ID, op.PageNumber, op.Title,
 					"create", "", genHTML, genHTML,
-					nil, "",
+					nil, "", changeReason,
 				)
 			}
 
@@ -309,7 +314,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 						_ = repository.CreateGeneratedPage(
 							pipeline.ID, op.PageNumber, op.Title,
 							"modify", sourceHTMLs[0].html, genHTML, genHTML,
-							lidPtr, "",
+							lidPtr, "", changeReason,
 						)
 					}
 				} else {
@@ -343,7 +348,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				_ = repository.CreateGeneratedPage(
 					pipeline.ID, op.PageNumber, op.Title,
 					"merge", sourceHTMLs[0].html, "", sourceHTMLs[0].html,
-					nil, string(mergeJSON),
+					nil, string(mergeJSON), changeReason,
 				)
 			} else {
 				genHTML := extractGeneratedHTML(callResult.Content)
@@ -355,7 +360,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				_ = repository.CreateGeneratedPage(
 					pipeline.ID, op.PageNumber, op.Title,
 					"merge", sourceHTMLs[0].html, genHTML, genHTML,
-					nil, string(mergeJSON),
+					nil, string(mergeJSON), changeReason,
 				)
 			}
 		}
