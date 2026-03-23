@@ -603,7 +603,8 @@ func handlePipelineError(w http.ResponseWriter, err error) {
 		err == services.ErrPipelineNotReviewable,
 		err == services.ErrFinalizeIncomplete,
 		err == services.ErrMarkPassedNotAllowed,
-		err == services.ErrVerifyNotFinalized:
+		err == services.ErrVerifyNotFinalized,
+		err == services.ErrEngineQueueFull:
 		utils.Fail(w, http.StatusConflict, errMsg)
 
 	// P4.5-E-2: AI快修失败 (502)
