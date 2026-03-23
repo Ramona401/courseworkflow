@@ -12,7 +12,7 @@ import (
 )
 
 // Setup 注册所有路由并返回根Handler
-// 版本：0.22.0（P4.6-2新增verify验收路由+修复ai-fix路由）
+// 版本：0.24.0（P4.6-4新增batch-verify批量验收路由+夜间定时任务）
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -24,6 +24,9 @@ func Setup(cfg *config.Config) http.Handler {
 	edService := services.NewExternalDataService(cfg)
 	courseService := services.NewCourseService(cfg)
 	pipelineService := services.NewPipelineService(cfg) // P4-1新增
+
+	// ==================== P4.6-4新增：启动夜间批量验收定时任务 ====================
+	pipelineService.StartNightlyVerifyScheduler()
 
 	// ==================== 初始化处理器层 ====================
 	authHandler := handlers.NewAuthHandler(authService)
@@ -224,7 +227,19 @@ func Setup(cfg *config.Config) http.Handler {
 	// /api/v1/pipelines/ 子路径分发
 	mux.Handle("/api/v1/pipelines/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
+
 		switch {
+		// POST /pipelines/batch-verify — 批量验收（P4.6-4新增，必须在/{id}路由之前匹配）
+		case hasSuffix(path, "/batch-verify"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || claims.Role != "admin" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员可触发批量验收"})
+				return
+			}
+			pipelineHandler.BatchVerify(w, r)
+
 		// POST /pipelines/{id}/start — 启动Pipeline
 		case hasSuffix(path, "/start"):
 			claims, ok := middleware.GetClaims(r.Context())
@@ -404,7 +419,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.23.0",
+		"version": "0.24.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

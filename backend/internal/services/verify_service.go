@@ -544,3 +544,84 @@ func (s *PipelineService) collectFinalHTML(pipelineID string) (string, int, erro
 	finalContent := strings.Join(htmlParts, "\n\n")
 	return finalContent, validCount, nil
 }
+
+// ==================== P4.6-4 批量验收+夜间定时任务 ====================
+
+// BatchVerifyResult 批量验收结果（返回给前端/日志）
+type BatchVerifyResult struct {
+	TotalFound   int      `json:"total_found"`   // 找到的finalized Pipeline数量
+	StartedIDs   []string `json:"started_ids"`   // 已启动验收的Pipeline ID列表
+	SkippedIDs   []string `json:"skipped_ids"`   // 跳过的Pipeline ID列表（状态已变化等）
+	ErrorMessage string   `json:"error_message"` // 整体错误信息（如有）
+}
+
+// BatchVerify 批量触发验收：扫描所有finalized状态的Pipeline，逐个触发验收
+// P4.6-4新增：手动批量验收接口(POST /pipelines/batch-verify)和夜间定时任务共用
+// 每个Pipeline的验收在独立goroutine中执行，不阻塞批量接口返回
+func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
+	result := &BatchVerifyResult{}
+
+	// 1. 查询所有finalized状态的Pipeline
+	ids, err := repository.ListFinalizedPipelineIDs()
+	if err != nil {
+		result.ErrorMessage = fmt.Sprintf("查询finalized Pipeline失败: %s", err.Error())
+		return result, err
+	}
+	result.TotalFound = len(ids)
+
+	if len(ids) == 0 {
+		return result, nil
+	}
+
+	// 2. 逐个检查并启动验收（每个在独立goroutine中异步执行）
+	for _, id := range ids {
+		// 再次确认状态仍为finalized（防止并发修改）
+		pipeline, pErr := repository.GetPipelineByID(id)
+		if pErr != nil || pipeline.Status != models.PipelineStatusFinalized {
+			result.SkippedIDs = append(result.SkippedIDs, id)
+			continue
+		}
+
+		result.StartedIDs = append(result.StartedIDs, id)
+
+		// 异步执行验收（复用VerifyPipeline方法，内部会处理verify_failed→2审等逻辑）
+		go s.VerifyPipeline(id)
+	}
+
+	return result, nil
+}
+
+// StartNightlyVerifyScheduler 启动夜间批量验收定时任务
+// P4.6-4新增：在main.go中调用，每晚凌晨2:00（UTC+8）扫描finalized Pipeline批量验收
+// 使用goroutine + time.Timer实现，无需外部cron依赖
+func (s *PipelineService) StartNightlyVerifyScheduler() {
+	go func() {
+		for {
+			// 计算距离下一个凌晨2:00的时间间隔
+			now := time.Now()
+			// 构造今天凌晨2:00（东八区，服务器本地时区）
+			next := time.Date(now.Year(), now.Month(), now.Day(), 2, 0, 0, 0, now.Location())
+			// 如果当前时间已过凌晨2:00，则设为明天凌晨2:00
+			if now.After(next) {
+				next = next.Add(24 * time.Hour)
+			}
+			waitDuration := next.Sub(now)
+
+			fmt.Printf("[夜间验收] 下次执行时间: %s（等待 %s）\n", next.Format("2006-01-02 15:04:05"), waitDuration)
+
+			// 等待到目标时间
+			timer := time.NewTimer(waitDuration)
+			<-timer.C
+
+			// 执行批量验收
+			fmt.Printf("[夜间验收] %s 开始执行批量验收...\n", time.Now().Format("2006-01-02 15:04:05"))
+			result, err := s.BatchVerify()
+			if err != nil {
+				fmt.Printf("[夜间验收] 执行失败: %s\n", err.Error())
+			} else {
+				fmt.Printf("[夜间验收] 执行完成: 找到%d个finalized Pipeline，已启动%d个验收，跳过%d个\n",
+					result.TotalFound, len(result.StartedIDs), len(result.SkippedIDs))
+			}
+		}
+	}()
+}

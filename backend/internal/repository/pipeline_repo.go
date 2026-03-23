@@ -904,3 +904,29 @@ func UpdateGeneratedPageHTML(pipelineID string, pageNumber int, generatedHTML st
 	}
 	return nil
 }
+
+// ==================== P4.6-4 夜间批量验收辅助方法 ====================
+
+// ListFinalizedPipelineIDs 获取所有finalized状态的Pipeline ID列表
+// P4.6-4新增：夜间批量验收和手动批量验收使用
+// 返回按创建时间正序排列的ID列表（先创建的先验收）
+func ListFinalizedPipelineIDs() ([]string, error) {
+	ctx := context.Background()
+	rows, err := database.DB.Query(ctx,
+		`SELECT id FROM pipelines WHERE status = $1 ORDER BY created_at ASC`,
+		models.PipelineStatusFinalized)
+	if err != nil {
+		return nil, fmt.Errorf("查询finalized Pipeline列表失败: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("扫描Pipeline ID失败: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}

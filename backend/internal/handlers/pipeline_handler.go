@@ -321,7 +321,7 @@ func (h *PipelineHandler) UpdatePageDecision(w http.ResponseWriter, r *http.Requ
 
 	// 解析请求体
 	var req struct {
-		Decision  string  `json:"decision"`  // approve / reject / edit
+		Decision  string  `json:"decision"`   // approve / reject / edit
 		FinalHTML *string `json:"final_html"` // edit时提供修改后的HTML
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -429,10 +429,10 @@ func (h *PipelineHandler) AIFixPage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	utils.Success(w, map[string]interface{}{
-		"message":      "AI快修完成",
-		"page_number":  pageNumber,
-		"new_html":     newHTML,
-		"html_length":  len(newHTML),
+		"message":     "AI快修完成",
+		"page_number": pageNumber,
+		"new_html":    newHTML,
+		"html_length": len(newHTML),
 	})
 }
 
@@ -461,6 +461,26 @@ func (h *PipelineHandler) VerifyPipeline(w http.ResponseWriter, r *http.Request)
 	}
 
 	utils.Success(w, resp)
+}
+
+// ==================== P4.6-4 批量验收接口 ====================
+
+// BatchVerify POST /api/v1/pipelines/batch-verify
+// 手动触发批量验收：扫描所有finalized状态的Pipeline，逐个异步触发验收
+// P4.6-4新增：批量验收入口接口（仅admin可操作）
+func (h *PipelineHandler) BatchVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+
+	result, err := h.pipelineService.BatchVerify()
+	if err != nil {
+		utils.InternalError(w, "批量验收失败: "+err.Error())
+		return
+	}
+
+	utils.Success(w, result)
 }
 
 // ==================== 路径解析辅助函数 ====================
