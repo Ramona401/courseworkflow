@@ -1,8 +1,9 @@
 package services
 
-// ==================== P4.6-2 验收执行逻辑 ====================
-// 实现 executeVerify 方法：收集最终HTML → 调索引生成器(prompt_g) → 调Evaluator(prompt_b) 1轮 → 判定
-// 新增 VerifyPipeline 入口方法：手动触发验收（POST /pipelines/{id}/verify）
+// ==================== P4.6-2 验收执行逻辑 + P4.6-3 2审自动流程 ====================
+// P4.6-2：executeVerify方法：收集最终HTML → 调索引生成器(prompt_g) → 调Evaluator(prompt_b) 1轮 → 判定
+// P4.6-2：VerifyPipeline入口方法：手动触发验收（POST /pipelines/{id}/verify）
+// P4.6-3：startRetrialPipeline方法：验收失败后自动启动2审（evaluator 2轮→meta→translator→generator→审核队列）
 
 import (
 	"fmt"
@@ -29,14 +30,20 @@ var (
 	ErrVerifyIndexTooShort    = fmt.Errorf("索引生成器输出过短，可能生成失败")
 	ErrVerifyEvalFailed       = fmt.Errorf("验收评估AI调用失败")
 	ErrVerifyScoreExtractFail = fmt.Errorf("验收评估未能提取有效评分")
+	// P4.6-3新增：2审流程错误常量
+	ErrRetrialResetFailed = fmt.Errorf("2审重置步骤失败")
+	ErrRetrialExecFailed  = fmt.Errorf("2审执行流程失败")
 )
 
 // ==================== VerifyPipeline 入口方法 ====================
 
 // VerifyPipeline 手动触发验收流程
 // P4.6-2新增：POST /pipelines/{id}/verify 的业务逻辑入口
+// P4.6-3增强：验收失败后根据review_round自动决定后续动作
+//   - review_round=1 且 verify_failed → 自动启动2审流程（goroutine异步执行）
+//   - review_round≥2 且 verify_failed → 标记needs_human（严重质量问题，不再自动重试）
 // 前置条件：Pipeline状态必须是 finalized
-// 流程：更新状态为running → 执行verify步骤 → 根据评分设置verified/verify_failed
+// 流程：更新状态为running → 执行verify步骤 → 根据评分设置verified/verify_failed → 判断是否触发2审
 func (s *PipelineService) VerifyPipeline(pipelineID string) (*models.PipelineDetailResponse, error) {
 	// 1. 获取Pipeline并检查状态
 	pipeline, err := repository.GetPipelineByID(pipelineID)
@@ -77,29 +84,182 @@ func (s *PipelineService) VerifyPipeline(pipelineID string) (*models.PipelineDet
 	}
 
 	// 从verify步骤的step_data提取passed字段
-	var verifyResult models.VerifyResult
 	if verifyStep.StepData != "" && verifyStep.StepData != "null" {
-		// 手动提取passed字段（避免引入encoding/json，该包在pipeline_service.go中已导入）
-		// 使用简单的字符串匹配方式
+		// 使用简单的字符串匹配方式（避免重复导入encoding/json）
 		if strings.Contains(verifyStep.StepData, `"passed":true`) {
-			// 验收通过 → verified
+			// ===== 验收通过 → verified =====
 			if err := repository.CompletePipeline(pipelineID, models.PipelineStatusVerified); err != nil {
 				return nil, fmt.Errorf("标记验收通过失败: %w", err)
 			}
 		} else {
-			// 验收未通过 → verify_failed
+			// ===== 验收未通过 → verify_failed =====
 			if err := repository.CompletePipeline(pipelineID, models.PipelineStatusVerifyFailed); err != nil {
 				return nil, fmt.Errorf("标记验收未通过失败: %w", err)
+			}
+
+			// P4.6-3：根据review_round决定后续动作
+			if pipeline.ReviewRound <= 1 {
+				// 初审验收失败 → 自动启动2审流程（goroutine异步执行，不阻塞当前请求）
+				go s.startRetrialPipeline(pipelineID)
+			} else {
+				// 2审验收仍然失败 → 标记"严重质量问题"，需要人工介入
+				_ = repository.UpdatePipelineStatus(pipelineID, models.StepVerify, models.PipelineStatusNeedsHuman)
 			}
 		}
 	} else {
 		// step_data为空，异常情况
-		_ = verifyResult // 消除unused警告
 		_ = repository.UpdatePipelineError(pipelineID, models.StepVerify, "验收步骤输出数据为空")
 		return s.GetPipelineDetail(pipelineID)
 	}
 
 	return s.GetPipelineDetail(pipelineID)
+}
+
+// ==================== P4.6-3 2审自动流程 ====================
+
+// startRetrialPipeline 验收失败后自动启动2审流程
+// P4.6-3新增：异步执行（在goroutine中调用），不阻塞验收接口返回
+// 流程：
+//  1. 设置review_round=2
+//  2. 清理旧的eval_rounds和generated_pages
+//  3. 重置evaluator/meta/translator/generator/review/verify步骤为pending
+//  4. 更新Pipeline状态为running
+//  5. 依次执行：evaluator(2轮) → meta → translator → generator
+//  6. 成功后放入审核队列（review_queue），标记为2审待审核
+//  7. 失败则标记Pipeline为failed并记录错误
+func (s *PipelineService) startRetrialPipeline(pipelineID string) {
+	// 1. 更新review_round为2
+	if err := repository.UpdatePipelineReviewRound(pipelineID, 2); err != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepVerify,
+			fmt.Sprintf("2审启动失败: 更新review_round失败: %s", err.Error()))
+		return
+	}
+
+	// 2. 清理旧的评估轮次数据和生成页面数据
+	_ = repository.DeleteEvalRoundsByPipelineID(pipelineID)
+	_ = repository.DeleteGeneratedPagesByPipelineID(pipelineID)
+
+	// 3. 重置需要重跑的步骤为pending状态（evaluator/meta/translator/generator/review/verify）
+	// 注意：dbCheck和scanner不需要重跑（课程索引和定位信息不变）
+	resetSteps := []string{
+		models.StepEvaluator,
+		models.StepMeta,
+		models.StepTranslator,
+		models.StepGenerator,
+		models.StepReview,
+		models.StepVerify,
+	}
+	if err := repository.ResetStepsForRetrial(pipelineID, resetSteps); err != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepEvaluator,
+			fmt.Sprintf("2审启动失败: 重置步骤失败: %s", err.Error()))
+		return
+	}
+
+	// 4. 更新Pipeline状态为running，当前步骤为evaluator
+	if err := repository.UpdatePipelineStatus(pipelineID, models.StepEvaluator, models.PipelineStatusRunning); err != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepEvaluator,
+			fmt.Sprintf("2审启动失败: 更新状态失败: %s", err.Error()))
+		return
+	}
+
+	// 5. 重新读取Pipeline（review_round已更新为2）
+	pipeline, err := repository.GetPipelineByID(pipelineID)
+	if err != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepEvaluator,
+			fmt.Sprintf("2审启动失败: 读取Pipeline失败: %s", err.Error()))
+		return
+	}
+
+	// ===== 阶段A：执行Evaluator（2轮评估，比初审的3轮少1轮以节省时间） =====
+	// 临时修改Pipeline config中的eval_rounds为2
+	pCfg := models.ParsePipelineConfig(pipeline.Config)
+	originalEvalRounds := pCfg.EvalRounds
+	pCfg.EvalRounds = 2
+	pipeline.Config = pCfg.ToJSON()
+	// 注意：这里只修改内存中的config，不写回数据库，因为executeEvaluator从pipeline.Config读取
+
+	evalErr := s.executeEvaluator(pipeline)
+
+	// 恢复原始eval_rounds（避免影响后续步骤读取config）
+	pCfg.EvalRounds = originalEvalRounds
+	pipeline.Config = pCfg.ToJSON()
+
+	if evalErr != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepEvaluator,
+			fmt.Sprintf("2审Evaluator失败: %s", evalErr.Error()))
+		return
+	}
+
+	// ===== 阶段B：推进到Meta =====
+	if err := repository.UpdatePipelineStatus(pipelineID, models.StepMeta, models.PipelineStatusRunning); err != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepMeta,
+			fmt.Sprintf("2审推进到Meta失败: %s", err.Error()))
+		return
+	}
+
+	// 重新读取Pipeline（current_step已更新）
+	pipeline, err = repository.GetPipelineByID(pipelineID)
+	if err != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepMeta, "2审读取Pipeline失败")
+		return
+	}
+
+	metaErr := s.executeMeta(pipeline)
+	if metaErr != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepMeta,
+			fmt.Sprintf("2审Meta失败: %s", metaErr.Error()))
+		return
+	}
+
+	// ===== 阶段C：推进到Translator =====
+	if err := repository.UpdatePipelineStatus(pipelineID, models.StepTranslator, models.PipelineStatusRunning); err != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepTranslator,
+			fmt.Sprintf("2审推进到Translator失败: %s", err.Error()))
+		return
+	}
+
+	pipeline, err = repository.GetPipelineByID(pipelineID)
+	if err != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepTranslator, "2审读取Pipeline失败")
+		return
+	}
+
+	transErr := s.executeTranslator(pipeline)
+	if transErr != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepTranslator,
+			fmt.Sprintf("2审Translator失败: %s", transErr.Error()))
+		return
+	}
+
+	// ===== 阶段D：推进到Generator =====
+	if err := repository.UpdatePipelineStatus(pipelineID, models.StepGenerator, models.PipelineStatusRunning); err != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepGenerator,
+			fmt.Sprintf("2审推进到Generator失败: %s", err.Error()))
+		return
+	}
+
+	pipeline, err = repository.GetPipelineByID(pipelineID)
+	if err != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepGenerator, "2审读取Pipeline失败")
+		return
+	}
+
+	genErr := s.executeGenerator(pipeline)
+	if genErr != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepGenerator,
+			fmt.Sprintf("2审Generator失败: %s", genErr.Error()))
+		return
+	}
+
+	// ===== 阶段E：2审完成，放入审核队列 =====
+	if err := repository.UpdatePipelineStatus(pipelineID, models.StepReview, models.PipelineStatusReviewQueue); err != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepReview,
+			fmt.Sprintf("2审推进到Review失败: %s", err.Error()))
+		return
+	}
+
+	// 2审流程成功完成，Pipeline现在处于review_queue状态，等待人工审核
+	// 人工审核后定稿 → 再次触发验收 → 通过则verified，不通过则needs_human
 }
 
 // ==================== executeVerify 核心执行方法 ====================

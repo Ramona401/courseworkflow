@@ -364,6 +364,53 @@ func CheckActivePipelineExists(courseCode string) (bool, string, error) {
 	return true, id, nil
 }
 
+// ==================== P4.6-3 新增：2审辅助方法 ====================
+
+// UpdatePipelineReviewRound 更新Pipeline的审核轮次（review_round字段）
+// P4.6-3新增：验收失败后将review_round从1设为2，标记进入2审流程
+func UpdatePipelineReviewRound(id string, reviewRound int) error {
+	ctx := context.Background()
+	_, err := database.DB.Exec(ctx,
+		`UPDATE pipelines SET review_round = $2, updated_at = NOW()
+		 WHERE id = $1`, id, reviewRound)
+	if err != nil {
+		return fmt.Errorf("更新Pipeline审核轮次失败: %w", err)
+	}
+	return nil
+}
+
+// ResetStepsForRetrial 批量重置指定步骤为pending状态（清除旧数据）
+// P4.6-3新增：2审流程需要重置evaluator/meta/translator/generator/review步骤
+// 在事务中执行：重置步骤状态+清空输出数据+重置时间和错误信息
+func ResetStepsForRetrial(pipelineID string, stepNames []string) error {
+	ctx := context.Background()
+	tx, err := database.DB.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	for _, stepName := range stepNames {
+		_, err = tx.Exec(ctx,
+			`UPDATE pipeline_steps
+			 SET status = $3, started_at = NULL, completed_at = NULL,
+				 duration_ms = 0, attempts = 0, step_data = NULL,
+				 error_message = NULL, model_used = NULL, tokens_used = 0,
+				 updated_at = NOW()
+			 WHERE pipeline_id = $1 AND step_name = $2`,
+			pipelineID, stepName, models.StepStatusPending,
+		)
+		if err != nil {
+			return fmt.Errorf("重置步骤 %s 失败: %w", stepName, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("提交重置事务失败: %w", err)
+	}
+	return nil
+}
+
 // ==================== Pipeline Step CRUD ====================
 
 // GetStepsByPipelineID 获取指定Pipeline的所有步骤（按步骤序号排序）
