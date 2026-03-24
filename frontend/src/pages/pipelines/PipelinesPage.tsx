@@ -10,13 +10,13 @@ import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import {
   getPipelines, createPipeline, startPipeline, cancelPipeline, deletePipeline,
-  markPassed, batchCreatePipelines, batchStartPipelines,
-  type PipelineListItem, type CreatePipelineRequest,
+  markPassed, batchCreatePipelines, batchStartPipelines, getOperators, batchAssignPipelines,
+  type PipelineListItem, type CreatePipelineRequest, type OperatorInfo,
 } from '@/api/pipelines'
 import {
   Workflow, Play, Square, Trash2, RefreshCw, Plus,
   CheckCircle, XCircle, Clock, AlertTriangle, Loader, Eye, Zap,
-  Layers, Rocket,
+  Layers, Rocket, UserPlus, X as XIcon, CheckCircle as CheckCircleIcon,
 } from 'lucide-react'
 
 // ==================== Toast组件 ====================
@@ -284,7 +284,7 @@ function canMarkPassed(p: PipelineListItem): boolean {
 export default function PipelinesPage() {
   const navigate = useNavigate()
   const { user } = useAuth()
-  const isAdmin = user?.role === 'admin'
+  const isAdmin = user?.role === 'admin' || user?.role === 'senior_operator'
   const canOperate = user?.role === 'admin' || user?.role === 'operator' || user?.role === 'senior_operator'
 
   const [pipelines, setPipelines] = useState<PipelineListItem[]>([])
@@ -296,6 +296,11 @@ export default function PipelinesPage() {
   const [statusFilter, setStatusFilter] = useState('')
   // P5-3新增：多选状态
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  // P6-2：分配相关状态
+  const [showAssignDialog, setShowAssignDialog] = useState(false)
+  const [operators, setOperators] = useState<OperatorInfo[]>([])
+  const [selectedOperator, setSelectedOperator] = useState('')
+  const [assigning, setAssigning] = useState(false)
 
   const loadPipelines = useCallback(async () => {
     setLoading(true)
@@ -365,6 +370,34 @@ export default function PipelinesPage() {
     } catch (e: any) {
       setToast({ message: '批量启动失败: ' + (e.message || ''), type: 'err' })
     }
+  }
+
+  // P6-2：打开分配弹窗
+  const openAssignDialog = async () => {
+    if (selectedIds.size === 0) return
+    try {
+      const ops = await getOperators()
+      setOperators(ops || [])
+    } catch { /* ignore */ }
+    setSelectedOperator('')
+    setShowAssignDialog(true)
+  }
+
+  // P6-2：执行批量分配
+  const handleBatchAssign = async () => {
+    if (!selectedOperator) return
+    setAssigning(true)
+    try {
+      const ids = Array.from(selectedIds)
+      const result = await batchAssignPipelines(ids, selectedOperator)
+      setToast({ message: '分配成功: ' + result.success_count + ' 个Pipeline已分配给 ' + result.assigned_name, type: 'ok' })
+      setShowAssignDialog(false)
+      setSelectedIds(new Set())
+      loadPipelines()
+    } catch (e: any) {
+      setToast({ message: '分配失败: ' + (e.message || ''), type: 'err' })
+    }
+    setAssigning(false)
   }
 
   const handleStart = async (p: PipelineListItem) => {
@@ -650,6 +683,15 @@ export default function PipelinesPage() {
               <Rocket size={14} /> 批量启动 ({selectedPendingCount})
             </button>
           )}
+          {isAdmin && (
+            <button onClick={openAssignDialog} style={{
+              padding: '8px 18px', borderRadius: 10, border: 'none',
+              background: '#5856d6', color: '#fff', fontSize: 13, fontWeight: 600,
+              cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6,
+            }}>
+              <UserPlus size={14} /> 分配审核员
+            </button>
+          )}
           <button onClick={() => setSelectedIds(new Set())} style={{
             padding: '8px 16px', borderRadius: 10, border: '1px solid rgba(255,255,255,0.2)',
             background: 'transparent', color: '#fff', fontSize: 13, fontWeight: 500, cursor: 'pointer',
@@ -661,6 +703,67 @@ export default function PipelinesPage() {
 
       {showCreate && <CreateDialog onClose={() => setShowCreate(false)} onCreate={handleCreate} />}
       {showBatchCreate && <BatchCreateDialog onClose={() => setShowBatchCreate(false)} onBatchCreate={handleBatchCreate} />}
+
+      {/* P6-2：分配审核员弹窗 */}
+      {showAssignDialog && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(4px)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          onClick={e => { if (e.target === e.currentTarget && !assigning) setShowAssignDialog(false) }}>
+          <div style={{ background: '#fff', borderRadius: 20, width: 440, maxWidth: '94vw', padding: 28, boxShadow: '0 20px 60px rgba(0,0,0,0.2)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
+              <UserPlus size={20} color="#5856d6" />
+              <div style={{ fontSize: 18, fontWeight: 700, color: '#1c1c1e', flex: 1 }}>分配审核员</div>
+              <button onClick={() => !assigning && setShowAssignDialog(false)} style={{
+                background: '#f2f2f7', border: 'none', borderRadius: '50%', width: 30, height: 30,
+                display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+              }}><XIcon size={16} color="#8e8e93" /></button>
+            </div>
+            <div style={{ fontSize: 13, color: '#86868b', marginBottom: 16 }}>
+              将 <span style={{ fontWeight: 600, color: '#1c1c1e' }}>{selectedIds.size}</span> 个Pipeline分配给指定审核员
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ fontSize: 13, fontWeight: 600, color: '#1c1c1e', display: 'block', marginBottom: 8 }}>选择审核员</label>
+              {operators.length === 0 ? (
+                <div style={{ fontSize: 13, color: '#aeaeb2', padding: '12px 0' }}>暂无可分配的审核员</div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {operators.map(op => (
+                    <div key={op.id} onClick={() => setSelectedOperator(op.id)} style={{
+                      display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, cursor: 'pointer',
+                      border: selectedOperator === op.id ? '2px solid #5856d6' : '1px solid rgba(0,0,0,0.08)',
+                      background: selectedOperator === op.id ? 'rgba(88,86,214,0.05)' : '#fff',
+                    }}>
+                      <div style={{
+                        width: 32, height: 32, borderRadius: '50%',
+                        background: selectedOperator === op.id ? '#5856d6' : 'rgba(88,86,214,0.1)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        color: selectedOperator === op.id ? '#fff' : '#5856d6', fontSize: 13, fontWeight: 600,
+                      }}>{op.display_name.charAt(0)}</div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: '#1c1c1e' }}>{op.display_name}</div>
+                        <div style={{ fontSize: 11, color: '#86868b' }}>{op.username} · {op.role === 'admin' ? '管理员' : op.role === 'senior_operator' ? '高级操作员' : '操作员'}</div>
+                      </div>
+                      {selectedOperator === op.id && <CheckCircleIcon size={18} color="#5856d6" />}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button onClick={() => !assigning && setShowAssignDialog(false)} style={{
+                padding: '10px 20px', borderRadius: 10, border: '1px solid rgba(0,0,0,0.08)',
+                background: '#fff', fontSize: 14, fontWeight: 500, cursor: 'pointer', color: '#3c3c43',
+              }}>取消</button>
+              <button onClick={handleBatchAssign} disabled={!selectedOperator || assigning} style={{
+                padding: '10px 24px', borderRadius: 10, border: 'none',
+                background: selectedOperator && !assigning ? '#5856d6' : '#c7c7cc',
+                color: '#fff', fontSize: 14, fontWeight: 600,
+                cursor: selectedOperator && !assigning ? 'pointer' : 'not-allowed',
+              }}>{assigning ? '分配中...' : '确认分配'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )
