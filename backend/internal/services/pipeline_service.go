@@ -19,6 +19,38 @@ import (
 	"tedna/internal/utils"
 )
 
+// ==================== 包级正则变量（避免每次调用重新编译，提升性能）====================
+// extractMetaScores 使用的正则
+var (
+	reMetaBlock     = regexp.MustCompile(`(?s)<<<META_SCORE>>>(.*?)<<<END_META_SCORE>>>`)
+	reTotalFallback = regexp.MustCompile(`(?i)TOTAL_FINAL:\s*([\d.]+)`)
+	reMetaTotal     = regexp.MustCompile(`(?i)TOTAL_FINAL:\s*([\d.]+)`)
+	reE1Final       = regexp.MustCompile(`(?i)E1_FINAL:\s*([\d.]+)`)
+	reE2Final       = regexp.MustCompile(`(?i)E2_FINAL:\s*([\d.]+)`)
+	reE3Final       = regexp.MustCompile(`(?i)E3_FINAL:\s*([\d.]+)`)
+	reE4Final       = regexp.MustCompile(`(?i)E4_FINAL:\s*([\d.]+)`)
+	reMetaHard      = regexp.MustCompile(`(?i)HARD_CONSTRAINT:\s*(PASS|FAIL)`)
+	reMetaGrade     = regexp.MustCompile(`(?i)GRADE:\s*([A-D])`)
+	reMetaRound     = regexp.MustCompile(`(?i)E([1-4])_R(\d+):\s*([\d.]+)`)
+	reFinalScore    = regexp.MustCompile(`(?:综合评分|综合)[：:]\s*[\d.]+\s*→\s*([\d.]+)\s*/\s*10`)
+)
+
+// extractEvalScores 使用的正则
+var (
+	reEvalBlock  = regexp.MustCompile(`(?s)<<<SCORE_BLOCK>>>(.*?)<<<END_SCORE_BLOCK>>>`)
+	reEvalTotal  = regexp.MustCompile(`(?i)TOTAL[:\s]+([\d.]+)`)
+	reEvalE1     = regexp.MustCompile(`(?i)E1[:\s]+([\d.]+)`)
+	reEvalE2     = regexp.MustCompile(`(?i)E2[:\s]+([\d.]+)`)
+	reEvalE3     = regexp.MustCompile(`(?i)E3[:\s]+([\d.]+)`)
+	reEvalE4     = regexp.MustCompile(`(?i)E4[:\s]+([\d.]+)`)
+	reEvalHard   = regexp.MustCompile(`(?i)HARD_CONSTRAINT[:\s]+(PASS|FAIL)`)
+	reEvalGrade  = regexp.MustCompile(`(?i)GRADE[:\s]+([A-D])`)
+	reEvalDimE1  = regexp.MustCompile(`(?i)E1[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`)
+	reEvalDimE2  = regexp.MustCompile(`(?i)E2[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`)
+	reEvalDimE3  = regexp.MustCompile(`(?i)E3[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`)
+	reEvalDimE4  = regexp.MustCompile(`(?i)E4[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`)
+)
+
 // ==================== Pipeline 错误常量 ====================
 
 var (
@@ -1153,12 +1185,12 @@ type metaScoreResult struct {
 func extractMetaScores(output string) *metaScoreResult {
 	result := &metaScoreResult{}
 
-	metaBlockRe := regexp.MustCompile(`(?s)<<<META_SCORE>>>(.*?)<<<END_META_SCORE>>>`)
-	blockMatch := metaBlockRe.FindStringSubmatch(output)
+	// 使用包级正则变量 reMetaBlock
+	blockMatch := reMetaBlock.FindStringSubmatch(output)
 
 	if len(blockMatch) < 2 {
-		totalFallbackRe := regexp.MustCompile(`(?i)TOTAL_FINAL:\s*([\d.]+)`)
-		tfm := totalFallbackRe.FindStringSubmatch(output)
+		// 使用包级正则变量 reTotalFallback
+		tfm := reTotalFallback.FindStringSubmatch(output)
 		if tfm != nil {
 			result.totalFinal = safeParseFloat(tfm[1])
 			if result.totalFinal > 0 {
@@ -1170,43 +1202,43 @@ func extractMetaScores(output string) *metaScoreResult {
 
 	block := blockMatch[1]
 
-	totalRe := regexp.MustCompile(`(?i)TOTAL_FINAL:\s*([\d.]+)`)
-	tm := totalRe.FindStringSubmatch(block)
+	// 使用包级正则变量 reMetaTotal
+	tm := reMetaTotal.FindStringSubmatch(block)
 	if tm == nil {
 		return result
 	}
 	result.totalFinal = safeParseFloat(tm[1])
 
-	e1FinalRe := regexp.MustCompile(`(?i)E1_FINAL:\s*([\d.]+)`)
-	e2FinalRe := regexp.MustCompile(`(?i)E2_FINAL:\s*([\d.]+)`)
-	e3FinalRe := regexp.MustCompile(`(?i)E3_FINAL:\s*([\d.]+)`)
-	e4FinalRe := regexp.MustCompile(`(?i)E4_FINAL:\s*([\d.]+)`)
+	// 使用包级正则变量 reE1Final
+	// 使用包级正则变量 reE2Final
+	// 使用包级正则变量 reE3Final
+	// 使用包级正则变量 reE4Final
 
-	if m := e1FinalRe.FindStringSubmatch(block); m != nil {
+	if m := reE1Final.FindStringSubmatch(block); m != nil {
 		result.e1Final = safeParseFloat(m[1])
 	}
-	if m := e2FinalRe.FindStringSubmatch(block); m != nil {
+	if m := reE2Final.FindStringSubmatch(block); m != nil {
 		result.e2Final = safeParseFloat(m[1])
 	}
-	if m := e3FinalRe.FindStringSubmatch(block); m != nil {
+	if m := reE3Final.FindStringSubmatch(block); m != nil {
 		result.e3Final = safeParseFloat(m[1])
 	}
-	if m := e4FinalRe.FindStringSubmatch(block); m != nil {
+	if m := reE4Final.FindStringSubmatch(block); m != nil {
 		result.e4Final = safeParseFloat(m[1])
 	}
 
-	hardRe := regexp.MustCompile(`(?i)HARD_CONSTRAINT:\s*(PASS|FAIL)`)
-	if hm := hardRe.FindStringSubmatch(block); hm != nil {
+	// 使用包级正则变量 reMetaHard
+	if hm := reMetaHard.FindStringSubmatch(block); hm != nil {
 		result.hardConstraint = hm[1]
 	}
 
-	gradeRe := regexp.MustCompile(`(?i)GRADE:\s*([A-D])`)
-	if gm := gradeRe.FindStringSubmatch(block); gm != nil {
+	// 使用包级正则变量 reMetaGrade
+	if gm := reMetaGrade.FindStringSubmatch(block); gm != nil {
 		result.grade = gm[1]
 	}
 
-	roundRe := regexp.MustCompile(`(?i)E([1-4])_R(\d+):\s*([\d.]+)`)
-	allRoundMatches := roundRe.FindAllStringSubmatch(block, -1)
+	// 使用包级正则变量 reMetaRound
+	allRoundMatches := reMetaRound.FindAllStringSubmatch(block, -1)
 
 	roundMap := map[int]map[int]float64{
 		1: {}, 2: {}, 3: {}, 4: {},
@@ -1231,8 +1263,8 @@ func extractMetaScores(output string) *metaScoreResult {
 		result.e4Rounds = append(result.e4Rounds, roundMap[4][rn])
 	}
 
-	finalScoreRe := regexp.MustCompile(`(?:综合评分|综合)[：:]\s*[\d.]+\s*→\s*([\d.]+)\s*/\s*10`)
-	if fsm := finalScoreRe.FindStringSubmatch(output); fsm != nil {
+	// 使用包级正则变量 reFinalScore
+	if fsm := reFinalScore.FindStringSubmatch(output); fsm != nil {
 		newScore := safeParseFloat(fsm[1])
 		if newScore > 0 {
 			result.totalFinal = newScore
@@ -1454,27 +1486,27 @@ func extractScannerParsed(stepData string) string {
 }
 
 func extractEvalScores(output string) (float64, float64, float64, float64, float64, string, string, bool) {
-	scoreBlockRe := regexp.MustCompile(`(?s)<<<SCORE_BLOCK>>>(.*?)<<<END_SCORE_BLOCK>>>`)
-	sbMatch := scoreBlockRe.FindStringSubmatch(output)
+	// 使用包级正则变量 reEvalBlock
+	sbMatch := reEvalBlock.FindStringSubmatch(output)
 
 	if len(sbMatch) >= 2 {
 		block := sbMatch[1]
 
-		totalRe := regexp.MustCompile(`(?i)TOTAL[:\s]+([\d.]+)`)
-		e1Re := regexp.MustCompile(`(?i)E1[:\s]+([\d.]+)`)
-		e2Re := regexp.MustCompile(`(?i)E2[:\s]+([\d.]+)`)
-		e3Re := regexp.MustCompile(`(?i)E3[:\s]+([\d.]+)`)
-		e4Re := regexp.MustCompile(`(?i)E4[:\s]+([\d.]+)`)
-		hardRe := regexp.MustCompile(`(?i)HARD_CONSTRAINT[:\s]+(PASS|FAIL)`)
-		gradeRe := regexp.MustCompile(`(?i)GRADE[:\s]+([A-D])`)
+		// 使用包级正则变量 reEvalTotal
+		// 使用包级正则变量 reEvalE1
+		// 使用包级正则变量 reEvalE2
+		// 使用包级正则变量 reEvalE3
+		// 使用包级正则变量 reEvalE4
+		// 使用包级正则变量 reEvalHard
+		// 使用包级正则变量 reEvalGrade
 
-		tm := totalRe.FindStringSubmatch(block)
-		e1m := e1Re.FindStringSubmatch(block)
-		e2m := e2Re.FindStringSubmatch(block)
-		e3m := e3Re.FindStringSubmatch(block)
-		e4m := e4Re.FindStringSubmatch(block)
-		hm := hardRe.FindStringSubmatch(block)
-		gm := gradeRe.FindStringSubmatch(block)
+		tm := reEvalTotal.FindStringSubmatch(block)
+		e1m := reEvalE1.FindStringSubmatch(block)
+		e2m := reEvalE2.FindStringSubmatch(block)
+		e3m := reEvalE3.FindStringSubmatch(block)
+		e4m := reEvalE4.FindStringSubmatch(block)
+		hm := reEvalHard.FindStringSubmatch(block)
+		gm := reEvalGrade.FindStringSubmatch(block)
 
 		if tm != nil {
 			scoreTotal := safeParseFloat(tm[1])
@@ -1500,10 +1532,10 @@ func extractEvalScores(output string) (float64, float64, float64, float64, float
 		re    *regexp.Regexp
 		field *float64
 	}{
-		{regexp.MustCompile(`(?i)E1[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`), &scoreE1},
-		{regexp.MustCompile(`(?i)E2[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`), &scoreE2},
-		{regexp.MustCompile(`(?i)E3[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`), &scoreE3},
-		{regexp.MustCompile(`(?i)E4[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`), &scoreE4},
+		{reEvalDimE1, &scoreE1},
+		{reEvalDimE2, &scoreE2},
+		{reEvalDimE3, &scoreE3},
+		{reEvalDimE4, &scoreE4},
 	}
 	for _, dp := range dimPatterns {
 		m := dp.re.FindStringSubmatch(output)

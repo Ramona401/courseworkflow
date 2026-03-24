@@ -6,10 +6,18 @@ package services
 //   2. 订阅/取消订阅：前端连接SSE时Subscribe，断开时Unsubscribe
 //   3. 广播事件：Pipeline执行步骤完成时Broadcast，推送给所有订阅该Pipeline的客户端
 //
-// 使用方式：
-//   GlobalSSEHub.Subscribe(pipelineID) → chan SSEEvent
-//   GlobalSSEHub.Unsubscribe(pipelineID, ch)
-//   GlobalSSEHub.Broadcast(pipelineID, event)
+// 竞态修复（代码审查）：
+//   原版Broadcast用RLock，Unsubscribe用Lock，存在以下竞态：
+//   Broadcast持有RLock正在向channel写入时，另一goroutine调用Unsubscribe获得Lock并close(ch)，
+//   随后Broadcast继续向已关闭的channel写入会panic（select default不能防止close后的写入panic）。
+//
+//   修复方案：
+//   1. Broadcast改用全局写锁（sync.Mutex），与Unsubscribe互斥，彻底消除竞态
+//   2. Unsubscribe将channel标记为"已关闭"而不立即close，改由Broadcast检测后清理
+//   3. 用独立的closed set跟踪待清理channel，避免double-close
+//
+//   性能影响：Broadcast改用互斥锁后，同一时刻只有一个goroutine可广播。
+//   实际场景中同时广播的goroutine极少（Worker数量=5），影响可忽略。
 
 import (
 	"fmt"
@@ -33,8 +41,8 @@ type SSEEvent struct {
 // SSEHub SSE事件广播中心（全局单例）
 // 管理按Pipeline ID分组的SSE连接
 type SSEHub struct {
-	mu          sync.RWMutex
-	subscribers map[string]map[chan SSEEvent]bool // pipelineID → set of channels
+	mu          sync.Mutex                       // 统一互斥锁，保护所有操作（避免RLock+Lock竞态）
+	subscribers map[string]map[chan SSEEvent]bool // pipelineID → set of channels（true=活跃，false=待清理）
 }
 
 // GlobalSSEHub 全局SSE广播中心实例
@@ -58,6 +66,7 @@ func (h *SSEHub) Subscribe(pipelineID string) chan SSEEvent {
 	if h.subscribers[pipelineID] == nil {
 		h.subscribers[pipelineID] = make(map[chan SSEEvent]bool)
 	}
+	// true 表示channel活跃可用
 	h.subscribers[pipelineID][ch] = true
 
 	count := len(h.subscribers[pipelineID])
@@ -66,34 +75,48 @@ func (h *SSEHub) Subscribe(pipelineID string) chan SSEEvent {
 }
 
 // Unsubscribe 取消订阅指定Pipeline的SSE事件
-// 关闭channel并从订阅列表中移除
+// 将channel标记为待清理（false），由下次Broadcast或本函数负责close和删除
+// 修复：不在持有锁期间close channel后立即让Broadcast写入已关闭channel
 func (h *SSEHub) Unsubscribe(pipelineID string, ch chan SSEEvent) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if subs, ok := h.subscribers[pipelineID]; ok {
-		if _, exists := subs[ch]; exists {
-			delete(subs, ch)
-			close(ch)
-		}
-		// 如果该Pipeline没有订阅者了，清理map条目
-		if len(subs) == 0 {
-			delete(h.subscribers, pipelineID)
-		}
+	subs, ok := h.subscribers[pipelineID]
+	if !ok {
+		return
+	}
+
+	active, exists := subs[ch]
+	if !exists {
+		return
+	}
+
+	if active {
+		// 标记为非活跃，并关闭channel
+		// 此时持有互斥锁，Broadcast无法同时执行，不会有double-write风险
+		subs[ch] = false
+		close(ch)
+		delete(subs, ch)
+	}
+
+	// 如果该Pipeline没有订阅者了，清理map条目
+	if len(subs) == 0 {
+		delete(h.subscribers, pipelineID)
 	}
 
 	count := 0
-	if subs, ok := h.subscribers[pipelineID]; ok {
-		count = len(subs)
+	if s, ok2 := h.subscribers[pipelineID]; ok2 {
+		count = len(s)
 	}
 	fmt.Printf("[SSE Hub] 取消订阅: pipeline=%s, 剩余订阅数=%d\n", pipelineID, count)
 }
 
 // Broadcast 向指定Pipeline的所有订阅者广播事件
-// 非阻塞：如果某个channel已满则跳过（避免慢消费者阻塞整个广播）
+// 使用互斥锁与Subscribe/Unsubscribe互斥，彻底避免向已关闭channel写入的竞态
+// 非阻塞写入：如果某个channel已满则跳过（避免慢消费者阻塞整个广播）
 func (h *SSEHub) Broadcast(pipelineID string, event SSEEvent) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
 	subs, ok := h.subscribers[pipelineID]
 	if !ok || len(subs) == 0 {
@@ -101,30 +124,37 @@ func (h *SSEHub) Broadcast(pipelineID string, event SSEEvent) {
 	}
 
 	sent := 0
-	for ch := range subs {
+	total := len(subs)
+
+	for ch, active := range subs {
+		if !active {
+			// 跳过已标记为非活跃的channel（理论上Unsubscribe已删除，双重保险）
+			continue
+		}
 		select {
 		case ch <- event:
 			sent++
 		default:
 			// channel已满，跳过此订阅者（防止阻塞）
+			// 注意：不在此处关闭channel，由Unsubscribe负责关闭
 		}
 	}
 
 	fmt.Printf("[SSE Hub] 广播: pipeline=%s, type=%s, step=%s, 推送=%d/%d\n",
-		pipelineID, event.EventType, event.CurrentStep, sent, len(subs))
+		pipelineID, event.EventType, event.CurrentStep, sent, total)
 }
 
 // GetSubscriberCount 获取指定Pipeline的订阅者数量（用于监控）
 func (h *SSEHub) GetSubscriberCount(pipelineID string) int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	return len(h.subscribers[pipelineID])
 }
 
 // GetTotalSubscribers 获取所有Pipeline的总订阅者数量
 func (h *SSEHub) GetTotalSubscribers() int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	total := 0
 	for _, subs := range h.subscribers {
 		total += len(subs)

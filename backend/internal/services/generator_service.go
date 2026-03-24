@@ -245,7 +245,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 			// 构建modify prompt并调用AI
 			userPrompt := buildModifyUserPrompt(pipeline.CourseCode, op, origHTML)
 			callStart := time.Now()
-			callResult, callErr := ai.CallAI(aiCfg, promptF.Content, userPrompt)
+			callResult, callErr := s.callAIWithSemaphore(aiCfg, promptF.Content, userPrompt)
 			pageRec.LatencyMs = time.Since(callStart).Milliseconds()
 
 			if callErr != nil {
@@ -280,7 +280,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 
 			userPrompt := buildCreateUserPrompt(pipeline.CourseCode, op, refHTML)
 			callStart := time.Now()
-			callResult, callErr := ai.CallAI(aiCfg, promptF.Content, userPrompt)
+			callResult, callErr := s.callAIWithSemaphore(aiCfg, promptF.Content, userPrompt)
 			pageRec.LatencyMs = time.Since(callStart).Milliseconds()
 
 			if callErr != nil {
@@ -320,7 +320,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				if len(sourceHTMLs) == 1 {
 					userPrompt := buildModifyUserPrompt(pipeline.CourseCode, op, sourceHTMLs[0].html)
 					callStart := time.Now()
-					callResult, callErr := ai.CallAI(aiCfg, promptF.Content, userPrompt)
+					callResult, callErr := s.callAIWithSemaphore(aiCfg, promptF.Content, userPrompt)
 					pageRec.LatencyMs = time.Since(callStart).Milliseconds()
 					if callErr != nil {
 						pageRec.Status = "failed"
@@ -360,7 +360,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 
 			userPrompt := buildMergeUserPrompt(pipeline.CourseCode, op, sourceHTMLs)
 			callStart := time.Now()
-			callResult, callErr := ai.CallAI(aiCfg, promptF.Content, userPrompt)
+			callResult, callErr := s.callAIWithSemaphore(aiCfg, promptF.Content, userPrompt)
 			pageRec.LatencyMs = time.Since(callStart).Milliseconds()
 
 			mergeJSON, _ := json.Marshal(mergeSourceNums)

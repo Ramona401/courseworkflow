@@ -42,6 +42,7 @@ function StatusBadge({ status, statusName }: { status: string; statusName: strin
     cancelled:    { bg: 'rgba(142,142,147,0.08)', fg: '#aeaeb2' },
     verified:     { bg: 'rgba(52,199,89,0.15)', fg: '#248a3d' },
     verify_failed:{ bg: 'rgba(255,59,48,0.15)', fg: '#d70015' },
+    pending_finalize: { bg: 'rgba(204,102,0,0.12)', fg: '#cc6600' },
   }
   const c = colorMap[status] || colorMap.pending
   const iconMap: Record<string, React.ReactNode> = {
@@ -54,6 +55,7 @@ function StatusBadge({ status, statusName }: { status: string; statusName: strin
     cancelled:    <Square size={11} />,
     verified:     <CheckCircle size={11} />,
     verify_failed:<XCircle size={11} />,
+    pending_finalize: <Clock size={11} />,
   }
   return (
     <span style={{

@@ -550,9 +550,8 @@ func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 			continue
 		}
 
-		result.StartedIDs = append(result.StartedIDs, id)
-
 		// P5-2改造：通过Engine提交验收任务
+		// 修复：提交成功才计入StartedIDs，失败才计入SkippedIDs，避免同时出现在两个列表
 		capturedID := id // 闭包捕获
 		if s.engine != nil {
 			task := &EngineTask{
@@ -560,13 +559,18 @@ func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 				PipelineID: capturedID,
 				ExecFunc:   func() { s.VerifyPipeline(capturedID) },
 			}
-			if !s.engine.Submit(task) {
+			if s.engine.Submit(task) {
+				// 提交成功，计入已启动列表
+				result.StartedIDs = append(result.StartedIDs, capturedID)
+			} else {
+				// 队列已满，提交失败，计入跳过列表
 				fmt.Printf("[批量验收] 任务提交失败（队列已满）: pipeline=%s\n", capturedID)
 				result.SkippedIDs = append(result.SkippedIDs, capturedID)
 			}
 		} else {
-			// 兼容模式：无Engine时直接goroutine执行
+			// 兼容模式：无Engine时直接goroutine执行，视为已启动
 			go s.VerifyPipeline(capturedID)
+			result.StartedIDs = append(result.StartedIDs, capturedID)
 		}
 	}
 

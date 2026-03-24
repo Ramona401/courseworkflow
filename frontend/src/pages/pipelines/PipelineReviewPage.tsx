@@ -285,21 +285,24 @@ export default function PipelineReviewPage() {
           </button>
         )}
 
-        {/* 场景2：审核队列中，超级审核员完成决策后，可直接提交定稿（也可选择提交申请） */}
+
+        {/* 场景2：审核队列中，超级审核员完成决策后，提交定稿申请（→pending_finalize）
+            修复：senior_operator在review_queue时应调用submitFinalize而非confirmFinalize
+            confirmFinalize要求Pipeline处于pending_finalize状态，此处调用会返回409 */}
         {isReviewQueue && isSuperReviewer && !isAdmin && (
           <button
             style={{
               ...btn,
-              background: allDecided ? '#34c759' : '#e5e5ea',
+              background: allDecided ? '#ff9500' : '#e5e5ea',
               color: allDecided ? '#fff' : '#aeaeb2',
               border: 'none',
               cursor: allDecided ? 'pointer' : 'not-allowed',
             }}
-            onClick={handleConfirmFinalize}
+            onClick={handleSubmitFinalize}
             disabled={!allDecided || finalizing}
-            title="超级审核员直接确认定稿"
+            title="提交定稿申请，等待超级审核员二次确认"
           >
-            <ShieldCheck size={14} /> {finalizing ? '定稿中...' : '确认定稿'}
+            <Send size={14} /> {finalizing ? '提交中...' : '提交定稿'}
           </button>
         )}
 
