@@ -126,7 +126,7 @@ func (h *SSEHub) Broadcast(pipelineID string, event SSEEvent) {
 	}
 
 	sent := 0
-	total := len(subs)
+	// total 已移入 Debug 日志的内联表达式
 
 	for ch, active := range subs {
 		if !active {
@@ -142,7 +142,7 @@ func (h *SSEHub) Broadcast(pipelineID string, event SSEEvent) {
 		}
 	}
 
-	sseLog.Debug("SSE广播事件", "pipeline_id", pipelineID, "event_type", event.EventType, "step", event.CurrentStep)
+	sseLog.Debug("SSE广播事件", "pipeline_id", pipelineID, "event_type", event.EventType, "step", event.CurrentStep, "subscriber_count", sent)
 }
 
 // GetSubscriberCount 获取指定Pipeline的订阅者数量（用于监控）
