@@ -1,13 +1,20 @@
 package services
 
+// 用户认证服务：登录验证 + JWT签发 + JWT验证
+// Phase8日志升级：
+//   - 查找用户失败（数据库错误）→ ERROR
+//   - Token生成失败 → ERROR
+//   - 更新登录信息失败 → WARN（不影响登录主流程，可接受）
+//   - 用户登录成功 → INFO（记录username/role，便于审计）
+
 import (
 	"context"
 	"errors"
-	"log"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"tedna/internal/config"
+	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 	"tedna/internal/utils"
@@ -23,10 +30,10 @@ var (
 
 // JWTClaims 自定义 JWT 声明
 type JWTClaims struct {
-	UserID   string `json:"user_id"`   // 用户 UUID
-	Username string `json:"username"`  // 用户名
-	Role     string `json:"role"`      // 用户角色
-	jwt.RegisteredClaims               // 标准声明（过期时间等）
+	UserID   string `json:"user_id"`  // 用户 UUID
+	Username string `json:"username"` // 用户名
+	Role     string `json:"role"`     // 用户角色
+	jwt.RegisteredClaims              // 标准声明（过期时间等）
 }
 
 // TokenExpiry JWT 有效期：24小时
@@ -36,6 +43,9 @@ const TokenExpiry = 24 * time.Hour
 type AuthService struct {
 	cfg *config.Config // 配置（含 JWTSecret）
 }
+
+// 模块日志：所有认证相关日志自动携带 module=auth 字段
+var authLog = logger.WithModule("auth")
 
 // NewAuthService 创建认证服务实例
 func NewAuthService(cfg *config.Config) *AuthService {
@@ -50,34 +60,62 @@ func (s *AuthService) Login(ctx context.Context, req *models.LoginRequest) (*mod
 		if errors.Is(err, repository.ErrUserNotFound) {
 			return nil, ErrInvalidCredentials
 		}
-		log.Printf("查找用户失败: %v", err)
+		// ERROR：数据库查询失败，系统级错误
+		authLog.Error("查找用户失败",
+			"username", req.Username,
+			"error", err,
+		)
 		return nil, err
 	}
 
 	// 2. 检查用户状态是否为 active
 	if user.Status != models.StatusActive {
+		authLog.Warn("禁用账户尝试登录",
+			"username", user.Username,
+			"user_id", user.ID,
+			"status", user.Status,
+		)
 		return nil, ErrUserDisabled
 	}
 
 	// 3. 验证密码（bcrypt 比对）
 	if !utils.CheckPassword(req.Password, user.PasswordHash) {
+		authLog.Warn("密码验证失败",
+			"username", req.Username,
+		)
 		return nil, ErrInvalidCredentials
 	}
 
 	// 4. 生成 JWT token
 	token, err := s.GenerateToken(user)
 	if err != nil {
-		log.Printf("生成token失败: %v", err)
+		// ERROR：Token生成失败，系统级错误
+		authLog.Error("生成token失败",
+			"username", user.Username,
+			"user_id", user.ID,
+			"error", err,
+		)
 		return nil, err
 	}
 
 	// 5. 更新登录时间和次数
 	if err := repository.UpdateLoginInfo(ctx, user.ID); err != nil {
-		// 更新失败不影响登录，仅记录日志
-		log.Printf("更新登录信息失败: %v", err)
+		// WARN：更新失败不影响登录主流程，记录警告继续执行
+		authLog.Warn("更新登录信息失败",
+			"username", user.Username,
+			"user_id", user.ID,
+			"error", err,
+		)
 	}
 
-	// 6. 返回 token 和用户信息
+	// 6. INFO：登录成功，记录关键字段便于审计
+	authLog.Info("用户登录成功",
+		"username", user.Username,
+		"user_id", user.ID,
+		"role", user.Role,
+	)
+
+	// 7. 返回 token 和用户信息
 	return &models.LoginResponse{
 		Token: token,
 		User:  user.ToUserInfo(),

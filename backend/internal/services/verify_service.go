@@ -7,6 +7,7 @@ package services
 
 import (
 	"fmt"
+	"tedna/internal/logger"
 	"strings"
 	"time"
 
@@ -16,6 +17,8 @@ import (
 )
 
 // ==================== 验收错误常量 ====================
+
+var verifyLog = logger.WithModule("verify")
 
 var (
 	ErrVerifyNotFinalized     = fmt.Errorf("Pipeline不是finalized状态，无法启动验收")
@@ -85,7 +88,7 @@ func (s *PipelineService) VerifyPipeline(pipelineID string) (*models.PipelineDet
 						ExecFunc:   func() { s.startRetrialPipeline(pipelineID) },
 					}
 					if !s.engine.Submit(task) {
-						fmt.Printf("[验收] 2审任务提交失败（队列已满）: pipeline=%s\n", pipelineID)
+						verifyLog.Warn("2审任务提交失败：队列已满", "pipeline_id", pipelineID)
 					}
 				} else {
 					go s.startRetrialPipeline(pipelineID)
@@ -506,7 +509,7 @@ func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 			if s.engine.Submit(task) {
 				result.StartedIDs = append(result.StartedIDs, capturedID)
 			} else {
-				fmt.Printf("[批量验收] 任务提交失败（队列已满）: pipeline=%s\n", capturedID)
+				verifyLog.Warn("批量验收任务提交失败：队列已满", "pipeline_id", capturedID)
 				result.SkippedIDs = append(result.SkippedIDs, capturedID)
 			}
 		} else {
@@ -528,7 +531,7 @@ func (s *PipelineService) StartNightlyVerifyScheduler() {
 		loc, err := time.LoadLocation("Asia/Shanghai")
 		if err != nil {
 			// 时区加载失败时降级使用UTC+8固定偏移，保证服务不中断
-			fmt.Printf("[夜间验收] 警告: 加载Asia/Shanghai时区失败(%s)，使用UTC+8固定偏移\n", err.Error())
+			verifyLog.Warn("加载Asia/Shanghai时区失败，降级为UTC+8", "error", err)
 			loc = time.FixedZone("CST", 8*3600)
 		}
 
@@ -541,8 +544,7 @@ func (s *PipelineService) StartNightlyVerifyScheduler() {
 			}
 			waitDuration := next.Sub(now)
 
-			fmt.Printf("[夜间验收] 下次执行时间: %s（等待 %s）\n",
-				next.Format("2006-01-02 15:04:05"), waitDuration)
+			verifyLog.Info("夜间验收调度器等待中", "next_run", next.Format("2006-01-02 15:04:05"), "wait_duration", waitDuration.String())
 
 			timer := time.NewTimer(waitDuration)
 			<-timer.C
@@ -551,10 +553,9 @@ func (s *PipelineService) StartNightlyVerifyScheduler() {
 				time.Now().In(loc).Format("2006-01-02 15:04:05"))
 			batchResult, batchErr := s.BatchVerify()
 			if batchErr != nil {
-				fmt.Printf("[夜间验收] 执行失败: %s\n", batchErr.Error())
+				verifyLog.Error("夜间验收执行失败", "error", batchErr)
 			} else {
-				fmt.Printf("[夜间验收] 执行完成: 找到%d个finalized Pipeline，已启动%d个验收，跳过%d个\n",
-					batchResult.TotalFound, len(batchResult.StartedIDs), len(batchResult.SkippedIDs))
+				verifyLog.Info("夜间验收执行完成", "total_found", batchResult.TotalFound, "started", len(batchResult.StartedIDs), "skipped", len(batchResult.SkippedIDs))
 			}
 		}
 	}()

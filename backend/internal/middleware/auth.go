@@ -1,11 +1,14 @@
 package middleware
 
+// JWT认证中间件 + RBAC权限中间件
+// Phase8日志升级：权限拒绝事件输出结构化日志（级别WARN，含username/role/path等字段）
+
 import (
 	"context"
-	"log"
 	"net/http"
 	"strings"
 
+	"tedna/internal/logger"
 	"tedna/internal/services"
 	"tedna/internal/utils"
 )
@@ -13,8 +16,11 @@ import (
 // 上下文键类型（避免与其他包冲突）
 type contextKey string
 
-// 上下文键常量：存储当前用户的 JWT 声明
+// ClaimsKey 上下文键常量：存储当前用户的 JWT 声明
 const ClaimsKey contextKey = "claims"
+
+// 模块日志
+var log = logger.WithModule("middleware")
 
 // AuthMiddleware 认证中间件：验证 JWT token
 // 用法：AuthMiddleware(authService)(nextHandler)
@@ -83,8 +89,16 @@ func RequireRole(allowedRoles ...string) func(http.Handler) http.Handler {
 			}
 
 			if !allowed {
-				log.Printf("权限拒绝: 用户 %s (角色: %s) 尝试访问需要 %v 角色的资源",
-					claims.Username, userRole, allowedRoles)
+				// WARN级别：权限拒绝属于安全事件，需要关注但不是系统错误
+				log.Warn("权限拒绝",
+					"username", claims.Username,
+					"user_id", claims.UserID,
+					"role", userRole,
+					"required_roles", allowedRoles,
+					"path", r.URL.Path,
+					"method", r.Method,
+					"remote_addr", r.RemoteAddr,
+				)
 				utils.Forbidden(w, "权限不足，需要以下角色之一: "+strings.Join(allowedRoles, ", "))
 				return
 			}

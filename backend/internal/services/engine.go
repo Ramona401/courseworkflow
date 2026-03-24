@@ -1,13 +1,13 @@
 package services
 
-// ==================== P5-2 并发引擎 + AI限流 ====================
-// Phase8修复E-02：新增优雅关闭机制
-//   原版：SIGTERM时队列中待执行任务直接丢失，Pipeline状态停留在running
-//   修复后：
-//     1. Engine持有context，Stop()方法关闭taskChan触发所有worker退出
-//     2. routes.Setup监听os.Signal(SIGTERM/SIGINT)，收到信号后调用engine.Stop()
-//     3. engine.Wait()等待所有worker完成当前任务后再退出
-//     4. 队列中尚未取出的任务无法被执行，但正在执行的任务可以正常完成
+// 并发执行引擎：Pipeline执行队列 + AI信号量限流 + 优雅关闭
+// Phase8日志升级：
+//   - 引擎启动/关闭 → INFO
+//   - Worker任务开始/完成 → DEBUG（高频，生产环境默认不输出，不干扰主日志）
+//   - Worker panic → ERROR（需要立即关注）
+//   - 任务提交成功 → DEBUG（高频）
+//   - 队列已满/引擎已关闭 → WARN（需要关注的异常情况）
+//   - 优雅关闭信号 → INFO
 
 import (
 	"context"
@@ -17,6 +17,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"tedna/internal/logger"
 )
 
 // ==================== 常量配置 ====================
@@ -25,13 +27,16 @@ const (
 	DefaultMaxWorkers       = 3
 	DefaultMaxAIConcurrency = 2
 	DefaultQueueSize        = 50
-	// GracefulShutdownTimeout 优雅关闭等待超时（E-02新增）
-	// 超过此时间强制退出，防止任务卡死导致进程无法退出
+	// GracefulShutdownTimeout 优雅关闭等待超时
 	GracefulShutdownTimeout = 30 * time.Second
 )
 
+// 模块日志
+var engineLog = logger.WithModule("engine")
+
 // ==================== 任务类型定义 ====================
 
+// TaskType 任务类型枚举
 type TaskType string
 
 const (
@@ -40,17 +45,16 @@ const (
 	TaskTypeVerify   TaskType = "verify"
 )
 
-// EngineTask 引擎任务
+// EngineTask 引擎任务（投递到队列的工作单元）
 type EngineTask struct {
-	Type       TaskType
-	PipelineID string
-	ExecFunc   func()
+	Type       TaskType // 任务类型
+	PipelineID string   // Pipeline ID
+	ExecFunc   func()   // 实际执行函数（闭包，由调用方构造）
 }
 
 // ==================== Engine 并发引擎 ====================
 
 // Engine 并发执行引擎
-// Phase8修复E-02：新增 ctx/cancel/stopOnce 支持优雅关闭
 type Engine struct {
 	taskChan    chan *EngineTask
 	aiSemaphore chan struct{}
@@ -61,10 +65,9 @@ type Engine struct {
 	running     bool
 	mu          sync.Mutex
 	stats       *EngineStats
-	// E-02优雅关闭相关字段
-	ctx      context.Context    // 引擎生命周期context
-	cancel   context.CancelFunc // 触发关闭
-	stopOnce sync.Once          // 防止多次调用Stop()
+	ctx         context.Context
+	cancel      context.CancelFunc
+	stopOnce    sync.Once
 }
 
 // EngineStats 引擎运行统计
@@ -104,7 +107,6 @@ func NewEngine(maxWorkers, maxAIConcurrency, queueSize int) *Engine {
 	}
 
 	e.start()
-
 	return e
 }
 
@@ -124,8 +126,12 @@ func (e *Engine) start() {
 		go e.worker(workerID)
 	}
 
-	fmt.Printf("[并发引擎] 已启动: %d个Worker, AI并发上限%d, 队列容量%d\n",
-		e.maxWorkers, e.maxAI, e.queueSize)
+	// INFO：引擎启动是重要事件，记录配置参数
+	engineLog.Info("并发引擎已启动",
+		"max_workers", e.maxWorkers,
+		"max_ai_concurrency", e.maxAI,
+		"queue_capacity", e.queueSize,
+	)
 }
 
 // worker 单个Worker的执行循环
@@ -138,14 +144,24 @@ func (e *Engine) worker(workerID int) {
 		e.stats.mu.Unlock()
 
 		startTime := time.Now()
-		fmt.Printf("[Worker-%d] 开始执行: type=%s, pipeline=%s\n",
-			workerID, task.Type, task.PipelineID)
+
+		// DEBUG：任务开始（高频事件，生产环境通常不需要）
+		engineLog.Debug("Worker开始执行任务",
+			"worker_id", workerID,
+			"task_type", string(task.Type),
+			"pipeline_id", task.PipelineID,
+		)
 
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					fmt.Printf("[Worker-%d] 任务panic: type=%s, pipeline=%s, error=%v\n",
-						workerID, task.Type, task.PipelineID, r)
+					// ERROR：panic需要立即关注，包含完整上下文
+					engineLog.Error("Worker任务发生panic",
+						"worker_id", workerID,
+						"task_type", string(task.Type),
+						"pipeline_id", task.PipelineID,
+						"panic_value", fmt.Sprintf("%v", r),
+					)
 					e.stats.mu.Lock()
 					e.stats.TotalFailed++
 					e.stats.mu.Unlock()
@@ -161,23 +177,33 @@ func (e *Engine) worker(workerID int) {
 		e.stats.TotalCompleted++
 		e.stats.mu.Unlock()
 
-		fmt.Printf("[Worker-%d] 执行完成: type=%s, pipeline=%s, 耗时=%s\n",
-			workerID, task.Type, task.PipelineID, elapsed.Round(time.Second))
+		// DEBUG：任务完成（高频事件）
+		engineLog.Debug("Worker任务完成",
+			"worker_id", workerID,
+			"task_type", string(task.Type),
+			"pipeline_id", task.PipelineID,
+			"elapsed_ms", elapsed.Milliseconds(),
+		)
 	}
 
-	fmt.Printf("[Worker-%d] 已退出（引擎关闭）\n", workerID)
+	// INFO：Worker退出（通常只在引擎关闭时发生）
+	engineLog.Info("Worker已退出",
+		"worker_id", workerID,
+		"reason", "引擎关闭",
+	)
 }
 
 // ==================== 任务提交 ====================
 
 // Submit 提交任务到执行队列（非阻塞）
-// E-02：引擎关闭后拒绝新任务提交
 func (e *Engine) Submit(task *EngineTask) bool {
 	// 引擎关闭后不接受新任务
 	select {
 	case <-e.ctx.Done():
-		fmt.Printf("[并发引擎] 引擎已关闭，拒绝新任务: type=%s, pipeline=%s\n",
-			task.Type, task.PipelineID)
+		engineLog.Warn("引擎已关闭，拒绝新任务",
+			"task_type", string(task.Type),
+			"pipeline_id", task.PipelineID,
+		)
 		return false
 	default:
 	}
@@ -188,12 +214,21 @@ func (e *Engine) Submit(task *EngineTask) bool {
 		e.stats.TotalSubmitted++
 		e.stats.mu.Unlock()
 
-		fmt.Printf("[并发引擎] 任务已提交: type=%s, pipeline=%s, 队列长度=%d/%d\n",
-			task.Type, task.PipelineID, len(e.taskChan), e.queueSize)
+		// DEBUG：任务提交成功（高频事件）
+		engineLog.Debug("任务已提交到队列",
+			"task_type", string(task.Type),
+			"pipeline_id", task.PipelineID,
+			"queue_length", len(e.taskChan),
+			"queue_capacity", e.queueSize,
+		)
 		return true
 	default:
-		fmt.Printf("[并发引擎] 队列已满，任务被拒绝: type=%s, pipeline=%s\n",
-			task.Type, task.PipelineID)
+		// WARN：队列满是需要关注的异常情况
+		engineLog.Warn("任务队列已满，任务被拒绝",
+			"task_type", string(task.Type),
+			"pipeline_id", task.PipelineID,
+			"queue_capacity", e.queueSize,
+		)
 		return false
 	}
 }
@@ -218,26 +253,25 @@ func (e *Engine) ReleaseAI() {
 	e.stats.mu.Unlock()
 }
 
-// ==================== E-02：优雅关闭 ====================
+// ==================== 优雅关闭 ====================
 
-// Stop 触发引擎优雅关闭
-// 调用后：
-//   1. 不再接受新任务（Submit返回false）
-//   2. 关闭taskChan，所有worker完成当前任务后退出range循环
-//   3. 队列中尚未被worker取出的任务会被丢弃（无法避免，但已运行中的任务可完成）
-//
-// 注意：Stop()是幂等的，多次调用安全
+// Stop 触发引擎优雅关闭（幂等）
 func (e *Engine) Stop() {
 	e.stopOnce.Do(func() {
-		fmt.Printf("[并发引擎] 开始优雅关闭，等待 %d 个正在执行的任务完成...\n",
-			e.stats.CurrentRunning)
-		e.cancel()         // 取消context，通知不再接受新任务
-		close(e.taskChan)  // 关闭channel，worker完成当前任务后退出for range循环
+		e.stats.mu.Lock()
+		currentRunning := e.stats.CurrentRunning
+		e.stats.mu.Unlock()
+
+		// INFO：关闭是重要生命周期事件
+		engineLog.Info("开始优雅关闭引擎",
+			"current_running_tasks", currentRunning,
+		)
+		e.cancel()
+		close(e.taskChan)
 	})
 }
 
 // Wait 等待所有Worker完成当前任务（带超时保护）
-// 应在Stop()之后调用，用于优雅关闭流程
 func (e *Engine) Wait() {
 	done := make(chan struct{})
 	go func() {
@@ -247,26 +281,28 @@ func (e *Engine) Wait() {
 
 	select {
 	case <-done:
-		fmt.Printf("[并发引擎] 所有Worker已退出，引擎关闭完成\n")
+		engineLog.Info("所有Worker已退出，引擎关闭完成")
 	case <-time.After(GracefulShutdownTimeout):
-		fmt.Printf("[并发引擎] 等待超时（%s），强制退出\n", GracefulShutdownTimeout)
+		engineLog.Warn("优雅关闭等待超时，强制退出",
+			"timeout", GracefulShutdownTimeout.String(),
+		)
 	}
 }
 
-// StartGracefulShutdown 在独立goroutine中监听系统信号并触发优雅关闭
-// Phase8修复E-02：在routes.Setup中调用此方法，监听SIGTERM/SIGINT
-// 收到信号后：Stop()→Wait()→进程退出
-// 此方法会阻塞调用goroutine直到收到信号，应在独立goroutine中运行
+// StartGracefulShutdown 监听系统信号，收到后执行优雅关闭
 func (e *Engine) StartGracefulShutdown() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 
 	go func() {
 		sig := <-sigChan
-		fmt.Printf("[并发引擎] 收到系统信号 %s，开始优雅关闭...\n", sig)
+		// INFO：收到系统信号是重要事件
+		engineLog.Info("收到系统信号，开始优雅关闭",
+			"signal", sig.String(),
+		)
 		e.Stop()
 		e.Wait()
-		fmt.Printf("[并发引擎] 优雅关闭完成，进程退出\n")
+		engineLog.Info("优雅关闭完成，进程退出")
 		os.Exit(0)
 	}()
 }

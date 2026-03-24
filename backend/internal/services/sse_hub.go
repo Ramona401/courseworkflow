@@ -20,7 +20,7 @@ package services
 //   实际场景中同时广播的goroutine极少（Worker数量=5），影响可忽略。
 
 import (
-	"fmt"
+	"tedna/internal/logger"
 	"sync"
 )
 
@@ -44,6 +44,8 @@ type SSEHub struct {
 	mu          sync.Mutex                       // 统一互斥锁，保护所有操作（避免RLock+Lock竞态）
 	subscribers map[string]map[chan SSEEvent]bool // pipelineID → set of channels（true=活跃，false=待清理）
 }
+
+var sseLog = logger.WithModule("sse")
 
 // GlobalSSEHub 全局SSE广播中心实例
 var GlobalSSEHub = NewSSEHub()
@@ -70,7 +72,7 @@ func (h *SSEHub) Subscribe(pipelineID string) chan SSEEvent {
 	h.subscribers[pipelineID][ch] = true
 
 	count := len(h.subscribers[pipelineID])
-	fmt.Printf("[SSE Hub] 新订阅: pipeline=%s, 当前订阅数=%d\n", pipelineID, count)
+	sseLog.Debug("SSE新订阅", "pipeline_id", pipelineID, "subscriber_count", count)
 	return ch
 }
 
@@ -108,7 +110,7 @@ func (h *SSEHub) Unsubscribe(pipelineID string, ch chan SSEEvent) {
 	if s, ok2 := h.subscribers[pipelineID]; ok2 {
 		count = len(s)
 	}
-	fmt.Printf("[SSE Hub] 取消订阅: pipeline=%s, 剩余订阅数=%d\n", pipelineID, count)
+	sseLog.Debug("SSE取消订阅", "pipeline_id", pipelineID, "remaining_subscribers", count)
 }
 
 // Broadcast 向指定Pipeline的所有订阅者广播事件
@@ -140,8 +142,7 @@ func (h *SSEHub) Broadcast(pipelineID string, event SSEEvent) {
 		}
 	}
 
-	fmt.Printf("[SSE Hub] 广播: pipeline=%s, type=%s, step=%s, 推送=%d/%d\n",
-		pipelineID, event.EventType, event.CurrentStep, sent, total)
+	sseLog.Debug("SSE广播事件", "pipeline_id", pipelineID, "event_type", event.EventType, "step", event.CurrentStep)
 }
 
 // GetSubscriberCount 获取指定Pipeline的订阅者数量（用于监控）

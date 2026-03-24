@@ -1,12 +1,18 @@
 package services
 
+// 用户管理业务逻辑层
+// Phase8日志升级：
+//   - 数据库查询/写入失败 → ERROR（系统级错误，需要处理）
+//   - 业务成功操作（创建/更新/重置密码） → INFO（含关键字段便于审计）
+//   - 密码哈希失败 → ERROR（加密库错误，极少发生）
+
 import (
 	"context"
 	"errors"
-	"log"
 	"strings"
 
 	"github.com/google/uuid"
+	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 	"tedna/internal/utils"
@@ -29,6 +35,9 @@ var (
 // UserService 用户管理服务
 type UserService struct{}
 
+// 模块日志：所有用户管理日志自动携带 module=user 字段
+var userLog = logger.WithModule("user")
+
 // NewUserService 创建用户管理服务实例
 func NewUserService() *UserService {
 	return &UserService{}
@@ -40,7 +49,7 @@ func NewUserService() *UserService {
 func (s *UserService) ListUsers(ctx context.Context) (*models.UserListResponse, error) {
 	users, err := repository.ListUsers(ctx)
 	if err != nil {
-		log.Printf("查询用户列表失败: %v", err)
+		userLog.Error("查询用户列表失败", "error", err)
 		return nil, err
 	}
 
@@ -80,7 +89,10 @@ func (s *UserService) CreateUser(ctx context.Context, req *models.CreateUserRequ
 	// 2. 检查用户名唯一性
 	exists, err := repository.CheckUsernameExists(ctx, req.Username)
 	if err != nil {
-		log.Printf("检查用户名失败: %v", err)
+		userLog.Error("检查用户名唯一性失败",
+			"username", req.Username,
+			"error", err,
+		)
 		return nil, err
 	}
 	if exists {
@@ -90,7 +102,10 @@ func (s *UserService) CreateUser(ctx context.Context, req *models.CreateUserRequ
 	// 3. 生成密码哈希
 	passwordHash, err := utils.HashPassword(req.Password)
 	if err != nil {
-		log.Printf("生成密码哈希失败: %v", err)
+		userLog.Error("生成密码哈希失败",
+			"username", req.Username,
+			"error", err,
+		)
 		return nil, err
 	}
 
@@ -106,11 +121,20 @@ func (s *UserService) CreateUser(ctx context.Context, req *models.CreateUserRequ
 
 	// 5. 写入数据库
 	if err := repository.CreateUser(ctx, user); err != nil {
-		log.Printf("创建用户失败: %v", err)
+		userLog.Error("创建用户失败",
+			"username", req.Username,
+			"role", req.Role,
+			"error", err,
+		)
 		return nil, err
 	}
 
-	log.Printf("创建用户成功: %s (%s, 角色: %s)", user.Username, user.ID, user.Role)
+	// INFO：用户创建成功，记录关键字段便于审计
+	userLog.Info("创建用户成功",
+		"username", user.Username,
+		"user_id", user.ID,
+		"role", user.Role,
+	)
 
 	// 6. 重新查询完整用户信息（含created_at等数据库生成字段）
 	created, err := repository.FindUserByID(ctx, user.ID)
@@ -137,7 +161,6 @@ func (s *UserService) UpdateUser(ctx context.Context, userID string, currentUser
 
 	// 2. 不允许修改自己的角色（防止admin把自己降级）
 	if userID == currentUserID {
-		// 先查当前角色
 		existing, err := repository.FindUserByID(ctx, userID)
 		if err != nil {
 			return nil, err
@@ -152,7 +175,11 @@ func (s *UserService) UpdateUser(ctx context.Context, userID string, currentUser
 		if errors.Is(err, repository.ErrUserNotFound) {
 			return nil, ErrUserNotFound
 		}
-		log.Printf("更新用户失败: %v", err)
+		userLog.Error("更新用户失败",
+			"user_id", userID,
+			"new_role", req.Role,
+			"error", err,
+		)
 		return nil, err
 	}
 
@@ -162,7 +189,13 @@ func (s *UserService) UpdateUser(ctx context.Context, userID string, currentUser
 		return nil, err
 	}
 
-	log.Printf("更新用户成功: %s (角色: %s)", updated.Username, updated.Role)
+	// INFO：用户更新成功
+	userLog.Info("更新用户成功",
+		"username", updated.Username,
+		"user_id", userID,
+		"role", updated.Role,
+		"operator_id", currentUserID,
+	)
 	return updated.ToUserInfo(), nil
 }
 
@@ -187,17 +220,28 @@ func (s *UserService) ResetPassword(ctx context.Context, userID string, req *mod
 	// 3. 生成新密码哈希
 	passwordHash, err := utils.HashPassword(req.NewPassword)
 	if err != nil {
-		log.Printf("生成密码哈希失败: %v", err)
+		userLog.Error("生成密码哈希失败",
+			"user_id", userID,
+			"error", err,
+		)
 		return err
 	}
 
 	// 4. 更新密码
 	if err := repository.UpdatePassword(ctx, userID, passwordHash); err != nil {
-		log.Printf("重置密码失败: %v", err)
+		userLog.Error("重置密码失败",
+			"username", user.Username,
+			"user_id", userID,
+			"error", err,
+		)
 		return err
 	}
 
-	log.Printf("重置密码成功: %s (%s)", user.Username, userID)
+	// INFO：密码重置成功
+	userLog.Info("重置密码成功",
+		"username", user.Username,
+		"user_id", userID,
+	)
 	return nil
 }
 
@@ -226,11 +270,23 @@ func (s *UserService) UpdateStatus(ctx context.Context, userID string, currentUs
 
 	// 4. 更新状态
 	if err := repository.UpdateStatus(ctx, userID, req.Status); err != nil {
-		log.Printf("更新用户状态失败: %v", err)
+		userLog.Error("更新用户状态失败",
+			"username", user.Username,
+			"user_id", userID,
+			"new_status", req.Status,
+			"error", err,
+		)
 		return err
 	}
 
-	log.Printf("更新用户状态成功: %s → %s", user.Username, req.Status)
+	// INFO：状态变更成功（enable/disable都是重要操作，记录审计）
+	userLog.Info("更新用户状态成功",
+		"username", user.Username,
+		"user_id", userID,
+		"old_status", user.Status,
+		"new_status", req.Status,
+		"operator_id", currentUserID,
+	)
 	return nil
 }
 
@@ -238,7 +294,6 @@ func (s *UserService) UpdateStatus(ctx context.Context, userID string, currentUs
 
 // GetAssignments 获取用户课程分配列表
 func (s *UserService) GetAssignments(ctx context.Context, userID string) ([]*models.CourseAssignment, error) {
-	// 确认用户存在
 	_, err := repository.FindUserByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, repository.ErrUserNotFound) {
@@ -263,11 +318,20 @@ func (s *UserService) UpdateAssignments(ctx context.Context, userID string, admi
 
 	// 2. 执行全量替换（事务）
 	if err := repository.ReplaceUserAssignments(ctx, userID, req.CourseCodes, adminID); err != nil {
-		log.Printf("更新课程分配失败: %v", err)
+		userLog.Error("更新课程分配失败",
+			"user_id", userID,
+			"course_count", len(req.CourseCodes),
+			"error", err,
+		)
 		return nil, err
 	}
 
-	log.Printf("更新课程分配成功: 用户 %s, 课程数 %d", userID, len(req.CourseCodes))
+	// INFO：课程分配更新成功
+	userLog.Info("更新课程分配成功",
+		"user_id", userID,
+		"course_count", len(req.CourseCodes),
+		"operator_id", adminID,
+	)
 
 	// 3. 返回最新的分配列表
 	return repository.GetUserAssignments(ctx, userID)
