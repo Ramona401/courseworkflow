@@ -14,13 +14,13 @@ export interface CreateUserRequest {
   username: string
   display_name: string
   password: string
-  role: 'admin' | 'operator' | 'viewer'
+  role: 'admin' | 'senior_operator' | 'operator' | 'viewer'
 }
 
 // 编辑用户请求
 export interface UpdateUserRequest {
   display_name: string
-  role: 'admin' | 'operator' | 'viewer'
+  role: 'admin' | 'senior_operator' | 'operator' | 'viewer'
 }
 
 // 重置密码请求

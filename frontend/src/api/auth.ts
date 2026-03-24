@@ -10,7 +10,7 @@ export interface UserInfo {
   id: string
   username: string
   display_name: string
-  role: 'admin' | 'operator' | 'viewer'
+  role: 'admin' | 'senior_operator' | 'operator' | 'viewer'
   status: string
   last_login_at: string | null
   login_count: number
