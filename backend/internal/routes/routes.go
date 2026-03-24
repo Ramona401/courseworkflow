@@ -115,6 +115,7 @@ func Setup(cfg *config.Config) http.Handler {
 			"data": map[string]interface{}{
 				"total_submitted":    stats.TotalSubmitted,
 				"total_completed":    stats.TotalCompleted,
+				"total_business_failed": stats.TotalBusinessFailed,
 				"total_failed":       stats.TotalFailed,
 				"current_running":    stats.CurrentRunning,
 				"current_ai_active":  stats.CurrentAIActive,
@@ -572,6 +573,7 @@ func makeHealthHandler(engine *services.Engine) http.HandlerFunc {
 				"status":            engineStatus,
 				"total_submitted":   stats.TotalSubmitted,
 				"total_completed":   stats.TotalCompleted,
+				"total_business_failed": stats.TotalBusinessFailed,
 				"total_failed":      stats.TotalFailed,
 				"current_running":   stats.CurrentRunning,
 				"current_ai_active": stats.CurrentAIActive,
