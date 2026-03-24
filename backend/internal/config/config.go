@@ -8,6 +8,11 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// AppVersion 应用版本号
+// 修复R-03：从硬编码迁移到配置，healthHandler和其他需要版本号的地方统一读取此常量
+// 发版时只需修改此处一个位置，避免多处硬编码漏改
+const AppVersion = "0.30.0"
+
 // Config 全局配置结构体
 type Config struct {
 	// 数据库配置
@@ -28,9 +33,9 @@ type Config struct {
 	AESKey string
 
 	// AI API 配置
-	AIAPIBaseURL    string
-	AIAPIKey        string
-	AIDefaultModel  string
+	AIAPIBaseURL   string
+	AIAPIKey       string
+	AIDefaultModel string
 }
 
 // Load 从环境变量加载配置
@@ -40,18 +45,18 @@ func Load() *Config {
 	}
 
 	cfg := &Config{
-		DBHost:          getEnv("DB_HOST", "127.0.0.1"),
-		DBPort:          getEnv("DB_PORT", "5432"),
-		DBUser:          getEnv("DB_USER", "tedna_user"),
-		DBPassword:      getEnv("DB_PASSWORD", ""),
-		DBName:          getEnv("DB_NAME", "tedna"),
-		Port:            getEnv("PORT", "8080"),
-		GinMode:         getEnv("GIN_MODE", "release"),
-		JWTSecret:       getEnv("JWT_SECRET", ""),
-		AESKey:          getEnv("AES_KEY", ""),
-		AIAPIBaseURL:    getEnv("AI_API_BASE_URL", ""),
-		AIAPIKey:        getEnv("AI_API_KEY", ""),
-		AIDefaultModel:  getEnv("AI_DEFAULT_MODEL", "anthropic/claude-sonnet-4-5"),
+		DBHost:         getEnv("DB_HOST", "127.0.0.1"),
+		DBPort:         getEnv("DB_PORT", "5432"),
+		DBUser:         getEnv("DB_USER", "tedna_user"),
+		DBPassword:     getEnv("DB_PASSWORD", ""),
+		DBName:         getEnv("DB_NAME", "tedna"),
+		Port:           getEnv("PORT", "8080"),
+		GinMode:        getEnv("GIN_MODE", "release"),
+		JWTSecret:      getEnv("JWT_SECRET", ""),
+		AESKey:         getEnv("AES_KEY", ""),
+		AIAPIBaseURL:   getEnv("AI_API_BASE_URL", ""),
+		AIAPIKey:       getEnv("AI_API_KEY", ""),
+		AIDefaultModel: getEnv("AI_DEFAULT_MODEL", "anthropic/claude-sonnet-4-5"),
 	}
 
 	// 验证必要配置

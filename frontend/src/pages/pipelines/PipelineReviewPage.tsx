@@ -1,14 +1,13 @@
 /**
- * Pipeline审核页面（P4.5-E 重构版 v3.4 | P7：二级审批流程）
+ * Pipeline审核页面（P4.5-E 重构版 v3.5 | P7：二级审批流程 | Phase8修复）
  *
- * P7更新：
- * - 审核员（operator）：逐页决策完毕后显示「提交定稿」按钮→调用 submitFinalize
- * - 超级审核员（senior_operator/admin）：进入 pending_finalize 状态的Pipeline时显示
- *   「确认定稿」和「退回重审」按钮
- * - admin 额外保留「直接定稿」按钮（跳过二级审批）
- *
- * 虚拟页码规则（P7修复）：
- * - create操作 page_number >= 1000 → 显示为 Pxx-new
+ * Phase8修复：
+ * - FP-03：HTMLPreview 中 iframe 移除 allow-scripts，防止AI生成HTML中的JS在审核员浏览器执行
+ *   原版：sandbox="allow-same-origin allow-scripts" 允许iframe内JS读取父页面DOM/localStorage，可窃取JWT
+ *   修复后：sandbox="allow-same-origin" 仅允许同源访问，JS无法执行
+ * - FP-04：selectPage 函数切换页面时同步清空 editContent
+ *   原版：切换页面后再点编辑，textarea 仍显示上一页内容
+ *   修复后：selectPage 时同时 setEditContent('')，彻底消除内容残留
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
@@ -61,7 +60,7 @@ function parseMergeSources(ms: string): number[] {
 }
 
 /**
- * 格式化页码标签（P7修复）
+ * 格式化页码标签
  * page_number < 1000 → "P04"
  * page_number >= 1000 → "P04-new"
  */
@@ -69,8 +68,6 @@ function formatPageLabel(pageNumber: number): string {
   if (pageNumber < CREATE_PAGE_OFFSET) {
     return `P${String(pageNumber).padStart(2, '0')}`
   }
-  // 后端规则：virtualPageNum = originalPage + 1000 + (counter-1)*10
-  // 还原：originalPage = (virtualPageNum - 1000) % 10
   const realOrigPage = (pageNumber - CREATE_PAGE_OFFSET) % 10
   return `P${String(realOrigPage).padStart(2, '0')}-new`
 }
@@ -82,7 +79,6 @@ export default function PipelineReviewPage() {
   const navigate = useNavigate()
   const { user } = useAuth()
 
-  // 角色判断
   const isAdmin = user?.role === 'admin'
   const isSuperReviewer = user?.role === 'admin' || user?.role === 'senior_operator'
   const canOperate = user?.role === 'admin' || user?.role === 'operator' || user?.role === 'senior_operator'
@@ -99,7 +95,6 @@ export default function PipelineReviewPage() {
   const [editContent, setEditContent] = useState('')
   const [fullscreen, setFullscreen] = useState(false)
   const [reasonExpanded, setReasonExpanded] = useState(true)
-  // P7：退回重审弹窗
   const [showRejectDialog, setShowRejectDialog] = useState(false)
   const [rejectReason, setRejectReason] = useState('')
 
@@ -108,7 +103,6 @@ export default function PipelineReviewPage() {
   const decidedPages = pages.filter(p => p.decision !== 'pending').length
   const allDecided = totalPages > 0 && decidedPages === totalPages
 
-  // P7：根据状态和角色决定显示哪些操作按钮
   const isPendingFinalize = pipeline?.status === 'pending_finalize'
   const isReviewQueue = pipeline?.status === 'review_queue' || pipeline?.status === 'needs_human'
 
@@ -146,7 +140,16 @@ export default function PipelineReviewPage() {
     return () => window.removeEventListener('keydown', h)
   }, [fullscreen, selectedIdx, pages.length])
 
-  const selectPage = (idx: number) => { setSelectedIdx(idx); setEditingHTML(false); setMergeSourceTab(0) }
+  /**
+   * 切换页面
+   * 修复FP-04：同时清空 editContent，防止切换页面后打开编辑仍显示上一页内容
+   */
+  const selectPage = (idx: number) => {
+    setSelectedIdx(idx)
+    setEditingHTML(false)
+    setMergeSourceTab(0)
+    setEditContent('') // FP-04修复：切换页面时清空编辑内容，防止残留
+  }
 
   const handleDecision = async (decision: 'approve' | 'reject' | 'edit', finalHTML?: string) => {
     if (!id || !currentPage) return
@@ -165,7 +168,6 @@ export default function PipelineReviewPage() {
     setDeciding(false)
   }
 
-  /** P7：审核员提交定稿申请（→pending_finalize） */
   const handleSubmitFinalize = async () => {
     if (!id || !allDecided) return
     if (!confirm('确认提交定稿申请？将发送给超级审核员确认。')) return
@@ -178,7 +180,6 @@ export default function PipelineReviewPage() {
     setFinalizing(false)
   }
 
-  /** P7：超级审核员确认定稿（→finalized） */
   const handleConfirmFinalize = async () => {
     if (!id) return
     if (!confirm('确认定稿归档？Pipeline将进入finalized状态，可触发验收。')) return
@@ -191,7 +192,6 @@ export default function PipelineReviewPage() {
     setFinalizing(false)
   }
 
-  /** P7：超级审核员退回重审（→review_queue） */
   const handleRejectFinalize = async () => {
     if (!id) return
     setFinalizing(true)
@@ -204,7 +204,6 @@ export default function PipelineReviewPage() {
     setFinalizing(false)
   }
 
-  /** admin直接定稿（跳过二级审批） */
   const handleDirectFinalize = async () => {
     if (!id || !allDecided) return
     if (!confirm('确认直接定稿归档？（跳过超级审核员确认）')) return
@@ -219,6 +218,7 @@ export default function PipelineReviewPage() {
 
   const startEdit = () => {
     if (!currentPage) return
+    // FP-04修复：打开编辑时总是从当前页面内容初始化，而非依赖 editContent 残留
     setEditContent(currentPage.final_html || currentPage.generated_html || '')
     setEditingHTML(true)
   }
@@ -255,19 +255,26 @@ export default function PipelineReviewPage() {
           <div style={{ fontSize: 12, color: '#8e8e93', marginTop: 2 }}>
             {decidedPages}/{totalPages} 页已决策
             {allDecided && <span style={{ color: '#34c759', marginLeft: 8 }}>✓ 全部完成</span>}
-            {/* P7：状态标注 */}
             {isPendingFinalize && (
               <span style={{ color: '#ff9500', marginLeft: 8, fontWeight: 600 }}>
                 ⏳ 待超级审核员确认定稿
+              </span>
+            )}
+            {/* Phase8修复P-02：展示退回原因，让审核员知晓退回理由 */}
+            {pipeline.reject_reason && isReviewQueue && (
+              <span style={{
+                color: '#ff3b30', marginLeft: 8, fontWeight: 500,
+                background: 'rgba(255,59,48,0.08)', padding: '1px 8px',
+                borderRadius: 4, fontSize: 11,
+              }}>
+                ↩ 退回原因：{pipeline.reject_reason}
               </span>
             )}
           </div>
         </div>
         <button style={btn} onClick={loadData}><RefreshCw size={14} /> 刷新</button>
 
-        {/* ===== P7：操作按钮区（根据角色和状态显示） ===== */}
-
-        {/* 场景1：审核队列中，审核员/超级审核员/admin 完成决策后，显示「提交定稿」 */}
+        {/* 场景1：审核队列中，普通操作员完成决策后显示「提交定稿」 */}
         {isReviewQueue && canOperate && !isSuperReviewer && (
           <button
             style={{
@@ -285,10 +292,7 @@ export default function PipelineReviewPage() {
           </button>
         )}
 
-
-        {/* 场景2：审核队列中，超级审核员完成决策后，提交定稿申请（→pending_finalize）
-            修复：senior_operator在review_queue时应调用submitFinalize而非confirmFinalize
-            confirmFinalize要求Pipeline处于pending_finalize状态，此处调用会返回409 */}
+        {/* 场景2：审核队列中，超级审核员完成决策后提交定稿申请 */}
         {isReviewQueue && isSuperReviewer && !isAdmin && (
           <button
             style={{
@@ -300,13 +304,13 @@ export default function PipelineReviewPage() {
             }}
             onClick={handleSubmitFinalize}
             disabled={!allDecided || finalizing}
-            title="提交定稿申请，等待超级审核员二次确认"
+            title="提交定稿申请，等待二次确认"
           >
             <Send size={14} /> {finalizing ? '提交中...' : '提交定稿'}
           </button>
         )}
 
-        {/* 场景3：pending_finalize 状态，超级审核员看到确认/退回按钮 */}
+        {/* 场景3：pending_finalize 状态，超级审核员显示确认/退回按钮 */}
         {isPendingFinalize && isSuperReviewer && (
           <>
             <button
@@ -338,7 +342,7 @@ export default function PipelineReviewPage() {
           </>
         )}
 
-        {/* 场景4：admin 可直接定稿（任意审核状态，跳过二级审批） */}
+        {/* 场景4：admin 可直接定稿（跳过二级审批） */}
         {isAdmin && (isReviewQueue || isPendingFinalize) && (
           <button
             style={{
@@ -473,7 +477,6 @@ export default function PipelineReviewPage() {
                   }}><FileText size={13} /> {reasonExpanded ? '收起理由' : '修改理由'}</button>
                 )}
 
-                {/* P7：pending_finalize 状态下显示只读提示，不显示决策按钮（超级审核员可操作） */}
                 {!editingHTML && !isPendingFinalize && canOperate && (
                   <div style={{ display: 'flex', gap: 6 }}>
                     <button style={{ ...btn, background: '#34c759', color: '#fff', border: 'none', opacity: deciding ? 0.6 : 1, padding: '6px 14px' }}
@@ -484,7 +487,6 @@ export default function PipelineReviewPage() {
                       onClick={startEdit}><Edit3 size={14} /> 编辑</button>
                   </div>
                 )}
-                {/* P7：pending_finalize 超级审核员仍可修改决策 */}
                 {!editingHTML && isPendingFinalize && isSuperReviewer && (
                   <div style={{ display: 'flex', gap: 6 }}>
                     <button style={{ ...btn, background: '#34c759', color: '#fff', border: 'none', opacity: deciding ? 0.6 : 1, padding: '6px 14px' }}
@@ -505,7 +507,7 @@ export default function PipelineReviewPage() {
                   <div style={{ display: 'flex', gap: 6 }}>
                     <button style={{ ...btn, background: '#34c759', color: '#fff', border: 'none', opacity: deciding ? 0.6 : 1 }}
                       onClick={() => handleDecision('edit', editContent)} disabled={deciding}><CheckCircle size={14} /> 保存编辑</button>
-                    <button style={btn} onClick={() => setEditingHTML(false)}>取消</button>
+                    <button style={btn} onClick={() => { setEditingHTML(false); setEditContent('') }}>取消</button>
                   </div>
                 )}
               </div>
@@ -589,7 +591,7 @@ export default function PipelineReviewPage() {
         />
       )}
 
-      {/* ===== P7：退回重审弹窗 ===== */}
+      {/* ===== 退回重审弹窗 ===== */}
       {showRejectDialog && (
         <div style={{
           position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(4px)',
@@ -612,7 +614,7 @@ export default function PipelineReviewPage() {
             </div>
             <div style={{ padding: '16px 20px' }}>
               <div style={{ fontSize: 13, color: '#3c3c43', marginBottom: 10 }}>
-                将退回给原审核员重新审核，可填写退回原因（选填）：
+                将退回给原审核员重新审核，退回原因将显示在审核员的审核页面顶部：
               </div>
               <textarea
                 value={rejectReason}
@@ -1012,6 +1014,22 @@ function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavigate, on
 
 // ==================== HTML预览 ====================
 
+/**
+ * HTMLPreview iframe HTML内容预览组件
+ * 修复FP-03：移除 allow-scripts，防止AI生成HTML中的JS在审核员浏览器中执行
+ *
+ * 原版：sandbox="allow-same-origin allow-scripts"
+ *   - allow-scripts 允许iframe内JavaScript执行
+ *   - allow-same-origin 允许iframe访问父页面同源内容
+ *   - 两者同时存在：iframe内脚本可通过window.parent读取父页面localStorage中的JWT token
+ *   - 攻击路径：AI在生成HTML中注入恶意JS → 审核员预览时JS执行 → 读取token → 冒充身份操作
+ *
+ * 修复后：sandbox="allow-same-origin"
+ *   - 仅保留allow-same-origin用于CSS/字体等资源加载
+ *   - 移除allow-scripts，iframe内JS完全无法执行
+ *   - 课件HTML的基础布局、文字、图片、表格仍可正常渲染
+ *   - 如需JS交互功能，建议将预览部署到独立子域名（跨域iframe中allow-scripts无法读取父页面）
+ */
 function HTMLPreview({ html }: { html: string }) {
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const doc = `<!DOCTYPE html>
@@ -1024,6 +1042,13 @@ img{max-width:100%;height:auto}table{border-collapse:collapse;width:100%}th,td{b
   if (!html && html !== '') {
     return <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#aeaeb2', fontSize: 13 }}>（无HTML内容）</div>
   }
-  return <iframe ref={iframeRef} srcDoc={doc} sandbox="allow-same-origin allow-scripts"
-    style={{ flex: 1, width: '100%', height: '100%', border: 'none', background: '#fff' }} title="HTML预览" />
+  return (
+    <iframe
+      ref={iframeRef}
+      srcDoc={doc}
+      sandbox="allow-same-origin"
+      style={{ flex: 1, width: '100%', height: '100%', border: 'none', background: '#fff' }}
+      title="HTML预览"
+    />
+  )
 }
