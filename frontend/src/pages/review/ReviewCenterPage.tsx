@@ -230,16 +230,11 @@ export default function ReviewCenterPage() {
 
   return (
     <div>
-      {/* ===== 页面标题区 ===== */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24 }}>
-        <div>
-          <h1 style={{ fontSize: 24, fontWeight: 700, color: '#1d1d1f', margin: 0, letterSpacing: '-0.3px' }}>
-            审核中心
-          </h1>
-          <p style={{ fontSize: 14, color: '#86868b', margin: '4px 0 0 0' }}>
-            集中管理所有待审核的Pipeline课程
-          </p>
-        </div>
+      {/* ===== 页面标题区（标题由MainLayout header提供，这里只显示描述和操作按钮） ===== */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
+        <p style={{ fontSize: 14, color: '#86868b', margin: 0 }}>
+          集中管理所有待审核的Pipeline课程
+        </p>
         <button style={btn} onClick={loadData}>
           <RefreshCw size={14} /> 刷新
         </button>
