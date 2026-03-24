@@ -295,7 +295,7 @@ export default function ExternalDataPage() {
   // ==================== 渲染 ====================
 
   return (
-    <div style={{ maxWidth: '960px', margin: '0 auto' }}>
+    <div style={{ maxWidth: 'none' }}>
       {/* Toast 提示 */}
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
 
