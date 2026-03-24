@@ -27,7 +27,7 @@ func Setup(cfg *config.Config) http.Handler {
 
 	// ==================== P5-2新增：创建并发引擎并注入PipelineService ====================
 	// 参数：maxWorkers=3（同时执行3个Pipeline），maxAIConcurrency=2（同时2个AI调用），queueSize=50
-	engine := services.NewEngine(3, 2, 50)
+	engine := services.NewEngine(5, 4, 50)
 	pipelineService.SetEngine(engine)
 
 	// ==================== P4.6-4新增：启动夜间批量验收定时任务 ====================
@@ -79,8 +79,8 @@ func Setup(cfg *config.Config) http.Handler {
 				"current_running":   stats.CurrentRunning,
 				"current_ai_active": stats.CurrentAIActive,
 				"queue_length":      stats.QueueLength,
-				"max_workers":       3,
-				"max_ai_concurrency": 2,
+				"max_workers":       5,
+				"max_ai_concurrency": 4,
 				"queue_capacity":    50,
 			},
 		})
