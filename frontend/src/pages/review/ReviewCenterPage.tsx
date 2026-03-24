@@ -217,7 +217,7 @@ export default function ReviewCenterPage() {
     setAssigning(false)
   }
 
-  /** P6-2：多选操作 */
+  /** P6-2：单选操作 */
   const toggleSelect = (id: string) => {
     setSelectedIds(prev => {
       const next = new Set(prev)
@@ -226,14 +226,6 @@ export default function ReviewCenterPage() {
       return next
     })
   }
-  const toggleSelectAllPending = () => {
-    if (selectedIds.size === pendingReview.length && pendingReview.length > 0) {
-      setSelectedIds(new Set())
-    } else {
-      setSelectedIds(new Set(pendingReview.map(p => p.id)))
-    }
-  }
-  const isAllPendingSelected = pendingReview.length > 0 && selectedIds.size === pendingReview.length
 
   // ===== 数据分组与排序 =====
 
@@ -253,6 +245,16 @@ export default function ReviewCenterPage() {
       const tb = b.created_at ? new Date(b.created_at).getTime() : 0
       return ta - tb
     })
+
+  // P6-2：全选/反选（必须在pendingReview声明之后）
+  const toggleSelectAllPending = () => {
+    if (selectedIds.size === pendingReview.length && pendingReview.length > 0) {
+      setSelectedIds(new Set())
+    } else {
+      setSelectedIds(new Set(pendingReview.map(p => p.id)))
+    }
+  }
+  const isAllPendingSelected = pendingReview.length > 0 && selectedIds.size === pendingReview.length
 
   // 已完成审核：finalized + verified + verify_failed（按完成时间倒序，最近20条）
   const completedReview = pipelines
