@@ -272,8 +272,8 @@ func ListPipelinesForUser(userID string, role string) ([]*models.PipelineListIte
 	var query string
 	var args []interface{}
 
-	if role == "admin" {
-		// admin看所有Pipeline
+	if role == "admin" || role == "senior_operator" {
+		// admin和senior_operator看所有Pipeline
 		query = pipelineListSelectSQL + " ORDER BY p.created_at DESC"
 	} else {
 		// 非admin：看自己发起的 + 分配给自己课程的Pipeline + 直接分配给自己的Pipeline
@@ -976,7 +976,7 @@ func ListOperatorUsers() ([]map[string]string, error) {
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, username, display_name, role
 		 FROM users
-		 WHERE status = 'active' AND role IN ('admin', 'operator')
+		 WHERE status = 'active' AND role IN ('admin', 'operator', 'senior_operator')
 		 ORDER BY role ASC, display_name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("查询审核员列表失败: %w", err)

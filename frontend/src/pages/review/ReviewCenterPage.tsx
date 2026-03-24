@@ -149,8 +149,8 @@ function isToday(t: string | null): boolean {
 export default function ReviewCenterPage() {
   const navigate = useNavigate()
   const { user } = useAuth()
-  const canOperate = user?.role === 'admin' || user?.role === 'operator'
-  const isAdmin = user?.role === 'admin'
+  const canOperate = user?.role === 'admin' || user?.role === 'operator' || user?.role === 'senior_operator'
+  const isAdmin = user?.role === 'admin' || user?.role === 'senior_operator'
 
   const [pipelines, setPipelines] = useState<PipelineListItem[]>([])
   const [loading, setLoading] = useState(true)

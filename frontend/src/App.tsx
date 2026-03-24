@@ -140,35 +140,35 @@ export default function App() {
 
             {/* P3-3 课程管理（admin + operator） */}
             <Route path="courses" element={
-              <RoleGuard roles={['admin', 'operator']}>
+              <RoleGuard roles={['admin', 'operator', 'senior_operator']}>
                 <CoursesPage />
               </RoleGuard>
             } />
 
             {/* P4-7 Pipeline列表（admin + operator） */}
             <Route path="pipelines" element={
-              <RoleGuard roles={['admin', 'operator']}>
+              <RoleGuard roles={['admin', 'operator', 'senior_operator']}>
                 <PipelinesPage />
               </RoleGuard>
             } />
 
             {/* P4-7 Pipeline详情（admin + operator） */}
             <Route path="pipelines/:id" element={
-              <RoleGuard roles={['admin', 'operator']}>
+              <RoleGuard roles={['admin', 'operator', 'senior_operator']}>
                 <PipelineDetailPage />
               </RoleGuard>
             } />
 
             {/* P4.5-C Pipeline审核（admin + operator） */}
             <Route path="pipelines/:id/review" element={
-              <RoleGuard roles={['admin', 'operator']}>
+              <RoleGuard roles={['admin', 'operator', 'senior_operator']}>
                 <PipelineReviewPage />
               </RoleGuard>
             } />
 
             {/* P6-1 审核中心（admin + operator） */}
             <Route path="review" element={
-              <RoleGuard roles={['admin', 'operator']}>
+              <RoleGuard roles={['admin', 'operator', 'senior_operator']}>
                 <ReviewCenterPage />
               </RoleGuard>
             } />

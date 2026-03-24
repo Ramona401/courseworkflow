@@ -24,12 +24,14 @@ import { Plus, Edit3, Key, UserCheck, UserX, X, AlertCircle, CheckCircle } from 
 
 const roleMap: Record<string, string> = {
   admin: '管理员',
+  senior_operator: '高级操作员',
   operator: '操作员',
   viewer: '查看者',
 }
 
 const roleColors: Record<string, { bg: string; color: string }> = {
   admin: { bg: 'rgba(255,59,48,0.1)', color: '#ff3b30' },
+  senior_operator: { bg: 'rgba(175,82,222,0.1)', color: '#af52de' },
   operator: { bg: 'rgba(0,122,255,0.1)', color: '#007aff' },
   viewer: { bg: 'rgba(142,142,147,0.1)', color: '#8e8e93' },
 }
@@ -366,7 +368,7 @@ export default function UsersPage() {
         {[
           { label: '用户总数', value: users.length, color: '#007aff' },
           { label: '管理员', value: users.filter(u => u.role === 'admin').length, color: '#ff3b30' },
-          { label: '操作员', value: users.filter(u => u.role === 'operator').length, color: '#5856d6' },
+          { label: '操作员', value: users.filter(u => u.role === 'operator' || u.role === 'senior_operator').length, color: '#5856d6' },
           { label: '已禁用', value: users.filter(u => u.status === 'disabled').length, color: '#8e8e93' },
         ].map((s, i) => (
           <div key={i} style={{ ...cardStyle, padding: '20px' }}>
@@ -532,6 +534,7 @@ export default function UsersPage() {
                   onChange={e => setCreateForm({ ...createForm, role: e.target.value as any })}
                   onFocus={handleFocus} onBlur={handleBlur}>
                   <option value="operator">操作员</option>
+                  <option value="senior_operator">高级操作员</option>
                   <option value="viewer">查看者</option>
                   <option value="admin">管理员</option>
                 </select>
@@ -583,6 +586,7 @@ export default function UsersPage() {
                   onFocus={handleFocus} onBlur={handleBlur}
                   disabled={editingUser.id === currentUser?.id}>
                   <option value="operator">操作员</option>
+                  <option value="senior_operator">高级操作员</option>
                   <option value="viewer">查看者</option>
                   <option value="admin">管理员</option>
                 </select>

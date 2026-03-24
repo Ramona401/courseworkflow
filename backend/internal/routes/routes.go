@@ -242,7 +242,7 @@ func Setup(cfg *config.Config) http.Handler {
 			pipelineHandler.ListPipelines(w, r)
 		case http.MethodPost:
 			claims, ok := middleware.GetClaims(r.Context())
-			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可创建Pipeline"})
@@ -279,7 +279,7 @@ func Setup(cfg *config.Config) http.Handler {
 			// POST /pipelines/batch-create — 批量创建Pipeline（P5-3新增）
 			case hasSuffix(path, "/batch-create"):
 				claims, ok := middleware.GetClaims(r.Context())
-				if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+				if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusForbidden)
 					json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可批量创建Pipeline"})
@@ -290,10 +290,10 @@ func Setup(cfg *config.Config) http.Handler {
 			// POST /pipelines/batch-assign — 批量分配Pipeline给审核员（P6-2新增）
 			case hasSuffix(path, "/batch-assign"):
 				claims, ok := middleware.GetClaims(r.Context())
-				if !ok || claims.Role != "admin" {
+				if !ok || (claims.Role != "admin" && claims.Role != "senior_operator") {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusForbidden)
-					json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员可分配审核任务"})
+					json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和高级操作员可分配审核任务"})
 					return
 				}
 				pipelineHandler.BatchAssign(w, r)
@@ -305,7 +305,7 @@ func Setup(cfg *config.Config) http.Handler {
 			// POST /pipelines/batch-start — 批量启动Pipeline（P5-3新增）
 			case hasSuffix(path, "/batch-start"):
 				claims, ok := middleware.GetClaims(r.Context())
-				if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+				if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusForbidden)
 					json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可批量启动Pipeline"})
@@ -316,7 +316,7 @@ func Setup(cfg *config.Config) http.Handler {
 		// POST /pipelines/{id}/start
 		case hasSuffix(path, "/start"):
 			claims, ok := middleware.GetClaims(r.Context())
-			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可启动Pipeline"})
@@ -338,7 +338,7 @@ func Setup(cfg *config.Config) http.Handler {
 		// POST /pipelines/{id}/finalize
 		case hasSuffix(path, "/finalize"):
 			claims, ok := middleware.GetClaims(r.Context())
-			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可定稿Pipeline"})
@@ -349,7 +349,7 @@ func Setup(cfg *config.Config) http.Handler {
 		// POST /pipelines/{id}/mark-passed
 		case hasSuffix(path, "/mark-passed"):
 			claims, ok := middleware.GetClaims(r.Context())
-			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可快捷通过Pipeline"})
@@ -360,7 +360,7 @@ func Setup(cfg *config.Config) http.Handler {
 		// POST /pipelines/{id}/verify
 		case hasSuffix(path, "/verify"):
 			claims, ok := middleware.GetClaims(r.Context())
-			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可触发验收"})
@@ -375,7 +375,7 @@ func Setup(cfg *config.Config) http.Handler {
 		// POST /pipelines/{id}/pages/{n}/ai-fix
 		case containsPagesAIFix(path):
 			claims, ok := middleware.GetClaims(r.Context())
-			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可使用AI快修"})
@@ -386,7 +386,7 @@ func Setup(cfg *config.Config) http.Handler {
 		// PUT /pipelines/{id}/pages/{n}/decision
 		case containsPagesDecision(path):
 			claims, ok := middleware.GetClaims(r.Context())
-			if !ok || (claims.Role != "admin" && claims.Role != "operator") {
+			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可审核页面"})
