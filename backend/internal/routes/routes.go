@@ -12,11 +12,10 @@ import (
 )
 
 // Setup 注册所有路由并返回根Handler
-// 版本：0.28.0（P5-4新增SSE实时进度推送+批量创建+批量启动+并发引擎+AI限流）
+// 版本：0.30.0（P7新增：二级审批流程 submit-finalize/confirm-finalize/reject-finalize）
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
-	// ==================== 初始化服务层 ====================
 	authService := services.NewAuthService(cfg)
 	userService := services.NewUserService()
 	aiConfigService := services.NewAIConfigService(cfg)
@@ -25,15 +24,11 @@ func Setup(cfg *config.Config) http.Handler {
 	courseService := services.NewCourseService(cfg)
 	pipelineService := services.NewPipelineService(cfg)
 
-	// ==================== P5-2新增：创建并发引擎并注入PipelineService ====================
-	// 参数：maxWorkers=3（同时执行3个Pipeline），maxAIConcurrency=2（同时2个AI调用），queueSize=50
 	engine := services.NewEngine(5, 4, 50)
 	pipelineService.SetEngine(engine)
 
-	// ==================== P4.6-4新增：启动夜间批量验收定时任务 ====================
 	pipelineService.StartNightlyVerifyScheduler()
 
-	// ==================== 初始化处理器层 ====================
 	authHandler := handlers.NewAuthHandler(authService)
 	userHandler := handlers.NewUserHandler(userService)
 	aiConfigHandler := handlers.NewAIConfigHandler(aiConfigService)
@@ -41,13 +36,12 @@ func Setup(cfg *config.Config) http.Handler {
 	edHandler := handlers.NewExternalDataHandler(edService)
 	courseHandler := handlers.NewCourseHandler(courseService)
 	pipelineHandler := handlers.NewPipelineHandler(pipelineService)
-	sseHandler := handlers.NewSSEHandler(authService) // P5-4修复：传入authService用于token验证
+	sseHandler := handlers.NewSSEHandler(authService)
 
-	// ==================== 中间件 ====================
 	authMW := middleware.AuthMiddleware(authService)
 	adminOnly := middleware.RequireRole("admin")
 
-	// ==================== 公开路由（无需认证） ====================
+	// ==================== 公开路由 ====================
 	mux.HandleFunc("/api/v1/health", healthHandler)
 	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
 
@@ -55,11 +49,10 @@ func Setup(cfg *config.Config) http.Handler {
 	mux.Handle("/api/v1/auth/me", middleware.Chain(http.HandlerFunc(authHandler.GetMe), authMW))
 	mux.Handle("/api/v1/auth/logout", middleware.Chain(http.HandlerFunc(authHandler.Logout), authMW))
 
-	// ==================== 仪表盘路由（P4.5-D新增） ====================
+	// ==================== 仪表盘路由 ====================
 	mux.Handle("/api/v1/dashboard/stats", middleware.Chain(http.HandlerFunc(pipelineHandler.GetDashboardStats), authMW))
 
-	// ==================== P5-2新增：引擎状态查询路由 ====================
-	// GET /api/v1/engine/stats — 获取并发引擎运行统计（仅admin）
+	// ==================== 引擎状态路由 ====================
 	mux.Handle("/api/v1/engine/stats", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Content-Type", "application/json")
@@ -73,15 +66,15 @@ func Setup(cfg *config.Config) http.Handler {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"code": 0,
 			"data": map[string]interface{}{
-				"total_submitted":   stats.TotalSubmitted,
-				"total_completed":   stats.TotalCompleted,
-				"total_failed":      stats.TotalFailed,
-				"current_running":   stats.CurrentRunning,
-				"current_ai_active": stats.CurrentAIActive,
-				"queue_length":      stats.QueueLength,
-				"max_workers":       5,
+				"total_submitted":    stats.TotalSubmitted,
+				"total_completed":    stats.TotalCompleted,
+				"total_failed":       stats.TotalFailed,
+				"current_running":    stats.CurrentRunning,
+				"current_ai_active":  stats.CurrentAIActive,
+				"queue_length":       stats.QueueLength,
+				"max_workers":        5,
 				"max_ai_concurrency": 4,
-				"queue_capacity":    50,
+				"queue_capacity":     50,
 			},
 		})
 	}), authMW, adminOnly))
@@ -235,7 +228,7 @@ func Setup(cfg *config.Config) http.Handler {
 		}
 	}), authMW))
 
-	// ==================== Pipeline路由（P4-1新增） ====================
+	// ==================== Pipeline路由 ====================
 	mux.Handle("/api/v1/pipelines", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -256,8 +249,7 @@ func Setup(cfg *config.Config) http.Handler {
 		}
 	}), authMW))
 
-	// ==================== P5-4新增：SSE实时推送路由（不走authMW，内部验证token） ====================
-	// GET /api/v1/pipelines/{id}/stream?token=xxx — EventSource不支持自定义header，token通过query传递
+	// SSE实时推送路由（不走authMW，内部验证token）
 	mux.HandleFunc("/api/v1/sse/pipelines/", sseHandler.StreamPipeline)
 
 	// /api/v1/pipelines/ 子路径分发
@@ -265,7 +257,8 @@ func Setup(cfg *config.Config) http.Handler {
 		path := r.URL.Path
 
 		switch {
-		// POST /pipelines/batch-verify — 批量验收（必须在/{id}路由之前匹配）
+		// ===== 批量操作（必须在/{id}路由之前匹配） =====
+
 		case hasSuffix(path, "/batch-verify"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || claims.Role != "admin" {
@@ -276,44 +269,41 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.BatchVerify(w, r)
 
-			// POST /pipelines/batch-create — 批量创建Pipeline（P5-3新增）
-			case hasSuffix(path, "/batch-create"):
-				claims, ok := middleware.GetClaims(r.Context())
-				if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusForbidden)
-					json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可批量创建Pipeline"})
-					return
-				}
-				pipelineHandler.BatchCreate(w, r)
+		case hasSuffix(path, "/batch-create"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可批量创建Pipeline"})
+				return
+			}
+			pipelineHandler.BatchCreate(w, r)
 
-			// POST /pipelines/batch-assign — 批量分配Pipeline给审核员（P6-2新增）
-			case hasSuffix(path, "/batch-assign"):
-				claims, ok := middleware.GetClaims(r.Context())
-				if !ok || (claims.Role != "admin" && claims.Role != "senior_operator") {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusForbidden)
-					json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和高级操作员可分配审核任务"})
-					return
-				}
-				pipelineHandler.BatchAssign(w, r)
+		case hasSuffix(path, "/batch-assign"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || (claims.Role != "admin" && claims.Role != "senior_operator") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和高级操作员可分配审核任务"})
+				return
+			}
+			pipelineHandler.BatchAssign(w, r)
 
-			// GET /pipelines/operators — 获取可分配审核员列表（P6-2新增）
-			case hasSuffix(path, "/operators"):
-				pipelineHandler.GetOperators(w, r)
+		case hasSuffix(path, "/operators"):
+			pipelineHandler.GetOperators(w, r)
 
-			// POST /pipelines/batch-start — 批量启动Pipeline（P5-3新增）
-			case hasSuffix(path, "/batch-start"):
-				claims, ok := middleware.GetClaims(r.Context())
-				if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusForbidden)
-					json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可批量启动Pipeline"})
-					return
-				}
-				pipelineHandler.BatchStart(w, r)
+		case hasSuffix(path, "/batch-start"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可批量启动Pipeline"})
+				return
+			}
+			pipelineHandler.BatchStart(w, r)
 
-		// POST /pipelines/{id}/start
+		// ===== 单个Pipeline操作 =====
+
 		case hasSuffix(path, "/start"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
@@ -324,7 +314,6 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.StartPipeline(w, r)
 
-		// POST /pipelines/{id}/cancel
 		case hasSuffix(path, "/cancel"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || claims.Role != "admin" {
@@ -335,18 +324,55 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.CancelPipeline(w, r)
 
-		// POST /pipelines/{id}/finalize
-		case hasSuffix(path, "/finalize"):
+		// ===== P7新增：二级审批路由 =====
+
+		// POST /pipelines/{id}/submit-finalize — 审核员提交定稿申请
+		// 权限：operator / senior_operator / admin（所有可操作角色）
+		case hasSuffix(path, "/submit-finalize"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可定稿Pipeline"})
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员和操作员可提交定稿申请"})
+				return
+			}
+			pipelineHandler.SubmitFinalize(w, r)
+
+		// POST /pipelines/{id}/confirm-finalize — 超级审核员确认定稿
+		// 权限：senior_operator / admin
+		case hasSuffix(path, "/confirm-finalize"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || (claims.Role != "admin" && claims.Role != "senior_operator") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅高级操作员和管理员可确认定稿"})
+				return
+			}
+			pipelineHandler.ConfirmFinalize(w, r)
+
+		// POST /pipelines/{id}/reject-finalize — 超级审核员退回重审
+		// 权限：senior_operator / admin
+		case hasSuffix(path, "/reject-finalize"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || (claims.Role != "admin" && claims.Role != "senior_operator") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅高级操作员和管理员可退回重审"})
+				return
+			}
+			pipelineHandler.RejectFinalize(w, r)
+
+		// POST /pipelines/{id}/finalize — 直接定稿（admin跳过二级审批）
+		case hasSuffix(path, "/finalize"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || claims.Role != "admin" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "直接定稿仅管理员可操作，操作员请使用提交定稿"})
 				return
 			}
 			pipelineHandler.FinalizePipeline(w, r)
 
-		// POST /pipelines/{id}/mark-passed
 		case hasSuffix(path, "/mark-passed"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
@@ -357,7 +383,6 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.MarkPassed(w, r)
 
-		// POST /pipelines/{id}/verify
 		case hasSuffix(path, "/verify"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
@@ -368,11 +393,9 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.VerifyPipeline(w, r)
 
-		// GET /pipelines/{id}/eval-rounds
 		case hasSuffix(path, "/eval-rounds"):
 			pipelineHandler.GetEvalRounds(w, r)
 
-		// POST /pipelines/{id}/pages/{n}/ai-fix
 		case containsPagesAIFix(path):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
@@ -383,7 +406,6 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.AIFixPage(w, r)
 
-		// PUT /pipelines/{id}/pages/{n}/decision
 		case containsPagesDecision(path):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || (claims.Role != "admin" && claims.Role != "operator" && claims.Role != "senior_operator") {
@@ -394,15 +416,12 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.UpdatePageDecision(w, r)
 
-		// GET /pipelines/{id}/pages
 		case hasSuffix(path, "/pages"):
 			pipelineHandler.GetGeneratedPages(w, r)
 
-		// GET /pipelines/{id}/steps/{name}
 		case containsStepsWithName(path):
 			pipelineHandler.GetStepDetail(w, r)
 
-		// GET /pipelines/{id}/steps
 		case hasSuffix(path, "/steps"):
 			pipelineHandler.GetSteps(w, r)
 
@@ -433,12 +452,10 @@ func Setup(cfg *config.Config) http.Handler {
 
 // ==================== 辅助函数 ====================
 
-// hasSuffix 检查路径是否以指定后缀结尾
 func hasSuffix(path string, suffix string) bool {
 	return len(path) >= len(suffix) && path[len(path)-len(suffix):] == suffix
 }
 
-// containsStepsWithName 检查路径是否匹配 /steps/{name} 模式
 func containsStepsWithName(path string) bool {
 	idx := indexOf(path, "/steps/")
 	if idx < 0 {
@@ -448,17 +465,14 @@ func containsStepsWithName(path string) bool {
 	return len(remaining) > 0 && remaining != "/"
 }
 
-// containsPagesDecision 检查路径是否匹配 /pages/{n}/decision 模式
 func containsPagesDecision(path string) bool {
 	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/decision")
 }
 
-// containsPagesAIFix 检查路径是否匹配 /pages/{n}/ai-fix 模式
 func containsPagesAIFix(path string) bool {
 	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/ai-fix")
 }
 
-// indexOf 查找子串位置
 func indexOf(s string, sub string) int {
 	for i := 0; i <= len(s)-len(sub); i++ {
 		if s[i:i+len(sub)] == sub {
@@ -468,7 +482,6 @@ func indexOf(s string, sub string) int {
 	return -1
 }
 
-// corsMiddleware CORS跨域中间件
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -483,13 +496,12 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// healthHandler 健康检查接口
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.29.0",
+		"version": "0.30.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

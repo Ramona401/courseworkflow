@@ -26,11 +26,27 @@ var (
 	ErrGenNoPages           = fmt.Errorf("未解析到任何页面操作")
 )
 
+// ==================== 新增页面虚拟页码规则（P7修复）====================
+//
+// 问题：Translator输出中新增页面（create操作）若使用与原有页面相同的整数页码，
+//       会在opsMap中覆盖原有页面，导致审核时页面错位。
+//
+// 解决方案：新增页面使用虚拟页码 = 原始位置 + createPageOffset（1000）
+//   例：Translator要求在P04之后新增一页 → 存储为 page_number=1004，page_title="P04-new 原标题"
+//   原有的P04保持 page_number=4 不变，两者互不干扰。
+//
+// 排序时：虚拟页码1004排在4之后，5之前（因1004>4且通常<1005），
+//         前端识别 page_number >= createPageOffset 时显示为 "Pxx-new" 格式。
+//
+// 注意：createPageOffset=1000，假设课程最多999页（实际课程通常20-30页）。
+const createPageOffset = 1000
+
 // ==================== Generator 步骤执行（P4-6新增）====================
 
 // executeGenerator 执行generator步骤：根据Translator输出逐页生成/修改HTML
 // 流程：解析页面操作 → 建立页码→lesson_id映射 → 逐页执行5种操作 → 存入generated_pages表
 // P4.5-E更新：每页存入change_reason（Translator的修改理由/指令），供审核页面展示
+// P7修复：新增页面使用虚拟页码（原始页码+createPageOffset），避免覆盖原有页面
 func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 	startTime := time.Now()
 	stepName := models.StepGenerator
@@ -96,6 +112,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 	}
 
 	// 6. 解析Translator输出为页面操作列表
+	// P7修复：parsePageOps会将create操作的页码自动偏移+createPageOffset，避免与原有页面冲突
 	pageOps := parsePageOps(transOutput, len(pageLessonMap))
 	if len(pageOps) == 0 {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -138,7 +155,12 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		changeReason := op.Description
 
 		// 获取当前页的lesson_id
-		lessonID, hasLesson := pageLessonMap[op.PageNumber]
+		// P7修复：create操作的虚拟页码需要还原为原始页码才能查找lesson_id
+		realPageNum := op.PageNumber
+		if op.Operation == models.PageOpCreate && op.PageNumber >= createPageOffset {
+			realPageNum = op.PageNumber - createPageOffset
+		}
+		lessonID, hasLesson := pageLessonMap[realPageNum]
 		if hasLesson {
 			pageRec.LessonID = lessonID
 		}
@@ -251,8 +273,10 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 
 		case models.PageOpCreate:
 			// ===== create: 用邻近页作为格式参考，AI生成新页面 =====
+			// P7修复：op.PageNumber已是虚拟页码（realPageNum+createPageOffset）
+			// findReferencePageHTML使用realPageNum查找邻近页
 			result.CreatedPages++
-			refHTML := findReferencePageHTML(ossService, pageLessonMap, op.PageNumber)
+			refHTML := findReferencePageHTML(ossService, pageLessonMap, realPageNum)
 
 			userPrompt := buildCreateUserPrompt(pipeline.CourseCode, op, refHTML)
 			callStart := time.Now()
@@ -389,9 +413,17 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 // parsePageOps 解析Translator输出中的逐页修改指令
 // Translator输出格式：每页用 "--\nPXX 标题 【修改】\n--" 分隔
 // 每页内有 【操作】保留/修改/新增/删除/合并 等标记
+//
+// P7修复：create操作的页面使用虚拟页码（原始页码 + createPageOffset），
+//         防止与原有页面在opsMap中冲突导致审核时页面错位。
+//         例：Translator写"P04 新页 【新增】" → 存储为 page_number=1004，title="P04-new 新页"
 func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperation {
 	var ops []*models.PageOperation
 	opsMap := make(map[int]*models.PageOperation)
+
+	// createPageCounter 用于给同一位置多个新增页面分配唯一虚拟页码
+	// key=原始页码，value=已分配的新增数量
+	createCounterMap := make(map[int]int)
 
 	lines := strings.Split(transOutput, "\n")
 
@@ -425,22 +457,47 @@ func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperatio
 			mergeSources = extractMergeSources(desc, currentPage)
 		}
 
-		if existing, ok := opsMap[currentPage]; ok {
-			// 如果已存在，追加描述，保留更高优先级的操作
-			existing.Description += "\n" + desc
-			if opPriority(op) > opPriority(existing.Operation) {
-				existing.Operation = op
+		if op == models.PageOpCreate {
+			// =====================================================================
+			// P7修复：create操作使用虚拟页码，避免覆盖同编号的原有页面
+			// 规则：虚拟页码 = 原始页码 + createPageOffset + 同位置已有新增数量×10
+			// 例：P04新增第1个 → 1004；P04新增第2个 → 1014（极少见情况）
+			// title标注 "-new" 后缀，供前端识别和显示
+			// =====================================================================
+			createCounterMap[currentPage]++
+			counter := createCounterMap[currentPage]
+			virtualPageNum := currentPage + createPageOffset + (counter-1)*10
+
+			// 标题加上 -new 后缀标识（前端根据 page_number >= createPageOffset 判断）
+			newTitle := fmt.Sprintf("P%02d-new %s", currentPage, currentTitle)
+			if len([]rune(newTitle)) > 60 {
+				newTitle = string([]rune(newTitle)[:60])
 			}
-			if len(mergeSources) > 0 {
-				existing.MergeSources = mergeSources
+
+			opsMap[virtualPageNum] = &models.PageOperation{
+				PageNumber:  virtualPageNum,
+				Operation:   models.PageOpCreate,
+				Title:       newTitle,
+				Description: desc,
 			}
 		} else {
-			opsMap[currentPage] = &models.PageOperation{
-				PageNumber:   currentPage,
-				Operation:    op,
-				Title:        currentTitle,
-				Description:  desc,
-				MergeSources: mergeSources,
+			if existing, ok := opsMap[currentPage]; ok {
+				// 如果已存在，追加描述，保留更高优先级的操作
+				existing.Description += "\n" + desc
+				if opPriority(op) > opPriority(existing.Operation) {
+					existing.Operation = op
+				}
+				if len(mergeSources) > 0 {
+					existing.MergeSources = mergeSources
+				}
+			} else {
+				opsMap[currentPage] = &models.PageOperation{
+					PageNumber:   currentPage,
+					Operation:    op,
+					Title:        currentTitle,
+					Description:  desc,
+					MergeSources: mergeSources,
+				}
 			}
 		}
 	}
@@ -483,6 +540,7 @@ func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperatio
 	flushPage()
 
 	// 补充未在Translator输出中提到的原始页面（默认keep）
+	// 注意：只补充整数页码范围内（1~totalOrigPages）的原始页面，不补充虚拟页码
 	for pn := 1; pn <= totalOrigPages; pn++ {
 		if _, exists := opsMap[pn]; !exists {
 			opsMap[pn] = &models.PageOperation{
@@ -494,6 +552,8 @@ func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperatio
 	}
 
 	// 按页码排序
+	// 虚拟页码（≥createPageOffset）排在对应原始页码之后，原始页码之前的下一页之前
+	// 例：1004排在4和5之间（1004>4, 1004<1005）
 	for _, op := range opsMap {
 		ops = append(ops, op)
 	}
@@ -598,6 +658,7 @@ func buildModifyUserPrompt(courseCode string, op *models.PageOperation, origHTML
 }
 
 // buildCreateUserPrompt 构建create操作的用户消息
+// P7修复：op.PageNumber是虚拟页码，提示词中显示的页码用op.Title中的P%02d部分（已含原始位置信息）
 func buildCreateUserPrompt(courseCode string, op *models.PageOperation, refHTML string) string {
 	var parts []string
 
@@ -626,7 +687,7 @@ func buildCreateUserPrompt(courseCode string, op *models.PageOperation, refHTML 
 
 	parts = append(parts,
 		fmt.Sprintf("【课程编号】%s", courseCode),
-		fmt.Sprintf("【页面】P%02d — %s", op.PageNumber, op.Title),
+		fmt.Sprintf("【页面】%s（新增页面）", op.Title),
 		"【操作类型】create（新建页面）",
 		"",
 		"【Translator创建指令（必须严格执行）】",
@@ -725,6 +786,7 @@ func extractGeneratedHTML(aiOutput string) string {
 
 // findReferencePageHTML 为create操作找一个邻近页面作为格式参考
 // 优先找前一页，其次后一页，最后找任意有HTML的页面
+// P7修复：传入的pageNum应为原始页码（非虚拟页码），调用方负责还原
 func findReferencePageHTML(ossService *OSSService, pageLessonMap map[int]int, pageNum int) string {
 	// 向前找
 	for n := pageNum - 1; n >= 1; n-- {

@@ -1,18 +1,12 @@
 /**
  * Pipeline管理API封装
- * P4-7: Pipeline列表 + 详情 + 步骤详情 + 操作（创建/启动/取消/删除）
- * P4.5-A增强: PipelineListItem增加eval_avg_score/meta_score/translator_score三个分数字段
- * P4.5-B增强: 新增getEvalRounds API + EvalRoundDetail类型
- * P4.5-C增强: 新增getGeneratedPages/updatePageDecision/finalizePipeline API
- * P4.5-D增强: 新增markPassed API（快捷通过）
- * P4.5-E-2增强: 新增aiFixPage API（AI快修）
- * P4.6-2增强: 新增verifyPipeline API（手动触发验收）
+ * P7新增：二级审批流程 submitFinalize/confirmFinalize/rejectFinalize
+ *         新增 pending_finalize 状态
  */
 import client from './client'
 
 // ==================== 类型定义 ====================
 
-/** Pipeline配置 */
 export interface PipelineConfig {
   eval_rounds: number
   threshold: number
@@ -21,7 +15,6 @@ export interface PipelineConfig {
   max_tr_loop: number
 }
 
-/** Pipeline列表单条（P4.5-A增强：含3个分数字段） */
 export interface PipelineListItem {
   id: string
   course_code: string
@@ -39,27 +32,19 @@ export interface PipelineListItem {
   started_at: string | null
   completed_at: string | null
   created_at: string | null
-  /** P4.5-A新增：Evaluator均分（从step_data.avg_total提取，可能为null） */
   eval_avg_score: number | null
-  /** P4.5-A新增：Meta仲裁分（从step_data.total_final提取，可能为null） */
   meta_score: number | null
-  /** P4.5-A新增：Translator最终分（从step_data.final_score提取，可能为null） */
   translator_score: number | null
-  /** P4.6新增：审核轮次（1=初审，2=2审） */
   review_round: number
-  /** P6-2新增：分配给哪个审核员（用户ID，可能为null） */
   assigned_to: string | null
-  /** P6-2新增：分配审核员的显示名称 */
   assigned_name: string
 }
 
-/** Pipeline列表响应 */
 export interface PipelineListResponse {
   pipelines: PipelineListItem[]
   total: number
 }
 
-/** 步骤列表单条 */
 export interface StepListItem {
   id: string
   step_name: string
@@ -77,7 +62,6 @@ export interface StepListItem {
   has_data: boolean
 }
 
-/** Pipeline详情响应 */
 export interface PipelineDetailResponse {
   id: string
   course_code: string
@@ -95,16 +79,12 @@ export interface PipelineDetailResponse {
   completed_at: string | null
   created_at: string | null
   updated_at: string | null
-  /** P4.6新增：审核轮次（1=初审，2=2审） */
   review_round: number
-  /** P6-2新增：分配审核员ID */
   assigned_to: string | null
-  /** P6-2新增：分配审核员名称 */
   assigned_name: string
   steps: StepListItem[]
 }
 
-/** 步骤详情响应 */
 export interface StepDetailResponse {
   id: string
   pipeline_id: string
@@ -125,7 +105,6 @@ export interface StepDetailResponse {
   updated_at: string | null
 }
 
-/** 创建Pipeline请求 */
 export interface CreatePipelineRequest {
   course_code: string
   auto_mode?: boolean
@@ -134,7 +113,6 @@ export interface CreatePipelineRequest {
 
 // ==================== Generator步骤相关类型 ====================
 
-/** Generator单页记录 */
 export interface GeneratorPageRecord {
   page_number: number
   page_title: string
@@ -150,7 +128,6 @@ export interface GeneratorPageRecord {
   error: string
 }
 
-/** Generator步骤step_data */
 export interface GeneratorStepData {
   total_pages: number
   kept_pages: number
@@ -167,7 +144,6 @@ export interface GeneratorStepData {
 
 // ==================== Evaluator步骤相关类型 ====================
 
-/** Evaluator步骤step_data */
 export interface EvaluatorStepData {
   total_rounds: number
   done_rounds: number
@@ -187,7 +163,6 @@ export interface EvaluatorStepData {
 
 // ==================== Meta步骤相关类型 ====================
 
-/** Meta步骤step_data */
 export interface MetaStepData {
   total_final: number
   e1_final: number
@@ -211,7 +186,6 @@ export interface MetaStepData {
 
 // ==================== Translator步骤相关类型 ====================
 
-/** Translator单轮记录 */
 export interface TranslatorRoundRecord {
   round: number
   trans_output: string
@@ -233,7 +207,6 @@ export interface TranslatorRoundRecord {
   passed: boolean
 }
 
-/** Translator步骤step_data */
 export interface TranslatorStepData {
   max_loops: number
   threshold: number
@@ -252,7 +225,6 @@ export interface TranslatorStepData {
 
 // ==================== Scanner步骤相关类型 ====================
 
-/** Scanner步骤step_data */
 export interface ScannerStepData {
   raw_output: string
   parsed: {
@@ -268,7 +240,6 @@ export interface ScannerStepData {
 
 // ==================== DbCheck步骤相关类型 ====================
 
-/** DbCheck步骤step_data */
 export interface DbCheckStepData {
   course_code: string
   course_id: string
@@ -281,9 +252,8 @@ export interface DbCheckStepData {
   error_detail: string
 }
 
-// ==================== P4.5-C 审核相关类型 ====================
+// ==================== 审核相关类型 ====================
 
-/** 生成页面完整数据（含HTML内容，用于审核预览） */
 export interface GeneratedPageFull {
   id: string
   pipeline_id: string
@@ -296,21 +266,18 @@ export interface GeneratedPageFull {
   decision: string
   lesson_id: number | null
   merge_sources: string
-  /** P4.5-E新增：Translator给出的修改理由和指令（审核页面展示用） */
   change_reason: string
   created_at: string | null
   updated_at: string | null
 }
 
-/** 更新页面决策请求 */
 export interface UpdatePageDecisionRequest {
   decision: 'approve' | 'reject' | 'edit'
   final_html?: string
 }
 
-// ==================== P4.6-2 验收相关类型 ====================
+// ==================== 验收相关类型 ====================
 
-/** Verify步骤step_data（P4.6-2新增） */
 export interface VerifyStepData {
   generated_index: string
   eval_score: number
@@ -328,53 +295,45 @@ export interface VerifyStepData {
 
 // ==================== API方法 ====================
 
-/** 获取Pipeline列表 */
 export async function getPipelines() {
   const res = await client.get('/pipelines')
   return (res.data as any).data as PipelineListResponse
 }
 
-/** 获取Pipeline详情 */
 export async function getPipelineDetail(id: string) {
   const res = await client.get('/pipelines/' + id)
   return (res.data as any).data as PipelineDetailResponse
 }
 
-/** 创建Pipeline */
 export async function createPipeline(req: CreatePipelineRequest) {
   const res = await client.post('/pipelines', req)
   return (res.data as any).data
 }
 
-/** 启动Pipeline（同步执行，可能耗时10-30分钟） */
 export async function startPipeline(id: string) {
   const res = await client.post('/pipelines/' + id + '/start', null, {
-    timeout: 3600000, // 60分钟超时（全链路AI调用耗时长）
+    timeout: 3600000,
   })
   return (res.data as any).data
 }
 
-/** 取消Pipeline */
 export async function cancelPipeline(id: string) {
   const res = await client.post('/pipelines/' + id + '/cancel')
   return (res.data as any).data
 }
 
-/** 删除Pipeline */
 export async function deletePipeline(id: string) {
   const res = await client.delete('/pipelines/' + id)
   return (res.data as any).data
 }
 
-/** 获取步骤详情 */
 export async function getStepDetail(pipelineId: string, stepName: string) {
   const res = await client.get('/pipelines/' + pipelineId + '/steps/' + stepName)
   return (res.data as any).data as StepDetailResponse
 }
 
-// ==================== Eval Rounds API（P4.5-B新增）====================
+// ==================== Eval Rounds API ====================
 
-/** 评估轮次详情 */
 export interface EvalRoundDetail {
   id: string
   round_number: number
@@ -391,50 +350,77 @@ export interface EvalRoundDetail {
   tokens_used: number
 }
 
-/** 获取评估轮次详情列表 */
 export async function getEvalRounds(pipelineId: string) {
   const res = await client.get('/pipelines/' + pipelineId + '/eval-rounds')
   const data = (res.data as any).data
   return data.rounds as EvalRoundDetail[]
 }
 
-// ==================== P4.5-C 审核相关API ====================
+// ==================== 审核相关API ====================
 
-/** 获取生成页面列表（含完整HTML） */
 export async function getGeneratedPages(pipelineId: string) {
   const res = await client.get('/pipelines/' + pipelineId + '/pages')
   const data = (res.data as any).data
   return data.pages as GeneratedPageFull[]
 }
 
-/** 更新单页审核决策 */
 export async function updatePageDecision(pipelineId: string, pageNumber: number, req: UpdatePageDecisionRequest) {
   const res = await client.put('/pipelines/' + pipelineId + '/pages/' + pageNumber + '/decision', req)
   return (res.data as any).data
 }
 
-/** 定稿归档Pipeline */
+/**
+ * 直接定稿归档（仅admin可用，跳过二级审批）
+ * P7更新：普通操作员请使用 submitFinalize
+ */
 export async function finalizePipeline(pipelineId: string) {
   const res = await client.post('/pipelines/' + pipelineId + '/finalize')
   return (res.data as any).data
 }
 
-// ==================== P4.5-D 快捷通过API ====================
+// ==================== P7新增：二级审批API ====================
 
-/** 快捷通过Pipeline（评估达标直接标记为finalized） */
+/**
+ * 提交定稿申请（审核员→待超级审核员确认）
+ * P7新增：审核员完成逐页决策后调用，状态变为 pending_finalize
+ * 权限：operator / senior_operator / admin
+ */
+export async function submitFinalize(pipelineId: string) {
+  const res = await client.post('/pipelines/' + pipelineId + '/submit-finalize')
+  return (res.data as any).data
+}
+
+/**
+ * 确认定稿（超级审核员确认，pending_finalize→finalized）
+ * P7新增：senior_operator / admin 在审核中心确认定稿
+ */
+export async function confirmFinalize(pipelineId: string) {
+  const res = await client.post('/pipelines/' + pipelineId + '/confirm-finalize')
+  return (res.data as any).data
+}
+
+/**
+ * 退回重审（超级审核员退回，pending_finalize→review_queue）
+ * P7新增：senior_operator / admin 退回给原审核员重新审核
+ */
+export async function rejectFinalize(pipelineId: string, reason?: string) {
+  const res = await client.post('/pipelines/' + pipelineId + '/reject-finalize', { reason: reason || '' })
+  return (res.data as any).data
+}
+
+// ==================== 快捷通过API ====================
+
 export async function markPassed(pipelineId: string) {
   const res = await client.post('/pipelines/' + pipelineId + '/mark-passed')
   return (res.data as any).data
 }
 
-// ==================== P4.5-E-2 AI快修API ====================
+// ==================== AI快修API ====================
 
-/** AI快修请求参数 */
 export interface AIFixPageRequest {
   fix_instruction: string
 }
 
-/** AI快修响应 */
 export interface AIFixPageResponse {
   message: string
   page_number: number
@@ -442,29 +428,24 @@ export interface AIFixPageResponse {
   html_length: number
 }
 
-/** AI快修页面（审核员输入修改指令，AI基于当前HTML修复） */
 export async function aiFixPage(pipelineId: string, pageNumber: number, req: AIFixPageRequest) {
   const res = await client.post('/pipelines/' + pipelineId + '/pages/' + pageNumber + '/ai-fix', req, {
-    timeout: 600000, // 10分钟超时（AI修复可能较慢）
+    timeout: 600000,
   })
   return (res.data as any).data as AIFixPageResponse
 }
 
-// ==================== P4.6-2 验收API ====================
+// ==================== 验收API ====================
 
-/** 手动触发验收评估（finalized状态的Pipeline） */
-// P4.6-2新增：收集最终HTML → 索引生成器压缩 → Evaluator评估 → 判定通过/失败
-// 验收过程包含2次AI调用（索引生成+评估），预计耗时5-15分钟
 export async function verifyPipeline(pipelineId: string) {
   const res = await client.post('/pipelines/' + pipelineId + '/verify', null, {
-    timeout: 1800000, // 30分钟超时（索引生成+评估两次AI调用）
+    timeout: 1800000,
   })
   return (res.data as any).data as PipelineDetailResponse
 }
 
-// ==================== P5-3 批量创建+批量启动API ====================
+// ==================== 批量操作API ====================
 
-/** 批量创建结果 */
 export interface BatchCreateResult {
   total_requested: number
   created_ids: string[]
@@ -474,7 +455,6 @@ export interface BatchCreateResult {
   failed_reasons: string[]
 }
 
-/** 批量启动结果 */
 export interface BatchStartResult {
   total_requested: number
   started_ids: string[]
@@ -484,22 +464,18 @@ export interface BatchStartResult {
   failed_reasons: string[]
 }
 
-/** 批量创建Pipeline（从课程编号列表） */
 export async function batchCreatePipelines(courseCodes: string[]) {
   const res = await client.post('/pipelines/batch-create', { course_codes: courseCodes })
   return (res.data as any).data as BatchCreateResult
 }
 
-/** 批量启动Pipeline（从Pipeline ID列表） */
 export async function batchStartPipelines(pipelineIds: string[]) {
   const res = await client.post('/pipelines/batch-start', { pipeline_ids: pipelineIds })
   return (res.data as any).data as BatchStartResult
 }
 
+// ==================== 审核分配API ====================
 
-// ==================== P6-2 审核分配API ====================
-
-/** 审核员信息 */
 export interface OperatorInfo {
   id: string
   username: string
@@ -507,7 +483,6 @@ export interface OperatorInfo {
   role: string
 }
 
-/** 批量分配结果 */
 export interface BatchAssignResult {
   total_requested: number
   success_count: number
@@ -516,20 +491,17 @@ export interface BatchAssignResult {
   failed_ids: string[]
 }
 
-/** 获取可分配的审核员列表 */
 export async function getOperators() {
   const res = await client.get('/pipelines/operators')
   const data = (res.data as any).data
   return data.operators as OperatorInfo[]
 }
 
-/** 分配单个Pipeline给审核员 */
 export async function assignPipeline(pipelineId: string, assignedTo: string) {
   const res = await client.post('/pipelines/' + pipelineId + '/assign', { assigned_to: assignedTo })
   return (res.data as any).data
 }
 
-/** 批量分配Pipeline给审核员 */
 export async function batchAssignPipelines(pipelineIds: string[], assignedTo: string) {
   const res = await client.post('/pipelines/batch-assign', { pipeline_ids: pipelineIds, assigned_to: assignedTo })
   return (res.data as any).data as BatchAssignResult
