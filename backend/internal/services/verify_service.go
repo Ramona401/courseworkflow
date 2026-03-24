@@ -2,8 +2,9 @@ package services
 
 // ==================== P4.6-2 验收执行逻辑 + P4.6-3 2审自动流程 ====================
 // Phase8修复V-02：夜间定时任务时区改为显式 Asia/Shanghai
-//   原版：now.Location() 依赖服务器本地时区，若服务器时区变更则2:00执行时间漂移
-//   修复后：time.LoadLocation("Asia/Shanghai") 显式指定，与业务时区强绑定
+// v33改进：EngineTask.ExecFunc 改为 func() error，支持业务失败统计
+//   - VerifyPipeline 闭包：直接返回 VerifyPipeline 的 error
+//   - startRetrialPipeline 闭包：包装检查 Pipeline 最终状态返回 error
 
 import (
 	"fmt"
@@ -82,10 +83,23 @@ func (s *PipelineService) VerifyPipeline(pipelineID string) (*models.PipelineDet
 
 			if pipeline.ReviewRound <= 1 {
 				if s.engine != nil {
+					// v33改进：ExecFunc 返回 error，供 Engine 统计业务失败
+					// startRetrialPipeline 本身无返回值，通过检查 Pipeline 最终状态判断是否失败
 					task := &EngineTask{
 						Type:       TaskTypeRetrial,
 						PipelineID: pipelineID,
-						ExecFunc:   func() { s.startRetrialPipeline(pipelineID) },
+						ExecFunc: func() error {
+							s.startRetrialPipeline(pipelineID)
+							// 检查 Pipeline 最终状态判断 retrial 是否成功
+							p, pErr := repository.GetPipelineByID(pipelineID)
+							if pErr != nil {
+								return fmt.Errorf("2审执行后读取Pipeline状态失败: %w", pErr)
+							}
+							if p.Status == models.PipelineStatusFailed {
+								return fmt.Errorf("2审执行失败: %s", p.ErrorMessage)
+							}
+							return nil
+						},
 					}
 					if !s.engine.Submit(task) {
 						verifyLog.Warn("2审任务提交失败：队列已满", "pipeline_id", pipelineID)
@@ -478,6 +492,7 @@ type BatchVerifyResult struct {
 }
 
 // BatchVerify 批量触发验收
+// v33改进：EngineTask.ExecFunc 返回 error，VerifyPipeline 的 error 直接传递给 Engine 统计
 func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 	result := &BatchVerifyResult{}
 
@@ -501,10 +516,14 @@ func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 
 		capturedID := id
 		if s.engine != nil {
+			// v33改进：ExecFunc 返回 error，VerifyPipeline 的第二个返回值直接作为业务失败标记
 			task := &EngineTask{
 				Type:       TaskTypeVerify,
 				PipelineID: capturedID,
-				ExecFunc:   func() { s.VerifyPipeline(capturedID) },
+				ExecFunc: func() error {
+					_, vErr := s.VerifyPipeline(capturedID)
+					return vErr
+				},
 			}
 			if s.engine.Submit(task) {
 				result.StartedIDs = append(result.StartedIDs, capturedID)
@@ -513,7 +532,9 @@ func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 				result.SkippedIDs = append(result.SkippedIDs, capturedID)
 			}
 		} else {
-			go s.VerifyPipeline(capturedID)
+			go func(vid string) {
+				s.VerifyPipeline(vid)
+			}(capturedID)
 			result.StartedIDs = append(result.StartedIDs, capturedID)
 		}
 	}
@@ -523,8 +544,6 @@ func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 
 // StartNightlyVerifyScheduler 启动夜间批量验收定时任务
 // 修复V-02：显式加载 Asia/Shanghai 时区，不再依赖服务器本地时区设置
-// 原版：time.Date(..., now.Location()) 若服务器时区非Asia/Shanghai则2:00计算错误
-// 修复后：强制使用 Asia/Shanghai，与业务时区（北京时间）强绑定
 func (s *PipelineService) StartNightlyVerifyScheduler() {
 	go func() {
 		// 显式加载 Asia/Shanghai 时区（北京时间）

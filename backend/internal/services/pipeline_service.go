@@ -407,7 +407,19 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 		task := &EngineTask{
 			Type:       TaskTypePipeline,
 			PipelineID: id,
-			ExecFunc:   func() { s.executePipelineAsync(id) },
+			// v33改进：ExecFunc 返回 error，供 Engine 统计业务失败
+		ExecFunc: func() error {
+			s.executePipelineAsync(id)
+			// 检查 Pipeline 最终状态判断执行是否成功
+			p, pErr := repository.GetPipelineByID(id)
+			if pErr != nil {
+				return fmt.Errorf("Pipeline执行后读取状态失败: %w", pErr)
+			}
+			if p.Status == models.PipelineStatusFailed {
+				return fmt.Errorf("Pipeline执行失败: %s", p.ErrorMessage)
+			}
+			return nil
+		},
 		}
 		if !s.engine.Submit(task) {
 			_ = repository.UpdatePipelineStatus(id, models.StepDbCheck, models.PipelineStatusPending)

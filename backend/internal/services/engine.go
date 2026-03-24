@@ -1,13 +1,17 @@
 package services
 
 // 并发执行引擎：Pipeline执行队列 + AI信号量限流 + 优雅关闭
+// v33改进：ExecFunc 改为 func() error，Worker 根据返回值区分业务失败和系统故障(panic)
+// 统计说明：
+//   - TotalCompleted：ExecFunc 返回 nil 的任务数（业务成功）
+//   - TotalBusinessFailed：ExecFunc 返回 error 的任务数（业务失败，如Pipeline执行失败）
+//   - TotalFailed：Worker panic 的任务数（系统故障，需要立即关注）
 // Phase8日志升级：
 //   - 引擎启动/关闭 → INFO
-//   - Worker任务开始/完成 → DEBUG（高频，生产环境默认不输出，不干扰主日志）
+//   - Worker任务开始/完成 → DEBUG（高频，生产环境默认不输出）
 //   - Worker panic → ERROR（需要立即关注）
-//   - 任务提交成功 → DEBUG（高频）
-//   - 队列已满/引擎已关闭 → WARN（需要关注的异常情况）
-//   - 优雅关闭信号 → INFO
+//   - 业务失败 → WARN（需要关注但不紧急）
+//   - 队列已满/引擎已关闭 → WARN
 
 import (
 	"context"
@@ -46,10 +50,14 @@ const (
 )
 
 // EngineTask 引擎任务（投递到队列的工作单元）
+// v33改进：ExecFunc 返回 error，允许 Worker 区分业务失败和系统故障
+//   返回 nil → 业务成功，计入 TotalCompleted
+//   返回 error → 业务失败（Pipeline执行失败等），计入 TotalBusinessFailed
+//   panic → 系统故障，计入 TotalFailed（由 recover 捕获）
 type EngineTask struct {
-	Type       TaskType // 任务类型
-	PipelineID string   // Pipeline ID
-	ExecFunc   func()   // 实际执行函数（闭包，由调用方构造）
+	Type       TaskType     // 任务类型
+	PipelineID string       // Pipeline ID
+	ExecFunc   func() error // 实际执行函数（闭包，由调用方构造，返回error表示业务失败）
 }
 
 // ==================== Engine 并发引擎 ====================
@@ -71,14 +79,16 @@ type Engine struct {
 }
 
 // EngineStats 引擎运行统计
+// v33改进：新增 TotalBusinessFailed 区分业务失败和系统故障
 type EngineStats struct {
-	mu              sync.Mutex
-	TotalSubmitted  int64 `json:"total_submitted"`
-	TotalCompleted  int64 `json:"total_completed"`
-	TotalFailed     int64 `json:"total_failed"`
-	CurrentRunning  int64 `json:"current_running"`
-	CurrentAIActive int64 `json:"current_ai_active"`
-	QueueLength     int   `json:"queue_length"`
+	mu                  sync.Mutex
+	TotalSubmitted      int64 `json:"total_submitted"`
+	TotalCompleted      int64 `json:"total_completed"`        // ExecFunc 返回 nil（业务成功）
+	TotalBusinessFailed int64 `json:"total_business_failed"`  // ExecFunc 返回 error（业务失败）
+	TotalFailed         int64 `json:"total_failed"`           // Worker panic（系统故障）
+	CurrentRunning      int64 `json:"current_running"`
+	CurrentAIActive     int64 `json:"current_ai_active"`
+	QueueLength         int   `json:"queue_length"`
 }
 
 // NewEngine 创建并启动并发引擎
@@ -135,6 +145,7 @@ func (e *Engine) start() {
 }
 
 // worker 单个Worker的执行循环
+// v33改进：根据 ExecFunc 返回值区分业务成功/业务失败/系统故障(panic)
 func (e *Engine) worker(workerID int) {
 	defer e.wg.Done()
 
@@ -152,9 +163,13 @@ func (e *Engine) worker(workerID int) {
 			"pipeline_id", task.PipelineID,
 		)
 
+		// 执行任务，捕获panic和业务错误
+		var taskErr error
+		var panicked bool
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
+					panicked = true
 					// ERROR：panic需要立即关注，包含完整上下文
 					engineLog.Error("Worker任务发生panic",
 						"worker_id", workerID,
@@ -167,23 +182,47 @@ func (e *Engine) worker(workerID int) {
 					e.stats.mu.Unlock()
 				}
 			}()
-			task.ExecFunc()
+			taskErr = task.ExecFunc()
 		}()
 
 		elapsed := time.Since(startTime)
 
+		// 更新统计：区分成功/业务失败/panic
 		e.stats.mu.Lock()
 		e.stats.CurrentRunning--
-		e.stats.TotalCompleted++
+		if !panicked {
+			if taskErr != nil {
+				// 业务失败：ExecFunc 返回了 error（Pipeline执行失败、验收失败等）
+				e.stats.TotalBusinessFailed++
+			} else {
+				// 业务成功：ExecFunc 返回 nil
+				e.stats.TotalCompleted++
+			}
+		}
+		// panic 情况已在 recover 中处理，不重复计数
 		e.stats.mu.Unlock()
 
-		// DEBUG：任务完成（高频事件）
-		engineLog.Debug("Worker任务完成",
-			"worker_id", workerID,
-			"task_type", string(task.Type),
-			"pipeline_id", task.PipelineID,
-			"elapsed_ms", elapsed.Milliseconds(),
-		)
+		// 日志：根据结果选择级别
+		if panicked {
+			// panic 已在 recover 中记录 ERROR，这里不重复
+		} else if taskErr != nil {
+			// WARN：业务失败需要关注但不紧急（错误详情已由业务层记录）
+			engineLog.Warn("Worker任务业务失败",
+				"worker_id", workerID,
+				"task_type", string(task.Type),
+				"pipeline_id", task.PipelineID,
+				"elapsed_ms", elapsed.Milliseconds(),
+				"error", taskErr.Error(),
+			)
+		} else {
+			// DEBUG：任务成功完成（高频事件）
+			engineLog.Debug("Worker任务完成",
+				"worker_id", workerID,
+				"task_type", string(task.Type),
+				"pipeline_id", task.PipelineID,
+				"elapsed_ms", elapsed.Milliseconds(),
+			)
+		}
 	}
 
 	// INFO：Worker退出（通常只在引擎关闭时发生）
@@ -310,17 +349,19 @@ func (e *Engine) StartGracefulShutdown() {
 // ==================== 状态查询 ====================
 
 // GetStats 获取引擎运行统计（线程安全）
+// v33改进：新增 TotalBusinessFailed 字段
 func (e *Engine) GetStats() EngineStats {
 	e.stats.mu.Lock()
 	defer e.stats.mu.Unlock()
 
 	return EngineStats{
-		TotalSubmitted:  e.stats.TotalSubmitted,
-		TotalCompleted:  e.stats.TotalCompleted,
-		TotalFailed:     e.stats.TotalFailed,
-		CurrentRunning:  e.stats.CurrentRunning,
-		CurrentAIActive: e.stats.CurrentAIActive,
-		QueueLength:     len(e.taskChan),
+		TotalSubmitted:      e.stats.TotalSubmitted,
+		TotalCompleted:      e.stats.TotalCompleted,
+		TotalBusinessFailed: e.stats.TotalBusinessFailed,
+		TotalFailed:         e.stats.TotalFailed,
+		CurrentRunning:      e.stats.CurrentRunning,
+		CurrentAIActive:     e.stats.CurrentAIActive,
+		QueueLength:         len(e.taskChan),
 	}
 }
 
