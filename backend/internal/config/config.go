@@ -11,7 +11,7 @@ import (
 // AppVersion 应用版本号
 // 修复R-03：从硬编码迁移到配置，healthHandler和其他需要版本号的地方统一读取此常量
 // 发版时只需修改此处一个位置，避免多处硬编码漏改
-const AppVersion = "0.30.0"
+const AppVersion = "0.31.0"
 
 // Config 全局配置结构体
 type Config struct {
