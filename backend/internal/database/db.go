@@ -63,3 +63,12 @@ func Close() {
 		log.Info("数据库连接池已关闭")
 	}
 }
+
+// Ping 检查数据库连接是否正常（供健康检查接口使用）
+// 返回 error 表示连接异常，nil 表示正常
+func Ping(ctx context.Context) error {
+	if DB == nil {
+		return fmt.Errorf("数据库连接池未初始化")
+	}
+	return DB.Ping(ctx)
+}

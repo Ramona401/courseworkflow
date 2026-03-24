@@ -1,11 +1,13 @@
 package routes
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
 
 	"tedna/internal/config"
+	"tedna/internal/database"
 	"tedna/internal/handlers"
 	"tedna/internal/middleware"
 	"tedna/internal/services"
@@ -71,6 +73,9 @@ func Setup(cfg *config.Config) http.Handler {
 	engine := services.NewEngine(5, 4, 50)
 	pipelineService.SetEngine(engine)
 
+	// P1：增强版健康检查，注入 engine 引用（含DB连通+Engine状态）
+	mux.HandleFunc("/api/v1/health", makeHealthHandler(engine))
+
 	pipelineService.StartNightlyVerifyScheduler()
 
 	authHandler := handlers.NewAuthHandler(authService)
@@ -86,7 +91,7 @@ func Setup(cfg *config.Config) http.Handler {
 	adminOnly := middleware.RequireRole(roleAdmin)
 
 	// ==================== 公开路由 ====================
-	mux.HandleFunc("/api/v1/health", healthHandler)
+	// /api/v1/health 注册移至 engine 创建之后（需要注入 engine 引用）
 	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
 
 	// ==================== 认证路由 ====================
@@ -515,14 +520,81 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// healthHandler 健康检查接口
-// 修复R-03：版本号从 config.AppVersion 读取，不再硬编码字符串
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "ok",
-		"version": config.AppVersion, // 修复R-03：从config包读取，发版只改config.go一处
-		"time":    time.Now().Format(time.RFC3339),
-	})
+// healthHandler 健康检查接口（P1增强版）
+// 返回字段：
+//   status        — "ok" 全部正常 / "degraded" 部分异常（DB或Engine有问题）
+//   version       — 当前服务版本（config.AppVersion）
+//   time          — 当前服务器时间（RFC3339）
+//   database      — DB连通性检查结果（"ok" / "error: <msg>"）
+//   engine        — 并发引擎运行统计快照
+//   uptime_hint   — 服务启动时间（近似，取自进程启动时记录的时间）
+func makeHealthHandler(engine *services.Engine) http.HandlerFunc {
+	startTime := time.Now()
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+
+		overallStatus := "ok"
+
+		// ===== 1. 数据库连通性检查 =====
+		dbStatus := "ok"
+		dbErr := database.Ping(ctx)
+		if dbErr != nil {
+			dbStatus = "error: " + dbErr.Error()
+			overallStatus = "degraded"
+		}
+
+		// ===== 2. Engine 状态快照 =====
+		stats := engine.GetStats()
+		engineStatus := "ok"
+		// 队列使用率超过80%视为 warning（不影响 overall status，仅提示）
+		queueUsagePct := 0
+		if stats.QueueLength > 0 {
+			queueUsagePct = stats.QueueLength * 100 / 50 // 50 = queue_capacity
+		}
+		if queueUsagePct >= 80 {
+			engineStatus = "warning: queue usage " + itoa(queueUsagePct) + "%"
+		}
+
+		// ===== 3. 组装响应 =====
+		w.Header().Set("Content-Type", "application/json")
+		// degraded 时仍返回 200（服务可用但部分功能受损），便于监控区分存活与健康
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  overallStatus,
+			"version": config.AppVersion,
+			"time":    time.Now().Format(time.RFC3339),
+			"uptime":  time.Since(startTime).Round(time.Second).String(),
+			"database": map[string]interface{}{
+				"status": dbStatus,
+			},
+			"engine": map[string]interface{}{
+				"status":            engineStatus,
+				"total_submitted":   stats.TotalSubmitted,
+				"total_completed":   stats.TotalCompleted,
+				"total_failed":      stats.TotalFailed,
+				"current_running":   stats.CurrentRunning,
+				"current_ai_active": stats.CurrentAIActive,
+				"queue_length":      stats.QueueLength,
+				"queue_capacity":    50,
+				"max_workers":       5,
+				"max_ai_concurrency": 4,
+			},
+		})
+	}
+}
+
+// itoa 简单整数转字符串（避免引入 strconv）
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	buf := [10]byte{}
+	pos := len(buf)
+	for n > 0 {
+		pos--
+		buf[pos] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[pos:])
 }
