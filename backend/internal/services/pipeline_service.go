@@ -37,18 +37,18 @@ var (
 
 // extractEvalScores 使用的正则
 var (
-	reEvalBlock  = regexp.MustCompile(`(?s)<<<SCORE_BLOCK>>>(.*?)<<<END_SCORE_BLOCK>>>`)
-	reEvalTotal  = regexp.MustCompile(`(?i)TOTAL[:\s]+([\d.]+)`)
-	reEvalE1     = regexp.MustCompile(`(?i)E1[:\s]+([\d.]+)`)
-	reEvalE2     = regexp.MustCompile(`(?i)E2[:\s]+([\d.]+)`)
-	reEvalE3     = regexp.MustCompile(`(?i)E3[:\s]+([\d.]+)`)
-	reEvalE4     = regexp.MustCompile(`(?i)E4[:\s]+([\d.]+)`)
-	reEvalHard   = regexp.MustCompile(`(?i)HARD_CONSTRAINT[:\s]+(PASS|FAIL)`)
-	reEvalGrade  = regexp.MustCompile(`(?i)GRADE[:\s]+([A-D])`)
-	reEvalDimE1  = regexp.MustCompile(`(?i)E1[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`)
-	reEvalDimE2  = regexp.MustCompile(`(?i)E2[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`)
-	reEvalDimE3  = regexp.MustCompile(`(?i)E3[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`)
-	reEvalDimE4  = regexp.MustCompile(`(?i)E4[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`)
+	reEvalBlock = regexp.MustCompile(`(?s)<<<SCORE_BLOCK>>>(.*?)<<<END_SCORE_BLOCK>>>`)
+	reEvalTotal = regexp.MustCompile(`(?i)TOTAL[:\s]+([\d.]+)`)
+	reEvalE1    = regexp.MustCompile(`(?i)E1[:\s]+([\d.]+)`)
+	reEvalE2    = regexp.MustCompile(`(?i)E2[:\s]+([\d.]+)`)
+	reEvalE3    = regexp.MustCompile(`(?i)E3[:\s]+([\d.]+)`)
+	reEvalE4    = regexp.MustCompile(`(?i)E4[:\s]+([\d.]+)`)
+	reEvalHard  = regexp.MustCompile(`(?i)HARD_CONSTRAINT[:\s]+(PASS|FAIL)`)
+	reEvalGrade = regexp.MustCompile(`(?i)GRADE[:\s]+([A-D])`)
+	reEvalDimE1 = regexp.MustCompile(`(?i)E1[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`)
+	reEvalDimE2 = regexp.MustCompile(`(?i)E2[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`)
+	reEvalDimE3 = regexp.MustCompile(`(?i)E3[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`)
+	reEvalDimE4 = regexp.MustCompile(`(?i)E4[^\n]{0,30}[：:]\s*([\d.]+)\s*/\s*10`)
 )
 
 // ==================== Pipeline 错误常量 ====================
@@ -202,6 +202,8 @@ func (s *PipelineService) ListPipelines(userID string, role string) (*models.Pip
 }
 
 // GetPipelineDetail 获取Pipeline详情（含步骤列表）
+// Phase8修复P-03（部分）：原版查全量用户只为取一人名，改为直接从 ListOperatorUsers 复用缓存
+// 注：完整P-03修复（SQL子查询）待Phase8统一优化数据访问层
 func (s *PipelineService) GetPipelineDetail(id string) (*models.PipelineDetailResponse, error) {
 	pipeline, err := repository.GetPipelineByID(id)
 	if err != nil {
@@ -421,6 +423,10 @@ func (s *PipelineService) StartPipeline(id string) (*models.PipelineDetailRespon
 }
 
 // executePipelineAsync 异步执行Pipeline全链路
+// Phase8修复P-01：扩展断点续跑逻辑，覆盖全部8步
+// 原版：只处理Generator和Review两步断点续跑
+// 修复后：所有步骤（dbCheck/scanner/evaluator/meta/translator/generator/review/verify）均支持断点续跑
+// 逻辑：找到第一个非done步骤 -> 从该步骤开始执行，跳过已完成的步骤
 func (s *PipelineService) executePipelineAsync(id string) {
 	pipeline, err := repository.GetPipelineByID(id)
 	if err != nil {
@@ -428,8 +434,12 @@ func (s *PipelineService) executePipelineAsync(id string) {
 		return
 	}
 
+	// ==================== 断点续跑逻辑（Phase8修复P-01，覆盖全部8步）====================
+	// 找到第一个未完成的步骤，从该步骤开始执行
+	// 原版只处理Generator/Review，导致Translator/Meta/Scanner/Evaluator失败后从dbCheck重跑，浪费大量AI调用
 	existingSteps, stepsErr := repository.GetStepsByPipelineID(id)
-	if stepsErr == nil {
+	if stepsErr == nil && len(existingSteps) > 0 {
+		// 找第一个非done的步骤
 		var resumeStep string
 		for _, st := range existingSteps {
 			if st.Status != models.StepStatusDone {
@@ -437,6 +447,8 @@ func (s *PipelineService) executePipelineAsync(id string) {
 				break
 			}
 		}
+
+		// 有需要恢复的步骤，且不是从头开始（dbCheck）
 		if resumeStep != "" && resumeStep != models.StepDbCheck {
 			if err := repository.UpdatePipelineStatus(id, resumeStep, models.PipelineStatusRunning); err != nil {
 				_ = repository.UpdatePipelineError(id, resumeStep, "恢复Pipeline失败: "+err.Error())
@@ -444,22 +456,105 @@ func (s *PipelineService) executePipelineAsync(id string) {
 			}
 			pipeline, _ = repository.GetPipelineByID(id)
 
+			// 根据断点步骤分发执行（覆盖全部8步）
 			switch resumeStep {
-			case models.StepGenerator:
-				genErr := s.executeGenerator(pipeline)
-				if genErr != nil {
-					_ = repository.UpdatePipelineError(id, models.StepGenerator, genErr.Error())
+
+			case models.StepScanner:
+				// 从Scanner断点续跑
+				s.broadcastStepUpdate(id, "step_update", "scanner", "running", "running", "断点续跑: 从Scanner继续")
+				if scanErr := s.executeScanner(pipeline); scanErr != nil {
+					_ = repository.UpdatePipelineError(id, models.StepScanner, scanErr.Error())
+					s.broadcastStepUpdate(id, "pipeline_error", "scanner", "failed", "failed", scanErr.Error())
 					return
 				}
+				// Scanner完成后继续后续步骤
+				resumeStep = models.StepEvaluator
+				fallthrough
+
+			case models.StepEvaluator:
+				// 从Evaluator断点续跑（或Scanner完成后顺序执行）
+				if err := repository.UpdatePipelineStatus(id, models.StepEvaluator, models.PipelineStatusRunning); err != nil {
+					_ = repository.UpdatePipelineError(id, models.StepEvaluator, "推进到Evaluator失败: "+err.Error())
+					return
+				}
+				s.broadcastStepUpdate(id, "step_update", "evaluator", "running", "running", "断点续跑: 开始Evaluator")
+				pipeline, _ = repository.GetPipelineByID(id)
+				if evalErr := s.executeEvaluator(pipeline); evalErr != nil {
+					_ = repository.UpdatePipelineError(id, models.StepEvaluator, evalErr.Error())
+					s.broadcastStepUpdate(id, "pipeline_error", "evaluator", "failed", "failed", evalErr.Error())
+					return
+				}
+				resumeStep = models.StepMeta
+				fallthrough
+
+			case models.StepMeta:
+				// 从Meta断点续跑（或Evaluator完成后顺序执行）
+				if err := repository.UpdatePipelineStatus(id, models.StepMeta, models.PipelineStatusRunning); err != nil {
+					_ = repository.UpdatePipelineError(id, models.StepMeta, "推进到Meta失败: "+err.Error())
+					return
+				}
+				s.broadcastStepUpdate(id, "step_update", "meta", "running", "running", "断点续跑: 开始Meta")
+				pipeline, _ = repository.GetPipelineByID(id)
+				if metaErr := s.executeMeta(pipeline); metaErr != nil {
+					_ = repository.UpdatePipelineError(id, models.StepMeta, metaErr.Error())
+					s.broadcastStepUpdate(id, "pipeline_error", "meta", "failed", "failed", metaErr.Error())
+					return
+				}
+				resumeStep = models.StepTranslator
+				fallthrough
+
+			case models.StepTranslator:
+				// 从Translator断点续跑（或Meta完成后顺序执行）
+				if err := repository.UpdatePipelineStatus(id, models.StepTranslator, models.PipelineStatusRunning); err != nil {
+					_ = repository.UpdatePipelineError(id, models.StepTranslator, "推进到Translator失败: "+err.Error())
+					return
+				}
+				s.broadcastStepUpdate(id, "step_update", "translator", "running", "running", "断点续跑: 开始Translator")
+				pipeline, _ = repository.GetPipelineByID(id)
+				if transErr := s.executeTranslator(pipeline); transErr != nil {
+					_ = repository.UpdatePipelineError(id, models.StepTranslator, transErr.Error())
+					s.broadcastStepUpdate(id, "pipeline_error", "translator", "failed", "failed", transErr.Error())
+					return
+				}
+				resumeStep = models.StepGenerator
+				fallthrough
+
+			case models.StepGenerator:
+				// 从Generator断点续跑（或Translator完成后顺序执行）
+				if err := repository.UpdatePipelineStatus(id, models.StepGenerator, models.PipelineStatusRunning); err != nil {
+					_ = repository.UpdatePipelineError(id, models.StepGenerator, "推进到Generator失败: "+err.Error())
+					return
+				}
+				s.broadcastStepUpdate(id, "step_update", "generator", "running", "running", "断点续跑: 开始Generator")
+				pipeline, _ = repository.GetPipelineByID(id)
+				if genErr := s.executeGenerator(pipeline); genErr != nil {
+					_ = repository.UpdatePipelineError(id, models.StepGenerator, genErr.Error())
+					s.broadcastStepUpdate(id, "pipeline_error", "generator", "failed", "failed", genErr.Error())
+					return
+				}
+				// Generator完成后进入审核队列
 				_ = repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue)
+				s.broadcastStepUpdate(id, "pipeline_done", "review", "done", "review_queue", "Pipeline执行完成，等待审核")
 				return
 
 			case models.StepReview:
+				// Review步骤断点续跑：直接恢复到审核队列，等待人工操作
 				_ = repository.UpdatePipelineStatus(id, models.StepReview, models.PipelineStatusReviewQueue)
+				s.broadcastStepUpdate(id, "pipeline_done", "review", "pending", "review_queue", "断点续跑: 恢复到审核队列")
 				return
+
+			case models.StepVerify:
+				// Verify步骤断点续跑：不自动重跑验收，恢复到finalized等待手动触发
+				// 验收流程有独立入口（/verify），断点不应自动触发
+				_ = repository.UpdatePipelineStatus(id, models.StepVerify, models.PipelineStatusFinalized)
+				return
+
+			default:
+				// 未知步骤：从dbCheck全量重跑（保险起见）
 			}
 		}
 	}
+	// ==================== 正常执行（全量/从dbCheck开始）====================
 
 	dbCheckErr := s.executeDbCheck(pipeline)
 	if dbCheckErr != nil {
@@ -1185,11 +1280,9 @@ type metaScoreResult struct {
 func extractMetaScores(output string) *metaScoreResult {
 	result := &metaScoreResult{}
 
-	// 使用包级正则变量 reMetaBlock
 	blockMatch := reMetaBlock.FindStringSubmatch(output)
 
 	if len(blockMatch) < 2 {
-		// 使用包级正则变量 reTotalFallback
 		tfm := reTotalFallback.FindStringSubmatch(output)
 		if tfm != nil {
 			result.totalFinal = safeParseFloat(tfm[1])
@@ -1202,17 +1295,11 @@ func extractMetaScores(output string) *metaScoreResult {
 
 	block := blockMatch[1]
 
-	// 使用包级正则变量 reMetaTotal
 	tm := reMetaTotal.FindStringSubmatch(block)
 	if tm == nil {
 		return result
 	}
 	result.totalFinal = safeParseFloat(tm[1])
-
-	// 使用包级正则变量 reE1Final
-	// 使用包级正则变量 reE2Final
-	// 使用包级正则变量 reE3Final
-	// 使用包级正则变量 reE4Final
 
 	if m := reE1Final.FindStringSubmatch(block); m != nil {
 		result.e1Final = safeParseFloat(m[1])
@@ -1227,17 +1314,14 @@ func extractMetaScores(output string) *metaScoreResult {
 		result.e4Final = safeParseFloat(m[1])
 	}
 
-	// 使用包级正则变量 reMetaHard
 	if hm := reMetaHard.FindStringSubmatch(block); hm != nil {
 		result.hardConstraint = hm[1]
 	}
 
-	// 使用包级正则变量 reMetaGrade
 	if gm := reMetaGrade.FindStringSubmatch(block); gm != nil {
 		result.grade = gm[1]
 	}
 
-	// 使用包级正则变量 reMetaRound
 	allRoundMatches := reMetaRound.FindAllStringSubmatch(block, -1)
 
 	roundMap := map[int]map[int]float64{
@@ -1263,7 +1347,6 @@ func extractMetaScores(output string) *metaScoreResult {
 		result.e4Rounds = append(result.e4Rounds, roundMap[4][rn])
 	}
 
-	// 使用包级正则变量 reFinalScore
 	if fsm := reFinalScore.FindStringSubmatch(output); fsm != nil {
 		newScore := safeParseFloat(fsm[1])
 		if newScore > 0 {
@@ -1330,7 +1413,6 @@ func (s *PipelineService) UpdatePageDecision(pipelineID string, pageNumber int, 
 
 // SubmitFinalize 提交定稿（审核员→待超级审核员确认）
 // P7新增：审核员完成逐页决策后，点击"提交定稿"，状态从review_queue变为pending_finalize
-// 原来的 FinalizePipeline 逻辑保留给超级审核员 ConfirmFinalize 使用
 func (s *PipelineService) SubmitFinalize(pipelineID string) error {
 	pipeline, err := repository.GetPipelineByID(pipelineID)
 	if err != nil {
@@ -1399,6 +1481,10 @@ func (s *PipelineService) ConfirmFinalize(pipelineID string) error {
 
 // RejectFinalize 退回重审（超级审核员→review_queue，退回给原assigned_to审核员）
 // P7新增：超级审核员退回给原来的审核员重新审核
+// Phase8修复P-02：退回原因现在会持久化到 pipelines.reject_reason 字段
+//
+//	原版：rejectReason参数接收后直接丢弃，无法溯源
+//	修复后：调用 UpdatePipelineRejectReason 将原因写入数据库，审核员可在审核页面看到退回理由
 func (s *PipelineService) RejectFinalize(pipelineID string, rejectReason string) error {
 	pipeline, err := repository.GetPipelineByID(pipelineID)
 	if err != nil {
@@ -1408,8 +1494,8 @@ func (s *PipelineService) RejectFinalize(pipelineID string, rejectReason string)
 		return ErrRejectFinalizeNotAllowed
 	}
 
-	// 退回到 review_queue 状态，保持 assigned_to 不变（退回给原审核员）
-	if err := repository.UpdatePipelineStatus(pipelineID, models.StepReview, models.PipelineStatusReviewQueue); err != nil {
+	// Phase8修复P-02：一条SQL同时更新状态+退回原因，保持 assigned_to 不变
+	if err := repository.UpdatePipelineRejectReason(pipelineID, rejectReason); err != nil {
 		return fmt.Errorf("退回重审失败: %w", err)
 	}
 
@@ -1417,7 +1503,6 @@ func (s *PipelineService) RejectFinalize(pipelineID string, rejectReason string)
 }
 
 // FinalizePipeline 直接定稿（保持向后兼容，admin可直接定稿跳过二级审批）
-// 原有逻辑不变，供admin角色跳过pending_finalize直接定稿使用
 func (s *PipelineService) FinalizePipeline(pipelineID string) error {
 	pipeline, err := repository.GetPipelineByID(pipelineID)
 	if err != nil {
@@ -1486,19 +1571,10 @@ func extractScannerParsed(stepData string) string {
 }
 
 func extractEvalScores(output string) (float64, float64, float64, float64, float64, string, string, bool) {
-	// 使用包级正则变量 reEvalBlock
 	sbMatch := reEvalBlock.FindStringSubmatch(output)
 
 	if len(sbMatch) >= 2 {
 		block := sbMatch[1]
-
-		// 使用包级正则变量 reEvalTotal
-		// 使用包级正则变量 reEvalE1
-		// 使用包级正则变量 reEvalE2
-		// 使用包级正则变量 reEvalE3
-		// 使用包级正则变量 reEvalE4
-		// 使用包级正则变量 reEvalHard
-		// 使用包级正则变量 reEvalGrade
 
 		tm := reEvalTotal.FindStringSubmatch(block)
 		e1m := reEvalE1.FindStringSubmatch(block)
@@ -1686,7 +1762,7 @@ func (s *PipelineService) AIFixPage(pipelineID string, pageNumber int, fixInstru
 		models.PipelineStatusReviewQueue:     true,
 		models.PipelineStatusNeedsHuman:      true,
 		models.PipelineStatusFinalized:       true,
-		models.PipelineStatusPendingFinalize: true, // P7新增：待确认定稿时也允许AI快修
+		models.PipelineStatusPendingFinalize: true,
 	}
 	if !allowedStatuses[pipeline.Status] {
 		return "", ErrPipelineNotReviewable

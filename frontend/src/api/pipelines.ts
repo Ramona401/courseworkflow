@@ -2,6 +2,10 @@
  * Pipeline管理API封装
  * P7新增：二级审批流程 submitFinalize/confirmFinalize/rejectFinalize
  *         新增 pending_finalize 状态
+ * Phase8修复A-02：删除 assignPipeline() 函数
+ *   原版调用 POST /pipelines/{id}/assign，但 routes.go 中该路由不存在（只有 /batch-assign）
+ *   修复：移除该函数，所有分配操作统一走 batchAssignPipelines（单条分配传一个ID即可）
+ * Phase8修复P-02：PipelineDetailResponse 新增 reject_reason 字段
  */
 import client from './client'
 
@@ -62,6 +66,11 @@ export interface StepListItem {
   has_data: boolean
 }
 
+/**
+ * PipelineDetailResponse Pipeline详情响应类型
+ * Phase8修复P-02：新增 reject_reason 字段
+ * 审核员在审核页面可看到超级审核员填写的退回原因
+ */
 export interface PipelineDetailResponse {
   id: string
   course_code: string
@@ -82,6 +91,8 @@ export interface PipelineDetailResponse {
   review_round: number
   assigned_to: string | null
   assigned_name: string
+  /** 最近一次退回重审的原因（空字符串表示未被退回或未填写原因）Phase8新增 */
+  reject_reason: string
   steps: StepListItem[]
 }
 
@@ -364,8 +375,15 @@ export async function getGeneratedPages(pipelineId: string) {
   return data.pages as GeneratedPageFull[]
 }
 
-export async function updatePageDecision(pipelineId: string, pageNumber: number, req: UpdatePageDecisionRequest) {
-  const res = await client.put('/pipelines/' + pipelineId + '/pages/' + pageNumber + '/decision', req)
+export async function updatePageDecision(
+  pipelineId: string,
+  pageNumber: number,
+  req: UpdatePageDecisionRequest
+) {
+  const res = await client.put(
+    '/pipelines/' + pipelineId + '/pages/' + pageNumber + '/decision',
+    req
+  )
   return (res.data as any).data
 }
 
@@ -402,9 +420,13 @@ export async function confirmFinalize(pipelineId: string) {
 /**
  * 退回重审（超级审核员退回，pending_finalize→review_queue）
  * P7新增：senior_operator / admin 退回给原审核员重新审核
+ * Phase8修复P-02：退回原因现在会持久化到数据库，审核员可在审核页面看到
  */
 export async function rejectFinalize(pipelineId: string, reason?: string) {
-  const res = await client.post('/pipelines/' + pipelineId + '/reject-finalize', { reason: reason || '' })
+  const res = await client.post(
+    '/pipelines/' + pipelineId + '/reject-finalize',
+    { reason: reason || '' }
+  )
   return (res.data as any).data
 }
 
@@ -428,10 +450,16 @@ export interface AIFixPageResponse {
   html_length: number
 }
 
-export async function aiFixPage(pipelineId: string, pageNumber: number, req: AIFixPageRequest) {
-  const res = await client.post('/pipelines/' + pipelineId + '/pages/' + pageNumber + '/ai-fix', req, {
-    timeout: 600000,
-  })
+export async function aiFixPage(
+  pipelineId: string,
+  pageNumber: number,
+  req: AIFixPageRequest
+) {
+  const res = await client.post(
+    '/pipelines/' + pipelineId + '/pages/' + pageNumber + '/ai-fix',
+    req,
+    { timeout: 600000 }
+  )
   return (res.data as any).data as AIFixPageResponse
 }
 
@@ -465,12 +493,16 @@ export interface BatchStartResult {
 }
 
 export async function batchCreatePipelines(courseCodes: string[]) {
-  const res = await client.post('/pipelines/batch-create', { course_codes: courseCodes })
+  const res = await client.post('/pipelines/batch-create', {
+    course_codes: courseCodes,
+  })
   return (res.data as any).data as BatchCreateResult
 }
 
 export async function batchStartPipelines(pipelineIds: string[]) {
-  const res = await client.post('/pipelines/batch-start', { pipeline_ids: pipelineIds })
+  const res = await client.post('/pipelines/batch-start', {
+    pipeline_ids: pipelineIds,
+  })
   return (res.data as any).data as BatchStartResult
 }
 
@@ -497,12 +529,22 @@ export async function getOperators() {
   return data.operators as OperatorInfo[]
 }
 
-export async function assignPipeline(pipelineId: string, assignedTo: string) {
-  const res = await client.post('/pipelines/' + pipelineId + '/assign', { assigned_to: assignedTo })
-  return (res.data as any).data
-}
-
-export async function batchAssignPipelines(pipelineIds: string[], assignedTo: string) {
-  const res = await client.post('/pipelines/batch-assign', { pipeline_ids: pipelineIds, assigned_to: assignedTo })
+/**
+ * 批量分配Pipeline给指定审核员
+ * Phase8修复A-02说明：
+ *   原版有一个 assignPipeline(pipelineId, assignedTo) 函数，
+ *   调用 POST /pipelines/{id}/assign，但该路由在后端 routes.go 中不存在（只有 /batch-assign）。
+ *   修复：删除 assignPipeline 函数，单条分配时传入长度为1的数组调用本函数即可。
+ *   用法：单条分配 → batchAssignPipelines([pipelineId], assignedTo)
+ *         批量分配 → batchAssignPipelines(pipelineIds, assignedTo)
+ */
+export async function batchAssignPipelines(
+  pipelineIds: string[],
+  assignedTo: string
+) {
+  const res = await client.post('/pipelines/batch-assign', {
+    pipeline_ids: pipelineIds,
+    assigned_to: assignedTo,
+  })
   return (res.data as any).data as BatchAssignResult
 }

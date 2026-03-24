@@ -8,6 +8,7 @@ import (
 // ==================== Pipeline 模型（对应 pipelines 表） ====================
 
 // Pipeline Pipeline主记录（对应 pipelines 表）
+// Phase8修复P-02：新增 RejectReason 字段，存储超级审核员退回重审时填写的原因
 type Pipeline struct {
 	ID               string     `json:"id"`
 	CourseCode       string     `json:"course_code"`
@@ -23,8 +24,12 @@ type Pipeline struct {
 	Config           string     `json:"config"`
 	ReviewRound      int        `json:"review_round"`
 	AssignedTo       *string    `json:"assigned_to"`
-	CreatedAt        *time.Time `json:"created_at"`
-	UpdatedAt        *time.Time `json:"updated_at"`
+	// RejectReason 退回重审原因（超级审核员填写，Phase8新增）
+	// 对应数据库 pipelines.reject_reason TEXT 字段
+	// 审核员提交定稿被退回时，可在审核页面看到此原因
+	RejectReason string `json:"reject_reason"`
+	CreatedAt    *time.Time `json:"created_at"`
+	UpdatedAt    *time.Time `json:"updated_at"`
 }
 
 // PipelineStep Pipeline步骤记录（对应 pipeline_steps 表）
@@ -269,6 +274,8 @@ type PipelineListItem struct {
 	AssignedName     string     `json:"assigned_name"`
 }
 
+// PipelineDetailResponse Pipeline详情响应
+// Phase8修复P-02：新增 RejectReason 字段，前端审核页面可展示退回原因
 type PipelineDetailResponse struct {
 	ID               string          `json:"id"`
 	CourseCode       string          `json:"course_code"`
@@ -289,7 +296,9 @@ type PipelineDetailResponse struct {
 	ReviewRound      int             `json:"review_round"`
 	AssignedTo       *string         `json:"assigned_to"`
 	AssignedName     string          `json:"assigned_name"`
-	Steps            []*StepListItem `json:"steps"`
+	// RejectReason 最近一次退回重审的原因（空字符串表示未被退回或未填写原因）
+	RejectReason string          `json:"reject_reason"`
+	Steps        []*StepListItem `json:"steps"`
 }
 
 type StepListItem struct {
@@ -332,16 +341,16 @@ type StepDetailResponse struct {
 // ==================== Pipeline 常量 ====================
 
 const (
-	PipelineStatusPending        = "pending"
-	PipelineStatusRunning        = "running"
-	PipelineStatusReviewQueue    = "review_queue"
+	PipelineStatusPending         = "pending"
+	PipelineStatusRunning         = "running"
+	PipelineStatusReviewQueue     = "review_queue"
 	PipelineStatusPendingFinalize = "pending_finalize" // P7新增：提交定稿待超级审核员确认
-	PipelineStatusFinalized      = "finalized"
-	PipelineStatusNeedsHuman     = "needs_human"
-	PipelineStatusFailed         = "failed"
-	PipelineStatusCancelled      = "cancelled"
-	PipelineStatusVerified       = "verified"
-	PipelineStatusVerifyFailed   = "verify_failed"
+	PipelineStatusFinalized       = "finalized"
+	PipelineStatusNeedsHuman      = "needs_human"
+	PipelineStatusFailed          = "failed"
+	PipelineStatusCancelled       = "cancelled"
+	PipelineStatusVerified        = "verified"
+	PipelineStatusVerifyFailed    = "verify_failed"
 )
 
 const (

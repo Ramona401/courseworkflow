@@ -2,8 +2,10 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"tedna/internal/database"
@@ -31,13 +33,15 @@ type DashboardStats struct {
 	Finalized        int `json:"finalized"`
 	Failed           int `json:"failed"`
 	// 达标统计（evaluator均分≥9.0）
+	// 修复E-05：改用LEFT JOIN一次性聚合，消除原版 N+1 子查询问题
 	PassedCount int `json:"passed_count"`
 	// AI消耗统计
 	TotalTokensUsed int64 `json:"total_tokens_used"`
 }
 
 // GetDashboardStats 获取仪表盘统计数据
-// P4.5-D新增：一次查询获取所有统计数据，避免多次查询
+// P4.5-D新增：一次查询获取所有统计数据
+// 修复E-05：PassedCount 改用 LEFT JOIN，避免对每行 Pipeline 执行子查询
 func GetDashboardStats() (*DashboardStats, error) {
 	ctx := context.Background()
 	stats := &DashboardStats{}
@@ -45,27 +49,33 @@ func GetDashboardStats() (*DashboardStats, error) {
 	// 1. 课程统计
 	err := database.DB.QueryRow(ctx,
 		`SELECT COUNT(*),
-			COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM course_indexes ci WHERE ci.course_id = c.id))
+		        COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM course_indexes ci WHERE ci.course_id = c.id))
 		 FROM courses c`).Scan(&stats.TotalCourses, &stats.CoursesWithIndex)
 	if err != nil {
 		return nil, fmt.Errorf("查询课程统计失败: %w", err)
 	}
 
 	// 2. Pipeline各状态统计 + 达标数
+	// 修复E-05：PassedCount 使用 LEFT JOIN + CTE 一次性聚合，不再对每行执行子查询
+	// evaluator步骤完成且avg_total >= 9.0 的 Pipeline 计入达标
 	err = database.DB.QueryRow(ctx,
-		`SELECT
-			COUNT(*),
-			COUNT(*) FILTER (WHERE status = 'running'),
-			COUNT(*) FILTER (WHERE status = 'review_queue'),
-			COUNT(*) FILTER (WHERE status = 'finalized'),
-			COUNT(*) FILTER (WHERE status = 'failed'),
-			COUNT(*) FILTER (WHERE EXISTS (
-				SELECT 1 FROM pipeline_steps ps
-				WHERE ps.pipeline_id = p.id AND ps.step_name = 'evaluator'
-					AND ps.status = 'done' AND ps.step_data IS NOT NULL
-					AND (ps.step_data->>'avg_total')::numeric >= 9.0
-			))
-		 FROM pipelines p`).Scan(
+		`WITH eval_passed AS (
+		        SELECT DISTINCT ps.pipeline_id
+		        FROM pipeline_steps ps
+		        WHERE ps.step_name = 'evaluator'
+		          AND ps.status = 'done'
+		          AND ps.step_data IS NOT NULL
+		          AND (ps.step_data->>'avg_total')::numeric >= 9.0
+		)
+		SELECT
+		        COUNT(*),
+		        COUNT(*) FILTER (WHERE p.status = 'running'),
+		        COUNT(*) FILTER (WHERE p.status = 'review_queue'),
+		        COUNT(*) FILTER (WHERE p.status = 'finalized'),
+		        COUNT(*) FILTER (WHERE p.status = 'failed'),
+		        COUNT(ep.pipeline_id)
+		FROM pipelines p
+		LEFT JOIN eval_passed ep ON ep.pipeline_id = p.id`).Scan(
 		&stats.TotalPipelines,
 		&stats.RunningPipelines,
 		&stats.ReviewQueue,
@@ -106,7 +116,7 @@ func CreatePipeline(p *models.Pipeline) error {
 	// 1. 插入Pipeline主记录
 	err = tx.QueryRow(ctx,
 		`INSERT INTO pipelines (course_code, course_name, external_module_id, started_by,
-			current_step, status, auto_mode, config, review_round)
+		        current_step, status, auto_mode, config, review_round)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
 		 RETURNING id, started_at, created_at, updated_at`,
 		p.CourseCode, p.CourseName, p.ExternalModuleID, p.StartedBy,
@@ -138,6 +148,7 @@ func CreatePipeline(p *models.Pipeline) error {
 
 // GetPipelineByID 根据ID获取Pipeline主记录
 // P4.6更新：读取review_round字段
+// Phase8修复P-02：新增读取reject_reason字段
 func GetPipelineByID(id string) (*models.Pipeline, error) {
 	ctx := context.Background()
 	p := &models.Pipeline{}
@@ -146,15 +157,18 @@ func GetPipelineByID(id string) (*models.Pipeline, error) {
 	var configStr *string
 	var errorMsg *string
 	var courseName *string
+	var rejectReason *string
 
 	err := database.DB.QueryRow(ctx,
 		`SELECT id, course_code, course_name, external_module_id, started_by,
-			started_at, completed_at, current_step, status, auto_mode,
-			error_message, config::text, review_round, assigned_to, created_at, updated_at
+		        started_at, completed_at, current_step, status, auto_mode,
+		        error_message, config::text, review_round, assigned_to,
+		        reject_reason, created_at, updated_at
 		 FROM pipelines WHERE id = $1`, id).Scan(
 		&p.ID, &p.CourseCode, &courseName, &p.ExternalModuleID, &p.StartedBy,
 		&p.StartedAt, &p.CompletedAt, &p.CurrentStep, &p.Status, &p.AutoMode,
-		&errorMsg, &configStr, &p.ReviewRound, &p.AssignedTo, &p.CreatedAt, &p.UpdatedAt,
+		&errorMsg, &configStr, &p.ReviewRound, &p.AssignedTo,
+		&rejectReason, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {
 		return nil, ErrPipelineNotFound
@@ -170,6 +184,9 @@ func GetPipelineByID(id string) (*models.Pipeline, error) {
 	if configStr != nil {
 		p.Config = *configStr
 	}
+	if rejectReason != nil {
+		p.RejectReason = *rejectReason
+	}
 
 	return p, nil
 }
@@ -179,27 +196,27 @@ func GetPipelineByID(id string) (*models.Pipeline, error) {
 // P4.6更新：新增review_round字段
 // 注意：JSONB提取用->>返回text，需要::numeric转换为数值类型
 const pipelineListSelectSQL = `SELECT p.id, p.course_code, p.course_name, p.external_module_id,
-	p.current_step, p.status, p.auto_mode, p.error_message,
-	p.started_by, p.started_at, p.completed_at, p.created_at,
-	p.review_round, p.assigned_to,
-	(SELECT u_assign.display_name FROM users u_assign WHERE u_assign.id = p.assigned_to) AS assigned_name,
-	COALESCE((SELECT COUNT(*) FROM pipeline_steps ps
-		WHERE ps.pipeline_id = p.id AND ps.status = 'done'), 0) AS steps_completed,
-	(SELECT (ps_eval.step_data->>'avg_total')::numeric
-	 FROM pipeline_steps ps_eval
-	 WHERE ps_eval.pipeline_id = p.id AND ps_eval.step_name = 'evaluator'
-		AND ps_eval.status = 'done' AND ps_eval.step_data IS NOT NULL
-	 LIMIT 1) AS eval_avg_score,
-	(SELECT (ps_meta.step_data->>'total_final')::numeric
-	 FROM pipeline_steps ps_meta
-	 WHERE ps_meta.pipeline_id = p.id AND ps_meta.step_name = 'meta'
-		AND ps_meta.status = 'done' AND ps_meta.step_data IS NOT NULL
-	 LIMIT 1) AS meta_score,
-	(SELECT (ps_trans.step_data->>'final_score')::numeric
-	 FROM pipeline_steps ps_trans
-	 WHERE ps_trans.pipeline_id = p.id AND ps_trans.step_name = 'translator'
-		AND ps_trans.status = 'done' AND ps_trans.step_data IS NOT NULL
-	 LIMIT 1) AS translator_score
+        p.current_step, p.status, p.auto_mode, p.error_message,
+        p.started_by, p.started_at, p.completed_at, p.created_at,
+        p.review_round, p.assigned_to,
+        (SELECT u_assign.display_name FROM users u_assign WHERE u_assign.id = p.assigned_to) AS assigned_name,
+        COALESCE((SELECT COUNT(*) FROM pipeline_steps ps
+                WHERE ps.pipeline_id = p.id AND ps.status = 'done'), 0) AS steps_completed,
+        (SELECT (ps_eval.step_data->>'avg_total')::numeric
+         FROM pipeline_steps ps_eval
+         WHERE ps_eval.pipeline_id = p.id AND ps_eval.step_name = 'evaluator'
+                AND ps_eval.status = 'done' AND ps_eval.step_data IS NOT NULL
+         LIMIT 1) AS eval_avg_score,
+        (SELECT (ps_meta.step_data->>'total_final')::numeric
+         FROM pipeline_steps ps_meta
+         WHERE ps_meta.pipeline_id = p.id AND ps_meta.step_name = 'meta'
+                AND ps_meta.status = 'done' AND ps_meta.step_data IS NOT NULL
+         LIMIT 1) AS meta_score,
+        (SELECT (ps_trans.step_data->>'final_score')::numeric
+         FROM pipeline_steps ps_trans
+         WHERE ps_trans.pipeline_id = p.id AND ps_trans.step_name = 'translator'
+                AND ps_trans.status = 'done' AND ps_trans.step_data IS NOT NULL
+         LIMIT 1) AS translator_score
 FROM pipelines p`
 
 // scanPipelineListRow 扫描Pipeline列表行（含3个分数字段+review_round）
@@ -279,8 +296,8 @@ func ListPipelinesForUser(userID string, role string) ([]*models.PipelineListIte
 		// 非admin：看自己发起的 + 分配给自己课程的Pipeline + 直接分配给自己的Pipeline
 		query = pipelineListSelectSQL + `
 		 WHERE p.started_by = $1
-			OR p.assigned_to = $1
-			OR p.course_code IN (SELECT uca.course_code FROM user_course_assignments uca WHERE uca.user_id = $1)
+		        OR p.assigned_to = $1
+		        OR p.course_code IN (SELECT uca.course_code FROM user_course_assignments uca WHERE uca.user_id = $1)
 		 ORDER BY p.created_at DESC`
 		args = append(args, userID)
 	}
@@ -400,9 +417,9 @@ func ResetStepsForRetrial(pipelineID string, stepNames []string) error {
 		_, err = tx.Exec(ctx,
 			`UPDATE pipeline_steps
 			 SET status = $3, started_at = NULL, completed_at = NULL,
-				 duration_ms = 0, attempts = 0, step_data = NULL,
-				 error_message = NULL, model_used = NULL, tokens_used = 0,
-				 updated_at = NOW()
+			         duration_ms = 0, attempts = 0, step_data = NULL,
+			         error_message = NULL, model_used = NULL, tokens_used = 0,
+			         updated_at = NOW()
 			 WHERE pipeline_id = $1 AND step_name = $2`,
 			pipelineID, stepName, models.StepStatusPending,
 		)
@@ -417,6 +434,27 @@ func ResetStepsForRetrial(pipelineID string, stepNames []string) error {
 	return nil
 }
 
+// ==================== Phase8修复P-02：退回原因存储 ====================
+
+// UpdatePipelineRejectReason 更新Pipeline的退回原因
+// Phase8新增：RejectFinalize时将退回原因持久化到 pipelines.reject_reason 字段
+// 同时将状态退回 review_queue，保持 assigned_to 不变
+func UpdatePipelineRejectReason(id string, rejectReason string) error {
+	ctx := context.Background()
+	_, err := database.DB.Exec(ctx,
+		`UPDATE pipelines
+		 SET current_step = 'review',
+		     status = $2,
+		     reject_reason = $3,
+		     updated_at = NOW()
+		 WHERE id = $1`,
+		id, models.PipelineStatusReviewQueue, rejectReason)
+	if err != nil {
+		return fmt.Errorf("更新退回原因失败: %w", err)
+	}
+	return nil
+}
+
 // ==================== Pipeline Step CRUD ====================
 
 // GetStepsByPipelineID 获取指定Pipeline的所有步骤（按步骤序号排序）
@@ -424,9 +462,9 @@ func GetStepsByPipelineID(pipelineID string) ([]*models.PipelineStep, error) {
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, pipeline_id, step_name, step_order, status,
-			started_at, completed_at, duration_ms, attempts,
-			step_data::text, error_message, model_used, tokens_used,
-			created_at, updated_at
+		        started_at, completed_at, duration_ms, attempts,
+		        step_data::text, error_message, model_used, tokens_used,
+		        created_at, updated_at
 		 FROM pipeline_steps
 		 WHERE pipeline_id = $1
 		 ORDER BY step_order ASC`, pipelineID)
@@ -473,9 +511,9 @@ func GetStepByName(pipelineID string, stepName string) (*models.PipelineStep, er
 
 	err := database.DB.QueryRow(ctx,
 		`SELECT id, pipeline_id, step_name, step_order, status,
-			started_at, completed_at, duration_ms, attempts,
-			step_data::text, error_message, model_used, tokens_used,
-			created_at, updated_at
+		        started_at, completed_at, duration_ms, attempts,
+		        step_data::text, error_message, model_used, tokens_used,
+		        created_at, updated_at
 		 FROM pipeline_steps
 		 WHERE pipeline_id = $1 AND step_name = $2`, pipelineID, stepName).Scan(
 		&s.ID, &s.PipelineID, &s.StepName, &s.StepOrder, &s.Status,
@@ -527,7 +565,7 @@ func CompleteStep(pipelineID string, stepName string, durationMs int64, stepData
 	_, err := database.DB.Exec(ctx,
 		`UPDATE pipeline_steps
 		 SET status = $3, completed_at = NOW(), duration_ms = $4,
-			 step_data = $5::jsonb, model_used = $6, tokens_used = $7, updated_at = NOW()
+		         step_data = $5::jsonb, model_used = $6, tokens_used = $7, updated_at = NOW()
 		 WHERE pipeline_id = $1 AND step_name = $2`,
 		pipelineID, stepName, models.StepStatusDone, durationMs,
 		stepDataParam, modelUsed, tokensUsed)
@@ -544,7 +582,7 @@ func FailStep(pipelineID string, stepName string, durationMs int64, errMsg strin
 	_, err := database.DB.Exec(ctx,
 		`UPDATE pipeline_steps
 		 SET status = $3, completed_at = $4, duration_ms = $5,
-			 error_message = $6, updated_at = $4
+		         error_message = $6, updated_at = $4
 		 WHERE pipeline_id = $1 AND step_name = $2`,
 		pipelineID, stepName, models.StepStatusFailed, now, durationMs, errMsg)
 	if err != nil {
@@ -598,8 +636,8 @@ func CompleteEvalRound(roundID string, output string, scoreTotal float64,
 	_, err := database.DB.Exec(ctx,
 		`UPDATE eval_rounds
 		 SET status = $2, output = $3, score_total = $4,
-			 score_e1 = $5, score_e2 = $6, score_e3 = $7, score_e4 = $8,
-			 dimensions = $9::jsonb, model_used = $10, tokens_used = $11
+		         score_e1 = $5, score_e2 = $6, score_e3 = $7, score_e4 = $8,
+		         dimensions = $9::jsonb, model_used = $10, tokens_used = $11
 		 WHERE id = $1`,
 		roundID, models.StepStatusDone, output, scoreTotal,
 		scoreE1, scoreE2, scoreE3, scoreE4,
@@ -610,13 +648,28 @@ func CompleteEvalRound(roundID string, output string, scoreTotal float64,
 	return nil
 }
 
+// evalErrDimensions 用于 FailEvalRound 的 JSON 序列化结构体
+// 修复E-06：改用 json.Marshal 替代字符串拼接，防止 errMsg 含引号时破坏JSON结构
+type evalErrDimensions struct {
+	Error string `json:"error"`
+}
+
 // FailEvalRound 标记评估轮次失败
+// 修复E-06：dimensions字段改用 json.Marshal 序列化，避免直接字符串拼接导致的JSON结构破坏
+// 原版：fmt.Sprintf(`{"error":"%s"}`, errMsg) 当 errMsg 含引号/反斜杠时产生非法JSON
 func FailEvalRound(roundID string, output string, errMsg string) error {
 	ctx := context.Background()
+
+	// 使用 json.Marshal 序列化，自动转义所有特殊字符
+	dimJSON, marshalErr := json.Marshal(evalErrDimensions{Error: errMsg})
+	if marshalErr != nil {
+		// 序列化失败时使用安全的降级字符串（纯ASCII，不含引号）
+		dimJSON = []byte(`{"error":"serialization_failed"}`)
+	}
+
 	_, err := database.DB.Exec(ctx,
 		`UPDATE eval_rounds SET status = $2, output = $3, dimensions = $4::jsonb WHERE id = $1`,
-		roundID, models.StepStatusFailed, output,
-		fmt.Sprintf(`{"error":"%s"}`, errMsg))
+		roundID, models.StepStatusFailed, output, string(dimJSON))
 	if err != nil {
 		return fmt.Errorf("标记评估轮次失败: %w", err)
 	}
@@ -628,8 +681,8 @@ func GetEvalRoundsByPipelineID(pipelineID string) ([]*models.EvalRoundRecord, er
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, pipeline_id, round_number, status, output,
-			score_total, score_e1, score_e2, score_e3, score_e4,
-			dimensions::text, model_used, tokens_used, created_at
+		        score_total, score_e1, score_e2, score_e3, score_e4,
+		        dimensions::text, model_used, tokens_used, created_at
 		 FROM eval_rounds
 		 WHERE pipeline_id = $1
 		 ORDER BY round_number ASC`, pipelineID)
@@ -691,8 +744,8 @@ func CreateGeneratedPage(pipelineID string, pageNumber int, pageTitle string,
 
 	_, err := database.DB.Exec(ctx,
 		`INSERT INTO generated_pages (pipeline_id, page_number, page_title,
-			operation, original_html, generated_html, final_html,
-			decision, lesson_id, merge_sources, change_reason)
+		        operation, original_html, generated_html, final_html,
+		        decision, lesson_id, merge_sources, change_reason)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9::jsonb, $10)`,
 		pipelineID, pageNumber, pageTitle,
 		operation, originalHTML, generatedHTML, finalHTML,
@@ -708,11 +761,11 @@ func GetGeneratedPagesByPipelineID(pipelineID string) ([]*GeneratedPageRow, erro
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, pipeline_id, page_number, page_title, operation,
-			LENGTH(COALESCE(original_html,'')) as orig_len,
-			LENGTH(COALESCE(generated_html,'')) as gen_len,
-			LENGTH(COALESCE(final_html,'')) as final_len,
-			decision, lesson_id, merge_sources::text,
-			created_at, updated_at
+		        LENGTH(COALESCE(original_html,'')) as orig_len,
+		        LENGTH(COALESCE(generated_html,'')) as gen_len,
+		        LENGTH(COALESCE(final_html,'')) as final_len,
+		        decision, lesson_id, merge_sources::text,
+		        created_at, updated_at
 		 FROM generated_pages
 		 WHERE pipeline_id = $1
 		 ORDER BY page_number ASC`, pipelineID)
@@ -759,12 +812,12 @@ func GetGeneratedPagesWithHTML(pipelineID string) ([]*GeneratedPageFullRow, erro
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, pipeline_id, page_number, page_title, operation,
-			COALESCE(original_html, '') as original_html,
-			COALESCE(generated_html, '') as generated_html,
-			COALESCE(final_html, '') as final_html,
-			decision, lesson_id, merge_sources::text,
-			COALESCE(change_reason, '') as change_reason,
-			created_at, updated_at
+		        COALESCE(original_html, '') as original_html,
+		        COALESCE(generated_html, '') as generated_html,
+		        COALESCE(final_html, '') as final_html,
+		        decision, lesson_id, merge_sources::text,
+		        COALESCE(change_reason, '') as change_reason,
+		        created_at, updated_at
 		 FROM generated_pages
 		 WHERE pipeline_id = $1
 		 ORDER BY page_number ASC`, pipelineID)
@@ -840,7 +893,7 @@ func GetPageDecisionStats(pipelineID string) (total int, decided int, err error)
 	ctx := context.Background()
 	err = database.DB.QueryRow(ctx,
 		`SELECT COUNT(*),
-			COUNT(*) FILTER (WHERE decision IN ('approve', 'reject', 'edit'))
+		        COUNT(*) FILTER (WHERE decision IN ('approve', 'reject', 'edit'))
 		 FROM generated_pages WHERE pipeline_id = $1`, pipelineID).Scan(&total, &decided)
 	if err != nil {
 		return 0, 0, fmt.Errorf("查询页面决策统计失败: %w", err)
@@ -937,7 +990,6 @@ func ListFinalizedPipelineIDs() ([]string, error) {
 	return ids, nil
 }
 
-
 // ==================== P6-2 Pipeline分配方法 ====================
 
 // AssignPipeline 分配Pipeline给指定审核员
@@ -955,17 +1007,29 @@ func AssignPipeline(pipelineID string, assignedTo *string) error {
 
 // BatchAssignPipelines 批量分配Pipeline给指定审核员
 // P6-2新增：admin在审核中心批量选择Pipeline后分配
+// Phase8修复E-04：改用 WHERE id = ANY($1) 批量UPDATE，避免原版逐条执行无事务的问题
+// 原版：逐条执行 UPDATE，部分失败时已成功的不会回滚
+// 修复后：单条SQL覆盖所有ID，数据库原子执行，要么全部成功要么全部失败
 func BatchAssignPipelines(pipelineIDs []string, assignedTo *string) (int, error) {
-	ctx := context.Background()
-	successCount := 0
-	for _, id := range pipelineIDs {
-		_, err := database.DB.Exec(ctx,
-			`UPDATE pipelines SET assigned_to = $2, updated_at = NOW()
-			 WHERE id = $1`, id, assignedTo)
-		if err == nil {
-			successCount++
-		}
+	if len(pipelineIDs) == 0 {
+		return 0, nil
 	}
+
+	ctx := context.Background()
+
+	// 使用 pgx 的 any 语法：WHERE id = ANY($1) 接受 []string 参数
+	// 单条SQL原子执行，消除逐条更新的事务缺失问题
+	result, err := database.DB.Exec(ctx,
+		`UPDATE pipelines
+		 SET assigned_to = $2, updated_at = NOW()
+		 WHERE id = ANY($1)`,
+		pipelineIDs, assignedTo)
+	if err != nil {
+		return 0, fmt.Errorf("批量分配Pipeline失败: %w", err)
+	}
+
+	// 返回实际更新的行数
+	successCount := int(result.RowsAffected())
 	return successCount, nil
 }
 
@@ -997,4 +1061,19 @@ func ListOperatorUsers() ([]map[string]string, error) {
 		result = []map[string]string{}
 	}
 	return result, nil
+}
+
+// ==================== 工具方法 ====================
+
+// buildPlaceholders 构建SQL占位符字符串，如 "$1,$2,$3"
+// 用于批量操作时动态生成IN子句（备用，当前BatchAssignPipelines已改用ANY）
+func buildPlaceholders(count int, startIdx int) string {
+	if count == 0 {
+		return ""
+	}
+	parts := make([]string, count)
+	for i := 0; i < count; i++ {
+		parts[i] = fmt.Sprintf("$%d", startIdx+i)
+	}
+	return strings.Join(parts, ",")
 }
