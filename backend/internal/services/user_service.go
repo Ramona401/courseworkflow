@@ -18,7 +18,7 @@ var (
 	ErrUsernameRequired    = errors.New("用户名不能为空")
 	ErrDisplayNameRequired = errors.New("显示名称不能为空")
 	ErrPasswordTooShort    = errors.New("密码长度不能少于6位")
-	ErrInvalidRole         = errors.New("无效的角色，可选值：admin/operator/viewer")
+	ErrInvalidRole         = errors.New("无效的角色，可选值：admin/senior_operator/operator/viewer")
 	ErrInvalidStatus       = errors.New("无效的状态，可选值：active/disabled")
 	ErrUsernameExists      = errors.New("用户名已存在")
 	ErrCannotDisableSelf   = errors.New("不能禁用自己的账户")

@@ -124,7 +124,7 @@ const (
 )
 
 // ValidRoles 有效角色列表（用于校验）
-var ValidRoles = []string{RoleAdmin, RoleOperator, RoleViewer}
+var ValidRoles = []string{RoleAdmin, RoleSeniorOperator, RoleOperator, RoleViewer}
 
 // ValidStatuses 有效状态列表（用于校验）
 var ValidStatuses = []string{StatusActive, StatusDisabled}
