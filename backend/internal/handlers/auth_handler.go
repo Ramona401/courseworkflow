@@ -3,11 +3,12 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
-	"log"
 	"net/http"
 	"strings"
 
+	"tedna/internal/logger"
 	"tedna/internal/models"
+	"tedna/internal/repository"
 	"tedna/internal/services"
 	"tedna/internal/utils"
 )
@@ -16,6 +17,9 @@ import (
 type AuthHandler struct {
 	authService *services.AuthService // 认证服务
 }
+
+// 模块日志
+var authHandlerLog = logger.WithModule("auth")
 
 // NewAuthHandler 创建认证处理器实例
 func NewAuthHandler(authService *services.AuthService) *AuthHandler {
@@ -59,12 +63,19 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// 其他错误（数据库异常等）
-		log.Printf("登录失败: %v", err)
+		authHandlerLog.Error("登录接口系统错误", "error", err)
 		utils.InternalError(w, "登录失败，请稍后重试")
 		return
 	}
 
 	// 登录成功
+	// 审计：用户登录成功
+	repository.WriteAuditLog(resp.User.ID, repository.ActionLogin,
+		map[string]interface{}{
+			"username": resp.User.Username,
+			"role":     resp.User.Role,
+		},
+		repository.GetClientIP(r.RemoteAddr))
 	utils.Success(w, resp)
 }
 
@@ -93,7 +104,7 @@ func (h *AuthHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 			utils.Forbidden(w, "账户已被禁用")
 			return
 		}
-		log.Printf("获取用户信息失败: %v", err)
+		authHandlerLog.Error("获取用户信息失败", "error", err)
 		utils.InternalError(w, "获取用户信息失败")
 		return
 	}
@@ -119,7 +130,17 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("用户登出: %s (%s)", claims.Username, claims.UserID)
+	authHandlerLog.Info("用户登出",
+		"username", claims.Username,
+		"user_id", claims.UserID,
+		"role", claims.Role,
+	)
+	repository.WriteAuditLog(claims.UserID, repository.ActionLogout,
+		map[string]interface{}{
+			"username": claims.Username,
+			"role":     claims.Role,
+		},
+		repository.GetClientIP(r.RemoteAddr))
 	utils.Success(w, nil)
 }
 

@@ -8,6 +8,7 @@ import (
 
 	"tedna/internal/middleware"
 	"tedna/internal/models"
+	"tedna/internal/repository"
 	"tedna/internal/services"
 	"tedna/internal/utils"
 )
@@ -281,6 +282,12 @@ func (h *PipelineHandler) FinalizePipeline(w http.ResponseWriter, r *http.Reques
 		handlePipelineError(w, err)
 		return
 	}
+	// 审计：直接定稿（admin专用）
+	if claims, ok := middleware.GetClaims(r.Context()); ok {
+		repository.WriteAuditLog(claims.UserID, repository.ActionDirectFinalize,
+			map[string]interface{}{"pipeline_id": id, "operator": claims.Username},
+			repository.GetClientIP(r.RemoteAddr))
+	}
 	utils.Success(w, map[string]interface{}{"message": "Pipeline已定稿归档"})
 }
 
@@ -303,6 +310,12 @@ func (h *PipelineHandler) SubmitFinalize(w http.ResponseWriter, r *http.Request)
 		handlePipelineError(w, err)
 		return
 	}
+	// 审计：提交定稿申请
+	if claims, ok := middleware.GetClaims(r.Context()); ok {
+		repository.WriteAuditLog(claims.UserID, repository.ActionSubmitFinalize,
+			map[string]interface{}{"pipeline_id": id, "operator": claims.Username},
+			repository.GetClientIP(r.RemoteAddr))
+	}
 	utils.Success(w, map[string]interface{}{"message": "已提交定稿申请，等待超级审核员确认"})
 }
 
@@ -322,6 +335,12 @@ func (h *PipelineHandler) ConfirmFinalize(w http.ResponseWriter, r *http.Request
 	if err := h.pipelineService.ConfirmFinalize(id); err != nil {
 		handlePipelineError(w, err)
 		return
+	}
+	// 审计：确认定稿
+	if claims, ok := middleware.GetClaims(r.Context()); ok {
+		repository.WriteAuditLog(claims.UserID, repository.ActionConfirmFinalize,
+			map[string]interface{}{"pipeline_id": id, "operator": claims.Username},
+			repository.GetClientIP(r.RemoteAddr))
 	}
 	utils.Success(w, map[string]interface{}{"message": "定稿已确认，Pipeline进入finalized状态"})
 }
@@ -349,6 +368,12 @@ func (h *PipelineHandler) RejectFinalize(w http.ResponseWriter, r *http.Request)
 		handlePipelineError(w, err)
 		return
 	}
+	// 审计：退回重审（含退回原因）
+	if claims, ok := middleware.GetClaims(r.Context()); ok {
+		repository.WriteAuditLog(claims.UserID, repository.ActionRejectFinalize,
+			map[string]interface{}{"pipeline_id": id, "operator": claims.Username, "reason": req.Reason},
+			repository.GetClientIP(r.RemoteAddr))
+	}
 	utils.Success(w, map[string]interface{}{"message": "已退回重审，Pipeline返回待审核状态"})
 }
 
@@ -367,6 +392,12 @@ func (h *PipelineHandler) MarkPassed(w http.ResponseWriter, r *http.Request) {
 	if err := h.pipelineService.MarkPassed(id); err != nil {
 		handlePipelineError(w, err)
 		return
+	}
+	// 审计：快捷通过
+	if claims, ok := middleware.GetClaims(r.Context()); ok {
+		repository.WriteAuditLog(claims.UserID, repository.ActionMarkPassed,
+			map[string]interface{}{"pipeline_id": id, "operator": claims.Username},
+			repository.GetClientIP(r.RemoteAddr))
 	}
 	utils.Success(w, map[string]interface{}{"message": "Pipeline已快捷通过并归档"})
 }
@@ -423,6 +454,12 @@ func (h *PipelineHandler) VerifyPipeline(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		handlePipelineError(w, err)
 		return
+	}
+	// 审计：触发验收
+	if claims, ok := middleware.GetClaims(r.Context()); ok {
+		repository.WriteAuditLog(claims.UserID, repository.ActionVerify,
+			map[string]interface{}{"pipeline_id": id, "operator": claims.Username},
+			repository.GetClientIP(r.RemoteAddr))
 	}
 	utils.Success(w, resp)
 }
