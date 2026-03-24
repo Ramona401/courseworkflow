@@ -574,7 +574,7 @@ export default function PipelinesPage() {
                     {/* P5-3：行选择checkbox */}
                     {canOperate && (
                       <td style={{ ...td, width: 36, textAlign: 'center', padding: '12px 8px' }}
-                        onClick={e => { e.stopPropagation(); toggleSelect(p.id) }}>
+                        onClick={e => e.stopPropagation()}>
                         <input type="checkbox" checked={selectedIds.has(p.id)} onChange={() => toggleSelect(p.id)} style={checkboxStyle} />
                       </td>
                     )}
