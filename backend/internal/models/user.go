@@ -113,8 +113,9 @@ type UserListResponse struct {
 // 角色常量
 const (
 	RoleAdmin    = "admin"    // 管理员：全部权限
-	RoleOperator = "operator" // 操作员：课程处理 + 审核
-	RoleViewer   = "viewer"   // 查看者：只读
+	RoleOperator       = "operator"        // 操作员：课程处理 + 审核
+	RoleSeniorOperator = "senior_operator" // 高级操作员：可分配审核任务 + 创建Pipeline
+	RoleViewer         = "viewer"          // 查看者：只读
 )
 
 // 用户状态常量
