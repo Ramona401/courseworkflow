@@ -49,7 +49,7 @@ func GetDashboardStats() (*DashboardStats, error) {
 	// 1. 课程统计
 	err := database.DB.QueryRow(ctx,
 		`SELECT COUNT(*),
-		        COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM course_indexes ci WHERE ci.course_id = c.id))
+			COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM course_indexes ci WHERE ci.course_id = c.id))
 		 FROM courses c`).Scan(&stats.TotalCourses, &stats.CoursesWithIndex)
 	if err != nil {
 		return nil, fmt.Errorf("查询课程统计失败: %w", err)
@@ -60,20 +60,20 @@ func GetDashboardStats() (*DashboardStats, error) {
 	// evaluator步骤完成且avg_total >= 9.0 的 Pipeline 计入达标
 	err = database.DB.QueryRow(ctx,
 		`WITH eval_passed AS (
-		        SELECT DISTINCT ps.pipeline_id
-		        FROM pipeline_steps ps
-		        WHERE ps.step_name = 'evaluator'
-		          AND ps.status = 'done'
-		          AND ps.step_data IS NOT NULL
-		          AND (ps.step_data->>'avg_total')::numeric >= 9.0
+			SELECT DISTINCT ps.pipeline_id
+			FROM pipeline_steps ps
+			WHERE ps.step_name = 'evaluator'
+			  AND ps.status = 'done'
+			  AND ps.step_data IS NOT NULL
+			  AND (ps.step_data->>'avg_total')::numeric >= 9.0
 		)
 		SELECT
-		        COUNT(*),
-		        COUNT(*) FILTER (WHERE p.status = 'running'),
-		        COUNT(*) FILTER (WHERE p.status = 'review_queue'),
-		        COUNT(*) FILTER (WHERE p.status = 'finalized'),
-		        COUNT(*) FILTER (WHERE p.status = 'failed'),
-		        COUNT(ep.pipeline_id)
+			COUNT(*),
+			COUNT(*) FILTER (WHERE p.status = 'running'),
+			COUNT(*) FILTER (WHERE p.status = 'review_queue'),
+			COUNT(*) FILTER (WHERE p.status = 'finalized'),
+			COUNT(*) FILTER (WHERE p.status = 'failed'),
+			COUNT(ep.pipeline_id)
 		FROM pipelines p
 		LEFT JOIN eval_passed ep ON ep.pipeline_id = p.id`).Scan(
 		&stats.TotalPipelines,
@@ -116,7 +116,7 @@ func CreatePipeline(p *models.Pipeline) error {
 	// 1. 插入Pipeline主记录
 	err = tx.QueryRow(ctx,
 		`INSERT INTO pipelines (course_code, course_name, external_module_id, started_by,
-		        current_step, status, auto_mode, config, review_round)
+			current_step, status, auto_mode, config, review_round)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
 		 RETURNING id, started_at, created_at, updated_at`,
 		p.CourseCode, p.CourseName, p.ExternalModuleID, p.StartedBy,
@@ -161,9 +161,9 @@ func GetPipelineByID(id string) (*models.Pipeline, error) {
 
 	err := database.DB.QueryRow(ctx,
 		`SELECT id, course_code, course_name, external_module_id, started_by,
-		        started_at, completed_at, current_step, status, auto_mode,
-		        error_message, config::text, review_round, assigned_to,
-		        reject_reason, created_at, updated_at
+			started_at, completed_at, current_step, status, auto_mode,
+			error_message, config::text, review_round, assigned_to,
+			reject_reason, created_at, updated_at
 		 FROM pipelines WHERE id = $1`, id).Scan(
 		&p.ID, &p.CourseCode, &courseName, &p.ExternalModuleID, &p.StartedBy,
 		&p.StartedAt, &p.CompletedAt, &p.CurrentStep, &p.Status, &p.AutoMode,
@@ -191,32 +191,52 @@ func GetPipelineByID(id string) (*models.Pipeline, error) {
 	return p, nil
 }
 
+// GetAssignedUserName 根据用户ID获取display_name（单条SQL，用于Pipeline详情等需要获取分配人姓名的场景）
+// v33修复P-03：替代原来的 ListOperatorUsers() 全量查询方案
+// 原方案：每次GetPipelineDetail都查全量用户表（SELECT * FROM users WHERE role IN (...)），只为获取一个人名
+// 新方案：直接按ID查单条记录，索引命中主键，查询代价从 O(N) 降至 O(1)
+// 返回值：display_name 字符串，查询失败或用户不存在时返回空字符串（不影响主流程）
+func GetAssignedUserName(userID string) string {
+	if userID == "" {
+		return ""
+	}
+	ctx := context.Background()
+	var displayName string
+	err := database.DB.QueryRow(ctx,
+		`SELECT display_name FROM users WHERE id = $1`, userID).Scan(&displayName)
+	if err != nil {
+		// 用户不存在或查询失败，返回空字符串，不阻断主流程
+		return ""
+	}
+	return displayName
+}
+
 // pipelineListSelectSQL P4.5-A: Pipeline列表查询的SELECT子句（含3个分数子查询）
 // 从pipeline_steps.step_data JSONB字段提取evaluator均分/meta仲裁分/translator最终分
 // P4.6更新：新增review_round字段
 // 注意：JSONB提取用->>返回text，需要::numeric转换为数值类型
 const pipelineListSelectSQL = `SELECT p.id, p.course_code, p.course_name, p.external_module_id,
-        p.current_step, p.status, p.auto_mode, p.error_message,
-        p.started_by, p.started_at, p.completed_at, p.created_at,
-        p.review_round, p.assigned_to,
-        (SELECT u_assign.display_name FROM users u_assign WHERE u_assign.id = p.assigned_to) AS assigned_name,
-        COALESCE((SELECT COUNT(*) FROM pipeline_steps ps
-                WHERE ps.pipeline_id = p.id AND ps.status = 'done'), 0) AS steps_completed,
-        (SELECT (ps_eval.step_data->>'avg_total')::numeric
-         FROM pipeline_steps ps_eval
-         WHERE ps_eval.pipeline_id = p.id AND ps_eval.step_name = 'evaluator'
-                AND ps_eval.status = 'done' AND ps_eval.step_data IS NOT NULL
-         LIMIT 1) AS eval_avg_score,
-        (SELECT (ps_meta.step_data->>'total_final')::numeric
-         FROM pipeline_steps ps_meta
-         WHERE ps_meta.pipeline_id = p.id AND ps_meta.step_name = 'meta'
-                AND ps_meta.status = 'done' AND ps_meta.step_data IS NOT NULL
-         LIMIT 1) AS meta_score,
-        (SELECT (ps_trans.step_data->>'final_score')::numeric
-         FROM pipeline_steps ps_trans
-         WHERE ps_trans.pipeline_id = p.id AND ps_trans.step_name = 'translator'
-                AND ps_trans.status = 'done' AND ps_trans.step_data IS NOT NULL
-         LIMIT 1) AS translator_score
+	p.current_step, p.status, p.auto_mode, p.error_message,
+	p.started_by, p.started_at, p.completed_at, p.created_at,
+	p.review_round, p.assigned_to,
+	(SELECT u_assign.display_name FROM users u_assign WHERE u_assign.id = p.assigned_to) AS assigned_name,
+	COALESCE((SELECT COUNT(*) FROM pipeline_steps ps
+		WHERE ps.pipeline_id = p.id AND ps.status = 'done'), 0) AS steps_completed,
+	(SELECT (ps_eval.step_data->>'avg_total')::numeric
+	 FROM pipeline_steps ps_eval
+	 WHERE ps_eval.pipeline_id = p.id AND ps_eval.step_name = 'evaluator'
+		AND ps_eval.status = 'done' AND ps_eval.step_data IS NOT NULL
+	 LIMIT 1) AS eval_avg_score,
+	(SELECT (ps_meta.step_data->>'total_final')::numeric
+	 FROM pipeline_steps ps_meta
+	 WHERE ps_meta.pipeline_id = p.id AND ps_meta.step_name = 'meta'
+		AND ps_meta.status = 'done' AND ps_meta.step_data IS NOT NULL
+	 LIMIT 1) AS meta_score,
+	(SELECT (ps_trans.step_data->>'final_score')::numeric
+	 FROM pipeline_steps ps_trans
+	 WHERE ps_trans.pipeline_id = p.id AND ps_trans.step_name = 'translator'
+		AND ps_trans.status = 'done' AND ps_trans.step_data IS NOT NULL
+	 LIMIT 1) AS translator_score
 FROM pipelines p`
 
 // scanPipelineListRow 扫描Pipeline列表行（含3个分数字段+review_round）
@@ -296,8 +316,8 @@ func ListPipelinesForUser(userID string, role string) ([]*models.PipelineListIte
 		// 非admin：看自己发起的 + 分配给自己课程的Pipeline + 直接分配给自己的Pipeline
 		query = pipelineListSelectSQL + `
 		 WHERE p.started_by = $1
-		        OR p.assigned_to = $1
-		        OR p.course_code IN (SELECT uca.course_code FROM user_course_assignments uca WHERE uca.user_id = $1)
+			OR p.assigned_to = $1
+			OR p.course_code IN (SELECT uca.course_code FROM user_course_assignments uca WHERE uca.user_id = $1)
 		 ORDER BY p.created_at DESC`
 		args = append(args, userID)
 	}
@@ -417,9 +437,9 @@ func ResetStepsForRetrial(pipelineID string, stepNames []string) error {
 		_, err = tx.Exec(ctx,
 			`UPDATE pipeline_steps
 			 SET status = $3, started_at = NULL, completed_at = NULL,
-			         duration_ms = 0, attempts = 0, step_data = NULL,
-			         error_message = NULL, model_used = NULL, tokens_used = 0,
-			         updated_at = NOW()
+				 duration_ms = 0, attempts = 0, step_data = NULL,
+				 error_message = NULL, model_used = NULL, tokens_used = 0,
+				 updated_at = NOW()
 			 WHERE pipeline_id = $1 AND step_name = $2`,
 			pipelineID, stepName, models.StepStatusPending,
 		)
@@ -462,9 +482,9 @@ func GetStepsByPipelineID(pipelineID string) ([]*models.PipelineStep, error) {
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, pipeline_id, step_name, step_order, status,
-		        started_at, completed_at, duration_ms, attempts,
-		        step_data::text, error_message, model_used, tokens_used,
-		        created_at, updated_at
+			started_at, completed_at, duration_ms, attempts,
+			step_data::text, error_message, model_used, tokens_used,
+			created_at, updated_at
 		 FROM pipeline_steps
 		 WHERE pipeline_id = $1
 		 ORDER BY step_order ASC`, pipelineID)
@@ -511,9 +531,9 @@ func GetStepByName(pipelineID string, stepName string) (*models.PipelineStep, er
 
 	err := database.DB.QueryRow(ctx,
 		`SELECT id, pipeline_id, step_name, step_order, status,
-		        started_at, completed_at, duration_ms, attempts,
-		        step_data::text, error_message, model_used, tokens_used,
-		        created_at, updated_at
+			started_at, completed_at, duration_ms, attempts,
+			step_data::text, error_message, model_used, tokens_used,
+			created_at, updated_at
 		 FROM pipeline_steps
 		 WHERE pipeline_id = $1 AND step_name = $2`, pipelineID, stepName).Scan(
 		&s.ID, &s.PipelineID, &s.StepName, &s.StepOrder, &s.Status,
@@ -565,7 +585,7 @@ func CompleteStep(pipelineID string, stepName string, durationMs int64, stepData
 	_, err := database.DB.Exec(ctx,
 		`UPDATE pipeline_steps
 		 SET status = $3, completed_at = NOW(), duration_ms = $4,
-		         step_data = $5::jsonb, model_used = $6, tokens_used = $7, updated_at = NOW()
+			 step_data = $5::jsonb, model_used = $6, tokens_used = $7, updated_at = NOW()
 		 WHERE pipeline_id = $1 AND step_name = $2`,
 		pipelineID, stepName, models.StepStatusDone, durationMs,
 		stepDataParam, modelUsed, tokensUsed)
@@ -582,7 +602,7 @@ func FailStep(pipelineID string, stepName string, durationMs int64, errMsg strin
 	_, err := database.DB.Exec(ctx,
 		`UPDATE pipeline_steps
 		 SET status = $3, completed_at = $4, duration_ms = $5,
-		         error_message = $6, updated_at = $4
+			 error_message = $6, updated_at = $4
 		 WHERE pipeline_id = $1 AND step_name = $2`,
 		pipelineID, stepName, models.StepStatusFailed, now, durationMs, errMsg)
 	if err != nil {
@@ -636,8 +656,8 @@ func CompleteEvalRound(roundID string, output string, scoreTotal float64,
 	_, err := database.DB.Exec(ctx,
 		`UPDATE eval_rounds
 		 SET status = $2, output = $3, score_total = $4,
-		         score_e1 = $5, score_e2 = $6, score_e3 = $7, score_e4 = $8,
-		         dimensions = $9::jsonb, model_used = $10, tokens_used = $11
+			 score_e1 = $5, score_e2 = $6, score_e3 = $7, score_e4 = $8,
+			 dimensions = $9::jsonb, model_used = $10, tokens_used = $11
 		 WHERE id = $1`,
 		roundID, models.StepStatusDone, output, scoreTotal,
 		scoreE1, scoreE2, scoreE3, scoreE4,
@@ -681,8 +701,8 @@ func GetEvalRoundsByPipelineID(pipelineID string) ([]*models.EvalRoundRecord, er
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, pipeline_id, round_number, status, output,
-		        score_total, score_e1, score_e2, score_e3, score_e4,
-		        dimensions::text, model_used, tokens_used, created_at
+			score_total, score_e1, score_e2, score_e3, score_e4,
+			dimensions::text, model_used, tokens_used, created_at
 		 FROM eval_rounds
 		 WHERE pipeline_id = $1
 		 ORDER BY round_number ASC`, pipelineID)
@@ -744,8 +764,8 @@ func CreateGeneratedPage(pipelineID string, pageNumber int, pageTitle string,
 
 	_, err := database.DB.Exec(ctx,
 		`INSERT INTO generated_pages (pipeline_id, page_number, page_title,
-		        operation, original_html, generated_html, final_html,
-		        decision, lesson_id, merge_sources, change_reason)
+			operation, original_html, generated_html, final_html,
+			decision, lesson_id, merge_sources, change_reason)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9::jsonb, $10)`,
 		pipelineID, pageNumber, pageTitle,
 		operation, originalHTML, generatedHTML, finalHTML,
@@ -761,11 +781,11 @@ func GetGeneratedPagesByPipelineID(pipelineID string) ([]*GeneratedPageRow, erro
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, pipeline_id, page_number, page_title, operation,
-		        LENGTH(COALESCE(original_html,'')) as orig_len,
-		        LENGTH(COALESCE(generated_html,'')) as gen_len,
-		        LENGTH(COALESCE(final_html,'')) as final_len,
-		        decision, lesson_id, merge_sources::text,
-		        created_at, updated_at
+			LENGTH(COALESCE(original_html,'')) as orig_len,
+			LENGTH(COALESCE(generated_html,'')) as gen_len,
+			LENGTH(COALESCE(final_html,'')) as final_len,
+			decision, lesson_id, merge_sources::text,
+			created_at, updated_at
 		 FROM generated_pages
 		 WHERE pipeline_id = $1
 		 ORDER BY page_number ASC`, pipelineID)
@@ -812,12 +832,12 @@ func GetGeneratedPagesWithHTML(pipelineID string) ([]*GeneratedPageFullRow, erro
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, pipeline_id, page_number, page_title, operation,
-		        COALESCE(original_html, '') as original_html,
-		        COALESCE(generated_html, '') as generated_html,
-		        COALESCE(final_html, '') as final_html,
-		        decision, lesson_id, merge_sources::text,
-		        COALESCE(change_reason, '') as change_reason,
-		        created_at, updated_at
+			COALESCE(original_html, '') as original_html,
+			COALESCE(generated_html, '') as generated_html,
+			COALESCE(final_html, '') as final_html,
+			decision, lesson_id, merge_sources::text,
+			COALESCE(change_reason, '') as change_reason,
+			created_at, updated_at
 		 FROM generated_pages
 		 WHERE pipeline_id = $1
 		 ORDER BY page_number ASC`, pipelineID)
@@ -893,7 +913,7 @@ func GetPageDecisionStats(pipelineID string) (total int, decided int, err error)
 	ctx := context.Background()
 	err = database.DB.QueryRow(ctx,
 		`SELECT COUNT(*),
-		        COUNT(*) FILTER (WHERE decision IN ('approve', 'reject', 'edit'))
+			COUNT(*) FILTER (WHERE decision IN ('approve', 'reject', 'edit'))
 		 FROM generated_pages WHERE pipeline_id = $1`, pipelineID).Scan(&total, &decided)
 	if err != nil {
 		return 0, 0, fmt.Errorf("查询页面决策统计失败: %w", err)

@@ -202,8 +202,9 @@ func (s *PipelineService) ListPipelines(userID string, role string) (*models.Pip
 }
 
 // GetPipelineDetail 获取Pipeline详情（含步骤列表）
-// Phase8修复P-03（部分）：原版查全量用户只为取一人名，改为直接从 ListOperatorUsers 复用缓存
-// 注：完整P-03修复（SQL子查询）待Phase8统一优化数据访问层
+// v33修复P-03：使用 GetAssignedUserName() 按主键直接查单条用户记录获取人名
+// 原版：调用 ListOperatorUsers() 查全量活跃用户表，遍历数组匹配ID，查询代价 O(N)
+// 修复后：直接 SELECT display_name FROM users WHERE id=$1，主键索引命中，查询代价 O(1)
 func (s *PipelineService) GetPipelineDetail(id string) (*models.PipelineDetailResponse, error) {
 	pipeline, err := repository.GetPipelineByID(id)
 	if err != nil {
@@ -235,15 +236,11 @@ func (s *PipelineService) GetPipelineDetail(id string) (*models.PipelineDetailRe
 		})
 	}
 
+	// v33修复P-03：直接按主键查单条用户记录获取display_name
+	// 替代原来的 ListOperatorUsers() 全量查询 + 数组遍历匹配
 	var assignedName string
 	if pipeline.AssignedTo != nil && *pipeline.AssignedTo != "" {
-		operators, _ := repository.ListOperatorUsers()
-		for _, op := range operators {
-			if op["id"] == *pipeline.AssignedTo {
-				assignedName = op["display_name"]
-				break
-			}
-		}
+		assignedName = repository.GetAssignedUserName(*pipeline.AssignedTo)
 	}
 
 	return &models.PipelineDetailResponse{
@@ -266,6 +263,7 @@ func (s *PipelineService) GetPipelineDetail(id string) (*models.PipelineDetailRe
 		ReviewRound:      pipeline.ReviewRound,
 		AssignedTo:       pipeline.AssignedTo,
 		AssignedName:     assignedName,
+		RejectReason:     pipeline.RejectReason,
 		Steps:            stepItems,
 	}, nil
 }
@@ -1955,6 +1953,8 @@ type BatchAssignResult struct {
 	FailedIDs      []string `json:"failed_ids"`
 }
 
+// AssignPipeline 分配Pipeline给指定审核员
+// v33修复P-03：使用 GetAssignedUserName() 替代 ListOperatorUsers() 获取人名
 func (s *PipelineService) AssignPipeline(pipelineID string, assignedToUserID string) (*AssignPipelineResult, error) {
 	_, err := repository.GetPipelineByID(pipelineID)
 	if err != nil {
@@ -1969,16 +1969,8 @@ func (s *PipelineService) AssignPipeline(pipelineID string, assignedToUserID str
 		return nil, fmt.Errorf("分配失败: %w", err)
 	}
 
-	assignedName := ""
-	if assignedToUserID != "" {
-		operators, _ := repository.ListOperatorUsers()
-		for _, op := range operators {
-			if op["id"] == assignedToUserID {
-				assignedName = op["display_name"]
-				break
-			}
-		}
-	}
+	// v33修复P-03：直接按主键查单条用户记录获取display_name
+	assignedName := repository.GetAssignedUserName(assignedToUserID)
 
 	return &AssignPipelineResult{
 		PipelineID:   pipelineID,
@@ -1987,6 +1979,8 @@ func (s *PipelineService) AssignPipeline(pipelineID string, assignedToUserID str
 	}, nil
 }
 
+// BatchAssignPipelines 批量分配Pipeline给指定审核员
+// v33修复P-03：使用 GetAssignedUserName() 替代 ListOperatorUsers() 获取人名
 func (s *PipelineService) BatchAssignPipelines(pipelineIDs []string, assignedToUserID string) (*BatchAssignResult, error) {
 	var assignPtr *string
 	if assignedToUserID != "" {
@@ -1998,16 +1992,8 @@ func (s *PipelineService) BatchAssignPipelines(pipelineIDs []string, assignedToU
 		return nil, fmt.Errorf("批量分配失败: %w", err)
 	}
 
-	assignedName := ""
-	if assignedToUserID != "" {
-		operators, _ := repository.ListOperatorUsers()
-		for _, op := range operators {
-			if op["id"] == assignedToUserID {
-				assignedName = op["display_name"]
-				break
-			}
-		}
-	}
+	// v33修复P-03：直接按主键查单条用户记录获取display_name
+	assignedName := repository.GetAssignedUserName(assignedToUserID)
 
 	return &BatchAssignResult{
 		TotalRequested: len(pipelineIDs),
