@@ -47,6 +47,10 @@ export interface PipelineListItem {
   translator_score: number | null
   /** P4.6新增：审核轮次（1=初审，2=2审） */
   review_round: number
+  /** P6-2新增：分配给哪个审核员（用户ID，可能为null） */
+  assigned_to: string | null
+  /** P6-2新增：分配审核员的显示名称 */
+  assigned_name: string
 }
 
 /** Pipeline列表响应 */
@@ -93,6 +97,10 @@ export interface PipelineDetailResponse {
   updated_at: string | null
   /** P4.6新增：审核轮次（1=初审，2=2审） */
   review_round: number
+  /** P6-2新增：分配审核员ID */
+  assigned_to: string | null
+  /** P6-2新增：分配审核员名称 */
+  assigned_name: string
   steps: StepListItem[]
 }
 
@@ -486,4 +494,43 @@ export async function batchCreatePipelines(courseCodes: string[]) {
 export async function batchStartPipelines(pipelineIds: string[]) {
   const res = await client.post('/pipelines/batch-start', { pipeline_ids: pipelineIds })
   return (res.data as any).data as BatchStartResult
+}
+
+
+// ==================== P6-2 审核分配API ====================
+
+/** 审核员信息 */
+export interface OperatorInfo {
+  id: string
+  username: string
+  display_name: string
+  role: string
+}
+
+/** 批量分配结果 */
+export interface BatchAssignResult {
+  total_requested: number
+  success_count: number
+  assigned_to: string
+  assigned_name: string
+  failed_ids: string[]
+}
+
+/** 获取可分配的审核员列表 */
+export async function getOperators() {
+  const res = await client.get('/pipelines/operators')
+  const data = (res.data as any).data
+  return data.operators as OperatorInfo[]
+}
+
+/** 分配单个Pipeline给审核员 */
+export async function assignPipeline(pipelineId: string, assignedTo: string) {
+  const res = await client.post('/pipelines/' + pipelineId + '/assign', { assigned_to: assignedTo })
+  return (res.data as any).data
+}
+
+/** 批量分配Pipeline给审核员 */
+export async function batchAssignPipelines(pipelineIds: string[], assignedTo: string) {
+  const res = await client.post('/pipelines/batch-assign', { pipeline_ids: pipelineIds, assigned_to: assignedTo })
+  return (res.data as any).data as BatchAssignResult
 }

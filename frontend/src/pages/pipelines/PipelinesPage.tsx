@@ -542,7 +542,7 @@ export default function PipelinesPage() {
           </div>
         ) : (
           <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 950 }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 1050 }}>
               <thead>
                 <tr style={{ background: 'rgba(0,0,0,0.02)' }}>
                   {/* P5-3：全选checkbox */}
@@ -559,6 +559,7 @@ export default function PipelinesPage() {
                   <th style={{ ...th, textAlign: 'center' }}>Meta分</th>
                   <th style={{ ...th, textAlign: 'center' }}>翻译分</th>
                   <th style={th}>进度</th>
+                  <th style={th}>分配给</th>
                   <th style={th}>创建时间</th>
                   <th style={{ ...th, textAlign: 'center' }}>操作</th>
                 </tr>
@@ -588,6 +589,9 @@ export default function PipelinesPage() {
                     <td style={{ ...td, textAlign: 'center' }}><ScoreCell value={p.meta_score} /></td>
                     <td style={{ ...td, textAlign: 'center' }}><ScoreCell value={p.translator_score} /></td>
                     <td style={{ ...td, minWidth: 100 }}><ProgressBar completed={p.steps_completed} total={p.steps_total} /></td>
+                    <td style={{ ...td, fontSize: 12, color: p.assigned_name ? '#5856d6' : '#c7c7cc', whiteSpace: 'nowrap' }}>
+                      {p.assigned_name || '-'}
+                    </td>
                     <td style={{ ...td, fontSize: 12, color: '#aeaeb2', whiteSpace: 'nowrap' }}>{formatTime(p.created_at)}</td>
                     <td style={{ ...td, textAlign: 'center' }} onClick={e => e.stopPropagation()}>
                       <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>

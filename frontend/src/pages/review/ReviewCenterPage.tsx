@@ -15,13 +15,13 @@ import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import {
-  getPipelines, markPassed,
-  type PipelineListItem,
+  getPipelines, markPassed, getOperators, batchAssignPipelines,
+  type PipelineListItem, type OperatorInfo,
 } from '@/api/pipelines'
 import {
   ClipboardCheck, RefreshCw, Zap, AlertTriangle,
   CheckCircle, ArrowRight, Loader, ShieldCheck,
-  FileText, XCircle,
+  FileText, XCircle, UserPlus, X, Users,
 } from 'lucide-react'
 
 // ==================== Toast组件 ====================
@@ -150,12 +150,19 @@ export default function ReviewCenterPage() {
   const navigate = useNavigate()
   const { user } = useAuth()
   const canOperate = user?.role === 'admin' || user?.role === 'operator'
+  const isAdmin = user?.role === 'admin'
 
   const [pipelines, setPipelines] = useState<PipelineListItem[]>([])
   const [loading, setLoading] = useState(true)
   const [toast, setToast] = useState<{ message: string; type: 'ok' | 'err' | 'info' } | null>(null)
   // 已完成区域的折叠状态
   const [showCompleted, setShowCompleted] = useState(true)
+  // P6-2：批量分配相关状态
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [showAssignDialog, setShowAssignDialog] = useState(false)
+  const [operators, setOperators] = useState<OperatorInfo[]>([])
+  const [selectedOperator, setSelectedOperator] = useState('')
+  const [assigning, setAssigning] = useState(false)
 
   /** 加载所有Pipeline数据 */
   const loadData = useCallback(async () => {
@@ -170,6 +177,63 @@ export default function ReviewCenterPage() {
   }, [])
 
   useEffect(() => { loadData() }, [loadData])
+
+  /** P6-2：加载可分配的审核员列表 */
+  const loadOperators = async () => {
+    try {
+      const ops = await getOperators()
+      setOperators(ops || [])
+    } catch { /* 静默忽略 */ }
+  }
+
+  /** P6-2：打开分配弹窗 */
+  const openAssignDialog = async () => {
+    if (selectedIds.size === 0) {
+      setToast({ message: '请先选择要分配的Pipeline', type: 'info' })
+      return
+    }
+    await loadOperators()
+    setSelectedOperator('')
+    setShowAssignDialog(true)
+  }
+
+  /** P6-2：执行批量分配 */
+  const handleBatchAssign = async () => {
+    if (!selectedOperator) {
+      setToast({ message: '请选择审核员', type: 'info' })
+      return
+    }
+    setAssigning(true)
+    try {
+      const ids = Array.from(selectedIds)
+      const result = await batchAssignPipelines(ids, selectedOperator)
+      setToast({ message: '分配成功: ' + result.success_count + ' 个Pipeline已分配给 ' + result.assigned_name, type: 'ok' })
+      setShowAssignDialog(false)
+      setSelectedIds(new Set())
+      loadData()
+    } catch (e: any) {
+      setToast({ message: '分配失败: ' + (e.message || ''), type: 'err' })
+    }
+    setAssigning(false)
+  }
+
+  /** P6-2：多选操作 */
+  const toggleSelect = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+  const toggleSelectAllPending = () => {
+    if (selectedIds.size === pendingReview.length && pendingReview.length > 0) {
+      setSelectedIds(new Set())
+    } else {
+      setSelectedIds(new Set(pendingReview.map(p => p.id)))
+    }
+  }
+  const isAllPendingSelected = pendingReview.length > 0 && selectedIds.size === pendingReview.length
 
   // ===== 数据分组与排序 =====
 
@@ -235,9 +299,16 @@ export default function ReviewCenterPage() {
         <p style={{ fontSize: 14, color: '#86868b', margin: 0 }}>
           集中管理所有待审核的Pipeline课程
         </p>
-        <button style={btn} onClick={loadData}>
-          <RefreshCw size={14} /> 刷新
-        </button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          {canOperate && isAdmin && selectedIds.size > 0 && (
+            <button style={{ ...btn, background: '#5856d6', color: '#fff', border: '1px solid #5856d6' }} onClick={openAssignDialog}>
+              <UserPlus size={14} /> 分配审核员 ({selectedIds.size})
+            </button>
+          )}
+          <button style={btn} onClick={loadData}>
+            <RefreshCw size={14} /> 刷新
+          </button>
+        </div>
       </div>
 
       {/* ===== 统计卡片 ===== */}
@@ -285,6 +356,10 @@ export default function ReviewCenterPage() {
             padding: '16px 20px', borderBottom: '1px solid rgba(0,0,0,0.04)',
             background: 'rgba(255,149,0,0.03)',
           }}>
+            {isAdmin && pendingReview.length > 0 && (
+              <input type="checkbox" checked={isAllPendingSelected} onChange={toggleSelectAllPending}
+                style={{ width: 16, height: 16, cursor: 'pointer', accentColor: '#5856d6' }} />
+            )}
             <ClipboardCheck size={18} color="#ff9500" />
             <span style={{ fontSize: 15, fontWeight: 700, color: '#1c1c1e' }}>待审核队列</span>
             <span style={{
@@ -324,6 +399,14 @@ export default function ReviewCenterPage() {
                   onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(0,122,255,0.03)' }}
                   onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}
                 >
+                  {/* P6-2：选择checkbox */}
+                  {isAdmin && (
+                    <div onClick={e => { e.stopPropagation(); toggleSelect(p.id) }} style={{ flexShrink: 0 }}>
+                      <input type="checkbox" checked={selectedIds.has(p.id)} onChange={() => toggleSelect(p.id)}
+                        style={{ width: 16, height: 16, cursor: 'pointer', accentColor: '#5856d6' }} />
+                    </div>
+                  )}
+
                   {/* 优先级指示器 */}
                   <div style={{
                     width: 4, height: 40, borderRadius: 2, flexShrink: 0,
@@ -343,6 +426,11 @@ export default function ReviewCenterPage() {
                       overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                     }}>
                       {p.course_name || p.course_code}
+                      {p.assigned_name && (
+                        <span style={{ marginLeft: 8, fontSize: 11, color: '#5856d6', fontWeight: 500 }}>
+                          <Users size={10} style={{ verticalAlign: -1, marginRight: 2 }} />{p.assigned_name}
+                        </span>
+                      )}
                     </div>
                   </div>
 
@@ -492,6 +580,91 @@ export default function ReviewCenterPage() {
 
       {/* 旋转动画CSS */}
       <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+
+      {/* P6-2：批量分配弹窗 */}
+      {showAssignDialog && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(4px)',
+          zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }} onClick={e => { if (e.target === e.currentTarget && !assigning) setShowAssignDialog(false) }}>
+          <div style={{
+            background: '#fff', borderRadius: 20, width: 440, maxWidth: '94vw',
+            padding: 28, boxShadow: '0 20px 60px rgba(0,0,0,0.2)',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
+              <UserPlus size={20} color="#5856d6" />
+              <div style={{ fontSize: 18, fontWeight: 700, color: '#1c1c1e', flex: 1 }}>
+                分配审核员
+              </div>
+              <button onClick={() => !assigning && setShowAssignDialog(false)} style={{
+                background: '#f2f2f7', border: 'none', borderRadius: '50%', width: 30, height: 30,
+                display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+              }}><X size={16} color="#8e8e93" /></button>
+            </div>
+
+            <div style={{ fontSize: 13, color: '#86868b', marginBottom: 16 }}>
+              将 <span style={{ fontWeight: 600, color: '#1c1c1e' }}>{selectedIds.size}</span> 个Pipeline分配给指定审核员
+            </div>
+
+            {/* 审核员选择 */}
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ fontSize: 13, fontWeight: 600, color: '#1c1c1e', display: 'block', marginBottom: 8 }}>
+                选择审核员
+              </label>
+              {operators.length === 0 ? (
+                <div style={{ fontSize: 13, color: '#aeaeb2', padding: '12px 0' }}>暂无可分配的审核员</div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {operators.map(op => (
+                    <div key={op.id}
+                      onClick={() => setSelectedOperator(op.id)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 12,
+                        padding: '10px 14px', borderRadius: 10, cursor: 'pointer',
+                        border: selectedOperator === op.id ? '2px solid #5856d6' : '1px solid rgba(0,0,0,0.08)',
+                        background: selectedOperator === op.id ? 'rgba(88,86,214,0.05)' : '#fff',
+                        transition: 'all 0.15s ease',
+                      }}>
+                      <div style={{
+                        width: 32, height: 32, borderRadius: '50%',
+                        background: selectedOperator === op.id ? '#5856d6' : 'rgba(88,86,214,0.1)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        color: selectedOperator === op.id ? '#fff' : '#5856d6',
+                        fontSize: 13, fontWeight: 600, flexShrink: 0,
+                      }}>{op.display_name.charAt(0)}</div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: '#1c1c1e' }}>{op.display_name}</div>
+                        <div style={{ fontSize: 11, color: '#86868b' }}>{op.username} · {op.role === 'admin' ? '管理员' : '操作员'}</div>
+                      </div>
+                      {selectedOperator === op.id && (
+                        <CheckCircle size={18} color="#5856d6" />
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* 操作按钮 */}
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button onClick={() => !assigning && setShowAssignDialog(false)} style={{
+                padding: '10px 20px', borderRadius: 10, border: '1px solid rgba(0,0,0,0.08)',
+                background: '#fff', fontSize: 14, fontWeight: 500, cursor: 'pointer', color: '#3c3c43',
+              }}>取消</button>
+              <button onClick={handleBatchAssign}
+                disabled={!selectedOperator || assigning}
+                style={{
+                  padding: '10px 24px', borderRadius: 10, border: 'none',
+                  background: selectedOperator && !assigning ? '#5856d6' : '#c7c7cc',
+                  color: '#fff', fontSize: 14, fontWeight: 600,
+                  cursor: selectedOperator && !assigning ? 'pointer' : 'not-allowed',
+                }}>
+                {assigning ? '分配中...' : '确认分配'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Toast */}
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
