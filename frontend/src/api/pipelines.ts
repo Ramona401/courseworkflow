@@ -6,8 +6,25 @@
  *   原版调用 POST /pipelines/{id}/assign，但 routes.go 中该路由不存在（只有 /batch-assign）
  *   修复：移除该函数，所有分配操作统一走 batchAssignPipelines（单条分配传一个ID即可）
  * Phase8修复P-02：PipelineDetailResponse 新增 reject_reason 字段
+ * v33修复A-01：消除全部 (res.data as any).data 类型绕过
+ *   使用 extractData<T>() 辅助函数，统一从 AxiosResponse<ApiResponse<T>> 中安全提取数据
+ *   所有API函数均获得完整的泛型类型推导，不再依赖 as any 强制转换
  */
 import client from './client'
+import type { ApiResponse } from './client'
+import type { AxiosResponse } from 'axios'
+
+// ==================== 辅助函数（v33修复A-01） ====================
+
+/**
+ * extractData 从 Axios 响应中安全提取业务数据
+ * v33修复A-01：替代全部 (res.data as any).data 写法
+ * 统一类型推导链：AxiosResponse<ApiResponse<T>> → ApiResponse<T>.data → T
+ * 注意：响应拦截器已处理 code !== 0 的情况（reject），这里只处理成功响应
+ */
+function extractData<T>(res: AxiosResponse<ApiResponse<T>>): T {
+  return res.data.data as T
+}
 
 // ==================== 类型定义 ====================
 
@@ -304,43 +321,61 @@ export interface VerifyStepData {
   latency_ms: number
 }
 
-// ==================== API方法 ====================
+// ==================== 后端包装响应类型（用于嵌套data结构） ====================
+// 部分接口返回 { pages: [...] } 或 { rounds: [...] } 等嵌套结构
+// 定义中间类型供 extractData 正确推导
 
-export async function getPipelines() {
-  const res = await client.get('/pipelines')
-  return (res.data as any).data as PipelineListResponse
+/** 生成页面列表响应包装 */
+interface PagesWrapper {
+  pages: GeneratedPageFull[]
 }
 
-export async function getPipelineDetail(id: string) {
-  const res = await client.get('/pipelines/' + id)
-  return (res.data as any).data as PipelineDetailResponse
+/** 评估轮次列表响应包装 */
+interface EvalRoundsWrapper {
+  rounds: EvalRoundDetail[]
 }
 
-export async function createPipeline(req: CreatePipelineRequest) {
-  const res = await client.post('/pipelines', req)
-  return (res.data as any).data
+/** 操作员列表响应包装 */
+interface OperatorsWrapper {
+  operators: OperatorInfo[]
 }
 
-export async function startPipeline(id: string) {
-  const res = await client.post('/pipelines/' + id + '/start', null, {
+// ==================== API方法（v33修复A-01：全部使用 extractData<T> 替代 as any） ====================
+
+export async function getPipelines(): Promise<PipelineListResponse> {
+  const res = await client.get<ApiResponse<PipelineListResponse>>('/pipelines')
+  return extractData<PipelineListResponse>(res)
+}
+
+export async function getPipelineDetail(id: string): Promise<PipelineDetailResponse> {
+  const res = await client.get<ApiResponse<PipelineDetailResponse>>('/pipelines/' + id)
+  return extractData<PipelineDetailResponse>(res)
+}
+
+export async function createPipeline(req: CreatePipelineRequest): Promise<PipelineDetailResponse> {
+  const res = await client.post<ApiResponse<PipelineDetailResponse>>('/pipelines', req)
+  return extractData<PipelineDetailResponse>(res)
+}
+
+export async function startPipeline(id: string): Promise<PipelineDetailResponse> {
+  const res = await client.post<ApiResponse<PipelineDetailResponse>>('/pipelines/' + id + '/start', null, {
     timeout: 3600000,
   })
-  return (res.data as any).data
+  return extractData<PipelineDetailResponse>(res)
 }
 
-export async function cancelPipeline(id: string) {
-  const res = await client.post('/pipelines/' + id + '/cancel')
-  return (res.data as any).data
+export async function cancelPipeline(id: string): Promise<PipelineDetailResponse> {
+  const res = await client.post<ApiResponse<PipelineDetailResponse>>('/pipelines/' + id + '/cancel')
+  return extractData<PipelineDetailResponse>(res)
 }
 
-export async function deletePipeline(id: string) {
-  const res = await client.delete('/pipelines/' + id)
-  return (res.data as any).data
+export async function deletePipeline(id: string): Promise<void> {
+  await client.delete<ApiResponse<void>>('/pipelines/' + id)
 }
 
-export async function getStepDetail(pipelineId: string, stepName: string) {
-  const res = await client.get('/pipelines/' + pipelineId + '/steps/' + stepName)
-  return (res.data as any).data as StepDetailResponse
+export async function getStepDetail(pipelineId: string, stepName: string): Promise<StepDetailResponse> {
+  const res = await client.get<ApiResponse<StepDetailResponse>>('/pipelines/' + pipelineId + '/steps/' + stepName)
+  return extractData<StepDetailResponse>(res)
 }
 
 // ==================== Eval Rounds API ====================
@@ -361,39 +396,37 @@ export interface EvalRoundDetail {
   tokens_used: number
 }
 
-export async function getEvalRounds(pipelineId: string) {
-  const res = await client.get('/pipelines/' + pipelineId + '/eval-rounds')
-  const data = (res.data as any).data
-  return data.rounds as EvalRoundDetail[]
+export async function getEvalRounds(pipelineId: string): Promise<EvalRoundDetail[]> {
+  const res = await client.get<ApiResponse<EvalRoundsWrapper>>('/pipelines/' + pipelineId + '/eval-rounds')
+  const data = extractData<EvalRoundsWrapper>(res)
+  return data.rounds
 }
 
 // ==================== 审核相关API ====================
 
-export async function getGeneratedPages(pipelineId: string) {
-  const res = await client.get('/pipelines/' + pipelineId + '/pages')
-  const data = (res.data as any).data
-  return data.pages as GeneratedPageFull[]
+export async function getGeneratedPages(pipelineId: string): Promise<GeneratedPageFull[]> {
+  const res = await client.get<ApiResponse<PagesWrapper>>('/pipelines/' + pipelineId + '/pages')
+  const data = extractData<PagesWrapper>(res)
+  return data.pages
 }
 
 export async function updatePageDecision(
   pipelineId: string,
   pageNumber: number,
   req: UpdatePageDecisionRequest
-) {
-  const res = await client.put(
+): Promise<void> {
+  await client.put<ApiResponse<void>>(
     '/pipelines/' + pipelineId + '/pages/' + pageNumber + '/decision',
     req
   )
-  return (res.data as any).data
 }
 
 /**
  * 直接定稿归档（仅admin可用，跳过二级审批）
  * P7更新：普通操作员请使用 submitFinalize
  */
-export async function finalizePipeline(pipelineId: string) {
-  const res = await client.post('/pipelines/' + pipelineId + '/finalize')
-  return (res.data as any).data
+export async function finalizePipeline(pipelineId: string): Promise<void> {
+  await client.post<ApiResponse<void>>('/pipelines/' + pipelineId + '/finalize')
 }
 
 // ==================== P7新增：二级审批API ====================
@@ -403,18 +436,16 @@ export async function finalizePipeline(pipelineId: string) {
  * P7新增：审核员完成逐页决策后调用，状态变为 pending_finalize
  * 权限：operator / senior_operator / admin
  */
-export async function submitFinalize(pipelineId: string) {
-  const res = await client.post('/pipelines/' + pipelineId + '/submit-finalize')
-  return (res.data as any).data
+export async function submitFinalize(pipelineId: string): Promise<void> {
+  await client.post<ApiResponse<void>>('/pipelines/' + pipelineId + '/submit-finalize')
 }
 
 /**
  * 确认定稿（超级审核员确认，pending_finalize→finalized）
  * P7新增：senior_operator / admin 在审核中心确认定稿
  */
-export async function confirmFinalize(pipelineId: string) {
-  const res = await client.post('/pipelines/' + pipelineId + '/confirm-finalize')
-  return (res.data as any).data
+export async function confirmFinalize(pipelineId: string): Promise<void> {
+  await client.post<ApiResponse<void>>('/pipelines/' + pipelineId + '/confirm-finalize')
 }
 
 /**
@@ -422,19 +453,17 @@ export async function confirmFinalize(pipelineId: string) {
  * P7新增：senior_operator / admin 退回给原审核员重新审核
  * Phase8修复P-02：退回原因现在会持久化到数据库，审核员可在审核页面看到
  */
-export async function rejectFinalize(pipelineId: string, reason?: string) {
-  const res = await client.post(
+export async function rejectFinalize(pipelineId: string, reason?: string): Promise<void> {
+  await client.post<ApiResponse<void>>(
     '/pipelines/' + pipelineId + '/reject-finalize',
     { reason: reason || '' }
   )
-  return (res.data as any).data
 }
 
 // ==================== 快捷通过API ====================
 
-export async function markPassed(pipelineId: string) {
-  const res = await client.post('/pipelines/' + pipelineId + '/mark-passed')
-  return (res.data as any).data
+export async function markPassed(pipelineId: string): Promise<void> {
+  await client.post<ApiResponse<void>>('/pipelines/' + pipelineId + '/mark-passed')
 }
 
 // ==================== AI快修API ====================
@@ -454,22 +483,22 @@ export async function aiFixPage(
   pipelineId: string,
   pageNumber: number,
   req: AIFixPageRequest
-) {
-  const res = await client.post(
+): Promise<AIFixPageResponse> {
+  const res = await client.post<ApiResponse<AIFixPageResponse>>(
     '/pipelines/' + pipelineId + '/pages/' + pageNumber + '/ai-fix',
     req,
     { timeout: 600000 }
   )
-  return (res.data as any).data as AIFixPageResponse
+  return extractData<AIFixPageResponse>(res)
 }
 
 // ==================== 验收API ====================
 
-export async function verifyPipeline(pipelineId: string) {
-  const res = await client.post('/pipelines/' + pipelineId + '/verify', null, {
+export async function verifyPipeline(pipelineId: string): Promise<PipelineDetailResponse> {
+  const res = await client.post<ApiResponse<PipelineDetailResponse>>('/pipelines/' + pipelineId + '/verify', null, {
     timeout: 1800000,
   })
-  return (res.data as any).data as PipelineDetailResponse
+  return extractData<PipelineDetailResponse>(res)
 }
 
 // ==================== 批量操作API ====================
@@ -492,18 +521,18 @@ export interface BatchStartResult {
   failed_reasons: string[]
 }
 
-export async function batchCreatePipelines(courseCodes: string[]) {
-  const res = await client.post('/pipelines/batch-create', {
+export async function batchCreatePipelines(courseCodes: string[]): Promise<BatchCreateResult> {
+  const res = await client.post<ApiResponse<BatchCreateResult>>('/pipelines/batch-create', {
     course_codes: courseCodes,
   })
-  return (res.data as any).data as BatchCreateResult
+  return extractData<BatchCreateResult>(res)
 }
 
-export async function batchStartPipelines(pipelineIds: string[]) {
-  const res = await client.post('/pipelines/batch-start', {
+export async function batchStartPipelines(pipelineIds: string[]): Promise<BatchStartResult> {
+  const res = await client.post<ApiResponse<BatchStartResult>>('/pipelines/batch-start', {
     pipeline_ids: pipelineIds,
   })
-  return (res.data as any).data as BatchStartResult
+  return extractData<BatchStartResult>(res)
 }
 
 // ==================== 审核分配API ====================
@@ -523,10 +552,10 @@ export interface BatchAssignResult {
   failed_ids: string[]
 }
 
-export async function getOperators() {
-  const res = await client.get('/pipelines/operators')
-  const data = (res.data as any).data
-  return data.operators as OperatorInfo[]
+export async function getOperators(): Promise<OperatorInfo[]> {
+  const res = await client.get<ApiResponse<OperatorsWrapper>>('/pipelines/operators')
+  const data = extractData<OperatorsWrapper>(res)
+  return data.operators
 }
 
 /**
@@ -541,10 +570,10 @@ export async function getOperators() {
 export async function batchAssignPipelines(
   pipelineIds: string[],
   assignedTo: string
-) {
-  const res = await client.post('/pipelines/batch-assign', {
+): Promise<BatchAssignResult> {
+  const res = await client.post<ApiResponse<BatchAssignResult>>('/pipelines/batch-assign', {
     pipeline_ids: pipelineIds,
     assigned_to: assignedTo,
   })
-  return (res.data as any).data as BatchAssignResult
+  return extractData<BatchAssignResult>(res)
 }
