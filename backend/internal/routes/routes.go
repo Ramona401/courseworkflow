@@ -474,7 +474,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"version": "0.28.0",
+		"version": "0.29.0",
 		"time":    time.Now().Format(time.RFC3339),
 	})
 }

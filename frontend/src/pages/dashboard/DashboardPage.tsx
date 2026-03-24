@@ -217,7 +217,7 @@ export default function DashboardPage() {
           系统信息
         </h3>
         <p style={{ fontSize: 13, color: '#86868b', margin: 0, lineHeight: 1.8 }}>
-          版本 0.19.0 · Phase 4.5-D · Go + React + PostgreSQL · 7步Pipeline自动评估引擎
+          版本 0.29.0 · Phase 6 · Go + React + PostgreSQL · 8步Pipeline自动评估引擎 + 审核中心
         </p>
       </div>
     </div>
