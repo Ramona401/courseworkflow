@@ -751,3 +751,90 @@ func (h *PipelineHandler) BatchStart(w http.ResponseWriter, r *http.Request) {
 
 	utils.Success(w, result)
 }
+
+
+// ==================== P6-2 审核分配接口 ====================
+
+// AssignPipeline POST /api/v1/pipelines/{id}/assign
+// 分配Pipeline给指定审核员（admin only）
+// P6-2新增：审核任务分配
+func (h *PipelineHandler) AssignPipeline(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+
+	id := extractPipelineIDWithSuffix(r.URL.Path, "/assign")
+	if id == "" {
+		utils.BadRequest(w, "缺少Pipeline ID")
+		return
+	}
+
+	var req struct {
+		AssignedTo string `json:"assigned_to"` // 审核员用户ID（空字符串=取消分配）
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+
+	result, err := h.pipelineService.AssignPipeline(id, req.AssignedTo)
+	if err != nil {
+		handlePipelineError(w, err)
+		return
+	}
+
+	utils.Success(w, result)
+}
+
+// BatchAssign POST /api/v1/pipelines/batch-assign
+// 批量分配Pipeline给指定审核员（admin only）
+// P6-2新增：审核中心批量分配
+func (h *PipelineHandler) BatchAssign(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+
+	var req struct {
+		PipelineIDs []string `json:"pipeline_ids"` // Pipeline ID列表
+		AssignedTo  string   `json:"assigned_to"`  // 审核员用户ID
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+	if len(req.PipelineIDs) == 0 {
+		utils.BadRequest(w, "Pipeline ID列表不能为空")
+		return
+	}
+
+	result, err := h.pipelineService.BatchAssignPipelines(req.PipelineIDs, req.AssignedTo)
+	if err != nil {
+		utils.InternalError(w, "批量分配失败: "+err.Error())
+		return
+	}
+
+	utils.Success(w, result)
+}
+
+// GetOperators GET /api/v1/pipelines/operators
+// 获取可分配的审核员列表（admin + operator）
+// P6-2新增：供前端分配弹窗选择审核员
+func (h *PipelineHandler) GetOperators(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		return
+	}
+
+	operators, err := h.pipelineService.GetOperatorUsers()
+	if err != nil {
+		utils.InternalError(w, "获取审核员列表失败: "+err.Error())
+		return
+	}
+
+	utils.Success(w, map[string]interface{}{
+		"operators": operators,
+		"total":     len(operators),
+	})
+}

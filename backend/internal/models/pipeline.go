@@ -23,6 +23,7 @@ type Pipeline struct {
 	ErrorMessage     string     `json:"error_message"`      // 错误信息
 	Config           string     `json:"config"`             // 配置JSON（JSONB存储）
 	ReviewRound      int        `json:"review_round"`       // P4.6新增：审核轮次（1=初审，2=2审）
+	AssignedTo       *string    `json:"assigned_to"`        // P6-2新增：分配给哪个审核员（用户ID）
 	CreatedAt        *time.Time `json:"created_at"`         // 创建时间
 	UpdatedAt        *time.Time `json:"updated_at"`         // 更新时间
 }
@@ -297,6 +298,9 @@ type PipelineListItem struct {
 	EvalAvgScore    *float64 `json:"eval_avg_score"`    // Evaluator均分（step_data->'avg_total'）
 	MetaScore       *float64 `json:"meta_score"`        // Meta仲裁分（step_data->'total_final'）
 	TranslatorScore *float64 `json:"translator_score"`  // Translator最终分（step_data->'final_score'）
+	// P6-2新增：分配审核员信息
+	AssignedTo      *string  `json:"assigned_to"`       // 分配给哪个审核员（用户ID）
+	AssignedName    string   `json:"assigned_name"`     // 分配审核员的显示名称
 }
 
 // PipelineDetailResponse Pipeline详情响应（含完整步骤列表）
@@ -319,6 +323,8 @@ type PipelineDetailResponse struct {
 	CreatedAt        *time.Time      `json:"created_at"`         // 创建时间
 	UpdatedAt        *time.Time      `json:"updated_at"`         // 更新时间
 	ReviewRound      int             `json:"review_round"`       // P4.6新增：审核轮次（1=初审，2=2审）
+	AssignedTo       *string         `json:"assigned_to"`        // P6-2新增：分配审核员ID
+	AssignedName     string          `json:"assigned_name"`      // P6-2新增：分配审核员名称
 	Steps            []*StepListItem `json:"steps"`              // 步骤列表
 }
 

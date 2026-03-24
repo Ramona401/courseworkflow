@@ -206,6 +206,18 @@ func (s *PipelineService) GetPipelineDetail(id string) (*models.PipelineDetailRe
 		})
 	}
 
+	// P6-2: 查询分配审核员名称
+	var assignedName string
+	if pipeline.AssignedTo != nil && *pipeline.AssignedTo != "" {
+		operators, _ := repository.ListOperatorUsers()
+		for _, op := range operators {
+			if op["id"] == *pipeline.AssignedTo {
+				assignedName = op["display_name"]
+				break
+			}
+		}
+	}
+
 	return &models.PipelineDetailResponse{
 		ID:               pipeline.ID,
 		CourseCode:       pipeline.CourseCode,
@@ -224,6 +236,8 @@ func (s *PipelineService) GetPipelineDetail(id string) (*models.PipelineDetailRe
 		CreatedAt:        pipeline.CreatedAt,
 		UpdatedAt:        pipeline.UpdatedAt,
 		ReviewRound:      pipeline.ReviewRound,
+		AssignedTo:       pipeline.AssignedTo,
+		AssignedName:     assignedName,
 		Steps:            stepItems,
 	}, nil
 }
@@ -1849,4 +1863,107 @@ func (s *PipelineService) BatchStartPipelines(ids []string) (*BatchStartResult, 
 	}
 
 	return result, nil
+}
+
+
+// ==================== P6-2 Pipeline分配服务方法 ====================
+
+// AssignPipelineResult 分配结果
+type AssignPipelineResult struct {
+	PipelineID   string `json:"pipeline_id"`
+	AssignedTo   string `json:"assigned_to"`
+	AssignedName string `json:"assigned_name"`
+}
+
+// BatchAssignResult 批量分配结果
+type BatchAssignResult struct {
+	TotalRequested int      `json:"total_requested"`
+	SuccessCount   int      `json:"success_count"`
+	AssignedTo     string   `json:"assigned_to"`
+	AssignedName   string   `json:"assigned_name"`
+	FailedIDs      []string `json:"failed_ids"`
+}
+
+// AssignPipeline 分配单个Pipeline给审核员
+// P6-2新增：admin将Pipeline分配给指定operator
+func (s *PipelineService) AssignPipeline(pipelineID string, assignedToUserID string) (*AssignPipelineResult, error) {
+	// 验证Pipeline存在
+	_, err := repository.GetPipelineByID(pipelineID)
+	if err != nil {
+		return nil, ErrPipelineNotFound
+	}
+
+	// 分配（空字符串表示取消分配）
+	var assignPtr *string
+	if assignedToUserID != "" {
+		assignPtr = &assignedToUserID
+	}
+	if err := repository.AssignPipeline(pipelineID, assignPtr); err != nil {
+		return nil, fmt.Errorf("分配失败: %w", err)
+	}
+
+	// 查询审核员名称
+	assignedName := ""
+	if assignedToUserID != "" {
+		operators, _ := repository.ListOperatorUsers()
+		for _, op := range operators {
+			if op["id"] == assignedToUserID {
+				assignedName = op["display_name"]
+				break
+			}
+		}
+	}
+
+	return &AssignPipelineResult{
+		PipelineID:   pipelineID,
+		AssignedTo:   assignedToUserID,
+		AssignedName: assignedName,
+	}, nil
+}
+
+// BatchAssignPipelines 批量分配Pipeline给审核员
+// P6-2新增：admin在审核中心批量选择后分配给指定operator
+func (s *PipelineService) BatchAssignPipelines(pipelineIDs []string, assignedToUserID string) (*BatchAssignResult, error) {
+	// 分配（空字符串表示取消分配）
+	var assignPtr *string
+	if assignedToUserID != "" {
+		assignPtr = &assignedToUserID
+	}
+
+	successCount, err := repository.BatchAssignPipelines(pipelineIDs, assignPtr)
+	if err != nil {
+		return nil, fmt.Errorf("批量分配失败: %w", err)
+	}
+
+	// 查询审核员名称
+	assignedName := ""
+	if assignedToUserID != "" {
+		operators, _ := repository.ListOperatorUsers()
+		for _, op := range operators {
+			if op["id"] == assignedToUserID {
+				assignedName = op["display_name"]
+				break
+			}
+		}
+	}
+
+	var failedIDs []string
+	if successCount < len(pipelineIDs) {
+		// 简化处理：不逐个追踪失败的ID
+		failedIDs = []string{}
+	}
+
+	return &BatchAssignResult{
+		TotalRequested: len(pipelineIDs),
+		SuccessCount:   successCount,
+		AssignedTo:     assignedToUserID,
+		AssignedName:   assignedName,
+		FailedIDs:      failedIDs,
+	}, nil
+}
+
+// GetOperatorUsers 获取可分配的审核员列表
+// P6-2新增：供前端分配弹窗使用
+func (s *PipelineService) GetOperatorUsers() ([]map[string]string, error) {
+	return repository.ListOperatorUsers()
 }

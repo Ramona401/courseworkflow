@@ -287,6 +287,21 @@ func Setup(cfg *config.Config) http.Handler {
 				}
 				pipelineHandler.BatchCreate(w, r)
 
+			// POST /pipelines/batch-assign — 批量分配Pipeline给审核员（P6-2新增）
+			case hasSuffix(path, "/batch-assign"):
+				claims, ok := middleware.GetClaims(r.Context())
+				if !ok || claims.Role != "admin" {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusForbidden)
+					json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "仅管理员可分配审核任务"})
+					return
+				}
+				pipelineHandler.BatchAssign(w, r)
+
+			// GET /pipelines/operators — 获取可分配审核员列表（P6-2新增）
+			case hasSuffix(path, "/operators"):
+				pipelineHandler.GetOperators(w, r)
+
 			// POST /pipelines/batch-start — 批量启动Pipeline（P5-3新增）
 			case hasSuffix(path, "/batch-start"):
 				claims, ok := middleware.GetClaims(r.Context())

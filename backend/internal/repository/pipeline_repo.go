@@ -150,11 +150,11 @@ func GetPipelineByID(id string) (*models.Pipeline, error) {
 	err := database.DB.QueryRow(ctx,
 		`SELECT id, course_code, course_name, external_module_id, started_by,
 			started_at, completed_at, current_step, status, auto_mode,
-			error_message, config::text, review_round, created_at, updated_at
+			error_message, config::text, review_round, assigned_to, created_at, updated_at
 		 FROM pipelines WHERE id = $1`, id).Scan(
 		&p.ID, &p.CourseCode, &courseName, &p.ExternalModuleID, &p.StartedBy,
 		&p.StartedAt, &p.CompletedAt, &p.CurrentStep, &p.Status, &p.AutoMode,
-		&errorMsg, &configStr, &p.ReviewRound, &p.CreatedAt, &p.UpdatedAt,
+		&errorMsg, &configStr, &p.ReviewRound, &p.AssignedTo, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {
 		return nil, ErrPipelineNotFound
@@ -181,7 +181,8 @@ func GetPipelineByID(id string) (*models.Pipeline, error) {
 const pipelineListSelectSQL = `SELECT p.id, p.course_code, p.course_name, p.external_module_id,
 	p.current_step, p.status, p.auto_mode, p.error_message,
 	p.started_by, p.started_at, p.completed_at, p.created_at,
-	p.review_round,
+	p.review_round, p.assigned_to,
+	(SELECT u_assign.display_name FROM users u_assign WHERE u_assign.id = p.assigned_to) AS assigned_name,
 	COALESCE((SELECT COUNT(*) FROM pipeline_steps ps
 		WHERE ps.pipeline_id = p.id AND ps.status = 'done'), 0) AS steps_completed,
 	(SELECT (ps_eval.step_data->>'avg_total')::numeric
@@ -208,11 +209,12 @@ func scanPipelineListRow(rows interface{ Scan(dest ...interface{}) error }) (*mo
 	item := &models.PipelineListItem{}
 	var courseName, errorMsg *string
 
+	var assignedName *string
 	err := rows.Scan(
 		&item.ID, &item.CourseCode, &courseName, &item.ExternalModuleID,
 		&item.CurrentStep, &item.Status, &item.AutoMode, &errorMsg,
 		&item.StartedBy, &item.StartedAt, &item.CompletedAt, &item.CreatedAt,
-		&item.ReviewRound,
+		&item.ReviewRound, &item.AssignedTo, &assignedName,
 		&item.StepsCompleted,
 		&item.EvalAvgScore,    // P4.5-A: evaluator均分（*float64，NULL自动映射为nil）
 		&item.MetaScore,       // P4.5-A: meta仲裁分
@@ -228,6 +230,9 @@ func scanPipelineListRow(rows interface{ Scan(dest ...interface{}) error }) (*mo
 	}
 	if errorMsg != nil {
 		item.ErrorMessage = *errorMsg
+	}
+	if assignedName != nil {
+		item.AssignedName = *assignedName
 	}
 
 	// 附加中文名
@@ -271,9 +276,10 @@ func ListPipelinesForUser(userID string, role string) ([]*models.PipelineListIte
 		// admin看所有Pipeline
 		query = pipelineListSelectSQL + " ORDER BY p.created_at DESC"
 	} else {
-		// 非admin：看自己发起的 + 分配给自己课程的Pipeline
+		// 非admin：看自己发起的 + 分配给自己课程的Pipeline + 直接分配给自己的Pipeline
 		query = pipelineListSelectSQL + `
 		 WHERE p.started_by = $1
+			OR p.assigned_to = $1
 			OR p.course_code IN (SELECT uca.course_code FROM user_course_assignments uca WHERE uca.user_id = $1)
 		 ORDER BY p.created_at DESC`
 		args = append(args, userID)
@@ -929,4 +935,66 @@ func ListFinalizedPipelineIDs() ([]string, error) {
 		ids = append(ids, id)
 	}
 	return ids, nil
+}
+
+
+// ==================== P6-2 Pipeline分配方法 ====================
+
+// AssignPipeline 分配Pipeline给指定审核员
+// P6-2新增：admin在审核中心将Pipeline分配给operator审核
+func AssignPipeline(pipelineID string, assignedTo *string) error {
+	ctx := context.Background()
+	_, err := database.DB.Exec(ctx,
+		`UPDATE pipelines SET assigned_to = $2, updated_at = NOW()
+		 WHERE id = $1`, pipelineID, assignedTo)
+	if err != nil {
+		return fmt.Errorf("分配Pipeline失败: %w", err)
+	}
+	return nil
+}
+
+// BatchAssignPipelines 批量分配Pipeline给指定审核员
+// P6-2新增：admin在审核中心批量选择Pipeline后分配
+func BatchAssignPipelines(pipelineIDs []string, assignedTo *string) (int, error) {
+	ctx := context.Background()
+	successCount := 0
+	for _, id := range pipelineIDs {
+		_, err := database.DB.Exec(ctx,
+			`UPDATE pipelines SET assigned_to = $2, updated_at = NOW()
+			 WHERE id = $1`, id, assignedTo)
+		if err == nil {
+			successCount++
+		}
+	}
+	return successCount, nil
+}
+
+// ListOperatorUsers 获取所有活跃的operator和admin用户列表（供分配审核员选择）
+// P6-2新增：审核中心分配弹窗中显示可选审核员
+func ListOperatorUsers() ([]map[string]string, error) {
+	ctx := context.Background()
+	rows, err := database.DB.Query(ctx,
+		`SELECT id, username, display_name, role
+		 FROM users
+		 WHERE status = 'active' AND role IN ('admin', 'operator')
+		 ORDER BY role ASC, display_name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("查询审核员列表失败: %w", err)
+	}
+	defer rows.Close()
+
+	var result []map[string]string
+	for rows.Next() {
+		var id, username, displayName, role string
+		if err := rows.Scan(&id, &username, &displayName, &role); err != nil {
+			continue
+		}
+		result = append(result, map[string]string{
+			"id": id, "username": username, "display_name": displayName, "role": role,
+		})
+	}
+	if result == nil {
+		result = []map[string]string{}
+	}
+	return result, nil
 }
