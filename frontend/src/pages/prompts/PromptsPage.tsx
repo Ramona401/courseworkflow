@@ -238,25 +238,10 @@ export default function PromptsPage() {
       {/* Toast */}
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
 
-      {/* 页面标题区 */}
-      <div style={{ marginBottom: '28px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px' }}>
-          <div style={{
-            width: '40px', height: '40px', borderRadius: '12px',
-            background: 'linear-gradient(135deg, #5856d6, #af52de)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            boxShadow: '0 4px 12px rgba(88,86,214,0.3)',
-          }}>
-            <FileText size={20} color="#fff" />
-          </div>
-          <div>
-            <h2 style={{ margin: 0, fontSize: '22px', fontWeight: 700, color: '#1d1d1f' }}>提示词管理</h2>
-            <p style={{ margin: '2px 0 0', fontSize: '13px', color: '#8e8e93' }}>
-              管理 Pipeline 8个槽位的提示词内容，支持版本历史和回滚
-            </p>
-          </div>
-        </div>
-      </div>
+      {/* 页面描述（标题由MainLayout header提供） */}
+      <p style={{ fontSize: '14px', color: '#8e8e93', margin: '0 0 20px 0' }}>
+        管理 Pipeline 各槽位的提示词内容，支持版本历史和回滚
+      </p>
 
       {/* 统计卡片 */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '24px' }}>

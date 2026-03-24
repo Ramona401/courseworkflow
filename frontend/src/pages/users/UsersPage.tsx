@@ -348,16 +348,11 @@ export default function UsersPage() {
       {/* Toast 提示 */}
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
 
-      {/* 页面头部 */}
+      {/* 页面头部（标题由MainLayout header提供） */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
-        <div>
-          <h2 style={{ fontSize: '22px', fontWeight: 700, color: '#1d1d1f', margin: 0, letterSpacing: '-0.3px' }}>
-            用户管理
-          </h2>
-          <p style={{ fontSize: '14px', color: '#8e8e93', margin: '4px 0 0' }}>
-            管理系统用户账户、角色和课程分配
-          </p>
-        </div>
+        <p style={{ fontSize: '14px', color: '#8e8e93', margin: 0 }}>
+          管理系统用户账户、角色和课程分配
+        </p>
         <button style={btnPrimary} onClick={() => setShowCreateModal(true)}
           onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = '0 4px 12px rgba(0,122,255,0.3)' }}
           onMouseLeave={e => { e.currentTarget.style.transform = 'none'; e.currentTarget.style.boxShadow = 'none' }}>

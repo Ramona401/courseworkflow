@@ -404,24 +404,8 @@ export default function AIConfigPage() {
       {/* Toast 提示 */}
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
 
-      {/* 页面标题 */}
-      <div style={{ marginBottom: '28px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px' }}>
-          <div style={{
-            width: '40px', height: '40px',
-            background: 'linear-gradient(135deg, #007aff, #5856d6)',
-            borderRadius: '12px',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            boxShadow: '0 2px 8px rgba(0,122,255,0.3)',
-          }}>
-            <Bot size={22} color="#fff" />
-          </div>
-          <div>
-            <h1 style={{ fontSize: '22px', fontWeight: 700, color: '#1d1d1f', margin: 0 }}>AI 配置中心</h1>
-            <p style={{ fontSize: '13px', color: '#8e8e93', margin: '2px 0 0 0' }}>管理 AI API 连接和各场景参数</p>
-          </div>
-        </div>
-      </div>
+      {/* 页面描述（标题由MainLayout header提供） */}
+      <p style={{ fontSize: '14px', color: '#8e8e93', margin: '0 0 20px 0' }}>管理 AI API 连接和各场景参数</p>
 
       {/* ==================== 全局配置卡片 ==================== */}
       <div style={cardStyle}>

@@ -299,24 +299,8 @@ export default function ExternalDataPage() {
       {/* Toast 提示 */}
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
 
-      {/* 页面标题 */}
-      <div style={{ marginBottom: '28px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px' }}>
-          <div style={{
-            width: '40px', height: '40px',
-            background: 'linear-gradient(135deg, #5856d6, #af52de)',
-            borderRadius: '12px',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            boxShadow: '0 2px 8px rgba(88,86,214,0.3)',
-          }}>
-            <Database size={22} color="#fff" />
-          </div>
-          <div>
-            <h1 style={{ fontSize: '22px', fontWeight: 700, color: '#1d1d1f', margin: 0 }}>外部数据配置</h1>
-            <p style={{ fontSize: '13px', color: '#8e8e93', margin: '2px 0 0 0' }}>配置 OSS 数据源和推送 API 连接信息</p>
-          </div>
-        </div>
-      </div>
+      {/* 页面描述（标题由MainLayout header提供） */}
+      <p style={{ fontSize: '14px', color: '#8e8e93', margin: '0 0 20px 0' }}>配置 OSS 数据源和推送 API 连接信息</p>
 
       {/* 统计卡片 */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '16px', marginBottom: '24px' }}>
