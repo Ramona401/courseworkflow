@@ -1158,7 +1158,7 @@ img{max-width:100%;height:auto}table{border-collapse:collapse;width:100%}th,td{b
     <iframe
       ref={iframeRef}
       srcDoc={doc}
-      sandbox="allow-same-origin"
+      sandbox="allow-same-origin allow-scripts"
       style={{ flex: 1, width: '100%', height: '100%', border: 'none', background: '#fff' }}
       title="HTML预览"
     />
