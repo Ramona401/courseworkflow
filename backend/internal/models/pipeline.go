@@ -542,10 +542,24 @@ const (
 	PageOpDelete = "delete"
 )
 
+// PageOperation Translator输出解析后的页面操作
+// v35修复：新增 OriginalPageNumber 字段
+// 当Translator重排页码时（如"P05=原P04，页码顺延"），PageNumber=5 但 OriginalPageNumber=4
+// Generator用 OriginalPageNumber 去 pageLessonMap 查找正确的 lesson_id 和原版HTML
 type PageOperation struct {
-	PageNumber   int    `json:"page_number"`
-	Operation    string `json:"operation"`
-	Title        string `json:"title"`
-	Description  string `json:"description"`
-	MergeSources []int  `json:"merge_sources,omitempty"`
+	PageNumber         int    `json:"page_number"`
+	OriginalPageNumber int    `json:"original_page_number"` // v35新增：原始页码（从标题"原Pxx"解析，0表示与PageNumber相同）
+	Operation          string `json:"operation"`
+	Title              string `json:"title"`
+	Description        string `json:"description"`
+	MergeSources       []int  `json:"merge_sources,omitempty"`
+}
+
+// GetOrigPageNum 获取实际的原始页码（v35新增）
+// 如果 OriginalPageNumber > 0，返回它；否则返回 PageNumber
+func (op *PageOperation) GetOrigPageNum() int {
+	if op.OriginalPageNumber > 0 {
+		return op.OriginalPageNumber
+	}
+	return op.PageNumber
 }

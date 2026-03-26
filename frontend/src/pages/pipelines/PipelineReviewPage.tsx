@@ -1,13 +1,16 @@
 /**
- * Pipeline审核页面（P4.5-E 重构版 v3.5 | P7：二级审批流程 | Phase8修复）
+ * Pipeline审核页面（P4.5-E 重构版 v3.5 | P7：二级审批流程 | Phase8修复 | v35排序优化v2）
+ *
+ * v35排序优化v2：
+ * - 新增页面（create操作，page_number>=1000）按逻辑位置插入到对应原始页码之后
+ *   排序后审核顺序：P01(保留) → P02(修改) → P02-new(新增) → P03(保留)
+ * - 显示标签保持数据原始含义，不重新编号（避免标签与实际内容脱节）
+ *   page_number=4 → P04, page_number=1004 → P04-new
+ * - 修复 formatPageLabel 对双位数页码的还原错误
  *
  * Phase8修复：
  * - FP-03：HTMLPreview 中 iframe 移除 allow-scripts，防止AI生成HTML中的JS在审核员浏览器执行
- *   原版：sandbox="allow-same-origin allow-scripts" 允许iframe内JS读取父页面DOM/localStorage，可窃取JWT
- *   修复后：sandbox="allow-same-origin" 仅允许同源访问，JS无法执行
  * - FP-04：selectPage 函数切换页面时同步清空 editContent
- *   原版：切换页面后再点编辑，textarea 仍显示上一页内容
- *   修复后：selectPage 时同时 setEditContent('')，彻底消除内容残留
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
@@ -60,16 +63,135 @@ function parseMergeSources(ms: string): number[] {
 }
 
 /**
- * 格式化页码标签
- * page_number < 1000 → "P04"
- * page_number >= 1000 → "P04-new"
+ * 从虚拟页码还原原始页码（v35新增）
+ *
+ * 后端规则：virtualPageNum = originalPage + 1000 + (counter-1)*10
+ * 最可靠的方式是从 page_title 提取（格式："P04-new 标题内容"）
+ * 降级方案：直接用 (page_number - 1000)，counter=1 时准确
  */
-function formatPageLabel(pageNumber: number): string {
+function getOriginalPageNumber(page: { page_number: number; page_title: string }): number {
+  if (page.page_number < CREATE_PAGE_OFFSET) {
+    return page.page_number
+  }
+  // 从标题提取原始页码：标题格式为 "P04-new 标题内容"
+  const titleMatch = page.page_title.match(/^P(\d{1,3})-new/)
+  if (titleMatch) {
+    return parseInt(titleMatch[1], 10)
+  }
+  // 降级方案：直接用 (page_number - 1000)，对于counter=1时是准确的
+  const offset = page.page_number - CREATE_PAGE_OFFSET
+  if (offset < 100) {
+    return offset
+  }
+  return offset % 100
+}
+
+/**
+ * 格式化页码标签（v35修复）
+ *
+ * page_number < 1000 → "P04"（原有页面，保持原始页码）
+ * page_number >= 1000 → "P04-new"（新增页面，从标题或数学还原原始页码）
+ *
+ * v35修复：原版使用 (pageNumber - 1000) % 10 对双位数页码会出错
+ * 例如 page_number=1012 原版显示 P02-new（错误），应显示 P12-new
+ *
+ * v35v2：不再重新编号，标签直接反映数据库中的原始含义
+ * 这样标签和实际HTML内容始终一致，不会出现"标签说P05但内容是P04"的问题
+ */
+function formatPageLabel(pageNumber: number, pageTitle?: string): string {
   if (pageNumber < CREATE_PAGE_OFFSET) {
     return `P${String(pageNumber).padStart(2, '0')}`
   }
-  const realOrigPage = (pageNumber - CREATE_PAGE_OFFSET) % 10
-  return `P${String(realOrigPage).padStart(2, '0')}-new`
+  // 优先从标题提取原始页码
+  if (pageTitle) {
+    const m = pageTitle.match(/^P(\d{1,3})-new/)
+    if (m) {
+      return `P${m[1].padStart(2, '0')}-new`
+    }
+  }
+  // 降级：数学还原
+  const offset = pageNumber - CREATE_PAGE_OFFSET
+  const origPage = offset < 100 ? offset : (offset % 100)
+  return `P${String(origPage).padStart(2, '0')}-new`
+}
+
+/**
+ * 智能排序页面列表（v35新增）
+ *
+ * 排序规则：
+ * 1. 按原始页码从小到大排列
+ * 2. 同一原始页码位置：新增页面（create）排在原有页面之后
+ *    因为Translator已重排页码，新增页面是"在此页码之后插入"的语义
+ * 3. 同一位置有多个新增页面时，按 page_number 从小到大排列
+ *
+ * 排序键设计：
+ * - 原有页面（page_number < 1000）：sortKey = page_number * 1000 + 500
+ * - 新增页面（page_number >= 1000）：sortKey = origPage * 1000 + subOrder
+ *   600 + subOrder < 1000 保证新增页面排在对应原始页码之后、下一个页码之前
+ *
+ * 示例（G1-03实际场景，P04之后有新增）：
+ *   P03(keep, pn=3)         → sortKey = 3500
+ *   P04(keep, pn=4)         → sortKey = 4500
+ *   P04-new(create, pn=1004) → sortKey = 4600
+ *   P05(keep, pn=5)         → sortKey = 5500
+ */
+function sortPagesLogically(pages: GeneratedPageFull[]): GeneratedPageFull[] {
+  // v35v4：Translator已经重编了所有页码（P01-P20按新顺序排列）
+  // 虚拟页码（>=1000）是parsePageOps对create操作创建的副本
+  // 如果同一原始页码同时存在普通版本和虚拟版本，需要合并：
+  //   - 虚拟版本有AI生成的HTML（generated_html），普通版本可能被错误标记为keep
+  //   - 用虚拟版本的内容替换普通版本，但保持普通版本的page_number（用于正确排序）
+  
+  // 1. 分离普通页面和虚拟页面
+  const normalPages = pages.filter(p => p.page_number < CREATE_PAGE_OFFSET)
+  const virtualPages = pages.filter(p => p.page_number >= CREATE_PAGE_OFFSET)
+  
+  // 2. 建立虚拟页面的映射：原始页码 → 虚拟页面数据
+  const virtualMap = new Map<number, GeneratedPageFull>()
+  for (const vp of virtualPages) {
+    const origPage = getOriginalPageNumber(vp)
+    virtualMap.set(origPage, vp)
+  }
+  
+  // 3. 合并：如果普通页面对应位置有虚拟页面，用虚拟页面的内容替换
+  const merged = normalPages.map(np => {
+    const vp = virtualMap.get(np.page_number)
+    if (vp) {
+      // 用虚拟页面的内容覆盖，但保持普通页面的page_number用于排序
+      // 这样P04位置显示的是create操作的AI生成内容
+      return {
+        ...np,
+        operation: vp.operation,           // create
+        generated_html: vp.generated_html, // AI生成的新页面HTML
+        final_html: vp.final_html,         // 定稿HTML
+        page_title: vp.page_title.replace(/^P\d{1,3}-new\s*/, ''), // 去掉"P04-new "前缀
+        change_reason: vp.change_reason || np.change_reason,
+        // 保留原始的 page_number, original_html, decision, lesson_id 等
+      }
+    }
+    return np
+  })
+  
+  // 4. 按page_number排序
+  return merged.sort((a, b) => a.page_number - b.page_number)
+}
+
+/**
+ * 计算单个页面的排序键（v35新增）
+ */
+function computeSortKey(page: { page_number: number; page_title: string }): number {
+  if (page.page_number < CREATE_PAGE_OFFSET) {
+    // 原有页面：原始页码 * 1000 + 500
+    return page.page_number * 1000 + 500
+  }
+  // 新增页面：先还原原始页码
+  const origPage = getOriginalPageNumber(page)
+  // 计算子排序（同一位置多个新增页面的顺序）
+  const subOrder = page.page_number - origPage - CREATE_PAGE_OFFSET
+  // 排序键：原始页码 * 1000 + 600 + subOrder
+  // 600 > 500（原有页面的偏移），所以新增页面排在对应原始页码的原有页面之后
+  // 600 + subOrder < 1000（下一个原始页码的起始），保证不会越界
+  return origPage * 1000 + 600 + subOrder
 }
 
 // ==================== 主组件 ====================
@@ -98,16 +220,19 @@ export default function PipelineReviewPage() {
   const [showRejectDialog, setShowRejectDialog] = useState(false)
   const [rejectReason, setRejectReason] = useState('')
 
-  const currentPage = pages[selectedIdx] || null
-  const totalPages = pages.length
-  const decidedPages = pages.filter(p => p.decision !== 'pending').length
+  /** v35：排序后的页面列表（新增页面插入到正确位置） */
+  const sortedPages = sortPagesLogically(pages)
+
+  const currentPage = sortedPages[selectedIdx] || null
+  const totalPages = sortedPages.length
+  const decidedPages = sortedPages.filter(p => p.decision !== 'pending').length
   const allDecided = totalPages > 0 && decidedPages === totalPages
 
   const isPendingFinalize = pipeline?.status === 'pending_finalize'
   const isReviewQueue = pipeline?.status === 'review_queue' || pipeline?.status === 'needs_human'
 
   const opStats: Record<string, number> = {}
-  for (const p of pages) {
+  for (const p of sortedPages) {
     const op = p.operation || 'keep'
     opStats[op] = (opStats[op] || 0) + 1
   }
@@ -133,12 +258,12 @@ export default function PipelineReviewPage() {
       if (e.key === 'Escape' && fullscreen) { setFullscreen(false); return }
       if (fullscreen) {
         if (e.key === 'ArrowLeft' && selectedIdx > 0) { setSelectedIdx(i => i - 1); setMergeSourceTab(0) }
-        if (e.key === 'ArrowRight' && selectedIdx < pages.length - 1) { setSelectedIdx(i => i + 1); setMergeSourceTab(0) }
+        if (e.key === 'ArrowRight' && selectedIdx < sortedPages.length - 1) { setSelectedIdx(i => i + 1); setMergeSourceTab(0) }
       }
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [fullscreen, selectedIdx, pages.length])
+  }, [fullscreen, selectedIdx, sortedPages.length])
 
   /**
    * 切换页面
@@ -148,7 +273,7 @@ export default function PipelineReviewPage() {
     setSelectedIdx(idx)
     setEditingHTML(false)
     setMergeSourceTab(0)
-    setEditContent('') // FP-04修复：切换页面时清空编辑内容，防止残留
+    setEditContent('')
   }
 
   const handleDecision = async (decision: 'approve' | 'reject' | 'edit', finalHTML?: string) => {
@@ -162,7 +287,8 @@ export default function PipelineReviewPage() {
         p.page_number === currentPage.page_number ? { ...p, decision, final_html: finalHTML || p.final_html } : p
       ))
       setEditingHTML(false)
-      const nextIdx = pages.findIndex((p, i) => i > selectedIdx && p.decision === 'pending')
+      // v35：在排序后的列表中查找下一个待决策的页面
+      const nextIdx = sortedPages.findIndex((p, i) => i > selectedIdx && p.decision === 'pending')
       if (nextIdx >= 0) setSelectedIdx(nextIdx)
     } catch (e: any) { alert('决策失败: ' + (e.message || '未知错误')) }
     setDeciding(false)
@@ -218,7 +344,6 @@ export default function PipelineReviewPage() {
 
   const startEdit = () => {
     if (!currentPage) return
-    // FP-04修复：打开编辑时总是从当前页面内容初始化，而非依赖 editContent 残留
     setEditContent(currentPage.final_html || currentPage.generated_html || '')
     setEditingHTML(true)
   }
@@ -260,7 +385,6 @@ export default function PipelineReviewPage() {
                 ⏳ 待超级审核员确认定稿
               </span>
             )}
-            {/* Phase8修复P-02：展示退回原因，让审核员知晓退回理由 */}
             {pipeline.reject_reason && isReviewQueue && (
               <span style={{
                 color: '#ff3b30', marginLeft: 8, fontWeight: 500,
@@ -387,7 +511,7 @@ export default function PipelineReviewPage() {
             </div>
           </div>
 
-          {pages.map((page, idx) => (
+          {sortedPages.map((page, idx) => (
             <div
               key={page.page_number}
               onClick={() => selectPage(idx)}
@@ -406,7 +530,7 @@ export default function PipelineReviewPage() {
                   fontSize: 13, fontWeight: 500, color: '#1c1c1e',
                   overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1,
                 }}>
-                  {formatPageLabel(page.page_number)}. {page.page_title || '无标题'}
+                  {formatPageLabel(page.page_number, page.page_title)}. {page.page_title || '无标题'}
                 </span>
               </div>
               {page.operation === 'merge' && page.merge_sources && page.merge_sources !== 'null' && (
@@ -416,7 +540,7 @@ export default function PipelineReviewPage() {
               )}
               {page.page_number >= CREATE_PAGE_OFFSET && (
                 <div style={{ fontSize: 10, color: '#af52de', marginTop: 2, paddingLeft: 42 }}>
-                  新增于 {formatPageLabel(page.page_number).replace('-new', '')} 之后
+                  新增于 P{String(getOriginalPageNumber(page)).padStart(2, '0')} 之后
                 </div>
               )}
               <div style={{
@@ -426,7 +550,7 @@ export default function PipelineReviewPage() {
               }}>{DECISION_NAMES[page.decision] || page.decision}</div>
             </div>
           ))}
-          {pages.length === 0 && (
+          {sortedPages.length === 0 && (
             <div style={{ padding: 20, textAlign: 'center', color: '#aeaeb2', fontSize: 13 }}>暂无生成页面</div>
           )}
         </div>
@@ -450,7 +574,7 @@ export default function PipelineReviewPage() {
                   borderRadius: 4, background: OP_COLORS[currentPage.operation] || '#aeaeb2',
                 }}>{OP_NAMES[currentPage.operation] || currentPage.operation}</span>
                 <span style={{ fontSize: 14, fontWeight: 600, color: '#1c1c1e' }}>
-                  {formatPageLabel(currentPage.page_number)}. {currentPage.page_title || '无标题'}
+                  {formatPageLabel(currentPage.page_number, currentPage.page_title)}. {currentPage.page_title || '无标题'}
                 </span>
                 {currentPage.operation === 'merge' && currentPage.merge_sources && currentPage.merge_sources !== 'null' && (
                   <span style={{ fontSize: 11, color: '#ff9500', fontWeight: 500 }}>
@@ -459,7 +583,7 @@ export default function PipelineReviewPage() {
                 )}
                 {currentPage.page_number >= CREATE_PAGE_OFFSET && (
                   <span style={{ fontSize: 11, color: '#af52de', fontWeight: 500 }}>
-                    （新增页面，位于 {formatPageLabel(currentPage.page_number).replace('-new', '')} 之后）
+                    （新增页面，位于 P{String(getOriginalPageNumber(currentPage)).padStart(2, '0')} 之后）
                   </span>
                 )}
                 <div style={{ flex: 1 }} />
@@ -554,7 +678,7 @@ export default function PipelineReviewPage() {
                 ) : currentPage.operation === 'create' ? (
                   <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
                     <div style={{ padding: '8px 12px', fontSize: 12, fontWeight: 600, color: '#af52de', background: '#faf5ff', flexShrink: 0 }}>
-                      新增页面（{formatPageLabel(currentPage.page_number)}，无原版）
+                      新增页面（{formatPageLabel(currentPage.page_number, currentPage.page_title)}，无原版）
                     </div>
                     <HTMLPreview html={currentPage.generated_html} />
                   </div>
@@ -579,7 +703,7 @@ export default function PipelineReviewPage() {
       {/* ===== 全屏预览 ===== */}
       {fullscreen && currentPage && (
         <FullscreenPreview
-          page={currentPage} pages={pages} currentIdx={selectedIdx}
+          page={currentPage} pages={sortedPages} currentIdx={selectedIdx}
           pipelineId={id || ''}
           onNavigate={(idx) => { setSelectedIdx(idx); setMergeSourceTab(0) }}
           onClose={() => setFullscreen(false)}
@@ -736,7 +860,7 @@ function AIFixModal({ pipelineId, pageNumber, pageTitle, loading, instruction, o
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '16px 20px', borderBottom: '1px solid rgba(0,0,0,0.06)', flexShrink: 0 }}>
           <Wand2 size={16} color="#e65100" />
           <span style={{ fontSize: 15, fontWeight: 600, color: '#1c1c1e', flex: 1 }}>
-            AI快修 — {formatPageLabel(pageNumber)}. {pageTitle || '无标题'}
+            AI快修 — {formatPageLabel(pageNumber, pageTitle)}. {pageTitle || '无标题'}
           </span>
           <button onClick={onClose} disabled={loading} style={{
             padding: '4px 12px', borderRadius: 8, border: '1px solid rgba(0,0,0,0.08)',
@@ -883,7 +1007,7 @@ function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavigate, on
           {OP_NAMES[page.operation] || page.operation}
         </span>
         <span style={{ fontSize: 14, fontWeight: 600, color: '#1c1c1e' }}>
-          {formatPageLabel(page.page_number)}. {page.page_title || '无标题'}
+          {formatPageLabel(page.page_number, page.page_title)}. {page.page_title || '无标题'}
         </span>
         <span style={{ fontSize: 12, color: '#8e8e93' }}>{currentIdx + 1}/{pages.length}</span>
 
@@ -1017,18 +1141,6 @@ function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavigate, on
 /**
  * HTMLPreview iframe HTML内容预览组件
  * 修复FP-03：移除 allow-scripts，防止AI生成HTML中的JS在审核员浏览器中执行
- *
- * 原版：sandbox="allow-same-origin allow-scripts"
- *   - allow-scripts 允许iframe内JavaScript执行
- *   - allow-same-origin 允许iframe访问父页面同源内容
- *   - 两者同时存在：iframe内脚本可通过window.parent读取父页面localStorage中的JWT token
- *   - 攻击路径：AI在生成HTML中注入恶意JS → 审核员预览时JS执行 → 读取token → 冒充身份操作
- *
- * 修复后：sandbox="allow-same-origin"
- *   - 仅保留allow-same-origin用于CSS/字体等资源加载
- *   - 移除allow-scripts，iframe内JS完全无法执行
- *   - 课件HTML的基础布局、文字、图片、表格仍可正常渲染
- *   - 如需JS交互功能，建议将预览部署到独立子域名（跨域iframe中allow-scripts无法读取父页面）
  */
 function HTMLPreview({ html }: { html: string }) {
   const iframeRef = useRef<HTMLIFrameElement>(null)

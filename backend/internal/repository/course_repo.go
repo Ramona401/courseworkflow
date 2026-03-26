@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"time"
 	"context"
 	"errors"
 	"fmt"
@@ -66,6 +67,12 @@ func ListCourses() ([]*models.CourseListItem, error) {
 		_ = pageCount
 		_ = totalLength
 		_ = fetchedAt
+		// 将 fetched_at 转换为 *time.Time 赋值给 item.IndexFetchedAt
+		if ftAt != nil {
+			if t, ok := ftAt.(time.Time); ok {
+				item.IndexFetchedAt = &t
+			}
+		}
 
 		items = append(items, item)
 	}
@@ -127,6 +134,12 @@ func ListCoursesForUser(userID string, role string) ([]*models.CourseListItem, e
 		}
 		if ttLen != nil {
 			item.IndexTotalLength = *ttLen
+		}
+		// 将 fetched_at 转换为 *time.Time 赋值给 item.IndexFetchedAt
+		if ftAt != nil {
+			if t, ok := ftAt.(time.Time); ok {
+				item.IndexFetchedAt = &t
+			}
 		}
 
 		items = append(items, item)

@@ -155,8 +155,10 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		changeReason := op.Description
 
 		// 获取当前页的lesson_id
-		// P7修复：create操作的虚拟页码需要还原为原始页码才能查找lesson_id
-		realPageNum := op.PageNumber
+		// v35修复：使用GetOrigPageNum()获取真实原始页码查找lesson_id
+		// 对于Translator重排的页面（如"P05=原P04"），用OriginalPageNumber=4查找
+		// 对于create操作的虚拟页码，还原为原始页码
+		realPageNum := op.GetOrigPageNum()
 		if op.Operation == models.PageOpCreate && op.PageNumber >= createPageOffset {
 			realPageNum = op.PageNumber - createPageOffset
 		}
@@ -491,12 +493,22 @@ func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperatio
 					existing.MergeSources = mergeSources
 				}
 			} else {
-				opsMap[currentPage] = &models.PageOperation{
-					PageNumber:   currentPage,
-					Operation:    op,
-					Title:        currentTitle,
-					Description:  desc,
-					MergeSources: mergeSources,
+				// v35修复：从标题中解析"原Pxx"获取真实的原始页码
+					// Translator重排页码时标题格式如"xxx（原P04，页码顺延）"
+					origPageNum := currentPage // 默认原始页码等于当前页码
+					origMatch := regexp.MustCompile(`(?:原|原始)[Pp]?(\d{1,3})`).FindStringSubmatch(currentTitle + " " + desc)
+					if origMatch != nil {
+						if parsed, parseErr := strconv.Atoi(origMatch[1]); parseErr == nil && parsed > 0 {
+							origPageNum = parsed
+						}
+					}
+					opsMap[currentPage] = &models.PageOperation{
+					PageNumber:         currentPage,
+					OriginalPageNumber: origPageNum,
+					Operation:          op,
+					Title:              currentTitle,
+					Description:        desc,
+					MergeSources:       mergeSources,
 				}
 			}
 		}
@@ -544,22 +556,63 @@ func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperatio
 	for pn := 1; pn <= totalOrigPages; pn++ {
 		if _, exists := opsMap[pn]; !exists {
 			opsMap[pn] = &models.PageOperation{
-				PageNumber: pn,
-				Operation:  models.PageOpKeep,
-				Title:      fmt.Sprintf("Page %d", pn),
+				PageNumber:         pn,
+				OriginalPageNumber: pn, // 未被Translator提到的页面，原始页码等于当前页码
+				Operation:          models.PageOpKeep,
+				Title:              fmt.Sprintf("Page %d", pn),
 			}
 		}
 	}
 
 	// 按页码排序
-	// 虚拟页码（≥createPageOffset）排在对应原始页码之后，原始页码之前的下一页之前
-	// 例：1004排在4和5之间（1004>4, 1004<1005）
 	for _, op := range opsMap {
 		ops = append(ops, op)
 	}
 	sort.Slice(ops, func(i, j int) bool {
 		return ops[i].PageNumber < ops[j].PageNumber
 	})
+
+	// ==================== v35v5修复：计算每个页面的真实原始页码 ====================
+	// Translator会重编页码（如新增P04后，原P04→P05，原P05→P06...）
+	// 判断方法：如果opsMap中存在虚拟页码(1000+x)，说明页码x是新增位置
+	// 统计虚拟页码对应的原始页码集合，然后按偏移量计算每个页面的真实原始页码
+	
+	// 第一步：收集所有新增页面的位置（通过虚拟页码识别）
+	newInsertPages := make(map[int]bool) // key=原始页码位置，表示该位置有新增页面
+	for pn := range opsMap {
+		if pn >= createPageOffset {
+			// 虚拟页码1004 → 原始位置4
+			origPos := pn - createPageOffset
+			// 处理同位置多个新增：1004→4, 1014→4
+			if origPos >= 10 {
+				origPos = origPos % 10
+				if origPos == 0 {
+					origPos = (pn - createPageOffset) / 10
+				}
+			}
+			newInsertPages[origPos] = true
+		}
+	}
+	
+	// 第二步：按页码顺序扫描，用新增位置计算偏移量
+	createOffset := 0
+	for _, op := range ops {
+		if op.PageNumber >= createPageOffset {
+			continue // 跳过虚拟页码
+		}
+		// 检查当前页码是否是新增位置（有对应的虚拟页码）
+		if newInsertPages[op.PageNumber] {
+			createOffset++
+			op.OriginalPageNumber = 0 // 新增页面没有对应的原始页面
+		} else if createOffset > 0 {
+			// 有偏移量，说明前面有新增页面导致页码顺延
+			calculatedOrig := op.PageNumber - createOffset
+			if calculatedOrig > 0 {
+				op.OriginalPageNumber = calculatedOrig
+			}
+		}
+		// createOffset == 0 且不是新增位置：OriginalPageNumber保持parsePageOps中设置的值
+	}
 
 	return ops
 }

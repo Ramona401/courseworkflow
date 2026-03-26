@@ -13,25 +13,18 @@ import (
 	"tedna/internal/services"
 )
 
-// ==================== 权限常量（R-01：集中定义，消除散乱的角色字符串）====================
-// 修复R-01：将各路由的内联角色判断逻辑统一提炼为辅助函数和常量注释
+// ==================== 权限常量 ====================
 // 角色权限矩阵（与 models/user.go 保持同步）：
-//   admin         : 全部功能（含批量验收、直接定稿、用户管理、引擎状态）
-//   senior_operator: Pipeline创建/启动/审核/提交定稿/确认定稿/退回/分配/批量创建/批量启动
-//   operator      : Pipeline创建/启动/审核/提交定稿/批量创建/批量启动
-//   viewer        : 只读（仅GET）
+//   admin          : 全部功能
+//   senior_operator: Pipeline创建/启动/审核/提交定稿/确认定稿/退回/分配/批量创建/批量启动/断点续跑/批量重跑
+//   operator       : Pipeline创建/启动/审核/提交定稿/批量创建/批量启动/断点续跑（仅failed/cancelled）
+//   viewer         : 只读（仅GET）
 
-// roleAdmin 管理员角色常量
 const roleAdmin = "admin"
-
-// roleSeniorOperator 高级操作员角色常量
 const roleSeniorOperator = "senior_operator"
-
-// roleOperator 操作员角色常量
 const roleOperator = "operator"
 
-// hasRole 检查 claims 中的角色是否在允许列表中（R-01：统一角色判断辅助函数）
-// 减少各路由中重复的 claims.Role != "admin" && claims.Role != "operator" 模式
+// hasRole 检查角色是否在允许列表中
 func hasRole(role string, allowed ...string) bool {
 	for _, r := range allowed {
 		if role == r {
@@ -41,7 +34,7 @@ func hasRole(role string, allowed ...string) bool {
 	return false
 }
 
-// forbiddenJSON 返回标准403响应（R-01：消除各路由重复的403响应代码）
+// forbiddenJSON 返回标准403响应
 func forbiddenJSON(w http.ResponseWriter, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusForbidden)
@@ -56,9 +49,6 @@ func methodNotAllowedJSON(w http.ResponseWriter, message string) {
 }
 
 // Setup 注册所有路由并返回根Handler
-// 修复R-03：版本号从 config.AppVersion 读取，不再硬编码
-// 修复R-04：CORS 收紧为生产域名 https://workflow.pkuailab.com
-// 修复R-01：权限判断统一使用 hasRole() 辅助函数，消除散乱的字符串比较
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -73,7 +63,6 @@ func Setup(cfg *config.Config) http.Handler {
 	engine := services.NewEngine(5, 4, 50)
 	pipelineService.SetEngine(engine)
 
-	// P1：增强版健康检查，注入 engine 引用（含DB连通+Engine状态）
 	mux.HandleFunc("/api/v1/health", makeHealthHandler(engine))
 
 	pipelineService.StartNightlyVerifyScheduler()
@@ -91,7 +80,6 @@ func Setup(cfg *config.Config) http.Handler {
 	adminOnly := middleware.RequireRole(roleAdmin)
 
 	// ==================== 公开路由 ====================
-	// /api/v1/health 注册移至 engine 创建之后（需要注入 engine 引用）
 	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
 
 	// ==================== 认证路由 ====================
@@ -113,16 +101,16 @@ func Setup(cfg *config.Config) http.Handler {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"code": 0,
 			"data": map[string]interface{}{
-				"total_submitted":    stats.TotalSubmitted,
-				"total_completed":    stats.TotalCompleted,
+				"total_submitted":       stats.TotalSubmitted,
+				"total_completed":       stats.TotalCompleted,
 				"total_business_failed": stats.TotalBusinessFailed,
-				"total_failed":       stats.TotalFailed,
-				"current_running":    stats.CurrentRunning,
-				"current_ai_active":  stats.CurrentAIActive,
-				"queue_length":       stats.QueueLength,
-				"max_workers":        5,
-				"max_ai_concurrency": 4,
-				"queue_capacity":     50,
+				"total_failed":          stats.TotalFailed,
+				"current_running":       stats.CurrentRunning,
+				"current_ai_active":     stats.CurrentAIActive,
+				"queue_length":          stats.QueueLength,
+				"max_workers":           5,
+				"max_ai_concurrency":    4,
+				"queue_capacity":        50,
 			},
 		})
 	}), authMW, adminOnly))
@@ -211,7 +199,6 @@ func Setup(cfg *config.Config) http.Handler {
 	}), authMW, adminOnly))
 
 	// ==================== 课程管理路由 ====================
-	// 权限：GET 全员可访问；POST 仅admin
 	mux.Handle("/api/v1/courses", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -260,7 +247,6 @@ func Setup(cfg *config.Config) http.Handler {
 	}), authMW))
 
 	// ==================== Pipeline路由 ====================
-	// 权限：GET 全员（按角色过滤数据）；POST admin/senior_operator/operator
 	mux.Handle("/api/v1/pipelines", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -314,6 +300,18 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.BatchAssign(w, r)
 
+		// v37新增：POST /pipelines/batch-restart — admin/senior_operator
+		// 批量断点续跑（从指定步骤重跑多个Pipeline）
+		// 注意：路由层仅允许 admin/senior_operator 调用批量重跑
+		// 服务层会根据每个Pipeline的状态做进一步细粒度权限校验
+		case hasSuffix(path, "/batch-restart"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || !hasRole(claims.Role, roleAdmin, roleSeniorOperator) {
+				forbiddenJSON(w, "仅管理员和高级操作员可批量重跑Pipeline")
+				return
+			}
+			pipelineHandler.BatchRestartFromStep(w, r)
+
 		// GET /pipelines/operators — 全员（含认证）
 		case hasSuffix(path, "/operators"):
 			pipelineHandler.GetOperators(w, r)
@@ -347,6 +345,18 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.CancelPipeline(w, r)
 
+		// ===== 断点续跑路由 =====
+
+		// POST /pipelines/{id}/restart-from — admin/senior_operator/operator
+		// 单个Pipeline断点续跑（路由层允许三个角色，服务层做状态+角色细粒度校验）
+		case hasSuffix(path, "/restart-from"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || !hasRole(claims.Role, roleAdmin, roleSeniorOperator, roleOperator) {
+				forbiddenJSON(w, "仅管理员和操作员可重启Pipeline步骤")
+				return
+			}
+			pipelineHandler.RestartFromStep(w, r)
+
 		// ===== P7：二级审批路由 =====
 
 		// POST /pipelines/{id}/submit-finalize — admin/senior_operator/operator
@@ -376,7 +386,7 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			pipelineHandler.RejectFinalize(w, r)
 
-		// POST /pipelines/{id}/finalize — 仅admin（直接定稿，跳过二级审批）
+		// POST /pipelines/{id}/finalize — 仅admin（直接定稿）
 		case hasSuffix(path, "/finalize"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || !hasRole(claims.Role, roleAdmin) {
@@ -437,7 +447,7 @@ func Setup(cfg *config.Config) http.Handler {
 		case hasSuffix(path, "/steps"):
 			pipelineHandler.GetSteps(w, r)
 
-		// GET/DELETE /pipelines/{id} — GET全员；DELETE仅admin
+		// GET/DELETE /pipelines/{id}
 		default:
 			switch r.Method {
 			case http.MethodGet:
@@ -455,7 +465,7 @@ func Setup(cfg *config.Config) http.Handler {
 		}
 	}), authMW))
 
-	// E-02：启动优雅关闭监听（监听SIGTERM/SIGINT，drain队列后退出）
+	// 启动优雅关闭监听
 	engine.StartGracefulShutdown()
 
 	return corsMiddleware(mux)
@@ -493,26 +503,19 @@ func indexOf(s string, sub string) int {
 	return -1
 }
 
-// corsMiddleware CORS中间件
-// 修复R-04：Access-Control-Allow-Origin 收紧为生产域名，禁止任意来源跨域请求
-// 原版使用通配符 "*"，允许任意网站发起跨域请求，增大CSRF攻击面
-// 修复后：仅允许 https://workflow.pkuailab.com 跨域访问
+// corsMiddleware CORS中间件（仅允许生产域名）
 func corsMiddleware(next http.Handler) http.Handler {
 	const allowedOrigin = "https://workflow.pkuailab.com"
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-
-		// 只对匹配的域名设置CORS头，其他来源不设置（浏览器会拦截）
 		if origin == allowedOrigin {
 			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 			w.Header().Set("Access-Control-Max-Age", "86400")
-			// 不设置 Vary: Origin 可能导致CDN缓存问题，建议加上
 			w.Header().Add("Vary", "Origin")
 		}
-
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -521,14 +524,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// healthHandler 健康检查接口（P1增强版）
-// 返回字段：
-//   status        — "ok" 全部正常 / "degraded" 部分异常（DB或Engine有问题）
-//   version       — 当前服务版本（config.AppVersion）
-//   time          — 当前服务器时间（RFC3339）
-//   database      — DB连通性检查结果（"ok" / "error: <msg>"）
-//   engine        — 并发引擎运行统计快照
-//   uptime_hint   — 服务启动时间（近似，取自进程启动时记录的时间）
+// makeHealthHandler 健康检查接口（增强版）
 func makeHealthHandler(engine *services.Engine) http.HandlerFunc {
 	startTime := time.Now()
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -537,7 +533,6 @@ func makeHealthHandler(engine *services.Engine) http.HandlerFunc {
 
 		overallStatus := "ok"
 
-		// ===== 1. 数据库连通性检查 =====
 		dbStatus := "ok"
 		dbErr := database.Ping(ctx)
 		if dbErr != nil {
@@ -545,21 +540,17 @@ func makeHealthHandler(engine *services.Engine) http.HandlerFunc {
 			overallStatus = "degraded"
 		}
 
-		// ===== 2. Engine 状态快照 =====
 		stats := engine.GetStats()
 		engineStatus := "ok"
-		// 队列使用率超过80%视为 warning（不影响 overall status，仅提示）
 		queueUsagePct := 0
 		if stats.QueueLength > 0 {
-			queueUsagePct = stats.QueueLength * 100 / 50 // 50 = queue_capacity
+			queueUsagePct = stats.QueueLength * 100 / 50
 		}
 		if queueUsagePct >= 80 {
 			engineStatus = "warning: queue usage " + itoa(queueUsagePct) + "%"
 		}
 
-		// ===== 3. 组装响应 =====
 		w.Header().Set("Content-Type", "application/json")
-		// degraded 时仍返回 200（服务可用但部分功能受损），便于监控区分存活与健康
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  overallStatus,
@@ -570,23 +561,22 @@ func makeHealthHandler(engine *services.Engine) http.HandlerFunc {
 				"status": dbStatus,
 			},
 			"engine": map[string]interface{}{
-				"status":            engineStatus,
-				"total_submitted":   stats.TotalSubmitted,
-				"total_completed":   stats.TotalCompleted,
+				"status":                engineStatus,
+				"total_submitted":       stats.TotalSubmitted,
+				"total_completed":       stats.TotalCompleted,
 				"total_business_failed": stats.TotalBusinessFailed,
-				"total_failed":      stats.TotalFailed,
-				"current_running":   stats.CurrentRunning,
-				"current_ai_active": stats.CurrentAIActive,
-				"queue_length":      stats.QueueLength,
-				"queue_capacity":    50,
-				"max_workers":       5,
-				"max_ai_concurrency": 4,
+				"total_failed":          stats.TotalFailed,
+				"current_running":       stats.CurrentRunning,
+				"current_ai_active":     stats.CurrentAIActive,
+				"queue_length":          stats.QueueLength,
+				"queue_capacity":        50,
+				"max_workers":           5,
+				"max_ai_concurrency":    4,
 			},
 		})
 	}
 }
 
-// itoa 简单整数转字符串（避免引入 strconv）
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

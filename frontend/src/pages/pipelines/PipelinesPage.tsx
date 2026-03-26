@@ -10,13 +10,13 @@ import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import {
   getPipelines, createPipeline, startPipeline, cancelPipeline, deletePipeline,
-  markPassed, batchCreatePipelines, batchStartPipelines, getOperators, batchAssignPipelines,
+  markPassed, batchCreatePipelines, batchStartPipelines, getOperators, batchAssignPipelines, batchRestartFromStep,
   type PipelineListItem, type CreatePipelineRequest, type OperatorInfo,
 } from '@/api/pipelines'
 import {
   Workflow, Play, Square, Trash2, RefreshCw, Plus,
   CheckCircle, XCircle, Clock, AlertTriangle, Loader, Eye, Zap,
-  Layers, Rocket, UserPlus, X as XIcon, CheckCircle as CheckCircleIcon,
+  Layers, Rocket, UserPlus, X as XIcon, CheckCircle as CheckCircleIcon, RotateCcw,
 } from 'lucide-react'
 
 // ==================== Toast组件 ====================
@@ -374,6 +374,32 @@ export default function PipelinesPage() {
     }
   }
 
+  // v37新增：批量重跑Generator
+  const handleBatchRestartGenerator = async () => {
+    const ids = Array.from(selectedIds)
+    if (ids.length === 0) {
+      setToast({ message: '请先选择要重跑的Pipeline', type: 'info' })
+      return
+    }
+    if (ids.length > 50) {
+      setToast({ message: '单次批量重跑上限50个Pipeline', type: 'err' })
+      return
+    }
+    if (!confirm('确认批量从Generator步骤重跑选中的 ' + ids.length + ' 个Pipeline？\n\n此操作将：\n• 重置Generator及后续步骤的执行数据\n• 清空已生成的页面\n• 重置审核和验收步骤\n• 每个Pipeline约需10-30分钟执行\n\n已完成的前序步骤（数据检查、评估、Meta、翻译）不受影响。')) return
+    try {
+      const result = await batchRestartFromStep(ids, 'generator')
+      const parts: string[] = []
+      if (result.success_count > 0) parts.push('成功提交 ' + result.success_count + ' 个')
+      if (result.skipped_ids.length > 0) parts.push('跳过 ' + result.skipped_ids.length + ' 个')
+      if (result.failed_ids.length > 0) parts.push('失败 ' + result.failed_ids.length + ' 个')
+      setToast({ message: '批量重跑完成: ' + parts.join(', '), type: result.failed_ids.length > 0 ? 'err' : 'ok' })
+      setSelectedIds(new Set())
+      loadPipelines()
+    } catch (e: any) {
+      setToast({ message: '批量重跑失败: ' + (e.message || ''), type: 'err' })
+    }
+  }
+
   // P6-2：打开分配弹窗
   const openAssignDialog = async () => {
     if (selectedIds.size === 0) return
@@ -683,6 +709,15 @@ export default function PipelinesPage() {
               cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6,
             }}>
               <Rocket size={14} /> 批量启动 ({selectedPendingCount})
+            </button>
+          )}
+          {isAdmin && (
+            <button onClick={handleBatchRestartGenerator} style={{
+              padding: '8px 18px', borderRadius: 10, border: 'none',
+              background: '#ff9500', color: '#fff', fontSize: 13, fontWeight: 600,
+              cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6,
+            }}>
+              <RotateCcw size={14} /> 批量重跑Generator
             </button>
           )}
           {isAdmin && (

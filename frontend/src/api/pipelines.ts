@@ -1,26 +1,20 @@
 /**
  * Pipeline管理API封装
  * P7新增：二级审批流程 submitFinalize/confirmFinalize/rejectFinalize
- *         新增 pending_finalize 状态
  * Phase8修复A-02：删除 assignPipeline() 函数
- *   原版调用 POST /pipelines/{id}/assign，但 routes.go 中该路由不存在（只有 /batch-assign）
- *   修复：移除该函数，所有分配操作统一走 batchAssignPipelines（单条分配传一个ID即可）
  * Phase8修复P-02：PipelineDetailResponse 新增 reject_reason 字段
- * v33修复A-01：消除全部 (res.data as any).data 类型绕过
- *   使用 extractData<T>() 辅助函数，统一从 AxiosResponse<ApiResponse<T>> 中安全提取数据
- *   所有API函数均获得完整的泛型类型推导，不再依赖 as any 强制转换
+ * v34修复A-01：消除全部 (res.data as any).data 类型绕过
+ * v36新增：restartFromStep() 断点续跑API
  */
 import client from './client'
 import type { ApiResponse } from './client'
 import type { AxiosResponse } from 'axios'
 
-// ==================== 辅助函数（v33修复A-01） ====================
+// ==================== 辅助函数 ====================
 
 /**
  * extractData 从 Axios 响应中安全提取业务数据
- * v33修复A-01：替代全部 (res.data as any).data 写法
- * 统一类型推导链：AxiosResponse<ApiResponse<T>> → ApiResponse<T>.data → T
- * 注意：响应拦截器已处理 code !== 0 的情况（reject），这里只处理成功响应
+ * v34修复A-01：替代全部 (res.data as any).data 写法
  */
 function extractData<T>(res: AxiosResponse<ApiResponse<T>>): T {
   return res.data.data as T
@@ -86,7 +80,6 @@ export interface StepListItem {
 /**
  * PipelineDetailResponse Pipeline详情响应类型
  * Phase8修复P-02：新增 reject_reason 字段
- * 审核员在审核页面可看到超级审核员填写的退回原因
  */
 export interface PipelineDetailResponse {
   id: string
@@ -108,7 +101,7 @@ export interface PipelineDetailResponse {
   review_round: number
   assigned_to: string | null
   assigned_name: string
-  /** 最近一次退回重审的原因（空字符串表示未被退回或未填写原因）Phase8新增 */
+  /** 最近一次退回重审的原因 Phase8新增 */
   reject_reason: string
   steps: StepListItem[]
 }
@@ -321,26 +314,32 @@ export interface VerifyStepData {
   latency_ms: number
 }
 
-// ==================== 后端包装响应类型（用于嵌套data结构） ====================
-// 部分接口返回 { pages: [...] } 或 { rounds: [...] } 等嵌套结构
-// 定义中间类型供 extractData 正确推导
+// ==================== 断点续跑相关类型（v36新增）====================
 
-/** 生成页面列表响应包装 */
+/**
+ * RestartFromStepRequest 断点续跑请求
+ * step_name: 要从哪个步骤开始重跑
+ * 支持: dbCheck / scanner / evaluator / meta / translator / generator
+ */
+export interface RestartFromStepRequest {
+  step_name: string
+}
+
+// ==================== 后端包装响应类型 ====================
+
 interface PagesWrapper {
   pages: GeneratedPageFull[]
 }
 
-/** 评估轮次列表响应包装 */
 interface EvalRoundsWrapper {
   rounds: EvalRoundDetail[]
 }
 
-/** 操作员列表响应包装 */
 interface OperatorsWrapper {
   operators: OperatorInfo[]
 }
 
-// ==================== API方法（v33修复A-01：全部使用 extractData<T> 替代 as any） ====================
+// ==================== API方法 ====================
 
 export async function getPipelines(): Promise<PipelineListResponse> {
   const res = await client.get<ApiResponse<PipelineListResponse>>('/pipelines')
@@ -376,6 +375,29 @@ export async function deletePipeline(id: string): Promise<void> {
 export async function getStepDetail(pipelineId: string, stepName: string): Promise<StepDetailResponse> {
   const res = await client.get<ApiResponse<StepDetailResponse>>('/pipelines/' + pipelineId + '/steps/' + stepName)
   return extractData<StepDetailResponse>(res)
+}
+
+// ==================== 断点续跑API（v36新增）====================
+
+/**
+ * restartFromStep 从指定步骤重新执行Pipeline
+ * v36新增：对应后端 POST /api/v1/pipelines/{id}/restart-from
+ * 调用后Pipeline立即进入running状态，前端通过SSE或轮询获取进度
+ *
+ * @param pipelineId - Pipeline ID
+ * @param stepName   - 要从哪个步骤开始重跑（dbCheck/scanner/evaluator/meta/translator/generator）
+ * @returns 更新后的Pipeline详情（status已变为running）
+ */
+export async function restartFromStep(
+  pipelineId: string,
+  stepName: string
+): Promise<PipelineDetailResponse> {
+  const res = await client.post<ApiResponse<PipelineDetailResponse>>(
+    '/pipelines/' + pipelineId + '/restart-from',
+    { step_name: stepName } satisfies RestartFromStepRequest,
+    { timeout: 3600000 }
+  )
+  return extractData<PipelineDetailResponse>(res)
 }
 
 // ==================== Eval Rounds API ====================
@@ -423,7 +445,6 @@ export async function updatePageDecision(
 
 /**
  * 直接定稿归档（仅admin可用，跳过二级审批）
- * P7更新：普通操作员请使用 submitFinalize
  */
 export async function finalizePipeline(pipelineId: string): Promise<void> {
   await client.post<ApiResponse<void>>('/pipelines/' + pipelineId + '/finalize')
@@ -431,28 +452,14 @@ export async function finalizePipeline(pipelineId: string): Promise<void> {
 
 // ==================== P7新增：二级审批API ====================
 
-/**
- * 提交定稿申请（审核员→待超级审核员确认）
- * P7新增：审核员完成逐页决策后调用，状态变为 pending_finalize
- * 权限：operator / senior_operator / admin
- */
 export async function submitFinalize(pipelineId: string): Promise<void> {
   await client.post<ApiResponse<void>>('/pipelines/' + pipelineId + '/submit-finalize')
 }
 
-/**
- * 确认定稿（超级审核员确认，pending_finalize→finalized）
- * P7新增：senior_operator / admin 在审核中心确认定稿
- */
 export async function confirmFinalize(pipelineId: string): Promise<void> {
   await client.post<ApiResponse<void>>('/pipelines/' + pipelineId + '/confirm-finalize')
 }
 
-/**
- * 退回重审（超级审核员退回，pending_finalize→review_queue）
- * P7新增：senior_operator / admin 退回给原审核员重新审核
- * Phase8修复P-02：退回原因现在会持久化到数据库，审核员可在审核页面看到
- */
 export async function rejectFinalize(pipelineId: string, reason?: string): Promise<void> {
   await client.post<ApiResponse<void>>(
     '/pipelines/' + pipelineId + '/reject-finalize',
@@ -558,15 +565,6 @@ export async function getOperators(): Promise<OperatorInfo[]> {
   return data.operators
 }
 
-/**
- * 批量分配Pipeline给指定审核员
- * Phase8修复A-02说明：
- *   原版有一个 assignPipeline(pipelineId, assignedTo) 函数，
- *   调用 POST /pipelines/{id}/assign，但该路由在后端 routes.go 中不存在（只有 /batch-assign）。
- *   修复：删除 assignPipeline 函数，单条分配时传入长度为1的数组调用本函数即可。
- *   用法：单条分配 → batchAssignPipelines([pipelineId], assignedTo)
- *         批量分配 → batchAssignPipelines(pipelineIds, assignedTo)
- */
 export async function batchAssignPipelines(
   pipelineIds: string[],
   assignedTo: string
@@ -576,4 +574,39 @@ export async function batchAssignPipelines(
     assigned_to: assignedTo,
   })
   return extractData<BatchAssignResult>(res)
+}
+
+// ==================== v37新增：批量断点续跑API ====================
+
+/**
+ * BatchRestartResult 批量断点续跑结果
+ */
+export interface BatchRestartResult {
+  total_requested: number
+  success_count: number
+  skipped_ids: string[]
+  skipped_reasons: string[]
+  failed_ids: string[]
+  failed_reasons: string[]
+}
+
+/**
+ * batchRestartFromStep 批量从指定步骤重新执行多个Pipeline
+ * v37新增：对应后端 POST /api/v1/pipelines/batch-restart
+ * 权限：仅 admin / senior_operator 可调用
+ *
+ * @param pipelineIds - 要重跑的Pipeline ID列表（上限50个）
+ * @param stepName    - 统一的起跑步骤（如 "generator"）
+ * @returns 批量重跑结果（成功数/跳过数/失败数）
+ */
+export async function batchRestartFromStep(
+  pipelineIds: string[],
+  stepName: string
+): Promise<BatchRestartResult> {
+  const res = await client.post<ApiResponse<BatchRestartResult>>(
+    '/pipelines/batch-restart',
+    { pipeline_ids: pipelineIds, step_name: stepName },
+    { timeout: 3600000 }
+  )
+  return extractData<BatchRestartResult>(res)
 }
