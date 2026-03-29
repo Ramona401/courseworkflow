@@ -6,21 +6,22 @@ package handlers
  * 路由前缀：/api/v1/admin/
  *
  * 接口列表：
- *   GET  /api/v1/admin/users                    — 用户列表（含教研组/学校归属，分页+筛选）
- *   POST /api/v1/admin/users                    — 新建用户
- *   GET  /api/v1/admin/users/{id}               — 用户详情（含跨系统权限全貌）
- *   PUT  /api/v1/admin/users/{id}               — 编辑用户（角色+显示名）
- *   PUT  /api/v1/admin/users/{id}/status        — 启用/禁用
- *   PUT  /api/v1/admin/users/{id}/password      — 重置密码（admin直接重置）
- *   GET  /api/v1/admin/users/{id}/assignments   — 获取课程分配
- *   PUT  /api/v1/admin/users/{id}/assignments   — 更新课程分配
- *   GET  /api/v1/admin/orgs                     — 组织列表（区域+学校）
- *   GET  /api/v1/admin/groups                   — 教研组列表（含成员数）
- *   GET  /api/v1/admin/groups/{id}/members      — 教研组成员列表
- *   POST /api/v1/admin/groups/{id}/members      — 添加教研组成员
- *   PUT  /api/v1/admin/groups/{id}/members/{uid}— 更新成员角色
+ *   GET  /api/v1/admin/users                      — 用户列表（含教研组/学校归属，分页+筛选）
+ *   POST /api/v1/admin/users                      — 新建用户
+ *   GET  /api/v1/admin/users/{id}                 — 用户详情（含跨系统权限全貌）
+ *   PUT  /api/v1/admin/users/{id}                 — 编辑用户（角色+显示名）
+ *   PUT  /api/v1/admin/users/{id}/status          — 启用/禁用
+ *   PUT  /api/v1/admin/users/{id}/password        — 重置密码（admin直接重置）
+ *   GET  /api/v1/admin/users/{id}/assignments     — 获取课程分配
+ *   PUT  /api/v1/admin/users/{id}/assignments     — 更新课程分配
+ *   GET  /api/v1/admin/orgs                       — 组织列表（区域+学校）
+ *   GET  /api/v1/admin/groups                     — 教研组列表（含成员数）
+ *   GET  /api/v1/admin/groups/{id}/members        — 教研组成员列表
+ *   POST /api/v1/admin/groups/{id}/members        — 添加教研组成员
+ *   PUT  /api/v1/admin/groups/{id}/members/{uid}  — 更新成员角色
  *   DELETE /api/v1/admin/groups/{id}/members/{uid}— 移除成员
- *   GET  /api/v1/admin/audit-logs               — 操作日志（分页+筛选）
+ *   GET  /api/v1/admin/audit-logs                 — 操作日志（分页+筛选）
+ *     支持参数：page / page_size / user_id（精确）/ username（模糊）/ action / start_date / end_date
  *
  * 权限：
  *   admin          → 所有操作，所有用户/组织
@@ -71,17 +72,17 @@ type AdminUserListItem struct {
 	ID          string  `json:"id"`
 	Username    string  `json:"username"`
 	DisplayName string  `json:"display_name"`
-	Role        string  `json:"role"`        // 课件审核角色
-	RoleName    string  `json:"role_name"`   // 角色中文名
+	Role        string  `json:"role"`       // 课件审核角色
+	RoleName    string  `json:"role_name"`  // 角色中文名
 	Status      string  `json:"status"`
 	LoginCount  int     `json:"login_count"`
 	LastLoginAt *string `json:"last_login_at"`
 	CreatedAt   string  `json:"created_at"`
 	// 教案系统归属（可能属于多个组，取第一个展示，详情页展开）
-	SchoolName  string `json:"school_name"`  // 所属学校（首个）
-	GroupName   string `json:"group_name"`   // 所属教研组（首个）
-	GroupRole   string `json:"group_role"`   // 教研组角色（member/backbone）
-	GroupCount  int    `json:"group_count"`  // 参与的教研组数
+	SchoolName string `json:"school_name"` // 所属学校（首个）
+	GroupName  string `json:"group_name"`  // 所属教研组（首个）
+	GroupRole  string `json:"group_role"`  // 教研组角色（member/backbone）
+	GroupCount int    `json:"group_count"` // 参与的教研组数
 }
 
 // AdminUserDetail 用户详情（含跨系统完整权限）
@@ -201,9 +202,9 @@ func (h *AdminHandler) CreateAdminUser(w http.ResponseWriter, r *http.Request) {
 	if claims != nil {
 		repository.WriteAuditLog(claims.UserID, "admin.user_create",
 			map[string]interface{}{
-				"target_user":  userInfo.ID,
-				"username":     userInfo.Username,
-				"role":         userInfo.Role,
+				"target_user": userInfo.ID,
+				"username":    userInfo.Username,
+				"role":        userInfo.Role,
 			}, repository.GetClientIP(r.RemoteAddr))
 	}
 
@@ -532,8 +533,18 @@ func (h *AdminHandler) RemoveAdminGroupMember(w http.ResponseWriter, r *http.Req
 
 // ==================== 操作日志 ====================
 
-// ListAdminAuditLogs 查询操作日志（分页+筛选）
-// GET /api/v1/admin/audit-logs?page=1&page_size=20&user_id=xxx&action=user.login
+// ListAdminAuditLogs 查询操作日志（分页+多维筛选）
+//
+// GET /api/v1/admin/audit-logs
+// 查询参数：
+//
+//	page        — 页码（默认1）
+//	page_size   — 每页条数（默认20，上限100）
+//	user_id     — 按用户ID精确过滤（旧参数保留）
+//	username    — 按用户名/显示名模糊搜索（新增）
+//	action      — 按操作类型精确过滤
+//	start_date  — 开始日期 yyyy-MM-dd（新增，含当天）
+//	end_date    — 结束日期 yyyy-MM-dd（新增，含当天）
 func (h *AdminHandler) ListAdminAuditLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
@@ -541,12 +552,27 @@ func (h *AdminHandler) ListAdminAuditLogs(w http.ResponseWriter, r *http.Request
 	}
 
 	q := r.URL.Query()
+
+	// 分页参数
 	page, _ := strconv.Atoi(q.Get("page"))
 	pageSize, _ := strconv.Atoi(q.Get("page_size"))
-	userID := q.Get("user_id")
-	action := q.Get("action")
 
-	result, err := repository.ListAuditLogs(r.Context(), userID, action, page, pageSize)
+	// 过滤参数（旧接口兼容 + 新增）
+	userID := q.Get("user_id")
+	username := q.Get("username")
+	action := q.Get("action")
+	startDate := q.Get("start_date")
+	endDate := q.Get("end_date")
+
+	result, err := repository.ListAuditLogs(r.Context(), repository.AuditLogQueryParams{
+		UserID:    userID,
+		Username:  username,
+		Action:    action,
+		StartDate: startDate,
+		EndDate:   endDate,
+		Page:      page,
+		PageSize:  pageSize,
+	})
 	if err != nil {
 		utils.InternalError(w, "查询操作日志失败: "+err.Error())
 		return

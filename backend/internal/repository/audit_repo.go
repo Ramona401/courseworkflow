@@ -3,7 +3,7 @@ package repository
 // audit_repo.go — 审计日志数据访问层
 //
 // 写入 audit_logs 表，记录关键业务操作。
-// 新增：支持分页+多条件查询，供统一用户管理中心使用。
+// v52强化：支持用户名模糊搜索 + 日期范围过滤 + 分页多条件查询。
 
 import (
 	"context"
@@ -76,6 +76,17 @@ type AuditLogListResult struct {
 	Total int            `json:"total"`
 }
 
+// AuditLogQueryParams 审计日志查询参数（v52新增结构体，支持更多过滤维度）
+type AuditLogQueryParams struct {
+	UserID    string // 按用户ID精确过滤（旧接口向后兼容）
+	Username  string // 按用户名/显示名模糊搜索（新增）
+	Action    string // 按操作类型精确过滤
+	StartDate string // 开始日期，格式 yyyy-MM-dd，含当天（新增）
+	EndDate   string // 结束日期，格式 yyyy-MM-dd，含当天（新增）
+	Page      int
+	PageSize  int
+}
+
 // actionNameMap 操作类型→中文名映射
 var actionNameMap = map[string]string{
 	"user.login":                "用户登录",
@@ -86,54 +97,92 @@ var actionNameMap = map[string]string{
 	"pipeline.direct_finalize":  "直接定稿",
 	"pipeline.mark_passed":      "快捷通过",
 	"pipeline.verify":           "触发验收",
+	"admin.user_create":         "创建用户",
+	"admin.user_status":         "状态变更",
+	"admin.user_reset_password": "重置密码",
 }
 
-// ListAuditLogs 分页查询审计日志
-// userID/action 为空则不过滤该字段；page从1开始；pageSize默认20
-func ListAuditLogs(ctx context.Context, userID string, action string, page int, pageSize int) (*AuditLogListResult, error) {
-	if page < 1 {
-		page = 1
+// ListAuditLogs 分页查询审计日志（支持多维过滤）
+//
+//   - params.UserID    非空则精确匹配 user_id（旧逻辑）
+//   - params.Username  非空则对 username/display_name 做 ILIKE 模糊搜索
+//   - params.Action    非空则精确匹配 action
+//   - params.StartDate 非空则过滤 created_at >= 当天零点
+//   - params.EndDate   非空则过滤 created_at <  次日零点
+//   - params.Page      从1开始；params.PageSize 默认20，上限100
+func ListAuditLogs(ctx context.Context, params AuditLogQueryParams) (*AuditLogListResult, error) {
+	if params.Page < 1 {
+		params.Page = 1
 	}
-	if pageSize < 1 || pageSize > 100 {
-		pageSize = 20
+	if params.PageSize < 1 || params.PageSize > 100 {
+		params.PageSize = 20
 	}
-	offset := (page - 1) * pageSize
+	offset := (params.Page - 1) * params.PageSize
 
-	// 构建WHERE条件
+	// ---- 动态构建 WHERE 子句 ----
 	where := "WHERE 1=1"
 	args := []interface{}{}
 	idx := 1
 
-	if userID != "" {
+	// 按用户ID精确过滤（旧接口保留）
+	if params.UserID != "" {
 		where += fmt.Sprintf(" AND al.user_id = $%d", idx)
-		args = append(args, userID)
-		idx++
-	}
-	if action != "" {
-		where += fmt.Sprintf(" AND al.action = $%d", idx)
-		args = append(args, action)
+		args = append(args, params.UserID)
 		idx++
 	}
 
-	// 查总数
+	// 按用户名/显示名模糊搜索（ILIKE，同一参数复用）
+	if params.Username != "" {
+		where += fmt.Sprintf(
+			" AND (u.username ILIKE $%d OR u.display_name ILIKE $%d)",
+			idx, idx,
+		)
+		args = append(args, "%"+params.Username+"%")
+		idx++
+	}
+
+	// 按操作类型精确过滤
+	if params.Action != "" {
+		where += fmt.Sprintf(" AND al.action = $%d", idx)
+		args = append(args, params.Action)
+		idx++
+	}
+
+	// 开始日期：created_at >= StartDate 当天零点
+	if params.StartDate != "" {
+		where += fmt.Sprintf(" AND al.created_at >= $%d::date", idx)
+		args = append(args, params.StartDate)
+		idx++
+	}
+
+	// 结束日期：created_at < EndDate 次日零点（含当天）
+	if params.EndDate != "" {
+		where += fmt.Sprintf(" AND al.created_at < ($%d::date + INTERVAL '1 day')", idx)
+		args = append(args, params.EndDate)
+		idx++
+	}
+
+	// ---- 查总数 ----
 	countSQL := fmt.Sprintf(`
-		SELECT COUNT(*) FROM audit_logs al
+		SELECT COUNT(*)
+		FROM audit_logs al
 		LEFT JOIN users u ON u.id = al.user_id
 		%s`, where)
+
 	var total int
 	if err := database.DB.QueryRow(ctx, countSQL, args...).Scan(&total); err != nil {
 		return nil, fmt.Errorf("统计审计日志失败: %w", err)
 	}
 
-	// 查数据（带分页）
-	dataArgs := append(args, pageSize, offset)
+	// ---- 查数据（带分页）----
+	dataArgs := append(args, params.PageSize, offset)
 	dataSQL := fmt.Sprintf(`
 		SELECT al.id, al.user_id,
 		       COALESCE(u.username, '已删除用户') AS username,
-		       COALESCE(u.display_name, '') AS display_name,
+		       COALESCE(u.display_name, '')       AS display_name,
 		       al.action,
-		       COALESCE(al.detail::text, '{}') AS detail,
-		       COALESCE(al.ip, '') AS ip,
+		       COALESCE(al.detail::text, '{}')    AS detail,
+		       COALESCE(al.ip, '')                AS ip,
 		       al.created_at
 		FROM audit_logs al
 		LEFT JOIN users u ON u.id = al.user_id
@@ -192,7 +241,12 @@ func GetClientIP(remoteAddr string) string {
 
 // QueryAuditLogs 兼容旧接口（保留，防止编译错误）
 func QueryAuditLogs(ctx context.Context, userID string, action string, limit int) ([]map[string]interface{}, error) {
-	result, err := ListAuditLogs(ctx, userID, action, 1, limit)
+	result, err := ListAuditLogs(ctx, AuditLogQueryParams{
+		UserID:   userID,
+		Action:   action,
+		Page:     1,
+		PageSize: limit,
+	})
 	if err != nil {
 		return nil, err
 	}

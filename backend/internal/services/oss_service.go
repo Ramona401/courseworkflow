@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -341,8 +342,10 @@ func (s *OSSService) FetchLessonHTML(lessonID int) (string, error) {
 	return string(data), nil
 }
 
-// BuildPageLessonMap 建立页码→lesson_id的映射（按order排序）
-// 返回：map[页码(从1开始)]lesson_id
+// BuildPageLessonMap 建立页码→lesson_id的映射
+// 策略：从lesson.Title解析页码（如"P10-清晰度挑战-V1.0"→页码10）
+// 不依赖order顺序，避免modules JSON与indexes JSON不同步导致页码错位
+// 返回：map[页码]lesson_id
 func (s *OSSService) BuildPageLessonMap(moduleID int) (map[int]int, error) {
 	detail, err := s.FetchModuleDetail(moduleID)
 	if err != nil {
@@ -352,17 +355,34 @@ func (s *OSSService) BuildPageLessonMap(moduleID int) (map[int]int, error) {
 		return nil, fmt.Errorf("模块%d无课时数据", moduleID)
 	}
 
-	// 按order排序
-	lessons := make([]*models.OSSLesson, len(detail.Lessons))
-	copy(lessons, detail.Lessons)
-	sort.Slice(lessons, func(i, j int) bool {
-		return lessons[i].Order < lessons[j].Order
-	})
-
-	// 页码从1开始
+	// 从title解析页码：匹配"P数字-"开头格式
+	// 例：P08-任务发布-v2.0 → 页码8
+	// 例：P10-清晰度挑战-V1.0 → 页码10
+	pageNumRe := regexp.MustCompile(`^P(\d{1,3})-`)
 	pageMap := make(map[int]int)
-	for i, lesson := range lessons {
-		pageMap[i+1] = lesson.ID
+	fallbackIdx := 1 // 解析失败时的兜底页码
+
+	for _, lesson := range detail.Lessons {
+		m := pageNumRe.FindStringSubmatch(lesson.Title)
+		if m != nil {
+			pageNum := 0
+			fmt.Sscanf(m[1], "%d", &pageNum)
+			if pageNum > 0 {
+				// title解析成功，直接用页码
+				pageMap[pageNum] = lesson.ID
+				continue
+			}
+		}
+		// title不符合P数字格式，兜底按order顺序（按order排序后填入空缺位置）
+		for pageMap[fallbackIdx] != 0 {
+			fallbackIdx++
+		}
+		pageMap[fallbackIdx] = lesson.ID
+		fallbackIdx++
+	}
+
+	if len(pageMap) == 0 {
+		return nil, fmt.Errorf("模块%d页码映射为空", moduleID)
 	}
 	return pageMap, nil
 }
