@@ -1,5 +1,9 @@
 package services
 
+// Translator + Reviewer 循环执行服务
+// v46修复：所有AI调用改用 callAIWithSemaphore，通过引擎信号量控制并发
+//          修复之前直接调用 ai.CallAI() 绕过信号量导致AI API并发过高卡死的问题
+
 import (
 	"encoding/json"
 	"fmt"
@@ -30,6 +34,7 @@ var (
 // executeTranslator 执行translator步骤：Translator(Prompt C) + Reviewer(Prompt D) 循环
 // 循环逻辑：Reviewer评分≥threshold且QUALITY_GATE=PASS → 通过
 //           否则提取反馈重跑Translator（最多max_tr_loop次）
+// v46修复：所有AI调用改用 s.callAIWithSemaphore() 以遵守引擎并发限制
 func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 	startTime := time.Now()
 	stepName := models.StepTranslator
@@ -40,8 +45,8 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 
 	// 解析Pipeline配置
 	pCfg := models.ParsePipelineConfig(pipeline.Config)
-	threshold := pCfg.Threshold   // 默认9.0
-	maxLoop := pCfg.MaxTRLoop     // 默认3
+	threshold := pCfg.Threshold // 默认9.0
+	maxLoop := pCfg.MaxTRLoop   // 默认3
 
 	// 1. 加载 Prompt C（Translator提示词）
 	promptC, err := repository.GetCurrentPromptByKey("prompt_c")
@@ -138,6 +143,7 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 		}
 
 		// ---- 8a. Translator调用（Prompt C）----
+		// v46修复：使用 callAIWithSemaphore 替代直接 ai.CallAI，遵守引擎并发限制
 		transUserPrompt := buildTranslatorUserPrompt(
 			scannerLocationJSON,
 			courseIndex.IndexContent,
@@ -146,7 +152,7 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 			loop,
 		)
 
-		transResult, transErr := ai.CallAI(aiCfgTrans, promptC.Content, transUserPrompt)
+		transResult, transErr := s.callAIWithSemaphore(aiCfgTrans, promptC.Content, transUserPrompt)
 		if transErr != nil {
 			roundRecord.TransError = transErr.Error()
 			result.Rounds = append(result.Rounds, roundRecord)
@@ -173,6 +179,7 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 		roundRecord.TransLatencyMs = transResult.LatencyMs
 
 		// ---- 8b. Reviewer调用（Prompt D）----
+		// v46修复：使用 callAIWithSemaphore 替代直接 ai.CallAI，遵守引擎并发限制
 		reviewUserPrompt := buildReviewerUserPrompt(
 			scannerLocationJSON,
 			courseIndex.IndexContent,
@@ -180,7 +187,7 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 			transOutput,
 		)
 
-		reviewResult, reviewErr := ai.CallAI(aiCfgReview, promptD.Content, reviewUserPrompt)
+		reviewResult, reviewErr := s.callAIWithSemaphore(aiCfgReview, promptD.Content, reviewUserPrompt)
 		if reviewErr != nil {
 			roundRecord.ReviewError = reviewErr.Error()
 			result.Rounds = append(result.Rounds, roundRecord)
@@ -365,16 +372,17 @@ type reviewScoreResult struct {
 
 // extractReviewScores 从Reviewer输出中提取<<<REVIEW_SCORE>>>块中的评分
 // 格式：
-//   <<<REVIEW_SCORE>>>
-//   HARD_CHECK:PASS或FAIL
-//   E1:{X.X}
-//   E2:{X.X}
-//   E3:{X.X}
-//   E4:{X.X}
-//   TOTAL:{X.X}
-//   GRADE:{A/B/C/D}
-//   QUALITY_GATE:{PASS/FAIL}
-//   <<<END_REVIEW_SCORE>>>
+//
+//	<<<REVIEW_SCORE>>>
+//	HARD_CHECK:PASS或FAIL
+//	E1:{X.X}
+//	E2:{X.X}
+//	E3:{X.X}
+//	E4:{X.X}
+//	TOTAL:{X.X}
+//	GRADE:{A/B/C/D}
+//	QUALITY_GATE:{PASS/FAIL}
+//	<<<END_REVIEW_SCORE>>>
 func extractReviewScores(output string) *reviewScoreResult {
 	result := &reviewScoreResult{}
 

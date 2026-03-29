@@ -14,39 +14,68 @@ import (
 	"tedna/internal/repository"
 )
 
-// ==================== Generator 错误常量（P4-6新增）====================
+// ==================== Generator 错误常量 ====================
 
 var (
 	ErrGenPromptFMissing    = fmt.Errorf("Prompt F未配置，请先在提示词管理中设置prompt_f")
 	ErrGenTranslatorNotDone = fmt.Errorf("Translator步骤未完成，无法执行Generator")
 	ErrGenScannerNotDone    = fmt.Errorf("Scanner步骤未完成，无法执行Generator")
-	ErrGenMetaNotDone       = fmt.Errorf("Meta步骤未完成，无法执行Generator")
 	ErrGenNoModuleID        = fmt.Errorf("课程无external_module_id，无法从OSS读取课件")
 	ErrGenPageMapFailed     = fmt.Errorf("无法建立页码→课时ID映射")
 	ErrGenNoPages           = fmt.Errorf("未解析到任何页面操作")
 )
 
-// ==================== 新增页面虚拟页码规则（P7修复）====================
-//
-// 问题：Translator输出中新增页面（create操作）若使用与原有页面相同的整数页码，
-//       会在opsMap中覆盖原有页面，导致审核时页面错位。
-//
-// 解决方案：新增页面使用虚拟页码 = 原始位置 + createPageOffset（1000）
-//   例：Translator要求在P04之后新增一页 → 存储为 page_number=1004，page_title="P04-new 原标题"
-//   原有的P04保持 page_number=4 不变，两者互不干扰。
-//
-// 排序时：虚拟页码1004排在4之后，5之前（因1004>4且通常<1005），
-//         前端识别 page_number >= createPageOffset 时显示为 "Pxx-new" 格式。
-//
-// 注意：createPageOffset=1000，假设课程最多999页（实际课程通常20-30页）。
+// createPageOffset 新增页面虚拟页码偏移量
+// 新增页面page_number = 新课件位置 + 1000
+// 例：在P09之后新增P10 → page_number=1010，排序时插入P09之后P11之前
 const createPageOffset = 1000
 
-// ==================== Generator 步骤执行（P4-6新增）====================
+// ==================== 提取"逐页修改指令"区域 ====================
+//
+// Translator输出结构：
+//   区域1：前言+总览+变化总览  ← 跳过（含页码提及，会被误读）
+//   区域2：逐页修改指令        ← 只解析这里
+//   区域3：修改后完整页面清单  ← 跳过（表格行会被误读为页面指令）
+//   区域4：评估分布图等附录    ← 跳过
+func extractPageOpsSection(transOutput string) string {
+	lines := strings.Split(transOutput, "\n")
+	startIdx := -1
+	endIdx := len(lines)
 
-// executeGenerator 执行generator步骤：根据Translator输出逐页生成/修改HTML
-// 流程：解析页面操作 → 建立页码→lesson_id映射 → 逐页执行5种操作 → 存入generated_pages表
-// P4.5-E更新：每页存入change_reason（Translator的修改理由/指令），供审核页面展示
-// P7修复：新增页面使用虚拟页码（原始页码+createPageOffset），避免覆盖原有页面
+	for i, line := range lines {
+		if strings.Contains(strings.TrimSpace(line), "逐页修改指令") {
+			startIdx = i + 1
+			break
+		}
+	}
+	if startIdx < 0 {
+		return transOutput // 兼容旧格式
+	}
+
+	endKeywords := []string{
+		"修改后完整页面清单", "评估分布图", "修改后时间估算",
+		"互动质量总览", "能力目标达成总览", "修改后整体指标", "全版本变更历史",
+	}
+	for i := startIdx; i < len(lines); i++ {
+		for _, kw := range endKeywords {
+			if strings.Contains(strings.TrimSpace(lines[i]), kw) {
+				endIdx = i
+				goto foundEnd
+			}
+		}
+	}
+foundEnd:
+	return strings.Join(lines[startIdx:endIdx], "\n")
+}
+
+// ==================== Generator 步骤执行 ====================
+//
+// 模型分层策略：
+//   keep   → 不调AI，直接从OSS读取
+//   delete → 不调AI，标记删除
+//   modify → Sonnet（在原HTML基础上修改，模板化操作）
+//   create → Opus（从零创建新页面，需要更强创意）
+//   merge  → Opus（多页合并，逻辑复杂）
 func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 	startTime := time.Now()
 	stepName := models.StepGenerator
@@ -63,7 +92,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		return ErrGenPromptFMissing
 	}
 
-	// 2. 获取Translator步骤的最终输出（FinalTransOutput）
+	// 2. 获取Translator最终输出
 	transStep, err := repository.GetStepByName(pipeline.ID, models.StepTranslator)
 	if err != nil || transStep.Status != models.StepStatusDone {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -78,7 +107,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		return fmt.Errorf(errMsg)
 	}
 
-	// 3. 获取Scanner定位（用于构建prompt）
+	// 3. 获取Scanner定位
 	scannerStep, err := repository.GetStepByName(pipeline.ID, models.StepScanner)
 	if err != nil || scannerStep.Status != models.StepStatusDone {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -86,7 +115,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		return ErrGenScannerNotDone
 	}
 
-	// 4. 获取课程信息和module_id
+	// 4. 获取课程module_id
 	course, err := repository.GetCourseByCode(pipeline.CourseCode)
 	if err != nil {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -101,7 +130,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 	}
 	moduleID := *course.ExternalModuleID
 
-	// 5. 建立页码→lesson_id映射（从OSS读取模块详情）
+	// 5. 从OSS实时建立页码→lesson_id映射（每次重跑都取最新内容）
 	ossService := NewOSSService(s.cfg)
 	pageLessonMap, err := ossService.BuildPageLessonMap(moduleID)
 	if err != nil {
@@ -111,34 +140,53 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		return fmt.Errorf(errMsg)
 	}
 
-	// 6. 解析Translator输出为页面操作列表
-	// P7修复：parsePageOps会将create操作的页码自动偏移+createPageOffset，避免与原有页面冲突
-	pageOps := parsePageOps(transOutput, len(pageLessonMap))
+	// 6. 提取"逐页修改指令"区域，解析页面操作列表
+	// Translator必须输出所有页面的完整指令，不存在需要自动补充的页面
+	pageOpsSection := extractPageOpsSection(transOutput)
+	pageOps := parsePageOps(pageOpsSection)
 	if len(pageOps) == 0 {
 		durationMs := time.Since(startTime).Milliseconds()
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, ErrGenNoPages.Error())
 		return ErrGenNoPages
 	}
 
-	// 7. 获取AI配置（使用generator场景）
-	aiCfg, err := ai.GetEffectiveConfig(
-		s.cfg.AESKey,
-		"generator",
-		s.cfg.AIAPIBaseURL,
-		s.cfg.AIAPIKey,
-		s.cfg.AIDefaultModel,
+	// 7. 按操作类型获取AI配置（模型分层）
+	// modify → generator场景（Sonnet）
+	// create → generator_create场景（Opus）
+	// merge  → generator_merge场景（Opus）
+	aiCfgModify, err := ai.GetEffectiveConfig(
+		s.cfg.AESKey, models.SceneGenerator,
+		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
 	)
 	if err != nil {
 		durationMs := time.Since(startTime).Milliseconds()
-		errMsg := fmt.Sprintf("generator: 获取AI配置失败: %s", err.Error())
+		errMsg := fmt.Sprintf("generator: 获取modify AI配置失败: %s", err.Error())
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
 		return fmt.Errorf(errMsg)
 	}
 
-	// 8. 清理旧的生成页面（支持重跑）
+	aiCfgCreate, err := ai.GetEffectiveConfig(
+		s.cfg.AESKey, models.SceneGeneratorCreate,
+		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		// 获取失败时降级使用modify配置
+		aiCfgCreate = aiCfgModify
+	}
+
+	aiCfgMerge, err := ai.GetEffectiveConfig(
+		s.cfg.AESKey, models.SceneGeneratorMerge,
+		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		// 获取失败时降级使用modify配置
+		aiCfgMerge = aiCfgModify
+	}
+
+	// 8. 清理旧数据（每次重跑从OSS取最新内容）
 	_ = repository.DeleteGeneratedPagesByPipelineID(pipeline.ID)
 
-	// 9. 逐页执行
+	// 9. 逐页执行（pageOps已按最终页码顺序排列）
 	result := &models.GeneratorResult{}
 	var totalTokens int
 	var lastModelUsed string
@@ -149,15 +197,10 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 			PageTitle:  op.Title,
 			Operation:  op.Operation,
 		}
-
-		// P4.5-E: 提取修改理由（Translator给出的逐页修改指令）
-		// 对于keep/delete页面也保留Description，作为衔接说明
 		changeReason := op.Description
 
-		// 获取当前页的lesson_id
-		// v35修复：使用GetOrigPageNum()获取真实原始页码查找lesson_id
-		// 对于Translator重排的页面（如"P05=原P04"），用OriginalPageNumber=4查找
-		// 对于create操作的虚拟页码，还原为原始页码
+		// 用【原始页码】直接查pageLessonMap，这是唯一权威来源
+		// create页面OriginalPageNumber=0，用虚拟页码还原找参考页
 		realPageNum := op.GetOrigPageNum()
 		if op.Operation == models.PageOpCreate && op.PageNumber >= createPageOffset {
 			realPageNum = op.PageNumber - createPageOffset
@@ -168,8 +211,9 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		}
 
 		switch op.Operation {
+
 		case models.PageOpKeep:
-			// ===== keep: 从OSS读取原始HTML，直接保存 =====
+			// keep：从OSS读取原始HTML，不调AI
 			result.KeptPages++
 			if hasLesson {
 				origHTML, fetchErr := ossService.FetchLessonHTML(lessonID)
@@ -185,7 +229,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 					)
 				} else {
 					pageRec.Status = "done"
-					pageRec.Error = "OSS读取失败或内容过短"
+					pageRec.Error = fmt.Sprintf("OSS读取失败(lesson=%d): %v", lessonID, fetchErr)
 					_ = repository.CreateGeneratedPage(
 						pipeline.ID, op.PageNumber, op.Title,
 						"keep", "", "", "",
@@ -202,7 +246,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 			}
 
 		case models.PageOpDelete:
-			// ===== delete: 标记删除，不调AI =====
+			// delete：标记删除，不调AI
 			result.DeletedPages++
 			pageRec.Status = "done"
 			_ = repository.CreateGeneratedPage(
@@ -212,11 +256,11 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 			)
 
 		case models.PageOpModify:
-			// ===== modify: 读取原始HTML + AI修改 =====
+			// modify：从OSS读取原始HTML + Sonnet修改
 			result.ModifiedPages++
 			if !hasLesson {
 				pageRec.Status = "failed"
-				pageRec.Error = "无lesson_id，无法读取原始HTML"
+				pageRec.Error = fmt.Sprintf("modify页面未找到lesson_id，原始页码=%d", realPageNum)
 				result.FailedPages++
 				_ = repository.CreateGeneratedPage(
 					pipeline.ID, op.PageNumber, op.Title,
@@ -226,11 +270,10 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				result.Pages = append(result.Pages, pageRec)
 				continue
 			}
-
 			origHTML, fetchErr := ossService.FetchLessonHTML(lessonID)
 			if fetchErr != nil || len(origHTML) < 100 {
 				pageRec.Status = "failed"
-				pageRec.Error = fmt.Sprintf("OSS读取失败: %v", fetchErr)
+				pageRec.Error = fmt.Sprintf("OSS读取失败(lesson=%d): %v", lessonID, fetchErr)
 				result.FailedPages++
 				_ = repository.CreateGeneratedPage(
 					pipeline.ID, op.PageNumber, op.Title,
@@ -240,14 +283,13 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				result.Pages = append(result.Pages, pageRec)
 				continue
 			}
-
 			pageRec.HasOrigHTML = true
 			pageRec.OrigHTMLLen = len(origHTML)
 
-			// 构建modify prompt并调用AI
+			// modify使用Sonnet（模板化修改，速度快）
 			userPrompt := buildModifyUserPrompt(pipeline.CourseCode, op, origHTML)
 			callStart := time.Now()
-			callResult, callErr := s.callAIWithSemaphore(aiCfg, promptF.Content, userPrompt)
+			callResult, callErr := s.callAIWithSemaphore(aiCfgModify, promptF.Content, userPrompt)
 			pageRec.LatencyMs = time.Since(callStart).Milliseconds()
 
 			if callErr != nil {
@@ -274,15 +316,13 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 			}
 
 		case models.PageOpCreate:
-			// ===== create: 用邻近页作为格式参考，AI生成新页面 =====
-			// P7修复：op.PageNumber已是虚拟页码（realPageNum+createPageOffset）
-			// findReferencePageHTML使用realPageNum查找邻近页
+			// create：用邻近页作为格式参考，Opus生成新页面（从零创建需要更强创意）
 			result.CreatedPages++
 			refHTML := findReferencePageHTML(ossService, pageLessonMap, realPageNum)
 
 			userPrompt := buildCreateUserPrompt(pipeline.CourseCode, op, refHTML)
 			callStart := time.Now()
-			callResult, callErr := s.callAIWithSemaphore(aiCfg, promptF.Content, userPrompt)
+			callResult, callErr := s.callAIWithSemaphore(aiCfgCreate, promptF.Content, userPrompt)
 			pageRec.LatencyMs = time.Since(callStart).Milliseconds()
 
 			if callErr != nil {
@@ -309,7 +349,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 			}
 
 		case models.PageOpMerge:
-			// ===== merge: 读取多个源页面HTML，AI合并生成 =====
+			// merge：读取多个源页面HTML，Opus合并生成（多页合并逻辑复杂）
 			result.MergedPages++
 			sourceHTMLs := collectMergeSourceHTMLs(ossService, pageLessonMap, op)
 			if len(sourceHTMLs) < 2 {
@@ -318,11 +358,10 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				op.Operation = models.PageOpModify
 				result.MergedPages--
 				result.ModifiedPages++
-
 				if len(sourceHTMLs) == 1 {
 					userPrompt := buildModifyUserPrompt(pipeline.CourseCode, op, sourceHTMLs[0].html)
 					callStart := time.Now()
-					callResult, callErr := s.callAIWithSemaphore(aiCfg, promptF.Content, userPrompt)
+					callResult, callErr := s.callAIWithSemaphore(aiCfgModify, promptF.Content, userPrompt)
 					pageRec.LatencyMs = time.Since(callStart).Milliseconds()
 					if callErr != nil {
 						pageRec.Status = "failed"
@@ -353,20 +392,19 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				continue
 			}
 
-			// 构建merge源信息
 			mergeSourceNums := make([]int, len(sourceHTMLs))
 			for i, sh := range sourceHTMLs {
 				mergeSourceNums[i] = sh.pageNum
 			}
 			pageRec.MergeSources = mergeSourceNums
 
+			// merge使用Opus（复杂合并需要更强推理）
 			userPrompt := buildMergeUserPrompt(pipeline.CourseCode, op, sourceHTMLs)
 			callStart := time.Now()
-			callResult, callErr := s.callAIWithSemaphore(aiCfg, promptF.Content, userPrompt)
+			callResult, callErr := s.callAIWithSemaphore(aiCfgMerge, promptF.Content, userPrompt)
 			pageRec.LatencyMs = time.Since(callStart).Milliseconds()
 
 			mergeJSON, _ := json.Marshal(mergeSourceNums)
-
 			if callErr != nil {
 				pageRec.Status = "failed"
 				pageRec.Error = callErr.Error()
@@ -390,7 +428,6 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				)
 			}
 		}
-
 		result.Pages = append(result.Pages, pageRec)
 	}
 
@@ -410,26 +447,25 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 	return nil
 }
 
-// ==================== 解析Translator输出为页面操作（P4-6新增）====================
-
-// parsePageOps 解析Translator输出中的逐页修改指令
-// Translator输出格式：每页用 "--\nPXX 标题 【修改】\n--" 分隔
-// 每页内有 【操作】保留/修改/新增/删除/合并 等标记
+// ==================== 解析逐页修改指令 ====================
 //
-// P7修复：create操作的页面使用虚拟页码（原始页码 + createPageOffset），
-//         防止与原有页面在opsMap中冲突导致审核时页面错位。
-//         例：Translator写"P04 新页 【新增】" → 存储为 page_number=1004，title="P04-new 新页"
-func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperation {
+// 设计原则：
+//   1. 只解析"逐页修改指令"区域（由extractPageOpsSection提取）
+//   2. 每页的【原始页码】字段是取OSS内容的唯一依据
+//   3. 完全不使用origCursor指针法，不自动补充任何页面
+//   4. Translator必须输出所有页面的完整指令
+//
+// 虚拟页码规则：
+//   新增页（create）page_number = 新课件位置 + 1000
+//   例：在P09之后新增P10 → page_number=1010
+//   排序时1010自然排在9之后11之前，前端按此顺序展示
+func parsePageOps(transOutput string) []*models.PageOperation {
 	var ops []*models.PageOperation
 	opsMap := make(map[int]*models.PageOperation)
-
-	// createPageCounter 用于给同一位置多个新增页面分配唯一虚拟页码
-	// key=原始页码，value=已分配的新增数量
 	createCounterMap := make(map[int]int)
 
 	lines := strings.Split(transOutput, "\n")
 
-	// 操作关键词映射
 	opKeywords := map[string]string{
 		"保留": models.PageOpKeep, "keep": models.PageOpKeep, "无变化": models.PageOpKeep,
 		"修改": models.PageOpModify, "modify": models.PageOpModify,
@@ -438,10 +474,10 @@ func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperatio
 		"删除": models.PageOpDelete, "delete": models.PageOpDelete, "移除": models.PageOpDelete,
 	}
 
-	// 页码+标题正则：匹配 "P01 标题文字" 或 "--\nP01 标题" 格式
 	pageHeaderRe := regexp.MustCompile(`(?m)^-*\s*P(\d{1,2})\s+(.+?)(?:\s*【|$)`)
+	origPageFieldRe := regexp.MustCompile(`【原始页码】\s*(?:P|p)(\d{1,3})(?:\s*[+＋]\s*(?:P|p)(\d{1,3}))?`)
+	origPageNoneRe := regexp.MustCompile(`【原始页码】\s*无`)
 
-	// 按页面分段
 	var currentPage int
 	var currentTitle string
 	var currentDesc []string
@@ -453,38 +489,55 @@ func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperatio
 		desc := strings.Join(currentDesc, "\n")
 		op := detectOperation(desc, opKeywords)
 
-		// 检测merge源页面
 		var mergeSources []int
 		if op == models.PageOpMerge {
 			mergeSources = extractMergeSources(desc, currentPage)
 		}
 
-		if op == models.PageOpCreate {
-			// =====================================================================
-			// P7修复：create操作使用虚拟页码，避免覆盖同编号的原有页面
-			// 规则：虚拟页码 = 原始页码 + createPageOffset + 同位置已有新增数量×10
-			// 例：P04新增第1个 → 1004；P04新增第2个 → 1014（极少见情况）
-			// title标注 "-new" 后缀，供前端识别和显示
-			// =====================================================================
+		// 从【原始页码】字段直接解析OriginalPageNumber
+		// 这是取OSS内容的唯一依据，不使用任何指针法推算
+		origPageNum := 0
+		isCreateOp := false
+
+		if origPageNoneRe.MatchString(desc) {
+			// 【原始页码】无 → 纯新增页面
+			isCreateOp = true
+			origPageNum = 0
+		} else if m := origPageFieldRe.FindStringSubmatch(desc); m != nil {
+			// 【原始页码】P03 或 【原始页码】P03+P04
+			if parsed, err := strconv.Atoi(m[1]); err == nil && parsed > 0 {
+				origPageNum = parsed
+			}
+			if op == models.PageOpMerge && m[2] != "" {
+				if parsed2, err := strconv.Atoi(m[2]); err == nil && parsed2 > 0 {
+					mergeSources = []int{origPageNum, parsed2}
+				}
+			}
+		} else {
+			// 没有【原始页码】字段：兼容旧格式，用当前页码
+			origPageNum = currentPage
+		}
+
+		if op == models.PageOpCreate || isCreateOp {
+			// 新增页面使用虚拟页码
 			createCounterMap[currentPage]++
 			counter := createCounterMap[currentPage]
 			virtualPageNum := currentPage + createPageOffset + (counter-1)*10
 
-			// 标题加上 -new 后缀标识（前端根据 page_number >= createPageOffset 判断）
 			newTitle := fmt.Sprintf("P%02d-new %s", currentPage, currentTitle)
 			if len([]rune(newTitle)) > 60 {
 				newTitle = string([]rune(newTitle)[:60])
 			}
 
 			opsMap[virtualPageNum] = &models.PageOperation{
-				PageNumber:  virtualPageNum,
-				Operation:   models.PageOpCreate,
-				Title:       newTitle,
-				Description: desc,
+				PageNumber:         virtualPageNum,
+				OriginalPageNumber: 0,
+				Operation:          models.PageOpCreate,
+				Title:              newTitle,
+				Description:        desc,
 			}
 		} else {
 			if existing, ok := opsMap[currentPage]; ok {
-				// 如果已存在，追加描述，保留更高优先级的操作
 				existing.Description += "\n" + desc
 				if opPriority(op) > opPriority(existing.Operation) {
 					existing.Operation = op
@@ -492,17 +545,11 @@ func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperatio
 				if len(mergeSources) > 0 {
 					existing.MergeSources = mergeSources
 				}
+				if origPageNum > 0 {
+					existing.OriginalPageNumber = origPageNum
+				}
 			} else {
-				// v35修复：从标题中解析"原Pxx"获取真实的原始页码
-					// Translator重排页码时标题格式如"xxx（原P04，页码顺延）"
-					origPageNum := currentPage // 默认原始页码等于当前页码
-					origMatch := regexp.MustCompile(`(?:原|原始)[Pp]?(\d{1,3})`).FindStringSubmatch(currentTitle + " " + desc)
-					if origMatch != nil {
-						if parsed, parseErr := strconv.Atoi(origMatch[1]); parseErr == nil && parsed > 0 {
-							origPageNum = parsed
-						}
-					}
-					opsMap[currentPage] = &models.PageOperation{
+				opsMap[currentPage] = &models.PageOperation{
 					PageNumber:         currentPage,
 					OriginalPageNumber: origPageNum,
 					Operation:          op,
@@ -517,13 +564,31 @@ func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperatio
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 
+		// 跳过表格行（含3个以上"|"）
+		if strings.Count(trimmed, "|") >= 3 {
+			continue
+		}
+
+		// 跳过纯分隔线
+		if len(trimmed) >= 2 {
+			allSep := true
+			for _, ch := range trimmed {
+				if ch != '-' && ch != '=' && ch != '＝' {
+					allSep = false
+					break
+				}
+			}
+			if allSep {
+				continue
+			}
+		}
+
 		// 检测页面标题行
 		if m := pageHeaderRe.FindStringSubmatch(trimmed); m != nil {
 			flushPage()
 			pn, _ := strconv.Atoi(m[1])
 			currentPage = pn
 			currentTitle = strings.TrimSpace(m[2])
-			// 去掉标题中可能的修改标记
 			currentTitle = regexp.MustCompile(`\s*【.*】.*$`).ReplaceAllString(currentTitle, "")
 			currentTitle = strings.TrimSpace(currentTitle)
 			if len([]rune(currentTitle)) > 60 {
@@ -533,7 +598,7 @@ func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperatio
 			continue
 		}
 
-		// 也支持 "P18" 这种纯页码格式（新增页面标题在下一行）
+		// 支持纯页码格式 "P18"
 		if m := regexp.MustCompile(`^P(\d{1,2})\b`).FindStringSubmatch(trimmed); m != nil {
 			if currentPage > 0 {
 				flushPage()
@@ -551,20 +616,7 @@ func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperatio
 	}
 	flushPage()
 
-	// 补充未在Translator输出中提到的原始页面（默认keep）
-	// 注意：只补充整数页码范围内（1~totalOrigPages）的原始页面，不补充虚拟页码
-	for pn := 1; pn <= totalOrigPages; pn++ {
-		if _, exists := opsMap[pn]; !exists {
-			opsMap[pn] = &models.PageOperation{
-				PageNumber:         pn,
-				OriginalPageNumber: pn, // 未被Translator提到的页面，原始页码等于当前页码
-				Operation:          models.PageOpKeep,
-				Title:              fmt.Sprintf("Page %d", pn),
-			}
-		}
-	}
-
-	// 按页码排序
+	// 按页码排序（虚拟页码1010排在10之后11之前，即最终课件顺序）
 	for _, op := range opsMap {
 		ops = append(ops, op)
 	}
@@ -572,54 +624,11 @@ func parsePageOps(transOutput string, totalOrigPages int) []*models.PageOperatio
 		return ops[i].PageNumber < ops[j].PageNumber
 	})
 
-	// ==================== v35v5修复：计算每个页面的真实原始页码 ====================
-	// Translator会重编页码（如新增P04后，原P04→P05，原P05→P06...）
-	// 判断方法：如果opsMap中存在虚拟页码(1000+x)，说明页码x是新增位置
-	// 统计虚拟页码对应的原始页码集合，然后按偏移量计算每个页面的真实原始页码
-	
-	// 第一步：收集所有新增页面的位置（通过虚拟页码识别）
-	newInsertPages := make(map[int]bool) // key=原始页码位置，表示该位置有新增页面
-	for pn := range opsMap {
-		if pn >= createPageOffset {
-			// 虚拟页码1004 → 原始位置4
-			origPos := pn - createPageOffset
-			// 处理同位置多个新增：1004→4, 1014→4
-			if origPos >= 10 {
-				origPos = origPos % 10
-				if origPos == 0 {
-					origPos = (pn - createPageOffset) / 10
-				}
-			}
-			newInsertPages[origPos] = true
-		}
-	}
-	
-	// 第二步：按页码顺序扫描，用新增位置计算偏移量
-	createOffset := 0
-	for _, op := range ops {
-		if op.PageNumber >= createPageOffset {
-			continue // 跳过虚拟页码
-		}
-		// 检查当前页码是否是新增位置（有对应的虚拟页码）
-		if newInsertPages[op.PageNumber] {
-			createOffset++
-			op.OriginalPageNumber = 0 // 新增页面没有对应的原始页面
-		} else if createOffset > 0 {
-			// 有偏移量，说明前面有新增页面导致页码顺延
-			calculatedOrig := op.PageNumber - createOffset
-			if calculatedOrig > 0 {
-				op.OriginalPageNumber = calculatedOrig
-			}
-		}
-		// createOffset == 0 且不是新增位置：OriginalPageNumber保持parsePageOps中设置的值
-	}
-
 	return ops
 }
 
 // detectOperation 从描述文本中检测操作类型
 func detectOperation(desc string, opKeywords map[string]string) string {
-	// 优先检查【操作】标记行
 	opLineRe := regexp.MustCompile(`【操作】\s*(.+)`)
 	if m := opLineRe.FindStringSubmatch(desc); m != nil {
 		opText := strings.ToLower(strings.TrimSpace(m[1]))
@@ -629,30 +638,19 @@ func detectOperation(desc string, opKeywords map[string]string) string {
 			}
 		}
 	}
-
-	// 检查标题中的【修改】【保留】等标记
 	headerOpRe := regexp.MustCompile(`【(修改|保留|新增|新建|删除|合并)】`)
 	if m := headerOpRe.FindStringSubmatch(desc); m != nil {
 		if op, ok := opKeywords[m[1]]; ok {
 			return op
 		}
 	}
-
-	// 检查 ✅无变化
 	if strings.Contains(desc, "✅无变化") || strings.Contains(desc, "✅ 无变化") {
 		return models.PageOpKeep
 	}
-
-	// 检查EX→IT转换等关键词
-	if strings.Contains(desc, "→") && (strings.Contains(desc, "转换") || strings.Contains(desc, "升级")) {
-		return models.PageOpModify
-	}
-
-	// 默认keep
 	return models.PageOpKeep
 }
 
-// opPriority 操作优先级（用于同一页有多个操作标记时取最高优先级）
+// opPriority 操作优先级
 func opPriority(op string) int {
 	switch op {
 	case models.PageOpDelete:
@@ -672,7 +670,6 @@ func opPriority(op string) int {
 
 // extractMergeSources 从描述中提取merge源页码
 func extractMergeSources(desc string, currentPage int) []int {
-	// 匹配 "合并P3和P4" 或 "merge P3+P4" 等
 	re := regexp.MustCompile(`(?i)(?:合并|merge)\s*(?:P|页面?)(\d+)\s*[+和与&,，]\s*(?:P|页面?)(\d+)`)
 	if m := re.FindStringSubmatch(desc); m != nil {
 		s1, _ := strconv.Atoi(m[1])
@@ -682,12 +679,10 @@ func extractMergeSources(desc string, currentPage int) []int {
 	return nil
 }
 
-// ==================== Prompt构建函数（P4-6新增）====================
+// ==================== Prompt构建函数 ====================
 
-// buildModifyUserPrompt 构建modify操作的用户消息
 func buildModifyUserPrompt(courseCode string, op *models.PageOperation, origHTML string) string {
 	var parts []string
-
 	parts = append(parts,
 		"【⚠️⚠️⚠️ 最重要 — 原始页面HTML，你必须在此基础上修改，禁止重写】",
 		"以下是当前线上运行的完整HTML。你的输出必须以此为基础，只修改下方指令要求的部分，其余代码原封不动保留。",
@@ -710,14 +705,11 @@ func buildModifyUserPrompt(courseCode string, op *models.PageOperation, origHTML
 	return strings.Join(parts, "\n")
 }
 
-// buildCreateUserPrompt 构建create操作的用户消息
-// P7修复：op.PageNumber是虚拟页码，提示词中显示的页码用op.Title中的P%02d部分（已含原始位置信息）
 func buildCreateUserPrompt(courseCode string, op *models.PageOperation, refHTML string) string {
 	var parts []string
-
 	if refHTML != "" {
 		parts = append(parts,
-			fmt.Sprintf("【⚠️⚠️⚠️ 格式参考页面 — 新建页面必须完全模仿此格式】"),
+			"【⚠️⚠️⚠️ 格式参考页面 — 新建页面必须完全模仿此格式】",
 			"以下是相邻页面的完整HTML。你必须：",
 			"1. 完全复制其HTML结构、CSS样式、导航栏、配色方案、布局框架",
 			"2. 只替换内容区域的文字和互动元素",
@@ -737,7 +729,6 @@ func buildCreateUserPrompt(courseCode string, op *models.PageOperation, refHTML 
 			"",
 		)
 	}
-
 	parts = append(parts,
 		fmt.Sprintf("【课程编号】%s", courseCode),
 		fmt.Sprintf("【页面】%s（新增页面）", op.Title),
@@ -751,22 +742,18 @@ func buildCreateUserPrompt(courseCode string, op *models.PageOperation, refHTML 
 	return strings.Join(parts, "\n")
 }
 
-// sourcePageHTML merge源页面数据
 type sourcePageHTML struct {
 	pageNum  int
 	html     string
 	lessonID *int
 }
 
-// buildMergeUserPrompt 构建merge操作的用户消息
 func buildMergeUserPrompt(courseCode string, op *models.PageOperation, sources []sourcePageHTML) string {
 	var parts []string
-
 	parts = append(parts,
 		fmt.Sprintf("【⚠️⚠️⚠️ 合并任务 — 需要将以下%d个页面合并为1个页面】", len(sources)),
 		"",
 	)
-
 	for i, src := range sources {
 		parts = append(parts,
 			fmt.Sprintf("═══ 源页面 %d/%d: P%02d ═══", i+1, len(sources), src.pageNum),
@@ -774,7 +761,6 @@ func buildMergeUserPrompt(courseCode string, op *models.PageOperation, sources [
 			"",
 		)
 	}
-
 	parts = append(parts,
 		"══════════════════════════════════════════════",
 		"▲ 以上是需要合并的所有源页面 ▼ 以下是合并要求",
@@ -799,9 +785,8 @@ func buildMergeUserPrompt(courseCode string, op *models.PageOperation, sources [
 	return strings.Join(parts, "\n")
 }
 
-// ==================== 辅助工具函数（P4-6新增）====================
+// ==================== 辅助工具函数 ====================
 
-// extractTransFinalOutput 从translator步骤的step_data中提取final_trans_output
 func extractTransFinalOutput(stepData string) string {
 	if stepData == "" || stepData == "null" {
 		return ""
@@ -821,27 +806,19 @@ func extractTransFinalOutput(stepData string) string {
 	return output
 }
 
-// extractGeneratedHTML 从AI输出中提取HTML（去除```html包裹和多余文字）
 func extractGeneratedHTML(aiOutput string) string {
-	// 尝试提取```html...```块
 	codeBlockRe := regexp.MustCompile("(?s)```html\\s*\n?(.*?)```")
 	if m := codeBlockRe.FindStringSubmatch(aiOutput); m != nil {
 		return strings.TrimSpace(m[1])
 	}
-	// 尝试从<!DOCTYPE或<html开始截取
 	doctypeRe := regexp.MustCompile(`(?si)(<(!DOCTYPE|html)[\s\S]*)`)
 	if m := doctypeRe.FindStringSubmatch(aiOutput); m != nil {
 		return strings.TrimSpace(m[1])
 	}
-	// 无法识别，返回原文
 	return strings.TrimSpace(aiOutput)
 }
 
-// findReferencePageHTML 为create操作找一个邻近页面作为格式参考
-// 优先找前一页，其次后一页，最后找任意有HTML的页面
-// P7修复：传入的pageNum应为原始页码（非虚拟页码），调用方负责还原
 func findReferencePageHTML(ossService *OSSService, pageLessonMap map[int]int, pageNum int) string {
-	// 向前找
 	for n := pageNum - 1; n >= 1; n-- {
 		if lid, ok := pageLessonMap[n]; ok {
 			html, err := ossService.FetchLessonHTML(lid)
@@ -850,7 +827,6 @@ func findReferencePageHTML(ossService *OSSService, pageLessonMap map[int]int, pa
 			}
 		}
 	}
-	// 向后找
 	for n := pageNum + 1; n <= pageNum+5; n++ {
 		if lid, ok := pageLessonMap[n]; ok {
 			html, err := ossService.FetchLessonHTML(lid)
@@ -859,7 +835,6 @@ func findReferencePageHTML(ossService *OSSService, pageLessonMap map[int]int, pa
 			}
 		}
 	}
-	// 任意页
 	for _, lid := range pageLessonMap {
 		html, err := ossService.FetchLessonHTML(lid)
 		if err == nil && len(html) > 200 {
@@ -869,11 +844,8 @@ func findReferencePageHTML(ossService *OSSService, pageLessonMap map[int]int, pa
 	return ""
 }
 
-// collectMergeSourceHTMLs 收集merge操作所需的所有源页面HTML
 func collectMergeSourceHTMLs(ossService *OSSService, pageLessonMap map[int]int, op *models.PageOperation) []sourcePageHTML {
 	var sources []sourcePageHTML
-
-	// 如果有明确的mergeSources
 	if len(op.MergeSources) >= 2 {
 		for _, pn := range op.MergeSources {
 			if lid, ok := pageLessonMap[pn]; ok {
@@ -889,19 +861,17 @@ func collectMergeSourceHTMLs(ossService *OSSService, pageLessonMap map[int]int, 
 			return sources
 		}
 	}
-
-	// 没有明确来源或不足，用当前页+下一页
 	sources = nil
-	pn := op.PageNumber
-	if lid, ok := pageLessonMap[pn]; ok {
+	origPn := op.GetOrigPageNum()
+	if lid, ok := pageLessonMap[origPn]; ok {
 		html, err := ossService.FetchLessonHTML(lid)
 		if err == nil && len(html) > 100 {
 			lidPtr := new(int)
 			*lidPtr = lid
-			sources = append(sources, sourcePageHTML{pageNum: pn, html: html, lessonID: lidPtr})
+			sources = append(sources, sourcePageHTML{pageNum: origPn, html: html, lessonID: lidPtr})
 		}
 	}
-	nextPn := pn + 1
+	nextPn := origPn + 1
 	if lid, ok := pageLessonMap[nextPn]; ok {
 		html, err := ossService.FetchLessonHTML(lid)
 		if err == nil && len(html) > 100 {
@@ -910,6 +880,5 @@ func collectMergeSourceHTMLs(ossService *OSSService, pageLessonMap map[int]int, 
 			sources = append(sources, sourcePageHTML{pageNum: nextPn, html: html, lessonID: lidPtr})
 		}
 	}
-
 	return sources
 }

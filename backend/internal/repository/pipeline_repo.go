@@ -911,10 +911,24 @@ func UpdatePageDecision(pipelineID string, pageNumber int, decision string, fina
 // P4.5-C新增：用于判断是否所有页面都已决策（支持定稿检查）
 func GetPageDecisionStats(pipelineID string) (total int, decided int, err error) {
 	ctx := context.Background()
+	// v43修复：排除被前端合并掉的虚拟页面（page_number >= 1000 的create页面，
+	// 如果在 page_number % 1000 位置已存在普通页面，前端会将两者合并为一个显示，
+	// 虚拟页面不单独展示，因此统计总数和决策数时也应排除这些被合并的虚拟页面）
+	// 排除条件：page_number >= 1000 AND 存在对应的 page_number < 1000 的同位置页面
 	err = database.DB.QueryRow(ctx,
 		`SELECT COUNT(*),
 			COUNT(*) FILTER (WHERE decision IN ('approve', 'reject', 'edit'))
-		 FROM generated_pages WHERE pipeline_id = $1`, pipelineID).Scan(&total, &decided)
+		 FROM generated_pages gp
+		 WHERE gp.pipeline_id = $1
+		   AND NOT (
+			 gp.page_number >= 1000
+			 AND EXISTS (
+				 SELECT 1 FROM generated_pages gp2
+				 WHERE gp2.pipeline_id = gp.pipeline_id
+				   AND gp2.page_number = gp.page_number % 1000
+				   AND gp2.page_number < 1000
+			 )
+		   )`, pipelineID).Scan(&total, &decided)
 	if err != nil {
 		return 0, 0, fmt.Errorf("查询页面决策统计失败: %w", err)
 	}
@@ -1084,6 +1098,23 @@ func ListOperatorUsers() ([]map[string]string, error) {
 }
 
 // ==================== 工具方法 ====================
+
+
+// GetPipelineByLessonPlanID 根据教案ID查询关联的Pipeline（Phase6新增）
+// 从教案详情页查询关联课件开发进度使用
+// 返回最新创建的那条（一个教案理论上只关联一个Pipeline）
+func GetPipelineByLessonPlanID(lessonPlanID string) (*models.Pipeline, error) {
+	ctx := context.Background()
+	var id string
+	err := database.DB.QueryRow(ctx,
+		`SELECT id FROM pipelines WHERE lesson_plan_id = $1 ORDER BY created_at DESC LIMIT 1`,
+		lessonPlanID,
+	).Scan(&id)
+	if err != nil {
+		return nil, ErrPipelineNotFound
+	}
+	return GetPipelineByID(id)
+}
 
 // buildPlaceholders 构建SQL占位符字符串，如 "$1,$2,$3"
 // 用于批量操作时动态生成IN子句（备用，当前BatchAssignPipelines已改用ANY）

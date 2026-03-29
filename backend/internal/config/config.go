@@ -100,3 +100,8 @@ func (c *Config) GetDSN() string {
 		" dbname=" + c.DBName +
 		" sslmode=disable TimeZone=Asia/Shanghai"
 }
+
+// GetAESKey 返回AES加密密钥（满足LessonPlanGenService依赖接口）
+func (c *Config) GetAESKey() string {
+	return c.AESKey
+}

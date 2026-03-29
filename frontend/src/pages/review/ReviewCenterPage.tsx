@@ -395,7 +395,7 @@ export default function ReviewCenterPage() {
               <div style={{ width: 4, height: 40, borderRadius: 2, flexShrink: 0, background: '#cc6600' }} />
 
               {/* 课程信息 */}
-              <div style={{ flex: 1, minWidth: 0, cursor: 'pointer' }} onClick={() => navigate('/pipelines/' + p.id + '/review')}>
+              <div style={{ flex: 1, minWidth: 0, cursor: 'pointer' }} onClick={() => navigate('/workflow/pipelines/' + p.id + '/review')}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
                   <span style={{ fontSize: 14, fontWeight: 700, color: '#1c1c1e' }}>{p.course_code}</span>
                   <StatusBadge status={p.status} />
@@ -428,7 +428,7 @@ export default function ReviewCenterPage() {
                 {/* 查看审核内容 */}
                 <button
                   title="进入审核页查看课件内容"
-                  onClick={() => navigate('/pipelines/' + p.id + '/review')}
+                  onClick={() => navigate('/workflow/pipelines/' + p.id + '/review')}
                   style={{
                     width: 30, height: 30, borderRadius: 8,
                     border: '1px solid rgba(0,122,255,0.3)', background: 'rgba(0,122,255,0.08)',
@@ -524,7 +524,7 @@ export default function ReviewCenterPage() {
                     borderBottom: idx < pendingReview.length - 1 ? '1px solid rgba(0,0,0,0.03)' : 'none',
                     transition: 'background 0.15s ease', cursor: 'pointer',
                   }}
-                  onClick={() => navigate('/pipelines/' + p.id + '/review')}
+                  onClick={() => navigate('/workflow/pipelines/' + p.id + '/review')}
                   onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(0,122,255,0.03)' }}
                   onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}
                 >
@@ -578,7 +578,7 @@ export default function ReviewCenterPage() {
                         <Zap size={14} />
                       </button>
                     )}
-                    <button title="进入审核" onClick={() => navigate('/pipelines/' + p.id + '/review')}
+                    <button title="进入审核" onClick={() => navigate('/workflow/pipelines/' + p.id + '/review')}
                       style={{
                         width: 30, height: 30, borderRadius: 8,
                         border: '1px solid rgba(0,122,255,0.3)', background: 'rgba(0,122,255,0.08)',
@@ -630,7 +630,7 @@ export default function ReviewCenterPage() {
                     borderBottom: idx < completedReview.length - 1 ? '1px solid rgba(0,0,0,0.03)' : 'none',
                     transition: 'background 0.15s ease, opacity 0.15s ease', cursor: 'pointer', opacity: 0.85,
                   }}
-                  onClick={() => navigate('/pipelines/' + p.id)}
+                  onClick={() => navigate('/workflow/pipelines/' + p.id)}
                   onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(0,122,255,0.03)'; (e.currentTarget as HTMLElement).style.opacity = '1' }}
                   onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent'; (e.currentTarget as HTMLElement).style.opacity = '0.85' }}
                 >

@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"tedna/internal/database"
 	"tedna/internal/models"
+	"tedna/internal/utils"
 )
 
 // ==================== 错误常量 ====================
@@ -16,9 +17,11 @@ var (
 	ErrUserNotFound      = errors.New("用户不存在")
 	ErrUsernameExists    = errors.New("用户名已存在")
 	ErrCannotDisableSelf = errors.New("不能禁用自己的账户")
+	// ErrWrongPassword 旧密码验证失败（用于用户自改密码）
+	ErrWrongPassword = errors.New("旧密码不正确")
 )
 
-// ==================== 认证相关查询（P1-1已有） ====================
+// ==================== 认证相关查询 ====================
 
 // FindUserByUsername 根据用户名查找用户（用于登录验证）
 func FindUserByUsername(ctx context.Context, username string) (*models.User, error) {
@@ -55,7 +58,7 @@ func FindUserByUsername(ctx context.Context, username string) (*models.User, err
 	return user, nil
 }
 
-// FindUserByID 根据 UUID 查找用户（用于 JWT 验证后获取用户信息）
+// FindUserByID 根据 UUID 查找用户（用于 JWT 验证后获取用户信息，也用于组件萃取列表查创建者名称）
 func FindUserByID(ctx context.Context, id string) (*models.User, error) {
 	user := &models.User{}
 
@@ -105,7 +108,7 @@ func UpdateLoginInfo(ctx context.Context, userID string) error {
 	return err
 }
 
-// ==================== 用户管理 CRUD（P1-4新增） ====================
+// ==================== 用户管理 CRUD（admin操作） ====================
 
 // ListUsers 获取所有用户列表（仅admin调用）
 func ListUsers(ctx context.Context) ([]*models.User, error) {
@@ -184,7 +187,7 @@ func CreateUser(ctx context.Context, user *models.User) error {
 	return err
 }
 
-// UpdateUser 更新用户基本信息（显示名+角色）
+// UpdateUser 更新用户基本信息（显示名+角色，admin管理其他用户用）
 func UpdateUser(ctx context.Context, id string, displayName string, role string) error {
 	query := `
 		UPDATE users
@@ -205,7 +208,7 @@ func UpdateUser(ctx context.Context, id string, displayName string, role string)
 	return nil
 }
 
-// UpdatePassword 重置用户密码
+// UpdatePassword admin重置用户密码（直接覆盖，不验证旧密码）
 func UpdatePassword(ctx context.Context, id string, passwordHash string) error {
 	query := `
 		UPDATE users
@@ -247,7 +250,75 @@ func UpdateStatus(ctx context.Context, id string, status string) error {
 	return nil
 }
 
-// ==================== 课程分配（P1-4新增） ====================
+// ==================== 用户中心自助操作（AccountHandler调用） ====================
+
+// UpdateUserDisplayName 用户自己更新显示名称
+// 与 UpdateUser 不同：只改 display_name，不涉及 role
+func UpdateUserDisplayName(ctx context.Context, userID string, displayName string) error {
+	query := `
+		UPDATE users
+		SET display_name = $1, updated_at = $2
+		WHERE id = $3
+	`
+
+	now := time.Now()
+	result, err := database.DB.Exec(ctx, query, displayName, now, userID)
+	if err != nil {
+		return err
+	}
+
+	if result.RowsAffected() == 0 {
+		return ErrUserNotFound
+	}
+
+	return nil
+}
+
+// ChangeUserPassword 用户自己修改密码（需要验证旧密码）
+// 流程：查询旧密码哈希 → bcrypt验证 → 哈希新密码 → 更新
+// 返回 ErrWrongPassword 表示旧密码不正确
+func ChangeUserPassword(ctx context.Context, userID string, oldPassword string, newPassword string) error {
+	// 第1步：查询当前密码哈希
+	var currentHash string
+	err := database.DB.QueryRow(ctx,
+		`SELECT password_hash FROM users WHERE id = $1`, userID,
+	).Scan(&currentHash)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrUserNotFound
+		}
+		return err
+	}
+
+	// 第2步：验证旧密码
+	if !utils.CheckPassword(oldPassword, currentHash) {
+		return ErrWrongPassword
+	}
+
+	// 第3步：哈希新密码
+	newHash, err := utils.HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+
+	// 第4步：更新密码
+	now := time.Now()
+	result, err := database.DB.Exec(ctx,
+		`UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3`,
+		newHash, now, userID,
+	)
+	if err != nil {
+		return err
+	}
+
+	if result.RowsAffected() == 0 {
+		return ErrUserNotFound
+	}
+
+	return nil
+}
+
+// ==================== 课程分配 ====================
 
 // GetUserAssignments 获取用户的课程分配列表
 func GetUserAssignments(ctx context.Context, userID string) ([]*models.CourseAssignment, error) {

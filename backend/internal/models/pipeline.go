@@ -28,6 +28,7 @@ type Pipeline struct {
 	// 对应数据库 pipelines.reject_reason TEXT 字段
 	// 审核员提交定稿被退回时，可在审核页面看到此原因
 	RejectReason string `json:"reject_reason"`
+	LessonPlanID     *string    `json:"lesson_plan_id,omitempty"` // Phase6：关联教案ID
 	CreatedAt    *time.Time `json:"created_at"`
 	UpdatedAt    *time.Time `json:"updated_at"`
 }

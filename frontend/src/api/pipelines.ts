@@ -610,3 +610,26 @@ export async function batchRestartFromStep(
   )
   return extractData<BatchRestartResult>(res)
 }
+
+// ==================== v38新增：Translator FAIL后强制推进API ====================
+
+/**
+ * forceProceed 确认使用当前Translator方案，跳过重跑直接启动Generator
+ * v38新增：对应后端 POST /api/v1/pipelines/{id}/force-proceed
+ *
+ * 使用场景：Translator-Reviewer循环FAIL（如评分差0.1不达标），
+ * 但方案质量已足够好，操作员确认后直接启动Generator。
+ *
+ * @param pipelineId - Pipeline ID
+ * @returns 更新后的Pipeline详情（status变为running）
+ */
+export async function forceProceed(
+  pipelineId: string
+): Promise<PipelineDetailResponse> {
+  const res = await client.post<ApiResponse<PipelineDetailResponse>>(
+    '/pipelines/' + pipelineId + '/force-proceed',
+    null,
+    { timeout: 3600000 }
+  )
+  return extractData<PipelineDetailResponse>(res)
+}

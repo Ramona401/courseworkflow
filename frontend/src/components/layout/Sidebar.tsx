@@ -1,9 +1,9 @@
 /**
- * 侧边栏组件 - Apple 风格
+ * 侧边栏组件 - Apple 风格（课件审核系统专用）
  * - 深色毛玻璃背景
  * - 根据用户角色显示菜单
  * - 优雅的悬停和激活效果
- * - P3-1新增：外部数据配置菜单项
+ * - v1.0修改：所有路径加 /workflow 前缀，底部新增返回入口按钮
  */
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
@@ -18,6 +18,7 @@ import {
   ClipboardCheck,
   Settings,
   LogOut,
+  Home,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 
@@ -30,17 +31,17 @@ interface MenuItem {
   roles: string[]
 }
 
-// 菜单配置（P3-1新增外部数据配置）
+// 菜单配置（v1.0：路径已加 /workflow 前缀）
 const menuItems: MenuItem[] = [
-  { key: 'dashboard', label: '仪表盘', icon: LayoutDashboard, path: '/', roles: ['admin', 'operator', 'senior_operator', 'viewer'] },
-  { key: 'users', label: '用户管理', icon: Users, path: '/users', roles: ['admin'] },
-  { key: 'ai-config', label: 'AI 配置', icon: Bot, path: '/ai-config', roles: ['admin'] },
-  { key: 'prompts', label: '提示词管理', icon: FileText, path: '/prompts', roles: ['admin'] },
-  { key: 'external-data', label: '外部数据配置', icon: Database, path: '/external-data', roles: ['admin'] },
-  { key: 'courses', label: '课程管理', icon: BookOpen, path: '/courses', roles: ['admin', 'operator', 'senior_operator'] },
-  { key: 'pipelines', label: 'Pipeline', icon: Workflow, path: '/pipelines', roles: ['admin', 'operator', 'senior_operator'] },
-  { key: 'review', label: '审核中心', icon: ClipboardCheck, path: '/review', roles: ['admin', 'operator', 'senior_operator'] },
-  { key: 'settings', label: '系统设置', icon: Settings, path: '/settings', roles: ['admin'] },
+  { key: 'dashboard', label: '仪表盘', icon: LayoutDashboard, path: '/workflow', roles: ['admin', 'operator', 'senior_operator', 'viewer'] },
+  { key: 'users', label: '用户管理', icon: Users, path: '/workflow/users', roles: ['admin'] },
+  { key: 'ai-config', label: 'AI 配置', icon: Bot, path: '/workflow/ai-config', roles: ['admin'] },
+  { key: 'prompts', label: '提示词管理', icon: FileText, path: '/workflow/prompts', roles: ['admin'] },
+  { key: 'external-data', label: '外部数据配置', icon: Database, path: '/workflow/external-data', roles: ['admin'] },
+  { key: 'courses', label: '课程管理', icon: BookOpen, path: '/workflow/courses', roles: ['admin', 'operator', 'senior_operator'] },
+  { key: 'pipelines', label: 'Pipeline', icon: Workflow, path: '/workflow/pipelines', roles: ['admin', 'operator', 'senior_operator'] },
+  { key: 'review', label: '审核中心', icon: ClipboardCheck, path: '/workflow/review', roles: ['admin', 'operator', 'senior_operator'] },
+  { key: 'settings', label: '系统设置', icon: Settings, path: '/workflow/settings', roles: ['admin'] },
 ]
 
 export default function Sidebar() {
@@ -53,7 +54,7 @@ export default function Sidebar() {
   )
 
   const isActive = (path: string) => {
-    if (path === '/') return location.pathname === '/'
+    if (path === '/workflow') return location.pathname === '/workflow'
     return location.pathname.startsWith(path)
   }
 
@@ -100,7 +101,7 @@ export default function Sidebar() {
           </div>
           <div>
             <div style={{ color: '#fff', fontSize: '14px', fontWeight: 600, letterSpacing: '-0.3px' }}>TE-DNA 2.0</div>
-            <div style={{ color: 'rgba(255,255,255,0.35)', fontSize: '11px', marginTop: '1px' }}>课程工作流</div>
+            <div style={{ color: 'rgba(255,255,255,0.35)', fontSize: '11px', marginTop: '1px' }}>课件审核系统</div>
           </div>
         </div>
       </div>
@@ -152,11 +153,45 @@ export default function Sidebar() {
         </div>
       </nav>
 
-      {/* 底部用户信息 */}
+      {/* 底部：返回入口 + 用户信息 */}
       <div style={{
-        padding: '12px',
+        padding: '8px 10px',
         borderTop: '1px solid rgba(255,255,255,0.06)',
       }}>
+        {/* 返回入口按钮 */}
+        <button
+          onClick={() => navigate('/')}
+          style={{
+            width: '100%',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '12px',
+            padding: '10px 14px',
+            borderRadius: '10px',
+            border: 'none',
+            cursor: 'pointer',
+            fontSize: '13px',
+            fontWeight: 400,
+            color: 'rgba(255,255,255,0.45)',
+            background: 'transparent',
+            transition: 'all 0.15s ease',
+            textAlign: 'left',
+            marginBottom: '8px',
+          }}
+          onMouseEnter={(e) => {
+            (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)'
+            ;(e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.8)'
+          }}
+          onMouseLeave={(e) => {
+            (e.currentTarget as HTMLElement).style.background = 'transparent'
+            ;(e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.45)'
+          }}
+        >
+          <Home size={16} strokeWidth={1.5} />
+          <span>返回入口</span>
+        </button>
+
+        {/* 用户信息 */}
         <div style={{
           display: 'flex',
           alignItems: 'center',

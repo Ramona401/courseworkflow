@@ -188,7 +188,7 @@ export default function DashboardPage() {
           <h3 style={{ fontSize: 15, fontWeight: 600, color: '#1d1d1f', margin: 0 }}>
             最近 Pipeline
           </h3>
-          <span onClick={() => navigate('/pipelines')} style={{
+          <span onClick={() => navigate('/workflow/pipelines')} style={{
             fontSize: 13, color: '#007aff', cursor: 'pointer', fontWeight: 500,
           }}>
             查看全部 →
@@ -202,7 +202,7 @@ export default function DashboardPage() {
         ) : (
           <div>
             {recentPipelines.map(p => (
-              <RecentPipelineRow key={p.id} p={p} onClick={() => navigate('/pipelines/' + p.id)} />
+              <RecentPipelineRow key={p.id} p={p} onClick={() => navigate('/workflow/pipelines/' + p.id)} />
             ))}
           </div>
         )}

@@ -2,6 +2,8 @@
  * Pipeline详情页面
  * v37改进: 断点续跑功能增强——admin/senior_operator在任何非running状态都能看到重跑按钮
  *          operator仅在failed/cancelled状态看到重跑按钮（与v36行为一致）
+ * v41修复: 导航路径加 /workflow 前缀（Phase1路由迁移修复）
+ * v46修复: showReviewBtn 增加 pending_finalize 状态，修复提交定稿后审核入口消失的问题
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
@@ -202,8 +204,14 @@ export default function PipelineDetailPage() {
     display: 'inline-flex', alignItems: 'center', gap: 6,
   }
 
+  /**
+   * v46修复：审核按钮显示条件
+   * 增加 pending_finalize 状态——操作员提交定稿后，高级操作员需要能进入审核页面
+   * 查看修改情况、确认定稿或退回重审
+   */
   const showReviewBtn = detail && (
     detail.status === 'review_queue' || detail.status === 'needs_human' ||
+    detail.status === 'pending_finalize' ||
     detail.status === 'finalized' || detail.status === 'verified' ||
     detail.status === 'verify_failed'
   )
@@ -220,7 +228,8 @@ export default function PipelineDetailPage() {
     return (
       <div style={{ textAlign: 'center', padding: 60 }}>
         <div style={{ color: '#ff3b30', fontSize: 14, marginBottom: 12 }}>{error}</div>
-        <button style={btn} onClick={() => navigate('/pipelines')}>
+        {/* v41修复：错误页面返回按钮路径加 /workflow 前缀 */}
+        <button style={btn} onClick={() => navigate('/workflow/pipelines')}>
           <ArrowLeft size={14} /> 返回列表
         </button>
       </div>
@@ -233,7 +242,8 @@ export default function PipelineDetailPage() {
     <div>
       {/* 顶部导航栏 */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
-        <button style={btn} onClick={() => navigate('/pipelines')}>
+        {/* v41修复：返回按钮路径加 /workflow 前缀 */}
+        <button style={btn} onClick={() => navigate('/workflow/pipelines')}>
           <ArrowLeft size={14} /> 返回
         </button>
         <div style={{ flex: 1 }}>
@@ -267,14 +277,20 @@ export default function PipelineDetailPage() {
             style={{
               ...btn,
               background: (detail.status === 'finalized' || detail.status === 'verified') ? '#34c759'
-                : detail.status === 'verify_failed' ? '#ff9500' : '#007aff',
+                : detail.status === 'verify_failed' ? '#ff9500'
+                : detail.status === 'pending_finalize' ? '#cc6600'
+                : '#007aff',
               color: '#fff', border: 'none',
             }}
-            onClick={() => navigate('/pipelines/' + id + '/review')}
+            /* v41修复：审核页面路径加 /workflow 前缀 */
+            onClick={() => navigate('/workflow/pipelines/' + id + '/review')}
           >
             <ClipboardCheck size={14} />
             {detail.status === 'finalized' || detail.status === 'verified' || detail.status === 'verify_failed'
-              ? '查看审核结果' : '进入审核'}
+              ? '查看审核结果'
+              : detail.status === 'pending_finalize'
+              ? '查看并确认定稿'
+              : '进入审核'}
           </button>
         )}
 
@@ -620,7 +636,7 @@ function StepCard({ pipelineId, step, pipelineStatus, onRestartFromStep, restart
           {loadingData ? (
             <div style={{ color: '#8e8e93', fontSize: 13 }}>加载步骤数据...</div>
           ) : stepData ? (
-            <StepPanelRouter stepName={step.step_name} data={stepData} />
+            <StepPanelRouter stepName={step.step_name} data={stepData} pipelineId={pipelineId} pipelineStatus={pipelineStatus} stepStatus={step.status} onRefresh={() => { setStepData(null); toggleExpand() }} />
           ) : !step.error_message ? (
             <div style={{ color: '#aeaeb2', fontSize: 13 }}>暂无数据</div>
           ) : null}
@@ -632,7 +648,7 @@ function StepCard({ pipelineId, step, pipelineStatus, onRestartFromStep, restart
 
 // ==================== 步骤面板路由 ====================
 
-function StepPanelRouter({ stepName, data }: { stepName: string; data: any }) {
+function StepPanelRouter({ stepName, data, pipelineId, pipelineStatus, stepStatus, onRefresh }: { stepName: string; data: any; pipelineId?: string; pipelineStatus?: string; stepStatus?: string; onRefresh?: () => void }) {
   if (!data) return <div style={{ color: '#aeaeb2', fontSize: 13 }}>暂无数据</div>
 
   switch (stepName) {
@@ -640,7 +656,7 @@ function StepPanelRouter({ stepName, data }: { stepName: string; data: any }) {
     case 'scanner':    return <ScannerPanel data={data} />
     case 'evaluator':  return <EvaluatorPanel data={data} />
     case 'meta':       return <MetaPanel data={data} />
-    case 'translator': return <TranslatorPanel data={data} />
+    case 'translator': return <TranslatorPanel data={data} pipelineId={pipelineId} pipelineStatus={pipelineStatus} stepStatus={stepStatus} onForceProceed={onRefresh} />
     case 'generator':  return <GeneratorPanel data={data} />
     case 'verify':     return <VerifyPanel data={data} />
     default:

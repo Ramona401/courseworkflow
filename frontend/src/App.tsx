@@ -1,21 +1,16 @@
 /**
  * App 根组件
- * - AuthProvider 包裹全局，提供认证状态
- * - 路由配置：登录页 / 主布局（含侧边栏）
- * - 路由守卫：未登录跳转登录页
- * - 角色守卫：按角色控制页面访问
- * - P4-7新增：Pipeline列表+详情路由
- * - P4.5-C新增：Pipeline审核路由
- * - P6-1新增：审核中心+系统设置路由
+ * v5.1：新增统一用户管理中心 /admin（独立路由，admin专属）
  */
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AuthContext } from '@/store/auth'
 import { useAuth } from '@/store/auth'
 import { useAuthProvider } from '@/hooks/useAuthProvider'
 
-// 布局和页面
+/* ==================== 课件审核系统 ==================== */
 import MainLayout from '@/components/layout/MainLayout'
 import LoginPage from '@/pages/login/LoginPage'
+import PortalPage from '@/pages/portal/PortalPage'
 import DashboardPage from '@/pages/dashboard/DashboardPage'
 import UsersPage from '@/pages/users/UsersPage'
 import AIConfigPage from '@/pages/ai-config/AIConfigPage'
@@ -28,161 +23,101 @@ import PipelineReviewPage from '@/pages/pipelines/PipelineReviewPage'
 import ReviewCenterPage from '@/pages/review/ReviewCenterPage'
 import SettingsPage from '@/pages/settings/SettingsPage'
 
-/**
- * 路由守卫组件
- * - 加载中显示 loading
- * - 未登录重定向到 /login
- * - 已登录正常渲染子组件
- */
+/* ==================== 教案系统 ==================== */
+import LPLayout from '@/components/layout-lp/LPLayout'
+import WorkshopPage from '@/pages/lesson-plans/workshop/WorkshopPage'
+import MyPlansPage from '@/pages/lesson-plans/my-plans/MyPlansPage'
+import LibraryPage from '@/pages/lesson-plans/library/LibraryPage'
+import ComponentsPage from '@/pages/lesson-plans/components/ComponentsPage'
+import TemplatesPage from '@/pages/lesson-plans/templates/TemplatesPage'
+import TemplateEditorPage from '@/pages/lesson-plans/templates/TemplateEditorPage'
+import PlanDetailPage from '@/pages/lesson-plans/plan-detail/PlanDetailPage'
+import ReviewCenterLPPage from '@/pages/lesson-plans/review/ReviewCenterLPPage'
+
+/* ==================== 通用独立页面 ==================== */
+import AccountPage from '@/pages/account/AccountPage'
+import AICenterPage from '@/pages/ai-center/AICenterPage'
+// v5.1 新增：统一用户管理中心
+import AdminPage from '@/pages/admin/AdminPage'
+
+/* ==================== 路由守卫 ==================== */
 function AuthGuard({ children }: { children: React.ReactNode }) {
   const { user, isLoading } = useAuth()
-
-  // 初始化加载中（正在验证 token）
   if (isLoading) {
     return (
-      <div style={{
-        height: '100vh',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        background: '#f5f5f7',
-      }}>
+      <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#FAFBFC' }}>
         <div style={{ textAlign: 'center' }}>
-          <div style={{
-            width: '32px',
-            height: '32px',
-            border: '2px solid #007aff',
-            borderTopColor: 'transparent',
-            borderRadius: '50%',
-            animation: 'spin 0.8s linear infinite',
-            margin: '0 auto 12px',
-          }} />
-          <div style={{ color: '#8e8e93', fontSize: '14px' }}>加载中...</div>
+          <div style={{ width: '32px', height: '32px', border: '2px solid #4F7BE8', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 0.8s linear infinite', margin: '0 auto 12px' }} />
+          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+          <div style={{ color: '#9CA3AF', fontSize: '14px' }}>加载中...</div>
         </div>
       </div>
     )
   }
-
-  // 未登录，跳转登录页
-  if (!user) {
-    return <Navigate to="/login" replace />
-  }
-
-  // 已登录，渲染子组件
+  if (!user) return <Navigate to="/login" replace />
   return <>{children}</>
 }
 
-/**
- * 角色守卫组件
- * - 检查当前用户角色是否在允许列表中
- * - 不匹配则重定向到首页
- */
 function RoleGuard({ children, roles }: { children: React.ReactNode; roles: string[] }) {
   const { user } = useAuth()
-
-  if (!user || !roles.includes(user.role)) {
-    return <Navigate to="/" replace />
-  }
-
+  if (!user || !roles.includes(user.role)) return <Navigate to="/" replace />
   return <>{children}</>
 }
 
 export default function App() {
-  // 初始化认证状态（从 localStorage 恢复 + 验证 token）
   const authValue = useAuthProvider()
-
   return (
     <AuthContext.Provider value={authValue}>
       <BrowserRouter>
         <Routes>
-          {/* 登录页（不需要认证） */}
+          {/* 登录页 */}
           <Route path="/login" element={<LoginPage />} />
 
-          {/* 主布局（需要认证） */}
-          <Route
-            path="/"
-            element={
-              <AuthGuard>
-                <MainLayout />
-              </AuthGuard>
-            }
-          >
-            {/* 仪表盘（首页） */}
+          {/* 入口选择页 */}
+          <Route path="/" element={<AuthGuard><PortalPage /></AuthGuard>} />
+
+          {/* ==================== 通用独立页面 ==================== */}
+          {/* 个人中心：所有已登录用户 */}
+          <Route path="/account" element={<AuthGuard><AccountPage /></AuthGuard>} />
+
+          {/* AI管理中心：仅admin */}
+          <Route path="/ai-center" element={
+            <AuthGuard><RoleGuard roles={['admin']}><AICenterPage /></RoleGuard></AuthGuard>
+          } />
+
+          {/* 用户管理中心：仅admin */}
+          <Route path="/admin" element={
+            <AuthGuard><RoleGuard roles={['admin']}><AdminPage /></RoleGuard></AuthGuard>
+          } />
+
+          {/* ==================== 课件审核系统 ==================== */}
+          <Route path="/workflow" element={<AuthGuard><MainLayout /></AuthGuard>}>
             <Route index element={<DashboardPage />} />
-
-            {/* P1-4 用户管理（仅admin） */}
-            <Route path="users" element={
-              <RoleGuard roles={['admin']}>
-                <UsersPage />
-              </RoleGuard>
-            } />
-
-            {/* P2-1 AI配置中心（仅admin） */}
-            <Route path="ai-config" element={
-              <RoleGuard roles={['admin']}>
-                <AIConfigPage />
-              </RoleGuard>
-            } />
-
-            {/* P2-3 提示词管理（仅admin） */}
-            <Route path="prompts" element={
-              <RoleGuard roles={['admin']}>
-                <PromptsPage />
-              </RoleGuard>
-            } />
-
-            {/* P3-1 外部数据配置（仅admin） */}
-            <Route path="external-data" element={
-              <RoleGuard roles={['admin']}>
-                <ExternalDataPage />
-              </RoleGuard>
-            } />
-
-            {/* P3-3 课程管理（admin + operator） */}
-            <Route path="courses" element={
-              <RoleGuard roles={['admin', 'operator', 'senior_operator']}>
-                <CoursesPage />
-              </RoleGuard>
-            } />
-
-            {/* P4-7 Pipeline列表（admin + operator） */}
-            <Route path="pipelines" element={
-              <RoleGuard roles={['admin', 'operator', 'senior_operator']}>
-                <PipelinesPage />
-              </RoleGuard>
-            } />
-
-            {/* P4-7 Pipeline详情（admin + operator） */}
-            <Route path="pipelines/:id" element={
-              <RoleGuard roles={['admin', 'operator', 'senior_operator']}>
-                <PipelineDetailPage />
-              </RoleGuard>
-            } />
-
-            {/* P4.5-C Pipeline审核（admin + operator） */}
-            <Route path="pipelines/:id/review" element={
-              <RoleGuard roles={['admin', 'operator', 'senior_operator']}>
-                <PipelineReviewPage />
-              </RoleGuard>
-            } />
-
-            {/* P6-1 审核中心（admin + operator） */}
-            <Route path="review" element={
-              <RoleGuard roles={['admin', 'operator', 'senior_operator']}>
-                <ReviewCenterPage />
-              </RoleGuard>
-            } />
-
-            {/* P6-1b 系统设置（仅admin） */}
-            <Route path="settings" element={
-              <RoleGuard roles={['admin']}>
-                <SettingsPage />
-              </RoleGuard>
-            } />
-
-            {/* 未匹配路由 -> 重定向到首页 */}
-            <Route path="*" element={<Navigate to="/" replace />} />
+            <Route path="users"         element={<RoleGuard roles={['admin']}><UsersPage /></RoleGuard>} />
+            <Route path="ai-config"     element={<RoleGuard roles={['admin']}><AIConfigPage /></RoleGuard>} />
+            <Route path="prompts"       element={<RoleGuard roles={['admin']}><PromptsPage /></RoleGuard>} />
+            <Route path="external-data" element={<RoleGuard roles={['admin']}><ExternalDataPage /></RoleGuard>} />
+            <Route path="courses"       element={<RoleGuard roles={['admin','operator','senior_operator']}><CoursesPage /></RoleGuard>} />
+            <Route path="pipelines"     element={<RoleGuard roles={['admin','operator','senior_operator']}><PipelinesPage /></RoleGuard>} />
+            <Route path="pipelines/:id" element={<RoleGuard roles={['admin','operator','senior_operator']}><PipelineDetailPage /></RoleGuard>} />
+            <Route path="pipelines/:id/review" element={<RoleGuard roles={['admin','operator','senior_operator']}><PipelineReviewPage /></RoleGuard>} />
+            <Route path="review"        element={<RoleGuard roles={['admin','operator','senior_operator']}><ReviewCenterPage /></RoleGuard>} />
+            <Route path="settings"      element={<RoleGuard roles={['admin']}><SettingsPage /></RoleGuard>} />
           </Route>
+
+          {/* ==================== 教案系统 ==================== */}
+          <Route path="/lesson-plans" element={<AuthGuard><LPLayout /></AuthGuard>}>
+            <Route index element={<WorkshopPage />} />
+            <Route path="my-plans"      element={<MyPlansPage />} />
+            <Route path="library"       element={<LibraryPage />} />
+            <Route path="plans/:id"     element={<PlanDetailPage />} />
+            <Route path="review"        element={<ReviewCenterLPPage />} />
+            <Route path="components"    element={<ComponentsPage />} />
+            <Route path="templates"     element={<TemplatesPage />} />
+            <Route path="templates/:id" element={<TemplateEditorPage />} />
+          </Route>
+
+          <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </BrowserRouter>
     </AuthContext.Provider>

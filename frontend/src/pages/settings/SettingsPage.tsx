@@ -281,13 +281,13 @@ export default function SettingsPage() {
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             <QuickLink label="AI 配置" desc="管理API密钥、模型选择和场景配置"
-              icon={<Bot size={18} color="#007aff" />} onClick={() => navigate('/ai-config')} />
+              icon={<Bot size={18} color="#007aff" />} onClick={() => navigate('/workflow/ai-config')} />
             <QuickLink label="提示词管理" desc="编辑评估/翻译/生成等11个提示词槽位"
-              icon={<FileText size={18} color="#007aff" />} onClick={() => navigate('/prompts')} />
+              icon={<FileText size={18} color="#007aff" />} onClick={() => navigate('/workflow/prompts')} />
             <QuickLink label="外部数据配置" desc="OSS存储、推送接口等外部服务配置"
-              icon={<Database size={18} color="#007aff" />} onClick={() => navigate('/external-data')} />
+              icon={<Database size={18} color="#007aff" />} onClick={() => navigate('/workflow/external-data')} />
             <QuickLink label="用户管理" desc="管理用户账号、角色和课程分配"
-              icon={<Shield size={18} color="#007aff" />} onClick={() => navigate('/users')} />
+              icon={<Shield size={18} color="#007aff" />} onClick={() => navigate('/workflow/users')} />
           </div>
         </div>
       )}
