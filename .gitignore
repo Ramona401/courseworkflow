@@ -18,3 +18,4 @@ frontend/dist/
 # 备份文件排除
 *.backup.*
 backup_*.sql
+backup/
