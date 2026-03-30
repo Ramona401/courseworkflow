@@ -14,6 +14,8 @@ package handlers
  *   PUT  /api/v1/admin/users/{id}/password        — 重置密码（admin直接重置）
  *   GET  /api/v1/admin/users/{id}/assignments     — 获取课程分配
  *   PUT  /api/v1/admin/users/{id}/assignments     — 更新课程分配
+ *   POST /api/v1/admin/users/{id}/groups          — 将用户加入教研组（v52任务六新增）
+ *   DELETE /api/v1/admin/users/{id}/groups/{gid}  — 将用户移出教研组（v52任务六新增，组长不可移除）
  *   GET  /api/v1/admin/orgs                       — 组织列表（区域+学校）
  *   GET  /api/v1/admin/groups                     — 教研组列表（含成员数）
  *   GET  /api/v1/admin/groups/{id}/members        — 教研组成员列表
@@ -21,12 +23,9 @@ package handlers
  *   PUT  /api/v1/admin/groups/{id}/members/{uid}  — 更新成员角色
  *   DELETE /api/v1/admin/groups/{id}/members/{uid}— 移除成员
  *   GET  /api/v1/admin/audit-logs                 — 操作日志（分页+筛选）
- *     支持参数：page / page_size / user_id（精确）/ username（模糊）/ action / start_date / end_date
  *
  * 权限：
- *   admin          → 所有操作，所有用户/组织
- *   学校admin       → 本校用户+本校教研组（通过 organizations.admin_user_id 判断）
- *   教研组长(lead)   → 本组成员管理
+ *   admin → 所有操作
  */
 
 import (
@@ -59,11 +58,8 @@ func NewAdminHandler(userService *services.UserService, orgService *services.Org
 
 // ==================== 权限判断辅助 ====================
 
-// isSchoolAdmin 判断当前用户是否是某学校的管理员
+// isSchoolAdmin 判断当前用户是否是某学校的管理员（保留占位）
 func isSchoolAdmin(ctx interface{ Value(key interface{}) interface{} }, userID string) (string, bool) {
-	// 查询该用户是否是任何学校的admin_user_id
-	// 此处通过 repository 直接查，返回该用户管理的学校ID（若有）
-	// 实现在下方 getCallerSchoolScope
 	return "", false
 }
 
@@ -72,26 +68,23 @@ type AdminUserListItem struct {
 	ID          string  `json:"id"`
 	Username    string  `json:"username"`
 	DisplayName string  `json:"display_name"`
-	Role        string  `json:"role"`       // 课件审核角色
-	RoleName    string  `json:"role_name"`  // 角色中文名
+	Role        string  `json:"role"`
+	RoleName    string  `json:"role_name"`
 	Status      string  `json:"status"`
 	LoginCount  int     `json:"login_count"`
 	LastLoginAt *string `json:"last_login_at"`
 	CreatedAt   string  `json:"created_at"`
-	// 教案系统归属（可能属于多个组，取第一个展示，详情页展开）
-	SchoolName string `json:"school_name"` // 所属学校（首个）
-	GroupName  string `json:"group_name"`  // 所属教研组（首个）
-	GroupRole  string `json:"group_role"`  // 教研组角色（member/backbone）
-	GroupCount int    `json:"group_count"` // 参与的教研组数
+	SchoolName  string  `json:"school_name"`
+	GroupName   string  `json:"group_name"`
+	GroupRole   string  `json:"group_role"`
+	GroupCount  int     `json:"group_count"`
 }
 
 // AdminUserDetail 用户详情（含跨系统完整权限）
 type AdminUserDetail struct {
 	AdminUserListItem
-	// 课件审核：课程分配
 	CourseAssignments []*models.CourseAssignment `json:"course_assignments"`
-	// 教案系统：所有教研组归属
-	TeachingGroups []AdminGroupMembership `json:"teaching_groups"`
+	TeachingGroups    []AdminGroupMembership     `json:"teaching_groups"`
 }
 
 // AdminGroupMembership 用户的教研组归属信息
@@ -99,23 +92,22 @@ type AdminGroupMembership struct {
 	GroupID    string `json:"group_id"`
 	GroupName  string `json:"group_name"`
 	SchoolName string `json:"school_name"`
-	Role       string `json:"role"`      // member/backbone
-	RoleName   string `json:"role_name"` // 普通成员/骨干教师
+	Role       string `json:"role"`
+	RoleName   string `json:"role_name"`
 	JoinedAt   string `json:"joined_at"`
-	IsLead     bool   `json:"is_lead"` // 是否是该组组长
+	IsLead     bool   `json:"is_lead"`
 }
 
 // ==================== 用户列表 ====================
 
 // ListAdminUsers 获取用户列表（含跨表权限摘要）
-// GET /api/v1/admin/users?page=1&page_size=20&role=operator&status=active&keyword=张
+// GET /api/v1/admin/users
 func (h *AdminHandler) ListAdminUsers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
 		return
 	}
 
-	// 解析查询参数
 	q := r.URL.Query()
 	page, _ := strconv.Atoi(q.Get("page"))
 	pageSize, _ := strconv.Atoi(q.Get("page_size"))
@@ -132,7 +124,6 @@ func (h *AdminHandler) ListAdminUsers(w http.ResponseWriter, r *http.Request) {
 		pageSize = 20
 	}
 
-	// 调用 Repository 层联合查询
 	result, err := repository.ListAdminUsers(r.Context(), repository.AdminUserListParams{
 		Page:     page,
 		PageSize: pageSize,
@@ -197,7 +188,6 @@ func (h *AdminHandler) CreateAdminUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 写审计日志
 	claims, _ := middleware.GetClaims(r.Context())
 	if claims != nil {
 		repository.WriteAuditLog(claims.UserID, "admin.user_create",
@@ -281,7 +271,6 @@ func (h *AdminHandler) UpdateAdminUserStatus(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// 写审计日志
 	repository.WriteAuditLog(claims.UserID, "admin.user_status",
 		map[string]interface{}{
 			"target_user": userID,
@@ -318,7 +307,6 @@ func (h *AdminHandler) ResetAdminUserPassword(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// 写审计日志
 	claims, _ := middleware.GetClaims(r.Context())
 	if claims != nil {
 		repository.WriteAuditLog(claims.UserID, "admin.user_reset_password",
@@ -388,6 +376,98 @@ func (h *AdminHandler) UpdateAdminUserAssignments(w http.ResponseWriter, r *http
 	}
 
 	utils.Success(w, result)
+}
+
+// ==================== 用户↔教研组双向分配（v52任务六新增）====================
+
+// AddUserToGroup 将用户加入指定教研组
+//
+// POST /api/v1/admin/users/{uid}/groups
+// Body: {"group_id": "...", "role": "member|backbone"}
+//
+// 业务规则：
+//   - 若用户已在该教研组，服务层返回错误
+//   - role 默认为 member
+func (h *AdminHandler) AddUserToGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+
+	// 从 URL 路径提取用户ID：/api/v1/admin/users/{uid}/groups
+	userID := extractAdminMiddleID(r.URL.Path, "/api/v1/admin/users/", "/groups")
+	if userID == "" {
+		utils.BadRequest(w, "缺少用户ID")
+		return
+	}
+
+	var body struct {
+		GroupID string `json:"group_id"`
+		Role    string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+	if body.GroupID == "" {
+		utils.BadRequest(w, "请选择教研组")
+		return
+	}
+	// role 默认值
+	if body.Role != "member" && body.Role != "backbone" {
+		body.Role = "member"
+	}
+
+	// 构造 AddGroupMemberRequest（UserID=路径中的用户，加入 body.GroupID）
+	req := &models.AddGroupMemberRequest{
+		UserID: userID,
+		Role:   body.Role,
+	}
+	if err := h.orgService.AddGroupMember(r.Context(), body.GroupID, req); err != nil {
+		utils.InternalError(w, "加入教研组失败: "+err.Error())
+		return
+	}
+
+	utils.Success(w, map[string]string{"message": "已成功加入教研组"})
+}
+
+// RemoveUserFromGroup 将用户移出指定教研组
+//
+// DELETE /api/v1/admin/users/{uid}/groups/{gid}
+//
+// 业务规则：
+//   - 若该用户是该教研组的组长（teaching_groups.lead_user_id = uid），拒绝移除并返回 400
+//   - 非组长成员可正常移除
+func (h *AdminHandler) RemoveUserFromGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE请求")
+		return
+	}
+
+	// 从路径提取 uid 和 gid：/api/v1/admin/users/{uid}/groups/{gid}
+	userID, groupID := extractUserGroupPath(r.URL.Path)
+	if userID == "" || groupID == "" {
+		utils.BadRequest(w, "缺少用户ID或教研组ID")
+		return
+	}
+
+	// 检查是否是教研组长（组长不可通过此接口移除）
+	isLead, err := repository.IsGroupLead(r.Context(), groupID, userID)
+	if err != nil {
+		utils.InternalError(w, "权限检查失败: "+err.Error())
+		return
+	}
+	if isLead {
+		utils.BadRequest(w, "教研组长不能被移除，请先在教研组管理中更换组长后再操作")
+		return
+	}
+
+	if err := h.orgService.RemoveGroupMember(r.Context(), groupID, userID); err != nil {
+		utils.InternalError(w, "移出教研组失败: "+err.Error())
+		return
+	}
+
+	utils.Success(w, map[string]string{"message": "已移出教研组"})
 }
 
 // ==================== 组织列表 ====================
@@ -534,17 +614,7 @@ func (h *AdminHandler) RemoveAdminGroupMember(w http.ResponseWriter, r *http.Req
 // ==================== 操作日志 ====================
 
 // ListAdminAuditLogs 查询操作日志（分页+多维筛选）
-//
 // GET /api/v1/admin/audit-logs
-// 查询参数：
-//
-//	page        — 页码（默认1）
-//	page_size   — 每页条数（默认20，上限100）
-//	user_id     — 按用户ID精确过滤（旧参数保留）
-//	username    — 按用户名/显示名模糊搜索（新增）
-//	action      — 按操作类型精确过滤
-//	start_date  — 开始日期 yyyy-MM-dd（新增，含当天）
-//	end_date    — 结束日期 yyyy-MM-dd（新增，含当天）
 func (h *AdminHandler) ListAdminAuditLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
@@ -552,12 +622,8 @@ func (h *AdminHandler) ListAdminAuditLogs(w http.ResponseWriter, r *http.Request
 	}
 
 	q := r.URL.Query()
-
-	// 分页参数
 	page, _ := strconv.Atoi(q.Get("page"))
 	pageSize, _ := strconv.Atoi(q.Get("page_size"))
-
-	// 过滤参数（旧接口兼容 + 新增）
 	userID := q.Get("user_id")
 	username := q.Get("username")
 	action := q.Get("action")
@@ -629,7 +695,6 @@ func extractAdminPathID(path, prefix string) string {
 	}
 	id := strings.TrimPrefix(path, prefix)
 	id = strings.TrimSuffix(id, "/")
-	// 去掉子路径（如 /status）
 	if idx := strings.Index(id, "/"); idx > 0 {
 		id = id[:idx]
 	}
@@ -672,6 +737,27 @@ func extractAdminGroupMemberPath(path string) (string, string) {
 	return gid, uid
 }
 
+// extractUserGroupPath 从 /api/v1/admin/users/{uid}/groups/{gid} 提取 uid 和 gid
+// 用于用户↔教研组双向分配接口
+func extractUserGroupPath(path string) (string, string) {
+	prefix := "/api/v1/admin/users/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", ""
+	}
+	rest := strings.TrimPrefix(path, prefix)
+	// rest = "{uid}/groups/{gid}"
+	parts := strings.SplitN(rest, "/groups/", 2)
+	if len(parts) != 2 {
+		return "", ""
+	}
+	uid := strings.TrimSuffix(parts[0], "/")
+	gid := strings.TrimSuffix(parts[1], "/")
+	if uid == "" || gid == "" {
+		return "", ""
+	}
+	return uid, gid
+}
+
 // ==================== 格式化辅助 ====================
 
 // formatRoleName 角色中文名
@@ -688,6 +774,6 @@ func formatRoleName(role string) string {
 	return role
 }
 
-// suppress unused warning
+// 抑制未使用警告
 var _ = fmt.Sprintf
 var _ = isSchoolAdmin

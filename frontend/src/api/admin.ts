@@ -3,13 +3,9 @@
  * 对应后端 /api/v1/admin/* 和 /api/v1/lesson-plans/organizations/* 路由
  * 仅 admin 可调用（路由层保护）
  *
- * v52更新：
- *   - getAdminAuditLogs 新增 username / start_date / end_date 参数
- * v52任务四新增：
- *   - 组织 CRUD（区域/学校）
- *   - 教研组 CRUD
- *   - 教研组成员管理（添加/移除/更新角色）
- *   - 教研组详情（含成员列表）
+ * v52任务六新增：
+ *   - addUserToGroup    POST /admin/users/{uid}/groups   将用户加入教研组
+ *   - removeUserFromGroup DELETE /admin/users/{uid}/groups/{gid} 将用户移出教研组
  */
 import client from './client'
 
@@ -254,6 +250,32 @@ export async function getAdminUserAssignments(id: string): Promise<AdminCourseAs
 
 export async function updateAdminUserAssignments(id: string, course_codes: string[]): Promise<void> {
   await client.put(`/admin/users/${id}/assignments`, { course_codes })
+}
+
+// ==================== 用户↔教研组双向分配 API（v52任务六新增）====================
+
+/**
+ * addUserToGroup — 将用户加入指定教研组
+ * POST /api/v1/admin/users/{userId}/groups
+ * @param userId  要操作的用户ID（URL路径中）
+ * @param data    { group_id: 教研组ID, role: 'member' | 'backbone' }
+ */
+export async function addUserToGroup(
+  userId: string,
+  data: { group_id: string; role: string }
+): Promise<void> {
+  await client.post(`/admin/users/${userId}/groups`, data)
+}
+
+/**
+ * removeUserFromGroup — 将用户移出教研组
+ * DELETE /api/v1/admin/users/{userId}/groups/{groupId}
+ * 后端会检查是否为组长，组长会返回 400 错误
+ * @param userId  要操作的用户ID
+ * @param groupId 要移出的教研组ID
+ */
+export async function removeUserFromGroup(userId: string, groupId: string): Promise<void> {
+  await client.delete(`/admin/users/${userId}/groups/${groupId}`)
 }
 
 // ==================== 组织管理 API（对应 /lesson-plans/organizations/*）====================

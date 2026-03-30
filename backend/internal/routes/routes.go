@@ -56,6 +56,8 @@ func Setup(cfg *config.Config) http.Handler {
 	compService := services.NewComponentService(cfg)
 	lpService := services.NewLessonPlanService(compService)
 	lpGenService := services.NewLessonPlanGenService(cfg)
+	// v52: 角色权限服务
+	roleService := services.NewRoleService()
 
 	engine := services.NewEngine(8, 8, 100)
 	pipelineService.SetEngine(engine)
@@ -76,6 +78,8 @@ func Setup(cfg *config.Config) http.Handler {
 	accountHandler := handlers.NewAccountHandler()
 	// 统一用户管理中心（admin+分层权限）
 	adminHandler := handlers.NewAdminHandler(userService, orgService)
+	// v52: 角色权限管理（admin 专属）
+	roleHandler := handlers.NewRoleHandler(roleService)
 
 	orgHandler := handlers.NewOrganizationHandler(orgService)
 	compHandler := handlers.NewComponentHandler(compService)
@@ -107,13 +111,13 @@ func Setup(cfg *config.Config) http.Handler {
 		http.HandlerFunc(accountHandler.ChangePassword), authMW))
 
 	// ==================== 统一用户管理中心（admin+分层权限）====================
-	// 说明：
-	//   - /admin/users/*   用户管理（创建/编辑/禁用/重置密码/课程分配）
-	//   - /admin/orgs      组织列表（区域+学校）
-	//   - /admin/groups/*  教研组管理（列表+成员管理）
-	//   - /admin/audit-logs 操作日志
-	//   - /admin/stats      统计摘要
-	// 权限：admin全部可用；学校admin/教研组长通过业务层判断范围
+	// 接口说明：
+	//   /admin/users/*      用户管理（含 /users/{uid}/groups/* 教研组分配，v52任务六新增）
+	//   /admin/orgs         组织列表
+	//   /admin/groups/*     教研组管理
+	//   /admin/roles/*      角色权限管理（v52任务五新增）
+	//   /admin/audit-logs   操作日志
+	//   /admin/stats        统计摘要
 
 	// 统计摘要（admin only）
 	mux.Handle("/api/v1/admin/stats", middleware.Chain(
@@ -161,7 +165,50 @@ func Setup(cfg *config.Config) http.Handler {
 		methodNotAllowedJSON(w, "未知的教研组子路径")
 	}), authMW, adminOnly))
 
-	// 用户管理（/admin/users 列表+创建）
+	// ==================== 角色权限管理（v52任务五，admin only）====================
+	// GET  /api/v1/admin/roles         — 角色列表
+	// POST /api/v1/admin/roles         — 新建自定义角色
+	mux.Handle("/api/v1/admin/roles", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			roleHandler.ListRoles(w, r)
+		case http.MethodPost:
+			roleHandler.CreateRole(w, r)
+		default:
+			methodNotAllowedJSON(w, "仅支持GET/POST请求")
+		}
+	}), authMW, adminOnly))
+
+	// 角色子操作（/admin/roles/{id}/*）
+	mux.Handle("/api/v1/admin/roles/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case hasSuffix(path, "/status"):
+			roleHandler.UpdateRoleStatus(w, r)
+		case hasSuffix(path, "/permissions"):
+			switch r.Method {
+			case http.MethodGet:
+				roleHandler.GetRolePermissions(w, r)
+			case http.MethodPut:
+				roleHandler.UpdateRolePermissions(w, r)
+			default:
+				methodNotAllowedJSON(w, "仅支持GET/PUT请求")
+			}
+		default:
+			switch r.Method {
+			case http.MethodGet:
+				roleHandler.GetRole(w, r)
+			case http.MethodPut:
+				roleHandler.UpdateRole(w, r)
+			case http.MethodDelete:
+				roleHandler.DeleteRole(w, r)
+			default:
+				methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
+			}
+		}
+	}), authMW, adminOnly))
+
+	// ==================== 用户管理（/admin/users 列表+创建）====================
 	mux.Handle("/api/v1/admin/users", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -174,14 +221,18 @@ func Setup(cfg *config.Config) http.Handler {
 	}), authMW, adminOnly))
 
 	// 用户详情+子操作（/admin/users/{id}/*）
+	// 包含 v52任务六新增的 /users/{uid}/groups 和 /users/{uid}/groups/{gid}
 	mux.Handle("/api/v1/admin/users/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
 		case hasSuffix(path, "/status"):
+			// PUT /admin/users/{uid}/status
 			adminHandler.UpdateAdminUserStatus(w, r)
 		case hasSuffix(path, "/password"):
+			// PUT /admin/users/{uid}/password
 			adminHandler.ResetAdminUserPassword(w, r)
 		case hasSuffix(path, "/assignments"):
+			// GET/PUT /admin/users/{uid}/assignments
 			switch r.Method {
 			case http.MethodGet:
 				adminHandler.GetAdminUserAssignments(w, r)
@@ -190,7 +241,24 @@ func Setup(cfg *config.Config) http.Handler {
 			default:
 				methodNotAllowedJSON(w, "仅支持GET/PUT请求")
 			}
+		// v52任务六：用户↔教研组双向分配
+		// 优先匹配含 /groups/{gid} 的路径（避免被 /groups 后缀捕获）
+		case containsUserGroupGID(path):
+			// DELETE /admin/users/{uid}/groups/{gid} — 移出教研组
+			if r.Method == http.MethodDelete {
+				adminHandler.RemoveUserFromGroup(w, r)
+			} else {
+				methodNotAllowedJSON(w, "仅支持DELETE请求")
+			}
+		case hasSuffix(path, "/groups"):
+			// POST /admin/users/{uid}/groups — 加入教研组
+			if r.Method == http.MethodPost {
+				adminHandler.AddUserToGroup(w, r)
+			} else {
+				methodNotAllowedJSON(w, "仅支持POST请求")
+			}
 		default:
+			// GET/PUT /admin/users/{uid} — 详情/编辑
 			switch r.Method {
 			case http.MethodGet:
 				adminHandler.GetAdminUserDetail(w, r)
@@ -771,6 +839,23 @@ func containsAdminMemberUID(path string) bool {
 		}
 		return s
 	}(rest)
+	return len(rest) > 0
+}
+
+// containsUserGroupGID 判断路径是否为 /users/{uid}/groups/{gid} 格式
+// 即路径中包含 /groups/ 且其后有非空内容（gid）
+// 用于区分 /users/{uid}/groups（加入）和 /users/{uid}/groups/{gid}（移出）
+func containsUserGroupGID(path string) bool {
+	idx := indexOf(path, "/groups/")
+	if idx < 0 {
+		return false
+	}
+	// /groups/ 之后必须有非空内容（即 gid）
+	rest := path[idx+len("/groups/"):]
+	// 去除末尾斜杠后应有内容
+	for len(rest) > 0 && rest[len(rest)-1] == '/' {
+		rest = rest[:len(rest)-1]
+	}
 	return len(rest) > 0
 }
 
