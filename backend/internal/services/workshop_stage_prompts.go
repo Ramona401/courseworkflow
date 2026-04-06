@@ -1166,6 +1166,19 @@ func generateStageOpeningMsgID(stageCode string) string {
 // 算法：找到 "fieldName": 位置，跳过空白到值的开始引号，
 // 逐字节读取处理转义序列，验证结束引号后的后续字符确认真正结束
 // v75：保留，供降级提取路径使用
+// safeUTF8Truncate 安全截断UTF-8字符串，避免截断中文字符导致无效字节序列
+//
+// v75 BugFix：len(s[:500]) 按字节截断，可能截断UTF-8多字节字符的中间，
+// 导致写入PostgreSQL时报 "invalid byte sequence for encoding UTF8" 错误。
+// 改用 []rune 按字符截断。
+func safeUTF8Truncate(s string, maxChars int) string {
+runes := []rune(s)
+if len(runes) <= maxChars {
+return s
+}
+return string(runes[:maxChars]) + "..."
+}
+
 func extractFieldFromText(text, fieldName string) string {
 	key := `"` + fieldName + `"`
 	keyIdx := strings.Index(text, key)
