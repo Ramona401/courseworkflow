@@ -357,10 +357,7 @@ func BuildPriorOutputsContext(outputs []*models.WorkshopStageOutput) string {
 			sb.WriteString("\n")
 		}
 		if strings.TrimSpace(out.NarrativeOutput) != "" {
-			narrative := out.NarrativeOutput
-			if len(narrative) > 500 {
-				narrative = narrative[:500] + "..."
-			}
+			narrative := safeUTF8Truncate(out.NarrativeOutput, 500)
 			sb.WriteString(fmt.Sprintf("总结：%s\n", narrative))
 		}
 	}
@@ -517,10 +514,7 @@ func extractWriteStageFromNatural(content string) (string, string, bool) {
 	lessonContent := DetectLessonPlanContent(content)
 	if lessonContent == "" {
 		// 没有检测到教案内容，保存narrative
-		narrative := content
-		if len(narrative) > 500 {
-			narrative = narrative[:500] + "..."
-		}
+		narrative := safeUTF8Truncate(content, 500)
 		return "{}", narrative, false
 	}
 
@@ -690,10 +684,7 @@ func extractReviewStageFromNatural(content string) (string, string, bool) {
 
 	if totalScore <= 0 {
 		// 未找到评分，作为普通narrative保存
-		narrative := content
-		if len(narrative) > 500 {
-			narrative = narrative[:500] + "..."
-		}
+		narrative := safeUTF8Truncate(content, 500)
 		return "{}", narrative, false
 	}
 
@@ -730,10 +721,7 @@ func extractReviewStageFromNatural(content string) (string, string, bool) {
 	b, _ := json.Marshal(structured)
 
 	// narrative = 完整评审文本的摘要
-	narrative := content
-	if len(narrative) > 500 {
-		narrative = narrative[:500] + "..."
-	}
+	narrative := safeUTF8Truncate(content, 500)
 
 	wsLog.Info("从自然语言回复中提取到评审信息",
 		"total_score", totalScore,
@@ -802,10 +790,7 @@ func extractGenericStageFromNatural(stageCode string, content string) (string, s
 		return "{}", "", false
 	}
 
-	narrative := content
-	if len(narrative) > 500 {
-		narrative = narrative[:500] + "..."
-	}
+	narrative := safeUTF8Truncate(content, 500)
 
 	// 构造简单的structured，包含阶段标识
 	structured := map[string]interface{}{
