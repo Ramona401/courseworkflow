@@ -25,10 +25,8 @@ type Pipeline struct {
 	ReviewRound      int        `json:"review_round"`
 	AssignedTo       *string    `json:"assigned_to"`
 	// RejectReason 退回重审原因（超级审核员填写，Phase8新增）
-	// 对应数据库 pipelines.reject_reason TEXT 字段
-	// 审核员提交定稿被退回时，可在审核页面看到此原因
-	RejectReason string `json:"reject_reason"`
-	LessonPlanID     *string    `json:"lesson_plan_id,omitempty"` // Phase6：关联教案ID
+	RejectReason string  `json:"reject_reason"`
+	LessonPlanID *string `json:"lesson_plan_id,omitempty"` // Phase6：关联教案ID
 	CreatedAt    *time.Time `json:"created_at"`
 	UpdatedAt    *time.Time `json:"updated_at"`
 }
@@ -276,7 +274,6 @@ type PipelineListItem struct {
 }
 
 // PipelineDetailResponse Pipeline详情响应
-// Phase8修复P-02：新增 RejectReason 字段，前端审核页面可展示退回原因
 type PipelineDetailResponse struct {
 	ID               string          `json:"id"`
 	CourseCode       string          `json:"course_code"`
@@ -297,9 +294,8 @@ type PipelineDetailResponse struct {
 	ReviewRound      int             `json:"review_round"`
 	AssignedTo       *string         `json:"assigned_to"`
 	AssignedName     string          `json:"assigned_name"`
-	// RejectReason 最近一次退回重审的原因（空字符串表示未被退回或未填写原因）
-	RejectReason string          `json:"reject_reason"`
-	Steps        []*StepListItem `json:"steps"`
+	RejectReason     string          `json:"reject_reason"`
+	Steps            []*StepListItem `json:"steps"`
 }
 
 type StepListItem struct {
@@ -345,13 +341,14 @@ const (
 	PipelineStatusPending         = "pending"
 	PipelineStatusRunning         = "running"
 	PipelineStatusReviewQueue     = "review_queue"
-	PipelineStatusPendingFinalize = "pending_finalize" // P7新增：提交定稿待超级审核员确认
+	PipelineStatusPendingFinalize = "pending_finalize"
 	PipelineStatusFinalized       = "finalized"
 	PipelineStatusNeedsHuman      = "needs_human"
 	PipelineStatusFailed          = "failed"
 	PipelineStatusCancelled       = "cancelled"
 	PipelineStatusVerified        = "verified"
 	PipelineStatusVerifyFailed    = "verify_failed"
+	PipelineStatusPublished       = "published"
 )
 
 const (
@@ -402,13 +399,14 @@ var PipelineStatusNameMap = map[string]string{
 	PipelineStatusPending:         "待启动",
 	PipelineStatusRunning:         "运行中",
 	PipelineStatusReviewQueue:     "等待审核",
-	PipelineStatusPendingFinalize: "待确认定稿", // P7新增
+	PipelineStatusPendingFinalize: "待确认定稿",
 	PipelineStatusFinalized:       "已定稿",
 	PipelineStatusNeedsHuman:      "需人工干预",
 	PipelineStatusFailed:          "失败",
 	PipelineStatusCancelled:       "已取消",
 	PipelineStatusVerified:        "验收通过",
 	PipelineStatusVerifyFailed:    "验收未通过",
+	PipelineStatusPublished:       "已发布至课程平台",
 }
 
 var StepStatusNameMap = map[string]string{
@@ -510,19 +508,41 @@ func (r *GeneratorResult) ToJSON() string {
 
 // ==================== Verify 步骤数据结构 ====================
 
+// VerifyResult verify验收结果
+// v63升级：支持多轮评估，EvalRoundScores存储每轮分数，EvalScore改为均分
 type VerifyResult struct {
-	GeneratedIndex string  `json:"generated_index"`
-	EvalScore      float64 `json:"eval_score"`
-	EvalOutput     string  `json:"eval_output"`
-	EvalE1         float64 `json:"eval_e1"`
-	EvalE2         float64 `json:"eval_e2"`
-	EvalE3         float64 `json:"eval_e3"`
-	EvalE4         float64 `json:"eval_e4"`
-	Passed         bool    `json:"passed"`
-	ReviewRound    int     `json:"review_round"`
-	ModelUsed      string  `json:"model_used"`
-	TokensUsed     int     `json:"tokens_used"`
-	LatencyMs      int64   `json:"latency_ms"`
+	GeneratedIndex  string             `json:"generated_index"`
+	// v63新增：多轮评估结果
+	EvalRoundScores []VerifyEvalRound  `json:"eval_round_scores,omitempty"` // 每轮评估的详细分数
+	TotalEvalRounds int                `json:"total_eval_rounds"`            // 总评估轮次
+	DoneEvalRounds  int                `json:"done_eval_rounds"`             // 成功的轮次数
+	// 均分（多轮取平均，向后兼容原有单轮字段名）
+	EvalScore       float64            `json:"eval_score"`
+	EvalOutput      string             `json:"eval_output"`                  // 最后一轮的输出（向后兼容）
+	EvalE1          float64            `json:"eval_e1"`
+	EvalE2          float64            `json:"eval_e2"`
+	EvalE3          float64            `json:"eval_e3"`
+	EvalE4          float64            `json:"eval_e4"`
+	Passed          bool               `json:"passed"`
+	ReviewRound     int                `json:"review_round"`
+	ModelUsed       string             `json:"model_used"`
+	TokensUsed      int                `json:"tokens_used"`
+	LatencyMs       int64              `json:"latency_ms"`
+}
+
+// VerifyEvalRound verify多轮评估中单轮的评分记录
+type VerifyEvalRound struct {
+	RoundNumber int     `json:"round_number"`
+	ScoreTotal  float64 `json:"score_total"`
+	ScoreE1     float64 `json:"score_e1"`
+	ScoreE2     float64 `json:"score_e2"`
+	ScoreE3     float64 `json:"score_e3"`
+	ScoreE4     float64 `json:"score_e4"`
+	Hard        string  `json:"hard_constraint"`
+	Grade       string  `json:"grade"`
+	Output      string  `json:"output"`
+	ModelUsed   string  `json:"model_used"`
+	TokensUsed  int     `json:"tokens_used"`
 }
 
 func (r *VerifyResult) ToJSON() string {
@@ -545,19 +565,16 @@ const (
 
 // PageOperation Translator输出解析后的页面操作
 // v35修复：新增 OriginalPageNumber 字段
-// 当Translator重排页码时（如"P05=原P04，页码顺延"），PageNumber=5 但 OriginalPageNumber=4
-// Generator用 OriginalPageNumber 去 pageLessonMap 查找正确的 lesson_id 和原版HTML
 type PageOperation struct {
 	PageNumber         int    `json:"page_number"`
-	OriginalPageNumber int    `json:"original_page_number"` // v35新增：原始页码（从标题"原Pxx"解析，0表示与PageNumber相同）
+	OriginalPageNumber int    `json:"original_page_number"`
 	Operation          string `json:"operation"`
 	Title              string `json:"title"`
 	Description        string `json:"description"`
 	MergeSources       []int  `json:"merge_sources,omitempty"`
 }
 
-// GetOrigPageNum 获取实际的原始页码（v35新增）
-// 如果 OriginalPageNumber > 0，返回它；否则返回 PageNumber
+// GetOrigPageNum 获取实际的原始页码
 func (op *PageOperation) GetOrigPageNum() int {
 	if op.OriginalPageNumber > 0 {
 		return op.OriginalPageNumber

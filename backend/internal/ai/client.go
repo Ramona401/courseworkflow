@@ -9,6 +9,12 @@ package ai
 //   通过中转API（oneapi类）时首字节延迟可能超过3-5分钟（排队+推理）。
 //   使用900秒（15分钟）作为总超时，足以覆盖最慢的Opus长文本生成。
 //   Engine信号量（8并发）防止过多goroutine同时等待，不会耗尽资源。
+//
+// 重试策略说明（v67.1新增）：
+//   OneAPI等中转API的nginx可能在Opus长推理时返回502/504超时错误，
+//   或返回500+不完整JSON。这些都是临时性错误，自动重试可有效恢复。
+//   非流式CallAI最多重试3次（间隔30s/60s/120s指数退避）。
+//   流式CallAIStream最多重试2次（间隔30s/60s）。
 
 import (
 	"bufio"
@@ -16,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -29,7 +36,20 @@ import (
 const (
 	// AICallTimeout AI调用HTTP超时时间（900秒=15分钟）
 	AICallTimeout = 900 * time.Second
+
+	// MaxRetries 非流式调用最大重试次数（首次调用 + 最多3次重试 = 总共4次尝试）
+	MaxRetries = 3
+
+	// MaxStreamRetries 流式调用最大重试次数（首次调用 + 最多2次重试 = 总共3次尝试）
+	MaxStreamRetries = 2
 )
+
+// retryDelays 重试间隔时间表（指数退避：30秒 → 60秒 → 120秒）
+var retryDelays = []time.Duration{
+	30 * time.Second,
+	60 * time.Second,
+	120 * time.Second,
+}
 
 // ==================== 类型定义 ====================
 
@@ -179,10 +199,57 @@ func GetEffectiveConfig(
 	return cfg, nil
 }
 
-// ==================== 非流式AI调用 ====================
+// ==================== 重试辅助函数 ====================
+
+// isRetryableError 判断HTTP状态码是否可以重试
+// 502 Bad Gateway / 503 Service Unavailable / 504 Gateway Timeout 是典型的临时性错误
+// 500 Internal Server Error 当响应内容包含典型超时特征时也可重试
+func isRetryableError(statusCode int, body []byte) bool {
+	switch statusCode {
+	case 502, 503, 504:
+		// 网关错误、服务不可用、网关超时 → 一定重试
+		return true
+	case 500:
+		// 500错误需要判断内容：如果是JSON解析失败、连接中断等，可以重试
+		bodyStr := string(body)
+		retryablePatterns := []string{
+			"unexpected end of JSON input",
+			"connection reset",
+			"broken pipe",
+			"EOF",
+			"timeout",
+			"Gateway Time-out",
+			"Bad Gateway",
+			"upstream",
+		}
+		for _, pattern := range retryablePatterns {
+			if strings.Contains(bodyStr, pattern) {
+				return true
+			}
+		}
+		return false
+	case 429:
+		// 频率限制 → 重试（退避后重试有意义）
+		return true
+	default:
+		return false
+	}
+}
+
+// getRetryDelay 获取第n次重试的等待时间（从0开始计数）
+func getRetryDelay(attempt int) time.Duration {
+	if attempt < len(retryDelays) {
+		return retryDelays[attempt]
+	}
+	// 超出预设范围则使用最大值
+	return retryDelays[len(retryDelays)-1]
+}
+
+// ==================== 非流式AI调用（带重试）====================
 
 // CallAI 调用AI API（OpenAI兼容格式，等待完整回复后返回）
 // 用于Pipeline各步骤、AI评审等需要完整结果的场景
+// 遇到502/503/504/429等临时错误时自动重试（最多3次，指数退避）
 func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*CallResult, error) {
 	var messages []ChatMessage
 	if strings.TrimSpace(systemPrompt) != "" {
@@ -203,6 +270,43 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 	}
 
 	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
+
+	// -------- 带重试的调用循环 --------
+	var lastErr error
+	for attempt := 0; attempt <= MaxRetries; attempt++ {
+		// 非首次调用时等待退避时间
+		if attempt > 0 {
+			delay := getRetryDelay(attempt - 1)
+			log.Printf("[AI重试] 第%d次重试，等待%s后重试（模型: %s）", attempt, delay, cfg.Model)
+			time.Sleep(delay)
+		}
+
+		result, err := callAIOnce(cfg, endpoint, jsonBody)
+		if err == nil {
+			// 调用成功
+			if attempt > 0 {
+				log.Printf("[AI重试] 第%d次重试成功（模型: %s）", attempt, cfg.Model)
+			}
+			return result, nil
+		}
+
+		lastErr = err
+
+		// 判断是否可重试
+		if !isRetryableCallError(err) {
+			// 不可重试的错误（如认证失败、请求格式错误等），直接返回
+			return nil, err
+		}
+
+		log.Printf("[AI重试] 调用失败（第%d/%d次），错误: %s", attempt+1, MaxRetries+1, err.Error())
+	}
+
+	// 所有重试都失败
+	return nil, fmt.Errorf("AI调用在%d次尝试后仍然失败: %w", MaxRetries+1, lastErr)
+}
+
+// callAIOnce 执行单次非流式AI调用（不含重试逻辑）
+func callAIOnce(cfg *EffectiveConfig, endpoint string, jsonBody []byte) (*CallResult, error) {
 	httpReq, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("创建HTTP请求失败: %w", err)
@@ -216,32 +320,49 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 	resp, err := httpClient.Do(httpReq)
 	latencyMs := time.Since(startTime).Milliseconds()
 	if err != nil {
-		return nil, fmt.Errorf("AI API调用失败（网络错误，超时%s）: %w", AICallTimeout.String(), err)
+		return nil, &retryableError{
+			msg: fmt.Sprintf("AI API调用失败（网络错误，超时%s）: %s", AICallTimeout.String(), err.Error()),
+		}
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取AI响应失败: %w", err)
+		return nil, &retryableError{
+			msg: fmt.Sprintf("读取AI响应失败: %s", err.Error()),
+		}
 	}
 
+	// 非200状态码：判断是否可重试
 	if resp.StatusCode != http.StatusOK {
 		errMsg := extractErrorMessage(respBody)
+		if isRetryableError(resp.StatusCode, respBody) {
+			return nil, &retryableError{
+				msg: fmt.Sprintf("AI API返回错误(HTTP %d): %s", resp.StatusCode, errMsg),
+			}
+		}
+		// 不可重试的错误（如401认证失败、400参数错误等）
 		return nil, fmt.Errorf("AI API返回错误(HTTP %d): %s", resp.StatusCode, errMsg)
 	}
 
 	var chatResp ChatResponse
 	if err := json.Unmarshal(respBody, &chatResp); err != nil {
-		return nil, fmt.Errorf("解析AI响应JSON失败: %w", err)
+		return nil, &retryableError{
+			msg: fmt.Sprintf("解析AI响应JSON失败: %s", err.Error()),
+		}
 	}
 
 	if len(chatResp.Choices) == 0 {
-		return nil, fmt.Errorf("AI响应中choices为空，未获得有效输出")
+		return nil, &retryableError{
+			msg: "AI响应中choices为空，未获得有效输出",
+		}
 	}
 
 	content := chatResp.Choices[0].Message.Content
 	if strings.TrimSpace(content) == "" {
-		return nil, fmt.Errorf("AI返回内容为空")
+		return nil, &retryableError{
+			msg: "AI返回内容为空",
+		}
 	}
 
 	content = stripThinking(content)
@@ -254,7 +375,24 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 	}, nil
 }
 
-// ==================== 流式AI调用 ====================
+// ==================== 重试错误类型 ====================
+
+// retryableError 标记可重试的错误
+type retryableError struct {
+	msg string
+}
+
+func (e *retryableError) Error() string {
+	return e.msg
+}
+
+// isRetryableCallError 判断错误是否为可重试类型
+func isRetryableCallError(err error) bool {
+	_, ok := err.(*retryableError)
+	return ok
+}
+
+// ==================== 流式AI调用（带重试）====================
 
 // CallAIStream 流式调用AI API（OpenAI兼容 SSE 格式）
 //
@@ -264,8 +402,14 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 //   本函数逐行读取，每收到一个非空 token 立即调用 onChunk 回调，
 //   调用方可在回调中将 token 实时推送给前端。
 //
+// 重试说明：
+//   流式调用在建立连接阶段（HTTP请求发出到收到200响应）如果遇到
+//   502/503/504等临时错误，会自动重试最多2次。
+//   但一旦开始接收流式数据后发生的错误不会重试（因为onChunk可能已经
+//   向前端推送了部分数据，重试会导致内容重复）。
+//
 // 参数：
-//   cfg      — AI配置（模型/温度/maxTokens）
+//   cfg          — AI配置（模型/温度/maxTokens）
 //   systemPrompt — 系统提示词
 //   userPrompt   — 用户消息
 //   onChunk      — 每收到一个token片段时的回调，返回error可中止流式读取
@@ -299,32 +443,69 @@ func CallAIStream(
 		return nil, fmt.Errorf("序列化AI流式请求失败: %w", err)
 	}
 
-	// -------- 构造HTTP请求 --------
 	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
-	httpReq, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("创建HTTP流式请求失败: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-	httpReq.Header.Set("Accept", "text/event-stream") // 明确声明接受SSE格式
 
-	// 流式请求使用相同的900秒超时（覆盖完整流式传输时长）
-	httpClient := &http.Client{Timeout: AICallTimeout}
+	// -------- 带重试的连接建立 --------
+	var resp *http.Response
+	var lastErr error
 	startTime := time.Now()
 
-	resp, err := httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("AI流式API调用失败: %w", err)
+	for attempt := 0; attempt <= MaxStreamRetries; attempt++ {
+		// 非首次调用时等待退避时间
+		if attempt > 0 {
+			delay := getRetryDelay(attempt - 1)
+			log.Printf("[AI流式重试] 第%d次重试，等待%s后重试（模型: %s）", attempt, delay, cfg.Model)
+			time.Sleep(delay)
+		}
+
+		httpReq, reqErr := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(jsonBody))
+		if reqErr != nil {
+			return nil, fmt.Errorf("创建HTTP流式请求失败: %w", reqErr)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+		httpReq.Header.Set("Accept", "text/event-stream") // 明确声明接受SSE格式
+
+		// 流式请求使用相同的900秒超时（覆盖完整流式传输时长）
+		httpClient := &http.Client{Timeout: AICallTimeout}
+
+		resp, err = httpClient.Do(httpReq)
+		if err != nil {
+			// 网络级错误（超时、连接拒绝等）→ 可重试
+			lastErr = fmt.Errorf("AI流式API调用失败: %w", err)
+			log.Printf("[AI流式重试] 网络错误（第%d/%d次）: %s", attempt+1, MaxStreamRetries+1, err.Error())
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			errMsg := extractErrorMessage(body)
+
+			if isRetryableError(resp.StatusCode, body) {
+				lastErr = fmt.Errorf("AI流式API返回错误(HTTP %d): %s", resp.StatusCode, errMsg)
+				log.Printf("[AI流式重试] HTTP %d（第%d/%d次）: %s", resp.StatusCode, attempt+1, MaxStreamRetries+1, errMsg)
+				continue
+			}
+			// 不可重试的错误
+			return nil, fmt.Errorf("AI流式API返回错误(HTTP %d): %s", resp.StatusCode, errMsg)
+		}
+
+		// 连接建立成功，跳出重试循环
+		if attempt > 0 {
+			log.Printf("[AI流式重试] 第%d次重试成功（模型: %s）", attempt, cfg.Model)
+		}
+		lastErr = nil
+		break
+	}
+
+	// 所有重试都失败
+	if lastErr != nil {
+		return nil, fmt.Errorf("AI流式调用在%d次尝试后仍然失败: %w", MaxStreamRetries+1, lastErr)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("AI流式API返回错误(HTTP %d): %s", resp.StatusCode, extractErrorMessage(body))
-	}
-
-	// -------- 逐行读取SSE流 --------
+	// -------- 逐行读取SSE流（此阶段不再重试）--------
 	var fullContent strings.Builder // 拼接完整回复
 	var modelUsed string
 	totalTokens := 0
@@ -546,4 +727,94 @@ func parseInt(s string, defaultVal int) int {
 		return defaultVal
 	}
 	return v
+}
+
+// ==================== 迭代7新增：多模态AI调用（图片+文字）====================
+
+// MultimodalContent OpenAI兼容的多模态消息内容项
+type MultimodalContent struct {
+	Type     string                 `json:"type"`               // "text" 或 "image_url"
+	Text     string                 `json:"text,omitempty"`     // type=text时的文本
+	ImageURL *MultimodalImageURL    `json:"image_url,omitempty"` // type=image_url时的图片
+}
+
+// MultimodalImageURL 图片URL结构
+type MultimodalImageURL struct {
+	URL    string `json:"url"`              // data:image/jpeg;base64,xxx 或 https://xxx
+	Detail string `json:"detail,omitempty"` // "auto"/"low"/"high"，默认auto
+}
+
+// MultimodalMessage OpenAI兼容的多模态消息（content为数组）
+type MultimodalMessage struct {
+	Role    string              `json:"role"`
+	Content []MultimodalContent `json:"content"`
+}
+
+// MultimodalChatRequest 多模态请求体
+type MultimodalChatRequest struct {
+	Model       string              `json:"model"`
+	Messages    []interface{}       `json:"messages"` // 混合普通和多模态消息
+	MaxTokens   int                 `json:"max_tokens"`
+	Temperature float64             `json:"temperature"`
+}
+
+// CallAIMultimodal 调用AI API发送图片+文字（多模态Vision调用）
+// 用于课本OCR识别等需要图像理解的场景
+// imageDataURI 格式：data:image/jpeg;base64,xxxxx
+func CallAIMultimodal(cfg *EffectiveConfig, systemPrompt string, userText string, imageDataURI string) (*CallResult, error) {
+	// 构造消息列表
+	var messages []interface{}
+
+	// 系统消息（普通文本格式）
+	if strings.TrimSpace(systemPrompt) != "" {
+		messages = append(messages, ChatMessage{Role: "system", Content: systemPrompt})
+	}
+
+	// 用户消息（多模态格式：文字+图片）
+	userContent := []MultimodalContent{
+		{Type: "text", Text: userText},
+		{Type: "image_url", ImageURL: &MultimodalImageURL{URL: imageDataURI, Detail: "high"}},
+	}
+	messages = append(messages, MultimodalMessage{
+		Role:    "user",
+		Content: userContent,
+	})
+
+	reqBody := MultimodalChatRequest{
+		Model:       cfg.Model,
+		Messages:    messages,
+		MaxTokens:   cfg.MaxTokens,
+		Temperature: cfg.Temperature,
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("序列化多模态AI请求失败: %w", err)
+	}
+
+	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
+
+	// 带重试调用（复用现有重试逻辑）
+	var lastErr error
+	for attempt := 0; attempt <= MaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := getRetryDelay(attempt - 1)
+			log.Printf("[AI多模态重试] 第%d次重试，等待%s（模型: %s）", attempt, delay, cfg.Model)
+			time.Sleep(delay)
+		}
+
+		result, err := callAIOnce(cfg, endpoint, jsonBody)
+		if err == nil {
+			if attempt > 0 {
+				log.Printf("[AI多模态重试] 第%d次重试成功", attempt)
+			}
+			return result, nil
+		}
+		lastErr = err
+		if !isRetryableCallError(err) {
+			return nil, err
+		}
+		log.Printf("[AI多模态重试] 失败（第%d/%d次）: %s", attempt+1, MaxRetries+1, err.Error())
+	}
+	return nil, fmt.Errorf("AI多模态调用在%d次尝试后失败: %w", MaxRetries+1, lastErr)
 }

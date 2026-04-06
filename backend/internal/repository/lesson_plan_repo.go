@@ -7,6 +7,10 @@ package repository
 //   - 教案CRUD（创建/查询/列表/更新内容/更新状态/更新可见范围/更新评审/Fork/删除）
 //   - 教案评审CRUD（创建/列表）
 //
+// v56修改：CreateLessonPlan/GetLessonPlanByID 增加 recipe_id 字段
+// v58修改：GetLessonPlanByID 增加 current_stage + stage_config 字段
+// 迭代7B修改：CreateLessonPlan 增加 textbook_page_ids 字段
+//             GetLessonPlanByID 增加 textbook_page_ids 字段
 // 提示词模板+组件萃取+对话记录 → lesson_plan_repo_ext.go
 
 import (
@@ -31,17 +35,21 @@ var (
 // ==================== 教案CRUD ====================
 
 // CreateLessonPlan 创建教案
+// v56：新增recipe_id字段
+// 迭代7B：新增textbook_page_ids字段
 func CreateLessonPlan(ctx context.Context, lp *models.LessonPlan) error {
 	query := `
 		INSERT INTO lesson_plans (
 			title, subject, grade, topic, duration_minutes,
 			content_markdown, content_structured, generation_config,
 			matched_components, conversation_log,
-			status, visibility, author_id, group_id, school_id, template_id
+			status, visibility, author_id, group_id, school_id, template_id, recipe_id,
+			textbook_page_ids
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10,
-			$11, $12, $13, $14, $15, $16
+			$11, $12, $13, $14, $15, $16, $17,
+			$18
 		)
 		RETURNING id, created_at, updated_at
 	`
@@ -73,11 +81,17 @@ func CreateLessonPlan(ctx context.Context, lp *models.LessonPlan) error {
 	if visibility == "" {
 		visibility = "personal"
 	}
+	// 迭代7B：课本图片ID列表默认空数组
+	textbookIDs := lp.TextbookPageIDs
+	if textbookIDs == "" {
+		textbookIDs = "[]"
+	}
 
 	err := database.DB.QueryRow(ctx, query,
 		lp.Title, lp.Subject, lp.Grade, lp.Topic, dur,
 		lp.ContentMarkdown, contentStruct, genConfig, matchedComp, convLog,
-		status, visibility, lp.AuthorID, lp.GroupID, lp.SchoolID, lp.TemplateID,
+		status, visibility, lp.AuthorID, lp.GroupID, lp.SchoolID, lp.TemplateID, lp.RecipeID,
+		textbookIDs,
 	).Scan(&lp.ID, &lp.CreatedAt, &lp.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("创建教案失败: %w", err)
@@ -86,6 +100,9 @@ func CreateLessonPlan(ctx context.Context, lp *models.LessonPlan) error {
 }
 
 // GetLessonPlanByID 根据ID查询教案
+// v56：新增recipe_id字段
+// v58：新增current_stage + stage_config字段
+// 迭代7B：新增textbook_page_ids字段
 func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, error) {
 	lp := &models.LessonPlan{}
 	query := `
@@ -94,8 +111,10 @@ func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, erro
 		       matched_components, conversation_log,
 		       ai_review_score, ai_review_result, ai_review_history,
 		       status, visibility, author_id, group_id, school_id,
-		       forked_from, fork_count, template_id,
+		       forked_from, fork_count, template_id, recipe_id,
 		       view_count, use_count, version,
+		       current_stage, COALESCE(stage_config::text, '[]'),
+		       COALESCE(textbook_page_ids::text, '[]'),
 		       created_at, updated_at
 		FROM lesson_plans WHERE id = $1
 	`
@@ -105,8 +124,10 @@ func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, erro
 		&lp.MatchedComponents, &lp.ConversationLog,
 		&lp.AIReviewScore, &lp.AIReviewResult, &lp.AIReviewHistory,
 		&lp.Status, &lp.Visibility, &lp.AuthorID, &lp.GroupID, &lp.SchoolID,
-		&lp.ForkedFrom, &lp.ForkCount, &lp.TemplateID,
+		&lp.ForkedFrom, &lp.ForkCount, &lp.TemplateID, &lp.RecipeID,
 		&lp.ViewCount, &lp.UseCount, &lp.Version,
+		&lp.CurrentStage, &lp.StageConfig,
+		&lp.TextbookPageIDs,
 		&lp.CreatedAt, &lp.UpdatedAt,
 	)
 	if err != nil {
@@ -150,7 +171,6 @@ func ListLessonPlans(ctx context.Context, authorID string, groupID string, statu
 		argIdx++
 	}
 
-	// 查询总数
 	var total int
 	if err := database.DB.QueryRow(ctx, "SELECT COUNT(*) FROM lesson_plans lp"+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("查询教案总数失败: %w", err)
@@ -164,9 +184,12 @@ func ListLessonPlans(ctx context.Context, authorID string, groupID string, statu
 		       lp.status, lp.visibility, lp.author_id,
 		       COALESCE(u.display_name, '') AS author_name,
 		       lp.ai_review_score, lp.fork_count, lp.view_count,
-		       lp.forked_from, lp.created_at, lp.updated_at
+		       lp.forked_from, lp.recipe_id,
+		       COALESCE(tr.name, '') AS recipe_name,
+		       lp.created_at, lp.updated_at
 		FROM lesson_plans lp
 		LEFT JOIN users u ON u.id = lp.author_id
+		LEFT JOIN teaching_recipes tr ON tr.id = lp.recipe_id
 		%s
 		ORDER BY lp.updated_at DESC
 		LIMIT $%d OFFSET $%d
@@ -186,7 +209,8 @@ func ListLessonPlans(ctx context.Context, authorID string, groupID string, statu
 			&item.ID, &item.Title, &item.Subject, &item.Grade, &item.Topic, &item.DurationMinutes,
 			&item.Status, &item.Visibility, &item.AuthorID, &item.AuthorName,
 			&item.AIReviewScore, &item.ForkCount, &item.ViewCount,
-			&item.ForkedFrom, &item.CreatedAt, &item.UpdatedAt,
+			&item.ForkedFrom, &item.RecipeID, &item.RecipeName,
+			&item.CreatedAt, &item.UpdatedAt,
 		)
 		if err != nil {
 			return nil, 0, fmt.Errorf("扫描教案行失败: %w", err)
@@ -197,7 +221,7 @@ func ListLessonPlans(ctx context.Context, authorID string, groupID string, statu
 	return items, total, nil
 }
 
-// UpdateLessonPlanContent 更新教案内容（标题/正文/结构/课时，版本号+1）
+// UpdateLessonPlanContent 更新教案内容
 func UpdateLessonPlanContent(ctx context.Context, id string, title string, contentMd string, contentStruct string, durMinutes int) error {
 	now := time.Now()
 	result, err := database.DB.Exec(ctx, `
@@ -264,7 +288,7 @@ func UpdateLessonPlanAIReview(ctx context.Context, id string, score float64, res
 	return nil
 }
 
-// ForkLessonPlan 复制教案（fork），同时增加源教案的fork计数
+// ForkLessonPlan 复制教案（fork）
 func ForkLessonPlan(ctx context.Context, sourceID string, newAuthorID string) (*models.LessonPlan, error) {
 	source, err := GetLessonPlanByID(ctx, sourceID)
 	if err != nil {
@@ -285,6 +309,8 @@ func ForkLessonPlan(ctx context.Context, sourceID string, newAuthorID string) (*
 		AuthorID:          newAuthorID,
 		ForkedFrom:        &sourceID,
 		TemplateID:        source.TemplateID,
+		RecipeID:          source.RecipeID,
+		TextbookPageIDs:   source.TextbookPageIDs, // 迭代7B：fork时保留课本关联
 	}
 	if err := CreateLessonPlan(ctx, newLP); err != nil {
 		return nil, err
@@ -343,7 +369,7 @@ func CreateLessonPlanReview(ctx context.Context, review *models.LessonPlanReview
 	return nil
 }
 
-// ListLessonPlanReviews 获取教案的评审记录列表（按轮次+时间正序）
+// ListLessonPlanReviews 获取教案的评审记录列表
 func ListLessonPlanReviews(ctx context.Context, lessonPlanID string) ([]*models.LessonPlanReviewItem, error) {
 	query := `
 		SELECT r.id, r.reviewer_id, COALESCE(u.display_name, '') AS reviewer_name,

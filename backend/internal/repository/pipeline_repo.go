@@ -192,31 +192,41 @@ func GetAssignedUserName(userID string) string {
 	return displayName
 }
 
-// pipelineListSelectSQL Pipeline列表查询SELECT子句（含3个分数子查询）
-// 从pipeline_steps.step_data JSONB字段提取evaluator均分/meta仲裁分/translator最终分
+// pipelineListSelectSQL Pipeline列表查询SELECT子句
+// v69优化（编号8）：从5个关联子查询改为LEFT JOIN预聚合，消除N+1查询
+// 原方案：每行5个子查询（assigned_name/steps_completed/eval/meta/translator分数）
+// 新方案：预聚合CTE计算steps_completed，3个分数用LEFT JOIN pipeline_steps按step_name精确匹配
 const pipelineListSelectSQL = `SELECT p.id, p.course_code, p.course_name, p.external_module_id,
         p.current_step, p.status, p.auto_mode, p.error_message,
         p.started_by, p.started_at, p.completed_at, p.created_at,
         p.review_round, p.assigned_to,
-        (SELECT u_assign.display_name FROM users u_assign WHERE u_assign.id = p.assigned_to) AS assigned_name,
-        COALESCE((SELECT COUNT(*) FROM pipeline_steps ps
-                WHERE ps.pipeline_id = p.id AND ps.status = 'done'), 0) AS steps_completed,
-        (SELECT (ps_eval.step_data->>'avg_total')::numeric
-         FROM pipeline_steps ps_eval
-         WHERE ps_eval.pipeline_id = p.id AND ps_eval.step_name = 'evaluator'
-                AND ps_eval.status = 'done' AND ps_eval.step_data IS NOT NULL
-         LIMIT 1) AS eval_avg_score,
-        (SELECT (ps_meta.step_data->>'total_final')::numeric
-         FROM pipeline_steps ps_meta
-         WHERE ps_meta.pipeline_id = p.id AND ps_meta.step_name = 'meta'
-                AND ps_meta.status = 'done' AND ps_meta.step_data IS NOT NULL
-         LIMIT 1) AS meta_score,
-        (SELECT (ps_trans.step_data->>'final_score')::numeric
-         FROM pipeline_steps ps_trans
-         WHERE ps_trans.pipeline_id = p.id AND ps_trans.step_name = 'translator'
-                AND ps_trans.status = 'done' AND ps_trans.step_data IS NOT NULL
-         LIMIT 1) AS translator_score
-FROM pipelines p`
+        u_assign.display_name AS assigned_name,
+        COALESCE(sc.done_count, 0) AS steps_completed,
+        (ps_eval.step_data->>'avg_total')::numeric AS eval_avg_score,
+        (ps_meta.step_data->>'total_final')::numeric AS meta_score,
+        (ps_trans.step_data->>'final_score')::numeric AS translator_score
+FROM pipelines p
+LEFT JOIN users u_assign ON u_assign.id = p.assigned_to
+LEFT JOIN (
+        SELECT pipeline_id, COUNT(*) AS done_count
+        FROM pipeline_steps WHERE status = 'done'
+        GROUP BY pipeline_id
+) sc ON sc.pipeline_id = p.id
+LEFT JOIN LATERAL (
+        SELECT step_data FROM pipeline_steps
+        WHERE pipeline_id = p.id AND step_name = 'evaluator' AND status = 'done' AND step_data IS NOT NULL
+        ORDER BY review_round DESC LIMIT 1
+) ps_eval ON true
+LEFT JOIN LATERAL (
+        SELECT step_data FROM pipeline_steps
+        WHERE pipeline_id = p.id AND step_name = 'meta' AND status = 'done' AND step_data IS NOT NULL
+        ORDER BY review_round DESC LIMIT 1
+) ps_meta ON true
+LEFT JOIN LATERAL (
+        SELECT step_data FROM pipeline_steps
+        WHERE pipeline_id = p.id AND step_name = 'translator' AND status = 'done' AND step_data IS NOT NULL
+        ORDER BY review_round DESC LIMIT 1
+) ps_trans ON true`
 
 // scanPipelineListRow 扫描Pipeline列表行（含3个分数字段）
 func scanPipelineListRow(rows interface{ Scan(dest ...interface{}) error }) (*models.PipelineListItem, error) {
@@ -392,36 +402,57 @@ func UpdatePipelineReviewRound(id string, reviewRound int) error {
 // ResetStepsForRetrial 批量重置指定步骤为pending（清除旧数据，事务执行）
 // 2审流程需要重置evaluator/meta/translator/generator/review步骤
 func ResetStepsForRetrial(pipelineID string, stepNames []string) error {
+	// v54重构：不再重置旧步骤，而是为新轮次插入全新的步骤记录
+	// 历史数据（旧review_round的步骤）保留，支持完整回溯
 	ctx := context.Background()
-	tx, err := database.DB.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("开启事务失败: %w", err)
-	}
-	defer tx.Rollback(ctx)
 
-	for _, stepName := range stepNames {
-		_, err = tx.Exec(ctx,
-			`UPDATE pipeline_steps
-			 SET status = $3, started_at = NULL, completed_at = NULL,
-			     duration_ms = 0, attempts = 0, step_data = NULL,
-			     error_message = NULL, model_used = NULL, tokens_used = 0,
-			     updated_at = NOW()
-			 WHERE pipeline_id = $1 AND step_name = $2`,
-			pipelineID, stepName, models.StepStatusPending,
-		)
-		if err != nil {
-			return fmt.Errorf("重置步骤 %s 失败: %w", stepName, err)
+	// 读取新的review_round（已被UpdatePipelineReviewRound更新）
+	var reviewRound int
+	if err := database.DB.QueryRow(ctx,
+		`SELECT review_round FROM pipelines WHERE id = $1`, pipelineID,
+	).Scan(&reviewRound); err != nil {
+		return fmt.Errorf("读取review_round失败: %w", err)
+	}
+
+	// 读取步骤的 step_order 映射（从旧记录中取）
+	orderRows, err := database.DB.Query(ctx,
+		`SELECT DISTINCT ON (step_name) step_name, step_order
+		 FROM pipeline_steps
+		 WHERE pipeline_id = $1
+		 ORDER BY step_name, review_round ASC`, pipelineID)
+	if err != nil {
+		return fmt.Errorf("查询步骤order失败: %w", err)
+	}
+	defer orderRows.Close()
+	orderMap := make(map[string]int)
+	for orderRows.Next() {
+		var name string
+		var order int
+		if err := orderRows.Scan(&name, &order); err == nil {
+			orderMap[name] = order
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("提交重置事务失败: %w", err)
+	// 为每个需要重置的步骤插入新轮次记录
+	for _, stepName := range stepNames {
+		order := orderMap[stepName]
+		_, err := database.DB.Exec(ctx,
+			`INSERT INTO pipeline_steps
+			    (pipeline_id, step_name, step_order, status, review_round)
+			 VALUES ($1, $2, $3, 'pending', $4)
+			 ON CONFLICT (pipeline_id, step_name, review_round) DO UPDATE
+			    SET status = 'pending', started_at = NULL, completed_at = NULL,
+			        duration_ms = 0, attempts = 0, step_data = NULL,
+			        error_message = NULL, tokens_used = 0, updated_at = NOW()`,
+			pipelineID, stepName, order, reviewRound)
+		if err != nil {
+			return fmt.Errorf("插入新轮次步骤%s失败: %w", stepName, err)
+		}
 	}
 	return nil
 }
 
-// UpdatePipelineRejectReason 更新Pipeline退回原因
-// RejectFinalize时将退回原因持久化，同时将状态退回review_queue
+
 func UpdatePipelineRejectReason(id string, rejectReason string) error {
 	ctx := context.Background()
 	_, err := database.DB.Exec(ctx,

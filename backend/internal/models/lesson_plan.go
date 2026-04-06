@@ -9,6 +9,8 @@ import (
 // LessonPlan 教案模型
 // 教案是独立资产，可独立使用、分享、fork
 // 双路径状态流转：个人使用（无需审核）/ 共享沉淀（需要评审）
+// v56新增：RecipeID 关联备课配方
+// v58新增：CurrentStage + StageConfig 阶段化备课工坊
 type LessonPlan struct {
 	ID                string     `json:"id"`                  // UUID主键
 	Title             string     `json:"title"`               // 教案标题
@@ -32,9 +34,13 @@ type LessonPlan struct {
 	ForkedFrom        *string    `json:"forked_from"`         // fork来源教案ID
 	ForkCount         int        `json:"fork_count"`          // 被fork次数
 	TemplateID        *string    `json:"template_id"`         // 使用的提示词模板ID
+	RecipeID          *string    `json:"recipe_id"`           // Phase 7A：使用的备课配方ID
 	ViewCount         int        `json:"view_count"`          // 浏览次数
 	UseCount          int        `json:"use_count"`           // 使用次数
 	Version           int        `json:"version"`             // 版本号
+	CurrentStage      string     `json:"current_stage"`       // Phase 7B：当前所在阶段代码（空=未开始/旧模式）
+	StageConfig       string     `json:"stage_config"`        // Phase 7B：阶段配置快照JSON
+        TextbookPageIDs   string     `json:"textbook_page_ids"`   // 迭代7B：关联的课本图片ID数组JSON
 	CreatedAt         *time.Time `json:"created_at"`          // 创建时间
 	UpdatedAt         *time.Time `json:"updated_at"`          // 更新时间
 }
@@ -77,82 +83,76 @@ const (
 // ==================== 教案评审模型（对应 lesson_plan_reviews 表） ====================
 
 // LessonPlanReview 教案评审记录
-// 记录教研组长/骨干对教案的人工评审
 type LessonPlanReview struct {
-	ID           string     `json:"id"`             // UUID主键
-	LessonPlanID string     `json:"lesson_plan_id"` // 教案ID
-	ReviewerID   string     `json:"reviewer_id"`    // 评审人用户ID
-	Decision     string     `json:"decision"`       // 评审决策：approved/revision/rejected
-	Score        *float64   `json:"score"`          // 评审总分
-	Dimensions   string     `json:"dimensions"`     // 各维度评分JSON
-	Comments     string     `json:"comments"`       // 评审意见
-	Suggestions  string     `json:"suggestions"`    // 具体建议列表JSON
-	Round        int        `json:"round"`          // 评审轮次
-	CreatedAt    *time.Time `json:"created_at"`     // 创建时间
+	ID           string     `json:"id"`
+	LessonPlanID string     `json:"lesson_plan_id"`
+	ReviewerID   string     `json:"reviewer_id"`
+	Decision     string     `json:"decision"`
+	Score        *float64   `json:"score"`
+	Dimensions   string     `json:"dimensions"`
+	Comments     string     `json:"comments"`
+	Suggestions  string     `json:"suggestions"`
+	Round        int        `json:"round"`
+	CreatedAt    *time.Time `json:"created_at"`
 }
 
 // ==================== 组件萃取模型（对应 component_extractions 表） ====================
 
 // ComponentExtraction 组件萃取记录
-// 记录从教案/对话中萃取组件的过程
 type ComponentExtraction struct {
-	ID                   string     `json:"id"`                      // UUID主键
-	SourceType           string     `json:"source_type"`             // 来源类型：conversation/lesson_plan/manual
-	SourceLessonPlanID   *string    `json:"source_lesson_plan_id"`   // 来源教案ID
-	SourceContent        string     `json:"source_content"`          // 来源内容片段
-	ExtractedComponentID *string    `json:"extracted_component_id"`  // 萃取生成的组件ID
-	ExtractionType       string     `json:"extraction_type"`         // 萃取类型
-	Status               string     `json:"status"`                  // 状态：pending/confirmed/rejected
-	ConfirmedBy          *string    `json:"confirmed_by"`            // 确认人
-	ConfirmedAt          *time.Time `json:"confirmed_at"`            // 确认时间
-	CreatedBy            *string    `json:"created_by"`              // 创建者
-	CreatedAt            *time.Time `json:"created_at"`              // 创建时间
+	ID                   string     `json:"id"`
+	SourceType           string     `json:"source_type"`
+	SourceLessonPlanID   *string    `json:"source_lesson_plan_id"`
+	SourceContent        string     `json:"source_content"`
+	ExtractedComponentID *string    `json:"extracted_component_id"`
+	ExtractionType       string     `json:"extraction_type"`
+	Status               string     `json:"status"`
+	ConfirmedBy          *string    `json:"confirmed_by"`
+	ConfirmedAt          *time.Time `json:"confirmed_at"`
+	CreatedBy            *string    `json:"created_by"`
+	CreatedAt            *time.Time `json:"created_at"`
 }
 
 // ==================== 提示词模板模型（对应 prompt_templates 表） ====================
 
 // PromptTemplate 提示词模板
-// 支持区域→学校→教研组→个人四级继承
-// 子级通过 ParentTemplateID 指向父级，解析时子级覆盖父级
 type PromptTemplate struct {
-	ID                string     `json:"id"`                  // UUID主键
-	Name              string     `json:"name"`                // 模板名称
-	Description       *string    `json:"description"`         // 模板描述（可NULL）
-	Level             string     `json:"level"`               // 归属层级：region/school/group/personal
-	OwnerID           string     `json:"owner_id"`            // 归属ID
-	ParentTemplateID  *string    `json:"parent_template_id"`  // 父级模板ID
-	SystemPrompt      *string    `json:"system_prompt"`       // 系统提示词（可NULL）
-	ContextRules      *string    `json:"context_rules"`       // 上下文规则JSON（可NULL）
-	GenerationRules   *string    `json:"generation_rules"`    // 生成规则JSON（可NULL）
-	ReviewRules       *string    `json:"review_rules"`        // 评审规则JSON（可NULL）
-	OutputFormat      *string    `json:"output_format"`       // 输出格式JSON（可NULL）
-	CustomInstructions *string   `json:"custom_instructions"` // 自定义指令（可NULL）
-	Subject           string     `json:"subject"`             // 适用学科
-	GradeRange        string     `json:"grade_range"`         // 适用学段
-	IsDefault         bool       `json:"is_default"`          // 是否默认模板
-	Version           int        `json:"version"`             // 版本号
-	Status            string     `json:"status"`              // 状态：active/disabled
-	CreatedBy         *string    `json:"created_by"`          // 创建者
-	CreatedAt         *time.Time `json:"created_at"`          // 创建时间
-	UpdatedAt         *time.Time `json:"updated_at"`          // 更新时间
+	ID                string     `json:"id"`
+	Name              string     `json:"name"`
+	Description       *string    `json:"description"`
+	Level             string     `json:"level"`
+	OwnerID           string     `json:"owner_id"`
+	ParentTemplateID  *string    `json:"parent_template_id"`
+	SystemPrompt      *string    `json:"system_prompt"`
+	ContextRules      *string    `json:"context_rules"`
+	GenerationRules   *string    `json:"generation_rules"`
+	ReviewRules       *string    `json:"review_rules"`
+	OutputFormat      *string    `json:"output_format"`
+	CustomInstructions *string   `json:"custom_instructions"`
+	Subject           string     `json:"subject"`
+	GradeRange        string     `json:"grade_range"`
+	IsDefault         bool       `json:"is_default"`
+	Version           int        `json:"version"`
+	Status            string     `json:"status"`
+	CreatedBy         *string    `json:"created_by"`
+	CreatedAt         *time.Time `json:"created_at"`
+	UpdatedAt         *time.Time `json:"updated_at"`
 }
 
 // ==================== 提示词模板层级常量 ====================
 
 const (
-	TemplateLevelRegion   = "region"   // 区域级
-	TemplateLevelSchool   = "school"   // 学校级
-	TemplateLevelGroup    = "group"    // 教研组级
-	TemplateLevelPersonal = "personal" // 个人级
+	TemplateLevelRegion   = "region"
+	TemplateLevelSchool   = "school"
+	TemplateLevelGroup    = "group"
+	TemplateLevelPersonal = "personal"
 )
 
-// ValidTemplateLevels 有效的模板层级列表
 var ValidTemplateLevels = []string{
 	TemplateLevelRegion, TemplateLevelSchool,
 	TemplateLevelGroup, TemplateLevelPersonal,
 }
 
-// IsValidTemplateLevel 检查模板层级是否有效
 func IsValidTemplateLevel(level string) bool {
 	for _, v := range ValidTemplateLevels {
 		if v == level {
@@ -164,50 +164,41 @@ func IsValidTemplateLevel(level string) bool {
 
 // ==================== 教案请求结构体 ====================
 
-// CreateLessonPlanRequest 创建教案请求（从备课工坊发起）
 type CreateLessonPlanRequest struct {
-	Title           string `json:"title"`            // 教案标题（必填）
-	Subject         string `json:"subject"`          // 学科（必填）
-	Grade           string `json:"grade"`            // 年级（必填）
-	Topic           string `json:"topic"`            // 课题（必填）
-	DurationMinutes int    `json:"duration_minutes"` // 课时时长（可选，默认45）
+	Title           string `json:"title"`
+	Subject         string `json:"subject"`
+	Grade           string `json:"grade"`
+	Topic           string `json:"topic"`
+	DurationMinutes int    `json:"duration_minutes"`
 }
 
-// UpdateLessonPlanRequest 更新教案请求
 type UpdateLessonPlanRequest struct {
-	Title           string `json:"title"`            // 教案标题
-	ContentMarkdown string `json:"content_markdown"` // Markdown内容
-	DurationMinutes int    `json:"duration_minutes"` // 课时时长
+	Title           string `json:"title"`
+	ContentMarkdown string `json:"content_markdown"`
+	DurationMinutes int    `json:"duration_minutes"`
 }
 
-// SubmitLessonPlanReviewRequest 提交教案评审请求
 type SubmitLessonPlanReviewRequest struct {
-	GroupID string `json:"group_id"` // 提交到哪个教研组（必填）
+	GroupID string `json:"group_id"`
 }
 
-// CreateLessonPlanReviewRequest 创建教案评审请求（评审人操作）
 type CreateLessonPlanReviewRequest struct {
-	Decision    string   `json:"decision"`    // 评审决策：approved/revision/rejected（必填）
-	Score       *float64 `json:"score"`       // 评审总分（可选）
-	Dimensions  string   `json:"dimensions"`  // 各维度评分JSON（可选）
-	Comments    string   `json:"comments"`    // 评审意见（必填）
-	Suggestions string   `json:"suggestions"` // 具体建议列表JSON（可选）
+	Decision    string   `json:"decision"`
+	Score       *float64 `json:"score"`
+	Dimensions  string   `json:"dimensions"`
+	Comments    string   `json:"comments"`
+	Suggestions string   `json:"suggestions"`
 }
 
-// ForkLessonPlanRequest fork教案请求
-type ForkLessonPlanRequest struct {
-	// 暂无额外字段，fork时自动复制教案内容
-}
+type ForkLessonPlanRequest struct{}
 
 // ==================== 教案响应结构体 ====================
 
-// LessonPlanListResponse 教案列表响应
 type LessonPlanListResponse struct {
-	LessonPlans []*LessonPlanListItem `json:"lesson_plans"` // 教案列表
-	Total       int                   `json:"total"`        // 总数
+	LessonPlans []*LessonPlanListItem `json:"lesson_plans"`
+	Total       int                   `json:"total"`
 }
 
-// LessonPlanListItem 教案列表单条
 type LessonPlanListItem struct {
 	ID              string     `json:"id"`
 	Title           string     `json:"title"`
@@ -216,19 +207,20 @@ type LessonPlanListItem struct {
 	Topic           string     `json:"topic"`
 	DurationMinutes int        `json:"duration_minutes"`
 	Status          string     `json:"status"`
-	StatusName      string     `json:"status_name"`     // 状态中文名
+	StatusName      string     `json:"status_name"`
 	Visibility      string     `json:"visibility"`
 	AuthorID        string     `json:"author_id"`
-	AuthorName      string     `json:"author_name"`     // 作者名称
-	AIReviewScore   *float64   `json:"ai_review_score"` // AI评审分
+	AuthorName      string     `json:"author_name"`
+	AIReviewScore   *float64   `json:"ai_review_score"`
 	ForkCount       int        `json:"fork_count"`
 	ViewCount       int        `json:"view_count"`
 	ForkedFrom      *string    `json:"forked_from"`
+	RecipeID        *string    `json:"recipe_id,omitempty"`        // Phase 7A：关联配方ID
+	RecipeName      string     `json:"recipe_name,omitempty"`     // Phase 7A：关联配方名称
 	CreatedAt       *time.Time `json:"created_at"`
 	UpdatedAt       *time.Time `json:"updated_at"`
 }
 
-// LessonPlanDetailResponse 教案详情响应
 type LessonPlanDetailResponse struct {
 	ID                string     `json:"id"`
 	Title             string     `json:"title"`
@@ -256,13 +248,16 @@ type LessonPlanDetailResponse struct {
 	ViewCount         int        `json:"view_count"`
 	UseCount          int        `json:"use_count"`
 	Version           int        `json:"version"`
+	RecipeID          *string    `json:"recipe_id,omitempty"`           // Phase 7A：关联配方ID
+	RecipeName        string     `json:"recipe_name,omitempty"`         // Phase 7A：关联配方名称
+	CurrentStage      string     `json:"current_stage,omitempty"`       // Phase 7B：当前阶段
+	StageConfig       string     `json:"stage_config,omitempty"`        // Phase 7B：阶段配置
 	Reviews           []*LessonPlanReviewItem `json:"reviews"`
-	LinkedPipelineID  *string                `json:"linked_pipeline_id,omitempty"` // Phase6：关联Pipeline ID // 评审记录
+	LinkedPipelineID  *string                `json:"linked_pipeline_id,omitempty"`
 	CreatedAt         *time.Time `json:"created_at"`
 	UpdatedAt         *time.Time `json:"updated_at"`
 }
 
-// LessonPlanReviewItem 评审记录展示项
 type LessonPlanReviewItem struct {
 	ID           string     `json:"id"`
 	ReviewerID   string     `json:"reviewer_id"`
@@ -276,25 +271,23 @@ type LessonPlanReviewItem struct {
 
 // ==================== 提示词模板请求结构体 ====================
 
-// CreatePromptTemplateRequest 创建提示词模板请求
 type CreatePromptTemplateRequest struct {
-	Name               string  `json:"name"`                // 模板名称（必填）
-	Description        string  `json:"description"`         // 描述（可选）
-	Level              string  `json:"level"`               // 归属层级（必填）
-	OwnerID            string  `json:"owner_id"`            // 归属ID（必填）
-	ParentTemplateID   *string `json:"parent_template_id"`  // 父级模板ID（可选）
-	SystemPrompt       string  `json:"system_prompt"`       // 系统提示词（可选）
-	ContextRules       string  `json:"context_rules"`       // 上下文规则JSON（可选）
-	GenerationRules    string  `json:"generation_rules"`    // 生成规则JSON（可选）
-	ReviewRules        string  `json:"review_rules"`        // 评审规则JSON（可选）
-	OutputFormat       string  `json:"output_format"`       // 输出格式JSON（可选）
-	CustomInstructions string  `json:"custom_instructions"` // 自定义指令（可选）
-	Subject            string  `json:"subject"`             // 适用学科（可选）
-	GradeRange         string  `json:"grade_range"`         // 适用学段（可选）
-	IsDefault          bool    `json:"is_default"`          // 是否默认（可选）
+	Name               string  `json:"name"`
+	Description        string  `json:"description"`
+	Level              string  `json:"level"`
+	OwnerID            string  `json:"owner_id"`
+	ParentTemplateID   *string `json:"parent_template_id"`
+	SystemPrompt       string  `json:"system_prompt"`
+	ContextRules       string  `json:"context_rules"`
+	GenerationRules    string  `json:"generation_rules"`
+	ReviewRules        string  `json:"review_rules"`
+	OutputFormat       string  `json:"output_format"`
+	CustomInstructions string  `json:"custom_instructions"`
+	Subject            string  `json:"subject"`
+	GradeRange         string  `json:"grade_range"`
+	IsDefault          bool    `json:"is_default"`
 }
 
-// UpdatePromptTemplateRequest 更新提示词模板请求
 type UpdatePromptTemplateRequest struct {
 	Name               string `json:"name"`
 	Description        string `json:"description"`
@@ -312,19 +305,17 @@ type UpdatePromptTemplateRequest struct {
 
 // ==================== 提示词模板响应结构体 ====================
 
-// PromptTemplateListResponse 模板列表响应
 type PromptTemplateListResponse struct {
-	Templates []*PromptTemplateListItem `json:"templates"` // 模板列表
-	Total     int                       `json:"total"`     // 总数
+	Templates []*PromptTemplateListItem `json:"templates"`
+	Total     int                       `json:"total"`
 }
 
-// PromptTemplateListItem 模板列表单条
 type PromptTemplateListItem struct {
 	ID               string     `json:"id"`
 	Name             string     `json:"name"`
 	Level            string     `json:"level"`
 	OwnerID          string     `json:"owner_id"`
-	OwnerName        string     `json:"owner_name"`         // 归属名称
+	OwnerName        string     `json:"owner_name"`
 	ParentTemplateID *string    `json:"parent_template_id"`
 	Subject          string     `json:"subject"`
 	GradeRange       string     `json:"grade_range"`
@@ -334,8 +325,6 @@ type PromptTemplateListItem struct {
 	CreatedAt        *time.Time `json:"created_at"`
 }
 
-// ResolvedPromptTemplate 解析后的完整模板（继承链合并结果）
-// 从个人→教研组→学校→区域逐级向上合并，子级覆盖父级
 type ResolvedPromptTemplate struct {
 	SystemPrompt       string   `json:"system_prompt"`
 	ContextRules       string   `json:"context_rules"`
@@ -343,5 +332,5 @@ type ResolvedPromptTemplate struct {
 	ReviewRules        string   `json:"review_rules"`
 	OutputFormat       string   `json:"output_format"`
 	CustomInstructions string   `json:"custom_instructions"`
-	InheritanceChain   []string `json:"inheritance_chain"` // 继承链（从根到叶的模板ID列表）
+	InheritanceChain   []string `json:"inheritance_chain"`
 }

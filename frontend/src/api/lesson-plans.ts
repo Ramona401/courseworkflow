@@ -9,6 +9,7 @@
  * - 提示词模板管理（templates）
  * - 教案生成（Phase3：对话/评审/建议应用）
  * - 萃取队列管理（Phase5：萃取列表/确认拒绝）
+ * - 阶段化备课工坊（Phase 7B-9：阶段查询/前进/跳过/回退/产出物）
  */
 import apiClient from './client'
 
@@ -246,8 +247,12 @@ export interface LessonPlan {
   school_id: string | null
   ai_review_score: number | null
   ai_review_result: string | null
-  linked_pipeline_id: string | null  // Phase6：关联Pipeline ID
+  linked_pipeline_id: string | null
+  recipe_id: string | null
+  recipe_name: string | null
   version: number
+  current_stage: string | null       // Phase 7B-9：当前阶段代码
+  stage_config: string | null        // Phase 7B-9：阶段配置快照JSON
   created_at: string
   updated_at: string
   author_name?: string
@@ -306,6 +311,8 @@ export interface StartConversationRequest {
   duration_minutes?: number
   template_id?: string
   group_id?: string
+  recipe_id?: string
+  textbook_page_ids?: string[]  // 迭代7B：关联课本图片ID列表
 }
 
 export interface StartConversationResponse {
@@ -351,6 +358,62 @@ export interface AIReviewResult {
   reviewed_at: string
 }
 
+/* ==================== 类型定义：阶段化备课工坊（Phase 7B-9 新增）==================== */
+
+/** 阶段进度条目 */
+export interface StageProgressItem {
+  stage_code: string
+  stage_name: string
+  stage_order: number
+  ai_role: string
+  gate_mode: 'suggest' | 'force' | 'auto'
+  skippable: boolean
+  status: 'pending' | 'in_progress' | 'completed' | 'skipped'
+  has_output: boolean
+  completed_at: string | null
+}
+
+/** 阶段状态响应 */
+export interface StageStatusResponse {
+  current_stage: string
+  total_stages: number
+  stages: StageProgressItem[]
+}
+
+/** 阶段产出物响应 */
+export interface StageOutputResponse {
+  stage_code: string
+  stage_name: string
+  structured_output: string
+  narrative_output: string
+  status: string
+  model_used: string
+  tokens_used: number
+}
+
+/** 系统默认阶段项 */
+export interface DefaultStageItem {
+  stage_code: string
+  stage_name: string
+  stage_order: number
+  ai_role: string
+  gate_mode: string
+  skippable: boolean
+  component_types: string
+}
+
+/** 阶段SSE事件数据 */
+export interface StageEventData {
+  stage_code: string
+  stage_name: string
+  stage_order: number
+  total_stages: number
+  next_stage?: string
+  can_skip?: boolean
+}
+
+/* ==================== SSE事件类型（Phase 7B-9：新增3个阶段事件）==================== */
+
 export type LPSSEEventType =
   | 'connected'
   | 'thinking'
@@ -358,19 +421,23 @@ export type LPSSEEventType =
   | 'message_done'
   | 'content_update'
   | 'review_done'
-  | 'extraction_hint'  // Phase5新增：对话萃取提示
+  | 'extraction_hint'
+  | 'stage_started'     // Phase 7B-9：进入新阶段
+  | 'stage_complete'    // Phase 7B-9：AI建议完成当前阶段
+  | 'stage_output'      // Phase 7B-9：阶段产出物已生成
   | 'error'
   | 'done'
 
 /** Phase5：萃取提示数据 */
 export interface ExtractionHint {
-  hint_id: string          // 临时ID，用于老师确认/拒绝
-  display_text: string     // 大白话描述（如"💡 这个悬念导入很有创意，要保存吗？"）
-  source_content: string   // 被萃取的原始内容
-  extraction_type: string  // 组件库类型（仅供后端使用）
+  hint_id: string
+  display_text: string
+  source_content: string
+  extraction_type: string
   plan_id: string
 }
 
+/** SSE事件完整结构（Phase 7B-9：新增stage_data字段） */
 export interface LPSSEEvent {
   type: LPSSEEventType
   plan_id: string
@@ -379,26 +446,25 @@ export interface LPSSEEvent {
   message?: ConversationMessage
   content?: string
   review?: AIReviewResult
-  extraction_hint?: ExtractionHint  // Phase5新增
+  extraction_hint?: ExtractionHint
+  stage_data?: StageEventData         // Phase 7B-9：阶段事件数据
   error?: string
 }
 
 /* ==================== 类型定义：萃取队列（Phase5新增）==================== */
 
-/** 待审萃取列表项 */
 export interface ExtractionListItem {
   id: string
   source_type: 'conversation' | 'lesson_plan' | 'manual'
-  source_content: string   // 原始内容片段
-  extraction_type: string  // 组件库类型（英文）
-  library_name: string     // 组件库中文名
+  source_content: string
+  extraction_type: string
+  library_name: string
   status: 'pending' | 'confirmed' | 'rejected'
-  plan_title?: string      // 来源教案标题
-  created_by_name?: string // 创建者名称
+  plan_title?: string
+  created_by_name?: string
   created_at: string
 }
 
-/** 萃取列表响应 */
 export interface ExtractionListResponse {
   extractions: ExtractionListItem[]
   total: number
@@ -635,7 +701,6 @@ export async function startDevelopment(id: string) {
   return resp.data.data as StartDevelopmentResult
 }
 
-/** Phase6：进入课件开发的返回结果 */
 export interface StartDevelopmentResult {
   pipeline_id: string
   message: string
@@ -678,8 +743,7 @@ export async function getConversation(planId: string) {
 
 /**
  * 创建教案SSE连接
- * GET /api/v1/lesson-plans/sse/plans/{id}/stream?token=xxx
- * Phase5新增：onExtractionHint 处理萃取提示事件
+ * Phase 7B-9新增：onStageStarted/onStageComplete/onStageOutput 三个阶段事件回调
  */
 export function createLessonPlanSSE(
   planId: string,
@@ -690,7 +754,10 @@ export function createLessonPlanSSE(
     onMessageDone?: (msg: ConversationMessage) => void
     onContentUpdate?: (content: string) => void
     onReviewDone?: (review: AIReviewResult) => void
-    onExtractionHint?: (hint: ExtractionHint) => void  // Phase5新增
+    onExtractionHint?: (hint: ExtractionHint) => void
+    onStageStarted?: (data: StageEventData) => void    // Phase 7B-9：进入新阶段
+    onStageComplete?: (data: StageEventData) => void   // Phase 7B-9：AI建议完成当前阶段
+    onStageOutput?: (data: StageEventData) => void     // Phase 7B-9：阶段产出物已生成
     onError?: (error: string) => void
     onDone?: () => void
   }
@@ -732,7 +799,6 @@ export function createLessonPlanSSE(
     } catch { /* 忽略解析错误 */ }
   })
 
-  // Phase5新增：监听萃取提示事件
   es.addEventListener('extraction_hint', (e: MessageEvent) => {
     try {
       const event: LPSSEEvent = JSON.parse(e.data)
@@ -740,12 +806,40 @@ export function createLessonPlanSSE(
     } catch { /* 忽略解析错误 */ }
   })
 
-  es.addEventListener('error', (e: MessageEvent) => {
+  // Phase 7B-9：监听阶段化备课工坊事件
+  es.addEventListener('stage_started', (e: MessageEvent) => {
     try {
       const event: LPSSEEvent = JSON.parse(e.data)
-      handlers.onError?.(event.error || '未知错误')
+      if (event.stage_data) handlers.onStageStarted?.(event.stage_data)
+    } catch { /* 忽略解析错误 */ }
+  })
+
+  es.addEventListener('stage_complete', (e: MessageEvent) => {
+    try {
+      const event: LPSSEEvent = JSON.parse(e.data)
+      if (event.stage_data) handlers.onStageComplete?.(event.stage_data)
+    } catch { /* 忽略解析错误 */ }
+  })
+
+  es.addEventListener('stage_output', (e: MessageEvent) => {
+    try {
+      const event: LPSSEEvent = JSON.parse(e.data)
+      if (event.stage_data) handlers.onStageOutput?.(event.stage_data)
+    } catch { /* 忽略解析错误 */ }
+  })
+
+  es.addEventListener('error', (e: MessageEvent) => {
+    // 连接级断开（e.data为空）：静默忽略，不报错给用户
+    // 这是SSE空闲超时或网络中断的正常行为，不是业务错误
+    if (!e.data) return
+    try {
+      const event: LPSSEEvent = JSON.parse(e.data)
+      // 只有明确的业务错误才报给用户
+      if (event.error) {
+        handlers.onError?.(event.error)
+      }
     } catch {
-      handlers.onError?.('SSE连接错误')
+      // JSON解析失败也静默忽略，避免误报
     }
   })
 
@@ -757,12 +851,50 @@ export function createLessonPlanSSE(
   return es
 }
 
+/* ==================== API函数：阶段化备课工坊（Phase 7B-9 新增 6个接口）==================== */
+
+/** 获取系统默认阶段列表 */
+export async function getDefaultStages() {
+  const resp = await apiClient.get('/lesson-plans/workshop/stages/defaults')
+  return resp.data.data as { stages: DefaultStageItem[] }
+}
+
+/** 获取教案的阶段进度 */
+export async function getStageStatus(planId: string) {
+  const resp = await apiClient.get(`/lesson-plans/plans/${planId}/stages`)
+  return resp.data.data as StageStatusResponse
+}
+
+/** 获取某阶段的产出物 */
+export async function getStageOutput(planId: string, stageCode: string) {
+  const resp = await apiClient.get(`/lesson-plans/plans/${planId}/stages/${stageCode}/output`)
+  return resp.data.data as StageOutputResponse
+}
+
+/** 进入下一阶段（可指定目标阶段） */
+export async function advanceStage(planId: string, targetStageCode?: string) {
+  const resp = await apiClient.post(`/lesson-plans/plans/${planId}/stages/advance`, {
+    target_stage_code: targetStageCode || '',
+  })
+  return resp.data.data as { stage_code: string; stage_name: string }
+}
+
+/** 跳过当前阶段 */
+export async function skipStage(planId: string, targetStageCode?: string) {
+  const resp = await apiClient.post(`/lesson-plans/plans/${planId}/stages/skip`, {
+    target_stage_code: targetStageCode || '',
+  })
+  return resp.data.data as { stage_code: string; stage_name: string }
+}
+
+/** 回退到上一阶段 */
+export async function backStage(planId: string) {
+  const resp = await apiClient.post(`/lesson-plans/plans/${planId}/stages/back`, {})
+  return resp.data.data as { stage_code: string; stage_name: string }
+}
+
 /* ==================== API函数：萃取队列管理（Phase5新增）==================== */
 
-/**
- * 获取待审萃取列表
- * GET /api/v1/lesson-plans/extractions?limit=50
- */
 export async function getExtractions(params?: { limit?: number }) {
   const query = new URLSearchParams()
   if (params?.limit) query.set('limit', String(params.limit))
@@ -771,12 +903,35 @@ export async function getExtractions(params?: { limit?: number }) {
   return resp.data.data as ExtractionListResponse
 }
 
-/**
- * 确认或拒绝萃取记录
- * POST /api/v1/lesson-plans/extractions/{id}/confirm
- * decision: 'confirmed' | 'rejected'
- */
 export async function confirmExtraction(id: string, decision: 'confirmed' | 'rejected') {
   const resp = await apiClient.post(`/lesson-plans/extractions/${id}/confirm`, { decision })
   return resp.data.data as { message: string }
+}
+
+
+/* ==================== API函数：阶段管理（Admin专用，Phase 7B新增）==================== */
+
+/** 获取全部系统阶段（含disabled，admin专用） */
+/** 获取全部系统阶段（admin专用，含disabled） — 迭代1：增加prompt_variants字段 */
+export async function getAdminStages() {
+  const resp = await apiClient.get('/admin/workshop-stages')
+  return resp.data.data as { stages: Array<{
+    id: string; stage_code: string; stage_name: string; stage_order: number;
+    source: string; ai_role: string; system_prompt: string;
+    prompt_variants: string;
+    output_format: string; component_types: string;
+    gate_mode: string; skippable: boolean; status: string;
+    created_at: string; updated_at: string;
+  }> }
+}
+
+/** 更新系统阶段（admin专用） — 迭代1：增加prompt_variants字段 */
+export async function updateAdminStage(stageCode: string, data: {
+  stage_name: string; ai_role: string; system_prompt: string;
+  prompt_variants: string;
+  output_format: string; component_types: string;
+  gate_mode: string; skippable: boolean; status: string;
+}) {
+  const resp = await apiClient.put(`/admin/workshop-stages/${stageCode}`, data)
+  return resp.data.data
 }

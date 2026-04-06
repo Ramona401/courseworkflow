@@ -165,6 +165,16 @@ export default function PlanDetailPage() {
           <MetaTag icon="⏱"  label="课时" value={`${plan.duration_minutes} 分钟`} />
           <MetaTag icon="📌" label="课题" value={plan.topic} />
           {plan.author_name && <MetaTag icon="👤" label="作者" value={plan.author_name} />}
+          {plan.recipe_name && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+              <span style={{ fontSize: '11px', color: '#9CA3AF', fontWeight: 500 }}>配方</span>
+              <button
+                onClick={() => plan.recipe_id && navigate(`/lesson-plans/recipes/${plan.recipe_id}/edit`, { state: { from: `/lesson-plans/plans/${plan.id}` } })}
+                style={{ fontSize: '14px', color: '#4F7BE8', display: 'flex', alignItems: 'center', gap: '4px', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+                <span>📦</span><span style={{ textDecoration: 'underline', textDecorationColor: 'rgba(79,123,232,0.3)' }}>{plan.recipe_name}</span>
+              </button>
+            </div>
+          )}
           {plan.ai_review_score != null && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
               <span style={{ fontSize: '11px', color: C.textMuted, fontWeight: 500 }}>AI评分</span>

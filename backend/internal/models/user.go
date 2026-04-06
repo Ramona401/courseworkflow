@@ -1,12 +1,14 @@
 package models
 
 import (
+	"encoding/json"
 	"time"
 )
 
 // ==================== 数据库模型 ====================
 
 // User 用户模型，对应数据库 users 表
+// v64(迭代3)新增：TeachingProfile 字段（JSONB，教学风格前测结果）
 type User struct {
 	ID           string     `json:"id"`           // UUID 主键
 	Username     string     `json:"username"`     // 用户名（唯一）
@@ -24,34 +26,52 @@ type User struct {
 	LoginCount  int        `json:"login_count"`   // 登录次数
 	CreatedAt   *time.Time `json:"created_at"`    // 创建时间
 	UpdatedAt   *time.Time `json:"updated_at"`    // 更新时间
+	// v64(迭代3)新增：教学风格前测结果（JSONB，可能为NULL）
+	TeachingProfileJSON *string `json:"-"` // 原始JSON字符串（不直接输出）
 }
 
 // UserInfo 返回给前端的用户信息（不含敏感字段）
+// v64(迭代3)新增：HasTeachingProfile 标记是否已完成前测
 type UserInfo struct {
-	ID          string     `json:"id"`
-	Username    string     `json:"username"`
-	DisplayName string     `json:"display_name"`
-	Role        string     `json:"role"`
-	Status      string     `json:"status"`
-	LastLoginAt *time.Time `json:"last_login_at"`
-	LoginCount  int        `json:"login_count"`
-	CreatedAt   *time.Time `json:"created_at"`
-	UpdatedAt   *time.Time `json:"updated_at"`
+	ID                  string     `json:"id"`
+	Username            string     `json:"username"`
+	DisplayName         string     `json:"display_name"`
+	Role                string     `json:"role"`
+	Status              string     `json:"status"`
+	LastLoginAt         *time.Time `json:"last_login_at"`
+	LoginCount          int        `json:"login_count"`
+	CreatedAt           *time.Time `json:"created_at"`
+	UpdatedAt           *time.Time `json:"updated_at"`
+	HasTeachingProfile  bool       `json:"has_teaching_profile"`  // 是否已完成前测
 }
 
 // ToUserInfo 将 User 转换为 UserInfo（过滤敏感信息）
 func (u *User) ToUserInfo() *UserInfo {
 	return &UserInfo{
-		ID:          u.ID,
-		Username:    u.Username,
-		DisplayName: u.DisplayName,
-		Role:        u.Role,
-		Status:      u.Status,
-		LastLoginAt: u.LastLoginAt,
-		LoginCount:  u.LoginCount,
-		CreatedAt:   u.CreatedAt,
-		UpdatedAt:   u.UpdatedAt,
+		ID:                 u.ID,
+		Username:           u.Username,
+		DisplayName:        u.DisplayName,
+		Role:               u.Role,
+		Status:             u.Status,
+		LastLoginAt:        u.LastLoginAt,
+		LoginCount:         u.LoginCount,
+		CreatedAt:          u.CreatedAt,
+		UpdatedAt:          u.UpdatedAt,
+		HasTeachingProfile: u.TeachingProfileJSON != nil,
 	}
+}
+
+// GetTeachingProfile 解析 TeachingProfile JSON 为结构体
+// 如果未完成前测（NULL），返回 nil
+func (u *User) GetTeachingProfile() *TeachingProfile {
+	if u.TeachingProfileJSON == nil {
+		return nil
+	}
+	var profile TeachingProfile
+	if err := json.Unmarshal([]byte(*u.TeachingProfileJSON), &profile); err != nil {
+		return nil
+	}
+	return &profile
 }
 
 // ==================== 认证相关请求/响应 ====================

@@ -476,6 +476,8 @@ export async function markPassed(pipelineId: string): Promise<void> {
 // ==================== AI快修API ====================
 
 export interface AIFixPageRequest {
+  /** v68新增：参考页码数组（可选，审核员选择的其他页面作为参考） */
+  reference_pages?: number[]
   fix_instruction: string
 }
 
@@ -484,6 +486,8 @@ export interface AIFixPageResponse {
   page_number: number
   new_html: string
   html_length: number
+  /** v68新增：AI修改说明 */
+  fix_summary: string
 }
 
 export async function aiFixPage(
@@ -497,6 +501,28 @@ export async function aiFixPage(
     { timeout: 600000 }
   )
   return extractData<AIFixPageResponse>(res)
+}
+
+// ==================== 回滚API（v68新增）====================
+
+export interface RollbackPageResponse {
+  message: string
+  page_number: number
+  restored_html: string
+  html_length: number
+  remaining_history: number
+}
+
+export async function rollbackPageHTML(
+  pipelineId: string,
+  pageNumber: number
+): Promise<RollbackPageResponse> {
+  const res = await client.post<ApiResponse<RollbackPageResponse>>(
+    '/pipelines/' + pipelineId + '/pages/' + pageNumber + '/rollback',
+    {},
+    { timeout: 30000 }
+  )
+  return extractData<RollbackPageResponse>(res)
 }
 
 // ==================== 验收API ====================
@@ -632,4 +658,205 @@ export async function forceProceed(
     { timeout: 3600000 }
   )
   return extractData<PipelineDetailResponse>(res)
+}
+
+// ==================== 发布至课程平台 ====================
+
+/**
+ * publishPipeline 骨干教师确认已将课件发布至课程平台
+ * 触发条件：Pipeline 状态为 verified
+ * 结果：状态变更为 published（单向不可逆）
+ */
+export async function publishPipeline(id: string): Promise<void> {
+  await client.post(`/pipelines/${id}/publish`)
+}
+
+// ==================== 历史轮次查询 ====================
+
+export interface HistoryStepItem {
+  step_name: string
+  step_order: number
+  status: string
+  status_name: string
+  step_name_cn: string
+  duration_ms: number
+  tokens_used: number
+  has_data: boolean
+  error_message: string
+  step_data?: any
+}
+
+export interface HistoryEvalRound {
+  id: string
+  round_number: number
+  status: string
+  score_total: number | null
+  score_e1: number | null
+  score_e2: number | null
+  score_e3: number | null
+  score_e4: number | null
+  output: string
+  tokens_used: number
+}
+
+export interface PipelineHistoryResponse {
+  round: number
+  available_rounds: number[]
+  steps: HistoryStepItem[]
+  eval_rounds: HistoryEvalRound[]
+}
+
+/** 获取可用历史轮次列表 */
+export async function getPipelineAvailableRounds(id: string): Promise<number[]> {
+  const res = await client.get<{ available_rounds: number[] }>(`/pipelines/${id}/history`)
+  return res.data.data?.available_rounds || []
+}
+
+/** 获取指定轮次的历史数据 */
+export async function getPipelineHistory(id: string, round: number): Promise<PipelineHistoryResponse> {
+  const res = await client.get<PipelineHistoryResponse>(`/pipelines/${id}/history?round=${round}`)
+  return res.data.data!
+}
+
+// ==================== 审核页HTML懒加载API（v69新增，编号8方案2）====================
+
+/**
+ * getPagesMeta 获取Pipeline所有页面的轻量元数据（不含HTML内容）
+ * v69新增：审核页首次加载只获取元数据，大幅减少传输数据量
+ * 页面的 original_html / generated_html / final_html 均为空字符串
+ */
+export async function getPagesMeta(pipelineId: string): Promise<GeneratedPageFull[]> {
+  const res = await client.get<ApiResponse<PagesWrapper>>('/pipelines/' + pipelineId + '/pages-meta')
+  const data = extractData<PagesWrapper>(res)
+  return data.pages
+}
+
+/**
+ * getSinglePageHTML 按需加载单页完整HTML数据
+ * v69新增：审核页选中页面时才请求完整HTML（含original/generated/final_html）
+ */
+export async function getSinglePageHTML(pipelineId: string, pageNumber: number): Promise<GeneratedPageFull> {
+  const res = await client.get<ApiResponse<GeneratedPageFull>>('/pipelines/' + pipelineId + '/pages/' + pageNumber + '/html')
+  return extractData<GeneratedPageFull>(res)
+}
+
+// ==================== AI快修流式API（v69新增，编号5）====================
+
+/**
+ * aiFixPageStream AI快修流式调用
+ * v69新增：通过POST请求建立SSE连接，逐token接收AI输出
+ * 注意：这不是标准EventSource（EventSource只支持GET），而是用fetch+ReadableStream实现
+ *
+ * @param pipelineId - Pipeline ID
+ * @param pageNumber - 页码
+ * @param req - 请求参数（同aiFixPage）
+ * @param onChunk - 收到AI输出token时的回调
+ * @param onDone - AI输出完成时的回调（含最终结果）
+ * @param onError - 出错时的回调
+ */
+export async function aiFixPageStream(
+  pipelineId: string,
+  pageNumber: number,
+  req: AIFixPageRequest,
+  onChunk: (content: string) => void,
+  onDone: (result: { new_html: string; fix_summary: string; html_length: number }) => void,
+  onError: (message: string) => void,
+): Promise<void> {
+  // 从localStorage获取token用于认证
+  const authData = localStorage.getItem('auth-storage')
+  let token = ''
+  if (authData) {
+    try {
+      const parsed = JSON.parse(authData)
+      token = parsed?.state?.token || ''
+    } catch { /* ignore */ }
+  }
+
+  try {
+    const resp = await fetch('/api/v1/pipelines/' + pipelineId + '/pages/' + pageNumber + '/ai-fix-stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token,
+      },
+      body: JSON.stringify(req),
+    })
+
+    if (!resp.ok) {
+      const errText = await resp.text()
+      try {
+        const errJson = JSON.parse(errText)
+        onError(errJson.message || errJson.error || '请求失败: HTTP ' + resp.status)
+      } catch {
+        onError('请求失败: HTTP ' + resp.status)
+      }
+      return
+    }
+
+    // 读取SSE流
+    const reader = resp.body?.getReader()
+    if (!reader) {
+      onError('浏览器不支持流式读取')
+      return
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+
+      // 按SSE协议逐行解析（双换行分隔消息）
+      const messages = buffer.split('\n\n')
+      // 最后一个可能不完整，留在buffer中
+      buffer = messages.pop() || ''
+
+      for (const msg of messages) {
+        if (!msg.trim()) continue
+
+        let eventType = 'message'
+        let eventData = ''
+
+        for (const line of msg.split('\n')) {
+          if (line.startsWith('event: ')) {
+            eventType = line.slice(7).trim()
+          } else if (line.startsWith('data: ')) {
+            eventData = line.slice(6)
+          }
+        }
+
+        if (!eventData) continue
+
+        try {
+          const parsed = JSON.parse(eventData)
+
+          switch (eventType) {
+            case 'chunk':
+              if (parsed.content) onChunk(parsed.content)
+              break
+            case 'done':
+              onDone({
+                new_html: parsed.new_html || '',
+                fix_summary: parsed.fix_summary || '',
+                html_length: parsed.html_length || 0,
+              })
+              return // 流式结束
+            case 'error':
+              onError(parsed.message || 'AI快修失败')
+              return
+            case 'connected':
+              // 连接建立，不做处理
+              break
+          }
+        } catch {
+          // JSON解析失败跳过
+        }
+      }
+    }
+  } catch (e: any) {
+    onError('网络错误: ' + (e.message || '连接失败'))
+  }
 }

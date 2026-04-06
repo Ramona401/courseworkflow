@@ -6,6 +6,9 @@ package routes
 //   GET  /api/v1/sse/pipelines/{id}/stream  — SSE实时推送
 //   GET/POST /api/v1/pipelines              — 列表/创建
 //   /api/v1/pipelines/{id}/*               — 详情/各操作（含批量）
+//
+// v59修复：修正 /verify 和 /publish 分支嵌套错误
+//          修正 /eval-rounds 和 /history 分支嵌套错误
 
 import (
 	"net/http"
@@ -163,6 +166,7 @@ func registerPipelineRoutes(
 			}
 			pipelineHandler.MarkPassed(w, r)
 
+		// ---- 验收（修复：独立case，不再嵌套publish）----
 		case hasSuffix(path, "/verify"):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || !hasRole(claims.Role, roleAdmin, roleSeniorOperator, roleOperator) {
@@ -171,10 +175,42 @@ func registerPipelineRoutes(
 			}
 			pipelineHandler.VerifyPipeline(w, r)
 
-		// ---- 评估/页面/步骤查询 ----
+		// ---- 发布至课程平台（修复：独立case，不再嵌套在verify内）----
+		case hasSuffix(path, "/publish"):
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || !hasRole(claims.Role, roleAdmin, roleSeniorOperator, roleOperator) {
+				forbiddenJSON(w, "仅管理员和操作员可确认发布")
+				return
+			}
+			pipelineHandler.PublishPipeline(w, r)
+
+		// ---- 历史轮次查询（修复：独立case，不再嵌套在eval-rounds内）----
+		case hasSuffix(path, "/history"):
+			pipelineHandler.GetPipelineHistory(w, r)
+
+		// ---- 评估轮次查询（修复：独立case）----
 		case hasSuffix(path, "/eval-rounds"):
 			pipelineHandler.GetEvalRounds(w, r)
 
+
+			// ---- v69新增(编号8): 轻量页面元数据列表 ----
+			case hasSuffix(path, "/pages-meta"):
+				pipelineHandler.GetGeneratedPagesLightweight(w, r)
+
+			// ---- v69新增(编号8): 单页HTML按需加载 ----
+			case containsPagesHTML(path):
+				pipelineHandler.GetSinglePageHTML(w, r)
+
+			// ---- v69新增(编号5): AI快修流式SSE ----
+			case containsPagesAIFixStream(path):
+				claims, ok := middleware.GetClaims(r.Context())
+				if !ok || !hasRole(claims.Role, roleAdmin, roleSeniorOperator, roleOperator) {
+					forbiddenJSON(w, "仅管理员和操作员可使用AI快修")
+					return
+				}
+				pipelineHandler.AIFixPageStream(w, r)
+
+		// ---- AI快修页面 ----
 		case containsPagesAIFix(path):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || !hasRole(claims.Role, roleAdmin, roleSeniorOperator, roleOperator) {
@@ -182,7 +218,15 @@ func registerPipelineRoutes(
 				return
 			}
 			pipelineHandler.AIFixPage(w, r)
-
+                // ---- 页面回滚（v68新增）----
+                case containsPagesRollback(path):
+                        claims, ok := middleware.GetClaims(r.Context())
+                        if !ok || !hasRole(claims.Role, roleAdmin, roleSeniorOperator, roleOperator) {
+                                forbiddenJSON(w, "仅管理员和操作员可回滚页面")
+                                return
+                        }
+                        pipelineHandler.RollbackPageHTML(w, r)
+                		// ---- 页面决策 ----
 		case containsPagesDecision(path):
 			claims, ok := middleware.GetClaims(r.Context())
 			if !ok || !hasRole(claims.Role, roleAdmin, roleSeniorOperator, roleOperator) {
@@ -191,12 +235,15 @@ func registerPipelineRoutes(
 			}
 			pipelineHandler.UpdatePageDecision(w, r)
 
+		// ---- 页面列表 ----
 		case hasSuffix(path, "/pages"):
 			pipelineHandler.GetGeneratedPages(w, r)
 
+		// ---- 步骤详情 ----
 		case containsStepsWithName(path):
 			pipelineHandler.GetStepDetail(w, r)
 
+		// ---- 步骤列表 ----
 		case hasSuffix(path, "/steps"):
 			pipelineHandler.GetSteps(w, r)
 

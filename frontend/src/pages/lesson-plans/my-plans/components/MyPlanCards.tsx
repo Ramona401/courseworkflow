@@ -178,6 +178,7 @@ export function PlanCard({ plan, onAction, loadingId }: PlanCardProps) {
         <MetaTag icon="🎓" text={plan.grade} />
         <MetaTag icon="⏱"  text={`${plan.duration_minutes}分钟`} />
         {plan.topic && <MetaTag icon="📌" text={plan.topic} maxWidth="180px" />}
+        {plan.recipe_name && <MetaTag icon="📦" text={plan.recipe_name} maxWidth="160px" />}
       </div>
 
       {/* AI评分 */}

@@ -206,3 +206,86 @@ export function VerifyFailedBanner({ reviewRound }: VerifyFailedBannerProps) {
     </div>
   )
 }
+
+// ==================== 已发布至课程平台横幅 ====================
+
+export function PublishedBanner() {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 10,
+      padding: '12px 18px', borderRadius: 12, marginBottom: 16,
+      background: 'linear-gradient(135deg, rgba(88,86,214,0.1), rgba(88,86,214,0.03))',
+      border: '1px solid rgba(88,86,214,0.25)',
+    }}>
+      <span style={{ fontSize: 20 }}>🚀</span>
+      <div>
+        <div style={{ fontSize: 14, fontWeight: 700, color: '#5856d6' }}>已发布至课程平台</div>
+        <div style={{ fontSize: 12, color: '#8e8e93', marginTop: 1 }}>
+          骨干教师已确认将课件发布至课程平台，课件正式上线。
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ==================== 2审进行中横幅（v69新增，编号13）====================
+
+interface RetrialRunningBannerProps {
+  detail: PipelineDetailResponse
+  sseConnected: boolean
+}
+
+/**
+ * RetrialRunningBanner 2审自动执行进行中横幅
+ * 显示条件：review_round >= 2 且 status 为 running 或 verify_failed（正在触发2审）
+ * 展示内容：2审执行进度提示 + 当前步骤 + SSE连接状态
+ */
+export function RetrialRunningBanner({ detail, sseConnected }: RetrialRunningBannerProps) {
+  // 只在2审阶段且正在执行时显示
+  const isRetrialRunning = detail.review_round >= 2 && (
+    detail.status === 'running' || detail.status === 'verify_failed'
+  )
+
+  if (!isRetrialRunning) return null
+
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 10,
+      padding: '12px 18px', borderRadius: 12, marginBottom: 16,
+      background: 'linear-gradient(135deg, rgba(255,149,0,0.1), rgba(255,149,0,0.03))',
+      border: '1px solid rgba(255,149,0,0.25)',
+    }}>
+      <RefreshCw size={18} color="#ff9500" style={{ animation: 'spin 2s linear infinite', flexShrink: 0 }} />
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 14, fontWeight: 700, color: '#ff9500' }}>
+          2审自动执行中
+        </div>
+        <div style={{ fontSize: 12, color: '#8e8e93', marginTop: 2 }}>
+          1审验收未通过，系统正在自动执行2审流程（Meta→Translator→Generator）。
+          {detail.status === 'running' && detail.current_step_name && (
+            <span style={{ marginLeft: 6, color: '#ff9500', fontWeight: 500 }}>
+              当前步骤: {detail.current_step_name}
+            </span>
+          )}
+          {detail.status === 'verify_failed' && (
+            <span style={{ marginLeft: 6, color: '#ff9500', fontWeight: 500 }}>
+              正在启动2审...
+            </span>
+          )}
+        </div>
+      </div>
+      {sseConnected && (
+        <span style={{
+          fontSize: 10, padding: '2px 8px', borderRadius: 10,
+          background: 'rgba(52,199,89,0.12)', color: '#34c759', fontWeight: 600,
+        }}>SSE</span>
+      )}
+      {!sseConnected && detail.status === 'running' && (
+        <span style={{
+          fontSize: 10, padding: '2px 8px', borderRadius: 10,
+          background: 'rgba(0,122,255,0.1)', color: '#007aff', fontWeight: 600,
+        }}>轮询中</span>
+      )}
+    </div>
+  )
+}

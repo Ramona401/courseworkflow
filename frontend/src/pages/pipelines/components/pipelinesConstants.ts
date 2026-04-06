@@ -20,9 +20,12 @@ export const FILTER_OPTIONS = [
   { label: '失败',       value: 'failed' },
   { label: '已完成',     value: 'finalized' },
   { label: '待启动',     value: 'pending' },
+  { label: '待确认定稿', value: 'pending_finalize' },
+  { label: '需人工干预', value: 'needs_human' },
   { label: '已取消',     value: 'cancelled' },
   { label: '验收通过',   value: 'verified' },
   { label: '验收未通过', value: 'verify_failed' },
+  { label: '已发布',     value: 'published' },
 ]
 
 /**
@@ -39,7 +42,8 @@ export const STATUS_SORT_ORDER: Record<string, number> = {
   finalized: 7,
   verified: 8,
   verify_failed: 9,
-  cancelled: 10,
+  published: 10,
+  cancelled: 11,
 }
 
 /** 每页条数选项 */

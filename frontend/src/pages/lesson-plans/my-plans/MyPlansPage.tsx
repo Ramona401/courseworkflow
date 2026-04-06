@@ -11,6 +11,8 @@
  *   - 筛选状态管理 + 数据加载
  *   - 操作函数（handleAction）
  *   - 页面级渲染框架（标题/筛选栏/卡片网格/Toast）
+ *
+ * v56修改：移除页面内重复标题（LPLayout header已有标题）
  */
 import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -122,14 +124,11 @@ export default function MyPlansPage() {
   // ==================== 渲染 ====================
   return (
     <div>
-      {/* ---- 页面标题区 ---- */}
-      <div style={{ marginBottom: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-        <div>
-          <h1 style={{ fontSize: '20px', fontWeight: 600, color: C.text, margin: '0 0 4px 0' }}>我的教案</h1>
-          <p style={{ fontSize: '14px', color: C.textSec, margin: 0 }}>
-            共 {total} 份教案{isFiltered ? `（筛选后 ${plans.length} 份）` : ''}
-          </p>
-        </div>
+      {/* ---- 摘要行 + 新建按钮（标题已在LPLayout header中显示，此处不再重复） ---- */}
+      <div style={{ marginBottom: '20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <p style={{ fontSize: '14px', color: C.textSec, margin: 0 }}>
+          共 {total} 份教案{isFiltered ? `（筛选后 ${plans.length} 份）` : ''}
+        </p>
         <button
           onClick={() => navigate('/lesson-plans')}
           style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '9px 18px', borderRadius: '8px', border: 'none', background: C.primary, color: '#fff', fontSize: '14px', fontWeight: 600, cursor: 'pointer', transition: 'all 150ms ease', flexShrink: 0 }}

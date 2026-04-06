@@ -1,6 +1,12 @@
 /**
  * adminShared.tsx — Admin页面共用小组件
  *   Toast / RoleBadge / StatusBadge / StatCard
+ *
+ * 角色名称与学校体系对齐：
+ *   admin           → 系统管理员
+ *   senior_operator → 学校管理员
+ *   operator        → 骨干教师
+ *   viewer          → 普通教师
  */
 import { useEffect } from 'react'
 import { C } from './adminConstants'
@@ -32,7 +38,7 @@ export function Toast({ message, type, onClose }: {
   )
 }
 
-// ==================== 角色徽章 ====================
+// ==================== 角色徽章（与学校体系对齐）====================
 export function RoleBadge({ role, roleName }: { role: string; roleName?: string }) {
   const styleMap: Record<string, { bg: string; color: string }> = {
     admin:           { bg: C.dangerLight,  color: C.danger  },
@@ -40,9 +46,12 @@ export function RoleBadge({ role, roleName }: { role: string; roleName?: string 
     operator:        { bg: C.primaryLight, color: C.primary },
     viewer:          { bg: C.bg,           color: C.textSec },
   }
+  // 前端本地中文名（roleName 优先，后端已返回新名称）
   const nameMap: Record<string, string> = {
-    admin: '管理员', senior_operator: '高级操作员',
-    operator: '操作员', viewer: '查看者',
+    admin:           '系统管理员',
+    senior_operator: '学校管理员',
+    operator:        '骨干教师',
+    viewer:          '普通教师',
   }
   const s = styleMap[role] || { bg: C.bg, color: C.textSec }
   return (

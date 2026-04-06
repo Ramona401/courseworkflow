@@ -472,12 +472,15 @@ export default function PipelinesPage() {
                       <td style={{ ...td, color: '#8e8e93', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {p.course_name || p.course_code}
                       </td>
-                      <td style={td}><StatusBadge status={p.status} statusName={p.status_name} /></td>
+                      <td style={td}><StatusBadge status={p.status} statusName={p.status_name} reviewRound={p.review_round} /></td>
                       <td style={{ ...td, fontSize: 12, color: '#636366', whiteSpace: 'nowrap' }}>{p.current_step_name}</td>
                       <td style={{ ...td, textAlign: 'center' }}><ScoreCell value={p.eval_avg_score} /></td>
                       <td style={{ ...td, textAlign: 'center' }}><ScoreCell value={p.meta_score} /></td>
                       <td style={{ ...td, textAlign: 'center' }}><ScoreCell value={p.translator_score} /></td>
                       <td style={{ ...td, minWidth: 100 }}><ProgressBar completed={p.steps_completed} total={p.steps_total} /></td>
+                      <td style={{ ...td, fontSize: 11, color: '#8e8e93', textAlign: 'center', whiteSpace: 'nowrap' }}>
+                        {p.review_round >= 2 ? <span style={{ fontWeight: 600, color: '#ff9500', background: 'rgba(255,149,0,0.1)', padding: '1px 6px', borderRadius: 4, fontSize: 10 }}>2审</span> : <span style={{ color: '#c7c7cc' }}>1审</span>}
+                      </td>
                       <td style={{ ...td, fontSize: 12, color: p.assigned_name ? '#5856d6' : '#c7c7cc', whiteSpace: 'nowrap' }}>
                         {p.assigned_name || '-'}
                       </td>

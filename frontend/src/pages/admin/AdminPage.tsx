@@ -4,24 +4,26 @@
  * 路由：/admin（独立页面，不在任何Layout内）
  * 权限：仅admin（路由层RoleGuard保护）
  *
- * 4个Tab：
- *   📊 概览    — 统计卡片 + 角色分布横条图 + 最近10条日志快览
- *   👥 用户管理 — 用户列表+学校筛选+详情弹窗（双Tab：基本信息/操作记录）
- *   🏫 组织架构 — 三栏递进：区域→学校→教研组，完整CRUD + 成员管理
- *   📋 操作日志 — 用户名搜索+日期范围+操作类型+详情展开
+ * 5个Tab：
+ *   📊 概览       — 统计卡片 + 角色分布横条图 + 最近10条日志快览
+ *   👥 用户管理   — 用户列表+学校筛选+详情弹窗（双Tab：基本信息/操作记录）
+ *   🏫 组织架构   — 三栏递进：区域→学校→教研组，完整CRUD + 成员管理
+ *                   修复：区域列表加载完成后自动选中首个区域并展开学校
+ *                         学校列表加载完成后如只有一所学校自动选中并展开教研组
+ *   📋 操作日志   — 用户名搜索+日期范围+操作类型+详情展开
+ *   🎭 角色权限   — 系统内置角色只读展示 + 自定义角色完整管理
  *
- * 子组件均从 ./components/ 引入，本文件只保留：
- *   - 全局状态管理
- *   - 4个Tab的页面级渲染逻辑
+ * 角色名称与学校体系对齐：
+ *   admin → 系统管理员 / senior_operator → 学校管理员
+ *   operator → 骨干教师 / viewer → 普通教师
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import {
   getAdminStats, getAdminUsers, getAdminAuditLogs,
   getAdminOrgs, createAdminOrg, updateAdminOrg, deleteAdminOrg,
-  getAdminGroups, getAdminGroupDetail,
+  getAdminGroups,
   createAdminGroup, updateAdminGroup, deleteAdminGroup,
-  getAdminGroupMembers,
 } from '@/api/admin'
 import type {
   AdminStats, AdminUserListItem, AuditLogItem,
@@ -32,7 +34,6 @@ import type {
 import { C, ROLE_OPTIONS, ACTION_OPTIONS, fmt, getActionStyle, rowBtn } from './components/adminConstants'
 import { Toast, RoleBadge, StatusBadge, StatCard } from './components/adminShared'
 import { ConfirmDialog }    from './components/ConfirmDialog'
-import { UserSearchPicker } from './components/UserSearchPicker'
 import { OrgFormModal }     from './components/OrgFormModal'
 import { GroupFormModal }   from './components/GroupFormModal'
 import { MemberPanel }      from './components/MemberPanel'
@@ -40,6 +41,7 @@ import { RoleBarChart }     from './components/RoleBarChart'
 import { RecentLogsCard }   from './components/RecentLogsCard'
 import { UserDetailModal }  from './components/UserDetailModal'
 import { CreateUserModal }  from './components/CreateUserModal'
+import { RolesTab }         from './components/RolesTab'
 
 // ==================== 三栏列卡（组织架构Tab内部组件）====================
 function ColCard({ title, count, onAdd, addLabel, loading, empty, children }: {
@@ -82,12 +84,12 @@ export default function AdminPage() {
   const fromPath: string = (location.state as { from?: string })?.from || '/'
 
   // ---- Tab状态 ----
-  const [activeTab, setActiveTab] = useState<'overview' | 'users' | 'orgs' | 'logs'>('overview')
+  const [activeTab, setActiveTab] = useState<'overview' | 'users' | 'orgs' | 'logs' | 'roles'>('overview')
 
   // ---- 概览Tab ----
-  const [stats, setStats]                     = useState<AdminStats | null>(null)
-  const [statsLoading, setStatsLoading]       = useState(true)
-  const [recentLogs, setRecentLogs]           = useState<AuditLogItem[]>([])
+  const [stats, setStats]                         = useState<AdminStats | null>(null)
+  const [statsLoading, setStatsLoading]           = useState(true)
+  const [recentLogs, setRecentLogs]               = useState<AuditLogItem[]>([])
   const [recentLogsLoading, setRecentLogsLoading] = useState(false)
 
   // ---- 用户管理Tab ----
@@ -102,7 +104,7 @@ export default function AdminPage() {
   const [schoolFilter, setSchoolFilter] = useState('')
   const [schools, setSchools]           = useState<OrgListItem[]>([])
   const [schoolsLoaded, setSchoolsLoaded] = useState(false)
-  const [detailUserId, setDetailUserId] = useState<string | null>(null)
+  const [detailUserId, setDetailUserId]   = useState<string | null>(null)
   const [showCreateModal, setShowCreateModal] = useState(false)
 
   // ---- 组织架构Tab ----
@@ -139,7 +141,7 @@ export default function AdminPage() {
 
   // ---- 全局Toast ----
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null)
-  const showToast = (m: string, t: 'success' | 'error') => setToast({ message: m, type: t })
+  const showToast = useCallback((m: string, t: 'success' | 'error') => setToast({ message: m, type: t }), [])
 
   // ==================== 数据加载 ====================
 
@@ -170,30 +172,55 @@ export default function AdminPage() {
       setUsers(data.users); setUserTotal(data.total)
     } catch (e: unknown) { showToast(e instanceof Error ? e.message : '加载用户失败', 'error') }
     finally { setUserLoading(false) }
-  }, [userPage, roleFilter, statusFilter, keyword, schoolFilter])
+  }, [userPage, roleFilter, statusFilter, keyword, schoolFilter, showToast])
   useEffect(() => { if (activeTab === 'users') loadUsers() }, [activeTab, loadUsers])
 
-  // 组织Tab：加载区域列表
-  const loadRegions = useCallback(async () => {
-    try { setRegLoading(true); setRegions(await getAdminOrgs({ type: 'region' })) }
-    catch { } finally { setRegLoading(false) }
-  }, [])
-  useEffect(() => {
-    if (activeTab === 'orgs') {
-      loadRegions()
-      setSelRegion(null); setSelSchool(null); setSchools2([]); setGroups2([])
-    }
-  }, [activeTab, loadRegions])
-
+  // ---- 组织架构：加载学校（带自动选中逻辑）----
   const loadSchools2 = useCallback(async (regionId: string) => {
-    try { setSchLoading(true); setSchools2(await getAdminOrgs({ type: 'school', parent_id: regionId })) }
-    catch { } finally { setSchLoading(false) }
+    try {
+      setSchLoading(true)
+      const list = await getAdminOrgs({ type: 'school', parent_id: regionId })
+      setSchools2(list)
+      // 如果只有一所学校，自动选中并加载教研组
+      if (list.length === 1) {
+        setSelSchool(list[0])
+        setGrpLoading(true)
+        try {
+          const grps = await getAdminGroups(list[0].id)
+          setGroups2(grps)
+        } catch { } finally { setGrpLoading(false) }
+      }
+    } catch { } finally { setSchLoading(false) }
   }, [])
 
   const loadGroups2 = useCallback(async (schoolId: string) => {
     try { setGrpLoading(true); setGroups2(await getAdminGroups(schoolId)) }
     catch { } finally { setGrpLoading(false) }
   }, [])
+
+  // ---- 组织架构：加载区域（带自动选中逻辑）----
+  const loadRegions = useCallback(async () => {
+    try {
+      setRegLoading(true)
+      const list = await getAdminOrgs({ type: 'region' })
+      setRegions(list)
+      // 如果只有一个区域，自动选中并加载其学校
+      if (list.length === 1) {
+        setSelRegion(list[0])
+        setSelSchool(null); setSchools2([]); setGroups2([])
+        await loadSchools2(list[0].id)
+      }
+    } catch { } finally { setRegLoading(false) }
+  }, [loadSchools2])
+
+  useEffect(() => {
+    if (activeTab === 'orgs') {
+      // 切换到组织架构Tab时重新加载（保持自动展开逻辑）
+      setSelRegion(null); setSelSchool(null); setSchools2([]); setGroups2([])
+      setExpandedGroupId(null)
+      loadRegions()
+    }
+  }, [activeTab, loadRegions])
 
   const handleSelectRegion = (r: OrgListItem) => {
     setSelRegion(r); setSelSchool(null); setGroups2([]); setExpandedGroupId(null)
@@ -213,8 +240,13 @@ export default function AdminPage() {
         try {
           await deleteAdminOrg(org.id)
           showToast('删除成功', 'success')
-          if (org.type === 'region') { loadRegions(); setSelRegion(null); setSchools2([]); setGroups2([]) }
-          else { if (selRegion) loadSchools2(selRegion.id); setSelSchool(null); setGroups2([]) }
+          if (org.type === 'region') {
+            setSelRegion(null); setSchools2([]); setGroups2([])
+            loadRegions()
+          } else {
+            setSelSchool(null); setGroups2([])
+            if (selRegion) loadSchools2(selRegion.id)
+          }
         } catch (e: unknown) { showToast(e instanceof Error ? e.message : '删除失败', 'error') }
         setConfirmDel(p => ({ ...p, open: false }))
       },
@@ -246,7 +278,7 @@ export default function AdminPage() {
     })
   }
 
-  // 日志Tab
+  // ---- 操作日志 ----
   const loadLogs = useCallback(async () => {
     try {
       setLogLoading(true)
@@ -279,16 +311,17 @@ export default function AdminPage() {
 
   const totalPages    = Math.ceil(userTotal / 15)
   const logTotalPages = Math.ceil(logTotal / 20)
-  const inputStyle: React.CSSProperties = { padding: '8px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '13px', outline: 'none', background: C.white, color: C.text }
+  const inputStyle: React.CSSProperties = {
+    padding: '8px 12px', borderRadius: '8px', border: `1px solid ${C.border}`,
+    fontSize: '13px', outline: 'none', background: C.white, color: C.text,
+  }
 
   // ==================== 渲染 ====================
   return (
     <div style={{ minHeight: '100vh', background: 'linear-gradient(135deg,#EEF2FF 0%,#FAFBFC 50%,#F0FDF4 100%)' }}>
 
-      {/* Toast通知 */}
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
 
-      {/* 删除确认弹窗 */}
       {confirmDel.open && (
         <ConfirmDialog
           title={confirmDel.title} message={confirmDel.message}
@@ -297,7 +330,6 @@ export default function AdminPage() {
         />
       )}
 
-      {/* 用户详情弹窗 */}
       {detailUserId && (
         <UserDetailModal
           userId={detailUserId}
@@ -306,7 +338,6 @@ export default function AdminPage() {
         />
       )}
 
-      {/* 新建用户弹窗 */}
       {showCreateModal && (
         <CreateUserModal
           onClose={() => setShowCreateModal(false)}
@@ -314,7 +345,6 @@ export default function AdminPage() {
         />
       )}
 
-      {/* 组织弹窗 */}
       {orgModal.open && (
         <OrgFormModal
           mode={orgModal.mode} type={orgModal.type} initial={orgModal.initial}
@@ -329,7 +359,6 @@ export default function AdminPage() {
         />
       )}
 
-      {/* 教研组弹窗 */}
       {groupModal.open && selSchool && (
         <GroupFormModal
           mode={groupModal.mode} schoolId={selSchool.id} schoolName={selSchool.name}
@@ -344,7 +373,8 @@ export default function AdminPage() {
 
       {/* ---- 顶部导航 ---- */}
       <header style={{ height: '64px', position: 'sticky', top: 0, zIndex: 100, background: 'rgba(255,255,255,0.88)', backdropFilter: 'blur(20px)', borderBottom: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', padding: '0 32px', gap: '16px' }}>
-        <button onClick={() => navigate(fromPath)} style={{ padding: '8px 16px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.white, fontSize: '14px', color: C.textSec, cursor: 'pointer' }}
+        <button onClick={() => navigate(fromPath)}
+          style={{ padding: '8px 16px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.white, fontSize: '14px', color: C.textSec, cursor: 'pointer' }}
           onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = C.bg }}
           onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = C.white }}>
           {'<- 返回'}
@@ -353,19 +383,21 @@ export default function AdminPage() {
           <h1 style={{ fontSize: '18px', fontWeight: 700, color: C.text, margin: 0 }}>👥 用户管理中心</h1>
           <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '2px' }}>统一管理用户、组织架构与操作日志</div>
         </div>
-        <button onClick={() => setShowCreateModal(true)} style={{ padding: '8px 18px', borderRadius: '8px', border: 'none', background: `linear-gradient(135deg,${C.primary},#7C3AED)`, color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>
+        <button onClick={() => setShowCreateModal(true)}
+          style={{ padding: '8px 18px', borderRadius: '8px', border: 'none', background: `linear-gradient(135deg,${C.primary},#7C3AED)`, color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>
           + 新建用户
         </button>
       </header>
 
       <div style={{ maxWidth: '1400px', margin: '0 auto', padding: '24px' }}>
 
-        {/* Tab切换 */}
+        {/* Tab切换（5个Tab）*/}
         <div style={{ display: 'flex', gap: '4px', marginBottom: '20px', background: C.bg, borderRadius: '12px', padding: '4px', border: `1px solid ${C.border}`, width: 'fit-content' }}>
-          {(['overview', 'users', 'orgs', 'logs'] as const).map((tab, i) => {
-            const labels = ['📊 概览', '👥 用户管理', '🏫 组织架构', '📋 操作日志']
+          {(['overview', 'users', 'orgs', 'logs', 'roles'] as const).map((tab, i) => {
+            const labels = ['📊 概览', '👥 用户管理', '🏫 组织架构', '📋 操作日志', '🎭 角色权限']
             return (
-              <button key={tab} onClick={() => setActiveTab(tab)} style={{ padding: '9px 22px', borderRadius: '9px', border: 'none', cursor: 'pointer', fontSize: '14px', fontWeight: activeTab === tab ? 600 : 400, color: activeTab === tab ? C.primary : C.textSec, background: activeTab === tab ? C.white : 'transparent', boxShadow: activeTab === tab ? '0 1px 4px rgba(0,0,0,0.08)' : 'none', transition: 'all 150ms ease' }}>
+              <button key={tab} onClick={() => setActiveTab(tab)}
+                style={{ padding: '9px 22px', borderRadius: '9px', border: 'none', cursor: 'pointer', fontSize: '14px', fontWeight: activeTab === tab ? 600 : 400, color: activeTab === tab ? C.primary : C.textSec, background: activeTab === tab ? C.white : 'transparent', boxShadow: activeTab === tab ? '0 1px 4px rgba(0,0,0,0.08)' : 'none', transition: 'all 150ms ease' }}>
                 {labels[i]}
               </button>
             )
@@ -404,32 +436,33 @@ export default function AdminPage() {
         {/* ===== Tab: 用户管理 ===== */}
         {activeTab === 'users' && (
           <div>
-            {/* 筛选栏 */}
             <div style={{ background: C.white, borderRadius: '14px', border: `1px solid ${C.border}`, padding: '16px 20px', marginBottom: '16px', display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
               <input value={keywordInput} onChange={e => handleKeywordChange(e.target.value)} placeholder="搜索用户名或显示名..."
                 style={{ flex: 1, minWidth: '180px', padding: '8px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none' }}
                 onFocus={e => { e.currentTarget.style.borderColor = C.primary }}
                 onBlur={e => { e.currentTarget.style.borderColor = C.border }}
               />
-              <select value={roleFilter} onChange={e => { setRoleFilter(e.target.value); setUserPage(1) }} style={{ padding: '8px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', background: C.white }}>
+              <select value={roleFilter} onChange={e => { setRoleFilter(e.target.value); setUserPage(1) }}
+                style={{ padding: '8px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', background: C.white }}>
                 {ROLE_OPTIONS.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
               </select>
-              <select value={statusFilter} onChange={e => { setStatusFilter(e.target.value); setUserPage(1) }} style={{ padding: '8px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', background: C.white }}>
+              <select value={statusFilter} onChange={e => { setStatusFilter(e.target.value); setUserPage(1) }}
+                style={{ padding: '8px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', background: C.white }}>
                 <option value="">全部状态</option>
                 <option value="active">正常</option>
                 <option value="disabled">已禁用</option>
               </select>
-              <select value={schoolFilter} onChange={e => { setSchoolFilter(e.target.value); setUserPage(1) }} style={{ padding: '8px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', background: C.white, minWidth: '120px' }}>
+              <select value={schoolFilter} onChange={e => { setSchoolFilter(e.target.value); setUserPage(1) }}
+                style={{ padding: '8px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', background: C.white, minWidth: '120px' }}>
                 <option value="">全部学校</option>
                 {schools.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
               <div style={{ fontSize: '13px', color: C.textMuted }}>共 {userTotal} 个用户</div>
             </div>
 
-            {/* 用户表格 */}
             <div style={{ background: C.white, borderRadius: '14px', border: `1px solid ${C.border}`, overflow: 'hidden' }}>
               <div style={{ display: 'grid', gridTemplateColumns: '2fr 1.5fr 1.5fr 1.2fr 1.5fr 1fr', padding: '12px 20px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '12px', fontWeight: 600, color: C.textSec }}>
-                <span>用户</span><span>课件审核角色</span><span>教案系统归属</span><span>状态</span><span>最近登录</span><span>操作</span>
+                <span>用户</span><span>系统角色</span><span>教案系统归属</span><span>状态</span><span>最近登录</span><span>操作</span>
               </div>
               {userLoading
                 ? <div style={{ padding: '40px', textAlign: 'center', color: C.textMuted }}>加载中...</div>
@@ -462,7 +495,7 @@ export default function AdminPage() {
                     </div>
                     <div><StatusBadge status={user.status} /></div>
                     <div style={{ fontSize: '12px', color: C.textSec }}>
-                      {user.last_login_at ? user.last_login_at.replace('T', ' ').substring(0, 16) : '从未登录'}
+                      {user.last_login_at ? String(user.last_login_at).replace('T', ' ').substring(0, 16) : '从未登录'}
                       <div style={{ fontSize: '11px', color: C.textMuted }}>共{user.login_count}次</div>
                     </div>
                     <div>
@@ -478,23 +511,26 @@ export default function AdminPage() {
               }
             </div>
 
-            {/* 分页 */}
             {totalPages > 1 && (
               <div style={{ display: 'flex', justifyContent: 'center', gap: '8px', marginTop: '16px', alignItems: 'center' }}>
-                <button onClick={() => setUserPage(p => Math.max(1, p - 1))} disabled={userPage === 1} style={{ padding: '6px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.white, fontSize: '13px', color: userPage === 1 ? C.textMuted : C.text, cursor: userPage === 1 ? 'not-allowed' : 'pointer' }}>上一页</button>
+                <button onClick={() => setUserPage(p => Math.max(1, p - 1))} disabled={userPage === 1}
+                  style={{ padding: '6px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.white, fontSize: '13px', color: userPage === 1 ? C.textMuted : C.text, cursor: userPage === 1 ? 'not-allowed' : 'pointer' }}>上一页</button>
                 <span style={{ fontSize: '13px', color: C.textSec }}>第 {userPage} / {totalPages} 页</span>
-                <button onClick={() => setUserPage(p => Math.min(totalPages, p + 1))} disabled={userPage === totalPages} style={{ padding: '6px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.white, fontSize: '13px', color: userPage === totalPages ? C.textMuted : C.text, cursor: userPage === totalPages ? 'not-allowed' : 'pointer' }}>下一页</button>
+                <button onClick={() => setUserPage(p => Math.min(totalPages, p + 1))} disabled={userPage === totalPages}
+                  style={{ padding: '6px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.white, fontSize: '13px', color: userPage === totalPages ? C.textMuted : C.text, cursor: userPage === totalPages ? 'not-allowed' : 'pointer' }}>下一页</button>
               </div>
             )}
           </div>
         )}
 
-        {/* ===== Tab: 组织架构（三栏递进）===== */}
+        {/* ===== Tab: 组织架构（三栏递进 + 自动展开）===== */}
         {activeTab === 'orgs' && (
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '16px', alignItems: 'start' }}>
 
             {/* 区域栏 */}
-            <ColCard title="🌍 区域" count={regions.length} onAdd={() => setOrgModal({ open: true, mode: 'create', type: 'region' })} addLabel="新建区域" loading={regLoading} empty={regions.length === 0 ? '暂无区域，点击右上角新建' : undefined}>
+            <ColCard title="🌍 区域" count={regions.length}
+              onAdd={() => setOrgModal({ open: true, mode: 'create', type: 'region' })} addLabel="新建区域"
+              loading={regLoading} empty={regions.length === 0 ? '暂无区域，点击右上角新建' : undefined}>
               {regions.map(r => (
                 <div key={r.id}>
                   <div onClick={() => handleSelectRegion(r)}
@@ -505,10 +541,14 @@ export default function AdminPage() {
                       <span style={{ fontSize: '14px', fontWeight: 600, color: selRegion?.id === r.id ? C.primary : C.text, flex: 1 }}>{r.name}</span>
                       <StatusBadge status={r.status} />
                     </div>
-                    <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '8px' }}>{r.admin_user_name ? `管理员：${r.admin_user_name}` : '暂无管理员'}</div>
+                    <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '8px' }}>
+                      {r.admin_user_name ? `管理员：${r.admin_user_name}` : '暂无管理员'}
+                    </div>
                     <div style={{ display: 'flex', gap: '6px' }} onClick={e => e.stopPropagation()}>
                       <button onClick={() => setOrgModal({ open: true, mode: 'edit', type: 'region', initial: r })} style={rowBtn(C.primary, C.primaryLight)}>✏️ 编辑</button>
-                      <button onClick={() => handleToggleOrgStatus(r)} style={rowBtn(r.status === 'active' ? C.danger : C.success, r.status === 'active' ? C.dangerLight : C.successLight)}>{r.status === 'active' ? '🚫 禁用' : '✅ 启用'}</button>
+                      <button onClick={() => handleToggleOrgStatus(r)} style={rowBtn(r.status === 'active' ? C.danger : C.success, r.status === 'active' ? C.dangerLight : C.successLight)}>
+                        {r.status === 'active' ? '🚫 禁用' : '✅ 启用'}
+                      </button>
                       <button onClick={() => handleDeleteOrg(r)} style={rowBtn(C.danger, C.dangerLight)}>🗑️ 删除</button>
                     </div>
                   </div>
@@ -522,7 +562,8 @@ export default function AdminPage() {
               title={selRegion ? <span>🏫 <span style={{ color: C.primary }}>{selRegion.name}</span> 的学校</span> : '🏫 学校'}
               count={schools2.length}
               onAdd={selRegion ? () => setOrgModal({ open: true, mode: 'create', type: 'school' }) : undefined} addLabel="新建学校"
-              loading={schLoading} empty={!selRegion ? '← 请先选择左侧区域' : schools2.length === 0 ? '暂无学校，点击右上角新建' : undefined}>
+              loading={schLoading}
+              empty={!selRegion ? '← 请先选择左侧区域' : schools2.length === 0 ? '暂无学校，点击右上角新建' : undefined}>
               {schools2.map(s => (
                 <div key={s.id}>
                   <div onClick={() => handleSelectSchool(s)}
@@ -533,10 +574,14 @@ export default function AdminPage() {
                       <span style={{ fontSize: '14px', fontWeight: 600, color: selSchool?.id === s.id ? C.primary : C.text, flex: 1 }}>{s.name}</span>
                       <StatusBadge status={s.status} />
                     </div>
-                    <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '8px' }}>{s.admin_user_name ? `管理员：${s.admin_user_name}` : '暂无管理员'} · {s.group_count} 个教研组</div>
+                    <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '8px' }}>
+                      {s.admin_user_name ? `管理员：${s.admin_user_name}` : '暂无管理员'} · {s.group_count} 个教研组
+                    </div>
                     <div style={{ display: 'flex', gap: '6px' }} onClick={e => e.stopPropagation()}>
                       <button onClick={() => setOrgModal({ open: true, mode: 'edit', type: 'school', initial: s })} style={rowBtn(C.primary, C.primaryLight)}>✏️ 编辑</button>
-                      <button onClick={() => handleToggleOrgStatus(s)} style={rowBtn(s.status === 'active' ? C.danger : C.success, s.status === 'active' ? C.dangerLight : C.successLight)}>{s.status === 'active' ? '🚫 禁用' : '✅ 启用'}</button>
+                      <button onClick={() => handleToggleOrgStatus(s)} style={rowBtn(s.status === 'active' ? C.danger : C.success, s.status === 'active' ? C.dangerLight : C.successLight)}>
+                        {s.status === 'active' ? '🚫 禁用' : '✅ 启用'}
+                      </button>
                       <button onClick={() => handleDeleteOrg(s)} style={rowBtn(C.danger, C.dangerLight)}>🗑️ 删除</button>
                     </div>
                   </div>
@@ -550,7 +595,8 @@ export default function AdminPage() {
               title={selSchool ? <span>👨‍🏫 <span style={{ color: C.primary }}>{selSchool.name}</span> 的教研组</span> : '👨‍🏫 教研组'}
               count={groups2.length}
               onAdd={selSchool ? () => setGroupModal({ open: true, mode: 'create' }) : undefined} addLabel="新建教研组"
-              loading={grpLoading} empty={!selSchool ? '← 请先选择中间学校' : groups2.length === 0 ? '暂无教研组，点击右上角新建' : undefined}>
+              loading={grpLoading}
+              empty={!selSchool ? '← 请先选择中间学校' : groups2.length === 0 ? '暂无教研组，点击右上角新建' : undefined}>
               {groups2.map(g => (
                 <div key={g.id}>
                   <div style={{ padding: '12px 14px' }}>
@@ -566,7 +612,8 @@ export default function AdminPage() {
                     <div style={{ display: 'flex', gap: '6px', marginTop: '8px' }}>
                       <button onClick={() => setGroupModal({ open: true, mode: 'edit', initial: g })} style={rowBtn(C.primary, C.primaryLight)}>✏️ 编辑</button>
                       <button onClick={() => handleDeleteGroup(g)} style={rowBtn(C.danger, C.dangerLight)}>🗑️ 删除</button>
-                      <button onClick={() => setExpandedGroupId(p => p === g.id ? null : g.id)} style={rowBtn(expandedGroupId === g.id ? C.purple : C.textSec, expandedGroupId === g.id ? C.purpleLight : C.bg)}>
+                      <button onClick={() => setExpandedGroupId(p => p === g.id ? null : g.id)}
+                        style={rowBtn(expandedGroupId === g.id ? C.purple : C.textSec, expandedGroupId === g.id ? C.purpleLight : C.bg)}>
                         {expandedGroupId === g.id ? '收起 ▲' : '👥 成员'}
                       </button>
                     </div>
@@ -584,10 +631,10 @@ export default function AdminPage() {
         {/* ===== Tab: 操作日志 ===== */}
         {activeTab === 'logs' && (
           <div>
-            {/* 筛选栏 */}
             <div style={{ background: C.white, borderRadius: '14px', border: `1px solid ${C.border}`, padding: '16px 20px', marginBottom: '16px' }}>
               <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '12px' }}>
-                <input value={logFilterInput.username} onChange={e => setLogFilterInput(p => ({ ...p, username: e.target.value }))} placeholder="搜索用户名 / 显示名..."
+                <input value={logFilterInput.username} onChange={e => setLogFilterInput(p => ({ ...p, username: e.target.value }))}
+                  placeholder="搜索用户名 / 显示名..."
                   style={{ ...inputStyle, flex: '1 1 160px', minWidth: '140px' }}
                   onFocus={e => { e.currentTarget.style.borderColor = C.primary }}
                   onBlur={e => { e.currentTarget.style.borderColor = C.border }}
@@ -595,24 +642,32 @@ export default function AdminPage() {
                 />
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                   <span style={{ fontSize: '12px', color: C.textSec, whiteSpace: 'nowrap' }}>开始</span>
-                  <input type="date" value={logFilterInput.startDate} onChange={e => setLogFilterInput(p => ({ ...p, startDate: e.target.value }))} style={{ ...inputStyle, width: '140px' }}
+                  <input type="date" value={logFilterInput.startDate} onChange={e => setLogFilterInput(p => ({ ...p, startDate: e.target.value }))}
+                    style={{ ...inputStyle, width: '140px' }}
                     onFocus={e => { e.currentTarget.style.borderColor = C.primary }}
                     onBlur={e => { e.currentTarget.style.borderColor = C.border }} />
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                   <span style={{ fontSize: '12px', color: C.textSec, whiteSpace: 'nowrap' }}>结束</span>
-                  <input type="date" value={logFilterInput.endDate} onChange={e => setLogFilterInput(p => ({ ...p, endDate: e.target.value }))} style={{ ...inputStyle, width: '140px' }}
+                  <input type="date" value={logFilterInput.endDate} onChange={e => setLogFilterInput(p => ({ ...p, endDate: e.target.value }))}
+                    style={{ ...inputStyle, width: '140px' }}
                     onFocus={e => { e.currentTarget.style.borderColor = C.primary }}
                     onBlur={e => { e.currentTarget.style.borderColor = C.border }} />
                 </div>
-                <select value={logFilterInput.action} onChange={e => setLogFilterInput(p => ({ ...p, action: e.target.value }))} style={{ ...inputStyle, minWidth: '130px' }}>
+                <select value={logFilterInput.action} onChange={e => setLogFilterInput(p => ({ ...p, action: e.target.value }))}
+                  style={{ ...inputStyle, minWidth: '130px' }}>
                   {ACTION_OPTIONS.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
                 </select>
               </div>
               <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                <button onClick={handleLogSearch} style={{ padding: '7px 20px', borderRadius: '8px', border: 'none', background: `linear-gradient(135deg,${C.primary},#7C3AED)`, color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>🔍 查询</button>
-                <button onClick={handleLogReset} style={{ padding: '7px 16px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.bg, color: C.textSec, fontSize: '13px', cursor: 'pointer' }}>重置</button>
-                {/* 已应用筛选标签 */}
+                <button onClick={handleLogSearch}
+                  style={{ padding: '7px 20px', borderRadius: '8px', border: 'none', background: `linear-gradient(135deg,${C.primary},#7C3AED)`, color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>
+                  🔍 查询
+                </button>
+                <button onClick={handleLogReset}
+                  style={{ padding: '7px 16px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.bg, color: C.textSec, fontSize: '13px', cursor: 'pointer' }}>
+                  重置
+                </button>
                 {(logFilters.username || logFilters.startDate || logFilters.endDate || logFilters.action) && (
                   <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' }}>
                     {logFilters.username  && <span style={{ padding: '2px 8px', borderRadius: '6px', fontSize: '12px', background: C.primaryLight, color: C.primary }}>用户：{logFilters.username}</span>}
@@ -625,7 +680,6 @@ export default function AdminPage() {
               </div>
             </div>
 
-            {/* 日志表格 */}
             <div style={{ background: C.white, borderRadius: '14px', border: `1px solid ${C.border}`, overflow: 'hidden' }}>
               <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 2fr 1.2fr 0.9fr 1.3fr 0.6fr', padding: '12px 20px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '12px', fontWeight: 600, color: C.textSec }}>
                 <span>操作者</span><span>操作内容摘要</span><span>操作类型</span><span>IP地址</span><span>时间</span><span>详情</span>
@@ -660,7 +714,6 @@ export default function AdminPage() {
                           </button>
                         </div>
                       </div>
-                      {/* 展开的JSON详情 */}
                       {isExpanded && (
                         <div style={{ padding: '12px 20px 16px', background: 'rgba(79,123,232,0.03)', borderTop: `1px dashed ${C.border}` }}>
                           <div style={{ fontSize: '12px', fontWeight: 600, color: C.textSec, marginBottom: '8px' }}>📄 完整操作详情</div>
@@ -675,15 +728,21 @@ export default function AdminPage() {
               }
             </div>
 
-            {/* 日志分页 */}
             {logTotalPages > 1 && (
               <div style={{ display: 'flex', justifyContent: 'center', gap: '8px', marginTop: '16px', alignItems: 'center' }}>
-                <button onClick={() => setLogPage(p => Math.max(1, p - 1))} disabled={logPage === 1} style={{ padding: '6px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.white, fontSize: '13px', color: logPage === 1 ? C.textMuted : C.text, cursor: logPage === 1 ? 'not-allowed' : 'pointer' }}>上一页</button>
+                <button onClick={() => setLogPage(p => Math.max(1, p - 1))} disabled={logPage === 1}
+                  style={{ padding: '6px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.white, fontSize: '13px', color: logPage === 1 ? C.textMuted : C.text, cursor: logPage === 1 ? 'not-allowed' : 'pointer' }}>上一页</button>
                 <span style={{ fontSize: '13px', color: C.textSec }}>第 {logPage} / {logTotalPages} 页</span>
-                <button onClick={() => setLogPage(p => Math.min(logTotalPages, p + 1))} disabled={logPage === logTotalPages} style={{ padding: '6px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.white, fontSize: '13px', color: logPage === logTotalPages ? C.textMuted : C.text, cursor: logPage === logTotalPages ? 'not-allowed' : 'pointer' }}>下一页</button>
+                <button onClick={() => setLogPage(p => Math.min(logTotalPages, p + 1))} disabled={logPage === logTotalPages}
+                  style={{ padding: '6px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.white, fontSize: '13px', color: logPage === logTotalPages ? C.textMuted : C.text, cursor: logPage === logTotalPages ? 'not-allowed' : 'pointer' }}>下一页</button>
               </div>
             )}
           </div>
+        )}
+
+        {/* ===== Tab: 角色权限 ===== */}
+        {activeTab === 'roles' && (
+          <RolesTab showToast={showToast} />
         )}
 
       </div>

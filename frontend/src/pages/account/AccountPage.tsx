@@ -38,10 +38,10 @@ const COLORS = {
 
 // 角色中文名映射
 const ROLE_NAMES: Record<string, string> = {
-  admin: '管理员',
-  senior_operator: '高级操作员',
-  operator: '操作员',
-  viewer: '查看者',
+  admin: '系统管理员',
+  senior_operator: '学校管理员',
+  operator: '骨干教师',
+  viewer: '普通教师',
 }
 
 // 角色颜色映射

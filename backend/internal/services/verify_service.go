@@ -1,18 +1,43 @@
 package services
 
-// ==================== P4.6-2 验收执行逻辑 + P4.6-3 2审自动流程 ====================
-// Phase8修复V-02：夜间定时任务时区改为显式 Asia/Shanghai
-// v33改进：EngineTask.ExecFunc 改为 func() error，支持业务失败统计
-//   - VerifyPipeline 闭包：直接返回 VerifyPipeline 的 error
-//   - startRetrialPipeline 闭包：包装检查 Pipeline 最终状态返回 error
+// ==================== verify_service.go — 验收执行 + 2审自动流程 ====================
+//
+// v63改造：
+//   1. executeVerify 从单轮评估改为多轮评估（复用PipelineConfig.EvalRounds）
+//      多轮取均值判定，减少AI评分波动误判
+//   2. verify无论通过与否都写入定稿索引（savePipelineIndex）
+//   3. verify未通过时，把每轮评分写入eval_rounds表（review_round=2）
+//      供二审meta直接读取，executeMeta零改动
+//   4. startRetrialPipeline 跳过evaluator，直接从meta开始
+//      因为verify已经做了评估（用的是同一个定稿索引），重跑evaluator纯浪费
+//
+// v65-bugfix（2处关键修复）：
+//   修复1: VerifyPipeline 的passed判定从字符串匹配改为JSON解析
+//          原因: strings.Contains("passed\":true")缺少空格，Go json.Marshal输出"passed": true有空格
+//          导致所有verify结果都被误判为未通过，包括实际通过的也触发了2审
+//   修复2: writeVerifyScoresToEvalRounds 移到 startRetrialPipeline 中 UpdatePipelineReviewRound(2) 之后调用
+//          原因: 原来在review_round=1时就写入eval_rounds，2审meta查review_round=2找不到数据
+//
+// v68变更：
+//   1. 高分早停pipeline快速验收（isEarlyStopPipeline检测→跳过索引生成和评估→直接passed）
+//   2. v68-bugfix：修复executeVerify中高分早停代码块被重复粘贴两次的问题
+//   3. v68-bugfix：修复文件末尾isEarlyStopPipeline方法重复定义（缺少函数体）的编译错误
+//
+// 流程说明：
+//   无论是evaluator高分早停还是正常流程，finalized后都需要经过验收(verify)
+//   verify通过 → verified（等待人工确认publish归档）
+//   verify未通过 + round=1 → 自动触发2审
+//   verify未通过 + round=2 → needs_human（人工干预）
 
 import (
+	"encoding/json"
 	"fmt"
-	"tedna/internal/logger"
+	"math"
 	"strings"
 	"time"
 
 	"tedna/internal/ai"
+	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 )
@@ -33,6 +58,7 @@ var (
 	ErrVerifyIndexTooShort    = fmt.Errorf("索引生成器输出过短，可能生成失败")
 	ErrVerifyEvalFailed       = fmt.Errorf("验收评估AI调用失败")
 	ErrVerifyScoreExtractFail = fmt.Errorf("验收评估未能提取有效评分")
+	ErrVerifyAllRoundsFailed  = fmt.Errorf("验收评估所有轮次均失败")
 	ErrRetrialResetFailed     = fmt.Errorf("2审重置步骤失败")
 	ErrRetrialExecFailed      = fmt.Errorf("2审执行流程失败")
 )
@@ -40,6 +66,10 @@ var (
 // ==================== VerifyPipeline 入口方法 ====================
 
 // VerifyPipeline 手动触发验收流程
+// 所有finalized的pipeline都走验收，包括高分早停的pipeline
+// verify通过 → verified（等待人工confirm publish归档）
+// verify未通过 + round=1 → 自动触发2审
+// verify未通过 + round=2 → needs_human
 func (s *PipelineService) VerifyPipeline(pipelineID string) (*models.PipelineDetailResponse, error) {
 	pipeline, err := repository.GetPipelineByID(pipelineID)
 	if err != nil {
@@ -71,68 +101,122 @@ func (s *PipelineService) VerifyPipeline(pipelineID string) (*models.PipelineDet
 		return s.GetPipelineDetail(pipelineID)
 	}
 
-	if verifyStep.StepData != "" && verifyStep.StepData != "null" {
-		if strings.Contains(verifyStep.StepData, "\"passed\":true") {
-			if err := repository.CompletePipeline(pipelineID, models.PipelineStatusVerified); err != nil {
-				return nil, fmt.Errorf("标记验收通过失败: %w", err)
-			}
-		} else {
-			if err := repository.CompletePipeline(pipelineID, models.PipelineStatusVerifyFailed); err != nil {
-				return nil, fmt.Errorf("标记验收未通过失败: %w", err)
-			}
-
-			if pipeline.ReviewRound <= 1 {
-				if s.engine != nil {
-					// v33改进：ExecFunc 返回 error，供 Engine 统计业务失败
-					// startRetrialPipeline 本身无返回值，通过检查 Pipeline 最终状态判断是否失败
-					task := &EngineTask{
-						Type:       TaskTypeRetrial,
-						PipelineID: pipelineID,
-						ExecFunc: func() error {
-							s.startRetrialPipeline(pipelineID)
-							// 检查 Pipeline 最终状态判断 retrial 是否成功
-							p, pErr := repository.GetPipelineByID(pipelineID)
-							if pErr != nil {
-								return fmt.Errorf("2审执行后读取Pipeline状态失败: %w", pErr)
-							}
-							if p.Status == models.PipelineStatusFailed {
-								return fmt.Errorf("2审执行失败: %s", p.ErrorMessage)
-							}
-							return nil
-						},
-					}
-					if !s.engine.Submit(task) {
-						verifyLog.Warn("2审任务提交失败：队列已满", "pipeline_id", pipelineID)
-					}
-				} else {
-					go s.startRetrialPipeline(pipelineID)
-				}
-			} else {
-				_ = repository.UpdatePipelineStatus(pipelineID, models.StepVerify, models.PipelineStatusNeedsHuman)
-			}
-		}
-	} else {
+	if verifyStep.StepData == "" || verifyStep.StepData == "null" {
 		_ = repository.UpdatePipelineError(pipelineID, models.StepVerify, "验收步骤输出数据为空")
 		return s.GetPipelineDetail(pipelineID)
+	}
+
+	// ---- v63：verify无论通过与否，都先写入定稿索引 ----
+	if idxErr := s.savePipelineIndex(pipelineID); idxErr != nil {
+		verifyLog.Warn("写入pipeline定稿索引失败，不影响verify结果",
+			"pipeline_id", pipelineID, "error", idxErr)
+	}
+
+	// ---- v65-bugfix：从字符串匹配改为JSON解析判定passed ----
+	// 原代码: strings.Contains(verifyStep.StepData, "\"passed\":true")
+	// 问题: Go的json.Marshal输出 "passed": true（有空格），字符串匹配"passed\":true"（无空格）永远不匹配
+	// 修复: 用json.Unmarshal解析后读取passed字段
+	verifyPassed := s.parseVerifyPassed(verifyStep.StepData)
+
+	if verifyPassed {
+		// ---- verify通过 → verified，等待人工confirm publish归档 ----
+		if err := repository.CompletePipeline(pipelineID, models.PipelineStatusVerified); err != nil {
+			return nil, fmt.Errorf("标记验收通过失败: %w", err)
+		}
+		verifyLog.Info("验收通过，等待人工归档",
+			"pipeline_id", pipelineID,
+			"status", "verified")
+	} else {
+		// ---- verify未通过 ----
+		if err := repository.CompletePipeline(pipelineID, models.PipelineStatusVerifyFailed); err != nil {
+			return nil, fmt.Errorf("标记验收未通过失败: %w", err)
+		}
+
+		// v65-bugfix：eval_rounds写入移到startRetrialPipeline中
+		// 原来在这里调用writeVerifyScoresToEvalRounds，此时review_round还是1
+		// 导致eval_rounds写入review_round=1，2审meta查review_round=2找不到数据
+		// 现在改为在startRetrialPipeline中UpdatePipelineReviewRound(2)之后再写入
+
+		if pipeline.ReviewRound <= 1 {
+			// 1审verify未通过 → 自动触发2审
+			if s.engine != nil {
+				capturedStepData := verifyStep.StepData
+				task := &EngineTask{
+					Type:       TaskTypeRetrial,
+					PipelineID: pipelineID,
+					ExecFunc: func() error {
+						s.startRetrialPipeline(pipelineID, capturedStepData)
+						p, pErr := repository.GetPipelineByID(pipelineID)
+						if pErr != nil {
+							return fmt.Errorf("2审执行后读取Pipeline状态失败: %w", pErr)
+						}
+						if p.Status == models.PipelineStatusFailed {
+							return fmt.Errorf("2审执行失败: %s", p.ErrorMessage)
+						}
+						return nil
+					},
+				}
+				if !s.engine.Submit(task) {
+					verifyLog.Warn("2审任务提交失败：队列已满", "pipeline_id", pipelineID)
+				}
+			} else {
+				capturedStepData := verifyStep.StepData
+				go s.startRetrialPipeline(pipelineID, capturedStepData)
+			}
+		} else {
+			// 2审verify未通过 → 需要人工干预
+			_ = repository.UpdatePipelineStatus(pipelineID, models.StepVerify, models.PipelineStatusNeedsHuman)
+			verifyLog.Info("2审验收未通过，需要人工干预",
+				"pipeline_id", pipelineID,
+				"status", "needs_human")
+		}
 	}
 
 	return s.GetPipelineDetail(pipelineID)
 }
 
-// ==================== P4.6-3 2审自动流程 ====================
+// parseVerifyPassed 从verify步骤的step_data JSON中解析passed字段
+// v65-bugfix新增：替代原来的strings.Contains字符串匹配
+func (s *PipelineService) parseVerifyPassed(stepData string) bool {
+	if stepData == "" || stepData == "null" {
+		return false
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(stepData), &data); err != nil {
+		verifyLog.Warn("解析verify步骤数据失败，降级为未通过", "error", err)
+		return false
+	}
+	passed, ok := data["passed"].(bool)
+	return ok && passed
+}
 
-func (s *PipelineService) startRetrialPipeline(pipelineID string) {
+// ==================== 2审自动流程 ====================
+
+// startRetrialPipeline 触发二审流程
+// v63改造：跳过evaluator，直接从meta开始
+// 原因：verify已经做了多轮评估（用的是定稿索引），评分已写入eval_rounds(review_round=2)
+//       重跑evaluator完全是浪费（相同索引+相同提示词=几乎相同的分数）
+//       meta读取eval_rounds(review_round=2)即可得到verify的评估结果
+//
+// v65-bugfix：新增verifyStepData参数，在UpdatePipelineReviewRound(2)之后再写入eval_rounds
+//       原来writeVerifyScoresToEvalRounds在VerifyPipeline中调用，此时review_round还是1
+//       导致eval_rounds写入review_round=1，2审meta查review_round=2找不到数据
+func (s *PipelineService) startRetrialPipeline(pipelineID string, verifyStepData string) {
 	if err := repository.UpdatePipelineReviewRound(pipelineID, 2); err != nil {
 		_ = repository.UpdatePipelineError(pipelineID, models.StepVerify,
 			fmt.Sprintf("2审启动失败: 更新review_round失败: %s", err.Error()))
 		return
 	}
 
-	_ = repository.DeleteEvalRoundsByPipelineID(pipelineID)
-	_ = repository.DeleteGeneratedPagesByPipelineID(pipelineID)
+	// v65-bugfix：在review_round=2之后再写入eval_rounds
+	// 这样CreateEvalRound读取pipelines.review_round=2，写入的eval_rounds.review_round=2
+	// 2审的executeMeta通过GetEvalRoundsByPipelineID查review_round=2就能读到数据
+	if verifyStepData != "" {
+		s.writeVerifyScoresToEvalRounds(pipelineID, verifyStepData)
+	}
 
+	// v63改造：不再重置evaluator（跳过），只重置meta及后续步骤
 	resetSteps := []string{
-		models.StepEvaluator,
 		models.StepMeta,
 		models.StepTranslator,
 		models.StepGenerator,
@@ -140,49 +224,26 @@ func (s *PipelineService) startRetrialPipeline(pipelineID string) {
 		models.StepVerify,
 	}
 	if err := repository.ResetStepsForRetrial(pipelineID, resetSteps); err != nil {
-		_ = repository.UpdatePipelineError(pipelineID, models.StepEvaluator,
+		_ = repository.UpdatePipelineError(pipelineID, models.StepMeta,
 			fmt.Sprintf("2审启动失败: 重置步骤失败: %s", err.Error()))
 		return
 	}
 
-	if err := repository.UpdatePipelineStatus(pipelineID, models.StepEvaluator, models.PipelineStatusRunning); err != nil {
-		_ = repository.UpdatePipelineError(pipelineID, models.StepEvaluator,
+	// v63改造：二审也需要evaluator步骤记录存在（即使跳过执行）
+	// 标记evaluator为done，step_data写入verify的评估结果摘要
+	s.markEvaluatorDoneForRetrial(pipelineID)
+
+	// 直接从meta开始
+	if err := repository.UpdatePipelineStatus(pipelineID, models.StepMeta, models.PipelineStatusRunning); err != nil {
+		_ = repository.UpdatePipelineError(pipelineID, models.StepMeta,
 			fmt.Sprintf("2审启动失败: 更新状态失败: %s", err.Error()))
 		return
 	}
 
 	pipeline, err := repository.GetPipelineByID(pipelineID)
 	if err != nil {
-		_ = repository.UpdatePipelineError(pipelineID, models.StepEvaluator,
-			fmt.Sprintf("2审启动失败: 读取Pipeline失败: %s", err.Error()))
-		return
-	}
-
-	pCfg := models.ParsePipelineConfig(pipeline.Config)
-	originalEvalRounds := pCfg.EvalRounds
-	pCfg.EvalRounds = 2
-	pipeline.Config = pCfg.ToJSON()
-
-	evalErr := s.executeEvaluator(pipeline)
-
-	pCfg.EvalRounds = originalEvalRounds
-	pipeline.Config = pCfg.ToJSON()
-
-	if evalErr != nil {
-		_ = repository.UpdatePipelineError(pipelineID, models.StepEvaluator,
-			fmt.Sprintf("2审Evaluator失败: %s", evalErr.Error()))
-		return
-	}
-
-	if err := repository.UpdatePipelineStatus(pipelineID, models.StepMeta, models.PipelineStatusRunning); err != nil {
 		_ = repository.UpdatePipelineError(pipelineID, models.StepMeta,
-			fmt.Sprintf("2审推进到Meta失败: %s", err.Error()))
-		return
-	}
-
-	pipeline, err = repository.GetPipelineByID(pipelineID)
-	if err != nil {
-		_ = repository.UpdatePipelineError(pipelineID, models.StepMeta, "2审读取Pipeline失败")
+			fmt.Sprintf("2审启动失败: 读取Pipeline失败: %s", err.Error()))
 		return
 	}
 
@@ -238,7 +299,7 @@ func (s *PipelineService) startRetrialPipeline(pipelineID string) {
 	}
 }
 
-// ==================== executeVerify 核心执行方法 ====================
+// ==================== executeVerify 核心执行方法（v63多轮评估）====================
 
 func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 	startTime := time.Now()
@@ -250,6 +311,7 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 
 	pCfg := models.ParsePipelineConfig(pipeline.Config)
 	threshold := pCfg.Threshold
+	evalRounds := pCfg.EvalRounds // v63：复用Pipeline配置的评估轮次数（默认3）
 
 	promptG, err := repository.GetCurrentPromptByKey("prompt_g")
 	if err != nil || promptG == nil {
@@ -290,11 +352,8 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 	}
 
 	aiCfg, err := ai.GetEffectiveConfig(
-		s.cfg.AESKey,
-		"evaluator",
-		s.cfg.AIAPIBaseURL,
-		s.cfg.AIAPIKey,
-		s.cfg.AIDefaultModel,
+		s.cfg.AESKey, "evaluator",
+		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
 	)
 	if err != nil {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -303,15 +362,41 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 		return fmt.Errorf(errMsg)
 	}
 
+	// ==================== v68：高分早停pipeline快速验收 ====================
+	// 如果evaluator已经高分早停（所有页面为keep），验收时跳过重新评估直接通过
+	// 原理：高分早停意味着原始课件质量已达标，页面全部保留无修改，
+	//       重新跑一遍索引生成+评估只会浪费时间和token，结果几乎相同
+	if s.isEarlyStopPipeline(pipeline) {
+		verifyLog.Info("高分早停pipeline快速验收通过",
+			"pipeline_id", pipeline.ID, "review_round", pipeline.ReviewRound)
+		avgScore := s.getEvalAvgScore(pipeline.ID)
+		quickResult := &models.VerifyResult{
+			GeneratedIndex:  "(高分早停快速验收：使用原始课程索引)",
+			TotalEvalRounds: 0,
+			DoneEvalRounds:  0,
+			EvalScore:       avgScore,
+			Passed:          true,
+			ReviewRound:     pipeline.ReviewRound,
+			ModelUsed:       "quick_pass",
+			TokensUsed:      0,
+			LatencyMs:       time.Since(startTime).Milliseconds(),
+		}
+		durationMs := time.Since(startTime).Milliseconds()
+		if err := repository.CompleteStep(
+			pipeline.ID, stepName, durationMs,
+			quickResult.ToJSON(), "quick_pass", 0,
+		); err != nil {
+			return fmt.Errorf("保存verify快速通过结果失败: %w", err)
+		}
+		return nil
+	}
+
+	// ==================== 第一步：用定稿HTML生成新索引 ====================
 	indexGenUserParts := []string{
-		"【课程定位】",
-		scannerLocationJSON,
-		"",
+		"【课程定位】", scannerLocationJSON, "",
 		fmt.Sprintf("【最终课件HTML（共%d页）】", pageCount),
 		"以下是经过人工审核定稿后的最终课件HTML内容，请按照要求压缩为TE-DNA课程索引+模块索引。",
-		"",
-		finalHTMLContent,
-		"",
+		"", finalHTMLContent, "",
 		"禁止输出<thinking>标签或任何思维过程标记。",
 	}
 	indexGenUserPrompt := strings.Join(indexGenUserParts, "\n")
@@ -338,15 +423,11 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 		return fmt.Errorf(errMsg)
 	}
 
+	// ==================== 第二步：多轮评估（v63核心改造） ====================
 	evalUserParts := []string{
-		"【课程定位】",
-		scannerLocationJSON,
-		"",
-		"【待评估索引】",
-		generatedIndex,
-		"",
-		"【TE-DNA解压缩字典】",
-		dict.Content,
+		"【课程定位】", scannerLocationJSON, "",
+		"【待评估索引】", generatedIndex, "",
+		"【TE-DNA解压缩字典】", dict.Content,
 	}
 	if abilityTable != nil && len(abilityTable.Content) > 20 {
 		evalUserParts = append(evalUserParts, "", "【能力定位表】", abilityTable.Content)
@@ -354,57 +435,99 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 	evalUserParts = append(evalUserParts, "", "禁止输出<thinking>标签或任何思维过程标记。")
 	evalUserPrompt := strings.Join(evalUserParts, "\n")
 
-	evalCallResult, evalCallErr := s.callAIWithSemaphore(aiCfg, promptB.Content, evalUserPrompt)
-	if evalCallErr != nil {
-		durationMs := time.Since(startTime).Milliseconds()
-		errMsg := fmt.Sprintf("%s: %s", ErrVerifyEvalFailed.Error(), evalCallErr.Error())
-		verifyResult := &models.VerifyResult{
-			GeneratedIndex: truncate(generatedIndex, 50000),
-			ReviewRound:    pipeline.ReviewRound,
-			ModelUsed:      lastModelUsed,
-			TokensUsed:     totalTokens,
-			LatencyMs:      time.Since(startTime).Milliseconds(),
+	var roundResults []models.VerifyEvalRound
+	var doneCount int
+
+	for i := 1; i <= evalRounds; i++ {
+		evalCallResult, evalCallErr := s.callAIWithSemaphore(aiCfg, promptB.Content, evalUserPrompt)
+		if evalCallErr != nil {
+			// 单轮失败不终止，继续下一轮
+			verifyLog.Warn("verify评估轮次失败",
+				"pipeline_id", pipeline.ID, "round", i, "error", evalCallErr)
+			continue
 		}
-		s.saveStepData(pipeline.ID, stepName, verifyResult.ToJSON())
-		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+
+		evalOutput := evalCallResult.Content
+		totalTokens += evalCallResult.TokensUsed
+		lastModelUsed = evalCallResult.ModelUsed
+
+		scoreTotal, scoreE1, scoreE2, scoreE3, scoreE4, hardConstraint, grade, parseOk := extractEvalScores(evalOutput)
+		if !parseOk || scoreTotal < 0 {
+			verifyLog.Warn("verify评估轮次评分提取失败",
+				"pipeline_id", pipeline.ID, "round", i)
+			continue
+		}
+
+		roundResults = append(roundResults, models.VerifyEvalRound{
+			RoundNumber: i,
+			ScoreTotal:  scoreTotal,
+			ScoreE1:     scoreE1,
+			ScoreE2:     scoreE2,
+			ScoreE3:     scoreE3,
+			ScoreE4:     scoreE4,
+			Hard:        hardConstraint,
+			Grade:       grade,
+			Output:      truncate(evalOutput, 50000),
+			ModelUsed:   evalCallResult.ModelUsed,
+			TokensUsed:  evalCallResult.TokensUsed,
+		})
+		doneCount++
 	}
 
-	evalOutput := evalCallResult.Content
-	totalTokens += evalCallResult.TokensUsed
-	lastModelUsed = evalCallResult.ModelUsed
-
-	scoreTotal, scoreE1, scoreE2, scoreE3, scoreE4, _, _, parseOk := extractEvalScores(evalOutput)
-	if !parseOk || scoreTotal < 0 {
+	// 所有轮次都失败
+	if doneCount == 0 {
 		durationMs := time.Since(startTime).Milliseconds()
 		verifyResult := &models.VerifyResult{
-			GeneratedIndex: truncate(generatedIndex, 50000),
-			EvalOutput:     truncate(evalOutput, 50000),
-			ReviewRound:    pipeline.ReviewRound,
-			ModelUsed:      lastModelUsed,
-			TokensUsed:     totalTokens,
-			LatencyMs:      time.Since(startTime).Milliseconds(),
+			GeneratedIndex:  truncate(generatedIndex, 50000),
+			TotalEvalRounds: evalRounds,
+			DoneEvalRounds:  0,
+			ReviewRound:     pipeline.ReviewRound,
+			ModelUsed:       lastModelUsed,
+			TokensUsed:      totalTokens,
+			LatencyMs:       time.Since(startTime).Milliseconds(),
 		}
 		s.saveStepData(pipeline.ID, stepName, verifyResult.ToJSON())
-		_ = repository.FailStep(pipeline.ID, stepName, durationMs, ErrVerifyScoreExtractFail.Error())
-		return ErrVerifyScoreExtractFail
+		_ = repository.FailStep(pipeline.ID, stepName, durationMs, ErrVerifyAllRoundsFailed.Error())
+		return ErrVerifyAllRoundsFailed
 	}
 
-	passed := scoreTotal >= threshold
+	// ==================== 第三步：计算均分并判定 ====================
+	var sumTotal, sumE1, sumE2, sumE3, sumE4 float64
+	for _, r := range roundResults {
+		sumTotal += r.ScoreTotal
+		sumE1 += r.ScoreE1
+		sumE2 += r.ScoreE2
+		sumE3 += r.ScoreE3
+		sumE4 += r.ScoreE4
+	}
+	n := float64(doneCount)
+	avgTotal := math.Round(sumTotal/n*10) / 10
+	avgE1 := math.Round(sumE1/n*10) / 10
+	avgE2 := math.Round(sumE2/n*10) / 10
+	avgE3 := math.Round(sumE3/n*10) / 10
+	avgE4 := math.Round(sumE4/n*10) / 10
+
+	passed := avgTotal >= threshold
+
+	// 最后一轮的输出作为eval_output（向后兼容）
+	lastRoundOutput := roundResults[len(roundResults)-1].Output
 
 	verifyResult := &models.VerifyResult{
-		GeneratedIndex: truncate(generatedIndex, 50000),
-		EvalScore:      scoreTotal,
-		EvalOutput:     truncate(evalOutput, 50000),
-		EvalE1:         scoreE1,
-		EvalE2:         scoreE2,
-		EvalE3:         scoreE3,
-		EvalE4:         scoreE4,
-		Passed:         passed,
-		ReviewRound:    pipeline.ReviewRound,
-		ModelUsed:      lastModelUsed,
-		TokensUsed:     totalTokens,
-		LatencyMs:      time.Since(startTime).Milliseconds(),
+		GeneratedIndex:  truncate(generatedIndex, 50000),
+		EvalRoundScores: roundResults,
+		TotalEvalRounds: evalRounds,
+		DoneEvalRounds:  doneCount,
+		EvalScore:       avgTotal,
+		EvalOutput:      lastRoundOutput,
+		EvalE1:          avgE1,
+		EvalE2:          avgE2,
+		EvalE3:          avgE3,
+		EvalE4:          avgE4,
+		Passed:          passed,
+		ReviewRound:     pipeline.ReviewRound,
+		ModelUsed:       lastModelUsed,
+		TokensUsed:      totalTokens,
+		LatencyMs:       time.Since(startTime).Milliseconds(),
 	}
 
 	durationMs := time.Since(startTime).Milliseconds()
@@ -481,6 +604,92 @@ func (s *PipelineService) collectFinalHTML(pipelineID string) (string, int, erro
 	return finalContent, validCount, nil
 }
 
+// ==================== verify评分写入eval_rounds ====================
+
+// writeVerifyScoresToEvalRounds 将verify的多轮评分写入eval_rounds表
+// v65-bugfix：现在在startRetrialPipeline中UpdatePipelineReviewRound(2)之后调用
+// 这样CreateEvalRound从pipelines.review_round读到2，写入的eval_rounds.review_round=2
+// 2审的executeMeta通过GetEvalRoundsByPipelineID查review_round=2就能读到这些记录
+func (s *PipelineService) writeVerifyScoresToEvalRounds(pipelineID string, stepData string) {
+	var verifyData models.VerifyResult
+	if err := json.Unmarshal([]byte(stepData), &verifyData); err != nil {
+		verifyLog.Warn("解析verify结果写入eval_rounds失败", "pipeline_id", pipelineID, "error", err)
+		return
+	}
+
+	// 如果有多轮评分数据（v63新格式），逐轮写入
+	if len(verifyData.EvalRoundScores) > 0 {
+		for _, round := range verifyData.EvalRoundScores {
+			roundRec, err := repository.CreateEvalRound(pipelineID, round.RoundNumber)
+			if err != nil {
+				verifyLog.Warn("创建verify→eval_round记录失败",
+					"pipeline_id", pipelineID, "round", round.RoundNumber, "error", err)
+				continue
+			}
+			dimMap := map[string]interface{}{"hard_constraint": round.Hard, "grade": round.Grade}
+			dimJSON, _ := json.Marshal(dimMap)
+			_ = repository.CompleteEvalRound(
+				roundRec.ID, truncate(round.Output, 50000),
+				round.ScoreTotal, round.ScoreE1, round.ScoreE2, round.ScoreE3, round.ScoreE4,
+				string(dimJSON), round.ModelUsed, round.TokensUsed,
+			)
+		}
+		verifyLog.Info("verify多轮评分已写入eval_rounds",
+			"pipeline_id", pipelineID, "rounds", len(verifyData.EvalRoundScores))
+		return
+	}
+
+	// 兜底：旧格式（单轮），写入一条eval_round记录
+	roundRec, err := repository.CreateEvalRound(pipelineID, 1)
+	if err != nil {
+		verifyLog.Warn("创建verify→eval_round记录失败(兼容)", "pipeline_id", pipelineID, "error", err)
+		return
+	}
+	_ = repository.CompleteEvalRound(
+		roundRec.ID, truncate(verifyData.EvalOutput, 50000),
+		verifyData.EvalScore, verifyData.EvalE1, verifyData.EvalE2, verifyData.EvalE3, verifyData.EvalE4,
+		"{}", verifyData.ModelUsed, verifyData.TokensUsed,
+	)
+	verifyLog.Info("verify单轮评分已写入eval_rounds(兼容模式)", "pipeline_id", pipelineID)
+}
+
+// markEvaluatorDoneForRetrial 二审时标记evaluator步骤为done（跳过执行）
+// 目的：让Pipeline的步骤列表显示evaluator已完成，前端不会显示异常
+// step_data写入verify评估的摘要信息
+func (s *PipelineService) markEvaluatorDoneForRetrial(pipelineID string) {
+	// 读取verify步骤的评分摘要
+	// 使用GetStepByName按review_round DESC取最新的
+	// 此时verify的round=2记录刚被ResetStepsForRetrial重置为pending
+	// 所以GetStepByName会取到round=1的done记录，这是正确的
+	verifyStep, err := repository.GetStepByName(pipelineID, models.StepVerify)
+	if err != nil {
+		return
+	}
+
+	var verifyData models.VerifyResult
+	if err := json.Unmarshal([]byte(verifyStep.StepData), &verifyData); err != nil {
+		return
+	}
+
+	// 构造evaluator的step_data（与正常evaluator输出格式兼容）
+	evalResult := &models.EvaluatorResult{
+		TotalRounds:  verifyData.DoneEvalRounds,
+		DoneRounds:   verifyData.DoneEvalRounds,
+		FailedRounds: verifyData.TotalEvalRounds - verifyData.DoneEvalRounds,
+		AvgTotal:     verifyData.EvalScore,
+		AvgE1:        verifyData.EvalE1,
+		AvgE2:        verifyData.EvalE2,
+		AvgE3:        verifyData.EvalE3,
+		AvgE4:        verifyData.EvalE4,
+		ModelUsed:    verifyData.ModelUsed,
+	}
+
+	// 启动并立即完成evaluator步骤
+	_ = repository.StartStep(pipelineID, models.StepEvaluator)
+	_ = repository.CompleteStep(pipelineID, models.StepEvaluator, 0,
+		evalResult.ToJSON(), verifyData.ModelUsed, 0)
+}
+
 // ==================== 批量验收+夜间定时任务 ====================
 
 // BatchVerifyResult 批量验收结果
@@ -492,7 +701,8 @@ type BatchVerifyResult struct {
 }
 
 // BatchVerify 批量触发验收
-// v33改进：EngineTask.ExecFunc 返回 error，VerifyPipeline 的 error 直接传递给 Engine 统计
+// 查询所有finalized状态的pipeline并逐个触发验收
+// 包括高分早停的pipeline（它们也需要经过验收确认质量）
 func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 	result := &BatchVerifyResult{}
 
@@ -516,7 +726,6 @@ func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 
 		capturedID := id
 		if s.engine != nil {
-			// v33改进：ExecFunc 返回 error，VerifyPipeline 的第二个返回值直接作为业务失败标记
 			task := &EngineTask{
 				Type:       TaskTypeVerify,
 				PipelineID: capturedID,
@@ -543,19 +752,15 @@ func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 }
 
 // StartNightlyVerifyScheduler 启动夜间批量验收定时任务
-// 修复V-02：显式加载 Asia/Shanghai 时区，不再依赖服务器本地时区设置
 func (s *PipelineService) StartNightlyVerifyScheduler() {
 	go func() {
-		// 显式加载 Asia/Shanghai 时区（北京时间）
 		loc, err := time.LoadLocation("Asia/Shanghai")
 		if err != nil {
-			// 时区加载失败时降级使用UTC+8固定偏移，保证服务不中断
 			verifyLog.Warn("加载Asia/Shanghai时区失败，降级为UTC+8", "error", err)
 			loc = time.FixedZone("CST", 8*3600)
 		}
 
 		for {
-			// 用 Asia/Shanghai 时区计算当前时间和下次2:00
 			now := time.Now().In(loc)
 			next := time.Date(now.Year(), now.Month(), now.Day(), 2, 0, 0, 0, loc)
 			if now.After(next) {
@@ -563,7 +768,9 @@ func (s *PipelineService) StartNightlyVerifyScheduler() {
 			}
 			waitDuration := next.Sub(now)
 
-			verifyLog.Info("夜间验收调度器等待中", "next_run", next.Format("2006-01-02 15:04:05"), "wait_duration", waitDuration.String())
+			verifyLog.Info("夜间验收调度器等待中",
+				"next_run", next.Format("2006-01-02 15:04:05"),
+				"wait_duration", waitDuration.String())
 
 			timer := time.NewTimer(waitDuration)
 			<-timer.C
@@ -574,8 +781,87 @@ func (s *PipelineService) StartNightlyVerifyScheduler() {
 			if batchErr != nil {
 				verifyLog.Error("夜间验收执行失败", "error", batchErr)
 			} else {
-				verifyLog.Info("夜间验收执行完成", "total_found", batchResult.TotalFound, "started", len(batchResult.StartedIDs), "skipped", len(batchResult.SkippedIDs))
+				verifyLog.Info("夜间验收执行完成",
+					"total_found", batchResult.TotalFound,
+					"started", len(batchResult.StartedIDs),
+					"skipped", len(batchResult.SkippedIDs))
 			}
 		}
 	}()
+}
+
+// ==================== savePipelineIndex 辅助方法 ====================
+
+// savePipelineIndex 从verify步骤的step_data中提取生成的索引并写入pipeline_indexes表
+func (s *PipelineService) savePipelineIndex(pipelineID string) error {
+	verifyStep, err := repository.GetStepByName(pipelineID, models.StepVerify)
+	if err != nil || verifyStep.StepData == "" || verifyStep.StepData == "null" {
+		return fmt.Errorf("无法读取verify步骤数据")
+	}
+
+	var verifyData map[string]interface{}
+	if err := json.Unmarshal([]byte(verifyStep.StepData), &verifyData); err != nil {
+		return fmt.Errorf("解析verify步骤数据失败: %w", err)
+	}
+
+	generatedIndex, ok := verifyData["generated_index"].(string)
+	if !ok || len(generatedIndex) < 100 {
+		return fmt.Errorf("verify步骤中generated_index为空或过短")
+	}
+
+	reviewRound := 1
+	if rr, ok := verifyData["review_round"].(float64); ok && rr > 0 {
+		reviewRound = int(rr)
+	}
+
+	pageCount := strings.Count(generatedIndex, "═══")
+	if pageCount == 0 {
+		pageCount = 1
+	}
+
+	if err := repository.UpsertPipelineIndex(pipelineID, generatedIndex, reviewRound, pageCount); err != nil {
+		return err
+	}
+
+	verifyLog.Info("pipeline定稿索引已写入",
+		"pipeline_id", pipelineID,
+		"review_round", reviewRound,
+		"index_length", len(generatedIndex),
+		"page_count", pageCount,
+	)
+	return nil
+}
+
+// ==================== 高分早停辅助方法（v68新增）====================
+
+// isEarlyStopPipeline 判断pipeline是否为高分早停（所有页面都是keep操作）
+// v68新增：用于验收时快速通过，避免对原始课件重复评估
+// 检查逻辑：
+//   1. 优先检查review步骤的step_data是否包含early_stop标记（由executePipelineAsync高分早停时写入）
+//   2. 兜底检查所有页面是否都是keep操作
+func (s *PipelineService) isEarlyStopPipeline(pipeline *models.Pipeline) bool {
+	// 检查review步骤的step_data是否包含early_stop标记
+	reviewStep, err := repository.GetStepByName(pipeline.ID, models.StepReview)
+	if err != nil || reviewStep.StepData == "" {
+		return false
+	}
+	var reviewData map[string]interface{}
+	if err := json.Unmarshal([]byte(reviewStep.StepData), &reviewData); err != nil {
+		return false
+	}
+	// 检查是否有early_stop标记（由executePipelineAsync高分早停时写入）
+	if earlyStop, ok := reviewData["early_stop"].(bool); ok && earlyStop {
+		return true
+	}
+	// 兜底：检查所有页面是否都是keep操作
+	pages, err := repository.GetGeneratedPagesByPipelineID(pipeline.ID)
+	if err != nil || len(pages) == 0 {
+		return false
+	}
+	for _, p := range pages {
+		if p.Operation != "keep" {
+			return false
+		}
+	}
+	return true
 }

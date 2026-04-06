@@ -17,6 +17,51 @@ var (
 	ErrComponentNotFound = errors.New("组件不存在")
 )
 
+// ==================== 年级范围匹配 SQL 片段 ====================
+// buildGradeRangeCondition 构建年级范围包含匹配的SQL条件
+// 核心逻辑：从grade_range字段（格式"X-Y"或"X"）中提取起止年级，
+// 判断输入的年级数字是否落在[起始,结束]范围内。
+// 例如：输入grade=5，能匹配"1-9""3-6""5-9""5"等，不匹配"7-9""1-4"。
+// 同时兼容grade_range为空或NULL的组件（视为全年级适用）。
+//
+// 输入参数gradeInput支持两种格式：
+//   - 纯数字如"5"——直接匹配
+//   - 范围如"3-6"——取范围中间值进行匹配
+func buildGradeRangeCondition(argIdx int) string {
+	// 使用PostgreSQL字符串函数解析grade_range：
+	// 1. 如果grade_range包含"-"，用split_part提取起止年级
+	// 2. 如果不包含"-"，视为单一年级（起=止）
+	// 3. 如果为空/NULL，视为全年级适用（不过滤）
+	// 输入参数$argIdx也做同样解析，取其起始年级作为匹配点
+	return fmt.Sprintf(`AND (
+		c.grade_range IS NULL 
+		OR c.grade_range = '' 
+		OR (
+			-- 解析组件的起止年级
+			CASE WHEN c.grade_range LIKE '%%-%%' 
+				THEN CAST(split_part(c.grade_range, '-', 1) AS INTEGER)
+				ELSE CAST(NULLIF(regexp_replace(c.grade_range, '[^0-9]', '', 'g'), '') AS INTEGER)
+			END
+			<= 
+			-- 解析输入的年级（取起始年级作为匹配点）
+			CASE WHEN $%d LIKE '%%-%%'
+				THEN CAST(split_part($%d, '-', 1) AS INTEGER)
+				ELSE CAST(NULLIF(regexp_replace($%d, '[^0-9]', '', 'g'), '') AS INTEGER)
+			END
+			AND
+			CASE WHEN c.grade_range LIKE '%%-%%'
+				THEN CAST(split_part(c.grade_range, '-', 2) AS INTEGER)
+				ELSE CAST(NULLIF(regexp_replace(c.grade_range, '[^0-9]', '', 'g'), '') AS INTEGER)
+			END
+			>=
+			CASE WHEN $%d LIKE '%%-%%'
+				THEN CAST(split_part($%d, '-', 1) AS INTEGER)
+				ELSE CAST(NULLIF(regexp_replace($%d, '[^0-9]', '', 'g'), '') AS INTEGER)
+			END
+		)
+	)`, argIdx, argIdx, argIdx, argIdx, argIdx, argIdx)
+}
+
 // ==================== 组件 CRUD ====================
 
 // CreateComponent 创建组件
@@ -251,6 +296,7 @@ func ReviewComponent(ctx context.Context, id string, reviewerID string, decision
 
 // MatchComponents 根据学科+学段匹配组件（核心匹配接口）
 // 返回按library_type分组的匹配结果，每组按quality_score降序排列
+// v70改进：年级匹配从精确匹配升级为范围包含匹配
 func MatchComponents(ctx context.Context, req *models.MatchComponentsRequest) ([]*models.MatchedComponentGroup, error) {
 	// 构建WHERE条件
 	where := " WHERE c.status = 'active' AND c.review_status = 'approved'"
@@ -264,9 +310,10 @@ func MatchComponents(ctx context.Context, req *models.MatchComponentsRequest) ([
 		argIdx++
 	}
 
-	// 学段匹配
+	// 年级范围包含匹配（v70改进：从精确匹配升级为范围包含匹配）
+	// 输入"5"能匹配到grade_range为"1-9""3-6""5-9""5"等所有包含5年级的组件
 	if req.GradeRange != "" {
-		where += fmt.Sprintf(" AND (c.grade_range = $%d OR c.grade_range IS NULL OR c.grade_range = '')", argIdx)
+		where += " " + buildGradeRangeCondition(argIdx)
 		args = append(args, req.GradeRange)
 		argIdx++
 	}
@@ -358,6 +405,151 @@ func MatchComponents(ctx context.Context, req *models.MatchComponentsRequest) ([
 	return result, nil
 }
 
+// ==================== 迭代4B-2：画像感知智能匹配 ====================
+
+// SmartMatchComponents 根据学科+学段+老师画像标签加权匹配组件
+// 核心算法：基础分(quality_score) + 风格标签匹配加权
+// 加权规则（PRD §12.2）：
+//   - 风格匹配(style:xxx)：+2.0分
+//   - 协作匹配(collab:xxx)：+1.5分
+//   - 关注点匹配(priority:xxx)：每命中一个+0.5分，最多+2.0分
+//   - 最终分 = min(基础分+加权, 10.0)
+//
+// profileTags参数：由service层根据teaching_profile解析出的匹配标签列表
+// v70改进：年级匹配从精确匹配升级为范围包含匹配
+func SmartMatchComponents(ctx context.Context, req *models.MatchComponentsRequest, profileTags []string) ([]*models.MatchedComponentGroup, error) {
+	// 如果没有画像标签，降级为普通匹配
+	if len(profileTags) == 0 {
+		return MatchComponents(ctx, req)
+	}
+
+	// 构建WHERE条件（与MatchComponents相同的基础筛选）
+	where := " WHERE c.status = 'active' AND c.review_status = 'approved'"
+	args := []interface{}{}
+	argIdx := 1
+
+	if req.Subject != "" {
+		where += fmt.Sprintf(" AND (c.subject = $%d OR c.subject = 'general')", argIdx)
+		args = append(args, req.Subject)
+		argIdx++
+	}
+
+	// 年级范围包含匹配（v70改进：从精确匹配升级为范围包含匹配）
+	if req.GradeRange != "" {
+		where += " " + buildGradeRangeCondition(argIdx)
+		args = append(args, req.GradeRange)
+		argIdx++
+	}
+
+	if req.InjectionMode != "" {
+		where += fmt.Sprintf(" AND c.injection_mode = $%d", argIdx)
+		args = append(args, req.InjectionMode)
+		argIdx++
+	}
+
+	if len(req.LibraryTypes) > 0 {
+		where += fmt.Sprintf(" AND c.library_type = ANY($%d)", argIdx)
+		args = append(args, req.LibraryTypes)
+		argIdx++
+	}
+
+	if len(req.Tags) > 0 {
+		for _, tag := range req.Tags {
+			where += fmt.Sprintf(" AND c.tags @> $%d::jsonb", argIdx)
+			args = append(args, fmt.Sprintf(`["%s"]`, tag))
+			argIdx++
+		}
+	}
+
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 5
+	}
+
+	// 构建SQL加权表达式：对每个画像标签检测组件tags是否包含，命中则加分
+	// 使用 CASE WHEN tags @> '["style:xxx"]'::jsonb THEN 权重 ELSE 0 END 的形式
+	bonusExpr := "0"
+	for _, tag := range profileTags {
+		var weight string
+		switch {
+		case len(tag) > 6 && tag[:6] == "style:":
+			weight = "2.0"
+		case len(tag) > 7 && tag[:7] == "collab:":
+			weight = "1.5"
+		case len(tag) > 9 && tag[:9] == "priority:":
+			weight = "0.5"
+		default:
+			continue
+		}
+		bonusExpr += fmt.Sprintf(` + CASE WHEN c.tags @> $%d::jsonb THEN %s ELSE 0 END`, argIdx, weight)
+		args = append(args, fmt.Sprintf(`["%s"]`, tag))
+		argIdx++
+	}
+
+	// 最终分 = LEAST(quality_score + bonus, 10.0)
+	// 按最终分排序替代原来的quality_score排序
+	query := fmt.Sprintf(`
+		SELECT library_type, id, display_label, design_logic, example_snippet,
+		       full_guide, final_score, usage_count, select_count, tags
+		FROM (
+			SELECT c.library_type, c.id, c.display_label,
+			       COALESCE(c.design_logic, '') AS design_logic,
+			       COALESCE(c.example_snippet, '') AS example_snippet,
+			       COALESCE(c.full_guide, '') AS full_guide,
+			       LEAST(c.quality_score + (%s), 10.0) AS final_score,
+			       c.usage_count, c.select_count, c.tags,
+			       ROW_NUMBER() OVER (
+			           PARTITION BY c.library_type
+			           ORDER BY LEAST(c.quality_score + (%s), 10.0) DESC, c.select_count DESC
+			       ) AS rn
+			FROM lesson_plan_components c
+			%s
+		) ranked
+		WHERE rn <= $%d
+		ORDER BY library_type, final_score DESC
+	`, bonusExpr, bonusExpr, where, argIdx)
+	args = append(args, limit)
+
+	rows, err := database.DB.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("智能匹配组件失败: %w", err)
+	}
+	defer rows.Close()
+
+	groupMap := make(map[string]*models.MatchedComponentGroup)
+	var groupOrder []string
+
+	for rows.Next() {
+		var libraryType string
+		mc := &models.MatchedComponent{}
+		err := rows.Scan(
+			&libraryType, &mc.ID, &mc.DisplayLabel, &mc.DesignLogic, &mc.ExampleSnippet,
+			&mc.FullGuide, &mc.QualityScore, &mc.UsageCount, &mc.SelectCount, &mc.Tags,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("扫描智能匹配结果行失败: %w", err)
+		}
+
+		group, exists := groupMap[libraryType]
+		if !exists {
+			group = &models.MatchedComponentGroup{
+				LibraryType: libraryType,
+				LibraryName: models.LibraryTypeNameMap[libraryType],
+				Components:  []*models.MatchedComponent{},
+			}
+			groupMap[libraryType] = group
+			groupOrder = append(groupOrder, libraryType)
+		}
+		group.Components = append(group.Components, mc)
+	}
+
+	var result []*models.MatchedComponentGroup
+	for _, lt := range groupOrder {
+		result = append(result, groupMap[lt])
+	}
+	return result, nil
+}
+
 // ==================== 组件统计更新 ====================
 
 // IncrementComponentUsage 增加组件使用次数
@@ -396,8 +588,6 @@ func UpdateComponentQualityScore(ctx context.Context, id string, avgLinkedPlanSc
 }
 
 // GetComponentLinkedPlanAvgScore 计算组件关联教案的平均AI评审分（Phase5新增）
-// 通过 component_extractions 关联表，取萃取自的教案的 ai_review_score 均值
-// 若无关联教案或分数为空，返回 0
 func GetComponentLinkedPlanAvgScore(ctx context.Context, componentID string) (float64, error) {
 	var avg float64
 	err := database.DB.QueryRow(ctx, `

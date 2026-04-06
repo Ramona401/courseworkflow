@@ -1,5 +1,8 @@
 /**
  * RoleBarChart.tsx — 角色分布横条图（纯CSS入场动画）
+ *
+ * 角色名与学校体系对齐：
+ *   管理员 / 学校管理员 / 骨干教师 / 普通教师
  */
 import { useState, useEffect } from 'react'
 import type { AdminStats } from '@/api/admin'
@@ -11,10 +14,10 @@ interface RoleBarChartProps {
 
 export function RoleBarChart({ stats }: RoleBarChartProps) {
   const roles = [
-    { label: '管理员',    count: stats.admin_count,           color: C.danger  },
-    { label: '高级操作员', count: stats.senior_operator_count, color: C.warning },
-    { label: '操作员',    count: stats.operator_count,        color: C.primary },
-    { label: '查看者',    count: stats.viewer_count,          color: C.textSec },
+    { label: '系统管理员', count: stats.admin_count,           color: C.danger  },
+    { label: '学校管理员', count: stats.senior_operator_count, color: C.warning },
+    { label: '骨干教师',   count: stats.operator_count,        color: C.primary },
+    { label: '普通教师',   count: stats.viewer_count,          color: C.textSec },
   ]
   const total    = stats.total_users || 1
   const maxCount = Math.max(...roles.map(r => r.count), 1)
@@ -61,7 +64,6 @@ export function RoleBarChart({ stats }: RoleBarChartProps) {
                   background: role.color, borderRadius: '6px', opacity: 0.85,
                   transition: 'width 500ms cubic-bezier(0.4,0,0.2,1)',
                 }} />
-                {/* 条内人数（宽度够时才显示）*/}
                 {role.count > 0 && barPct > 18 && (
                   <div style={{
                     position: 'absolute', left: '10px', top: 0, bottom: 0,

@@ -1,6 +1,8 @@
 /**
- * 教案系统布局组件 — LPLayout v5.2
- * 下拉菜单新增"用户管理"入口（admin专属）
+ * 教案系统布局组件 — LPLayout v5.3
+ *
+ * v5.3变更：pageTitles 增加备课配方相关路径
+ * v5.2变更：下拉菜单新增"用户管理"入口（admin专属）
  */
 import { useState, useRef, useEffect } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
@@ -8,18 +10,21 @@ import { useAuth } from '@/store/auth'
 import LPSidebar from './LPSidebar'
 
 const pageTitles: Record<string, string> = {
-  '/lesson-plans':            '备课工坊',
-  '/lesson-plans/my-plans':   '我的教案',
-  '/lesson-plans/library':    '教案库',
-  '/lesson-plans/review':     '评审中心',
-  '/lesson-plans/components': '组件管理',
-  '/lesson-plans/templates':  '提示词模板',
+  '/lesson-plans':              '备课工坊',
+  '/lesson-plans/recipes':      '备课配方',
+  '/lesson-plans/recipes/new':  '新建配方',
+  '/lesson-plans/my-plans':     '我的教案',
+  '/lesson-plans/library':      '教案库',
+  '/lesson-plans/review':       '评审中心',
+  '/lesson-plans/components':   '组件管理',
+  '/lesson-plans/templates':    '提示词模板',
 }
 
 function getPageTitle(pathname: string): string {
   if (pageTitles[pathname]) return pageTitles[pathname]
   if (pathname.startsWith('/lesson-plans/plans/')) return '教案详情'
   if (pathname.startsWith('/lesson-plans/templates/')) return '模板编辑器'
+  if (pathname.match(/^\/lesson-plans\/recipes\/[^/]+\/edit$/)) return '编辑配方'
   return '备课工坊'
 }
 

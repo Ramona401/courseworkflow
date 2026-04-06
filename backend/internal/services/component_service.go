@@ -9,6 +9,8 @@ package services
 //   - ConfirmExtractionByID      — 教研组长/骨干确认萃取记录
 //   - ListPendingExtractionItems — 获取待审萃取队列
 //   - RefreshQualityScore        — 刷新组件质量分
+// 迭代4B-2新增：
+//   - SmartRecommendComponents   — 画像感知智能推荐（根据teaching_profile加权匹配）
 
 import (
 	"context"
@@ -176,7 +178,7 @@ func (s *ComponentService) ReviewComponent(ctx context.Context, id string, revie
 
 // ==================== 匹配引擎 ====================
 
-// MatchComponents 匹配组件
+// MatchComponents 匹配组件（原始匹配，按学科+年级+质量分）
 func (s *ComponentService) MatchComponents(ctx context.Context, req *models.MatchComponentsRequest) (*models.MatchComponentsResponse, error) {
 	if req.Subject == "" {
 		return nil, errors.New("学科不能为空")
@@ -190,6 +192,76 @@ func (s *ComponentService) MatchComponents(ctx context.Context, req *models.Matc
 		groups = []*models.MatchedComponentGroup{}
 	}
 	return &models.MatchComponentsResponse{Groups: groups}, nil
+}
+
+// ==================== 迭代4B-2新增：画像感知智能推荐 ====================
+
+// SmartRecommendComponents 根据老师画像+学科+年级智能推荐组件
+// 从teaching_profile中提取风格标签，传给SmartMatchComponents进行加权匹配
+// 无画像时降级为普通匹配
+func (s *ComponentService) SmartRecommendComponents(ctx context.Context, subject string, gradeRange string, profile *models.TeachingProfile) ([]*models.MatchedComponentGroup, error) {
+	if strings.TrimSpace(subject) == "" {
+		return nil, errors.New("学科不能为空")
+	}
+
+	req := &models.MatchComponentsRequest{
+		Subject:    subject,
+		GradeRange: gradeRange,
+		Limit:      5, // 每种类型取前5个
+	}
+
+	// 从teaching_profile提取画像标签
+	profileTags := buildProfileTags(profile)
+
+	compLog.Info("智能推荐组件",
+		"subject", subject,
+		"grade", gradeRange,
+		"profile_tags_count", len(profileTags),
+		"profile_tags", strings.Join(profileTags, ","),
+	)
+
+	groups, err := repository.SmartMatchComponents(ctx, req, profileTags)
+	if err != nil {
+		compLog.Error("智能推荐匹配失败", "subject", subject, "error", err)
+		return nil, err
+	}
+	if groups == nil {
+		groups = []*models.MatchedComponentGroup{}
+	}
+	return groups, nil
+}
+
+// buildProfileTags 从teaching_profile中提取匹配标签列表
+// 返回如 ["style:growing", "collab:collaborative", "priority:activity_detail", "priority:student_response"]
+func buildProfileTags(profile *models.TeachingProfile) []string {
+	if profile == nil {
+		return nil
+	}
+
+	var tags []string
+
+	// 教学风格 → style:xxx 标签
+	if profile.TeachingStyle != "" {
+		tags = append(tags, "style:"+profile.TeachingStyle)
+	}
+
+	// AI协作偏好 → collab:xxx 标签
+	if profile.AICollaboration != "" {
+		tags = append(tags, "collab:"+profile.AICollaboration)
+	}
+
+	// 质量关注点 → priority:xxx 标签（最多取4个，避免过多加权）
+	if len(profile.Priorities) > 0 {
+		maxPriorities := 4
+		for i, p := range profile.Priorities {
+			if i >= maxPriorities {
+				break
+			}
+			tags = append(tags, "priority:"+p)
+		}
+	}
+
+	return tags
 }
 
 // ==================== 统计更新 ====================
@@ -214,7 +286,6 @@ func (s *ComponentService) RecordComponentSelect(ctx context.Context, componentI
 }
 
 // RefreshQualityScore 刷新组件质量分
-// 公式：选中率×0.4 + 关联教案均分/10×0.4 + 反馈分×0.2
 func (s *ComponentService) RefreshQualityScore(ctx context.Context, componentID string) error {
 	avgScore, err := repository.GetComponentLinkedPlanAvgScore(ctx, componentID)
 	if err != nil {
@@ -231,8 +302,6 @@ func (s *ComponentService) RefreshQualityScore(ctx context.Context, componentID 
 // ==================== Phase5：通道一——对话萃取 ====================
 
 // SaveExtractionFromChat 保存对话中AI识别的高价值设计片段
-// 由 lesson_plan_gen_service.processChatAsync 在老师确认萃取提示后调用
-// 创建 captured 状态的组件 + 萃取记录，等待教研组长/骨干人工确认
 func (s *ComponentService) SaveExtractionFromChat(
 	ctx context.Context,
 	planID string,
@@ -242,7 +311,6 @@ func (s *ComponentService) SaveExtractionFromChat(
 	designLogic string,
 	createdBy string,
 ) error {
-	// 创建组件（captured状态：AI萃取，待人工确认）
 	comp := &models.LessonPlanComponent{
 		LibraryType:  extractionType,
 		DisplayLabel: displayLabel,
@@ -256,7 +324,6 @@ func (s *ComponentService) SaveExtractionFromChat(
 		return fmt.Errorf("创建萃取组件失败: %w", err)
 	}
 
-	// 创建萃取记录
 	planIDPtr := planID
 	ce := &models.ComponentExtraction{
 		SourceType:           "conversation",
@@ -283,8 +350,6 @@ func (s *ComponentService) SaveExtractionFromChat(
 // ==================== Phase5：通道二——评审自动萃取 ====================
 
 // AutoExtractFromLessonPlan 从评审通过的高分教案自动萃取可复用设计逻辑
-// 触发条件：decision=approved 且 ai_review_score>=8.5
-// 由 lesson_plan_service.ReviewLessonPlan 异步调用
 func (s *ComponentService) AutoExtractFromLessonPlan(
 	ctx context.Context,
 	planID string,
@@ -395,8 +460,6 @@ activity_design, questioning_strategy, pedagogy, assessment_strategy, cross_subj
 // ==================== Phase5：萃取确认 ====================
 
 // ConfirmExtractionByID 确认或拒绝萃取记录
-// confirmed → 组件变为approved，进入匹配引擎
-// rejected  → 组件标记rejected
 func (s *ComponentService) ConfirmExtractionByID(
 	ctx context.Context,
 	extractionID string,
@@ -414,7 +477,6 @@ func (s *ComponentService) ConfirmExtractionByID(
 		return fmt.Errorf("更新萃取状态失败: %w", err)
 	}
 
-	// 同步更新关联组件的审核状态
 	ce, err := repository.GetExtractionByID(ctx, extractionID)
 	if err == nil && ce.ExtractedComponentID != nil {
 		componentDecision := models.ComponentReviewApproved
@@ -431,7 +493,7 @@ func (s *ComponentService) ConfirmExtractionByID(
 	return nil
 }
 
-// ListPendingExtractionItems 获取待审萃取列表（含教案标题和创建者名称）
+// ListPendingExtractionItems 获取待审萃取列表
 func (s *ComponentService) ListPendingExtractionItems(ctx context.Context, limit int) (*models.ExtractionListResponse, error) {
 	extractions, err := repository.ListPendingExtractions(ctx, limit)
 	if err != nil {
@@ -450,14 +512,12 @@ func (s *ComponentService) ListPendingExtractionItems(ctx context.Context, limit
 			CreatedAt:      ce.CreatedAt.Format(time.RFC3339),
 		}
 
-		// 查询来源教案标题
 		if ce.SourceLessonPlanID != nil {
 			if lp, err := repository.GetLessonPlanByID(ctx, *ce.SourceLessonPlanID); err == nil {
 				item.PlanTitle = lp.Title
 			}
 		}
 
-		// 查询创建者名称
 		if ce.CreatedBy != nil {
 			if user, err := repository.FindUserByID(ctx, *ce.CreatedBy); err == nil {
 				item.CreatedByName = user.DisplayName
@@ -485,13 +545,11 @@ type autoExtractionItem struct {
 
 // parseAutoExtractionResult 解析AI自动萃取结果（JSON数组）
 func parseAutoExtractionResult(content string) ([]autoExtractionItem, error) {
-	// 尝试用ExtractJSON找到JSON片段
 	jsonStr, ok := aiClient.ExtractJSON(content)
 	if !ok {
 		jsonStr = strings.TrimSpace(content)
 	}
 
-	// 确保是数组格式
 	if !strings.HasPrefix(jsonStr, "[") {
 		jsonStr = "[" + jsonStr + "]"
 	}

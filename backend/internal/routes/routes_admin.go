@@ -30,6 +30,7 @@ func registerAdminRoutes(
 	promptHandler *handlers.PromptHandler,
 	edHandler *handlers.ExternalDataHandler,
 	courseHandler *handlers.CourseHandler,
+	wsStageHandler *handlers.WorkshopStageHandler,
 ) {
 	// ==================== 统一用户管理中心（admin only）====================
 
@@ -251,6 +252,21 @@ func registerAdminRoutes(
 				methodNotAllowedJSON(w, "仅支持GET/PUT请求")
 			}
 		}
+	}), authMW, adminOnly))
+
+	// ==================== 阶段管理（admin only）====================
+
+	// GET /api/v1/admin/workshop-stages — 全部系统阶段列表（含disabled）
+	mux.Handle("/api/v1/admin/workshop-stages", middleware.Chain(
+		http.HandlerFunc(wsStageHandler.ListAllSystemStages), authMW, adminOnly))
+
+	// PUT /api/v1/admin/workshop-stages/{code} — 更新系统阶段
+	mux.Handle("/api/v1/admin/workshop-stages/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			methodNotAllowedJSON(w, "仅支持PUT请求")
+			return
+		}
+		wsStageHandler.UpdateSystemStage(w, r)
 	}), authMW, adminOnly))
 
 	// ==================== 外部数据配置（admin only）====================

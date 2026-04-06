@@ -1,22 +1,29 @@
 /**
- * 主布局组件 - 课件审核系统专用 v5.2
- * 下拉菜单新增"用户管理"入口（admin专属）
+ * 主布局组件 — 课件审核系统 v6.0
+ *
+ * v6.0 改版：与备课工坊 LPLayout 视觉风格统一
+ *   - 整体背景色统一为 #FAFBFC（与 LPLayout 一致）
+ *   - Header 背景、字号、padding 与 LPLayout 对齐
+ *   - UserMenu 下拉样式全面同步（边框/圆角/颜色）
+ *   - 去除深色毛玻璃风格，改为浅色系亮色方案
  */
 import { useState, useRef, useEffect } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import Sidebar from './Sidebar'
 
+// ==================== 页面标题映射 ====================
+
 const pageTitles: Record<string, string> = {
-  '/': '仪表盘',
-  '/users': '用户管理',
-  '/ai-config': 'AI 配置',
-  '/prompts': '提示词管理',
-  '/external-data': '外部数据配置',
-  '/courses': '课程管理',
-  '/pipelines': 'Pipeline',
-  '/review': '审核中心',
-  '/settings': '系统设置',
+  '/':               '仪表盘',
+  '/users':          '用户管理',
+  '/ai-config':      'AI 配置',
+  '/prompts':        '提示词管理',
+  '/external-data':  '外部数据配置',
+  '/courses':        '课程管理',
+  '/pipelines':      'Pipeline',
+  '/review':         '审核中心',
+  '/settings':       '系统设置',
 }
 
 function getPageTitle(pathname: string): string {
@@ -25,7 +32,7 @@ function getPageTitle(pathname: string): string {
   return 'TE-DNA 2.0'
 }
 
-// ==================== DropdownPortal ====================
+// ==================== DropdownPortal（与 LPLayout 统一）====================
 
 function DropdownPortal({
   children,
@@ -45,11 +52,17 @@ function DropdownPortal({
 
   return (
     <div style={{
-      position: 'fixed', top: pos.top, right: pos.right,
-      width: '220px', background: '#fff',
-      borderRadius: '14px', border: '1px solid rgba(0,0,0,0.08)',
-      boxShadow: '0 8px 32px rgba(0,0,0,0.15)',
-      overflow: 'hidden', zIndex: 9999,
+      position: 'fixed',
+      top: pos.top,
+      right: pos.right,
+      width: '220px',
+      background: '#fff',
+      // 与 LPLayout DropdownPortal 完全一致的圆角/边框/阴影
+      borderRadius: '16px',
+      border: '1px solid #E5E7EB',
+      boxShadow: '0 8px 32px rgba(0,0,0,0.12)',
+      overflow: 'hidden',
+      zIndex: 9999,
     }}>
       {children}
     </div>
@@ -64,9 +77,12 @@ function UserMenu() {
   const [open, setOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
 
+  // 点击菜单外关闭下拉
   useEffect(() => {
     function handleClick(e: MouseEvent) {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setOpen(false)
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setOpen(false)
+      }
     }
     if (open) document.addEventListener('mousedown', handleClick)
     return () => document.removeEventListener('mousedown', handleClick)
@@ -84,66 +100,113 @@ function UserMenu() {
   }
 
   const roleNames: Record<string, string> = {
-    admin: '管理员', senior_operator: '高级操作员',
-    operator: '操作员', viewer: '查看者',
+    admin:           '系统管理员',
+    senior_operator: '学校管理员',
+    operator:        '骨干教师',
+    viewer:          '普通教师',
   }
 
   return (
     <div ref={menuRef} style={{ position: 'relative' }}>
+      {/* 触发按钮（与 LPLayout UserMenu 样式一致）*/}
       <button
         onClick={() => setOpen(p => !p)}
         style={{
-          display: 'flex', alignItems: 'center', gap: '8px',
-          padding: '6px 10px 6px 6px', borderRadius: '20px',
-          border: '1px solid rgba(0,0,0,0.08)',
-          background: open ? 'rgba(0,0,0,0.06)' : 'transparent',
-          cursor: 'pointer', transition: 'all 150ms ease',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          padding: '5px 10px 5px 5px',
+          borderRadius: '20px',
+          border: '1px solid #E5E7EB',
+          background: open ? '#F3F4F6' : 'transparent',
+          cursor: 'pointer',
+          transition: 'all 150ms ease',
         }}
-        onMouseEnter={e => { if (!open) (e.currentTarget as HTMLElement).style.background = 'rgba(0,0,0,0.04)' }}
-        onMouseLeave={e => { if (!open) (e.currentTarget as HTMLElement).style.background = 'transparent' }}
+        onMouseEnter={e => {
+          if (!open) (e.currentTarget as HTMLElement).style.background = '#F9FAFB'
+        }}
+        onMouseLeave={e => {
+          if (!open) (e.currentTarget as HTMLElement).style.background = 'transparent'
+        }}
       >
+        {/* 头像圆形（与 LPLayout 渐变一致）*/}
         <div style={{
-          width: '30px', height: '30px',
-          background: 'linear-gradient(135deg,#5856d6,#007aff)',
-          borderRadius: '50%', display: 'flex', alignItems: 'center',
-          justifyContent: 'center', flexShrink: 0,
+          width: '30px',
+          height: '30px',
+          background: 'linear-gradient(135deg, #4F7BE8, #818CF8)',
+          borderRadius: '50%',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          flexShrink: 0,
         }}>
           <span style={{ color: '#fff', fontSize: '12px', fontWeight: 700 }}>
             {user?.display_name?.charAt(0)?.toUpperCase() || 'U'}
           </span>
         </div>
-        <span style={{ fontSize: '13px', fontWeight: 500, color: '#1d1d1f', maxWidth: '80px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        {/* 用户名 */}
+        <span style={{
+          fontSize: '13px',
+          fontWeight: 500,
+          color: '#1F2937',
+          maxWidth: '80px',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}>
           {user?.display_name}
         </span>
-        <span style={{ fontSize: '10px', color: '#8e8e93', transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 200ms ease' }}>▼</span>
+        {/* 展开箭头 */}
+        <span style={{
+          fontSize: '10px',
+          color: '#9CA3AF',
+          transform: open ? 'rotate(180deg)' : 'none',
+          transition: 'transform 200ms ease',
+        }}>▼</span>
       </button>
 
+      {/* 下拉面板 */}
       {open && (
         <DropdownPortal triggerRef={menuRef}>
           {/* 用户信息头部 */}
-          <div style={{ padding: '14px 16px 12px', borderBottom: '1px solid rgba(0,0,0,0.06)' }}>
-            <div style={{ fontSize: '14px', fontWeight: 600, color: '#1d1d1f' }}>{user?.display_name}</div>
-            <div style={{ fontSize: '12px', color: '#8e8e93', marginTop: '2px' }}>
+          <div style={{
+            padding: '14px 16px 12px',
+            borderBottom: '1px solid #F3F4F6',
+          }}>
+            <div style={{ fontSize: '14px', fontWeight: 600, color: '#1F2937' }}>
+              {user?.display_name}
+            </div>
+            <div style={{ fontSize: '12px', color: '#9CA3AF', marginTop: '2px' }}>
               @{user?.username} · {roleNames[user?.role || ''] || user?.role}
             </div>
           </div>
 
-          {/* 菜单项 */}
+          {/* 功能菜单 */}
           <div style={{ padding: '6px' }}>
-            <MenuItem icon="👤" label="个人中心" onClick={() => go('/account', '/workflow')} />
-            {/* admin专属功能 */}
+            <DropdownItem icon="👤" label="个人中心" onClick={() => go('/account', '/workflow')} />
+            {/* admin 专属功能 */}
             {user?.role === 'admin' && (
               <>
-                <MenuItem icon="👥" label="用户管理" onClick={() => go('/admin', '/workflow')} highlight />
-                <MenuItem icon="🤖" label="AI 管理中心" onClick={() => go('/ai-center', '/workflow')} />
+                <DropdownItem
+                  icon="👥"
+                  label="用户管理"
+                  onClick={() => go('/admin', '/workflow')}
+                  highlight
+                />
+                <DropdownItem
+                  icon="🤖"
+                  label="AI 管理中心"
+                  onClick={() => go('/ai-center', '/workflow')}
+                />
               </>
             )}
           </div>
 
-          <div style={{ height: '1px', background: 'rgba(0,0,0,0.06)', margin: '0 6px' }} />
+          <div style={{ height: '1px', background: '#F3F4F6', margin: '0 6px' }} />
 
+          {/* 退出登录 */}
           <div style={{ padding: '6px' }}>
-            <MenuItem icon="⏻" label="退出登录" onClick={handleLogout} danger />
+            <DropdownItem icon="⏻" label="退出登录" onClick={handleLogout} danger />
           </div>
         </DropdownPortal>
       )}
@@ -151,8 +214,17 @@ function UserMenu() {
   )
 }
 
-function MenuItem({ icon, label, onClick, danger, highlight }: {
-  icon: string; label: string; onClick: () => void; danger?: boolean; highlight?: boolean
+/**
+ * 下拉菜单项（与 LPLayout LPMenuItem 完全一致的样式）
+ */
+function DropdownItem({
+  icon, label, onClick, danger, highlight,
+}: {
+  icon: string
+  label: string
+  onClick: () => void
+  danger?: boolean
+  highlight?: boolean
 }) {
   const [hovered, setHovered] = useState(false)
   return (
@@ -161,17 +233,30 @@ function MenuItem({ icon, label, onClick, danger, highlight }: {
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       style={{
-        width: '100%', display: 'flex', alignItems: 'center', gap: '10px',
-        padding: '9px 12px', borderRadius: '8px', border: 'none',
-        cursor: 'pointer', textAlign: 'left', fontSize: '14px',
+        width: '100%',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '10px',
+        padding: '9px 12px',
+        borderRadius: '10px',
+        border: 'none',
+        cursor: 'pointer',
+        textAlign: 'left',
+        fontSize: '14px',
         color: danger
-          ? (hovered ? '#ff453a' : '#ff3b30')
+          ? (hovered ? '#DC2626' : '#EF4444')
           : highlight
             ? '#4F7BE8'
-            : (hovered ? '#1d1d1f' : '#3c3c43'),
+            : (hovered ? '#1F2937' : '#6B7280'),
         background: hovered
-          ? (danger ? 'rgba(255,59,48,0.06)' : highlight ? 'rgba(79,123,232,0.08)' : 'rgba(0,0,0,0.04)')
-          : highlight ? 'rgba(79,123,232,0.04)' : 'transparent',
+          ? (danger
+              ? 'rgba(239,68,68,0.06)'
+              : highlight
+                ? 'rgba(79,123,232,0.08)'
+                : '#F9FAFB')
+          : highlight
+            ? 'rgba(79,123,232,0.04)'
+            : 'transparent',
         transition: 'all 150ms ease',
       }}
     >
@@ -185,26 +270,52 @@ function MenuItem({ icon, label, onClick, danger, highlight }: {
 
 export default function MainLayout() {
   const location = useLocation()
+  // 去掉 /workflow 前缀后匹配标题
   const subPath = location.pathname.replace('/workflow', '') || '/'
   const pageTitle = getPageTitle(subPath)
 
   return (
-    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: '#f5f5f7' }}>
+    <div style={{
+      display: 'flex',
+      height: '100vh',
+      overflow: 'hidden',
+      // 与 LPLayout 统一的背景色
+      background: '#FAFBFC',
+    }}>
       <Sidebar />
+
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        {/* ── 顶部 Header（与 LPLayout 完全对齐）── */}
         <header style={{
-          height: '64px', position: 'relative', zIndex: 50,
-          background: 'rgba(255,255,255,0.72)',
-          backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)',
-          borderBottom: '1px solid rgba(0,0,0,0.06)',
-          display: 'flex', alignItems: 'center', padding: '0 28px', flexShrink: 0,
+          height: '64px',
+          position: 'relative',
+          zIndex: 50,
+          // 与 LPLayout header 一致：浅色毛玻璃
+          background: 'rgba(255,255,255,0.85)',
+          backdropFilter: 'blur(20px)',
+          WebkitBackdropFilter: 'blur(20px)',
+          borderBottom: '1px solid rgba(0,0,0,0.05)',
+          display: 'flex',
+          alignItems: 'center',
+          // 与 LPLayout 一致的 padding
+          padding: '0 32px',
+          flexShrink: 0,
         }}>
-          <h2 style={{ flex: 1, fontSize: '18px', fontWeight: 600, color: '#1d1d1f', margin: 0, letterSpacing: '-0.3px' }}>
+          <h2 style={{
+            flex: 1,
+            fontSize: '20px',
+            fontWeight: 600,
+            color: '#1F2937',
+            margin: 0,
+            letterSpacing: '-0.3px',
+          }}>
             {pageTitle}
           </h2>
           <UserMenu />
         </header>
-        <main style={{ flex: 1, overflowY: 'auto', padding: '28px' }}>
+
+        {/* ── 内容区（与 LPLayout 一致的 padding）── */}
+        <main style={{ flex: 1, overflowY: 'auto', padding: '28px 32px' }}>
           <Outlet />
         </main>
       </div>

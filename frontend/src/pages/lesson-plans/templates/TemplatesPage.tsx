@@ -8,6 +8,7 @@
  *
  * PRD §1.3：分层继承，上级设标准下级可覆盖
  * PRD §8.2 配色 + §8.3 动效
+ * v56修改：移除页面内重复标题（LPLayout header已有标题）
  */
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -81,15 +82,10 @@ export default function TemplatesPage() {
 
   return (
     <div>
-      {/* 页面标题 */}
-      <div style={{ marginBottom: '24px' }}>
-        <h1 style={{ fontSize: '20px', fontWeight: 600, color: COLORS.textPrimary, margin: '0 0 8px 0' }}>
-          提示词模板
-        </h1>
-        <p style={{ fontSize: '14px', color: COLORS.textSecondary, margin: 0 }}>
-          管理四级继承链提示词模板，子级可覆盖父级配置
-        </p>
-      </div>
+      {/* 描述文字（标题已在LPLayout header中显示，此处不再重复） */}
+      <p style={{ fontSize: '14px', color: COLORS.textSecondary, margin: '0 0 20px 0' }}>
+        管理四级继承链提示词模板，子级可覆盖父级配置
+      </p>
 
       {/* ==================== 继承链可视化 ==================== */}
       <div style={{

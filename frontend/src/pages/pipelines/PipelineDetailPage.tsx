@@ -5,6 +5,8 @@
  *          operator仅在failed/cancelled可见
  * v41修复: 导航路径加 /workflow 前缀
  * v46修复: showReviewBtn 增加 pending_finalize 状态
+ * v69新增: 编号12 — 全流程时间线组件（1审→验收→2审→验收）
+ * v69新增: 编号13 — 验收后自动追踪2审进度（SSE扩展+验收后轮询+2审横幅）
  *
  * 子组件均从 ./components/ 引入，本文件只保留：
  *   - SSE实时推送 + 轮询回退逻辑
@@ -23,9 +25,12 @@ import { useAuth } from '@/store/auth'
 // ---- 子组件 ----
 import {
   RunningBanner, FailedBanner, MessageBanner,
-  EarlyStopBanner, VerifiedBanner, VerifyFailedBanner,
+  EarlyStopBanner, VerifiedBanner, VerifyFailedBanner, PublishedBanner,
+  RetrialRunningBanner,
 } from './components/PipelineDetailBanners'
 import { StepCard } from './components/PipelineStepCard'
+import { HistoryRoundPanel, PipelineFlowTimeline } from './components/HistoryRoundPanel'
+import { PublishButton } from './components/PublishButton'
 
 // ==================== 常量 ====================
 
@@ -97,7 +102,12 @@ export default function PipelineDetailPage() {
       }
     }
 
-    if (!detail || detail.status !== 'running' || !id) {
+    // v69（编号13）：SSE连接条件扩展——verify_failed状态下可能正在自动触发2审
+    // 需要SSE/轮询来追踪2审的执行进度
+    const needsTracking = detail && id && (
+      detail.status === 'running' || detail.status === 'verify_failed'
+    )
+    if (!needsTracking) {
       cleanup(); return cleanup
     }
 
@@ -134,12 +144,58 @@ export default function PipelineDetailPage() {
       await verifyPipeline(id)
       setVerifyMsg('验收完成！正在刷新...')
       await loadDetail()
+      // v69（编号13）：验收完成后启动短轮询追踪2审进度
+      // 如果验收未通过触发了2审，需要持续刷新直到2审执行完成
+      startPostVerifyPolling()
       setVerifyMsg('')
     } catch (e: unknown) {
       setVerifyMsg('验收失败: ' + (e instanceof Error ? e.message : '未知错误'))
     }
     setVerifying(false)
   }
+
+  // ==================== v69新增（编号13）：验收后轮询追踪 ====================
+  // 验收完成后，如果触发了2审，启动短轮询（3秒间隔）追踪2审执行进度
+  // 持续刷新直到状态稳定（review_queue/needs_human/verified/failed等非running状态）
+  const postVerifyTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  const startPostVerifyPolling = useCallback(() => {
+    // 清除可能存在的旧轮询
+    if (postVerifyTimerRef.current) {
+      clearInterval(postVerifyTimerRef.current)
+      postVerifyTimerRef.current = null
+    }
+    let pollCount = 0
+    const maxPolls = 120 // 最多轮询120次（6分钟），防止无限轮询
+    postVerifyTimerRef.current = setInterval(async () => {
+      pollCount++
+      if (pollCount >= maxPolls) {
+        if (postVerifyTimerRef.current) clearInterval(postVerifyTimerRef.current)
+        postVerifyTimerRef.current = null
+        return
+      }
+      try {
+        const freshData = await getPipelineDetail(id!)
+        setDetail(freshData)
+        // 状态稳定后停止轮询
+        const stableStatuses = ['review_queue', 'needs_human', 'verified', 'published', 'pending', 'cancelled', 'pending_finalize', 'finalized']
+        if (stableStatuses.includes(freshData.status) || freshData.status === 'failed') {
+          if (postVerifyTimerRef.current) clearInterval(postVerifyTimerRef.current)
+          postVerifyTimerRef.current = null
+        }
+      } catch { /* 静默忽略 */ }
+    }, 3000)
+  }, [id])
+
+  // 组件卸载时清除验收后轮询
+  useEffect(() => {
+    return () => {
+      if (postVerifyTimerRef.current) {
+        clearInterval(postVerifyTimerRef.current)
+        postVerifyTimerRef.current = null
+      }
+    }
+  }, [])
 
   // ==================== 断点续跑 ====================
   const handleRestartFromStep = async (stepName: string, stepNameCN: string) => {
@@ -183,7 +239,7 @@ export default function PipelineDetailPage() {
 
   /**
    * v46修复：审核按钮显示条件
-   * 增加 pending_finalize：操作员提交定稿后，高级操作员需进入审核确认
+   * 增加 pending_finalize：骨干教师提交定稿后，学校管理员需进入审核确认
    */
   const showReviewBtn = detail && (
     detail.status === 'review_queue' || detail.status === 'needs_human' ||
@@ -280,10 +336,23 @@ export default function PipelineDetailPage() {
         <FailedBanner status={detail.status} errorMessage={detail.error_message} />
       )}
       {verifyMsg  && <MessageBanner message={verifyMsg}  type="verify"  />}
+      {/* v69新增（编号13）：2审进行中横幅 */}
+      <RetrialRunningBanner detail={detail} sseConnected={sseConnected} />
       {restartMsg && <MessageBanner message={restartMsg} type="restart" />}
       <EarlyStopBanner detail={detail} />
+      {/* verified 状态：显示待发布提示区块 */}
+      {detail.status === 'verified' && (
+        <div style={{ marginBottom: 16 }}>
+          <PublishButton pipelineId={detail.id} onPublished={loadDetail} />
+        </div>
+      )}
+      {/* published 状态：显示已发布横幅 */}
+      {detail.status === 'published' && <PublishedBanner />}
       {detail.status === 'verified'      && <VerifiedBanner />}
       {detail.status === 'verify_failed' && <VerifyFailedBanner reviewRound={detail.review_round} />}
+
+      {/* ---- v69新增（编号12）：全流程时间线（1审→验收→2审→验收）---- */}
+      <PipelineFlowTimeline detail={detail} />
 
       {/* ---- 8步进度可视化 ---- */}
       <div style={{
@@ -333,6 +402,14 @@ export default function PipelineDetailPage() {
           ))
         }
       </div>
+
+      {/* ---- 历史轮次数据（review_round >= 2 时显示）---- */}
+      {detail.review_round >= 2 && (
+        <HistoryRoundPanel
+          pipelineId={detail.id}
+          currentRound={detail.review_round}
+        />
+      )}
 
       <style>{`
         @keyframes spin {

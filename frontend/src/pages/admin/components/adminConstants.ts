@@ -1,5 +1,11 @@
 /**
  * adminConstants.ts — Admin页面共用常量、样式变量、工具函数
+ *
+ * 角色名称与学校体系对齐：
+ *   admin           → 系统管理员
+ *   senior_operator → 学校管理员
+ *   operator        → 骨干教师
+ *   viewer          → 普通教师
  */
 
 // ==================== 颜色常量 ====================
@@ -22,13 +28,13 @@ export const C = {
   white: '#FFFFFF',
 }
 
-// ==================== 下拉选项常量 ====================
+// ==================== 下拉选项常量（角色名与学校体系对齐）====================
 export const ROLE_OPTIONS = [
-  { value: '', label: '全部角色' },
-  { value: 'admin', label: '管理员' },
-  { value: 'senior_operator', label: '高级操作员' },
-  { value: 'operator', label: '操作员' },
-  { value: 'viewer', label: '查看者' },
+  { value: '',                label: '全部角色' },
+  { value: 'admin',           label: '系统管理员' },
+  { value: 'senior_operator', label: '学校管理员' },
+  { value: 'operator',        label: '骨干教师' },
+  { value: 'viewer',          label: '普通教师' },
 ]
 
 export const ACTION_OPTIONS = [

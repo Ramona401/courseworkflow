@@ -183,6 +183,18 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		aiCfgMerge = aiCfgModify
 	}
 
+	// 7.5 v65-bugfix: 2审时加载上一轮定稿HTML映射
+	// 2审的generator应基于1审定稿后的版本进行修改，而非从OSS读取原始课件
+	// prevRoundHTMLMap: map[pageNumber] → 上一轮定稿后的final_html
+	var prevRoundHTMLMap map[int]string
+	if pipeline.ReviewRound >= 2 {
+		prevRoundHTMLMap = repository.GetPrevRoundFinalHTMLMap(pipeline.ID, pipeline.ReviewRound-1)
+		if len(prevRoundHTMLMap) > 0 {
+			fmt.Printf("[generator] 2审模式：已加载上一轮(%d)定稿HTML共%d页\n",
+				pipeline.ReviewRound-1, len(prevRoundHTMLMap))
+		}
+	}
+
 	// 8. 清理旧数据（每次重跑从OSS取最新内容）
 	_ = repository.DeleteGeneratedPagesByPipelineID(pipeline.ID)
 
@@ -213,8 +225,25 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		switch op.Operation {
 
 		case models.PageOpKeep:
-			// keep：从OSS读取原始HTML，不调AI
+			// keep：不调AI，直接使用原始HTML
+			// v65-bugfix: 2审时优先从上一轮定稿读取，而非从OSS读原始课件
 			result.KeptPages++
+			if pipeline.ReviewRound >= 2 && prevRoundHTMLMap != nil {
+				if prevHTML, hasPrev := prevRoundHTMLMap[realPageNum]; hasPrev && len(prevHTML) > 100 {
+					pageRec.HasOrigHTML = true
+					pageRec.OrigHTMLLen = len(prevHTML)
+					pageRec.Status = "done"
+					lidPtr := &lessonID
+					_ = repository.CreateGeneratedPage(
+						pipeline.ID, op.PageNumber, op.Title,
+						"keep", prevHTML, "", prevHTML,
+						lidPtr, "", changeReason,
+					)
+					result.Pages = append(result.Pages, pageRec)
+					continue
+				}
+				// 上一轮没有该页面数据，降级从OSS读取
+			}
 			if hasLesson {
 				origHTML, fetchErr := ossService.FetchLessonHTML(lessonID)
 				if fetchErr == nil && len(origHTML) > 100 {
@@ -256,9 +285,10 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 			)
 
 		case models.PageOpModify:
-			// modify：从OSS读取原始HTML + Sonnet修改
+			// modify：读取原始HTML + Sonnet修改
+			// v65-bugfix: 2审时基于上一轮定稿版本修改，而非OSS原始课件
 			result.ModifiedPages++
-			if !hasLesson {
+			if !hasLesson && (pipeline.ReviewRound < 2 || prevRoundHTMLMap == nil) {
 				pageRec.Status = "failed"
 				pageRec.Error = fmt.Sprintf("modify页面未找到lesson_id，原始页码=%d", realPageNum)
 				result.FailedPages++
@@ -270,18 +300,41 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				result.Pages = append(result.Pages, pageRec)
 				continue
 			}
-			origHTML, fetchErr := ossService.FetchLessonHTML(lessonID)
-			if fetchErr != nil || len(origHTML) < 100 {
-				pageRec.Status = "failed"
-				pageRec.Error = fmt.Sprintf("OSS读取失败(lesson=%d): %v", lessonID, fetchErr)
-				result.FailedPages++
-				_ = repository.CreateGeneratedPage(
-					pipeline.ID, op.PageNumber, op.Title,
-					"modify", "", "", "",
-					&lessonID, "", changeReason,
-				)
-				result.Pages = append(result.Pages, pageRec)
-				continue
+			// v65-bugfix: 2审时优先从上一轮定稿读取原始HTML
+			var origHTML string
+			var fetchErr error
+			if pipeline.ReviewRound >= 2 && prevRoundHTMLMap != nil {
+				if prevHTML, hasPrev := prevRoundHTMLMap[realPageNum]; hasPrev && len(prevHTML) > 100 {
+					origHTML = prevHTML
+				}
+			}
+			// 没有上一轮定稿数据时，降级从OSS读取
+			if origHTML == "" {
+				if !hasLesson {
+					pageRec.Status = "failed"
+					pageRec.Error = fmt.Sprintf("modify页面无上一轮定稿且未找到lesson_id，原始页码=%d", realPageNum)
+					result.FailedPages++
+					_ = repository.CreateGeneratedPage(
+						pipeline.ID, op.PageNumber, op.Title,
+						"modify", "", "", "",
+						nil, "", changeReason,
+					)
+					result.Pages = append(result.Pages, pageRec)
+					continue
+				}
+				origHTML, fetchErr = ossService.FetchLessonHTML(lessonID)
+				if fetchErr != nil || len(origHTML) < 100 {
+					pageRec.Status = "failed"
+					pageRec.Error = fmt.Sprintf("OSS读取失败(lesson=%d): %v", lessonID, fetchErr)
+					result.FailedPages++
+					_ = repository.CreateGeneratedPage(
+						pipeline.ID, op.PageNumber, op.Title,
+						"modify", "", "", "",
+						&lessonID, "", changeReason,
+					)
+					result.Pages = append(result.Pages, pageRec)
+					continue
+				}
 			}
 			pageRec.HasOrigHTML = true
 			pageRec.OrigHTMLLen = len(origHTML)

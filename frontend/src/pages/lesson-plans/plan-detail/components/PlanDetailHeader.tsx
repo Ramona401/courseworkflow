@@ -3,11 +3,15 @@
  *   DetailSkeleton  — 骨架屏（加载中占位）
  *   StatusBadge     — 状态徽标
  *   MetaTag         — 元信息标签（学科/年级/课时等）
- *   ActionBar       — 操作按钮组（按状态动态渲染）
+ *   ActionBar       — 操作按钮组（按状态动态渲染 + 导出Word按钮）
+ *
+ * 新增：导出Word按钮，调用 exportLessonPlanToWord 工具，纯前端生成 .docx 下载
  */
+import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { LessonPlan, LessonPlanStatus } from '@/api/lesson-plans'
 import { C, STATUS_CONFIG } from './planDetailConstants'
+import { exportLessonPlanToWord } from '@/utils/exportWord'
 
 // ==================== 骨架屏 ====================
 
@@ -21,7 +25,6 @@ export function DetailSkeleton() {
   return (
     <div>
       <style>{`@keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }`}</style>
-      {/* 头部骨架 */}
       <div style={{ background: C.card, borderRadius: '12px', border: `1px solid ${C.border}`, padding: '28px', marginBottom: '20px' }}>
         <div style={{ ...shimmer, width: '60%', height: '28px', marginBottom: '16px' }} />
         <div style={{ display: 'flex', gap: '24px', marginBottom: '16px' }}>
@@ -31,7 +34,6 @@ export function DetailSkeleton() {
           {[1,2].map(i => <div key={i} style={{ ...shimmer, width: '100px', height: '34px', borderRadius: '8px' }} />)}
         </div>
       </div>
-      {/* 内容骨架 */}
       <div style={{ background: C.card, borderRadius: '12px', border: `1px solid ${C.border}`, padding: '28px' }}>
         {[1,2,3,4,5].map(i => (
           <div key={i} style={{ ...shimmer, width: i%2===0 ? '80%' : '100%', height: '14px', marginBottom: '10px' }} />
@@ -83,7 +85,36 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction }: ActionBarP
   const navigate = useNavigate()
   const isLoading = !!actionLoading
 
-  // 按钮基础样式
+  // 导出Word加载状态
+  const [exporting, setExporting] = useState(false)
+
+  /**
+   * 点击"导出Word"：异步生成并下载 .docx
+   */
+  const handleExportWord = async () => {
+    if (exporting) return
+    setExporting(true)
+    try {
+      await exportLessonPlanToWord({
+        title:            plan.title,
+        subject:          plan.subject,
+        grade:            plan.grade,
+        topic:            plan.topic,
+        duration_minutes: plan.duration_minutes,
+        content_markdown: plan.content_markdown,
+        author_name:      plan.author_name,
+        ai_review_score:  plan.ai_review_score,
+        created_at:       plan.created_at,
+      })
+    } catch (err) {
+      console.error('导出Word失败:', err)
+      alert('导出失败，请稍后重试')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  // ---- 按钮样式 ----
   const primaryBtn: React.CSSProperties = {
     padding: '9px 20px', borderRadius: '8px', border: 'none',
     background: isLoading ? '#E5E7EB' : C.primary,
@@ -104,8 +135,19 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction }: ActionBarP
     cursor: isLoading ? 'not-allowed' : 'pointer',
     transition: 'all 150ms ease', whiteSpace: 'nowrap',
   }
+  // 导出按钮：绿色系，独立于主操作加载状态
+  const exportBtn: React.CSSProperties = {
+    padding: '9px 20px', borderRadius: '8px',
+    border: '1px solid rgba(16,185,129,0.3)',
+    background: exporting ? '#F3F4F6' : 'rgba(16,185,129,0.08)',
+    fontSize: '14px', fontWeight: 500,
+    color: exporting ? C.textMuted : '#059669',
+    cursor: exporting ? 'not-allowed' : 'pointer',
+    transition: 'all 150ms ease', whiteSpace: 'nowrap',
+    display: 'inline-flex', alignItems: 'center', gap: '5px',
+  }
 
-  // 按状态动态构建按钮列表
+  // ---- 按状态动态构建主操作按钮列表 ----
   const buttons: Array<{ label: string; style: React.CSSProperties; action: string; confirm?: string }> = []
 
   if (isOwner) {
@@ -129,7 +171,6 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction }: ActionBarP
         buttons.push({ label: '查看课件进度', style: primaryBtn, action: 'view_pipeline' })
         break
     }
-    // 可删除的状态
     if (['draft', 'published_personal', 'revision'].includes(plan.status)) {
       buttons.push({
         label: '删除教案', style: dangerBtn, action: 'delete',
@@ -137,21 +178,19 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction }: ActionBarP
       })
     }
   } else {
-    // 非作者：可Fork
     if (['approved', 'published_shared'].includes(plan.status)) {
       buttons.push({ label: '🔀 Fork到我的草稿', style: primaryBtn, action: 'fork' })
     }
   }
 
-  if (!buttons.length) return null
-
   return (
     <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
-      {/* 加载中提示 */}
+      {/* 主操作加载提示 */}
       {actionLoading && (
         <span style={{ fontSize: '13px', color: C.primary, marginRight: '4px' }}>处理中...</span>
       )}
-      {/* 按钮列表 */}
+
+      {/* 主操作按钮列表 */}
       {!actionLoading && buttons.map(btn => (
         <button
           key={btn.action}
@@ -159,7 +198,6 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction }: ActionBarP
           disabled={isLoading}
           onClick={() => {
             if (btn.confirm && !window.confirm(btn.confirm)) return
-            // 查看课件进度：直接跳转，不走onAction
             if (btn.action === 'view_pipeline') {
               if (plan.linked_pipeline_id) navigate(`/workflow/pipelines/${plan.linked_pipeline_id}`)
               else navigate('/workflow/pipelines')
@@ -170,6 +208,17 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction }: ActionBarP
           {btn.label}
         </button>
       ))}
+
+      {/* 导出Word按钮：始终显示，不受主操作加载状态影响 */}
+      <button
+        style={exportBtn}
+        disabled={exporting}
+        onClick={handleExportWord}
+        title="将教案导出为Word文档（.docx）">
+        {exporting ? '⏳ 导出中...' : '📄 导出 Word'}
+      </button>
+
+      <style>{`@keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }`}</style>
     </div>
   )
 }

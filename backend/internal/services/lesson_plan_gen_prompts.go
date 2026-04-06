@@ -329,3 +329,50 @@ func formatSelectedComponents(ids []string) string {
 func generateMsgID() string {
 	return fmt.Sprintf("msg_%d", time.Now().UnixNano())
 }
+
+// ==================== Phase 7A：带配方上下文的对话提示词 ====================
+
+// buildChatPromptWithRecipe 组装带配方上下文的对话提示词
+// 如果有配方上下文，将其注入到对话历史之前，让AI始终保持全局视角
+func buildChatPromptWithRecipe(history []*models.ConversationMessage, userMsg *models.ConversationMessage, lp *models.LessonPlan, recipeContext string) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("【当前备课信息】\n学科：%s\n年级：%s\n课题：%s\n课时：%d分钟\n\n",
+		lp.Subject, lp.Grade, lp.Topic, lp.DurationMinutes))
+
+	// Phase 7A：注入配方上下文（组件+学情+风格+心得）
+	if recipeContext != "" {
+		sb.WriteString(recipeContext)
+		sb.WriteString("\n")
+	}
+
+	// 附加已有教案内容（截断防止超token）
+	if lp.ContentMarkdown != "" {
+		sb.WriteString("【已生成教案内容】\n")
+		content := lp.ContentMarkdown
+		if len(content) > 2000 {
+			content = content[:2000] + "\n...(教案内容已截断)"
+		}
+		sb.WriteString(content)
+		sb.WriteString("\n\n")
+	}
+
+	// 最近10轮对话历史
+	recentHistory := history
+	if len(recentHistory) > 10 {
+		recentHistory = recentHistory[len(recentHistory)-10:]
+	}
+	if len(recentHistory) > 0 {
+		sb.WriteString("【对话记录】\n")
+		for _, h := range recentHistory {
+			role := "教师"
+			if h.Role == models.ConvRoleAssistant {
+				role = "AI助手"
+			}
+			sb.WriteString(fmt.Sprintf("%s：%s\n", role, h.Content))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString(fmt.Sprintf("教师：%s\n\nAI助手：", userMsg.Content))
+	return sb.String()
+}

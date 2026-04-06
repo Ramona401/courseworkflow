@@ -2,16 +2,7 @@ package handlers
 
 // pipeline_handler.go — Pipeline处理器主文件
 //
-// 职责：
-//   - PipelineHandler struct定义与构造
-//   - Dashboard统计
-//   - Pipeline基础操作：创建/列表/详情/启动/取消/删除
-//   - 步骤查询：步骤列表/步骤详情/评估轮
-//   - 路径解析辅助函数（extractPipelineID系列）
-//   - 统一错误处理（handlePipelineError）
-//
-// 审核定稿类接口 → pipeline_handler_review.go
-// 批量操作类接口 → pipeline_handler_batch.go
+// v68变更：GetStepDetail从JWT提取角色传给服务层，用于verify步骤数据脱敏
 
 import (
 	"encoding/json"
@@ -21,6 +12,7 @@ import (
 
 	"tedna/internal/middleware"
 	"tedna/internal/models"
+	"tedna/internal/repository"
 	"tedna/internal/services"
 	"tedna/internal/utils"
 )
@@ -199,6 +191,7 @@ func (h *PipelineHandler) GetSteps(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetStepDetail GET /api/v1/pipelines/{id}/steps/{name}
+// v68改动：从JWT提取调用者角色，传给服务层用于verify步骤数据脱敏
 func (h *PipelineHandler) GetStepDetail(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
@@ -209,7 +202,12 @@ func (h *PipelineHandler) GetStepDetail(w http.ResponseWriter, r *http.Request) 
 		utils.BadRequest(w, "缺少Pipeline ID或步骤名称")
 		return
 	}
-	resp, err := h.pipelineService.GetStepDetail(pipelineID, stepName)
+	// v68新增：从JWT提取角色，用于verify步骤数据的角色感知脱敏
+	callerRole := ""
+	if claims, ok := middleware.GetClaims(r.Context()); ok {
+		callerRole = claims.Role
+	}
+	resp, err := h.pipelineService.GetStepDetail(pipelineID, stepName, callerRole)
 	if err != nil {
 		handlePipelineError(w, err)
 		return
@@ -243,7 +241,6 @@ func (h *PipelineHandler) GetEvalRounds(w http.ResponseWriter, r *http.Request) 
 // ==================== 路径解析辅助函数 ====================
 
 // extractPipelineID 从路径末尾提取Pipeline ID
-// 例：/api/v1/pipelines/abc123 → "abc123"
 func extractPipelineID(path string) string {
 	path = strings.TrimSuffix(path, "/")
 	lastSlash := strings.LastIndex(path, "/")
@@ -258,7 +255,6 @@ func extractPipelineID(path string) string {
 }
 
 // extractPipelineIDWithSuffix 提取带固定后缀路径中的Pipeline ID
-// 例：/api/v1/pipelines/abc123/start → "abc123"（suffix="/start"）
 func extractPipelineIDWithSuffix(path string, suffix string) string {
 	idx := strings.LastIndex(path, suffix)
 	if idx <= 0 {
@@ -269,7 +265,6 @@ func extractPipelineIDWithSuffix(path string, suffix string) string {
 }
 
 // extractPipelineIDAndStepName 从步骤路径提取Pipeline ID和步骤名
-// 例：/api/v1/pipelines/abc123/steps/scanner → "abc123", "scanner"
 func extractPipelineIDAndStepName(path string) (string, string) {
 	stepsIdx := strings.Index(path, "/steps/")
 	if stepsIdx < 0 {
@@ -285,7 +280,6 @@ func extractPipelineIDAndStepName(path string) (string, string) {
 }
 
 // extractPipelineIDAndPageNumber 从页面决策路径提取Pipeline ID和页码
-// 例：/api/v1/pipelines/abc123/pages/3/decision → "abc123", 3
 func extractPipelineIDAndPageNumber(path string) (string, int) {
 	pagesIdx := strings.Index(path, "/pages/")
 	if pagesIdx < 0 {
@@ -310,7 +304,6 @@ func extractPipelineIDAndPageNumber(path string) (string, int) {
 }
 
 // extractPipelineIDAndPageNumberForAIFix 从AI快修路径提取Pipeline ID和页码
-// 例：/api/v1/pipelines/abc123/pages/3/ai-fix → "abc123", 3
 func extractPipelineIDAndPageNumberForAIFix(path string) (string, int) {
 	pagesIdx := strings.Index(path, "/pages/")
 	if pagesIdx < 0 {
@@ -327,6 +320,30 @@ func extractPipelineIDAndPageNumberForAIFix(path string) (string, int) {
 		return pipelineID, 0
 	}
 	pageNumStr := afterPages[:aiFixIdx]
+	pageNum, err := strconv.Atoi(pageNumStr)
+	if err != nil || pageNum <= 0 {
+		return pipelineID, 0
+	}
+	return pipelineID, pageNum
+}
+
+// extractPipelineIDAndPageNumberForRollback 从回滚路径提取Pipeline ID和页码（v68新增）
+func extractPipelineIDAndPageNumberForRollback(path string) (string, int) {
+	pagesIdx := strings.Index(path, "/pages/")
+	if pagesIdx < 0 {
+		return "", 0
+	}
+	beforePages := path[:pagesIdx]
+	pipelineID := extractPipelineID(beforePages)
+	if pipelineID == "" {
+		return "", 0
+	}
+	afterPages := path[pagesIdx+len("/pages/"):]
+	rollbackIdx := strings.Index(afterPages, "/rollback")
+	if rollbackIdx < 0 {
+		return pipelineID, 0
+	}
+	pageNumStr := afterPages[:rollbackIdx]
 	pageNum, err := strconv.Atoi(pageNumStr)
 	if err != nil || pageNum <= 0 {
 		return pipelineID, 0
@@ -358,21 +375,19 @@ func handlePipelineError(w http.ResponseWriter, err error) {
 		err == services.ErrFinalizeIncomplete,
 		err == services.ErrMarkPassedNotAllowed,
 		err == services.ErrVerifyNotFinalized,
+		err == services.ErrPublishNotVerified,
+		err == services.ErrPublishAlreadyDone,
 		err == services.ErrEngineQueueFull,
-		// 二级审批状态冲突
 		err == services.ErrSubmitFinalizeNotAllowed,
 		err == services.ErrConfirmFinalizeNotAllowed,
 		err == services.ErrRejectFinalizeNotAllowed,
-		// 断点续跑状态冲突
 		err == services.ErrRestartPipelineBusy:
 		utils.Fail(w, http.StatusConflict, errMsg)
 
-	// 断点续跑参数错误
 	case err == services.ErrRestartInvalidStep,
 		err == services.ErrRestartStepNotAllowed:
 		utils.BadRequest(w, errMsg)
 
-	// 已完成Pipeline重跑权限不足 → 403
 	case err == services.ErrRestartPermissionDenied:
 		utils.Forbidden(w, errMsg)
 
@@ -428,4 +443,100 @@ func handlePipelineError(w http.ResponseWriter, err error) {
 	default:
 		utils.InternalError(w, errMsg)
 	}
+}
+
+// ==================== 历史轮次查询 ====================
+
+// GetPipelineHistory GET /api/v1/pipelines/{id}/history?round=N
+func (h *PipelineHandler) GetPipelineHistory(w http.ResponseWriter, r *http.Request) {
+	id := extractPipelineIDWithSuffix(r.URL.Path, "/history")
+	if id == "" {
+		utils.BadRequest(w, "无效的Pipeline ID")
+		return
+	}
+
+	roundStr := r.URL.Query().Get("round")
+	round := 0
+	if roundStr != "" {
+		if n, err := strconv.Atoi(roundStr); err == nil && n > 0 {
+			round = n
+		}
+	}
+
+	availableRounds, err := repository.GetAvailableRounds(id)
+	if err != nil {
+		utils.InternalError(w, "查询可用轮次失败")
+		return
+	}
+
+	if round == 0 {
+		utils.Success(w, map[string]interface{}{
+			"available_rounds": availableRounds,
+		})
+		return
+	}
+
+	steps, err := repository.GetStepsByRound(id, round)
+	if err != nil {
+		utils.InternalError(w, "查询历史步骤失败")
+		return
+	}
+
+	evalRounds, err := repository.GetEvalRoundsByRound(id, round)
+	if err != nil {
+		utils.InternalError(w, "查询历史评估失败")
+		return
+	}
+
+	stepItems := make([]map[string]interface{}, 0, len(steps))
+	for _, s := range steps {
+		hasData := s.StepData != "" && s.StepData != "null" && s.StepData != "{}"
+		item := map[string]interface{}{
+			"step_name":     s.StepName,
+			"step_order":    s.StepOrder,
+			"status":        s.Status,
+			"status_name":   models.StepStatusNameMap[s.Status],
+			"step_name_cn":  models.StepNameMap[s.StepName],
+			"duration_ms":   s.DurationMs,
+			"tokens_used":   s.TokensUsed,
+			"has_data":      hasData,
+			"error_message": s.ErrorMessage,
+		}
+		if hasData {
+			item["step_data"] = s.StepData
+		}
+		stepItems = append(stepItems, item)
+	}
+
+	utils.Success(w, map[string]interface{}{
+		"round":            round,
+		"available_rounds": availableRounds,
+		"steps":            stepItems,
+		"eval_rounds":      evalRounds,
+	})
+}
+
+// extractPipelineIDAndPageNumberForHTML 从HTML加载路径提取Pipeline ID和页码（v69新增）
+// 路径格式：/api/v1/pipelines/{id}/pages/{num}/html
+func extractPipelineIDAndPageNumberForHTML(path string) (string, int) {
+	pagesIdx := strings.Index(path, "/pages/")
+	if pagesIdx < 0 {
+		return "", 0
+	}
+	beforePages := path[:pagesIdx]
+	pipelineID := extractPipelineID(beforePages)
+	if pipelineID == "" {
+		return "", 0
+	}
+	afterPages := path[pagesIdx+len("/pages/"):]
+	htmlIdx := strings.Index(afterPages, "/html")
+	if htmlIdx < 0 {
+		return pipelineID, 0
+	}
+	pageNumStr := afterPages[:htmlIdx]
+	pageNum, err := strconv.Atoi(pageNumStr)
+	if err != nil || pageNum <= 0 {
+		return pipelineID, 0
+	}
+	return pipelineID, pageNum
 }

@@ -24,9 +24,9 @@ import { Plus, Edit3, Key, UserCheck, UserX, X, AlertCircle, CheckCircle } from 
 
 const roleMap: Record<string, string> = {
   admin: '管理员',
-  senior_operator: '高级操作员',
-  operator: '操作员',
-  viewer: '查看者',
+  senior_operator: '学校管理员',
+  operator: '骨干教师',
+  viewer: '普通教师',
 }
 
 const roleColors: Record<string, { bg: string; color: string }> = {
@@ -368,7 +368,7 @@ export default function UsersPage() {
         {[
           { label: '用户总数', value: users.length, color: '#007aff' },
           { label: '管理员', value: users.filter(u => u.role === 'admin').length, color: '#ff3b30' },
-          { label: '操作员', value: users.filter(u => u.role === 'operator' || u.role === 'senior_operator').length, color: '#5856d6' },
+          { label: '骨干/学校管理员', value: users.filter(u => u.role === 'operator' || u.role === 'senior_operator').length, color: '#5856d6' },
           { label: '已禁用', value: users.filter(u => u.status === 'disabled').length, color: '#8e8e93' },
         ].map((s, i) => (
           <div key={i} style={{ ...cardStyle, padding: '20px' }}>
@@ -533,9 +533,9 @@ export default function UsersPage() {
                 <select style={selectStyle} value={createForm.role}
                   onChange={e => setCreateForm({ ...createForm, role: e.target.value as any })}
                   onFocus={handleFocus} onBlur={handleBlur}>
-                  <option value="operator">操作员</option>
-                  <option value="senior_operator">高级操作员</option>
-                  <option value="viewer">查看者</option>
+                  <option value="operator">骨干教师</option>
+                  <option value="senior_operator">学校管理员</option>
+                  <option value="viewer">普通教师</option>
                   <option value="admin">管理员</option>
                 </select>
               </div>
@@ -585,9 +585,9 @@ export default function UsersPage() {
                   onChange={e => setEditForm({ ...editForm, role: e.target.value as any })}
                   onFocus={handleFocus} onBlur={handleBlur}
                   disabled={editingUser.id === currentUser?.id}>
-                  <option value="operator">操作员</option>
-                  <option value="senior_operator">高级操作员</option>
-                  <option value="viewer">查看者</option>
+                  <option value="operator">骨干教师</option>
+                  <option value="senior_operator">学校管理员</option>
+                  <option value="viewer">普通教师</option>
                   <option value="admin">管理员</option>
                 </select>
                 {editingUser.id === currentUser?.id && (

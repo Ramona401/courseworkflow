@@ -437,10 +437,10 @@ func extractUserGroupPath(path string) (string, string) {
 // formatRoleName 角色中文名映射
 func formatRoleName(role string) string {
 	names := map[string]string{
-		"admin":           "管理员",
-		"senior_operator": "高级操作员",
-		"operator":        "操作员",
-		"viewer":          "查看者",
+		"admin":           "系统管理员",
+		"senior_operator": "学校管理员",
+		"operator":        "骨干教师",
+		"viewer":          "普通教师",
 	}
 	if n, ok := names[role]; ok {
 		return n

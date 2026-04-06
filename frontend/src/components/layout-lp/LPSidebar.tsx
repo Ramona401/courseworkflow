@@ -1,12 +1,11 @@
 /**
- * 教案系统侧边栏 — LPSidebar v5.0
+ * 教案系统侧边栏 — LPSidebar v7.0
  *
- * v5.0变更：
- *   - 移除底部用户信息卡片和登出按钮（已统一到顶部Header下拉菜单）
- *   - 保留"返回入口"按钮
- *   - 其余菜单和样式保持不变
+ * v7.0变更：新增"课本管理"菜单项（在组件管理之前）
+ * v6.0变更：新增"备课配方"菜单项
  */
 import { useState } from 'react'
+import { useAuth } from '@/store/auth'
 import { useLocation, useNavigate } from 'react-router-dom'
 
 interface LPMenuItem {
@@ -15,15 +14,19 @@ interface LPMenuItem {
   icon: string
   path: string
   description: string
+  adminOnly?: boolean
 }
 
 const menuItems: LPMenuItem[] = [
   { key: 'workshop',   label: '备课工坊',   icon: '✨', path: '/lesson-plans',            description: 'AI辅助对话式备课' },
+  { key: 'recipes',    label: '备课配方',   icon: '📦', path: '/lesson-plans/recipes',    description: '可复用的AI备课预设包' },
   { key: 'my-plans',   label: '我的教案',   icon: '📋', path: '/lesson-plans/my-plans',   description: '个人教案管理' },
   { key: 'library',    label: '教案库',     icon: '📚', path: '/lesson-plans/library',    description: '教研组共享教案' },
   { key: 'review',     label: '评审中心',   icon: '📝', path: '/lesson-plans/review',     description: '人工评审教案' },
+  { key: 'textbooks',  label: '课本管理',   icon: '📷', path: '/lesson-plans/textbooks',  description: '上传课本图片供AI精准备课' },
   { key: 'components', label: '组件管理',   icon: '🧩', path: '/lesson-plans/components', description: '教学设计组件库' },
   { key: 'templates',  label: '提示词模板', icon: '📐', path: '/lesson-plans/templates',  description: '分层提示词模板配置' },
+  { key: 'stages-config', label: '阶段管理', icon: '⚙️', path: '/lesson-plans/stages-config', description: '备课阶段流程配置', adminOnly: true },
 ]
 
 const COLORS = {
@@ -39,6 +42,7 @@ const COLORS = {
 }
 
 export default function LPSidebar() {
+  const { user } = useAuth()
   const location = useLocation()
   const navigate = useNavigate()
   const [hoveredKey, setHoveredKey] = useState<string | null>(null)
@@ -85,7 +89,7 @@ export default function LPSidebar() {
       {/* 菜单列表 */}
       <nav style={{ flex: 1, padding: '16px 12px', overflowY: 'auto' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-          {menuItems.map((item) => {
+          {menuItems.filter(item => !item.adminOnly || user?.role === 'admin').map((item) => {
             const active = isActive(item.path)
             const hovered = hoveredKey === item.key
             return (
@@ -132,7 +136,7 @@ export default function LPSidebar() {
         </div>
       </nav>
 
-      {/* 底部：仅保留返回入口按钮（用户信息已移至顶部Header）*/}
+      {/* 底部：返回入口按钮 */}
       <div style={{ padding: '12px', borderTop: `1px solid ${COLORS.border}` }}>
         <button
           onClick={() => navigate('/')}

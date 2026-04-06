@@ -15,6 +15,7 @@
  * PRD §2.3 教研组长权限
  * PRD §7.1 状态路径二：共享沉淀（需要评审）
  * PRD §3.2 AI评审展示规范（人工评审参考同样原则）
+ * v56修改：移除页面内重复标题（LPLayout header已有标题）
  */
 import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -551,17 +552,14 @@ export default function ReviewCenterLPPage() {
   /* ==================== 渲染 ==================== */
   return (
     <div>
-      {/* 页面标题 */}
-      <div style={{ marginBottom: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-        <div>
-          <h1 style={{ fontSize: '20px', fontWeight: 600, color: C.text, margin: '0 0 4px 0' }}>评审中心</h1>
-          <p style={{ fontSize: '14px', color: C.textSec, margin: 0 }}>
-            审核组内教师提交的教案，通过评审的教案可共享到教研组库
-          </p>
-        </div>
+      {/* 描述 + 无教研组提示（标题已在LPLayout header中显示，此处不再重复） */}
+      <div style={{ marginBottom: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <p style={{ fontSize: '14px', color: C.textSec, margin: 0 }}>
+          审核组内教师提交的教案，通过评审的教案可共享到教研组库
+        </p>
         {/* 无教研组提示 */}
         {!loading && myGroups.length === 0 && (
-          <div style={{ padding: '8px 14px', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.2)', borderRadius: '8px', fontSize: '13px', color: C.warning }}>
+          <div style={{ padding: '8px 14px', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.2)', borderRadius: '8px', fontSize: '13px', color: C.warning, flexShrink: 0 }}>
             💡 你尚未加入教研组，暂时看不到待评审教案
           </div>
         )}

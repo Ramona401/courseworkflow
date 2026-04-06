@@ -9,6 +9,7 @@
  *   5. 骨架屏/空状态/错误重试
  *
  * PRD §7.3 教研组视角教案库
+ * v56修改：移除页面内重复标题（LPLayout header已有标题）
  */
 import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -363,12 +364,9 @@ export default function LibraryPage() {
   /* ==================== 渲染 ==================== */
   return (
     <div>
-      {/* 标题区 */}
-      <div style={{ marginBottom: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-        <div>
-          <h1 style={{ fontSize: '20px', fontWeight: 600, color: C.text, margin: '0 0 4px 0' }}>教案库</h1>
-          <p style={{ fontSize: '14px', color: C.textSec, margin: 0 }}>浏览共享教案，Fork优秀教案到我的草稿进行微调</p>
-        </div>
+      {/* 描述 + 新建按钮（标题已在LPLayout header中显示，此处不再重复） */}
+      <div style={{ marginBottom: '20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <p style={{ fontSize: '14px', color: C.textSec, margin: 0 }}>浏览共享教案，Fork优秀教案到我的草稿进行微调</p>
         <button
           onClick={() => navigate('/lesson-plans')}
           style={{

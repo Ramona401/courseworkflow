@@ -23,9 +23,10 @@ const STATUS_COLOR_MAP: Record<string, { bg: string; fg: string }> = {
   verified:         { bg: 'rgba(52,199,89,0.15)',   fg: '#248a3d' },
   verify_failed:    { bg: 'rgba(255,59,48,0.15)',   fg: '#d70015' },
   pending_finalize: { bg: 'rgba(204,102,0,0.12)',   fg: '#cc6600' },
+  published:        { bg: 'rgba(88,86,214,0.12)',   fg: '#5856d6' },
 }
 
-export function StatusBadge({ status, statusName }: { status: string; statusName: string }) {
+export function StatusBadge({ status, statusName, reviewRound }: { status: string; statusName: string; reviewRound?: number }) {
   const c = STATUS_COLOR_MAP[status] || STATUS_COLOR_MAP.pending
   const iconMap: Record<string, React.ReactNode> = {
     pending:          <Clock size={11} />,
@@ -45,7 +46,7 @@ export function StatusBadge({ status, statusName }: { status: string; statusName
       padding: '2px 8px', borderRadius: 20, fontSize: 11, fontWeight: 500,
       background: c.bg, color: c.fg, whiteSpace: 'nowrap',
     }}>
-      {iconMap[status]}{statusName}
+      {iconMap[status]}{statusName}{reviewRound && reviewRound >= 2 ? <span style={{ marginLeft: 3, fontSize: 9, fontWeight: 700, padding: '0 3px', borderRadius: 3, background: 'rgba(0,0,0,0.08)' }}>R{reviewRound}</span> : null}
     </span>
   )
 }

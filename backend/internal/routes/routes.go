@@ -2,18 +2,9 @@ package routes
 
 // routes.go — 路由注册主入口
 //
-// 职责：
-//   - 初始化所有服务层和处理器层
-//   - 注册公共路由（health/auth/account）
-//   - 调用各模块注册函数
-//   - CORS中间件
-//   - 健康检查处理器
-//   - 公共辅助函数（hasSuffix/indexOf/contains系列）
-//
-// 子文件：
-//   routes_pipeline.go   — Pipeline相关路由
-//   routes_lessonplan.go — 教案系统路由
-//   routes_admin.go      — Admin/用户/AI配置/提示词/课程路由
+// v73新增：wsStageService.SetGenService(lpGenService) 注入依赖
+//   WorkshopStageService.AdvanceStage 进入review/revise阶段时自动触发Chat，
+//   需要持有genService引用，通过SetGenService在routes层注入，避免循环依赖。
 
 import (
 	"context"
@@ -34,7 +25,6 @@ const roleAdmin          = "admin"
 const roleSeniorOperator = "senior_operator"
 const roleOperator       = "operator"
 
-// hasRole 判断角色是否在允许列表中
 func hasRole(role string, allowed ...string) bool {
 	for _, r := range allowed {
 		if role == r {
@@ -44,14 +34,12 @@ func hasRole(role string, allowed ...string) bool {
 	return false
 }
 
-// forbiddenJSON 返回403 JSON响应
 func forbiddenJSON(w http.ResponseWriter, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusForbidden)
 	json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": message})
 }
 
-// methodNotAllowedJSON 返回405 JSON响应
 func methodNotAllowedJSON(w http.ResponseWriter, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusMethodNotAllowed)
@@ -60,23 +48,30 @@ func methodNotAllowedJSON(w http.ResponseWriter, message string) {
 
 // ==================== 主入口 ====================
 
-// Setup 初始化所有服务/处理器，注册全部路由，返回根Handler
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
 	// ---- 初始化服务层 ----
-	authService    := services.NewAuthService(cfg)
-	userService    := services.NewUserService()
+	authService     := services.NewAuthService(cfg)
+	userService     := services.NewUserService()
 	aiConfigService := services.NewAIConfigService(cfg)
-	promptService  := services.NewPromptService()
-	edService      := services.NewExternalDataService(cfg)
-	courseService  := services.NewCourseService(cfg)
+	promptService   := services.NewPromptService()
+	edService       := services.NewExternalDataService(cfg)
+	courseService   := services.NewCourseService(cfg)
 	pipelineService := services.NewPipelineService(cfg)
-	orgService     := services.NewOrganizationService()
-	compService    := services.NewComponentService(cfg)
-	lpService      := services.NewLessonPlanService(compService)
-	lpGenService   := services.NewLessonPlanGenService(cfg)
-	roleService    := services.NewRoleService()
+	orgService      := services.NewOrganizationService()
+	compService     := services.NewComponentService(cfg)
+	lpService       := services.NewLessonPlanService(compService)
+	lpGenService    := services.NewLessonPlanGenService(cfg)
+	roleService     := services.NewRoleService()
+	recipeService   := services.NewRecipeService()
+	wsStageService  := services.NewWorkshopStageService()
+	assessService   := services.NewAssessmentService(recipeService, cfg)
+	tbService       := services.NewTextbookService(cfg)
+
+	// v73：注入genService到wsStageService，使review/revise阶段可自动触发Chat
+	// 必须在两个service都初始化完成后才能注入，避免循环依赖
+	wsStageService.SetGenService(lpGenService)
 
 	engine := services.NewEngine(8, 8, 100)
 	pipelineService.SetEngine(engine)
@@ -97,8 +92,12 @@ func Setup(cfg *config.Config) http.Handler {
 	compHandler     := handlers.NewComponentHandler(compService)
 	lpHandler       := handlers.NewLessonPlanHandler(lpService)
 	lpGenHandler    := handlers.NewLessonPlanGenHandler(lpGenService, authService)
+	recipeHandler   := handlers.NewRecipeHandler(recipeService, compService)
+	wsStageHandler  := handlers.NewWorkshopStageHandler(wsStageService)
+	assessHandler   := handlers.NewAssessmentHandler(assessService)
+	tbHandler       := handlers.NewTextbookHandler(tbService)
 
-	authMW   := middleware.AuthMiddleware(authService)
+	authMW    := middleware.AuthMiddleware(authService)
 	adminOnly := middleware.RequireRole(roleAdmin)
 
 	// ---- 健康检查（公开）----
@@ -138,7 +137,7 @@ func Setup(cfg *config.Config) http.Handler {
 	mux.Handle("/api/v1/auth/me",     middleware.Chain(http.HandlerFunc(authHandler.GetMe),    authMW))
 	mux.Handle("/api/v1/auth/logout", middleware.Chain(http.HandlerFunc(authHandler.Logout),   authMW))
 
-	// ---- 通用用户中心（所有已登录用户）----
+	// ---- 通用用户中心 ----
 	mux.Handle("/api/v1/account/profile", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -157,9 +156,9 @@ func Setup(cfg *config.Config) http.Handler {
 		http.HandlerFunc(pipelineHandler.GetDashboardStats), authMW))
 
 	// ---- 注册各模块路由 ----
-	registerAdminRoutes(mux, authMW, adminOnly, adminHandler, roleHandler, userHandler, aiConfigHandler, promptHandler, edHandler, courseHandler)
+	registerAdminRoutes(mux, authMW, adminOnly, adminHandler, roleHandler, userHandler, aiConfigHandler, promptHandler, edHandler, courseHandler, wsStageHandler)
 	registerPipelineRoutes(mux, authMW, pipelineHandler, sseHandler)
-	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler)
+	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler)
 
 	engine.StartGracefulShutdown()
 	return corsMiddleware(mux)
@@ -167,12 +166,10 @@ func Setup(cfg *config.Config) http.Handler {
 
 // ==================== 公共辅助函数 ====================
 
-// hasSuffix 判断路径是否以指定后缀结尾
 func hasSuffix(path string, suffix string) bool {
 	return len(path) >= len(suffix) && path[len(path)-len(suffix):] == suffix
 }
 
-// indexOf 字符串子串查找（不依赖strings包避免import冲突）
 func indexOf(s string, sub string) int {
 	for i := 0; i <= len(s)-len(sub); i++ {
 		if s[i:i+len(sub)] == sub {
@@ -182,7 +179,6 @@ func indexOf(s string, sub string) int {
 	return -1
 }
 
-// containsStepsWithName 判断是否为 /steps/{name} 格式（步骤详情）
 func containsStepsWithName(path string) bool {
 	idx := indexOf(path, "/steps/")
 	if idx < 0 {
@@ -192,32 +188,38 @@ func containsStepsWithName(path string) bool {
 	return len(remaining) > 0 && remaining != "/"
 }
 
-// containsPagesDecision 判断是否为页面决策路径
 func containsPagesDecision(path string) bool {
 	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/decision")
 }
 
-// containsPagesAIFix 判断是否为AI快修路径
+func containsPagesAIFixStream(path string) bool {
+	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/ai-fix-stream")
+}
+
 func containsPagesAIFix(path string) bool {
 	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/ai-fix")
 }
 
-// containsAdminMemberUID 判断路径是否包含 /members/{uid}（单个成员操作）
+func containsPagesRollback(path string) bool {
+	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/rollback")
+}
+
+func containsPagesHTML(path string) bool {
+	return indexOf(path, "/pages/") >= 0 && hasSuffix(path, "/html")
+}
+
 func containsAdminMemberUID(path string) bool {
 	idx := indexOf(path, "/members/")
 	if idx < 0 {
 		return false
 	}
 	rest := path[idx+len("/members/"):]
-	// 去除末尾斜杠
 	for len(rest) > 0 && rest[len(rest)-1] == '/' {
 		rest = rest[:len(rest)-1]
 	}
 	return len(rest) > 0
 }
 
-// containsUserGroupGID 判断路径是否为 /users/{uid}/groups/{gid} 格式
-// 用于区分加入（/groups）和移出（/groups/{gid}）
 func containsUserGroupGID(path string) bool {
 	idx := indexOf(path, "/groups/")
 	if idx < 0 {
@@ -294,7 +296,6 @@ func makeHealthHandler(engine *services.Engine) http.HandlerFunc {
 	}
 }
 
-// itoa 整数转字符串（避免引入strconv）
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
@@ -309,5 +310,4 @@ func itoa(n int) string {
 	return string(buf[pos:])
 }
 
-// 抑制itoa未使用警告
 var _ = itoa

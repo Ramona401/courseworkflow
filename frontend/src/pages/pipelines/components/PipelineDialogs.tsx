@@ -232,7 +232,7 @@ export function AssignDialog({
                   <div style={{ flex: 1 }}>
                     <div style={{ fontSize: 14, fontWeight: 600, color: '#1c1c1e' }}>{op.display_name}</div>
                     <div style={{ fontSize: 11, color: '#86868b' }}>
-                      {op.username} · {op.role === 'admin' ? '管理员' : op.role === 'senior_operator' ? '高级操作员' : '操作员'}
+                      {op.username} · {op.role === 'admin' ? '系统管理员' : op.role === 'senior_operator' ? '学校管理员' : '骨干教师'}
                     </div>
                   </div>
                   {selectedOperator === op.id && <CheckCircleIcon size={18} color="#5856d6" />}

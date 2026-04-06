@@ -7,6 +7,12 @@ package repository
  *   - ListAdminUsers   : 用户列表（含教研组/学校归属摘要）
  *   - GetAdminUserDetail: 用户详情（含课程分配+所有教研组）
  *   - GetAdminStats    : 统计摘要（用户数/组织数/教研组数/活跃数）
+ *
+ * 角色名称更新（与学校体系对齐）：
+ *   admin           → 系统管理员
+ *   senior_operator → 学校管理员
+ *   operator        → 骨干教师
+ *   viewer          → 普通教师
  */
 
 import (
@@ -101,15 +107,17 @@ type AdminStats struct {
 	ViewerCount         int `json:"viewer_count"`
 }
 
-// ==================== 角色中文名映射 ====================
+// ==================== 角色中文名映射（与学校体系对齐）====================
 
+// roleNameMap 系统角色中文名（英文code → 中文显示名）
 var roleNameMap = map[string]string{
-	"admin":           "管理员",
-	"senior_operator": "高级操作员",
-	"operator":        "操作员",
-	"viewer":          "查看者",
+	"admin":           "系统管理员",
+	"senior_operator": "学校管理员",
+	"operator":        "骨干教师",
+	"viewer":          "普通教师",
 }
 
+// memberRoleNameMap 教研组内成员角色中文名
 var memberRoleNameMap = map[string]string{
 	"member":   "普通成员",
 	"backbone": "骨干教师",
@@ -236,7 +244,7 @@ func ListAdminUsers(ctx context.Context, params AdminUserListParams) (*AdminUser
 			s := lastLoginAt.Format("2006-01-02 15:04:05")
 			item.LastLoginAt = &s
 		}
-		// 角色中文名
+		// 角色中文名（与学校体系对齐）
 		if n, ok := roleNameMap[item.Role]; ok {
 			item.RoleName = n
 		} else {
@@ -262,21 +270,12 @@ func ListAdminUsers(ctx context.Context, params AdminUserListParams) (*AdminUser
 
 // GetAdminUserDetail 获取用户详情（含课程分配+所有教研组归属）
 func GetAdminUserDetail(ctx context.Context, userID string) (*AdminUserDetailResult, error) {
-	// 1. 基础信息（复用列表查询，单用户）
-	listResult, err := ListAdminUsers(ctx, AdminUserListParams{
-		Page: 1, PageSize: 1,
-		// 通过单独查询而非keyword，精确匹配ID
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	// 直接查单个用户基础信息
 	var base AdminUserListItem
 	var lastLoginAt *time.Time
 	var createdAt time.Time
 
-	err = database.DB.QueryRow(ctx, `
+	err := database.DB.QueryRow(ctx, `
 		SELECT
 			u.id, u.username, u.display_name, u.role, u.status,
 			u.login_count, u.last_login_at, u.created_at,
@@ -311,6 +310,7 @@ func GetAdminUserDetail(ctx context.Context, userID string) (*AdminUserDetailRes
 		s := lastLoginAt.Format("2006-01-02 15:04:05")
 		base.LastLoginAt = &s
 	}
+	// 角色中文名（与学校体系对齐）
 	if n, ok := roleNameMap[base.Role]; ok {
 		base.RoleName = n
 	}
@@ -386,11 +386,10 @@ func GetAdminUserDetail(ctx context.Context, userID string) (*AdminUserDetailRes
 		groups = []AdminGroupMembership{}
 	}
 
-	_ = listResult
 	return &AdminUserDetailResult{
-		AdminUserListItem:  base,
-		CourseAssignments:  courses,
-		TeachingGroups:     groups,
+		AdminUserListItem: base,
+		CourseAssignments: courses,
+		TeachingGroups:    groups,
 	}, nil
 }
 

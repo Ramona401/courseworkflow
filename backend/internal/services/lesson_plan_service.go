@@ -139,6 +139,14 @@ func (s *LessonPlanService) GetLessonPlan(ctx context.Context, id string) (*mode
 		reviews = []*models.LessonPlanReviewItem{}
 	}
 
+	// Phase 7A：查询关联配方名称
+	recipeName := ""
+	if lp.RecipeID != nil && *lp.RecipeID != "" {
+		if recipe, err := repository.GetRecipeByID(ctx, *lp.RecipeID); err == nil {
+			recipeName = recipe.Name
+		}
+	}
+
 	// Phase6：查询关联Pipeline（如有）
 	var linkedPipelineID *string
 	linkedPipeline, err := repository.GetPipelineByLessonPlanID(id)
@@ -173,6 +181,10 @@ func (s *LessonPlanService) GetLessonPlan(ctx context.Context, id string) (*mode
 		ViewCount:         lp.ViewCount,
 		UseCount:          lp.UseCount,
 		Version:           lp.Version,
+		RecipeID:          lp.RecipeID,
+		RecipeName:        recipeName,
+                CurrentStage:     lp.CurrentStage,
+                StageConfig:      lp.StageConfig,
 		Reviews:           reviews,
 		LinkedPipelineID:  linkedPipelineID,
 		CreatedAt:         lp.CreatedAt,
