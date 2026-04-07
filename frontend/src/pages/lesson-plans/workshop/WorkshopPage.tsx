@@ -5,6 +5,8 @@
  *   P1：阶段隔离 + 用户手动完成触发
  *   P2：阶段过渡弹窗 + 结构化产出展示（方案B）
  *   P3：叙事式过渡动画
+ * 迭代12 新增：
+ *   阶段过渡时弹出组件推荐弹窗（方案B组件交互）
  */
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
@@ -12,7 +14,7 @@ import { useAuth } from '@/store/auth'
 import {
   startConversation, sendChatMessage, triggerAIReview, applyAISuggestions,
   publishLessonPlanPersonal, createLessonPlanSSE, getLessonPlan, getConversation,
-  getStageStatus, advanceStage, skipStage, backStage, getStageOutput,
+  getStageStatus, advanceStage, skipStage, backStage, getStageOutput, resetStage, switchToStage,
   type LessonPlan, type ConversationMessage, type AIReviewResult, type ConvComponent,
   type StageProgressItem, type StageEventData,
 } from '@/api/lesson-plans'
@@ -26,9 +28,13 @@ import {
 import {
   StageSummaryModal, StageTransitionView, StageSeparatorBubble,
 } from './components/WorkshopTransitionComponents'
+import StageComponentsModal from './components/StageComponentsModal'
 import { getAssessmentResult } from '@/api/assessment'
 
 const STAGE_SEP_PREFIX = '__STAGE_SEP__'
+
+// 迭代12：有组件映射的阶段列表（revise无组件）
+const STAGES_WITH_COMPONENTS = ['analyze', 'design', 'write', 'review']
 
 export default function WorkshopPage() {
   const { token } = useAuth()
@@ -71,7 +77,7 @@ export default function WorkshopPage() {
   const [showSummaryModal, setShowSummaryModal] = useState(false)
   const [summaryLoading, setSummaryLoading]     = useState(false)
   const [stageSummary, setStageSummary]         = useState('')
-  const [stageStructured, setStageStructured]   = useState('{}') // 新增：结构化产出
+  const [stageStructured, setStageStructured]   = useState('{}')
 
   // P3：过渡动画
   const [isTransitioning, setIsTransitioning]   = useState(false)
@@ -79,6 +85,13 @@ export default function WorkshopPage() {
   const [transitionInfo, setTransitionInfo]     = useState<{
     currentName: string; nextName: string; nextRole: string
   } | null>(null)
+
+  // 迭代12：阶段组件推荐弹窗状态
+  const [showComponentsModal, setShowComponentsModal] = useState(false)
+  const [pendingTransitionStage, setPendingTransitionStage] = useState<string | null>(null)
+
+  // v77：阶段视图切换状态（null=显示当前阶段，指定stageCode=查看该阶段历史对话）
+  const [viewingStage, setViewingStage] = useState<string | null>(null)
 
   const sseRef         = useRef<EventSource | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -137,7 +150,6 @@ export default function WorkshopPage() {
       onStageStarted: (_data: StageEventData) => { refreshStages(planId) },
       onStageComplete: (_data: StageEventData) => {
         // v75：AI不再发送stage_complete事件（标签体系已移除）
-        // 保留回调签名以兼容SSE类型定义，但不做任何操作
         setIsStageProcessing(false)
         refreshStages(planId)
       },
@@ -164,7 +176,7 @@ export default function WorkshopPage() {
           getConversation(effectivePlanId),
         ])
         setPlan(planData)
-        setMessages((convData.messages || []).filter(m => m.role === 'user' || m.role === 'assistant'))
+        setMessages((convData.messages || []).filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'system'))
         if (planData.content_markdown) setPlanContent(planData.content_markdown)
         if (planData.ai_review_result) {
           try {
@@ -254,7 +266,7 @@ export default function WorkshopPage() {
     } catch (err) { console.error('发布失败:', err); alert('发布失败，请稍后重试') }
   }
 
-  // ==================== P2：点击完成本阶段（方案B：同时加载structured）====================
+  // ==================== P2：点击完成本阶段 ====================
   const handleCompleteStageClick = async () => {
     if (!plan || !currentStage) return
     setSummaryLoading(true)
@@ -270,6 +282,44 @@ export default function WorkshopPage() {
       setStageStructured('{}')
     }
     setSummaryLoading(false)
+  }
+
+  // ==================== 迭代12：实际执行 advanceStage 并插入分隔符 ====================
+  const doAdvanceStage = async (planId: string, nextStageItem: StageProgressItem | null, selectedCompIds: string[]) => {
+    // 插入阶段分隔符气泡
+    if (nextStageItem) {
+      const sepMsg = {
+        id: `stage_sep_${Date.now()}`,
+        role: 'system' as const,
+        type: 'text' as const,
+        content: `${STAGE_SEP_PREFIX}${nextStageItem.stage_name}__${nextStageItem.ai_role}`,
+        created_at: new Date().toISOString(),
+      }
+      setMessages(prev => [...prev, sepMsg as ConversationMessage])
+    }
+    try {
+      await advanceStage(planId, undefined, selectedCompIds.length > 0 ? selectedCompIds : undefined)
+      await refreshStages(planId)
+      setAiSuggestsComplete(false)
+      setViewingStage(null)
+    } catch (err) { console.error('进入下一阶段失败:', err) }
+  }
+
+  // ==================== 迭代12：组件弹窗回调 ====================
+  const handleComponentsConfirm = async (selectedIds: string[]) => {
+    if (!plan) return
+    setShowComponentsModal(false)
+    const nextItem = stageItems.find(s => s.stage_code === pendingTransitionStage) || null
+    await doAdvanceStage(plan.id, nextItem, selectedIds)
+    setPendingTransitionStage(null)
+  }
+
+  const handleComponentsSkip = async () => {
+    if (!plan) return
+    setShowComponentsModal(false)
+    const nextItem = stageItems.find(s => s.stage_code === pendingTransitionStage) || null
+    await doAdvanceStage(plan.id, nextItem, [])
+    setPendingTransitionStage(null)
   }
 
   // ==================== P2+P3：确认进入下一阶段 ====================
@@ -289,6 +339,7 @@ export default function WorkshopPage() {
       return
     }
 
+    // P3：启动过渡动画
     setTransitionInfo({
       currentName: currentStageItem?.stage_name || currentStage,
       nextName: nextStageItem.stage_name,
@@ -300,30 +351,21 @@ export default function WorkshopPage() {
     const t1 = setTimeout(() => setTransitionStep(1), 700)
     const t2 = setTimeout(() => setTransitionStep(2), 1400)
 
-    let newStageResult: { stage_code: string; stage_name: string } | null = null
-    try {
-      newStageResult = await advanceStage(plan.id)
-      await refreshStages(plan.id)
-      setAiSuggestsComplete(false)
-    } catch (err) { console.error('进入下一阶段失败:', err) }
-
+    // 过渡动画结束后：判断是否需要组件弹窗
     const t3 = setTimeout(() => {
       setIsTransitioning(false)
       setTransitionStep(0)
       setTransitionInfo(null)
 
-      // 插入阶段分隔符气泡，标记新阶段开始
-      const sepMsg = {
-        id: `stage_sep_${Date.now()}`,
-        role: 'system' as const,
-        type: 'text' as const,
-        content: `${STAGE_SEP_PREFIX}${nextStageItem.stage_name}__${nextStageItem.ai_role}`,
-        created_at: new Date().toISOString(),
+      // 迭代12：判断下一阶段是否有组件映射
+      if (nextStageItem && STAGES_WITH_COMPONENTS.includes(nextStageItem.stage_code)) {
+        // 有组件映射 → 弹出组件推荐弹窗，暂不调用 advanceStage
+        setPendingTransitionStage(nextStageItem.stage_code)
+        setShowComponentsModal(true)
+      } else {
+        // 无组件映射（如revise）→ 直接进入下一阶段
+        doAdvanceStage(plan.id, nextStageItem, [])
       }
-      setMessages(prev => [...prev, sepMsg as ConversationMessage])
-      // 注意：不在前端发送触发消息
-      // 后端 AdvanceStage 的 autoTriggerStages 机制会自动触发 review/revise 阶段的 Chat
-      // 其他阶段（analyze/design/write）由用户自然对话推进，也不需要前端触发
     }, 2200)
 
     return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3) }
@@ -342,6 +384,37 @@ export default function WorkshopPage() {
       setAiSuggestsComplete(false)
       await refreshStages(plan.id)
     } catch (err) { console.error('回退阶段失败:', err) }
+  }
+
+  // 迭代12新增：重启指定阶段
+  const handleResetStage = async (stageCode: string) => {
+    if (!plan) return
+    const stageName = stageItems.find(s => s.stage_code === stageCode)?.stage_name || stageCode
+    if (!confirm(`确定要重启「${stageName}」阶段吗？\n\n该阶段及之后阶段的产出物和对话将被清空。`)) return
+    try {
+      await resetStage(plan.id, stageCode)
+      // v77：截断前端消息（保留目标阶段分隔符之前的消息）
+      const targetItem = stageItems.find(s => s.stage_code === stageCode)
+      if (targetItem) {
+        const sepIdx = messages.findIndex(m =>
+          (m.role as string) === 'system' && m.content.startsWith(STAGE_SEP_PREFIX) &&
+          m.content.includes(targetItem.stage_name)
+        )
+        if (sepIdx >= 0) {
+          setMessages(prev => prev.slice(0, sepIdx))
+        } else {
+          setMessages([])
+        }
+      } else {
+        setMessages([])
+      }
+      if (stageCode === 'write' || stageCode === 'revise') setPlanContent('')
+      setReview(null)
+      setAiSuggestsComplete(false)
+      setViewingStage(null)
+      await refreshStages(plan.id)
+      connectSSE(plan.id)
+    } catch (err) { console.error('重启阶段失败:', err); alert('重启阶段失败，请重试') }
   }
 
   // ==================== 恢复中 ====================
@@ -387,7 +460,8 @@ export default function WorkshopPage() {
 
   // ==================== 备课中 ====================
   const isAIActive = isThinking || !!streaming || isStageProcessing
-  const isBusy = isAIActive || reviewLoading || isTransitioning
+  const isViewingHistory = !!(viewingStage && viewingStage !== currentStage)
+  const isBusy = isAIActive || reviewLoading || isTransitioning || isViewingHistory
   const canCompleteStage = isStageMode && currentStage && !isAIActive && !isTransitioning && !summaryLoading
 
   const currentStageIdx = stageItems.findIndex(s => s.stage_code === currentStage)
@@ -421,10 +495,13 @@ export default function WorkshopPage() {
           isStageMode && stageItems.length > 0
             ? stageItems.map(stage => {
                 const isCurrent = stage.stage_code === currentStage
+                const isViewing = viewingStage === stage.stage_code
                 const statusColor = STAGE_STATUS_COLOR[stage.status] || C.textMuted
                 const statusIcon  = STAGE_STATUS_ICON[stage.status]  || '○'
+                // v77：点击阶段切换查看历史对话（已完成/进行中的阶段才可点击）
+                const canView = stage.status === 'completed' || stage.status === 'in_progress' || isCurrent
                 return (
-                  <div key={stage.stage_code} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 10px', borderRadius: '8px', background: isCurrent ? C.primaryLight : 'transparent', transition: 'background 150ms ease' }}>
+                  <div key={stage.stage_code} onClick={() => { if (canView) setViewingStage(isViewing || isCurrent ? null : stage.stage_code) }} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 10px', borderRadius: '8px', background: isViewing ? 'rgba(79,123,232,0.12)' : isCurrent ? C.primaryLight : 'transparent', transition: 'background 150ms ease', cursor: canView ? 'pointer' : 'default', border: isViewing ? '1px solid rgba(79,123,232,0.3)' : '1px solid transparent' }}>
                     <div style={{ width: '22px', height: '22px', borderRadius: '50%', flexShrink: 0, background: stage.status === 'completed' ? C.success : isCurrent ? C.primary : '#E5E7EB', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '10px', color: '#fff', fontWeight: 700, border: isCurrent && stage.status !== 'completed' ? `2px solid ${C.primary}` : 'none' }}>
                       {stage.status === 'completed' ? '✓' : stage.status === 'skipped' ? '⊘' : stage.stage_order}
                     </div>
@@ -509,7 +586,42 @@ export default function WorkshopPage() {
               🔄 已恢复历史对话，可继续备课
             </div>
           )}
-          {messages.map(msg => {
+          {(() => {
+            // v77：按阶段分隔符过滤消息 — viewingStage非null时只显示该阶段的消息
+            const targetStage = viewingStage || currentStage
+            let filteredMsgs = messages
+            if (isStageMode && targetStage && stageItems.length > 0) {
+              // 找到目标阶段的分隔符索引和下一个分隔符索引
+              let startIdx = -1
+              let endIdx = messages.length
+              for (let i = 0; i < messages.length; i++) {
+                const m = messages[i]
+                if ((m.role as string) === 'system' && m.content.startsWith(STAGE_SEP_PREFIX)) {
+                  const rest = m.content.slice(STAGE_SEP_PREFIX.length)
+                  const sepStageName = rest.split('__')[0] || ''
+                  const matchItem = stageItems.find(s => s.stage_name === sepStageName || s.stage_code === sepStageName)
+                  if (matchItem && matchItem.stage_code === targetStage) {
+                    startIdx = i  // 包含分隔符本身
+                  } else if (startIdx >= 0 && endIdx === messages.length) {
+                    endIdx = i  // 下一个分隔符位置
+                  }
+                }
+              }
+              if (startIdx >= 0) {
+                filteredMsgs = messages.slice(startIdx, endIdx)
+              } else if (targetStage === stageItems[0]?.stage_code) {
+                // 第一个阶段没有分隔符，显示从头到第一个分隔符之前的消息
+                const firstSepIdx = messages.findIndex(m => (m.role as string) === 'system' && m.content.startsWith(STAGE_SEP_PREFIX))
+                filteredMsgs = firstSepIdx >= 0 ? messages.slice(0, firstSepIdx) : messages
+              }
+            }
+            // v77：过滤掉系统自动触发的指令消息（不显示给用户）
+            return filteredMsgs.filter(m => {
+              if (m.role === 'user' && m.content.startsWith('我们进入') && m.content.includes('阶段了。请先简要介绍')) return false
+              if (m.role === 'user' && m.content === '请对上一阶段完成的教案进行全面专业评审，直接输出评审报告，包含各维度评分和改进建议。') return false
+              return true
+            })
+          })().map(msg => {
             if ((msg.role as string) === 'system' && msg.content.startsWith(STAGE_SEP_PREFIX)) {
               const rest = msg.content.slice(STAGE_SEP_PREFIX.length)
               const [stageName, aiRole] = rest.split('__')
@@ -525,6 +637,17 @@ export default function WorkshopPage() {
           {isThinking && !streaming && <ThinkingIndicator />}
           <div ref={messagesEndRef} />
         </div>
+
+        {isStageMode && viewingStage && viewingStage !== currentStage && (
+          <div style={{ padding: '9px 20px', background: 'linear-gradient(135deg, rgba(79,123,232,0.08), rgba(129,140,248,0.05))', borderTop: '1px solid rgba(79,123,232,0.18)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '13px' }}>
+            <span style={{ color: C.primary }}>📖 正在查看「{stageItems.find(s => s.stage_code === viewingStage)?.stage_name || viewingStage}」阶段的历史对话</span>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <button onClick={async () => { if (!plan) return; try { await switchToStage(plan.id, viewingStage!); await refreshStages(plan.id); setViewingStage(null) } catch { alert('回退失败') } }} style={{ padding: '4px 12px', borderRadius: '12px', border: '1px solid #10B981', background: 'transparent', fontSize: '12px', color: '#10B981', cursor: 'pointer' }}>💬 继续该阶段对话</button>
+              <button onClick={() => { handleResetStage(viewingStage!) }} style={{ padding: '4px 12px', borderRadius: '12px', border: '1px solid #EF4444', background: 'transparent', fontSize: '12px', color: '#EF4444', cursor: 'pointer' }}>🔄 重启该阶段</button>
+              <button onClick={() => setViewingStage(null)} style={{ padding: '4px 12px', borderRadius: '12px', border: `1px solid ${C.primary}`, background: 'transparent', fontSize: '12px', color: C.primary, cursor: 'pointer' }}>回到当前阶段 →</button>
+            </div>
+          </div>
+        )}
 
         {isStageMode && aiSuggestsComplete && !isTransitioning && (
           <div style={{ padding: '9px 20px', background: 'linear-gradient(135deg, rgba(16,185,129,0.08), rgba(52,211,153,0.05))', borderTop: '1px solid rgba(16,185,129,0.18)', display: 'flex', alignItems: 'center', gap: '10px', fontSize: '13px' }}>
@@ -556,7 +679,6 @@ export default function WorkshopPage() {
 
           <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
             {[
-              // 阶段模式下隐藏"AI评审"快捷按钮，避免触发旧评审路径覆盖阶段评审分数
               ...(!isStageMode ? [{ label: '🔍 AI评审', action: handleTriggerReview, disabled: isBusy }] : []),
               { label: '📄 预览教案', action: () => setRightPanel('preview'), disabled: false },
               ...(isStageMode ? [{ label: '📊 阶段产出', action: () => setRightPanel('stages'), disabled: false }] : []),
@@ -578,6 +700,7 @@ export default function WorkshopPage() {
           {isStageMode && currentStageIdx > 0 && (
             <div style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
               <button onClick={handleBackStageQuick} disabled={isBusy} style={{ padding: '4px 10px', borderRadius: '12px', border: `1px solid ${C.border}`, background: 'transparent', fontSize: '11px', color: C.textMuted, cursor: isBusy ? 'not-allowed' : 'pointer' }}>← 回到上一阶段</button>
+              <button onClick={() => handleResetStage(currentStage)} disabled={isBusy} style={{ padding: '4px 10px', borderRadius: '12px', border: `1px solid ${C.border}`, background: 'transparent', fontSize: '11px', color: '#EF4444', cursor: isBusy ? 'not-allowed' : 'pointer' }}>🔄 重启本阶段</button>
               {nextStageForSummary?.skippable && (
                 <button onClick={handleSkipStageQuick} disabled={isBusy} style={{ padding: '4px 10px', borderRadius: '12px', border: `1px solid ${C.border}`, background: 'transparent', fontSize: '11px', color: C.textMuted, cursor: isBusy ? 'not-allowed' : 'pointer' }}>跳过下一阶段 →</button>
               )}
@@ -613,7 +736,7 @@ export default function WorkshopPage() {
             </div>
           )}
           {rightPanel === 'review' && (
-            review
+            review && review.total_score
               ? <ReviewPanel review={review} onApply={handleApplySuggestions} applying={applyingReview} isStageMode={isStageMode} />
               : <div style={{ height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: C.textMuted, textAlign: 'center', padding: '24px' }}>
                   <div style={{ fontSize: '32px', marginBottom: '12px' }}>🤖</div>
@@ -636,7 +759,7 @@ export default function WorkshopPage() {
               {stageItems.length > 0 ? (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                   {stageItems.map(stage => (
-                    <div key={stage.stage_code} style={{ padding: '14px 16px', borderRadius: '10px', border: `1px solid ${stage.stage_code === currentStage ? C.primary : C.border}`, background: stage.status === 'completed' ? 'rgba(16,185,129,0.04)' : C.card }}>
+                    <div key={stage.stage_code} onClick={() => { const canClick = stage.status === 'completed' || stage.status === 'in_progress'; if (canClick) setViewingStage(stage.stage_code === currentStage ? null : stage.stage_code) }} style={{ padding: '14px 16px', borderRadius: '10px', border: `1px solid ${viewingStage === stage.stage_code ? 'rgba(79,123,232,0.5)' : stage.stage_code === currentStage ? C.primary : C.border}`, background: viewingStage === stage.stage_code ? 'rgba(79,123,232,0.06)' : stage.status === 'completed' ? 'rgba(16,185,129,0.04)' : C.card, cursor: stage.status === 'completed' || stage.status === 'in_progress' ? 'pointer' : 'default', transition: 'all 150ms ease' }}>
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                           <span style={{ fontSize: '14px' }}>{STAGE_CODE_EMOJI[stage.stage_code] || '📋'}</span>
@@ -669,7 +792,19 @@ export default function WorkshopPage() {
         )}
       </div>
 
-      {/* P2弹窗（方案B：传stageCode + structuredOutput）*/}
+      {/* 迭代12：阶段组件推荐弹窗 */}
+      {showComponentsModal && plan && pendingTransitionStage && (
+        <StageComponentsModal
+          planId={plan.id}
+          stageCode={pendingTransitionStage}
+          stageName={stageItems.find(s => s.stage_code === pendingTransitionStage)?.stage_name || pendingTransitionStage}
+          onConfirm={handleComponentsConfirm}
+          onSkip={handleComponentsSkip}
+          onCancel={() => { setShowComponentsModal(false); setPendingTransitionStage(null) }}
+        />
+      )}
+
+      {/* P2弹窗 */}
       {showSummaryModal && plan && (
         <StageSummaryModal
           stageCode={currentStage}

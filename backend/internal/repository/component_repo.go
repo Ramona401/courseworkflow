@@ -352,8 +352,8 @@ func MatchComponents(ctx context.Context, req *models.MatchComponentsRequest) ([
 		SELECT library_type, id, display_label, COALESCE(design_logic, ''), COALESCE(example_snippet, ''),
 		       COALESCE(full_guide, ''), quality_score, usage_count, select_count, tags
 		FROM (
-			SELECT c.library_type, c.id, c.display_label, COALESCE(c.design_logic, ''), COALESCE(c.example_snippet, ''),
-			       COALESCE(c.full_guide, ''), c.quality_score, c.usage_count, c.select_count, c.tags,
+			SELECT c.library_type, c.id, c.display_label, COALESCE(c.design_logic, '') AS design_logic, COALESCE(c.example_snippet, '') AS example_snippet,
+			       COALESCE(c.full_guide, '') AS full_guide, c.quality_score, c.usage_count, c.select_count, c.tags,
 			       ROW_NUMBER() OVER (PARTITION BY c.library_type ORDER BY c.quality_score DESC, c.select_count DESC) AS rn
 			FROM lesson_plan_components c
 			%s

@@ -64,7 +64,6 @@ type SceneConfigResponse struct {
 	ID             string     `json:"id"`               // UUID
 	SceneCode      string     `json:"scene_code"`       // 场景代码
 	SceneName      string     `json:"scene_name"`       // 场景中文名
-	SceneGroup     string     `json:"scene_group"`      // 场景分组：lesson_plan=教案备课 / pipeline=Pipeline
 	Model          *string    `json:"model"`            // 模型
 	Temperature    *float64   `json:"temperature"`      // 温度
 	MaxTokens      *int       `json:"max_tokens"`       // 最大Token
@@ -95,16 +94,10 @@ const (
 	SceneReviewer        = "reviewer"         // 审核检查（Prompt D）→ Opus
 	SceneGenerator       = "generator"        // 页面生成-修改（Prompt F）→ Sonnet
 	SceneGeneratorCreate = "generator_create" // 页面生成-新增（Prompt F）→ Opus（从零创建）
-	SceneGeneratorMerge  = "generator_merge" // 页面生成-合并（Prompt F）→ Opus（复杂合并）
-	SceneAIFix           = "ai_fix"           // AI快修（Sonnet）  // 页面生成-合并（Prompt F）→ Opus（复杂合并）
+	SceneGeneratorMerge  = "generator_merge"  // 页面生成-合并（Prompt F）→ Opus（复杂合并）
 )
 
 // ValidSceneCodes 有效场景代码列表（含新增的generator子场景）
-// 教案备课场景代码常量（v78新增）
-const (
-	SceneLessonPlan = "lesson_plan" // 教案备课对话
-)
-
 var ValidSceneCodes = []string{
 	SceneScanner, SceneEvaluator, SceneMeta,
 	SceneTranslator, SceneReviewer,
@@ -121,23 +114,6 @@ var SceneNameMap = map[string]string{
 	SceneGenerator:       "页面生成-修改",
 	SceneGeneratorCreate: "页面生成-新增",
 	SceneGeneratorMerge:  "页面生成-合并",
-	SceneAIFix:           "AI快修",
-	SceneLessonPlan:      "教案备课对话",
-}
-
-
-// SceneGroupMap 场景代码→分组映射（v78新增）
-var SceneGroupMap = map[string]string{
-	SceneScanner:         "pipeline",
-	SceneEvaluator:       "pipeline",
-	SceneMeta:            "pipeline",
-	SceneTranslator:      "pipeline",
-	SceneReviewer:        "pipeline",
-	SceneGenerator:       "pipeline",
-	SceneGeneratorCreate: "pipeline",
-	SceneGeneratorMerge:  "pipeline",
-	SceneAIFix:           "pipeline",
-	SceneLessonPlan:      "lesson_plan",
 }
 
 // IsValidSceneCode 检查场景代码是否有效

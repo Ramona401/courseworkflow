@@ -4,10 +4,8 @@ package handlers
 //
 // Phase 7B 新增：6个REST接口（阶段操作）
 // 迭代5 新增：4个REST接口（自定义阶段CRUD）
-//   GET    /api/v1/lesson-plans/recipes/{id}/custom-stages           — 获取配方自定义阶段列表
-//   POST   /api/v1/lesson-plans/recipes/{id}/custom-stages           — 创建自定义阶段
-//   PUT    /api/v1/lesson-plans/recipes/{id}/custom-stages/{code}    — 更新自定义阶段
-//   DELETE /api/v1/lesson-plans/recipes/{id}/custom-stages/{code}    — 删除自定义阶段
+// 迭代12 新增：1个REST接口（阶段推荐组件）
+//   GET    /api/v1/lesson-plans/plans/{id}/stages/{code}/recommended-components — 获取阶段推荐组件
 
 import (
 	"encoding/json"
@@ -92,9 +90,66 @@ func (h *WorkshopStageHandler) GetStageOutput(w http.ResponseWriter, r *http.Req
 	utils.Success(w, resp)
 }
 
+// ==================== 迭代12新增：重启指定阶段 ====================
+
+// ResetStage POST /api/v1/lesson-plans/plans/{id}/stages/reset
+// 重启指定阶段：清空该阶段及后续阶段产出物，重置当前阶段，清空对话，重新触发开场白
+func (h *WorkshopStageHandler) ResetStage(w http.ResponseWriter, r *http.Request) {
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	planID := extractPlanIDBeforeStages(r.URL.Path)
+	if planID == "" {
+		utils.BadRequest(w, "教案ID无效")
+		return
+	}
+
+	var req models.ResetStageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TargetStageCode == "" {
+		utils.BadRequest(w, "请指定要重启的阶段代码")
+		return
+	}
+
+	stage, err := h.stageService.ResetStage(r.Context(), planID, req.TargetStageCode, claims.UserID)
+	if err != nil {
+		handleStageError(w, err)
+		return
+	}
+	utils.Success(w, stage)
+}
+
+// ==================== 迭代12新增：获取阶段推荐组件 ====================
+
+// GetStageRecommendedComponents GET /api/v1/lesson-plans/plans/{id}/stages/{code}/recommended-components
+// 获取指定阶段的推荐教学组件列表，供用户在阶段过渡时勾选
+func (h *WorkshopStageHandler) GetStageRecommendedComponents(w http.ResponseWriter, r *http.Request) {
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	planID, stageCode := extractPlanIDAndStageCode(r.URL.Path)
+	if planID == "" || stageCode == "" {
+		utils.BadRequest(w, "教案ID或阶段代码无效")
+		return
+	}
+
+	resp, err := h.stageService.GetRecommendedComponents(r.Context(), planID, stageCode, claims.UserID)
+	if err != nil {
+		handleStageError(w, err)
+		return
+	}
+	utils.Success(w, resp)
+}
+
 // ==================== 进入下一阶段 ====================
 
 // AdvanceStage POST /api/v1/lesson-plans/plans/{id}/stages/advance
+// 迭代12增强：支持 selected_component_ids 参数，用户在阶段过渡弹窗选中组件后传入
 func (h *WorkshopStageHandler) AdvanceStage(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
@@ -108,13 +163,21 @@ func (h *WorkshopStageHandler) AdvanceStage(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	var req models.AdvanceStageRequest
+	// 迭代12：尝试解析带组件ID的请求体
+	var req models.AdvanceStageWithComponentsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		// body可以为空，默认进入下一个
-		req = models.AdvanceStageRequest{}
+		req = models.AdvanceStageWithComponentsRequest{}
 	}
 
-	stage, err := h.stageService.AdvanceStage(r.Context(), planID, req.TargetStageCode, claims.UserID)
+	// 如果有选中组件，走带组件的逻辑
+	var stage interface{}
+	var err error
+	if len(req.SelectedComponentIDs) > 0 {
+		stage, err = h.stageService.AdvanceStageWithComponents(r.Context(), planID, req.TargetStageCode, claims.UserID, req.SelectedComponentIDs)
+	} else {
+		stage, err = h.stageService.AdvanceStage(r.Context(), planID, req.TargetStageCode, claims.UserID)
+	}
 	if err != nil {
 		handleStageError(w, err)
 		return
@@ -301,7 +364,7 @@ func extractPlanIDAndStageCode(path string) (string, string) {
 		}
 		if p == "stages" && i+1 < len(parts) {
 			candidate := parts[i+1]
-			// 排除操作路径（advance/skip/back）
+			// 排除操作路径（advance/skip/back/defaults）
 			if candidate != "advance" && candidate != "skip" && candidate != "back" && candidate != "defaults" {
 				stageCode = candidate
 			}
@@ -465,3 +528,34 @@ func (h *WorkshopStageHandler) UpdateSystemStage(w http.ResponseWriter, r *http.
 	}
 	utils.Success(w, updated)
 }
+
+// SwitchToStage 切换到指定阶段继续对话（v77d新增）
+// POST /api/v1/lesson-plans/plans/{id}/stages/switch
+// 只更新current_stage，不清产出物、不清对话、不触发AI开场白
+func (h *WorkshopStageHandler) SwitchToStage(w http.ResponseWriter, r *http.Request) {
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	planID := extractPlanIDBeforeStages(r.URL.Path)
+	if planID == "" {
+		utils.BadRequest(w, "教案ID无效")
+		return
+	}
+
+	var req models.ResetStageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TargetStageCode == "" {
+		utils.BadRequest(w, "请指定要切换的阶段代码")
+		return
+	}
+
+	stage, err := h.stageService.SwitchToStage(r.Context(), planID, req.TargetStageCode, claims.UserID)
+	if err != nil {
+		handleStageError(w, err)
+		return
+	}
+	utils.Success(w, stage)
+}
+

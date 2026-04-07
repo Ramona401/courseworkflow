@@ -20,6 +20,10 @@ package services
 //   3. 改用 ExtractStructuredFromNaturalReply 从自然语言中提取结构化数据
 //   4. 不再推送 LPSSEStageComplete 事件 — 阶段完成由用户手动控制
 //   5. genStageOpeningMessage 去掉 CleanStageMarkers 调用
+//
+// v78 改动：
+//   1. 所有 GetEffectiveConfig 调用传入 sceneCode="lesson_plan"，支持独立模型场景配置
+//   2. 教案生成可在AI配置中心独立配置模型/温度/max_tokens，不再依赖全局默认模型
 
 import (
 	"context"
@@ -45,6 +49,12 @@ var (
 	ErrLPGenUnauthorized    = errors.New("无权操作此教案")
 	ErrLPGenNotEditable     = errors.New("教案当前状态不可编辑")
 )
+
+// ==================== 常量定义 ====================
+
+// lessonPlanSceneCode 教案生成场景代码，用于从ai_scene_configs获取独立模型配置
+// v78新增：教案生成不再使用全局默认模型，改为独立场景配置
+const lessonPlanSceneCode = "lesson_plan"
 
 // ==================== 服务结构体 ====================
 
@@ -174,6 +184,7 @@ func (s *LessonPlanGenService) StartConversation(
 // genStageOpeningMessage 阶段模式下生成第一阶段的AI开场白
 //
 // v75改动：去掉 CleanStageMarkers 调用，AI不再输出标签
+// v78改动：sceneCode改为lessonPlanSceneCode，使用独立场景配置
 func (s *LessonPlanGenService) genStageOpeningMessage(
 	ctx context.Context,
 	lp *models.LessonPlan,
@@ -192,7 +203,8 @@ func (s *LessonPlanGenService) genStageOpeningMessage(
 
 	userPrompt := BuildStageOpeningPrompt(lp, stage, snapshots[0].StageOrder, len(snapshots))
 
-	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), "", "", "", "")
+	// v78改动：传入lessonPlanSceneCode，使用教案生成独立场景配置
+	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
 	if err != nil {
 		return nil, fmt.Errorf("AI配置加载失败: %w", err)
 	}
@@ -282,6 +294,8 @@ func (s *LessonPlanGenService) Chat(
 //   3. 不再调用 ParseStageOutput / DetectStageComplete
 //   4. 不再推送 LPSSEStageComplete 事件 — 阶段完成由用户手动点击按钮
 //   5. write/revise阶段防重复生成逻辑保留
+//
+// v78改动：sceneCode改为lessonPlanSceneCode，使用独立场景配置
 func (s *LessonPlanGenService) processChatStageAsync(
 	ctx context.Context,
 	lp *models.LessonPlan,
@@ -299,8 +313,8 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		MessageID: generateMsgID(),
 	})
 
-	// 加载AI配置
-	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), "", "", "", "")
+	// v78改动：传入lessonPlanSceneCode，使用教案生成独立场景配置
+	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
 	if err != nil {
 		s.broadcastError(planID, "AI配置加载失败: "+err.Error())
 		return
@@ -318,7 +332,9 @@ func (s *LessonPlanGenService) processChatStageAsync(
 	// 如果教案正文已经有内容（之前已成功生成），追加指令防止AI重新生成整篇教案
 	if currentStage == "write" {
 		latestLP, freshErr := repository.GetLessonPlanByID(ctx, planID)
-		if freshErr == nil && strings.TrimSpace(latestLP.ContentMarkdown) != "" {
+		// v76修复：只有教案内容超过2000字符才注入防重复指令
+		// 短于2000字符说明可能是不完整的提取，应允许AI重新生成
+		if freshErr == nil && len(strings.TrimSpace(latestLP.ContentMarkdown)) > 2000 {
 			contentLen := len(latestLP.ContentMarkdown)
 			stageSystemPrompt += fmt.Sprintf(`
 
@@ -510,6 +526,7 @@ func (s *LessonPlanGenService) handleWriteStageOutput(
 	lpGenLog.Info("write/revise阶段教案正文已更新", "plan_id", planID, "content_len", len(content))
 }
 
+// handleReviewStageOutput 处理review阶段产出物——解析评审结果并保存到教案
 func (s *LessonPlanGenService) handleReviewStageOutput(
 	ctx context.Context,
 	planID string,
@@ -554,6 +571,7 @@ func (s *LessonPlanGenService) handleReviewStageOutput(
 
 // ==================== 3. 触发AI评审 ====================
 
+// TriggerAIReview 触发AI质量评审（异步执行，结果通过SSE推送）
 func (s *LessonPlanGenService) TriggerAIReview(
 	ctx context.Context,
 	planID string,
@@ -574,6 +592,9 @@ func (s *LessonPlanGenService) TriggerAIReview(
 	return nil
 }
 
+// executeAIReviewAsync 异步执行AI评审
+//
+// v78改动：sceneCode改为lessonPlanSceneCode，使用独立场景配置
 func (s *LessonPlanGenService) executeAIReviewAsync(ctx context.Context, lp *models.LessonPlan) {
 	planID := lp.ID
 
@@ -582,7 +603,8 @@ func (s *LessonPlanGenService) executeAIReviewAsync(ctx context.Context, lp *mod
 		PlanID:    planID,
 	})
 
-	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), "", "", "", "")
+	// v78改动：传入lessonPlanSceneCode，使用教案生成独立场景配置
+	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
 	if err != nil {
 		s.broadcastError(planID, "AI评审配置失败: "+err.Error())
 		return
@@ -634,6 +656,7 @@ func (s *LessonPlanGenService) executeAIReviewAsync(ctx context.Context, lp *mod
 
 // ==================== 4. 应用AI建议 ====================
 
+// ApplyAISuggestions 将AI评审建议应用到教案内容（异步优化+重新评审）
 func (s *LessonPlanGenService) ApplyAISuggestions(
 	ctx context.Context,
 	req *models.ApplyAISuggestionsRequest,
@@ -657,6 +680,9 @@ func (s *LessonPlanGenService) ApplyAISuggestions(
 	return nil
 }
 
+// applyAndReviewAsync 异步应用建议并重新评审
+//
+// v78改动：sceneCode改为lessonPlanSceneCode，使用独立场景配置
 func (s *LessonPlanGenService) applyAndReviewAsync(
 	ctx context.Context,
 	lp *models.LessonPlan,
@@ -669,7 +695,8 @@ func (s *LessonPlanGenService) applyAndReviewAsync(
 		PlanID:    planID,
 	})
 
-	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), "", "", "", "")
+	// v78改动：传入lessonPlanSceneCode，使用教案生成独立场景配置
+	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
 	if err != nil {
 		s.broadcastError(planID, "AI配置失败: "+err.Error())
 		return
@@ -713,6 +740,7 @@ func (s *LessonPlanGenService) applyAndReviewAsync(
 
 // ==================== 5. 获取对话历史 ====================
 
+// GetConversation 获取教案对话历史
 func (s *LessonPlanGenService) GetConversation(
 	ctx context.Context,
 	planID string,
@@ -733,6 +761,7 @@ func (s *LessonPlanGenService) GetConversation(
 
 // ==================== 内部辅助方法 ====================
 
+// checkPlanEditable 检查教案是否存在、归属正确、且处于可编辑状态
 func (s *LessonPlanGenService) checkPlanEditable(ctx context.Context, planID string, callerID string) (*models.LessonPlan, error) {
 	lp, err := repository.GetLessonPlanByID(ctx, planID)
 	if err != nil {
@@ -753,14 +782,17 @@ func (s *LessonPlanGenService) checkPlanEditable(ctx context.Context, planID str
 	return lp, nil
 }
 
+// appendMessage 追加消息到教案对话历史
 func (s *LessonPlanGenService) appendMessage(ctx context.Context, planID string, msg *models.ConversationMessage) error {
 	return repository.AppendConversationMessage(ctx, planID, msg)
 }
 
+// loadConversation 加载教案对话历史
 func (s *LessonPlanGenService) loadConversation(ctx context.Context, planID string) ([]*models.ConversationMessage, error) {
 	return repository.GetConversationLog(ctx, planID)
 }
 
+// resolveTemplateForGen 解析教案生成模板（暂保留，未来可能恢复使用）
 func (s *LessonPlanGenService) resolveTemplateForGen(ctx context.Context, templateID string, subject string) (systemPrompt string, genRules string) {
 	if templateID != "" {
 		resolved, err := repository.ResolvePromptTemplateChain(ctx, templateID)
@@ -771,10 +803,12 @@ func (s *LessonPlanGenService) resolveTemplateForGen(ctx context.Context, templa
 	return buildDefaultSystemPrompt(subject), buildDefaultGenRules()
 }
 
+// resolveTemplateForReview 解析评审模板
 func (s *LessonPlanGenService) resolveTemplateForReview(ctx context.Context, subject string) (systemPrompt string, reviewRules string) {
 	return buildReviewSystemPrompt(subject), buildDefaultReviewRules(subject)
 }
 
+// broadcastError 通过SSE推送错误消息给前端
 func (s *LessonPlanGenService) broadcastError(planID string, msg string) {
 	GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
 		EventType: models.LPSSEError,
@@ -783,6 +817,7 @@ func (s *LessonPlanGenService) broadcastError(planID string, msg string) {
 	})
 }
 
+// parseAIReply 解析AI回复，判断消息类型（普通文本/教案内容/组件推荐）
 func (s *LessonPlanGenService) parseAIReply(ctx context.Context, content string, lp *models.LessonPlan) *models.ConversationMessage {
 	msg := &models.ConversationMessage{
 		ID:        generateMsgID(),
@@ -814,6 +849,9 @@ func (s *LessonPlanGenService) parseAIReply(ctx context.Context, content string,
 	return msg
 }
 
+// genOpeningMessage 旧版开场白生成（保留兼容，已不常用）
+//
+// v78改动：sceneCode改为lessonPlanSceneCode，使用独立场景配置
 func (s *LessonPlanGenService) genOpeningMessage(
 	ctx context.Context,
 	req *models.StartConversationRequest,
@@ -821,7 +859,8 @@ func (s *LessonPlanGenService) genOpeningMessage(
 	genRules string,
 	backgroundContext string,
 ) (*models.ConversationMessage, error) {
-	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), "", "", "", "")
+	// v78改动：传入lessonPlanSceneCode，使用教案生成独立场景配置
+	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
 	if err != nil {
 		return nil, err
 	}

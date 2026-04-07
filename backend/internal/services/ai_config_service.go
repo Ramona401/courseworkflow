@@ -516,6 +516,7 @@ func (s *AIConfigService) GetAllSceneConfigs() ([]*models.SceneConfigResponse, e
 			ID:             sc.ID,
 			SceneCode:      sc.SceneCode,
 			SceneName:      models.SceneNameMap[sc.SceneCode],
+				SceneGroup:     models.SceneGroupMap[sc.SceneCode],
 			Model:          sc.Model,
 			Temperature:    sc.Temperature,
 			MaxTokens:      sc.MaxTokens,
@@ -523,7 +524,14 @@ func (s *AIConfigService) GetAllSceneConfigs() ([]*models.SceneConfigResponse, e
 			IsActive:       sc.IsActive,
 			UpdatedAt:      sc.UpdatedAt,
 		}
-		result = append(result, resp)
+		// 兜底：未注册的场景给默认值
+			if resp.SceneName == "" {
+				resp.SceneName = sc.SceneCode
+			}
+			if resp.SceneGroup == "" {
+				resp.SceneGroup = "pipeline"
+			}
+			result = append(result, resp)
 	}
 	return result, nil
 }

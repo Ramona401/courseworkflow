@@ -485,6 +485,39 @@ func SkipStageOutput(ctx context.Context, lessonPlanID string, stageCode string)
 	return nil
 }
 
+// ResetStageOutput 重置单个阶段的产出物为初始状态
+// 迭代12新增：重启阶段时调用，清空产出内容，状态设回 in_progress
+func ResetStageOutput(ctx context.Context, lessonPlanID string, stageCode string) error {
+	now := time.Now()
+	result, err := database.DB.Exec(ctx, `
+		UPDATE workshop_stage_outputs
+		SET structured_output = '{}', narrative_output = '', conversation_snapshot = '[]',
+		    model_used = '', tokens_used = 0, status = $1, completed_at = NULL, updated_at = $2
+		WHERE lesson_plan_id = $3 AND stage_code = $4
+	`, models.StageOutputInProgress, now, lessonPlanID, stageCode)
+	if err != nil {
+		return fmt.Errorf("重置阶段产出失败: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		// 不存在也不算错误，可能该阶段还没创建产出记录
+		return nil
+	}
+	return nil
+}
+
+// DeleteStageOutputsAfter 删除指定阶段之后的所有产出物
+// 迭代12新增：重启某阶段时，该阶段之后的阶段产出物需要删除
+func DeleteStageOutputsAfter(ctx context.Context, lessonPlanID string, stageOrder int) error {
+	_, err := database.DB.Exec(ctx,
+		`DELETE FROM workshop_stage_outputs WHERE lesson_plan_id = $1 AND stage_order > $2`,
+		lessonPlanID, stageOrder,
+	)
+	if err != nil {
+		return fmt.Errorf("删除后续阶段产出失败: %w", err)
+	}
+	return nil
+}
+
 // ==================== 教案阶段状态更新 ====================
 
 // UpdateLessonPlanCurrentStage 更新教案的当前阶段

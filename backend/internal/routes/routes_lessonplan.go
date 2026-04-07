@@ -327,14 +327,21 @@ func registerLessonPlanRoutes(
 	mux.Handle("/api/v1/lesson-plans/plans/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
-		case hasSuffix(path, "/stages/advance") && r.Method == http.MethodPost:
+				case hasSuffix(path, "/stages/switch") && r.Method == http.MethodPost:
+					wsStageHandler.SwitchToStage(w, r)
+		case hasSuffix(path, "/stages/reset") && r.Method == http.MethodPost:
+				wsStageHandler.ResetStage(w, r)
+			case hasSuffix(path, "/stages/advance") && r.Method == http.MethodPost:
 			wsStageHandler.AdvanceStage(w, r)
 		case hasSuffix(path, "/stages/skip") && r.Method == http.MethodPost:
 			wsStageHandler.SkipStage(w, r)
 		case hasSuffix(path, "/stages/back") && r.Method == http.MethodPost:
 			wsStageHandler.BackStage(w, r)
-		case hasSuffix(path, "/output") && indexOf(path, "/stages/") >= 0 && r.Method == http.MethodGet:
-			wsStageHandler.GetStageOutput(w, r)
+		// 迭代12新增：阶段推荐组件
+			case hasSuffix(path, "/recommended-components") && indexOf(path, "/stages/") >= 0 && r.Method == http.MethodGet:
+				wsStageHandler.GetStageRecommendedComponents(w, r)
+			case hasSuffix(path, "/output") && indexOf(path, "/stages/") >= 0 && r.Method == http.MethodGet:
+				wsStageHandler.GetStageOutput(w, r)
 		case hasSuffix(path, "/stages") && r.Method == http.MethodGet:
 			wsStageHandler.GetStageStatus(w, r)
 		case hasSuffix(path, "/chat"):

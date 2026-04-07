@@ -272,3 +272,40 @@ type UpdateStageRequest struct {
 type AdminStageListResponse struct {
 	Stages []*WorkshopStage `json:"stages"` // 全部系统阶段（含disabled）
 }
+
+// ==================== 迭代12新增：阶段推荐组件响应 ====================
+
+// StageRecommendedComponentsResponse 阶段推荐组件列表响应
+// GET /api/v1/lesson-plans/plans/{id}/stages/{code}/recommended-components
+type StageRecommendedComponentsResponse struct {
+	StageCode  string                       `json:"stage_code"`  // 阶段代码
+	StageName  string                       `json:"stage_name"`  // 阶段名称
+	Components []*RecommendedComponentItem  `json:"components"`  // 推荐组件列表
+}
+
+// RecommendedComponentItem 推荐组件条目
+type RecommendedComponentItem struct {
+	ID           string  `json:"id"`            // 组件UUID
+	LibraryType  string  `json:"library_type"`  // 组件库类型
+	LibraryName  string  `json:"library_name"`  // 类型中文名
+	DisplayLabel string  `json:"display_label"` // 展示标签
+	DesignLogic    string  `json:"design_logic"`    // 设计逻辑简述
+	FullGuide      string  `json:"full_guide"`      // 完整指引（v78新增）
+	ExampleSnippet string  `json:"example_snippet"` // 示例片段（v78新增）
+	QualityScore   float64 `json:"quality_score"`   // 质量分
+	Source         string  `json:"source"`          // 来源：recipe=配方已选 / auto=自动匹配
+}
+
+// AdvanceStageWithComponentsRequest 进入下一阶段请求（带用户选中组件）
+// 迭代12新增：前端阶段过渡弹窗选中组件后使用此请求
+type AdvanceStageWithComponentsRequest struct {
+	TargetStageCode      string   `json:"target_stage_code"`       // 目标阶段代码（可选）
+	SelectedComponentIDs []string `json:"selected_component_ids"`  // 用户选中的组件ID列表
+}
+
+// ResetStageRequest 重启指定阶段请求（迭代12新增）
+// 清空该阶段及之后阶段的产出物，将当前阶段设回目标阶段，重新触发AI开场白
+type ResetStageRequest struct {
+	TargetStageCode string `json:"target_stage_code"` // 要重启到的阶段代码（必填）
+}
+

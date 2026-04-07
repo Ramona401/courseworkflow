@@ -871,11 +871,41 @@ export async function getStageOutput(planId: string, stageCode: string) {
   return resp.data.data as StageOutputResponse
 }
 
-/** 进入下一阶段（可指定目标阶段） */
-export async function advanceStage(planId: string, targetStageCode?: string) {
-  const resp = await apiClient.post(`/lesson-plans/plans/${planId}/stages/advance`, {
+/** 迭代12新增：推荐组件条目 */
+export interface RecommendedComponentItem {
+  id: string
+  library_type: string
+  library_name: string
+  display_label: string
+  design_logic: string
+  full_guide: string         // 完整指引（v78新增）
+  example_snippet: string    // 示例片段（v78新增）
+  quality_score: number
+  source: 'recipe' | 'auto'
+}
+
+/** 迭代12新增：阶段推荐组件响应 */
+export interface StageRecommendedComponentsResponse {
+  stage_code: string
+  stage_name: string
+  components: RecommendedComponentItem[]
+}
+
+/** 迭代12新增：获取阶段推荐组件 */
+export async function getStageRecommendedComponents(planId: string, stageCode: string) {
+  const resp = await apiClient.get(`/lesson-plans/plans/${planId}/stages/${stageCode}/recommended-components`)
+  return resp.data.data as StageRecommendedComponentsResponse
+}
+
+/** 进入下一阶段（可指定目标阶段，迭代12：支持传入选中组件ID） */
+export async function advanceStage(planId: string, targetStageCode?: string, selectedComponentIds?: string[]) {
+  const body: Record<string, unknown> = {
     target_stage_code: targetStageCode || '',
-  })
+  }
+  if (selectedComponentIds && selectedComponentIds.length > 0) {
+    body.selected_component_ids = selectedComponentIds
+  }
+  const resp = await apiClient.post(`/lesson-plans/plans/${planId}/stages/advance`, body)
   return resp.data.data as { stage_code: string; stage_name: string }
 }
 
@@ -886,6 +916,21 @@ export async function skipStage(planId: string, targetStageCode?: string) {
   })
   return resp.data.data as { stage_code: string; stage_name: string }
 }
+
+/** 迭代12新增：重启指定阶段（清空该阶段及后续产出，重新触发开场白） */
+export async function resetStage(planId: string, targetStageCode: string) {
+  const resp = await apiClient.post(`/lesson-plans/plans/${planId}/stages/reset`, {
+    target_stage_code: targetStageCode,
+  })
+  return resp.data.data as { stage_code: string; stage_name: string }
+}
+
+/** v77d: 切换到指定阶段继续对话（不清产出物、不清对话） */
+export async function switchToStage(planId: string, targetStageCode: string) {
+  const resp = await apiClient.post(`/lesson-plans/plans/${planId}/stages/switch`, { target_stage_code: targetStageCode })
+  return resp.data
+}
+
 
 /** 回退到上一阶段 */
 export async function backStage(planId: string) {

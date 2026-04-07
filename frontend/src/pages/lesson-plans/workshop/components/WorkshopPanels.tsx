@@ -367,20 +367,20 @@ export function ReviewPanel({ review, onApply, applying, isStageMode = false }: 
           <div style={{ fontSize: '12px', color: C.textSec, marginTop: '2px', lineHeight: 1.5 }}>{review.summary}</div>
         </div>
       </div>
-      {review.good_points.length > 0 && (
+      {(review.good_points || []).length > 0 && (
         <div style={{ marginBottom: '16px' }}>
           <div style={{ fontSize: '13px', fontWeight: 600, color: C.success, marginBottom: '8px' }}>✅ 做得好的</div>
-          {review.good_points.map((point, i) => (
+          {(review.good_points || []).map((point, i) => (
             <div key={i} style={{ fontSize: '13px', color: C.text, lineHeight: 1.6, padding: '6px 10px', marginBottom: '4px', background: 'rgba(16,185,129,0.06)', borderRadius: '6px' }}>
               {point}
             </div>
           ))}
         </div>
       )}
-      {review.improvements.length > 0 && (
+      {(review.improvements || []).length > 0 && (
         <div style={{ marginBottom: '16px' }}>
           <div style={{ fontSize: '13px', fontWeight: 600, color: C.accent, marginBottom: '8px' }}>💡 可以更好</div>
-          {review.improvements.map(imp => (
+          {(review.improvements || []).map(imp => (
             <div key={imp.id} style={{ marginBottom: '8px', padding: '10px 12px', background: 'rgba(245,158,11,0.06)', borderRadius: '8px', border: '1px solid rgba(245,158,11,0.15)' }}>
               <div style={{ fontSize: '13px', fontWeight: 500, color: C.text, marginBottom: '4px' }}>{imp.issue}</div>
               <div style={{ fontSize: '12px', color: C.textSec, lineHeight: 1.6 }}>{imp.suggestion}</div>
