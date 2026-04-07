@@ -204,9 +204,14 @@ func (s *ComponentService) SmartRecommendComponents(ctx context.Context, subject
 		return nil, errors.New("学科不能为空")
 	}
 
+	// v79-3：将中文年级转换为数字格式，确保SQL年级范围匹配能正常工作
+	// 例如 "三年级" → "3"、"七年级" → "7"、"高一" → "10"
+	normalizedGrade := normalizeGradeForMatch(gradeRange)
+	compLog.Info("智能推荐-年级转换", "original", gradeRange, "normalized", normalizedGrade)
+
 	req := &models.MatchComponentsRequest{
 		Subject:    subject,
-		GradeRange: gradeRange,
+		GradeRange: normalizedGrade,
 		Limit:      5, // 每种类型取前5个
 	}
 
@@ -559,4 +564,75 @@ func parseAutoExtractionResult(content string) ([]autoExtractionItem, error) {
 		return nil, fmt.Errorf("JSON解析失败: %w", err)
 	}
 	return items, nil
+}
+
+
+// normalizeGradeForMatch 将中文年级名转换为数字格式（用于组件匹配SQL）
+// v79-3新增：解决前端传入"三年级""七年级"等中文时SQL无法提取数字的问题
+// 转换规则：
+//   - 已含阿拉伯数字 → 直接提取数字部分（如"7年级"→"7"）
+//   - 中文数字 → 转换（如"三年级"→"3"、"十二年级"→"12"）
+//   - 别名 → 转换（如"初一"→"7"、"高一"→"10"）
+//   - 小学段 → 取中间值（如"小学低段"→"1-2"、"小学中段"→"3-4"、"小学高段"→"5-6"）
+//   - 无法识别 → 返回原值
+func normalizeGradeForMatch(grade string) string {
+	if strings.TrimSpace(grade) == "" {
+		return grade
+	}
+
+	// 1. 先检查是否已包含阿拉伯数字
+	var digits []byte
+	for _, b := range []byte(grade) {
+		if b >= '0' && b <= '9' {
+			digits = append(digits, b)
+		}
+	}
+	if len(digits) > 0 {
+		return string(digits)
+	}
+
+	// 2. 小学段别名（特殊处理，返回范围格式）
+	segmentMap := map[string]string{
+		"小学低段": "1-2",
+		"小学中段": "3-4",
+		"小学高段": "5-6",
+	}
+	for seg, num := range segmentMap {
+		if strings.Contains(grade, seg) {
+			return num
+		}
+	}
+
+	// 3. 初高中别名
+	aliasMap := map[string]string{
+		"初一": "7", "初二": "8", "初三": "9",
+		"高一": "10", "高二": "11", "高三": "12",
+	}
+	for alias, num := range aliasMap {
+		if strings.Contains(grade, alias) {
+			return num
+		}
+	}
+
+	// 4. 中文数字转换（先匹配长的"十一""十二"，再匹配短的）
+	cnMapLong := map[string]string{
+		"十一": "11", "十二": "12",
+	}
+	for cn, num := range cnMapLong {
+		if strings.Contains(grade, cn) {
+			return num
+		}
+	}
+	cnMap := map[string]string{
+		"一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
+		"六": "6", "七": "7", "八": "8", "九": "9", "十": "10",
+	}
+	for cn, num := range cnMap {
+		if strings.Contains(grade, cn) {
+			return num
+		}
+	}
+
+	// 5. 无法识别，返回原值
+	return grade
 }

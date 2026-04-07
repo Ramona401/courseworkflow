@@ -40,6 +40,8 @@ import ReviewCenterLPPage from '@/pages/lesson-plans/review/ReviewCenterLPPage'
 // Phase 7A新增：备课配方
 import RecipesPage from '@/pages/lesson-plans/recipes/RecipesPage'
 import RecipeEditorPage from '@/pages/lesson-plans/recipes/RecipeEditorPage'
+// v79新增：配方创建向导
+import RecipeWizardPage from '@/pages/lesson-plans/recipes/RecipeWizardPage'
 import StagesConfigPage from '@/pages/lesson-plans/stages-config/StagesConfigPage'
 // 迭代3新增：教学风格前测
 import AssessmentPage from '@/pages/lesson-plans/assessment/AssessmentPage'
@@ -124,6 +126,8 @@ export default function App() {
             <Route path="templates/:id"    element={<TemplateEditorPage />} />
             {/* Phase 7A新增：备课配方路由 */}
             <Route path="recipes"          element={<RecipesPage />} />
+            <Route path="recipes/wizard"   element={<RecipeWizardPage />} />
+            {/* 原编辑器路由保留（直接URL访问或编辑模式） */}
             <Route path="recipes/new"      element={<RecipeEditorPage />} />
             <Route path="recipes/:id/edit" element={<RecipeEditorPage />} />
             {/* 阶段管理（admin专用）*/}

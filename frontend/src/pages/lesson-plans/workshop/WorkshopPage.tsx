@@ -266,6 +266,34 @@ export default function WorkshopPage() {
     } catch (err) { console.error('发布失败:', err); alert('发布失败，请稍后重试') }
   }
 
+  // ==================== v79-2：退出备课（保存草稿+回到首屏）====================
+  const handleExitWorkshop = () => {
+    if (!plan) return
+    const confirmMsg = '确定退出当前备课吗？\n\n教案已自动保存为草稿，你可以随时从「我的教案」继续。'
+    if (!confirm(confirmMsg)) return
+    // 关闭SSE连接
+    sseRef.current?.close()
+    sseRef.current = null
+    // 清除session状态
+    sessionStorage.removeItem('workshop_active_plan_id')
+    // 重置所有状态回到首屏
+    setPlan(null)
+    setMessages([])
+    setPlanContent('')
+    setReview(null)
+    setStageItems([])
+    setCurrentStage('')
+    setIsStageMode(false)
+    isStageModeRef.current = false
+    setViewingStage(null)
+    setAiSuggestsComplete(false)
+    setIsThinking(false)
+    setStreaming(null)
+    setInputText('')
+    setSelectedComponentIds(new Set())
+    setPhase('start')
+  }
+
   // ==================== P2：点击完成本阶段 ====================
   const handleCompleteStageClick = async () => {
     if (!plan || !currentStage) return
@@ -490,6 +518,15 @@ export default function WorkshopPage() {
           onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}>
           {sidebarCollapsed ? <span style={{ fontSize: '14px' }}>»</span> : <><span style={{ fontWeight: 600, letterSpacing: '0.5px' }}>备课进度</span><span style={{ fontSize: '14px' }}>«</span></>}
         </button>
+
+        {/* v79-2：退出备课快捷入口（展开时显示） */}
+        {!sidebarCollapsed && plan && (
+          <button onClick={handleExitWorkshop} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px', width: '100%', padding: '5px 8px', borderRadius: '6px', border: `1px dashed ${C.border}`, background: 'transparent', fontSize: '11px', color: C.textMuted, cursor: 'pointer', marginBottom: '4px', transition: 'all 150ms ease' }}
+            onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.borderColor = '#EF4444'; el.style.color = '#EF4444'; el.style.background = 'rgba(239,68,68,0.04)' }}
+            onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.borderColor = C.border; el.style.color = C.textMuted; el.style.background = 'transparent' }}>
+            🚪 退出备课
+          </button>
+        )}
 
         {!sidebarCollapsed && (
           isStageMode && stageItems.length > 0
@@ -786,7 +823,7 @@ export default function WorkshopPage() {
 
         {plan && (
           <div style={{ padding: '12px 16px', borderTop: `1px solid ${C.border}`, display: 'flex', gap: '8px' }}>
-            <button onClick={() => navigate('/lesson-plans/my-plans')} style={{ flex: 1, padding: '9px', borderRadius: '8px', border: `1px solid ${C.border}`, background: 'transparent', fontSize: '13px', color: C.textSec, cursor: 'pointer' }}>保存草稿</button>
+            <button onClick={handleExitWorkshop} style={{ flex: 1, padding: '9px', borderRadius: '8px', border: `1px solid ${C.border}`, background: 'transparent', fontSize: '13px', color: C.textSec, cursor: 'pointer' }} title="退出备课，教案自动保存为草稿">🚪 退出备课</button>
             <button onClick={handlePublish} style={{ flex: 1, padding: '9px', borderRadius: '8px', border: 'none', background: C.primary, color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>发布教案 →</button>
           </div>
         )}

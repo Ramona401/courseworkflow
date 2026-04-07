@@ -140,6 +140,7 @@ export interface RecommendedComponentGroup {
 export interface RecommendedComponent {
   id: string
   display_label: string
+  design_logic: string      // v79-4b：组件设计逻辑（帮老师理解组件解决什么问题）
   quality_score: number
   grade_range: string
 }

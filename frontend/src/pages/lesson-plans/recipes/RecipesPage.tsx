@@ -264,7 +264,7 @@ export default function RecipesPage() {
           <button onClick={() => setActiveTab('mine')} style={tabStyle(activeTab === 'mine')}>📦 我的配方</button>
           <button onClick={() => setActiveTab('market')} style={tabStyle(activeTab === 'market')}>🏪 配方市场</button>
         </div>
-        <button onClick={() => navigate('/lesson-plans/recipes/new')} style={{
+        <button onClick={() => navigate('/lesson-plans/recipes/wizard')} style={{
           display: 'flex', alignItems: 'center', gap: '6px', padding: '9px 18px', borderRadius: '8px',
           border: 'none', background: C.primary, color: '#fff', fontSize: '14px', fontWeight: 600, cursor: 'pointer',
         }}><span>📦</span><span>新建配方</span></button>
@@ -309,7 +309,7 @@ export default function RecipesPage() {
                 <div style={{ fontSize: '16px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>{isFiltered ? '没有符合条件的配方' : '还没有备课配方'}</div>
                 <div style={{ fontSize: '14px', color: C.textMuted, marginBottom: '24px' }}>{isFiltered ? '试试调整筛选条件' : '创建您的第一个备课配方'}</div>
                 {isFiltered ? <button onClick={handleReset} style={{ padding: '10px 24px', borderRadius: '8px', border: `1px solid ${C.border}`, background: 'transparent', fontSize: '14px', color: C.textSec, cursor: 'pointer' }}>清空筛选</button>
-                  : <button onClick={() => navigate('/lesson-plans/recipes/new')} style={{ padding: '10px 24px', borderRadius: '8px', border: 'none', background: C.primary, color: '#fff', fontSize: '14px', fontWeight: 600, cursor: 'pointer' }}>📦 创建配方</button>}
+                  : <button onClick={() => navigate('/lesson-plans/recipes/wizard')} style={{ padding: '10px 24px', borderRadius: '8px', border: 'none', background: C.primary, color: '#fff', fontSize: '14px', fontWeight: 600, cursor: 'pointer' }}>📦 创建配方</button>}
               </div>
             )}
           </div>
