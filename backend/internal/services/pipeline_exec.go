@@ -535,7 +535,7 @@ func (s *PipelineService) callAIWithSemaphore(cfg *ai.EffectiveConfig, systemPro
 		s.engine.AcquireAI()
 		defer s.engine.ReleaseAI()
 	}
-	return ai.CallAI(cfg, systemPrompt, userPrompt)
+	return ai.CallAI(cfg, systemPrompt, userPrompt, nil)
 }
 
 // ==================== SSE事件广播 ====================

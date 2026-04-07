@@ -198,6 +198,11 @@ function UserMenu() {
                   label="AI 管理中心"
                   onClick={() => go('/ai-center', '/workflow')}
                 />
+                <DropdownItem
+                  icon="📊"
+                  label="AI 调用统计"
+                  onClick={() => go('/ai-traces', '/workflow')}
+                />
               </>
             )}
           </div>

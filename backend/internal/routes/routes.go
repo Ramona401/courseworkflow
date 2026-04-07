@@ -5,6 +5,9 @@ package routes
 // v73新增：wsStageService.SetGenService(lpGenService) 注入依赖
 //   WorkshopStageService.AdvanceStage 进入review/revise阶段时自动触发Chat，
 //   需要持有genService引用，通过SetGenService在routes层注入，避免循环依赖。
+//
+// v80新增：InitTraceWriter() 启动AI调用追踪异步写入器
+//   AITraceHandler 注册到 registerAdminRoutes
 
 import (
 	"context"
@@ -16,6 +19,7 @@ import (
 	"tedna/internal/database"
 	"tedna/internal/handlers"
 	"tedna/internal/middleware"
+	"tedna/internal/repository"
 	"tedna/internal/services"
 )
 
@@ -50,6 +54,9 @@ func methodNotAllowedJSON(w http.ResponseWriter, message string) {
 
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
+
+	// ---- v80新增：启动AI调用追踪异步写入器 ----
+	repository.InitTraceWriter()
 
 	// ---- 初始化服务层 ----
 	authService     := services.NewAuthService(cfg)
@@ -96,6 +103,9 @@ func Setup(cfg *config.Config) http.Handler {
 	wsStageHandler  := handlers.NewWorkshopStageHandler(wsStageService)
 	assessHandler   := handlers.NewAssessmentHandler(assessService)
 	tbHandler       := handlers.NewTextbookHandler(tbService)
+
+	// v80新增：AI调用追踪处理器
+	aiTraceHandler  := handlers.NewAITraceHandler()
 
 	authMW    := middleware.AuthMiddleware(authService)
 	adminOnly := middleware.RequireRole(roleAdmin)
@@ -155,8 +165,8 @@ func Setup(cfg *config.Config) http.Handler {
 	mux.Handle("/api/v1/dashboard/stats", middleware.Chain(
 		http.HandlerFunc(pipelineHandler.GetDashboardStats), authMW))
 
-	// ---- 注册各模块路由 ----
-	registerAdminRoutes(mux, authMW, adminOnly, adminHandler, roleHandler, userHandler, aiConfigHandler, promptHandler, edHandler, courseHandler, wsStageHandler)
+	// ---- 注册各模块路由（v80: aiTraceHandler传入registerAdminRoutes）----
+	registerAdminRoutes(mux, authMW, adminOnly, adminHandler, roleHandler, userHandler, aiConfigHandler, promptHandler, edHandler, courseHandler, wsStageHandler, aiTraceHandler)
 	registerPipelineRoutes(mux, authMW, pipelineHandler, sseHandler)
 	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler)
 

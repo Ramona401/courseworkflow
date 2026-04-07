@@ -15,6 +15,12 @@ package ai
 //   或返回500+不完整JSON。这些都是临时性错误，自动重试可有效恢复。
 //   非流式CallAI最多重试3次（间隔30s/60s/120s指数退避）。
 //   流式CallAIStream最多重试2次（间隔30s/60s）。
+//
+// v80新增：AI调用追踪埋点
+//   每次CallAI/CallAIStream/CallAIMultimodal调用完成后（成功或失败），
+//   通过repository.EnqueueTrace异步写入ai_call_traces表。
+//   埋点不影响主路径延迟（非阻塞channel写入）。
+//   场景代码通过TraceContext传入，调用方负责设置。
 
 import (
 	"bufio"
@@ -27,6 +33,7 @@ import (
 	"strings"
 	"time"
 
+	"tedna/internal/models"
 	"tedna/internal/repository"
 	"tedna/internal/utils"
 )
@@ -62,6 +69,15 @@ type EffectiveConfig struct {
 	MaxTokens   int     // 最大Token数
 }
 
+// TraceContext AI调用追踪上下文（v80新增）
+// 调用方在调用CallAI等方法前设置，用于关联trace记录到业务实体
+type TraceContext struct {
+	SceneCode    string  // 场景代码（必填，如scanner/evaluator/lesson_plan）
+	PipelineID   *string // 关联Pipeline ID（Pipeline步骤时设置）
+	LessonPlanID *string // 关联教案 ID（备课对话时设置）
+	UserID       *string // 关联用户 ID
+}
+
 // ChatMessage OpenAI兼容的消息格式
 type ChatMessage struct {
 	Role    string `json:"role"`
@@ -93,7 +109,9 @@ type ChatResponse struct {
 		} `json:"message"`
 	} `json:"choices"`
 	Usage struct {
-		TotalTokens int `json:"total_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
 	} `json:"usage"`
 	Model string `json:"model"`
 }
@@ -108,7 +126,9 @@ type StreamChunkResponse struct {
 	} `json:"choices"`
 	Model string `json:"model"`
 	Usage *struct {
-		TotalTokens int `json:"total_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
 	} `json:"usage"` // 部分API在最后一条返回usage
 }
 
@@ -245,12 +265,15 @@ func getRetryDelay(attempt int) time.Duration {
 	return retryDelays[len(retryDelays)-1]
 }
 
-// ==================== 非流式AI调用（带重试）====================
+// ==================== 非流式AI调用（带重试 + 埋点）====================
 
 // CallAI 调用AI API（OpenAI兼容格式，等待完整回复后返回）
 // 用于Pipeline各步骤、AI评审等需要完整结果的场景
 // 遇到502/503/504/429等临时错误时自动重试（最多3次，指数退避）
-func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*CallResult, error) {
+//
+// v80新增：traceCtx参数用于关联trace记录到业务实体
+// 如果traceCtx为nil，不记录trace（兼容旧调用方式）
+func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceCtx *TraceContext) (*CallResult, error) {
 	var messages []ChatMessage
 	if strings.TrimSpace(systemPrompt) != "" {
 		messages = append(messages, ChatMessage{Role: "system", Content: systemPrompt})
@@ -272,6 +295,7 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
 
 	// -------- 带重试的调用循环 --------
+	startTime := time.Now()
 	var lastErr error
 	for attempt := 0; attempt <= MaxRetries; attempt++ {
 		// 非首次调用时等待退避时间
@@ -287,6 +311,9 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 			if attempt > 0 {
 				log.Printf("[AI重试] 第%d次重试成功（模型: %s）", attempt, cfg.Model)
 			}
+			// v80: 记录成功trace
+			emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
+				time.Since(startTime).Milliseconds(), "success", "", len(result.Content), false)
 			return result, nil
 		}
 
@@ -295,6 +322,9 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 		// 判断是否可重试
 		if !isRetryableCallError(err) {
 			// 不可重试的错误（如认证失败、请求格式错误等），直接返回
+			// v80: 记录失败trace
+			emitTrace(traceCtx, cfg.Model, 0, 0, 0,
+				time.Since(startTime).Milliseconds(), "error", err.Error(), 0, false)
 			return nil, err
 		}
 
@@ -302,6 +332,9 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string) (*Call
 	}
 
 	// 所有重试都失败
+	// v80: 记录失败trace
+	emitTrace(traceCtx, cfg.Model, 0, 0, 0,
+		time.Since(startTime).Milliseconds(), "error", lastErr.Error(), 0, false)
 	return nil, fmt.Errorf("AI调用在%d次尝试后仍然失败: %w", MaxRetries+1, lastErr)
 }
 
@@ -392,7 +425,7 @@ func isRetryableCallError(err error) bool {
 	return ok
 }
 
-// ==================== 流式AI调用（带重试）====================
+// ==================== 流式AI调用（带重试 + 埋点）====================
 
 // CallAIStream 流式调用AI API（OpenAI兼容 SSE 格式）
 //
@@ -408,11 +441,14 @@ func isRetryableCallError(err error) bool {
 //   但一旦开始接收流式数据后发生的错误不会重试（因为onChunk可能已经
 //   向前端推送了部分数据，重试会导致内容重复）。
 //
+// v80新增：traceCtx参数用于关联trace记录
+//
 // 参数：
 //   cfg          — AI配置（模型/温度/maxTokens）
 //   systemPrompt — 系统提示词
 //   userPrompt   — 用户消息
 //   onChunk      — 每收到一个token片段时的回调，返回error可中止流式读取
+//   traceCtx     — 追踪上下文（可为nil）
 //
 // 返回：
 //   完整的 CallResult（包含全文拼接内容和token统计）
@@ -421,6 +457,7 @@ func CallAIStream(
 	systemPrompt string,
 	userPrompt string,
 	onChunk func(chunk string) error,
+	traceCtx *TraceContext,
 ) (*CallResult, error) {
 	// -------- 构造消息列表 --------
 	var messages []ChatMessage
@@ -488,6 +525,10 @@ func CallAIStream(
 				continue
 			}
 			// 不可重试的错误
+			// v80: 记录失败trace
+			emitTrace(traceCtx, cfg.Model, 0, 0, 0,
+				time.Since(startTime).Milliseconds(), "error",
+				fmt.Sprintf("HTTP %d: %s", resp.StatusCode, errMsg), 0, true)
 			return nil, fmt.Errorf("AI流式API返回错误(HTTP %d): %s", resp.StatusCode, errMsg)
 		}
 
@@ -501,6 +542,9 @@ func CallAIStream(
 
 	// 所有重试都失败
 	if lastErr != nil {
+		// v80: 记录失败trace
+		emitTrace(traceCtx, cfg.Model, 0, 0, 0,
+			time.Since(startTime).Milliseconds(), "error", lastErr.Error(), 0, true)
 		return nil, fmt.Errorf("AI流式调用在%d次尝试后仍然失败: %w", MaxStreamRetries+1, lastErr)
 	}
 	defer resp.Body.Close()
@@ -509,6 +553,8 @@ func CallAIStream(
 	var fullContent strings.Builder // 拼接完整回复
 	var modelUsed string
 	totalTokens := 0
+	promptTokens := 0
+	completionTokens := 0
 
 	scanner := bufio.NewScanner(resp.Body)
 	// 设置较大的缓冲区，防止超长行截断
@@ -553,6 +599,8 @@ func CallAIStream(
 		// 记录token统计（部分API在最后一条携带usage）
 		if chunk.Usage != nil {
 			totalTokens = chunk.Usage.TotalTokens
+			promptTokens = chunk.Usage.PromptTokens
+			completionTokens = chunk.Usage.CompletionTokens
 		}
 
 		// 提取增量内容
@@ -597,8 +645,15 @@ func CallAIStream(
 	// 对完整内容做一次thinking清理
 	content := stripThinking(fullContent.String())
 	if strings.TrimSpace(content) == "" {
+		// v80: 记录失败trace
+		emitTrace(traceCtx, coalesce(modelUsed, cfg.Model), totalTokens, promptTokens, completionTokens,
+			latencyMs, "error", "AI流式返回内容为空", 0, true)
 		return nil, fmt.Errorf("AI流式返回内容为空")
 	}
+
+	// v80: 记录成功trace
+	emitTrace(traceCtx, coalesce(modelUsed, cfg.Model), totalTokens, promptTokens, completionTokens,
+		latencyMs, "success", "", len(content), true)
 
 	return &CallResult{
 		Content:    content,
@@ -729,13 +784,52 @@ func parseInt(s string, defaultVal int) int {
 	return v
 }
 
-// ==================== 迭代7新增：多模态AI调用（图片+文字）====================
+// ==================== v80新增：追踪埋点辅助函数 ====================
+
+// emitTrace 异步记录AI调用trace（不阻塞主路径）
+// 如果traceCtx为nil，静默跳过（兼容未传traceCtx的旧调用）
+func emitTrace(
+	traceCtx *TraceContext,
+	modelUsed string,
+	totalTokens int,
+	promptTokens int,
+	completionTokens int,
+	latencyMs int64,
+	status string,
+	errorMsg string,
+	outputLength int,
+	isStream bool,
+) {
+	if traceCtx == nil {
+		return
+	}
+
+	rec := models.TraceRecord{
+		SceneCode:        traceCtx.SceneCode,
+		ModelUsed:        modelUsed,
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      totalTokens,
+		LatencyMs:        latencyMs,
+		Status:           status,
+		ErrorMessage:     errorMsg,
+		PipelineID:       traceCtx.PipelineID,
+		LessonPlanID:     traceCtx.LessonPlanID,
+		UserID:           traceCtx.UserID,
+		OutputLength:     outputLength,
+		IsStream:         isStream,
+	}
+
+	repository.EnqueueTrace(rec)
+}
+
+// ==================== 迭代7新增：多模态AI调用（图片+文字 + 埋点）====================
 
 // MultimodalContent OpenAI兼容的多模态消息内容项
 type MultimodalContent struct {
-	Type     string                 `json:"type"`               // "text" 或 "image_url"
-	Text     string                 `json:"text,omitempty"`     // type=text时的文本
-	ImageURL *MultimodalImageURL    `json:"image_url,omitempty"` // type=image_url时的图片
+	Type     string              `json:"type"`                // "text" 或 "image_url"
+	Text     string              `json:"text,omitempty"`      // type=text时的文本
+	ImageURL *MultimodalImageURL `json:"image_url,omitempty"` // type=image_url时的图片
 }
 
 // MultimodalImageURL 图片URL结构
@@ -752,16 +846,18 @@ type MultimodalMessage struct {
 
 // MultimodalChatRequest 多模态请求体
 type MultimodalChatRequest struct {
-	Model       string              `json:"model"`
-	Messages    []interface{}       `json:"messages"` // 混合普通和多模态消息
-	MaxTokens   int                 `json:"max_tokens"`
-	Temperature float64             `json:"temperature"`
+	Model       string        `json:"model"`
+	Messages    []interface{} `json:"messages"` // 混合普通和多模态消息
+	MaxTokens   int           `json:"max_tokens"`
+	Temperature float64       `json:"temperature"`
 }
 
 // CallAIMultimodal 调用AI API发送图片+文字（多模态Vision调用）
 // 用于课本OCR识别等需要图像理解的场景
 // imageDataURI 格式：data:image/jpeg;base64,xxxxx
-func CallAIMultimodal(cfg *EffectiveConfig, systemPrompt string, userText string, imageDataURI string) (*CallResult, error) {
+//
+// v80新增：traceCtx参数用于关联trace记录
+func CallAIMultimodal(cfg *EffectiveConfig, systemPrompt string, userText string, imageDataURI string, traceCtx *TraceContext) (*CallResult, error) {
 	// 构造消息列表
 	var messages []interface{}
 
@@ -795,6 +891,7 @@ func CallAIMultimodal(cfg *EffectiveConfig, systemPrompt string, userText string
 	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
 
 	// 带重试调用（复用现有重试逻辑）
+	startTime := time.Now()
 	var lastErr error
 	for attempt := 0; attempt <= MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -808,13 +905,22 @@ func CallAIMultimodal(cfg *EffectiveConfig, systemPrompt string, userText string
 			if attempt > 0 {
 				log.Printf("[AI多模态重试] 第%d次重试成功", attempt)
 			}
+			// v80: 记录成功trace
+			emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
+				time.Since(startTime).Milliseconds(), "success", "", len(result.Content), false)
 			return result, nil
 		}
 		lastErr = err
 		if !isRetryableCallError(err) {
+			// v80: 记录失败trace
+			emitTrace(traceCtx, cfg.Model, 0, 0, 0,
+				time.Since(startTime).Milliseconds(), "error", err.Error(), 0, false)
 			return nil, err
 		}
 		log.Printf("[AI多模态重试] 失败（第%d/%d次）: %s", attempt+1, MaxRetries+1, err.Error())
 	}
+	// v80: 记录失败trace
+	emitTrace(traceCtx, cfg.Model, 0, 0, 0,
+		time.Since(startTime).Milliseconds(), "error", lastErr.Error(), 0, false)
 	return nil, fmt.Errorf("AI多模态调用在%d次尝试后失败: %w", MaxRetries+1, lastErr)
 }

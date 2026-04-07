@@ -13,7 +13,7 @@ package services
 // AI调用模式：
 //   import aiClient "tedna/internal/ai"
 //   aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), "", "", "", "")
-//   result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt)
+//   result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt, nil)
 //   result.Content — AI输出文本
 
 import (
@@ -128,7 +128,7 @@ func (s *AssessmentService) callAI(systemPrompt string, userPrompt string) (stri
 	if err != nil {
 		return "", fmt.Errorf("获取AI配置失败: %w", err)
 	}
-	result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt)
+	result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt, nil)
 	if err != nil {
 		return "", fmt.Errorf("AI调用失败: %w", err)
 	}

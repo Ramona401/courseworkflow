@@ -914,7 +914,7 @@ func (s *PipelineService) AIFixPageStream(
 	callResult, callErr := ai.CallAIStream(aiCfg, systemPrompt, userPrompt, func(chunk string) error {
 		onChunk(chunk)
 		return nil
-	})
+	}, nil)
 
 	if callErr != nil {
 		onError("AI快修调用失败: " + callErr.Error())

@@ -209,7 +209,7 @@ func (s *LessonPlanGenService) genStageOpeningMessage(
 		return nil, fmt.Errorf("AI配置加载失败: %w", err)
 	}
 
-	result, err := aiClient.CallAI(aiCfg, stageSystemPrompt, userPrompt)
+	result, err := aiClient.CallAI(aiCfg, stageSystemPrompt, userPrompt, nil)
 	if err != nil {
 		return nil, fmt.Errorf("AI开场白生成失败: %w", err)
 	}
@@ -376,7 +376,7 @@ func (s *LessonPlanGenService) processChatStageAsync(
 			Chunk:     chunk,
 		})
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		s.broadcastError(planID, "AI回复失败: "+err.Error())
 		return
@@ -614,7 +614,7 @@ func (s *LessonPlanGenService) executeAIReviewAsync(ctx context.Context, lp *mod
 	reviewPrompt := buildReviewPrompt(lp, reviewRules)
 	systemPrompt := buildReviewSystemPrompt(lp.Subject)
 
-	result, err := aiClient.CallAI(aiCfg, systemPrompt, reviewPrompt)
+	result, err := aiClient.CallAI(aiCfg, systemPrompt, reviewPrompt, nil)
 	if err != nil {
 		s.broadcastError(planID, "AI评审失败: "+err.Error())
 		return
@@ -714,7 +714,7 @@ func (s *LessonPlanGenService) applyAndReviewAsync(
 		lp.Subject,
 	)
 
-	result, err := aiClient.CallAI(aiCfg, systemPrompt, optimizePrompt)
+	result, err := aiClient.CallAI(aiCfg, systemPrompt, optimizePrompt, nil)
 	if err != nil {
 		s.broadcastError(planID, "AI优化失败: "+err.Error())
 		return
@@ -881,7 +881,7 @@ func (s *LessonPlanGenService) genOpeningMessage(
 不要超过150字，用自然的口吻，可以用emoji增加亲和力。`,
 		req.Subject, req.Grade, req.Topic, req.DurationMinutes, backgroundContext, recipeHint)
 
-	result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt)
+	result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt, nil)
 	if err != nil {
 		return nil, err
 	}

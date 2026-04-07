@@ -9,6 +9,7 @@ package routes
 //   /api/v1/prompts/*        — 提示词管理（admin only）
 //   /api/v1/external-data/*  — 外部数据配置（admin only）
 //   /api/v1/courses/*        — 课程管理（读：全员，写：admin）
+//   /api/v1/admin/ai-traces/* — AI调用追踪仪表盘（v80新增，admin only）
 
 import (
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 )
 
 // registerAdminRoutes 注册Admin及系统配置相关所有路由
+// v80变更：新增aiTraceHandler参数，注册AI调用追踪仪表盘路由
 func registerAdminRoutes(
 	mux *http.ServeMux,
 	authMW func(http.Handler) http.Handler,
@@ -31,7 +33,14 @@ func registerAdminRoutes(
 	edHandler *handlers.ExternalDataHandler,
 	courseHandler *handlers.CourseHandler,
 	wsStageHandler *handlers.WorkshopStageHandler,
+	aiTraceHandler *handlers.AITraceHandler,
 ) {
+	// ==================== AI调用追踪仪表盘（v80新增，admin only）====================
+
+	// GET /api/v1/admin/ai-traces/dashboard — 获取AI调用统计数据
+	mux.Handle("/api/v1/admin/ai-traces/dashboard",
+		middleware.Chain(http.HandlerFunc(aiTraceHandler.GetDashboard), authMW, adminOnly))
+
 	// ==================== 统一用户管理中心（admin only）====================
 
 	// 统计摘要

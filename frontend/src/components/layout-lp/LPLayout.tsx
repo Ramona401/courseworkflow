@@ -129,6 +129,7 @@ function UserMenu() {
               <>
                 <LPMenuItem icon="👥" label="用户管理" onClick={() => go('/admin', '/lesson-plans')} highlight />
                 <LPMenuItem icon="🤖" label="AI 管理中心" onClick={() => go('/ai-center', '/lesson-plans')} />
+                <LPMenuItem icon="📊" label="AI 调用统计" onClick={() => go('/ai-traces', '/lesson-plans')} />
               </>
             )}
           </div>

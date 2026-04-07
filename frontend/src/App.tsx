@@ -51,6 +51,8 @@ import TextbooksPage from '@/pages/lesson-plans/textbooks/TextbooksPage'
 /* ==================== 通用独立页面 ==================== */
 import AccountPage from '@/pages/account/AccountPage'
 import AICenterPage from '@/pages/ai-center/AICenterPage'
+// v80新增：AI调用追踪仪表盘
+import AITraceDashboardPage from '@/pages/ai-traces/AITraceDashboardPage'
 // v5.1 新增：统一用户管理中心
 import AdminPage from '@/pages/admin/AdminPage'
 
@@ -97,6 +99,10 @@ export default function App() {
           } />
           <Route path="/admin" element={
             <AuthGuard><RoleGuard roles={['admin']}><AdminPage /></RoleGuard></AuthGuard>
+          } />
+          {/* v80新增：AI调用追踪仪表盘 */}
+          <Route path="/ai-traces" element={
+            <AuthGuard><RoleGuard roles={['admin']}><AITraceDashboardPage /></RoleGuard></AuthGuard>
           } />
 
           {/* ==================== 课件审核系统 ==================== */}

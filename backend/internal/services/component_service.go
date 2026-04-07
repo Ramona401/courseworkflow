@@ -399,7 +399,7 @@ activity_design, questioning_strategy, pedagogy, assessment_strategy, cross_subj
 		subject, grade, planContent,
 	)
 
-	result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt)
+	result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt, nil)
 	if err != nil {
 		return fmt.Errorf("AI萃取调用失败: %w", err)
 	}

@@ -297,6 +297,7 @@ func (s *TextbookService) RecognizeTextbookPage(ctx context.Context, id string, 
 		"你是课本文字识别专家。请仔细识别图片中的所有文字内容，包括标题、正文、注释、图表中的文字、公式等。按原文排版顺序输出，保持段落结构。如果有表格，用Markdown表格格式输出。如果有公式，用LaTeX格式输出。",
 		"请识别这张课本图片中的所有文字内容：",
 		dataURI,
+		nil,
 	)
 	if err != nil {
 		return "", fmt.Errorf("AI识别失败: %w", err)
