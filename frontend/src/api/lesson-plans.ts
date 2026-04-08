@@ -10,6 +10,8 @@
  * - 教案生成（Phase3：对话/评审/建议应用）
  * - 萃取队列管理（Phase5：萃取列表/确认拒绝）
  * - 阶段化备课工坊（Phase 7B-9：阶段查询/前进/跳过/回退/产出物）
+ *
+ * v88新增：SSE自动重连机制（指数退避+连接状态回调+重连补齐）
  */
 import apiClient from './client'
 
@@ -470,6 +472,37 @@ export interface ExtractionListResponse {
   total: number
 }
 
+/* ==================== v88新增：SSE连接状态类型 ==================== */
+
+/** SSE连接状态枚举 */
+export type SSEConnectionState = 'connected' | 'reconnecting' | 'disconnected'
+
+/** SSE重连配置常量 */
+const SSE_RECONNECT_MAX_RETRIES = 5           // 最大重连次数
+const SSE_RECONNECT_BASE_DELAY_MS = 1000      // 基础重连延迟（1秒）
+const SSE_RECONNECT_MAX_DELAY_MS = 30000      // 最大重连延迟（30秒）
+
+/* ==================== v88新增：可控SSE连接管理器 ==================== */
+
+/**
+ * SSEConnection — 可控的SSE连接包装器
+ *
+ * v88新增：封装EventSource，提供：
+ *   - 自动重连（指数退避，最多5次）
+ *   - 连接状态变化回调（connected/reconnecting/disconnected）
+ *   - 重连成功后自动拉取最新对话补齐丢失消息
+ *   - 手动关闭（close方法）
+ *
+ * 使用方式：
+ *   const conn = createLessonPlanSSE(planId, token, handlers)
+ *   // ... 需要关闭时：
+ *   conn.close()
+ */
+export interface SSEConnection {
+  /** 手动关闭连接（同时停止重连计时器） */
+  close: () => void
+}
+
 /* ==================== API函数：组织管理 ==================== */
 
 export async function getOrganizations(params?: { type?: OrgType; parent_id?: string }) {
@@ -742,8 +775,22 @@ export async function getConversation(planId: string) {
 }
 
 /**
- * 创建教案SSE连接
+ * 创建教案SSE连接（v88增强版：自动重连+连接状态回调）
+ *
  * Phase 7B-9新增：onStageStarted/onStageComplete/onStageOutput 三个阶段事件回调
+ * v88新增：
+ *   - onConnectionStateChange：连接状态变化回调（connected/reconnecting/disconnected）
+ *   - onReconnected：重连成功后回调，用于拉取最新对话补齐丢失消息
+ *   - 自动重连机制：指数退避（1s/2s/4s/8s/16s），最多5次
+ *   - 返回SSEConnection对象，支持手动close
+ *
+ * 重连策略：
+ *   1. EventSource的onerror触发时（包括网络断开、服务端关闭连接、空闲超时）
+ *   2. 先关闭当前EventSource
+ *   3. 状态切换为reconnecting，通知前端显示黄色指示器
+ *   4. 等待指数退避延迟后创建新的EventSource
+ *   5. 新连接收到connected事件后，状态切换为connected，触发onReconnected
+ *   6. 5次全部失败后，状态切换为disconnected，通知前端显示红色指示器
  */
 export function createLessonPlanSSE(
   planId: string,
@@ -760,95 +807,194 @@ export function createLessonPlanSSE(
     onStageOutput?: (data: StageEventData) => void     // Phase 7B-9：阶段产出物已生成
     onError?: (error: string) => void
     onDone?: () => void
+    onConnectionStateChange?: (state: SSEConnectionState) => void  // v88新增：连接状态变化
+    onReconnected?: () => void                                      // v88新增：重连成功回调
   }
-): EventSource {
-  const url = `/api/v1/lesson-plans/sse/plans/${planId}/stream?token=${encodeURIComponent(token)}`
-  const es = new EventSource(url)
+): SSEConnection {
+  // v88：内部状态管理
+  let currentES: EventSource | null = null    // 当前EventSource实例
+  let retryCount = 0                          // 当前重连次数
+  let retryTimer: ReturnType<typeof setTimeout> | null = null  // 重连计时器
+  let isClosed = false                        // 是否已手动关闭
+  let isFirstConnect = true                   // 是否首次连接（首次不触发onReconnected）
 
-  es.addEventListener('connected', () => { /* 连接建立 */ })
-
-  es.addEventListener('thinking', () => {
-    handlers.onThinking?.()
-  })
-
-  es.addEventListener('chunk', (e: MessageEvent) => {
-    try {
-      const event: LPSSEEvent = JSON.parse(e.data)
-      if (event.chunk) handlers.onChunk?.(event.chunk)
-    } catch { /* 忽略解析错误 */ }
-  })
-
-  es.addEventListener('message_done', (e: MessageEvent) => {
-    try {
-      const event: LPSSEEvent = JSON.parse(e.data)
-      if (event.message) handlers.onMessageDone?.(event.message)
-    } catch { /* 忽略解析错误 */ }
-  })
-
-  es.addEventListener('content_update', (e: MessageEvent) => {
-    try {
-      const event: LPSSEEvent = JSON.parse(e.data)
-      if (event.content) handlers.onContentUpdate?.(event.content)
-    } catch { /* 忽略解析错误 */ }
-  })
-
-  es.addEventListener('review_done', (e: MessageEvent) => {
-    try {
-      const event: LPSSEEvent = JSON.parse(e.data)
-      if (event.review) handlers.onReviewDone?.(event.review)
-    } catch { /* 忽略解析错误 */ }
-  })
-
-  es.addEventListener('extraction_hint', (e: MessageEvent) => {
-    try {
-      const event: LPSSEEvent = JSON.parse(e.data)
-      if (event.extraction_hint) handlers.onExtractionHint?.(event.extraction_hint)
-    } catch { /* 忽略解析错误 */ }
-  })
-
-  // Phase 7B-9：监听阶段化备课工坊事件
-  es.addEventListener('stage_started', (e: MessageEvent) => {
-    try {
-      const event: LPSSEEvent = JSON.parse(e.data)
-      if (event.stage_data) handlers.onStageStarted?.(event.stage_data)
-    } catch { /* 忽略解析错误 */ }
-  })
-
-  es.addEventListener('stage_complete', (e: MessageEvent) => {
-    try {
-      const event: LPSSEEvent = JSON.parse(e.data)
-      if (event.stage_data) handlers.onStageComplete?.(event.stage_data)
-    } catch { /* 忽略解析错误 */ }
-  })
-
-  es.addEventListener('stage_output', (e: MessageEvent) => {
-    try {
-      const event: LPSSEEvent = JSON.parse(e.data)
-      if (event.stage_data) handlers.onStageOutput?.(event.stage_data)
-    } catch { /* 忽略解析错误 */ }
-  })
-
-  es.addEventListener('error', (e: MessageEvent) => {
-    // 连接级断开（e.data为空）：静默忽略，不报错给用户
-    // 这是SSE空闲超时或网络中断的正常行为，不是业务错误
-    if (!e.data) return
-    try {
-      const event: LPSSEEvent = JSON.parse(e.data)
-      // 只有明确的业务错误才报给用户
-      if (event.error) {
-        handlers.onError?.(event.error)
+  /**
+   * 绑定EventSource的所有事件监听器
+   * 提取为独立函数，首次连接和重连共用
+   */
+  const bindEventListeners = (es: EventSource) => {
+    // 连接建立成功
+    es.addEventListener('connected', () => {
+      // 重连成功：重置重连计数，通知状态恢复
+      retryCount = 0
+      handlers.onConnectionStateChange?.('connected')
+      // 非首次连接时触发重连回调（首次连接不需要补齐）
+      if (!isFirstConnect) {
+        handlers.onReconnected?.()
       }
-    } catch {
-      // JSON解析失败也静默忽略，避免误报
+      isFirstConnect = false
+    })
+
+    es.addEventListener('thinking', () => {
+      handlers.onThinking?.()
+    })
+
+    es.addEventListener('chunk', (e: MessageEvent) => {
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        if (event.chunk) handlers.onChunk?.(event.chunk)
+      } catch { /* 忽略解析错误 */ }
+    })
+
+    es.addEventListener('message_done', (e: MessageEvent) => {
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        if (event.message) handlers.onMessageDone?.(event.message)
+      } catch { /* 忽略解析错误 */ }
+    })
+
+    es.addEventListener('content_update', (e: MessageEvent) => {
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        if (event.content) handlers.onContentUpdate?.(event.content)
+      } catch { /* 忽略解析错误 */ }
+    })
+
+    es.addEventListener('review_done', (e: MessageEvent) => {
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        if (event.review) handlers.onReviewDone?.(event.review)
+      } catch { /* 忽略解析错误 */ }
+    })
+
+    es.addEventListener('extraction_hint', (e: MessageEvent) => {
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        if (event.extraction_hint) handlers.onExtractionHint?.(event.extraction_hint)
+      } catch { /* 忽略解析错误 */ }
+    })
+
+    // Phase 7B-9：监听阶段化备课工坊事件
+    es.addEventListener('stage_started', (e: MessageEvent) => {
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        if (event.stage_data) handlers.onStageStarted?.(event.stage_data)
+      } catch { /* 忽略解析错误 */ }
+    })
+
+    es.addEventListener('stage_complete', (e: MessageEvent) => {
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        if (event.stage_data) handlers.onStageComplete?.(event.stage_data)
+      } catch { /* 忽略解析错误 */ }
+    })
+
+    es.addEventListener('stage_output', (e: MessageEvent) => {
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        if (event.stage_data) handlers.onStageOutput?.(event.stage_data)
+      } catch { /* 忽略解析错误 */ }
+    })
+
+    // 业务级错误事件（后端主动推送的error事件，带error字段）
+    es.addEventListener('error', (e: MessageEvent) => {
+      // 连接级断开（e.data为空）：触发重连而非报错给用户
+      if (!e.data) return
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        // 只有明确的业务错误才报给用户
+        if (event.error) {
+          handlers.onError?.(event.error)
+        }
+      } catch {
+        // JSON解析失败也静默忽略，避免误报
+      }
+    })
+
+    es.addEventListener('done', () => {
+      handlers.onDone?.()
+      // done是正常结束，不触发重连
+      isClosed = true
+      es.close()
+    })
+
+    /**
+     * v88核心：EventSource原生onerror处理器
+     *
+     * 当EventSource遇到连接错误时触发（网络断开、服务端关闭、空闲超时等）
+     * 注意：EventSource默认会自动重连，但我们需要自行控制重连逻辑以便：
+     *   1. 通知前端连接状态变化（显示指示器）
+     *   2. 控制重连次数上限
+     *   3. 重连成功后触发消息补齐
+     * 因此：先关闭当前EventSource（禁止其默认自动重连），再自行管理重连
+     */
+    es.onerror = () => {
+      // 已手动关闭，不重连
+      if (isClosed) return
+
+      // 关闭当前连接（阻止EventSource默认的自动重连行为）
+      es.close()
+      currentES = null
+
+      // 检查是否还有重连次数
+      if (retryCount >= SSE_RECONNECT_MAX_RETRIES) {
+        // 超过最大重连次数，切换为disconnected状态
+        handlers.onConnectionStateChange?.('disconnected')
+        return
+      }
+
+      // 切换为reconnecting状态
+      handlers.onConnectionStateChange?.('reconnecting')
+
+      // 指数退避计算延迟：1s, 2s, 4s, 8s, 16s（上限30s）
+      const delay = Math.min(
+        SSE_RECONNECT_BASE_DELAY_MS * Math.pow(2, retryCount),
+        SSE_RECONNECT_MAX_DELAY_MS
+      )
+      retryCount++
+
+      console.log(`[SSE] 连接断开，${delay / 1000}秒后尝试第${retryCount}次重连... (planId: ${planId})`)
+
+      // 延迟后重连
+      retryTimer = setTimeout(() => {
+        if (isClosed) return
+        connectSSE()
+      }, delay)
     }
-  })
+  }
 
-  es.addEventListener('done', () => {
-    handlers.onDone?.()
-    es.close()
-  })
+  /**
+   * 创建并连接EventSource
+   * 首次连接和重连共用此函数
+   */
+  const connectSSE = () => {
+    if (isClosed) return
 
-  return es
+    const url = `/api/v1/lesson-plans/sse/plans/${planId}/stream?token=${encodeURIComponent(token)}`
+    const es = new EventSource(url)
+    currentES = es
+    bindEventListeners(es)
+  }
+
+  // 首次连接
+  connectSSE()
+
+  // 返回可控连接对象
+  return {
+    close: () => {
+      isClosed = true
+      // 清除重连计时器
+      if (retryTimer) {
+        clearTimeout(retryTimer)
+        retryTimer = null
+      }
+      // 关闭EventSource
+      if (currentES) {
+        currentES.close()
+        currentES = null
+      }
+    },
+  }
 }
 
 /* ==================== API函数：阶段化备课工坊（Phase 7B-9 新增 6个接口）==================== */
@@ -979,4 +1125,32 @@ export async function updateAdminStage(stageCode: string, data: {
 }) {
   const resp = await apiClient.put(`/admin/workshop-stages/${stageCode}`, data)
   return resp.data.data
+}
+
+
+// ==================== P0-2新增：阶段完成度检测 ====================
+
+/** 完成度检查项 */
+export interface CompletenessItem {
+  label: string
+  passed: boolean
+  detail: string
+}
+
+/** 阶段完成度响应 */
+export interface StageCompletenessResponse {
+  stage_code: string
+  stage_name: string
+  percentage: number
+  is_complete: boolean
+  checked_items: CompletenessItem[]
+  missing_hints: string[]
+}
+
+/** 获取阶段完成度检测结果 */
+export async function getStageCompleteness(planId: string, stageCode: string): Promise<StageCompletenessResponse> {
+  const res = await apiClient.get<{ code: number; data: StageCompletenessResponse }>(
+    `/lesson-plans/plans/${planId}/stages/${stageCode}/completeness`
+  )
+  return res.data.data
 }

@@ -7,6 +7,11 @@
  *   P3：叙事式过渡动画
  * 迭代12 新增：
  *   阶段过渡时弹出组件推荐弹窗（方案B组件交互）
+ * v88 新增（P2-3 断线恢复与SSE韧性）：
+ *   - 网络状态指示器（绿/黄/红）
+ *   - SSE自动重连（指数退避，最多5次）
+ *   - 重连后自动拉取最新对话补齐丢失消息
+ *   - 消息发送失败自动重试1次
  */
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
@@ -14,9 +19,10 @@ import { useAuth } from '@/store/auth'
 import {
   startConversation, sendChatMessage, triggerAIReview, applyAISuggestions,
   publishLessonPlanPersonal, createLessonPlanSSE, getLessonPlan, getConversation,
-  getStageStatus, advanceStage, skipStage, backStage, getStageOutput, resetStage, switchToStage,
+  getStageStatus, advanceStage, skipStage, backStage, getStageOutput, resetStage, switchToStage, getStageCompleteness,
   type LessonPlan, type ConversationMessage, type AIReviewResult, type ConvComponent,
-  type StageProgressItem, type StageEventData,
+  type StageProgressItem, type StageEventData, type StageCompletenessResponse,
+  type SSEConnectionState, type SSEConnection,
 } from '@/api/lesson-plans'
 import {
   C, renderMarkdown, type StreamingState,
@@ -35,6 +41,9 @@ const STAGE_SEP_PREFIX = '__STAGE_SEP__'
 
 // 迭代12：有组件映射的阶段列表（revise无组件）
 const STAGES_WITH_COMPONENTS = ['analyze', 'design', 'write', 'review']
+
+// v88：消息发送最大重试次数
+const SEND_RETRY_MAX = 1
 
 export default function WorkshopPage() {
   const { token } = useAuth()
@@ -86,6 +95,9 @@ export default function WorkshopPage() {
     currentName: string; nextName: string; nextRole: string
   } | null>(null)
 
+  // P0-2：阶段完成度状态
+  const [stageCompleteness, setStageCompleteness] = useState<StageCompletenessResponse | null>(null)
+
   // 迭代12：阶段组件推荐弹窗状态
   const [showComponentsModal, setShowComponentsModal] = useState(false)
   const [pendingTransitionStage, setPendingTransitionStage] = useState<string | null>(null)
@@ -93,8 +105,14 @@ export default function WorkshopPage() {
   // v77：阶段视图切换状态（null=显示当前阶段，指定stageCode=查看该阶段历史对话）
   const [viewingStage, setViewingStage] = useState<string | null>(null)
 
-  const sseRef         = useRef<EventSource | null>(null)
+  // v88新增：SSE连接状态（connected=绿色 | reconnecting=黄色 | disconnected=红色）
+  const [sseConnectionState, setSseConnectionState] = useState<SSEConnectionState>('connected')
+
+  // v88：SSE连接引用改为SSEConnection类型（支持close方法）
+  const sseRef         = useRef<SSEConnection | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  // v88：保存planId的ref，供重连回调使用（避免闭包捕获旧值）
+  const planIdRef = useRef<string | null>(null)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -122,9 +140,12 @@ export default function WorkshopPage() {
     }
   }, [])
 
+  // v88重构：connectSSE增加连接状态回调和重连补齐逻辑
   const connectSSE = useCallback((planId: string) => {
     if (!token) return
     sseRef.current?.close()
+    planIdRef.current = planId
+
     sseRef.current = createLessonPlanSSE(planId, token, {
       onThinking: () => { setIsThinking(true); setStreaming(null) },
       onChunk: (chunk: string) => {
@@ -149,7 +170,6 @@ export default function WorkshopPage() {
       },
       onStageStarted: (_data: StageEventData) => { refreshStages(planId) },
       onStageComplete: (_data: StageEventData) => {
-        // v75：AI不再发送stage_complete事件（标签体系已移除）
         setIsStageProcessing(false)
         refreshStages(planId)
       },
@@ -163,6 +183,46 @@ export default function WorkshopPage() {
           content: `抱歉，遇到了一点问题：${err}。你可以重试或换个方式表达。`,
           created_at: new Date().toISOString(),
         }])
+      },
+
+      // v88新增：连接状态变化回调 → 驱动顶部指示器颜色
+      onConnectionStateChange: (state: SSEConnectionState) => {
+        setSseConnectionState(state)
+      },
+
+      // v88新增：重连成功后自动补齐丢失消息
+      onReconnected: async () => {
+        const currentPlanId = planIdRef.current
+        if (!currentPlanId) return
+        try {
+          console.log('[SSE] 重连成功，开始补齐对话消息...')
+          // 拉取服务端最新的完整对话记录
+          const convData = await getConversation(currentPlanId)
+          const serverMsgs = (convData.messages || []).filter(
+            (m: ConversationMessage) => m.role === 'user' || m.role === 'assistant' || m.role === 'system'
+          )
+          // 用服务端完整消息替换本地消息（服务端是真实来源）
+          // 只在服务端消息数量大于本地时才替换，避免重连瞬间本地正在streaming的消息被覆盖
+          setMessages(prev => {
+            if (serverMsgs.length > prev.length) {
+              console.log(`[SSE] 补齐完成：本地${prev.length}条 → 服务端${serverMsgs.length}条`)
+              return serverMsgs
+            }
+            console.log(`[SSE] 无需补齐：本地${prev.length}条 >= 服务端${serverMsgs.length}条`)
+            return prev
+          })
+          // 同时刷新教案内容和阶段状态
+          const planData = await getLessonPlan(currentPlanId)
+          if (planData.content_markdown) setPlanContent(planData.content_markdown)
+          if (planData.current_stage && planData.stage_config) {
+            await refreshStages(currentPlanId)
+          }
+          // 清理可能残留的streaming状态
+          setIsThinking(false)
+          setStreaming(null)
+        } catch (err) {
+          console.error('[SSE] 重连后补齐消息失败:', err)
+        }
       },
     })
   }, [token, refreshStages])
@@ -221,20 +281,52 @@ export default function WorkshopPage() {
     } finally { setStartLoading(false) }
   }
 
+  // v88增强：消息发送增加重试机制
   const handleSend = async () => {
     if (!plan || (!inputText.trim() && selectedComponentIds.size === 0)) return
     const msgText = inputText.trim()
     setInputText('')
-    setMessages(prev => [...prev, {
+
+    // 乐观更新：立即将用户消息显示在UI中
+    const localMsg: ConversationMessage = {
       id: `local_${Date.now()}`, role: 'user' as const, type: 'text' as const,
       content: msgText || `已选择${selectedComponentIds.size}个组件`,
       created_at: new Date().toISOString(),
-    }])
+    }
+    setMessages(prev => [...prev, localMsg])
     setIsThinking(true)
-    try {
-      await sendChatMessage(plan.id, { message: msgText, selected_components: Array.from(selectedComponentIds) })
-      setSelectedComponentIds(new Set())
-    } catch (err) { setIsThinking(false); console.error('发送消息失败:', err) }
+
+    const componentIds = Array.from(selectedComponentIds)
+
+    // 带重试的发送逻辑
+    let lastErr: unknown = null
+    for (let attempt = 0; attempt <= SEND_RETRY_MAX; attempt++) {
+      try {
+        await sendChatMessage(plan.id, { message: msgText, selected_components: componentIds })
+        setSelectedComponentIds(new Set())
+        lastErr = null
+        break
+      } catch (err) {
+        lastErr = err
+        if (attempt < SEND_RETRY_MAX) {
+          console.warn(`[Send] 发送失败，${1}秒后重试第${attempt + 1}次...`)
+          await new Promise(resolve => setTimeout(resolve, 1000))
+        }
+      }
+    }
+
+    // 所有重试都失败
+    if (lastErr) {
+      setIsThinking(false)
+      console.error('发送消息失败（含重试）:', lastErr)
+      setMessages(prev => [...prev, {
+        id: `send_err_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
+        content: '⚠️ 消息发送失败，请检查网络后重试。你刚才的内容已保留在输入框中。',
+        created_at: new Date().toISOString(),
+      }])
+      // 将消息内容恢复到输入框，方便用户重试
+      setInputText(msgText)
+    }
   }
 
   const handleSelectComponent = (comp: ConvComponent) => {
@@ -291,7 +383,15 @@ export default function WorkshopPage() {
     setStreaming(null)
     setInputText('')
     setSelectedComponentIds(new Set())
+    setSseConnectionState('connected')  // v88：重置连接状态
     setPhase('start')
+  }
+
+  // v88新增：手动重连按钮（disconnected状态时可用）
+  const handleManualReconnect = () => {
+    if (!plan) return
+    setSseConnectionState('reconnecting')
+    connectSSE(plan.id)
   }
 
   // ==================== P2：点击完成本阶段 ====================
@@ -301,10 +401,15 @@ export default function WorkshopPage() {
     setShowSummaryModal(true)
     setStageSummary('')
     setStageStructured('{}')
+    setStageCompleteness(null)
     try {
-      const output = await getStageOutput(plan.id, currentStage)
+      const [output, completeness] = await Promise.all([
+        getStageOutput(plan.id, currentStage),
+        getStageCompleteness(plan.id, currentStage).catch(() => null),
+      ])
       setStageSummary(output.narrative_output || '')
       setStageStructured(output.structured_output || '{}')
+      if (completeness) setStageCompleteness(completeness)
     } catch {
       setStageSummary('')
       setStageStructured('{}')
@@ -545,6 +650,11 @@ export default function WorkshopPage() {
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: '12px', fontWeight: isCurrent ? 600 : 400, color: isCurrent ? C.primary : stage.status === 'completed' ? C.success : C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{stage.stage_name}</div>
                       <div style={{ fontSize: '10px', color: statusColor, marginTop: '1px' }}>{statusIcon} {stage.ai_role}</div>
+                      {isCurrent && stageCompleteness && stageCompleteness.stage_code === stage.stage_code && (
+                        <div style={{ fontSize: '10px', marginTop: '2px', color: stageCompleteness.percentage >= 80 ? '#10B981' : '#F59E0B', fontWeight: 600 }}>
+                          {stageCompleteness.percentage}% 完成
+                        </div>
+                      )}
                     </div>
                   </div>
                 )
@@ -601,6 +711,48 @@ export default function WorkshopPage() {
           <StageTransitionView currentStageName={transitionInfo.currentName} nextStageName={transitionInfo.nextName} nextStageRole={transitionInfo.nextRole} step={transitionStep} />
         )}
 
+        {/* v88新增：网络状态指示器（仅在非connected状态时显示） */}
+        {phase === 'chatting' && sseConnectionState !== 'connected' && (
+          <div style={{
+            padding: '7px 16px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '8px',
+            fontSize: '13px',
+            fontWeight: 500,
+            borderBottom: `1px solid ${sseConnectionState === 'reconnecting' ? 'rgba(245,158,11,0.3)' : 'rgba(239,68,68,0.3)'}`,
+            background: sseConnectionState === 'reconnecting'
+              ? 'linear-gradient(135deg, rgba(245,158,11,0.08), rgba(251,191,36,0.05))'
+              : 'linear-gradient(135deg, rgba(239,68,68,0.08), rgba(248,113,113,0.05))',
+            color: sseConnectionState === 'reconnecting' ? '#92400E' : '#991B1B',
+            animation: sseConnectionState === 'reconnecting' ? 'sseReconnectPulse 2s ease-in-out infinite' : 'none',
+          }}>
+            {/* 状态圆点 */}
+            <div style={{
+              width: '8px', height: '8px', borderRadius: '50%', flexShrink: 0,
+              background: sseConnectionState === 'reconnecting' ? '#F59E0B' : '#EF4444',
+              boxShadow: sseConnectionState === 'reconnecting'
+                ? '0 0 6px rgba(245,158,11,0.5)'
+                : '0 0 6px rgba(239,68,68,0.5)',
+            }} />
+            {sseConnectionState === 'reconnecting' ? (
+              <span>网络连接中断，正在尝试重新连接...</span>
+            ) : (
+              <>
+                <span>网络连接已断开</span>
+                <button onClick={handleManualReconnect} style={{
+                  padding: '3px 12px', borderRadius: '12px',
+                  border: '1px solid rgba(239,68,68,0.4)',
+                  background: 'rgba(239,68,68,0.08)',
+                  fontSize: '12px', color: '#DC2626', cursor: 'pointer',
+                  fontWeight: 600,
+                }}>点击重连</button>
+              </>
+            )}
+          </div>
+        )}
+
         {isStageMode && currentStage && (() => {
           const cur = stageItems.find(s => s.stage_code === currentStage)
           return (
@@ -611,6 +763,21 @@ export default function WorkshopPage() {
                   <span style={{ fontSize: '13px', fontWeight: 600, color: C.primary }}>{cur?.stage_name || currentStage}</span>
                   {cur?.ai_role && <span style={{ fontSize: '11px', color: C.textMuted, marginLeft: '8px' }}>· {cur.ai_role}</span>}
                 </div>
+                {/* v88：阶段标题栏右侧的小型连接状态点 */}
+                <div title={
+                  sseConnectionState === 'connected' ? '连接正常' :
+                  sseConnectionState === 'reconnecting' ? '重连中...' : '连接断开'
+                } style={{
+                  width: '6px', height: '6px', borderRadius: '50%', marginLeft: '4px',
+                  background: sseConnectionState === 'connected' ? '#10B981' :
+                              sseConnectionState === 'reconnecting' ? '#F59E0B' : '#EF4444',
+                  boxShadow: sseConnectionState === 'connected'
+                    ? '0 0 4px rgba(16,185,129,0.4)'
+                    : sseConnectionState === 'reconnecting'
+                    ? '0 0 4px rgba(245,158,11,0.4)'
+                    : '0 0 4px rgba(239,68,68,0.4)',
+                  transition: 'background 300ms ease, box-shadow 300ms ease',
+                }} />
               </div>
               <span style={{ fontSize: '12px', color: C.textMuted }}>{currentStageIdx + 1} / {stageItems.length}</span>
             </div>
@@ -710,7 +877,7 @@ export default function WorkshopPage() {
 
         <div style={{ padding: '14px 20px', borderTop: `1px solid ${C.border}`, background: C.card }}>
           <div style={{ display: 'flex', gap: '10px', alignItems: 'flex-end', background: '#F9FAFB', borderRadius: '12px', border: `1px solid ${C.border}`, padding: '10px 12px' }}>
-            <textarea value={inputText} onChange={e => setInputText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }} placeholder={isBusy ? 'AI处理中...' : '告诉AI你的想法... (Enter发送，Shift+Enter换行)'} rows={2} disabled={isBusy} style={{ flex: 1, background: 'transparent', border: 'none', outline: 'none', fontSize: '15px', color: C.text, resize: 'none', fontFamily: 'inherit', lineHeight: 1.6, opacity: isBusy ? 0.5 : 1 }} />
+            <textarea value={inputText} onChange={e => setInputText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }} placeholder={isBusy ? 'AI处理中...' : sseConnectionState === 'disconnected' ? '网络已断开，请先重连...' : '告诉AI你的想法... (Enter发送，Shift+Enter换行)'} rows={2} disabled={isBusy} style={{ flex: 1, background: 'transparent', border: 'none', outline: 'none', fontSize: '15px', color: C.text, resize: 'none', fontFamily: 'inherit', lineHeight: 1.6, opacity: isBusy ? 0.5 : 1 }} />
             <button onClick={handleSend} disabled={isBusy || (!inputText.trim() && selectedComponentIds.size === 0)} style={{ width: '36px', height: '36px', flexShrink: 0, borderRadius: '50%', border: 'none', background: isBusy || (!inputText.trim() && selectedComponentIds.size === 0) ? '#E5E7EB' : C.primary, color: '#fff', cursor: 'pointer', fontSize: '16px', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 200ms ease' }}>→</button>
           </div>
 
@@ -854,6 +1021,7 @@ export default function WorkshopPage() {
           loading={summaryLoading}
           onConfirm={handleConfirmTransition}
           onCancel={() => setShowSummaryModal(false)}
+          completeness={stageCompleteness}
         />
       )}
 
@@ -861,6 +1029,10 @@ export default function WorkshopPage() {
         @keyframes completePulse {
           0%, 100% { box-shadow: 0 3px 12px rgba(16,185,129,0.35); }
           50%       { box-shadow: 0 3px 20px rgba(16,185,129,0.6); transform: translateY(-1px); }
+        }
+        @keyframes sseReconnectPulse {
+          0%, 100% { opacity: 1; }
+          50%       { opacity: 0.7; }
         }
       `}</style>
     </div>
