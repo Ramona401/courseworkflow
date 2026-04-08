@@ -13,8 +13,10 @@ package services
 // AI调用模式：
 //   import aiClient "tedna/internal/ai"
 //   aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), "", "", "", "")
-//   result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt, nil)
+//   result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt, traceCtx)
 //   result.Content — AI输出文本
+//
+// v89-2变更：callAI方法增加userID参数，传入真实TraceContext替代nil
 
 import (
 	"context"
@@ -123,12 +125,25 @@ const assessmentSystemPrompt = `你是一位经验丰富的教研专家，正在
 // ==================== 内部：获取AI配置并调用 ====================
 
 // callAI 封装AI调用：获取配置→调用→返回文本
-func (s *AssessmentService) callAI(systemPrompt string, userPrompt string) (string, error) {
+// v89-2变更：增加userID参数，构建真实TraceContext
+// 前测对话属于lesson_plan场景范畴（但无plan_id，只有user_id）
+func (s *AssessmentService) callAI(systemPrompt string, userPrompt string, userID string) (string, error) {
 	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), "", "", "", "")
 	if err != nil {
 		return "", fmt.Errorf("获取AI配置失败: %w", err)
 	}
-	result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt, nil)
+
+	// v89-2：构建真实TraceContext，记录场景和用户ID
+	var traceCtx *aiClient.TraceContext
+	if userID != "" {
+		uid := userID
+		traceCtx = &aiClient.TraceContext{
+			SceneCode: "lesson_plan", // 前测对话归类为教案场景
+			UserID:    &uid,
+		}
+	}
+
+	result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt, traceCtx)
 	if err != nil {
 		return "", fmt.Errorf("AI调用失败: %w", err)
 	}
@@ -145,9 +160,9 @@ func (s *AssessmentService) StartAssessment(ctx context.Context, userID string) 
 		assessLog.Info("用户重新进行前测", "user_id", userID, "previous_version", existing.AssessmentVersion)
 	}
 
-	// 调用AI获取开场白
+	// 调用AI获取开场白（v89-2：传入userID用于追踪）
 	openingPrompt := "请开始和这位老师进行风格前测对话。先用一句温暖的开场白打招呼，然后问第一个问题（Q1：教龄和学科年级）。"
-	aiContent, err := s.callAI(assessmentSystemPrompt, openingPrompt)
+	aiContent, err := s.callAI(assessmentSystemPrompt, openingPrompt, userID)
 	if err != nil {
 		assessLog.Error("前测AI调用失败，使用降级开场白", "user_id", userID, "error", err)
 		// 降级：使用固定开场白
@@ -177,7 +192,8 @@ func (s *AssessmentService) ChatAssessment(ctx context.Context, userID string, u
 	// 构建多轮对话prompt（将历史对话拼入user消息）
 	fullPrompt := buildMultiTurnPrompt(conversationHistory, userMessage)
 
-	aiContent, err := s.callAI(assessmentSystemPrompt, fullPrompt)
+	// v89-2：传入userID用于追踪
+	aiContent, err := s.callAI(assessmentSystemPrompt, fullPrompt, userID)
 	if err != nil {
 		assessLog.Error("前测对话AI调用失败", "user_id", userID, "error", err)
 		return nil, fmt.Errorf("AI服务暂时不可用，请稍后重试")

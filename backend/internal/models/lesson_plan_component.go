@@ -244,6 +244,7 @@ type MatchedComponent struct {
 	UsageCount     int     `json:"usage_count"`      // 使用次数
 	SelectCount    int     `json:"select_count"`     // 选中次数
 	Tags           string  `json:"tags"`             // 标签
+	ComponentIndex string  `json:"component_index"`  // v83: AOCI压缩索引
 }
 
 // MatchComponentsResponse 组件匹配响应

@@ -342,7 +342,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 			// modify使用Sonnet（模板化修改，速度快）
 			userPrompt := buildModifyUserPrompt(pipeline.CourseCode, op, origHTML)
 			callStart := time.Now()
-			callResult, callErr := s.callAIWithSemaphore(aiCfgModify, promptF.Content, userPrompt)
+			callResult, callErr := s.callAIWithSemaphore(aiCfgModify, promptF.Content, userPrompt, pipeline.ID)
 			pageRec.LatencyMs = time.Since(callStart).Milliseconds()
 
 			if callErr != nil {
@@ -375,7 +375,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 
 			userPrompt := buildCreateUserPrompt(pipeline.CourseCode, op, refHTML)
 			callStart := time.Now()
-			callResult, callErr := s.callAIWithSemaphore(aiCfgCreate, promptF.Content, userPrompt)
+			callResult, callErr := s.callAIWithSemaphore(aiCfgCreate, promptF.Content, userPrompt, pipeline.ID)
 			pageRec.LatencyMs = time.Since(callStart).Milliseconds()
 
 			if callErr != nil {
@@ -414,7 +414,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 				if len(sourceHTMLs) == 1 {
 					userPrompt := buildModifyUserPrompt(pipeline.CourseCode, op, sourceHTMLs[0].html)
 					callStart := time.Now()
-					callResult, callErr := s.callAIWithSemaphore(aiCfgModify, promptF.Content, userPrompt)
+					callResult, callErr := s.callAIWithSemaphore(aiCfgModify, promptF.Content, userPrompt, pipeline.ID)
 					pageRec.LatencyMs = time.Since(callStart).Milliseconds()
 					if callErr != nil {
 						pageRec.Status = "failed"
@@ -454,7 +454,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 			// merge使用Opus（复杂合并需要更强推理）
 			userPrompt := buildMergeUserPrompt(pipeline.CourseCode, op, sourceHTMLs)
 			callStart := time.Now()
-			callResult, callErr := s.callAIWithSemaphore(aiCfgMerge, promptF.Content, userPrompt)
+			callResult, callErr := s.callAIWithSemaphore(aiCfgMerge, promptF.Content, userPrompt, pipeline.ID)
 			pageRec.LatencyMs = time.Since(callStart).Milliseconds()
 
 			mergeJSON, _ := json.Marshal(mergeSourceNums)

@@ -17,6 +17,7 @@ import (
 
 	"tedna/internal/models"
 	"tedna/internal/repository"
+	"tedna/internal/utils"
 )
 
 // stageComponentTypeMap 阶段→组件类型映射
@@ -127,7 +128,7 @@ func (s *WorkshopStageService) getRecipeComponentsForStage(ctx context.Context, 
 
 // getAutoMatchedComponentsForStage 从组件库自动匹配阶段组件
 func (s *WorkshopStageService) getAutoMatchedComponentsForStage(ctx context.Context, stageTypes []string, subject string, grade string) []*models.RecommendedComponentItem {
-	normalizedGrade := normalizeGradeToNumber(grade)
+	normalizedGrade := utils.NormalizeGradeToNumber(grade)
 	wsLog.Info("自动匹配组件参数", "subject", subject, "grade", grade, "normalizedGrade", normalizedGrade, "stageTypes", stageTypes)
 	groups, err := repository.MatchComponents(ctx, &models.MatchComponentsRequest{
 		Subject: subject, GradeRange: normalizedGrade, LibraryTypes: stageTypes, Limit: 3,

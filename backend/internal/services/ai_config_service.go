@@ -215,7 +215,7 @@ func (s *AIConfigService) maskAPIKey(encValue string) (string, bool) {
 	return plaintext[:8] + "***" + plaintext[len(plaintext)-4:], true
 }
 
-// ==================== AI连通性测试方法（P2-2新增）====================
+// ==================== AI连通性测试方法 ====================
 
 // TestConnection 测试AI API连通性
 // 使用当前全局配置（API Base URL + Key + Model）向AI API发送简短测试请求
@@ -266,14 +266,13 @@ func (s *AIConfigService) TestConnection() (*TestConnectionResult, error) {
 	}
 
 	// 4. 构造OpenAI兼容格式的测试请求
-	// 使用最简短的消息，降低Token消耗
 	requestBody := map[string]interface{}{
 		"model": modelName,
 		"messages": []map[string]string{
 			{"role": "user", "content": "Hi"},
 		},
-		"max_tokens":  10,  // 限制响应长度，节省Token
-		"temperature": 0.0, // 确定性输出
+		"max_tokens":  10,
+		"temperature": 0.0,
 	}
 
 	jsonBody, err := json.Marshal(requestBody)
@@ -287,9 +286,7 @@ func (s *AIConfigService) TestConnection() (*TestConnectionResult, error) {
 	}
 
 	// 5. 构造HTTP请求
-	// API地址格式：{base_url}/chat/completions（OpenAI兼容）
 	endpoint := strings.TrimRight(apiBaseURL, "/") + "/chat/completions"
-
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(jsonBody))
 	if err != nil {
 		return &TestConnectionResult{
@@ -300,20 +297,16 @@ func (s *AIConfigService) TestConnection() (*TestConnectionResult, error) {
 		}, nil
 	}
 
-	// 设置请求头（OpenAI兼容格式）
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	// 6. 发送请求并计时
-	// 设置30秒超时，避免长时间等待
+	// 6. 发送请求并计时（30秒超时）
 	httpClient := &http.Client{Timeout: 30 * time.Second}
-
 	startTime := time.Now()
 	resp, err := httpClient.Do(req)
 	latencyMs := time.Since(startTime).Milliseconds()
 
 	if err != nil {
-		// 网络错误（超时、DNS解析失败、连接拒绝等）
 		return &TestConnectionResult{
 			Success:    false,
 			Message:    "网络连接失败: " + err.Error(),
@@ -338,11 +331,9 @@ func (s *AIConfigService) TestConnection() (*TestConnectionResult, error) {
 
 	// 8. 判断HTTP状态码
 	if resp.StatusCode != http.StatusOK {
-		// 尝试从响应体提取错误信息
 		errMsg := s.extractAPIErrorMessage(respBody)
 		statusText := fmt.Sprintf("HTTP %d", resp.StatusCode)
 
-		// 针对常见错误码给出友好提示
 		switch resp.StatusCode {
 		case 401:
 			statusText = "认证失败(401) — API Key无效或已过期"
@@ -370,7 +361,7 @@ func (s *AIConfigService) TestConnection() (*TestConnectionResult, error) {
 		}, nil
 	}
 
-	// 9. 解析成功响应，验证内容有效
+	// 9. 解析成功响应
 	var chatResp map[string]interface{}
 	if err := json.Unmarshal(respBody, &chatResp); err != nil {
 		return &TestConnectionResult{
@@ -382,7 +373,6 @@ func (s *AIConfigService) TestConnection() (*TestConnectionResult, error) {
 		}, nil
 	}
 
-	// 检查响应中是否包含choices字段（OpenAI兼容格式标志）
 	if _, ok := chatResp["choices"]; !ok {
 		return &TestConnectionResult{
 			Success:    false,
@@ -404,7 +394,6 @@ func (s *AIConfigService) TestConnection() (*TestConnectionResult, error) {
 }
 
 // extractAPIErrorMessage 从AI API错误响应中提取错误信息
-// 支持OpenAI标准错误格式：{"error":{"message":"...","type":"..."}}
 func (s *AIConfigService) extractAPIErrorMessage(body []byte) string {
 	var errResp struct {
 		Error struct {
@@ -416,7 +405,6 @@ func (s *AIConfigService) extractAPIErrorMessage(body []byte) string {
 		return errResp.Error.Message
 	}
 
-	// 如果无法解析，返回截断的原始响应（最多200字符）
 	raw := string(body)
 	if len(raw) > 200 {
 		raw = raw[:200] + "..."
@@ -430,7 +418,6 @@ func (s *AIConfigService) extractAPIErrorMessage(body []byte) string {
 // ==================== 可用模型查询方法 ====================
 
 // ListModels 查询当前 Key 下可用的模型列表
-// 调用上游 {api_base_url}/models 接口（OpenAI兼容），返回模型ID列表（按字母排序）
 func (s *AIConfigService) ListModels() ([]ModelInfo, error) {
 	// 1. 获取API Base URL
 	baseURLConfig, err := repository.GetConfigByKey(models.ConfigKeyAPIBaseURL)
@@ -445,7 +432,7 @@ func (s *AIConfigService) ListModels() ([]ModelInfo, error) {
 		return nil, ErrAPIKeyNotSet
 	}
 
-	// 3. 调用 GET {base_url}/models 接口（OpenAI兼容标准端点）
+	// 3. 调用 GET {base_url}/models
 	endpoint := apiBaseURL + "/models"
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -454,7 +441,6 @@ func (s *AIConfigService) ListModels() ([]ModelInfo, error) {
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	// 15秒超时，模型列表查询通常很快
 	httpClient := &http.Client{Timeout: 15 * time.Second}
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -477,7 +463,7 @@ func (s *AIConfigService) ListModels() ([]ModelInfo, error) {
 		return nil, fmt.Errorf("API返回错误(HTTP %d)，该Key可能无权查询模型列表", resp.StatusCode)
 	}
 
-	// 6. 解析 OpenAI 兼容格式：{"object":"list","data":[{"id":"..."},...]}
+	// 6. 解析 OpenAI 兼容格式
 	var listResp struct {
 		Data []struct {
 			ID string `json:"id"`
@@ -487,7 +473,7 @@ func (s *AIConfigService) ListModels() ([]ModelInfo, error) {
 		return nil, fmt.Errorf("解析模型列表响应失败: %w", err)
 	}
 
-	// 7. 提取模型ID并按字母排序，过滤空ID
+	// 7. 提取模型ID并按字母排序
 	result := make([]ModelInfo, 0, len(listResp.Data))
 	for _, m := range listResp.Data {
 		if strings.TrimSpace(m.ID) != "" {
@@ -503,7 +489,7 @@ func (s *AIConfigService) ListModels() ([]ModelInfo, error) {
 
 // ==================== 场景配置方法 ====================
 
-// GetAllSceneConfigs 获取所有场景配置（含中文名）
+// GetAllSceneConfigs 获取所有场景配置（含中文名 + v85 fallback_models）
 func (s *AIConfigService) GetAllSceneConfigs() ([]*models.SceneConfigResponse, error) {
 	scenes, err := repository.GetAllSceneConfigs()
 	if err != nil {
@@ -512,31 +498,38 @@ func (s *AIConfigService) GetAllSceneConfigs() ([]*models.SceneConfigResponse, e
 
 	var result []*models.SceneConfigResponse
 	for _, sc := range scenes {
+		// 确保FallbackModels不为nil（前端友好）
+		fallbacks := sc.FallbackModels
+		if fallbacks == nil {
+			fallbacks = []string{}
+		}
+
 		resp := &models.SceneConfigResponse{
 			ID:             sc.ID,
 			SceneCode:      sc.SceneCode,
 			SceneName:      models.SceneNameMap[sc.SceneCode],
-				SceneGroup:     models.SceneGroupMap[sc.SceneCode],
+			SceneGroup:     models.SceneGroupMap[sc.SceneCode],
 			Model:          sc.Model,
 			Temperature:    sc.Temperature,
 			MaxTokens:      sc.MaxTokens,
 			SystemPromptID: sc.SystemPromptID,
 			IsActive:       sc.IsActive,
+			FallbackModels: fallbacks,
 			UpdatedAt:      sc.UpdatedAt,
 		}
 		// 兜底：未注册的场景给默认值
-			if resp.SceneName == "" {
-				resp.SceneName = sc.SceneCode
-			}
-			if resp.SceneGroup == "" {
-				resp.SceneGroup = "pipeline"
-			}
-			result = append(result, resp)
+		if resp.SceneName == "" {
+			resp.SceneName = sc.SceneCode
+		}
+		if resp.SceneGroup == "" {
+			resp.SceneGroup = "pipeline"
+		}
+		result = append(result, resp)
 	}
 	return result, nil
 }
 
-// UpdateSceneConfig 更新指定场景配置
+// UpdateSceneConfig 更新指定场景配置（v85：支持fallback_models更新）
 func (s *AIConfigService) UpdateSceneConfig(code string, req *models.UpdateSceneConfigRequest, userID string) error {
 	// 校验场景代码
 	if !models.IsValidSceneCode(code) {
@@ -570,6 +563,7 @@ func (s *AIConfigService) UpdateSceneConfig(code string, req *models.UpdateScene
 		MaxTokens:      existing.MaxTokens,
 		SystemPromptID: existing.SystemPromptID,
 		IsActive:       &existing.IsActive,
+		FallbackModels: existing.FallbackModels, // v85: 保留现有fallback
 	}
 	if req.Model != nil {
 		merged.Model = req.Model
@@ -585,6 +579,10 @@ func (s *AIConfigService) UpdateSceneConfig(code string, req *models.UpdateScene
 	}
 	if req.IsActive != nil {
 		merged.IsActive = req.IsActive
+	}
+	// v85: fallback_models使用请求中的值（前端总是发送完整列表）
+	if req.FallbackModels != nil {
+		merged.FallbackModels = req.FallbackModels
 	}
 
 	return repository.UpdateSceneConfig(code, merged, userID)

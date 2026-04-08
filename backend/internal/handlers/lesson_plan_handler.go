@@ -44,7 +44,13 @@ func (h *LessonPlanHandler) ListLessonPlans(w http.ResponseWriter, r *http.Reque
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	offset, _ := strconv.Atoi(q.Get("offset"))
 
-	result, err := h.lpService.ListLessonPlans(r.Context(), authorID, groupID, status, subject, grade, limit, offset)
+	// v86新增：AOCI索引维度筛选参数（用户友好的中文标签→数字）
+	qualityLevel, _ := strconv.Atoi(q.Get("quality_level"))
+	structureType, _ := strconv.Atoi(q.Get("structure_type"))
+	cognitiveLevel, _ := strconv.Atoi(q.Get("cognitive_level"))
+	pedagogyIntensity, _ := strconv.Atoi(q.Get("pedagogy_intensity"))
+
+	result, err := h.lpService.ListLessonPlans(r.Context(), authorID, groupID, status, subject, grade, limit, offset, qualityLevel, structureType, cognitiveLevel, pedagogyIntensity)
 	if err != nil {
 		log.Printf("获取教案列表失败: %v", err)
 		utils.InternalError(w, "获取教案列表失败")

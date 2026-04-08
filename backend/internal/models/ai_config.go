@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/json"
 	"time"
 )
 
@@ -26,7 +27,7 @@ type AIConfigItem struct {
 
 // GlobalConfigResponse 全局配置响应（聚合为一个对象）
 type GlobalConfigResponse struct {
-	APIBaseURL   string     `json:"api_base_url"`  // AI API 基础地址
+	APIBaseURL   string     `json:"api_base_url"`   // AI API 基础地址
 	APIKey       string     `json:"api_key"`        // API Key（脱敏显示）
 	APIKeySet    bool       `json:"api_key_set"`    // API Key 是否已配置
 	DefaultModel string     `json:"default_model"`  // 默认模型
@@ -37,7 +38,7 @@ type GlobalConfigResponse struct {
 
 // UpdateGlobalConfigRequest 更新全局配置请求体
 type UpdateGlobalConfigRequest struct {
-	APIBaseURL   string `json:"api_base_url"`  // AI API 基础地址
+	APIBaseURL   string `json:"api_base_url"`   // AI API 基础地址
 	APIKey       string `json:"api_key"`        // API Key（明文，后端加密存储；空字符串表示不修改）
 	DefaultModel string `json:"default_model"`  // 默认模型
 	Temperature  string `json:"temperature"`    // 默认温度（字符串，如 "0.7"）
@@ -57,9 +58,23 @@ type AISceneConfig struct {
 	IsActive       bool       `json:"is_active"`        // 是否启用
 	UpdatedBy      *string    `json:"updated_by"`       // 最后更新者ID
 	UpdatedAt      *time.Time `json:"updated_at"`       // 最后更新时间
+	FallbackModels []string   `json:"-"`                // v85新增：降级模型列表（从JSONB解析）
 }
 
-// SceneConfigResponse 返回给前端的场景配置（含场景中文名）
+// ParseFallbackModels 从原始JSONB字节解析降级模型列表
+// 在repository层Scan后调用
+func ParseFallbackModels(raw []byte) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var models []string
+	if err := json.Unmarshal(raw, &models); err != nil {
+		return nil
+	}
+	return models
+}
+
+// SceneConfigResponse 返回给前端的场景配置（含中文名）
 type SceneConfigResponse struct {
 	ID             string     `json:"id"`               // UUID
 	SceneCode      string     `json:"scene_code"`       // 场景代码
@@ -70,6 +85,7 @@ type SceneConfigResponse struct {
 	MaxTokens      *int       `json:"max_tokens"`       // 最大Token
 	SystemPromptID *string    `json:"system_prompt_id"` // 关联提示词ID
 	IsActive       bool       `json:"is_active"`        // 是否启用
+	FallbackModels []string   `json:"fallback_models"`  // v85新增：降级模型列表
 	UpdatedAt      *time.Time `json:"updated_at"`       // 最后更新时间
 }
 
@@ -80,6 +96,7 @@ type UpdateSceneConfigRequest struct {
 	MaxTokens      *int     `json:"max_tokens"`       // 最大Token（null表示继承全局）
 	SystemPromptID *string  `json:"system_prompt_id"` // 关联提示词ID
 	IsActive       *bool    `json:"is_active"`        // 是否启用
+	FallbackModels []string `json:"fallback_models"`  // v85新增：降级模型列表（nil表示不修改）
 }
 
 // ==================== 场景代码常量与映射 ====================
@@ -88,27 +105,34 @@ type UpdateSceneConfigRequest struct {
 // 核心6个场景对应Pipeline的6个AI步骤
 // Generator额外拆分为3个子场景：modify(Sonnet)/create(Opus)/merge(Opus)
 const (
-	SceneScanner         = "scanner"          // 扫描定位（Prompt A）→ Sonnet
+	SceneScanner         = "scanner"          // 扫描定位（Prompt A）→ Haiku
 	SceneEvaluator       = "evaluator"        // 评估打分（Prompt B）→ Opus
 	SceneMeta            = "meta"             // 元评估仲裁（Prompt E）→ Opus
-	SceneTranslator      = "translator"       // 翻译转换（Prompt C）→ Opus
-	SceneReviewer        = "reviewer"         // 审核检查（Prompt D）→ Opus
+	SceneTranslator      = "translator"       // 翻译转换（Prompt C）→ Sonnet
+	SceneReviewer        = "reviewer"         // 审核检查（Prompt D）→ Sonnet
 	SceneGenerator       = "generator"        // 页面生成-修改（Prompt F）→ Sonnet
 	SceneGeneratorCreate = "generator_create" // 页面生成-新增（Prompt F）→ Opus（从零创建）
-	SceneGeneratorMerge  = "generator_merge" // 页面生成-合并（Prompt F）→ Opus（复杂合并）
-	SceneAIFix           = "ai_fix"           // AI快修（Sonnet）  // 页面生成-合并（Prompt F）→ Opus（复杂合并）
+	SceneGeneratorMerge  = "generator_merge"  // 页面生成-合并（Prompt F）→ Opus（复杂合并）
+	SceneAIFix           = "ai_fix"           // AI快修（Sonnet）
 )
 
-// ValidSceneCodes 有效场景代码列表（含新增的generator子场景）
 // 教案备课场景代码常量（v78新增）
 const (
 	SceneLessonPlan = "lesson_plan" // 教案备课对话
 )
 
+// v87新增：AI教练场景代码常量
+const (
+	SceneStageCoach = "stage_coach" // 阶段教练评估（Haiku，低成本）
+)
+
+// ValidSceneCodes 有效场景代码列表（v87新增stage_coach）
 var ValidSceneCodes = []string{
 	SceneScanner, SceneEvaluator, SceneMeta,
 	SceneTranslator, SceneReviewer,
 	SceneGenerator, SceneGeneratorCreate, SceneGeneratorMerge,
+	SceneAIFix, SceneLessonPlan,
+	SceneStageCoach,
 }
 
 // SceneNameMap 场景代码→中文名映射
@@ -123,10 +147,10 @@ var SceneNameMap = map[string]string{
 	SceneGeneratorMerge:  "页面生成-合并",
 	SceneAIFix:           "AI快修",
 	SceneLessonPlan:      "教案备课对话",
+	SceneStageCoach:      "阶段教练评估",
 }
 
-
-// SceneGroupMap 场景代码→分组映射（v78新增）
+// SceneGroupMap 场景代码→分组映射（v78新增，v87补充stage_coach）
 var SceneGroupMap = map[string]string{
 	SceneScanner:         "pipeline",
 	SceneEvaluator:       "pipeline",
@@ -138,6 +162,7 @@ var SceneGroupMap = map[string]string{
 	SceneGeneratorMerge:  "pipeline",
 	SceneAIFix:           "pipeline",
 	SceneLessonPlan:      "lesson_plan",
+	SceneStageCoach:      "lesson_plan",
 }
 
 // IsValidSceneCode 检查场景代码是否有效

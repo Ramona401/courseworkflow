@@ -1,22 +1,25 @@
 /**
- * 系统设置页面（Phase 6 - P6-1b）
+ * 系统设置页面（Phase 6 - P6-1b，v81清理）
  *
  * 功能：
- * 1. 系统信息卡片：版本号、技术栈、部署信息
- * 2. 并发引擎状态（admin可见）：实时查询引擎运行统计
- * 3. 快捷管理入口：跳转到各配置页面
- * 4. 健康检查：实时检测后端服务状态
+ * 1. 健康检查：实时检测后端服务状态
+ * 2. 系统信息卡片：版本号、技术栈、部署信息
+ * 3. 并发引擎状态（admin可见）：实时查询引擎运行统计
+ *
+ * v81变更：
+ *   - 移除「快捷管理」区域（4个入口已有更好的替代）
+ *     → AI配置 / 用户管理 → Header下拉菜单（新版 /ai-center 和 /admin）
+ *     → 提示词管理 / 外部数据配置 → 侧边栏已有入口
+ *   - 页面更聚焦：健康检查 + 系统信息 + 引擎状态
  *
  * Apple风格内联CSS
  */
 import { useState, useEffect, useCallback } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import client from '@/api/client'
 import {
-  Settings, RefreshCw, Server, Cpu, Activity,
-  Bot, FileText, Database, Shield, Heart,
-  ExternalLink, CheckCircle, XCircle, Loader,
+  RefreshCw, Server, Cpu,
+  Heart, CheckCircle, XCircle, Loader,
 } from 'lucide-react'
 
 // ==================== 类型定义 ====================
@@ -57,45 +60,9 @@ function InfoRow({ label, value, mono }: { label: string; value: string | number
   )
 }
 
-// ==================== 快捷入口组件 ====================
-function QuickLink({ label, desc, icon, onClick }: {
-  label: string; desc: string; icon: React.ReactNode; onClick: () => void
-}) {
-  return (
-    <div
-      onClick={onClick}
-      style={{
-        display: 'flex', alignItems: 'center', gap: 14,
-        padding: '14px 18px', borderRadius: 12, cursor: 'pointer',
-        transition: 'all 0.15s ease', border: '1px solid rgba(0,0,0,0.04)',
-      }}
-      onMouseEnter={e => {
-        (e.currentTarget as HTMLElement).style.background = 'rgba(0,122,255,0.04)';
-        (e.currentTarget as HTMLElement).style.borderColor = 'rgba(0,122,255,0.15)'
-      }}
-      onMouseLeave={e => {
-        (e.currentTarget as HTMLElement).style.background = 'transparent';
-        (e.currentTarget as HTMLElement).style.borderColor = 'rgba(0,0,0,0.04)'
-      }}
-    >
-      <div style={{
-        width: 36, height: 36, borderRadius: 10,
-        background: 'rgba(0,122,255,0.08)', display: 'flex',
-        alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-      }}>{icon}</div>
-      <div style={{ flex: 1 }}>
-        <div style={{ fontSize: 14, fontWeight: 600, color: '#1c1c1e' }}>{label}</div>
-        <div style={{ fontSize: 12, color: '#86868b', marginTop: 1 }}>{desc}</div>
-      </div>
-      <ExternalLink size={14} color="#c7c7cc" />
-    </div>
-  )
-}
-
 // ==================== 主页面组件 ====================
 
 export default function SettingsPage() {
-  const navigate = useNavigate()
   const { user } = useAuth()
   const isAdmin = user?.role === 'admin'
 
@@ -162,7 +129,7 @@ export default function SettingsPage() {
     <div style={{ maxWidth: 800 }}>
       {/* ===== 描述 ===== */}
       <p style={{ fontSize: 14, color: '#86868b', margin: '0 0 20px 0' }}>
-        查看系统状态、引擎运行情况和快捷管理入口
+        查看系统状态和引擎运行情况
       </p>
 
       {/* ===== 健康检查 ===== */}
@@ -269,26 +236,6 @@ export default function SettingsPage() {
           ) : (
             <div style={{ color: '#86868b', fontSize: 13 }}>加载中...</div>
           )}
-        </div>
-      )}
-
-      {/* ===== 快捷管理入口（仅admin） ===== */}
-      {isAdmin && (
-        <div style={card}>
-          <div style={cardTitle}>
-            <Activity size={18} color="#34c759" />
-            <span>快捷管理</span>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <QuickLink label="AI 配置" desc="管理API密钥、模型选择和场景配置"
-              icon={<Bot size={18} color="#007aff" />} onClick={() => navigate('/workflow/ai-config')} />
-            <QuickLink label="提示词管理" desc="编辑评估/翻译/生成等11个提示词槽位"
-              icon={<FileText size={18} color="#007aff" />} onClick={() => navigate('/workflow/prompts')} />
-            <QuickLink label="外部数据配置" desc="OSS存储、推送接口等外部服务配置"
-              icon={<Database size={18} color="#007aff" />} onClick={() => navigate('/workflow/external-data')} />
-            <QuickLink label="用户管理" desc="管理用户账号、角色和课程分配"
-              icon={<Shield size={18} color="#007aff" />} onClick={() => navigate('/workflow/users')} />
-          </div>
         </div>
       )}
 

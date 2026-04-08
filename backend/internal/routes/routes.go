@@ -8,10 +8,15 @@ package routes
 //
 // v80新增：InitTraceWriter() 启动AI调用追踪异步写入器
 //   AITraceHandler 注册到 registerAdminRoutes
+//
+// v87新增：wsStageService.SetAESKey(cfg.GetAESKey()) 注入AES密钥
+//   WorkshopStageService.AdvanceStage 阶段过渡时调用LLM教练评估，
+//   需要AES密钥获取AI配置，通过SetAESKey在routes层注入。
 
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"time"
 
@@ -75,10 +80,15 @@ func Setup(cfg *config.Config) http.Handler {
 	wsStageService  := services.NewWorkshopStageService()
 	assessService   := services.NewAssessmentService(recipeService, cfg)
 	tbService       := services.NewTextbookService(cfg)
+	ciService       := services.NewComponentIndexService(cfg)
+	liService       := services.NewLessonIndexService(cfg)
 
 	// v73：注入genService到wsStageService，使review/revise阶段可自动触发Chat
 	// 必须在两个service都初始化完成后才能注入，避免循环依赖
 	wsStageService.SetGenService(lpGenService)
+
+	// v87：注入AES密钥到wsStageService，使阶段过渡时LLM教练评估可获取AI配置
+	wsStageService.SetAESKey(cfg.GetAESKey())
 
 	engine := services.NewEngine(8, 8, 100)
 	pipelineService.SetEngine(engine)
@@ -169,6 +179,40 @@ func Setup(cfg *config.Config) http.Handler {
 	registerAdminRoutes(mux, authMW, adminOnly, adminHandler, roleHandler, userHandler, aiConfigHandler, promptHandler, edHandler, courseHandler, wsStageHandler, aiTraceHandler)
 	registerPipelineRoutes(mux, authMW, pipelineHandler, sseHandler)
 	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler)
+
+	// ---- v83新增：组件索引批量压缩（admin only）----
+	mux.Handle("/api/v1/admin/component-index/batch-compress", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			methodNotAllowedJSON(w, "仅支持POST请求")
+			return
+		}
+		// 异步执行批量压缩，立即返回
+		go func() {
+			import_ctx := context.Background()
+			success, failed, err := ciService.BatchCompressAllComponents(import_ctx, 20, 800)
+			if err != nil {
+				log.Printf("批量压缩组件索引错误: %v", err)
+			} else {
+				log.Printf("批量压缩组件索引完成: 成功=%d 失败=%d", success, failed)
+			}
+		}()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "message": "批量压缩已开始，请查看服务日志"})
+	}), authMW, adminOnly))
+
+	// ---- v86新增：教案索引批量生成（admin only）----
+	mux.Handle("/api/v1/admin/lesson-index/batch-index", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			methodNotAllowedJSON(w, "仅支持POST请求")
+			return
+		}
+		// 异步执行批量索引，立即返回
+		go liService.BatchIndexAllLessonPlans()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "message": "批量教案索引已开始，请查看服务日志"})
+	}), authMW, adminOnly))
 
 	engine.StartGracefulShutdown()
 	return corsMiddleware(mux)

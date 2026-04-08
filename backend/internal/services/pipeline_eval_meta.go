@@ -381,7 +381,7 @@ func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 		}
 		_ = repository.UpdateEvalRoundRunning(roundRec.ID)
 
-		callResult, callErr := s.callAIWithSemaphore(aiCfg, systemPrompt, userPrompt)
+		callResult, callErr := s.callAIWithSemaphore(aiCfg, systemPrompt, userPrompt, pipeline.ID)
 		if callErr != nil {
 			_ = repository.FailEvalRound(roundRec.ID, "", callErr.Error())
 			failCount++
@@ -625,7 +625,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 	for attempt := 1; attempt <= maxRetry; attempt++ {
 		metaResult.Attempt = attempt
 
-		callResult, callErr := s.callAIWithSemaphore(aiCfg, systemPrompt, userPrompt)
+		callResult, callErr := s.callAIWithSemaphore(aiCfg, systemPrompt, userPrompt, pipeline.ID)
 		if callErr != nil {
 			totalLatencyMs += time.Since(startTime).Milliseconds() - totalLatencyMs
 			if attempt == maxRetry {

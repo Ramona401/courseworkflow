@@ -121,6 +121,43 @@ func (h *WorkshopStageHandler) ResetStage(w http.ResponseWriter, r *http.Request
 	utils.Success(w, stage)
 }
 
+
+// ==================== P0-2新增：阶段完成度检测 ====================
+
+// GetStageCompleteness GET /api/v1/lesson-plans/plans/{id}/stages/{code}/completeness
+// 返回指定阶段的完成度百分比和缺失要素清单（纯规则引擎，无AI调用）
+func (h *WorkshopStageHandler) GetStageCompleteness(w http.ResponseWriter, r *http.Request) {
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	planID, stageCode := extractPlanIDAndStageCode(r.URL.Path)
+	if planID == "" || stageCode == "" {
+		utils.BadRequest(w, "教案ID或阶段代码无效")
+		return
+	}
+
+	// 验证教案所有权
+	lp, err := services.GetLessonPlanForCheck(r.Context(), planID)
+	if err != nil {
+		utils.Fail(w, 404, "教案不存在")
+		return
+	}
+	if lp.AuthorID != claims.UserID {
+		utils.Fail(w, 403, "无权操作此教案")
+		return
+	}
+
+	resp, err := services.CheckStageCompleteness(r.Context(), planID, stageCode)
+	if err != nil {
+		handleStageError(w, err)
+		return
+	}
+	utils.Success(w, resp)
+}
+
 // ==================== 迭代12新增：获取阶段推荐组件 ====================
 
 // GetStageRecommendedComponents GET /api/v1/lesson-plans/plans/{id}/stages/{code}/recommended-components

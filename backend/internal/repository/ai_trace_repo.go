@@ -4,8 +4,11 @@ package repository
 //
 // 职责：
 //   1. 异步写入AI调用trace记录（channel缓冲，不阻塞主路径）
-//   2. 仪表盘聚合查询（按场景/模型/日期/状态多维聚合）
+//   2. 仪表盘聚合查询（按场景/模型/用户/组织/日期/状态多维聚合）
 //   3. 最近错误记录查询
+//
+// v81变更：新增按用户/组织聚合查询
+// v85变更：INSERT新增is_fallback+original_model列；概览新增降级统计；错误记录Scan增加2列
 //
 // 被引用：
 //   ai/client.go — EnqueueTrace写入
@@ -67,7 +70,7 @@ func traceConsumer() {
 	}
 }
 
-// insertTrace 执行单条trace记录的数据库INSERT
+// insertTrace 执行单条trace记录的数据库INSERT（v85：新增is_fallback+original_model列）
 func insertTrace(rec models.TraceRecord) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -79,13 +82,15 @@ func insertTrace(rec models.TraceRecord) error {
 		INSERT INTO ai_call_traces
 			(scene_code, model_used, prompt_tokens, completion_tokens, total_tokens,
 			 latency_ms, status, error_message, pipeline_id, lesson_plan_id, user_id,
-			 estimated_cost_usd, output_length, is_stream)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			 estimated_cost_usd, output_length, is_stream,
+			 is_fallback, original_model)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		rec.SceneCode, rec.ModelUsed,
 		rec.PromptTokens, rec.CompletionTokens, rec.TotalTokens,
 		rec.LatencyMs, rec.Status, rec.ErrorMessage,
 		rec.PipelineID, rec.LessonPlanID, rec.UserID,
 		cost, rec.OutputLength, rec.IsStream,
+		rec.IsFallback, rec.OriginalModel,
 	)
 	return err
 }
@@ -93,14 +98,14 @@ func insertTrace(rec models.TraceRecord) error {
 // ==================== 仪表盘聚合查询 ====================
 
 // GetTraceDashboard 获取AI调用仪表盘全部数据（一次请求返回）
-// 包含：概览数字 + 按场景聚合 + 按模型聚合 + 每日趋势 + 最近错误
+// 包含：概览数字 + 按场景聚合 + 按模型聚合 + 按用户聚合 + 按组织聚合 + 每日趋势 + 最近错误
 func GetTraceDashboard(ctx context.Context, params models.TraceQueryParams) (*models.TraceDashboard, error) {
 	dash := &models.TraceDashboard{}
 
 	// 构建公共WHERE子句（时间范围+场景+模型筛选）
 	whereClause, args := buildTraceWhere(params)
 
-	// ---- 1. 概览数字 ----
+	// ---- 1. 概览数字（v85：新增降级统计）----
 	overviewSQL := fmt.Sprintf(`
 		SELECT
 			COUNT(*),
@@ -110,6 +115,11 @@ func GetTraceDashboard(ctx context.Context, params models.TraceQueryParams) (*mo
 			CASE WHEN COUNT(*) > 0
 				THEN ROUND(COUNT(*) FILTER (WHERE status != 'success')::numeric / COUNT(*)::numeric * 100, 2)
 				ELSE 0
+			END,
+			COALESCE(COUNT(*) FILTER (WHERE is_fallback = true), 0),
+			CASE WHEN COUNT(*) > 0
+				THEN ROUND(COUNT(*) FILTER (WHERE is_fallback = true)::numeric / COUNT(*)::numeric * 100, 2)
+				ELSE 0
 			END
 		FROM ai_call_traces
 		%s`, whereClause)
@@ -117,6 +127,7 @@ func GetTraceDashboard(ctx context.Context, params models.TraceQueryParams) (*mo
 	err := database.DB.QueryRow(ctx, overviewSQL, args...).Scan(
 		&dash.TotalCalls, &dash.TotalTokens, &dash.TotalCostUSD,
 		&dash.AvgLatencyMs, &dash.ErrorRate,
+		&dash.FallbackCount, &dash.FallbackRate,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("概览查询失败: %w", err)
@@ -154,7 +165,7 @@ func GetTraceDashboard(ctx context.Context, params models.TraceQueryParams) (*mo
 		); err != nil {
 			return nil, fmt.Errorf("扫描场景聚合行失败: %w", err)
 		}
-		// 填充场景中文名（从models.SceneNameMap获取）
+		// 填充场景中文名
 		if name, ok := models.SceneNameMap[s.SceneCode]; ok {
 			s.SceneName = name
 		} else {
@@ -195,7 +206,107 @@ func GetTraceDashboard(ctx context.Context, params models.TraceQueryParams) (*mo
 		dash.ByModel = append(dash.ByModel, m)
 	}
 
-	// ---- 4. 每日趋势（最近30天）----
+	// ---- 4. 按用户聚合（v81新增）----
+	userWhereClause := whereClause
+	if userWhereClause == "" {
+		userWhereClause = "WHERE t.user_id IS NOT NULL"
+	} else {
+		userWhereClause = strings.Replace(userWhereClause, "WHERE ", "WHERE t.user_id IS NOT NULL AND ", 1)
+		userWhereClause = addTablePrefix(userWhereClause, "t")
+	}
+
+	userSQL := fmt.Sprintf(`
+		SELECT
+			t.user_id,
+			COALESCE(u.username, '未知用户') AS username,
+			COALESCE(u.display_name, '') AS display_name,
+			COALESCE(u.role, '') AS role,
+			COUNT(*) AS call_count,
+			COUNT(*) FILTER (WHERE t.status = 'success') AS success_count,
+			COUNT(*) FILTER (WHERE t.status != 'success') AS error_count,
+			COALESCE(AVG(t.latency_ms)::int, 0) AS avg_latency,
+			COALESCE(SUM(t.total_tokens), 0) AS total_tokens,
+			COALESCE(SUM(t.prompt_tokens), 0) AS total_prompt,
+			COALESCE(SUM(t.completion_tokens), 0) AS total_completion,
+			COALESCE(SUM(t.estimated_cost_usd), 0) AS cost
+		FROM ai_call_traces t
+		LEFT JOIN users u ON t.user_id::uuid = u.id
+		%s
+		GROUP BY t.user_id, u.username, u.display_name, u.role
+		ORDER BY cost DESC
+		LIMIT 50`, userWhereClause)
+
+	userRows, err := database.DB.Query(ctx, userSQL, args...)
+	if err != nil {
+		return nil, fmt.Errorf("用户聚合查询失败: %w", err)
+	}
+	defer userRows.Close()
+
+	for userRows.Next() {
+		var u models.TraceUserStats
+		if err := userRows.Scan(
+			&u.UserID, &u.Username, &u.DisplayName, &u.Role,
+			&u.CallCount, &u.SuccessCount, &u.ErrorCount,
+			&u.AvgLatencyMs, &u.TotalTokens, &u.TotalPromptTokens,
+			&u.TotalCompletionTokens, &u.EstimatedCostUSD,
+		); err != nil {
+			return nil, fmt.Errorf("扫描用户聚合行失败: %w", err)
+		}
+		dash.ByUser = append(dash.ByUser, u)
+	}
+
+	// ---- 5. 按组织聚合（v81新增）----
+	orgWhereClause := whereClause
+	if orgWhereClause == "" {
+		orgWhereClause = "WHERE t.user_id IS NOT NULL"
+	} else {
+		orgWhereClause = strings.Replace(orgWhereClause, "WHERE ", "WHERE t.user_id IS NOT NULL AND ", 1)
+		orgWhereClause = addTablePrefix(orgWhereClause, "t")
+	}
+
+	orgSQL := fmt.Sprintf(`
+		SELECT
+			o.id AS org_id,
+			o.name AS org_name,
+			o.type AS org_type,
+			COUNT(DISTINCT t.user_id) AS member_count,
+			COUNT(*) AS call_count,
+			COUNT(*) FILTER (WHERE t.status = 'success') AS success_count,
+			COUNT(*) FILTER (WHERE t.status != 'success') AS error_count,
+			COALESCE(AVG(t.latency_ms)::int, 0) AS avg_latency,
+			COALESCE(SUM(t.total_tokens), 0) AS total_tokens,
+			COALESCE(SUM(t.prompt_tokens), 0) AS total_prompt,
+			COALESCE(SUM(t.completion_tokens), 0) AS total_completion,
+			COALESCE(SUM(t.estimated_cost_usd), 0) AS cost
+		FROM ai_call_traces t
+		INNER JOIN teaching_group_members tgm ON t.user_id::uuid = tgm.user_id
+		INNER JOIN teaching_groups tg ON tgm.group_id = tg.id
+		INNER JOIN organizations o ON tg.school_id = o.id
+		%s
+		GROUP BY o.id, o.name, o.type
+		ORDER BY cost DESC
+		LIMIT 50`, orgWhereClause)
+
+	orgRows, err := database.DB.Query(ctx, orgSQL, args...)
+	if err != nil {
+		return nil, fmt.Errorf("组织聚合查询失败: %w", err)
+	}
+	defer orgRows.Close()
+
+	for orgRows.Next() {
+		var org models.TraceOrgStats
+		if err := orgRows.Scan(
+			&org.OrgID, &org.OrgName, &org.OrgType,
+			&org.MemberCount, &org.CallCount, &org.SuccessCount, &org.ErrorCount,
+			&org.AvgLatencyMs, &org.TotalTokens, &org.TotalPromptTokens,
+			&org.TotalCompletionTokens, &org.EstimatedCostUSD,
+		); err != nil {
+			return nil, fmt.Errorf("扫描组织聚合行失败: %w", err)
+		}
+		dash.ByOrg = append(dash.ByOrg, org)
+	}
+
+	// ---- 6. 每日趋势（最近30天）----
 	trendSQL := fmt.Sprintf(`
 		SELECT
 			TO_CHAR(created_at, 'YYYY-MM-DD') AS date,
@@ -227,12 +338,13 @@ func GetTraceDashboard(ctx context.Context, params models.TraceQueryParams) (*mo
 		dash.DailyTrend = append(dash.DailyTrend, t)
 	}
 
-	// ---- 5. 最近错误记录（最多20条）----
+	// ---- 7. 最近错误记录（最多20条，v85：新增is_fallback+original_model列）----
 	errorSQL := `
 		SELECT id, scene_code, model_used, prompt_tokens, completion_tokens,
 			   total_tokens, latency_ms, status, error_message,
 			   pipeline_id, lesson_plan_id, user_id,
-			   estimated_cost_usd, output_length, is_stream, created_at
+			   estimated_cost_usd, output_length, is_stream,
+			   is_fallback, original_model, created_at
 		FROM ai_call_traces
 		WHERE status != 'success'
 		ORDER BY created_at DESC
@@ -251,7 +363,8 @@ func GetTraceDashboard(ctx context.Context, params models.TraceQueryParams) (*mo
 			&t.PromptTokens, &t.CompletionTokens, &t.TotalTokens,
 			&t.LatencyMs, &t.Status, &t.ErrorMessage,
 			&t.PipelineID, &t.LessonPlanID, &t.UserID,
-			&t.EstimatedCostUSD, &t.OutputLength, &t.IsStream, &t.CreatedAt,
+			&t.EstimatedCostUSD, &t.OutputLength, &t.IsStream,
+			&t.IsFallback, &t.OriginalModel, &t.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("扫描错误记录行失败: %w", err)
 		}
@@ -264,6 +377,12 @@ func GetTraceDashboard(ctx context.Context, params models.TraceQueryParams) (*mo
 	}
 	if dash.ByModel == nil {
 		dash.ByModel = []models.TraceModelStats{}
+	}
+	if dash.ByUser == nil {
+		dash.ByUser = []models.TraceUserStats{}
+	}
+	if dash.ByOrg == nil {
+		dash.ByOrg = []models.TraceOrgStats{}
 	}
 	if dash.DailyTrend == nil {
 		dash.DailyTrend = []models.TraceDailyTrend{}
@@ -323,4 +442,22 @@ func buildTraceWhere(params models.TraceQueryParams) (string, []interface{}) {
 	}
 
 	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+// addTablePrefix 为WHERE子句中的列名添加表别名前缀
+// 用于JOIN查询时消除列名歧义
+// 处理的列: created_at, scene_code, model_used, status
+func addTablePrefix(where string, prefix string) string {
+	replacements := map[string]string{
+		"created_at ":  prefix + ".created_at ",
+		"created_at<":  prefix + ".created_at<",
+		"scene_code ":  prefix + ".scene_code ",
+		"model_used ":  prefix + ".model_used ",
+		"status ":      prefix + ".status ",
+	}
+	result := where
+	for old, new := range replacements {
+		result = strings.ReplaceAll(result, old, new)
+	}
+	return result
 }

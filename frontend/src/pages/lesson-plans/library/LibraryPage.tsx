@@ -291,6 +291,8 @@ export default function LibraryPage() {
   const [keyword, setKeyword]           = useState('')
   const [subjectFilter, setSubjectFilter] = useState('全部')
   const [gradeFilter,   setGradeFilter]   = useState('全部')
+  const [qualityFilter, setQualityFilter] = useState('全部')
+  const [structFilter,  setStructFilter]  = useState('全部')
 
   const [plans, setPlans]     = useState<LessonPlan[]>([])
   const [total, setTotal]     = useState(0)
@@ -316,6 +318,8 @@ export default function LibraryPage() {
       const params: Record<string, string | number> = { limit: 100 }
       if (subjectFilter !== '全部') params.subject = subjectFilter
       if (gradeFilter   !== '全部') params.grade   = gradeFilter
+      if (qualityFilter !== '全部') params.quality_level = qualityFilter
+      if (structFilter  !== '全部') params.structure_type = structFilter
       if (scope === 'group' && myGroups.length > 0) params.group_id = myGroups[0].id
 
       const [sharedResp, approvedResp] = await Promise.all([
@@ -343,12 +347,12 @@ export default function LibraryPage() {
     } catch (e) {
       console.error('加载教案库失败:', e); setError('加载失败，请稍后重试')
     } finally { setLoading(false) }
-  }, [user, scope, subjectFilter, gradeFilter, keyword, myGroups])
+  }, [user, scope, subjectFilter, gradeFilter, keyword, myGroups, qualityFilter, structFilter])
 
   useEffect(() => { loadPlans() }, [loadPlans])
 
-  const handleReset = () => { setKeyword(''); setSubjectFilter('全部'); setGradeFilter('全部') }
-  const isFiltered  = keyword.trim() !== '' || subjectFilter !== '全部' || gradeFilter !== '全部'
+  const handleReset = () => { setKeyword(''); setSubjectFilter('全部'); setGradeFilter('全部'); setQualityFilter('全部'); setStructFilter('全部') }
+  const isFiltered  = keyword.trim() !== '' || subjectFilter !== '全部' || gradeFilter !== '全部' || qualityFilter !== '全部' || structFilter !== '全部'
 
   const handleFork = async (plan: LessonPlan) => {
     if (forkingId) return
@@ -436,6 +440,20 @@ export default function LibraryPage() {
           <select value={gradeFilter} onChange={e => setGradeFilter(e.target.value)}
             style={{ padding: '6px 10px', borderRadius: '6px', border: `1px solid ${gradeFilter !== '全部' ? C.primary : C.border}`, background: gradeFilter !== '全部' ? C.primaryLight : 'transparent', color: gradeFilter !== '全部' ? C.primary : C.textSec, fontSize: '13px', cursor: 'pointer', outline: 'none' }}>
             {GRADES.map(g => <option key={g} value={g}>{g}</option>)}
+          </select>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '13px', fontWeight: 500, color: C.textSec, flexShrink: 0 }}>质量</span>
+          <select value={qualityFilter} onChange={e => setQualityFilter(e.target.value)}
+            style={{ padding: '6px 10px', borderRadius: '6px', border: `1px solid ${qualityFilter !== '全部' ? '#10B981' : C.border}`, background: qualityFilter !== '全部' ? 'rgba(16,185,129,0.08)' : 'transparent', color: qualityFilter !== '全部' ? '#10B981' : C.textSec, fontSize: '13px', cursor: 'pointer', outline: 'none' }}>
+            {['全部', '5', '4', '3', '2'].map(v => <option key={v} value={v}>{v === '全部' ? '全部' : v === '5' ? '精品' : v === '4' ? '优秀' : v === '3' ? '良好' : '可用'}</option>)}
+          </select>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '13px', fontWeight: 500, color: C.textSec, flexShrink: 0 }}>教法</span>
+          <select value={structFilter} onChange={e => setStructFilter(e.target.value)}
+            style={{ padding: '6px 10px', borderRadius: '6px', border: `1px solid ${structFilter !== '全部' ? '#8B5CF6' : C.border}`, background: structFilter !== '全部' ? 'rgba(139,92,246,0.08)' : 'transparent', color: structFilter !== '全部' ? '#8B5CF6' : C.textSec, fontSize: '13px', cursor: 'pointer', outline: 'none' }}>
+            {['全部', '1', '2', '3', '4', '5'].map(v => <option key={v} value={v}>{v === '全部' ? '全部' : v === '1' ? '讲授型' : v === '2' ? '探究型' : v === '3' ? '项目型' : v === '4' ? '翻转型' : '混合型'}</option>)}
           </select>
         </div>
         {isFiltered && (

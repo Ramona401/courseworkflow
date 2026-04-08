@@ -1,12 +1,14 @@
 /**
- * AITraceDashboardPage — AI调用追踪仪表盘（v80新增，admin专属）
+ * AITraceDashboardPage — AI调用追踪仪表盘（v80新增，v81增加用户/组织维度）
  *
  * 展示内容：
  *   1. 概览卡片（总调用/总token/总成本/平均延迟/错误率）
  *   2. 按场景聚合表格（每个AI场景的调用量/成本/延迟）
  *   3. 按模型聚合表格
- *   4. 每日趋势（简易柱状图）
- *   5. 最近错误列表
+ *   4. 按用户聚合表格（v81新增：每个用户的token消耗和成本）
+ *   5. 按组织聚合表格（v81新增：每个学校/区域的整体消耗）
+ *   6. 每日趋势（简易柱状图）
+ *   7. 最近错误列表
  *
  * 路由：/ai-traces（独立路由，admin专属）
  */
@@ -27,6 +29,8 @@ const C = {
   redLight: 'rgba(239,68,68,0.08)',
   purple: '#8B5CF6',
   purpleLight: 'rgba(139,92,246,0.08)',
+  cyan: '#06B6D4',
+  cyanLight: 'rgba(6,182,212,0.08)',
   textPrimary: '#1F2937',
   textSecondary: '#6B7280',
   textMuted: '#9CA3AF',
@@ -34,6 +38,20 @@ const C = {
   card: '#FFFFFF',
   border: '#F3F4F6',
   borderDark: '#E5E7EB',
+}
+
+// 角色中文映射
+const ROLE_NAMES: Record<string, string> = {
+  admin: '管理员',
+  senior_operator: '高级操作员',
+  operator: '操作员',
+  viewer: '查看者',
+}
+
+// 组织类型中文映射
+const ORG_TYPE_NAMES: Record<string, string> = {
+  region: '区域',
+  school: '学校',
 }
 
 // ==================== 主组件 ====================
@@ -191,7 +209,122 @@ export default function AITraceDashboardPage() {
               </div>
             </div>
 
-            {/* ── 4. 每日趋势 ── */}
+            {/* ── 4+5. 按用户 + 按组织 两列（v81新增）── */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginBottom: '28px' }}>
+              {/* 按用户统计 */}
+              <div style={sectionStyle}>
+                <h3 style={sectionTitleStyle}>👤 按用户统计</h3>
+                {data.by_user.length === 0 ? (
+                  <div style={emptyStyle}>暂无数据（需要trace记录包含user_id）</div>
+                ) : (
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={tableStyle}>
+                      <thead>
+                        <tr>
+                          <th style={thStyle}>用户</th>
+                          <th style={{...thStyle, textAlign: 'right'}}>调用</th>
+                          <th style={{...thStyle, textAlign: 'right'}}>Token</th>
+                          <th style={{...thStyle, textAlign: 'right'}}>均延迟</th>
+                          <th style={{...thStyle, textAlign: 'right'}}>成本</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {data.by_user.map(u => (
+                          <tr key={u.user_id}>
+                            <td style={tdStyle}>
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                <span style={{ fontWeight: 500 }}>{u.display_name || u.username}</span>
+                                <span style={{ fontSize: '11px', color: C.textMuted }}>
+                                  {u.username} · {ROLE_NAMES[u.role] || u.role}
+                                </span>
+                              </div>
+                            </td>
+                            <td style={{...tdStyle, textAlign: 'right'}}>
+                              <span>{u.call_count}</span>
+                              {u.error_count > 0 && (
+                                <span style={{ fontSize: '11px', color: C.red, marginLeft: '4px' }}>({u.error_count}错)</span>
+                              )}
+                            </td>
+                            <td style={{...tdStyle, textAlign: 'right'}}>
+                              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '1px' }}>
+                                <span style={{ fontWeight: 500 }}>{formatTokens(u.total_tokens)}</span>
+                                <span style={{ fontSize: '10px', color: C.textMuted }}>
+                                  入{formatTokens(u.total_prompt_tokens)} / 出{formatTokens(u.total_completion_tokens)}
+                                </span>
+                              </div>
+                            </td>
+                            <td style={{...tdStyle, textAlign: 'right'}}>{formatLatency(u.avg_latency_ms)}</td>
+                            <td style={{...tdStyle, textAlign: 'right', fontWeight: 600, color: C.green}}>${u.estimated_cost_usd.toFixed(3)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              {/* 按组织统计 */}
+              <div style={sectionStyle}>
+                <h3 style={sectionTitleStyle}>🏫 按组织统计</h3>
+                {data.by_org.length === 0 ? (
+                  <div style={emptyStyle}>暂无数据（需要用户加入教研组且有trace记录）</div>
+                ) : (
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={tableStyle}>
+                      <thead>
+                        <tr>
+                          <th style={thStyle}>组织</th>
+                          <th style={{...thStyle, textAlign: 'right'}}>活跃人数</th>
+                          <th style={{...thStyle, textAlign: 'right'}}>调用</th>
+                          <th style={{...thStyle, textAlign: 'right'}}>Token</th>
+                          <th style={{...thStyle, textAlign: 'right'}}>成本</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {data.by_org.map(o => (
+                          <tr key={o.org_id}>
+                            <td style={tdStyle}>
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                <span style={{ fontWeight: 500 }}>{o.org_name}</span>
+                                <span style={{
+                                  fontSize: '11px', color: C.textMuted,
+                                  display: 'inline-flex', alignItems: 'center', gap: '4px',
+                                }}>
+                                  <span style={{
+                                    padding: '1px 6px', borderRadius: '3px', fontSize: '10px',
+                                    background: o.org_type === 'school' ? C.primaryLight : C.purpleLight,
+                                    color: o.org_type === 'school' ? C.primary : C.purple,
+                                    fontWeight: 500,
+                                  }}>{ORG_TYPE_NAMES[o.org_type] || o.org_type}</span>
+                                </span>
+                              </div>
+                            </td>
+                            <td style={{...tdStyle, textAlign: 'right'}}>{o.member_count}人</td>
+                            <td style={{...tdStyle, textAlign: 'right'}}>
+                              <span>{o.call_count}</span>
+                              {o.error_count > 0 && (
+                                <span style={{ fontSize: '11px', color: C.red, marginLeft: '4px' }}>({o.error_count}错)</span>
+                              )}
+                            </td>
+                            <td style={{...tdStyle, textAlign: 'right'}}>
+                              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '1px' }}>
+                                <span style={{ fontWeight: 500 }}>{formatTokens(o.total_tokens)}</span>
+                                <span style={{ fontSize: '10px', color: C.textMuted }}>
+                                  入{formatTokens(o.total_prompt_tokens)} / 出{formatTokens(o.total_completion_tokens)}
+                                </span>
+                              </div>
+                            </td>
+                            <td style={{...tdStyle, textAlign: 'right', fontWeight: 600, color: C.green}}>${o.estimated_cost_usd.toFixed(3)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* ── 6. 每日趋势 ── */}
             <div style={{ ...sectionStyle, marginBottom: '28px' }}>
               <h3 style={sectionTitleStyle}>📈 每日趋势（最近30天）</h3>
               {data.daily_trend.length === 0 ? (
@@ -221,7 +354,7 @@ export default function AITraceDashboardPage() {
               )}
             </div>
 
-            {/* ── 5. 最近错误 ── */}
+            {/* ── 7. 最近错误 ── */}
             <div style={sectionStyle}>
               <h3 style={sectionTitleStyle}>🚨 最近错误（最多20条）</h3>
               {data.recent_errors.length === 0 ? (

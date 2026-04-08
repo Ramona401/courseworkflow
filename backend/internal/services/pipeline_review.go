@@ -398,7 +398,7 @@ func (s *PipelineService) AIFixPage(pipelineID string, pageNumber int, fixInstru
 	userPrompt := strings.Join(userPromptParts, "\n")
 
 	// 调用AI
-	callResult, callErr := s.callAIWithSemaphore(aiCfg, systemPrompt, userPrompt)
+	callResult, callErr := s.callAIWithSemaphore(aiCfg, systemPrompt, userPrompt, pipeline.ID)
 	if callErr != nil {
 		return nil, fmt.Errorf("%w: %s", ErrAIFixFailed, callErr.Error())
 	}

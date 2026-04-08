@@ -41,6 +41,11 @@ type LessonPlan struct {
 	CurrentStage      string     `json:"current_stage"`       // Phase 7B：当前所在阶段代码（空=未开始/旧模式）
 	StageConfig       string     `json:"stage_config"`        // Phase 7B：阶段配置快照JSON
         TextbookPageIDs   string     `json:"textbook_page_ids"`   // 迭代7B：关联的课本图片ID数组JSON
+        LessonIndex          string     `json:"lesson_index"`           // v86新增：AOCI索引文本（编码行+语义标签行）
+        IdxCognitiveLevel    int        `json:"idx_cognitive_level"`    // v86新增：认知层级冗余列（1-6）
+        IdxPedagogyIntensity int        `json:"idx_pedagogy_intensity"` // v86新增：教法强度冗余列（1-3）
+        IdxStructureType     int        `json:"idx_structure_type"`     // v86新增：结构类型冗余列（1-5）
+        IdxQualityLevel      int        `json:"idx_quality_level"`      // v86新增：质量等级冗余列（1-5）
 	CreatedAt         *time.Time `json:"created_at"`          // 创建时间
 	UpdatedAt         *time.Time `json:"updated_at"`          // 更新时间
 }
@@ -217,6 +222,8 @@ type LessonPlanListItem struct {
 	ForkedFrom      *string    `json:"forked_from"`
 	RecipeID        *string    `json:"recipe_id,omitempty"`        // Phase 7A：关联配方ID
 	RecipeName      string     `json:"recipe_name,omitempty"`     // Phase 7A：关联配方名称
+        LessonIndex     string     `json:"lesson_index,omitempty"`    // v86新增：AOCI索引文本
+        IdxQualityLevel int        `json:"idx_quality_level"`         // v86新增：质量等级
 	CreatedAt       *time.Time `json:"created_at"`
 	UpdatedAt       *time.Time `json:"updated_at"`
 }
@@ -250,6 +257,11 @@ type LessonPlanDetailResponse struct {
 	Version           int        `json:"version"`
 	RecipeID          *string    `json:"recipe_id,omitempty"`           // Phase 7A：关联配方ID
 	RecipeName        string     `json:"recipe_name,omitempty"`         // Phase 7A：关联配方名称
+        LessonIndex       string     `json:"lesson_index,omitempty"`        // v86新增：AOCI索引
+        IdxCognitiveLevel int        `json:"idx_cognitive_level"`           // v86新增：认知层级
+        IdxPedagogyIntensity int     `json:"idx_pedagogy_intensity"`        // v86新增：教法强度
+        IdxStructureType  int        `json:"idx_structure_type"`            // v86新增：结构类型
+        IdxQualityLevel   int        `json:"idx_quality_level"`             // v86新增：质量等级
 	CurrentStage      string     `json:"current_stage,omitempty"`       // Phase 7B：当前阶段
 	StageConfig       string     `json:"stage_config,omitempty"`        // Phase 7B：阶段配置
 	Reviews           []*LessonPlanReviewItem `json:"reviews"`

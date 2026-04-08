@@ -1,6 +1,6 @@
 /**
- * AI调用追踪 API 封装（v80新增）
- * - 仪表盘数据：概览数字 + 按场景/模型聚合 + 每日趋势 + 最近错误
+ * AI调用追踪 API 封装（v80新增，v81增加用户/组织维度）
+ * - 仪表盘数据：概览数字 + 按场景/模型/用户/组织聚合 + 每日趋势 + 最近错误
  * - 仅 admin 可调用
  */
 import client from './client'
@@ -29,6 +29,38 @@ export interface TraceModelStats {
   error_count: number
   avg_latency_ms: number
   total_tokens: number
+  estimated_cost_usd: number
+}
+
+/** 按用户聚合统计（v81新增） */
+export interface TraceUserStats {
+  user_id: string
+  username: string
+  display_name: string
+  role: string
+  call_count: number
+  success_count: number
+  error_count: number
+  avg_latency_ms: number
+  total_tokens: number
+  total_prompt_tokens: number
+  total_completion_tokens: number
+  estimated_cost_usd: number
+}
+
+/** 按组织聚合统计（v81新增） */
+export interface TraceOrgStats {
+  org_id: string
+  org_name: string
+  org_type: string
+  member_count: number
+  call_count: number
+  success_count: number
+  error_count: number
+  avg_latency_ms: number
+  total_tokens: number
+  total_prompt_tokens: number
+  total_completion_tokens: number
   estimated_cost_usd: number
 }
 
@@ -71,6 +103,8 @@ export interface TraceDashboard {
   error_rate: number
   by_scene: TraceSceneStats[]
   by_model: TraceModelStats[]
+  by_user: TraceUserStats[]     // v81新增
+  by_org: TraceOrgStats[]       // v81新增
   daily_trend: TraceDailyTrend[]
   recent_errors: AICallTrace[]
 }

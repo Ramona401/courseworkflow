@@ -4,21 +4,15 @@
  * P2：StageSummaryModal — 阶段完成确认弹窗（方案B：结构化产出展示）
  * P3：StageTransitionView — 阶段切换叙事动画
  * StageSeparatorBubble — 对话流中的阶段分隔符
- *
- * 方案B核心：
- *   从structured_output提取各阶段关键字段，渲染为可读的结构化卡片，
- *   每个阶段有专属展示模板，让用户真正看懂"这个阶段做了什么"。
+ * P0-2：completeness prop — 阶段完成度提示（不阻止操作，友好提醒）
  */
 
 import { useState, useEffect } from 'react'
 import { C } from './workshopConstants'
-import type { StageProgressItem } from '@/api/lesson-plans'
+import type { StageProgressItem, StageCompletenessResponse } from '@/api/lesson-plans'
 
 // ==================== 各阶段结构化摘要渲染 ====================
 
-/**
- * parseStructured 安全解析structured_output JSON字符串
- */
 function parseStructured(structuredOutput: string): Record<string, unknown> | null {
   if (!structuredOutput || structuredOutput === '{}') return null
   try {
@@ -30,10 +24,6 @@ function parseStructured(structuredOutput: string): Record<string, unknown> | nu
   }
 }
 
-/**
- * StageSummaryCards 各阶段结构化产出卡片渲染
- * 根据stage_code选择不同的展示模板
- */
 function StageSummaryCards({ stageCode, structuredOutput }: {
   stageCode: string
   structuredOutput: string
@@ -60,7 +50,6 @@ function StageSummaryCards({ stageCode, structuredOutput }: {
     fontSize: '12px', fontWeight: 500, margin: '2px 4px 2px 0',
   }
 
-  // 渲染字符串数组为标签
   const renderTags = (arr: unknown) => {
     if (!Array.isArray(arr) || arr.length === 0) return null
     return (
@@ -73,7 +62,6 @@ function StageSummaryCards({ stageCode, structuredOutput }: {
     )
   }
 
-  // 渲染字符串值
   const renderStr = (val: unknown, fallback?: string) => {
     const s = typeof val === 'string' ? val.trim() : ''
     return s || fallback || null
@@ -81,7 +69,6 @@ function StageSummaryCards({ stageCode, structuredOutput }: {
 
   switch (stageCode) {
     case 'analyze': {
-      // analyze: textbook_analysis, curriculum_standards[], student_profile, key_concepts[]
       const sp = data.student_profile as Record<string, unknown> | null
       return (
         <div>
@@ -122,7 +109,6 @@ function StageSummaryCards({ stageCode, structuredOutput }: {
     }
 
     case 'design': {
-      // design: objectives{knowledge[], ability[], emotion[]}, key_points[], difficult_points[], strategy, activities[]
       const obj = data.objectives as Record<string, unknown> | null
       const acts = data.activities as Array<Record<string, unknown>> | null
       return (
@@ -193,7 +179,6 @@ function StageSummaryCards({ stageCode, structuredOutput }: {
 
     case 'write':
     case 'revise': {
-      // write/revise: content_markdown（教案正文，只展示摘要）, content_structured
       const cs = data.content_structured as Record<string, unknown> | null
       const hasContent = renderStr(data.content_markdown)
       const revLog = data.revision_log as Array<Record<string, unknown>> | null
@@ -202,10 +187,7 @@ function StageSummaryCards({ stageCode, structuredOutput }: {
           {hasContent && (
             <div style={cardStyle}>
               <div style={labelStyle}>📄 教案内容</div>
-              <div style={{
-                fontSize: '13px', color: C.success, fontWeight: 600,
-                display: 'flex', alignItems: 'center', gap: '6px',
-              }}>
+              <div style={{ fontSize: '13px', color: C.success, fontWeight: 600, display: 'flex', alignItems: 'center', gap: '6px' }}>
                 <span>✅</span>
                 <span>完整教案已生成（{Math.round(hasContent.length / 100) * 100}+ 字符）</span>
               </div>
@@ -249,7 +231,6 @@ function StageSummaryCards({ stageCode, structuredOutput }: {
     }
 
     case 'review': {
-      // review: total_score, summary, good_points[], improvements[], dimensions[]
       const dims = data.dimensions as Array<Record<string, unknown>> | null
       const imps = data.improvements as Array<Record<string, unknown>> | null
       const score = typeof data.total_score === 'number' ? data.total_score : null
@@ -258,18 +239,11 @@ function StageSummaryCards({ stageCode, structuredOutput }: {
           {score !== null && (
             <div style={{
               ...cardStyle,
-              background: score >= 8.5
-                ? 'rgba(16,185,129,0.06)'
-                : 'rgba(245,158,11,0.06)',
-              border: score >= 8.5
-                ? '1px solid rgba(16,185,129,0.2)'
-                : '1px solid rgba(245,158,11,0.2)',
+              background: score >= 8.5 ? 'rgba(16,185,129,0.06)' : 'rgba(245,158,11,0.06)',
+              border: score >= 8.5 ? '1px solid rgba(16,185,129,0.2)' : '1px solid rgba(245,158,11,0.2)',
               display: 'flex', alignItems: 'center', gap: '14px',
             }}>
-              <div style={{
-                fontSize: '32px', fontWeight: 800, flexShrink: 0,
-                color: score >= 8.5 ? C.success : C.accent,
-              }}>
+              <div style={{ fontSize: '32px', fontWeight: 800, flexShrink: 0, color: score >= 8.5 ? C.success : C.accent }}>
                 {score.toFixed(1)}
               </div>
               <div>
@@ -332,30 +306,30 @@ function StageSummaryCards({ stageCode, structuredOutput }: {
   }
 }
 
-// ==================== P2：阶段完成确认弹窗（方案B：结构化展示）====================
+// ==================== P2：阶段完成确认弹窗 ====================
 
 interface StageSummaryModalProps {
-  stageCode: string                      // 当前阶段代码（用于选择展示模板）
-  stageName: string                      // 当前阶段名称
-  stageOrder: number                     // 当前阶段序号
-  totalStages: number                    // 总阶段数
-  nextStageItem: StageProgressItem | null // 下一阶段信息（null=最后阶段）
-  structuredOutput: string               // 结构化产出物JSON字符串
-  narrative: string                      // AI自然语言总结（用户可编辑）
-  loading: boolean                       // 加载产出物中
-  onConfirm: () => void                  // 确认进入下一阶段
-  onCancel: () => void                   // 继续当前阶段
+  stageCode: string
+  stageName: string
+  stageOrder: number
+  totalStages: number
+  nextStageItem: StageProgressItem | null
+  structuredOutput: string
+  narrative: string
+  loading: boolean
+  onConfirm: () => void
+  onCancel: () => void
+  completeness?: StageCompletenessResponse | null
 }
 
 export function StageSummaryModal({
   stageCode, stageName, stageOrder, totalStages, nextStageItem,
-  structuredOutput, narrative, loading, onConfirm, onCancel,
+  structuredOutput, narrative, loading, onConfirm, onCancel, completeness,
 }: StageSummaryModalProps) {
   const [userNote, setUserNote] = useState('')
   const isLastStage = !nextStageItem || stageOrder >= totalStages
   const hasStructured = structuredOutput && structuredOutput !== '{}'
 
-  // narrative变化时不自动填充（让用户自己写补充说明）
   useEffect(() => { setUserNote('') }, [stageCode])
 
   return (
@@ -411,7 +385,7 @@ export function StageSummaryModal({
           </div>
         </div>
 
-        {/* 内容区：结构化产出 + 用户补充 */}
+        {/* 内容区 */}
         <div style={{ flex: 1, overflow: 'auto', marginBottom: '16px' }}>
           {loading ? (
             <div style={{
@@ -426,7 +400,6 @@ export function StageSummaryModal({
             </div>
           ) : (
             <>
-              {/* 结构化产出卡片 */}
               {hasStructured ? (
                 <div style={{ marginBottom: '12px' }}>
                   <div style={{
@@ -445,7 +418,6 @@ export function StageSummaryModal({
                   <StageSummaryCards stageCode={stageCode} structuredOutput={structuredOutput} />
                 </div>
               ) : (
-                /* 无结构化产出时的提示 */
                 !loading && (
                   <div style={{
                     padding: '16px', borderRadius: '10px', marginBottom: '12px',
@@ -462,7 +434,6 @@ export function StageSummaryModal({
                 )
               )}
 
-              {/* 用户补充备注（可选）*/}
               <div>
                 <div style={{
                   fontSize: '11px', fontWeight: 700, color: C.textMuted,
@@ -489,6 +460,28 @@ export function StageSummaryModal({
             </>
           )}
         </div>
+
+        {/* P0-2：阶段完成度提示（不阻止操作，友好提醒） */}
+        {completeness && !completeness.is_complete && completeness.missing_hints && completeness.missing_hints.length > 0 && (
+          <div style={{
+            flexShrink: 0, padding: '12px 16px', borderRadius: '10px', marginBottom: '12px',
+            background: '#FFFBEB', border: '1px solid rgba(245,158,11,0.3)',
+          }}>
+            <div style={{ fontSize: '13px', fontWeight: 600, color: '#92400E', marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <span>⚡</span>
+              <span>完成度 {completeness.percentage}%，以下内容可以补充：</span>
+            </div>
+            {completeness.missing_hints.map((hint: string, i: number) => (
+              <div key={i} style={{ fontSize: '12px', color: '#A16207', padding: '2px 0', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span style={{ color: '#F59E0B', flexShrink: 0 }}>○</span>
+                <span>{hint}</span>
+              </div>
+            ))}
+            <div style={{ fontSize: '11px', color: '#B45309', marginTop: '6px', fontStyle: 'italic' }}>
+              这不会阻止你继续，只是友好提醒 😊
+            </div>
+          </div>
+        )}
 
         {/* 操作按钮 */}
         <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', gap: '10px' }}>

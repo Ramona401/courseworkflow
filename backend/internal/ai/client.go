@@ -21,6 +21,12 @@ package ai
 //   通过repository.EnqueueTrace异步写入ai_call_traces表。
 //   埋点不影响主路径延迟（非阻塞channel写入）。
 //   场景代码通过TraceContext传入，调用方负责设置。
+//
+// v85新增：多模型Fallback降级
+//   GetEffectiveConfig返回FallbackModels列表（从ai_scene_configs.fallback_models获取）。
+//   CallAI/CallAIStream/CallAIMultimodal在主模型所有重试耗尽后，
+//   依次尝试fallback模型（每个fallback模型有1次重试机会）。
+//   降级调用的trace记录标记is_fallback=true + original_model=主模型。
 
 import (
 	"bufio"
@@ -49,6 +55,9 @@ const (
 
 	// MaxStreamRetries 流式调用最大重试次数（首次调用 + 最多2次重试 = 总共3次尝试）
 	MaxStreamRetries = 2
+
+	// MaxFallbackRetries 每个fallback模型的最大重试次数（v85新增）
+	MaxFallbackRetries = 1
 )
 
 // retryDelays 重试间隔时间表（指数退避：30秒 → 60秒 → 120秒）
@@ -62,11 +71,12 @@ var retryDelays = []time.Duration{
 
 // EffectiveConfig 合并后的有效AI配置
 type EffectiveConfig struct {
-	APIBaseURL  string  // API基础地址
-	APIKey      string  // 解密后的API Key（明文）
-	Model       string  // 使用的模型名称
-	Temperature float64 // 温度参数（0.0~2.0）
-	MaxTokens   int     // 最大Token数
+	APIBaseURL     string   // API基础地址
+	APIKey         string   // 解密后的API Key（明文）
+	Model          string   // 使用的模型名称
+	Temperature    float64  // 温度参数（0.0~2.0）
+	MaxTokens      int      // 最大Token数
+	FallbackModels []string // v85新增：降级模型列表（按优先级排序）
 }
 
 // TraceContext AI调用追踪上下文（v80新增）
@@ -144,6 +154,7 @@ type CallResult struct {
 
 // GetEffectiveConfig 获取指定场景的有效AI配置
 // 三级回退策略：场景配置 → 全局配置 → .env环境变量
+// v85变更：新增FallbackModels字段从场景配置读取
 func GetEffectiveConfig(
 	aesKey string,
 	sceneCode string,
@@ -202,6 +213,10 @@ func GetEffectiveConfig(
 			if sceneCfg.MaxTokens != nil {
 				cfg.MaxTokens = *sceneCfg.MaxTokens
 			}
+			// v85: 读取fallback模型列表
+			if len(sceneCfg.FallbackModels) > 0 {
+				cfg.FallbackModels = sceneCfg.FallbackModels
+			}
 		}
 	}
 
@@ -227,10 +242,8 @@ func GetEffectiveConfig(
 func isRetryableError(statusCode int, body []byte) bool {
 	switch statusCode {
 	case 502, 503, 504:
-		// 网关错误、服务不可用、网关超时 → 一定重试
 		return true
 	case 500:
-		// 500错误需要判断内容：如果是JSON解析失败、连接中断等，可以重试
 		bodyStr := string(body)
 		retryablePatterns := []string{
 			"unexpected end of JSON input",
@@ -249,7 +262,6 @@ func isRetryableError(statusCode int, body []byte) bool {
 		}
 		return false
 	case 429:
-		// 频率限制 → 重试（退避后重试有意义）
 		return true
 	default:
 		return false
@@ -261,18 +273,17 @@ func getRetryDelay(attempt int) time.Duration {
 	if attempt < len(retryDelays) {
 		return retryDelays[attempt]
 	}
-	// 超出预设范围则使用最大值
 	return retryDelays[len(retryDelays)-1]
 }
 
-// ==================== 非流式AI调用（带重试 + 埋点）====================
+// ==================== 非流式AI调用（带重试 + Fallback + 埋点）====================
 
 // CallAI 调用AI API（OpenAI兼容格式，等待完整回复后返回）
 // 用于Pipeline各步骤、AI评审等需要完整结果的场景
 // 遇到502/503/504/429等临时错误时自动重试（最多3次，指数退避）
+// v85新增：主模型所有重试耗尽后，依次尝试fallback模型
 //
-// v80新增：traceCtx参数用于关联trace记录到业务实体
-// 如果traceCtx为nil，不记录trace（兼容旧调用方式）
+// traceCtx参数用于关联trace记录到业务实体，如果为nil不记录trace
 func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceCtx *TraceContext) (*CallResult, error) {
 	var messages []ChatMessage
 	if strings.TrimSpace(systemPrompt) != "" {
@@ -280,8 +291,58 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 	}
 	messages = append(messages, ChatMessage{Role: "user", Content: userPrompt})
 
+	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
+	startTime := time.Now()
+
+	// -------- 第1阶段：主模型调用（带完整重试）--------
+	primaryModel := cfg.Model
+	result, err := callAIWithRetries(cfg, primaryModel, messages, endpoint, MaxRetries)
+	if err == nil {
+		// 主模型调用成功
+		emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
+			time.Since(startTime).Milliseconds(), "success", "", len(result.Content), false, false, "")
+		return result, nil
+	}
+
+	primaryErr := err
+	log.Printf("[AI Fallback] 主模型 %s 所有重试失败: %s", primaryModel, err.Error())
+
+	// -------- 第2阶段：依次尝试fallback模型（v85新增）--------
+	for i, fbModel := range cfg.FallbackModels {
+		// 跳过与主模型相同的fallback
+		if fbModel == primaryModel {
+			continue
+		}
+
+		log.Printf("[AI Fallback] 尝试降级模型 %d/%d: %s（场景: %s）",
+			i+1, len(cfg.FallbackModels), fbModel, getSceneFromTrace(traceCtx))
+
+		result, err = callAIWithRetries(cfg, fbModel, messages, endpoint, MaxFallbackRetries)
+		if err == nil {
+			// fallback模型调用成功
+			log.Printf("[AI Fallback] 降级模型 %s 调用成功（原始模型: %s）", fbModel, primaryModel)
+			emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
+				time.Since(startTime).Milliseconds(), "success", "", len(result.Content), false,
+				true, primaryModel)
+			return result, nil
+		}
+
+		log.Printf("[AI Fallback] 降级模型 %s 也失败: %s", fbModel, err.Error())
+	}
+
+	// 所有模型（主+fallback）都失败
+	totalLatency := time.Since(startTime).Milliseconds()
+	emitTrace(traceCtx, primaryModel, 0, 0, 0,
+		totalLatency, "error", primaryErr.Error(), 0, false, false, "")
+	return nil, fmt.Errorf("AI调用失败（主模型 %s + %d个降级模型均失败）: %w",
+		primaryModel, len(cfg.FallbackModels), primaryErr)
+}
+
+// callAIWithRetries 使用指定模型执行非流式AI调用（带重试）
+// 这是从CallAI中提取的核心重试循环，供主模型和fallback模型复用
+func callAIWithRetries(cfg *EffectiveConfig, model string, messages []ChatMessage, endpoint string, maxRetries int) (*CallResult, error) {
 	reqBody := ChatRequest{
-		Model:       cfg.Model,
+		Model:       model,
 		Messages:    messages,
 		MaxTokens:   cfg.MaxTokens,
 		Temperature: cfg.Temperature,
@@ -292,28 +353,20 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 		return nil, fmt.Errorf("序列化AI请求失败: %w", err)
 	}
 
-	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
-
-	// -------- 带重试的调用循环 --------
-	startTime := time.Now()
 	var lastErr error
-	for attempt := 0; attempt <= MaxRetries; attempt++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		// 非首次调用时等待退避时间
 		if attempt > 0 {
 			delay := getRetryDelay(attempt - 1)
-			log.Printf("[AI重试] 第%d次重试，等待%s后重试（模型: %s）", attempt, delay, cfg.Model)
+			log.Printf("[AI重试] 模型 %s 第%d次重试，等待%s", model, attempt, delay)
 			time.Sleep(delay)
 		}
 
 		result, err := callAIOnce(cfg, endpoint, jsonBody)
 		if err == nil {
-			// 调用成功
 			if attempt > 0 {
-				log.Printf("[AI重试] 第%d次重试成功（模型: %s）", attempt, cfg.Model)
+				log.Printf("[AI重试] 模型 %s 第%d次重试成功", model, attempt)
 			}
-			// v80: 记录成功trace
-			emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
-				time.Since(startTime).Milliseconds(), "success", "", len(result.Content), false)
 			return result, nil
 		}
 
@@ -321,21 +374,14 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 
 		// 判断是否可重试
 		if !isRetryableCallError(err) {
-			// 不可重试的错误（如认证失败、请求格式错误等），直接返回
-			// v80: 记录失败trace
-			emitTrace(traceCtx, cfg.Model, 0, 0, 0,
-				time.Since(startTime).Milliseconds(), "error", err.Error(), 0, false)
 			return nil, err
 		}
 
-		log.Printf("[AI重试] 调用失败（第%d/%d次），错误: %s", attempt+1, MaxRetries+1, err.Error())
+		log.Printf("[AI重试] 模型 %s 调用失败（第%d/%d次）: %s",
+			model, attempt+1, maxRetries+1, err.Error())
 	}
 
-	// 所有重试都失败
-	// v80: 记录失败trace
-	emitTrace(traceCtx, cfg.Model, 0, 0, 0,
-		time.Since(startTime).Milliseconds(), "error", lastErr.Error(), 0, false)
-	return nil, fmt.Errorf("AI调用在%d次尝试后仍然失败: %w", MaxRetries+1, lastErr)
+	return nil, fmt.Errorf("模型 %s 在%d次尝试后失败: %w", model, maxRetries+1, lastErr)
 }
 
 // callAIOnce 执行单次非流式AI调用（不含重试逻辑）
@@ -374,7 +420,6 @@ func callAIOnce(cfg *EffectiveConfig, endpoint string, jsonBody []byte) (*CallRe
 				msg: fmt.Sprintf("AI API返回错误(HTTP %d): %s", resp.StatusCode, errMsg),
 			}
 		}
-		// 不可重试的错误（如401认证失败、400参数错误等）
 		return nil, fmt.Errorf("AI API返回错误(HTTP %d): %s", resp.StatusCode, errMsg)
 	}
 
@@ -425,26 +470,15 @@ func isRetryableCallError(err error) bool {
 	return ok
 }
 
-// ==================== 流式AI调用（带重试 + 埋点）====================
+// ==================== 流式AI调用（带重试 + Fallback + 埋点）====================
 
 // CallAIStream 流式调用AI API（OpenAI兼容 SSE 格式）
 //
-// 原理：
-//   OpenAI stream=true 时，服务端以 SSE 格式逐行推送 data: {...} 行，
-//   每行包含一个增量 token（delta.content）。
-//   本函数逐行读取，每收到一个非空 token 立即调用 onChunk 回调，
-//   调用方可在回调中将 token 实时推送给前端。
-//
-// 重试说明：
-//   流式调用在建立连接阶段（HTTP请求发出到收到200响应）如果遇到
-//   502/503/504等临时错误，会自动重试最多2次。
-//   但一旦开始接收流式数据后发生的错误不会重试（因为onChunk可能已经
-//   向前端推送了部分数据，重试会导致内容重复）。
-//
-// v80新增：traceCtx参数用于关联trace记录
+// v85新增：主模型连接建立阶段所有重试失败后，依次尝试fallback模型。
+// 注意：一旦某个模型的流式连接建立成功并开始推送数据，就不再fallback。
 //
 // 参数：
-//   cfg          — AI配置（模型/温度/maxTokens）
+//   cfg          — AI配置（模型/温度/maxTokens/fallback列表）
 //   systemPrompt — 系统提示词
 //   userPrompt   — 用户消息
 //   onChunk      — 每收到一个token片段时的回调，返回error可中止流式读取
@@ -466,116 +500,151 @@ func CallAIStream(
 	}
 	messages = append(messages, ChatMessage{Role: "user", Content: userPrompt})
 
-	// -------- 构造流式请求体 --------
-	reqBody := ChatRequestStream{
-		Model:       cfg.Model,
-		Messages:    messages,
-		MaxTokens:   cfg.MaxTokens,
-		Temperature: cfg.Temperature,
-		Stream:      true, // 开启流式
-	}
-
-	jsonBody, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("序列化AI流式请求失败: %w", err)
-	}
-
 	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
-
-	// -------- 带重试的连接建立 --------
-	var resp *http.Response
-	var lastErr error
 	startTime := time.Now()
 
-	for attempt := 0; attempt <= MaxStreamRetries; attempt++ {
-		// 非首次调用时等待退避时间
-		if attempt > 0 {
-			delay := getRetryDelay(attempt - 1)
-			log.Printf("[AI流式重试] 第%d次重试，等待%s后重试（模型: %s）", attempt, delay, cfg.Model)
-			time.Sleep(delay)
+	// -------- 构建模型尝试列表：主模型 + fallback模型 --------
+	modelsToTry := []struct {
+		model      string
+		maxRetries int
+		isFallback bool
+	}{
+		{model: cfg.Model, maxRetries: MaxStreamRetries, isFallback: false},
+	}
+	for _, fbModel := range cfg.FallbackModels {
+		if fbModel != cfg.Model {
+			modelsToTry = append(modelsToTry, struct {
+				model      string
+				maxRetries int
+				isFallback bool
+			}{model: fbModel, maxRetries: MaxFallbackRetries, isFallback: true})
 		}
-
-		httpReq, reqErr := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(jsonBody))
-		if reqErr != nil {
-			return nil, fmt.Errorf("创建HTTP流式请求失败: %w", reqErr)
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-		httpReq.Header.Set("Accept", "text/event-stream") // 明确声明接受SSE格式
-
-		// 流式请求使用相同的900秒超时（覆盖完整流式传输时长）
-		httpClient := &http.Client{Timeout: AICallTimeout}
-
-		resp, err = httpClient.Do(httpReq)
-		if err != nil {
-			// 网络级错误（超时、连接拒绝等）→ 可重试
-			lastErr = fmt.Errorf("AI流式API调用失败: %w", err)
-			log.Printf("[AI流式重试] 网络错误（第%d/%d次）: %s", attempt+1, MaxStreamRetries+1, err.Error())
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			errMsg := extractErrorMessage(body)
-
-			if isRetryableError(resp.StatusCode, body) {
-				lastErr = fmt.Errorf("AI流式API返回错误(HTTP %d): %s", resp.StatusCode, errMsg)
-				log.Printf("[AI流式重试] HTTP %d（第%d/%d次）: %s", resp.StatusCode, attempt+1, MaxStreamRetries+1, errMsg)
-				continue
-			}
-			// 不可重试的错误
-			// v80: 记录失败trace
-			emitTrace(traceCtx, cfg.Model, 0, 0, 0,
-				time.Since(startTime).Milliseconds(), "error",
-				fmt.Sprintf("HTTP %d: %s", resp.StatusCode, errMsg), 0, true)
-			return nil, fmt.Errorf("AI流式API返回错误(HTTP %d): %s", resp.StatusCode, errMsg)
-		}
-
-		// 连接建立成功，跳出重试循环
-		if attempt > 0 {
-			log.Printf("[AI流式重试] 第%d次重试成功（模型: %s）", attempt, cfg.Model)
-		}
-		lastErr = nil
-		break
 	}
 
-	// 所有重试都失败
-	if lastErr != nil {
-		// v80: 记录失败trace
+	// -------- 依次尝试每个模型建立流式连接 --------
+	var resp *http.Response
+	var lastErr error
+	var actualModel string
+	var isFallback bool
+
+	for _, modelEntry := range modelsToTry {
+		reqBody := ChatRequestStream{
+			Model:       modelEntry.model,
+			Messages:    messages,
+			MaxTokens:   cfg.MaxTokens,
+			Temperature: cfg.Temperature,
+			Stream:      true,
+		}
+
+		jsonBody, err := json.Marshal(reqBody)
+		if err != nil {
+			return nil, fmt.Errorf("序列化AI流式请求失败: %w", err)
+		}
+
+		// 带重试的连接建立
+		connected := false
+		for attempt := 0; attempt <= modelEntry.maxRetries; attempt++ {
+			if attempt > 0 {
+				delay := getRetryDelay(attempt - 1)
+				log.Printf("[AI流式重试] 模型 %s 第%d次重试，等待%s", modelEntry.model, attempt, delay)
+				time.Sleep(delay)
+			}
+
+			httpReq, reqErr := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(jsonBody))
+			if reqErr != nil {
+				return nil, fmt.Errorf("创建HTTP流式请求失败: %w", reqErr)
+			}
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+			httpReq.Header.Set("Accept", "text/event-stream")
+
+			httpClient := &http.Client{Timeout: AICallTimeout}
+			resp, err = httpClient.Do(httpReq)
+			if err != nil {
+				lastErr = fmt.Errorf("AI流式API调用失败（模型 %s）: %w", modelEntry.model, err)
+				log.Printf("[AI流式重试] 模型 %s 网络错误（第%d/%d次）: %s",
+					modelEntry.model, attempt+1, modelEntry.maxRetries+1, err.Error())
+				continue
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				errMsg := extractErrorMessage(body)
+
+				if isRetryableError(resp.StatusCode, body) {
+					lastErr = fmt.Errorf("AI流式API返回错误（模型 %s, HTTP %d）: %s",
+						modelEntry.model, resp.StatusCode, errMsg)
+					log.Printf("[AI流式重试] 模型 %s HTTP %d（第%d/%d次）: %s",
+						modelEntry.model, resp.StatusCode, attempt+1, modelEntry.maxRetries+1, errMsg)
+					continue
+				}
+				// 不可重试的错误（如401认证失败），不继续fallback，直接返回
+				emitTrace(traceCtx, modelEntry.model, 0, 0, 0,
+					time.Since(startTime).Milliseconds(), "error",
+					fmt.Sprintf("HTTP %d: %s", resp.StatusCode, errMsg), 0, true,
+					modelEntry.isFallback, cfg.Model)
+				return nil, fmt.Errorf("AI流式API返回错误(HTTP %d): %s", resp.StatusCode, errMsg)
+			}
+
+			// 连接建立成功
+			connected = true
+			actualModel = modelEntry.model
+			isFallback = modelEntry.isFallback
+			if attempt > 0 {
+				log.Printf("[AI流式重试] 模型 %s 第%d次重试成功", modelEntry.model, attempt)
+			}
+			break
+		}
+
+		if connected {
+			if isFallback {
+				log.Printf("[AI Fallback] 流式降级模型 %s 连接成功（原始模型: %s）", actualModel, cfg.Model)
+			}
+			break
+		}
+
+		// 当前模型所有重试失败，尝试下一个
+		if modelEntry.isFallback {
+			log.Printf("[AI Fallback] 流式降级模型 %s 所有重试失败", modelEntry.model)
+		} else {
+			log.Printf("[AI Fallback] 流式主模型 %s 所有重试失败，开始尝试降级", modelEntry.model)
+		}
+	}
+
+	// 所有模型都失败
+	if resp == nil || lastErr != nil {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("AI流式调用所有模型均失败")
+		}
 		emitTrace(traceCtx, cfg.Model, 0, 0, 0,
-			time.Since(startTime).Milliseconds(), "error", lastErr.Error(), 0, true)
-		return nil, fmt.Errorf("AI流式调用在%d次尝试后仍然失败: %w", MaxStreamRetries+1, lastErr)
+			time.Since(startTime).Milliseconds(), "error", lastErr.Error(), 0, true, false, "")
+		return nil, lastErr
 	}
 	defer resp.Body.Close()
 
-	// -------- 逐行读取SSE流（此阶段不再重试）--------
-	var fullContent strings.Builder // 拼接完整回复
+	// -------- 逐行读取SSE流（此阶段不再重试/fallback）--------
+	var fullContent strings.Builder
 	var modelUsed string
 	totalTokens := 0
 	promptTokens := 0
 	completionTokens := 0
 
 	scanner := bufio.NewScanner(resp.Body)
-	// 设置较大的缓冲区，防止超长行截断
 	scanBuf := make([]byte, 64*1024)
 	scanner.Buffer(scanBuf, 64*1024)
 
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// SSE格式：每行以 "data: " 开头
-		// 空行是消息分隔符，跳过
 		if line == "" || line == ": keep-alive" {
 			continue
 		}
 
-		// 流式结束标志
 		if line == "data: [DONE]" {
 			break
 		}
 
-		// 提取data内容
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
@@ -584,80 +653,65 @@ func CallAIStream(
 			continue
 		}
 
-		// 解析JSON块
 		var chunk StreamChunkResponse
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			// 解析失败时跳过该行（部分API会发送非标准行）
 			continue
 		}
 
-		// 记录模型名（首次出现时）
 		if modelUsed == "" && chunk.Model != "" {
 			modelUsed = chunk.Model
 		}
 
-		// 记录token统计（部分API在最后一条携带usage）
 		if chunk.Usage != nil {
 			totalTokens = chunk.Usage.TotalTokens
 			promptTokens = chunk.Usage.PromptTokens
 			completionTokens = chunk.Usage.CompletionTokens
 		}
 
-		// 提取增量内容
 		if len(chunk.Choices) == 0 {
 			continue
 		}
 		delta := chunk.Choices[0].Delta.Content
 		if delta == "" {
-			// delta为空可能是finish_reason行，检查是否结束
 			if chunk.Choices[0].FinishReason != nil {
 				break
 			}
 			continue
 		}
 
-		// 清理思维链标签（如果模型逐token输出thinking标签）
-		// 注意：这里只做简单过滤，完整的thinking清理在最后对全文处理
 		if strings.Contains(delta, "<thinking>") || strings.Contains(delta, "</thinking>") {
 			continue
 		}
 
-		// 追加到全文
 		fullContent.WriteString(delta)
 
-		// 回调：将token推送给调用方
 		if onChunk != nil {
 			if callbackErr := onChunk(delta); callbackErr != nil {
-				// 调用方返回error时中止流式读取（例如客户端断开）
 				break
 			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		// scanner错误（如连接中断）不作为fatal，已积累的内容仍然有效
-		// 记录日志但继续返回已有内容
 		_ = err
 	}
 
 	latencyMs := time.Since(startTime).Milliseconds()
 
-	// 对完整内容做一次thinking清理
 	content := stripThinking(fullContent.String())
 	if strings.TrimSpace(content) == "" {
-		// v80: 记录失败trace
-		emitTrace(traceCtx, coalesce(modelUsed, cfg.Model), totalTokens, promptTokens, completionTokens,
-			latencyMs, "error", "AI流式返回内容为空", 0, true)
+		emitTrace(traceCtx, coalesce(modelUsed, actualModel), totalTokens, promptTokens, completionTokens,
+			latencyMs, "error", "AI流式返回内容为空", 0, true, isFallback, cfg.Model)
 		return nil, fmt.Errorf("AI流式返回内容为空")
 	}
 
-	// v80: 记录成功trace
-	emitTrace(traceCtx, coalesce(modelUsed, cfg.Model), totalTokens, promptTokens, completionTokens,
-		latencyMs, "success", "", len(content), true)
+	// 记录成功trace
+	emitTrace(traceCtx, coalesce(modelUsed, actualModel), totalTokens, promptTokens, completionTokens,
+		latencyMs, "success", "", len(content), true, isFallback, cfg.Model)
 
 	return &CallResult{
 		Content:    content,
-		ModelUsed:  coalesce(modelUsed, cfg.Model),
+		ModelUsed:  coalesce(modelUsed, actualModel),
 		TokensUsed: totalTokens,
 		LatencyMs:  latencyMs,
 	}, nil
@@ -784,10 +838,19 @@ func parseInt(s string, defaultVal int) int {
 	return v
 }
 
-// ==================== v80新增：追踪埋点辅助函数 ====================
+// getSceneFromTrace 从TraceContext中安全获取场景代码（辅助日志）
+func getSceneFromTrace(traceCtx *TraceContext) string {
+	if traceCtx == nil {
+		return "unknown"
+	}
+	return traceCtx.SceneCode
+}
+
+// ==================== v80新增 + v85改造：追踪埋点辅助函数 ====================
 
 // emitTrace 异步记录AI调用trace（不阻塞主路径）
 // 如果traceCtx为nil，静默跳过（兼容未传traceCtx的旧调用）
+// v85新增：isFallback和originalModel参数记录降级信息
 func emitTrace(
 	traceCtx *TraceContext,
 	modelUsed string,
@@ -799,9 +862,17 @@ func emitTrace(
 	errorMsg string,
 	outputLength int,
 	isStream bool,
+	isFallback bool,
+	originalModel string,
 ) {
 	if traceCtx == nil {
 		return
+	}
+
+	// 仅在实际降级时记录originalModel
+	actualOriginalModel := ""
+	if isFallback {
+		actualOriginalModel = originalModel
 	}
 
 	rec := models.TraceRecord{
@@ -818,12 +889,14 @@ func emitTrace(
 		UserID:           traceCtx.UserID,
 		OutputLength:     outputLength,
 		IsStream:         isStream,
+		IsFallback:       isFallback,
+		OriginalModel:    actualOriginalModel,
 	}
 
 	repository.EnqueueTrace(rec)
 }
 
-// ==================== 迭代7新增：多模态AI调用（图片+文字 + 埋点）====================
+// ==================== 多模态AI调用（图片+文字 + Fallback + 埋点）====================
 
 // MultimodalContent OpenAI兼容的多模态消息内容项
 type MultimodalContent struct {
@@ -856,17 +929,15 @@ type MultimodalChatRequest struct {
 // 用于课本OCR识别等需要图像理解的场景
 // imageDataURI 格式：data:image/jpeg;base64,xxxxx
 //
-// v80新增：traceCtx参数用于关联trace记录
+// v85新增：主模型失败后依次尝试fallback模型
 func CallAIMultimodal(cfg *EffectiveConfig, systemPrompt string, userText string, imageDataURI string, traceCtx *TraceContext) (*CallResult, error) {
 	// 构造消息列表
 	var messages []interface{}
 
-	// 系统消息（普通文本格式）
 	if strings.TrimSpace(systemPrompt) != "" {
 		messages = append(messages, ChatMessage{Role: "system", Content: systemPrompt})
 	}
 
-	// 用户消息（多模态格式：文字+图片）
 	userContent := []MultimodalContent{
 		{Type: "text", Text: userText},
 		{Type: "image_url", ImageURL: &MultimodalImageURL{URL: imageDataURI, Detail: "high"}},
@@ -876,51 +947,90 @@ func CallAIMultimodal(cfg *EffectiveConfig, systemPrompt string, userText string
 		Content: userContent,
 	})
 
-	reqBody := MultimodalChatRequest{
-		Model:       cfg.Model,
-		Messages:    messages,
-		MaxTokens:   cfg.MaxTokens,
-		Temperature: cfg.Temperature,
-	}
-
-	jsonBody, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("序列化多模态AI请求失败: %w", err)
-	}
-
 	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
-
-	// 带重试调用（复用现有重试逻辑）
 	startTime := time.Now()
+
+	// -------- 构建模型尝试列表：主模型 + fallback模型 --------
+	modelsToTry := []struct {
+		model      string
+		isFallback bool
+	}{
+		{model: cfg.Model, isFallback: false},
+	}
+	for _, fbModel := range cfg.FallbackModels {
+		if fbModel != cfg.Model {
+			modelsToTry = append(modelsToTry, struct {
+				model      string
+				isFallback bool
+			}{model: fbModel, isFallback: true})
+		}
+	}
+
+	primaryModel := cfg.Model
 	var lastErr error
-	for attempt := 0; attempt <= MaxRetries; attempt++ {
-		if attempt > 0 {
-			delay := getRetryDelay(attempt - 1)
-			log.Printf("[AI多模态重试] 第%d次重试，等待%s（模型: %s）", attempt, delay, cfg.Model)
-			time.Sleep(delay)
+
+	for _, modelEntry := range modelsToTry {
+		maxRetries := MaxRetries
+		if modelEntry.isFallback {
+			maxRetries = MaxFallbackRetries
 		}
 
-		result, err := callAIOnce(cfg, endpoint, jsonBody)
-		if err == nil {
+		reqBody := MultimodalChatRequest{
+			Model:       modelEntry.model,
+			Messages:    messages,
+			MaxTokens:   cfg.MaxTokens,
+			Temperature: cfg.Temperature,
+		}
+
+		jsonBody, err := json.Marshal(reqBody)
+		if err != nil {
+			return nil, fmt.Errorf("序列化多模态AI请求失败: %w", err)
+		}
+
+		// 带重试调用
+		for attempt := 0; attempt <= maxRetries; attempt++ {
 			if attempt > 0 {
-				log.Printf("[AI多模态重试] 第%d次重试成功", attempt)
+				delay := getRetryDelay(attempt - 1)
+				log.Printf("[AI多模态重试] 模型 %s 第%d次重试，等待%s", modelEntry.model, attempt, delay)
+				time.Sleep(delay)
 			}
-			// v80: 记录成功trace
-			emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
-				time.Since(startTime).Milliseconds(), "success", "", len(result.Content), false)
-			return result, nil
+
+			result, err := callAIOnce(cfg, endpoint, jsonBody)
+			if err == nil {
+				if attempt > 0 {
+					log.Printf("[AI多模态重试] 模型 %s 第%d次重试成功", modelEntry.model, attempt)
+				}
+				if modelEntry.isFallback {
+					log.Printf("[AI Fallback] 多模态降级模型 %s 调用成功（原始: %s）", modelEntry.model, primaryModel)
+				}
+				emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
+					time.Since(startTime).Milliseconds(), "success", "", len(result.Content), false,
+					modelEntry.isFallback, primaryModel)
+				return result, nil
+			}
+			lastErr = err
+			if !isRetryableCallError(err) {
+				// 不可重试错误（如401），不继续fallback
+				emitTrace(traceCtx, modelEntry.model, 0, 0, 0,
+					time.Since(startTime).Milliseconds(), "error", err.Error(), 0, false,
+					modelEntry.isFallback, primaryModel)
+				return nil, err
+			}
+			log.Printf("[AI多模态重试] 模型 %s 失败（第%d/%d次）: %s",
+				modelEntry.model, attempt+1, maxRetries+1, err.Error())
 		}
-		lastErr = err
-		if !isRetryableCallError(err) {
-			// v80: 记录失败trace
-			emitTrace(traceCtx, cfg.Model, 0, 0, 0,
-				time.Since(startTime).Milliseconds(), "error", err.Error(), 0, false)
-			return nil, err
+
+		// 当前模型所有重试失败
+		if modelEntry.isFallback {
+			log.Printf("[AI Fallback] 多模态降级模型 %s 所有重试失败", modelEntry.model)
+		} else {
+			log.Printf("[AI Fallback] 多模态主模型 %s 所有重试失败，开始尝试降级", modelEntry.model)
 		}
-		log.Printf("[AI多模态重试] 失败（第%d/%d次）: %s", attempt+1, MaxRetries+1, err.Error())
 	}
-	// v80: 记录失败trace
-	emitTrace(traceCtx, cfg.Model, 0, 0, 0,
-		time.Since(startTime).Milliseconds(), "error", lastErr.Error(), 0, false)
-	return nil, fmt.Errorf("AI多模态调用在%d次尝试后失败: %w", MaxRetries+1, lastErr)
+
+	// 所有模型都失败
+	emitTrace(traceCtx, primaryModel, 0, 0, 0,
+		time.Since(startTime).Milliseconds(), "error", lastErr.Error(), 0, false, false, "")
+	return nil, fmt.Errorf("AI多模态调用失败（主模型 %s + %d个降级模型均失败）: %w",
+		primaryModel, len(cfg.FallbackModels), lastErr)
 }

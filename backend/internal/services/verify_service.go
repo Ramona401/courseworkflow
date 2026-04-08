@@ -404,7 +404,7 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 	var totalTokens int
 	var lastModelUsed string
 
-	indexCallResult, indexCallErr := s.callAIWithSemaphore(aiCfg, promptG.Content, indexGenUserPrompt)
+	indexCallResult, indexCallErr := s.callAIWithSemaphore(aiCfg, promptG.Content, indexGenUserPrompt, pipeline.ID)
 	if indexCallErr != nil {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("%s: %s", ErrVerifyIndexGenFailed.Error(), indexCallErr.Error())
@@ -439,7 +439,7 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 	var doneCount int
 
 	for i := 1; i <= evalRounds; i++ {
-		evalCallResult, evalCallErr := s.callAIWithSemaphore(aiCfg, promptB.Content, evalUserPrompt)
+		evalCallResult, evalCallErr := s.callAIWithSemaphore(aiCfg, promptB.Content, evalUserPrompt, pipeline.ID)
 		if evalCallErr != nil {
 			// 单轮失败不终止，继续下一轮
 			verifyLog.Warn("verify评估轮次失败",

@@ -5,8 +5,12 @@ package models
 // 职责：
 //   1. 定义ai_call_traces表对应的数据结构
 //   2. 定义追踪写入请求（内部使用，由ai/client.go埋点）
-//   3. 定义仪表盘聚合查询的响应结构
+//   3. 定义仪表盘聚合查询的响应结构（含按用户/按组织维度）
 //   4. 提供模型定价表和成本估算函数
+//
+// v85变更：
+//   TraceRecord新增IsFallback+OriginalModel字段，记录模型降级信息
+//   AICallTrace新增IsFallback+OriginalModel字段
 //
 // 被引用：
 //   repository/ai_trace_repo.go — 数据访问层
@@ -36,6 +40,8 @@ type AICallTrace struct {
 	EstimatedCostUSD float64   `json:"estimated_cost_usd"`
 	OutputLength     int       `json:"output_length"`
 	IsStream         bool      `json:"is_stream"`
+	IsFallback       bool      `json:"is_fallback"`       // v85新增：是否为降级调用
+	OriginalModel    string    `json:"original_model"`    // v85新增：降级前的原始模型
 	CreatedAt        time.Time `json:"created_at"`
 }
 
@@ -51,13 +57,15 @@ type TraceRecord struct {
 	CompletionTokens int     // 输出token数
 	TotalTokens      int     // 总token数
 	LatencyMs        int64   // 调用耗时（毫秒）
-	Status           string  // success / error / timeout
+	Status           string  // success / error / timeout / fallback
 	ErrorMessage     string  // 失败时的错误信息
 	PipelineID       *string // 关联Pipeline ID（可为空）
 	LessonPlanID     *string // 关联教案 ID（可为空）
 	UserID           *string // 关联用户 ID（可为空）
 	OutputLength     int     // AI输出内容长度（字符数）
 	IsStream         bool    // 是否流式调用
+	IsFallback       bool    // v85新增：是否为降级调用
+	OriginalModel    string  // v85新增：降级前的原始模型（仅IsFallback=true时有值）
 }
 
 // ==================== 仪表盘聚合响应 ====================
@@ -87,6 +95,41 @@ type TraceModelStats struct {
 	EstimatedCostUSD float64 `json:"estimated_cost_usd"`
 }
 
+// TraceUserStats 按用户聚合的统计数据（v81新增）
+// 通过ai_call_traces.user_id关联users表获取用户信息
+type TraceUserStats struct {
+	UserID                string  `json:"user_id"`
+	Username              string  `json:"username"`
+	DisplayName           string  `json:"display_name"`
+	Role                  string  `json:"role"`
+	CallCount             int     `json:"call_count"`
+	SuccessCount          int     `json:"success_count"`
+	ErrorCount            int     `json:"error_count"`
+	AvgLatencyMs          int     `json:"avg_latency_ms"`
+	TotalTokens           int64   `json:"total_tokens"`
+	TotalPromptTokens     int64   `json:"total_prompt_tokens"`
+	TotalCompletionTokens int64   `json:"total_completion_tokens"`
+	EstimatedCostUSD      float64 `json:"estimated_cost_usd"`
+}
+
+// TraceOrgStats 按组织聚合的统计数据（v81新增）
+// 通过user_id → teaching_group_members → teaching_groups → organizations关联
+// 一个用户可能属于多个组织，此处按学校维度聚合
+type TraceOrgStats struct {
+	OrgID                 string  `json:"org_id"`
+	OrgName               string  `json:"org_name"`
+	OrgType               string  `json:"org_type"`
+	MemberCount           int     `json:"member_count"`
+	CallCount             int     `json:"call_count"`
+	SuccessCount          int     `json:"success_count"`
+	ErrorCount            int     `json:"error_count"`
+	AvgLatencyMs          int     `json:"avg_latency_ms"`
+	TotalTokens           int64   `json:"total_tokens"`
+	TotalPromptTokens     int64   `json:"total_prompt_tokens"`
+	TotalCompletionTokens int64   `json:"total_completion_tokens"`
+	EstimatedCostUSD      float64 `json:"estimated_cost_usd"`
+}
+
 // TraceDailyTrend 按日期聚合的趋势数据
 type TraceDailyTrend struct {
 	Date             string  `json:"date"` // 格式: YYYY-MM-DD
@@ -105,10 +148,15 @@ type TraceDashboard struct {
 	TotalCostUSD float64 `json:"total_cost_usd"`
 	AvgLatencyMs int     `json:"avg_latency_ms"`
 	ErrorRate    float64 `json:"error_rate"` // 百分比，如 2.35 表示 2.35%
+	// v85新增：降级统计
+	FallbackCount int     `json:"fallback_count"` // 降级调用总次数
+	FallbackRate  float64 `json:"fallback_rate"`  // 降级率（百分比）
 	// 分维度聚合
-	ByScene      []TraceSceneStats `json:"by_scene"`
-	ByModel      []TraceModelStats `json:"by_model"`
-	DailyTrend   []TraceDailyTrend `json:"daily_trend"`
+	ByScene    []TraceSceneStats `json:"by_scene"`
+	ByModel    []TraceModelStats `json:"by_model"`
+	ByUser     []TraceUserStats  `json:"by_user"`  // v81新增：按用户聚合
+	ByOrg      []TraceOrgStats   `json:"by_org"`   // v81新增：按组织聚合
+	DailyTrend []TraceDailyTrend `json:"daily_trend"`
 	// 最近的错误记录
 	RecentErrors []AICallTrace `json:"recent_errors"`
 }

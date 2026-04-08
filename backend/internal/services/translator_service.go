@@ -152,7 +152,7 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 			loop,
 		)
 
-		transResult, transErr := s.callAIWithSemaphore(aiCfgTrans, promptC.Content, transUserPrompt)
+		transResult, transErr := s.callAIWithSemaphore(aiCfgTrans, promptC.Content, transUserPrompt, pipeline.ID)
 		if transErr != nil {
 			roundRecord.TransError = transErr.Error()
 			result.Rounds = append(result.Rounds, roundRecord)
@@ -187,7 +187,7 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 			transOutput,
 		)
 
-		reviewResult, reviewErr := s.callAIWithSemaphore(aiCfgReview, promptD.Content, reviewUserPrompt)
+		reviewResult, reviewErr := s.callAIWithSemaphore(aiCfgReview, promptD.Content, reviewUserPrompt, pipeline.ID)
 		if reviewErr != nil {
 			roundRecord.ReviewError = reviewErr.Error()
 			result.Rounds = append(result.Rounds, roundRecord)

@@ -115,6 +115,8 @@ func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, erro
 		       view_count, use_count, version,
 		       current_stage, COALESCE(stage_config::text, '[]'),
 		       COALESCE(textbook_page_ids::text, '[]'),
+                       COALESCE(lesson_index, ''), idx_cognitive_level, idx_pedagogy_intensity,
+                       idx_structure_type, idx_quality_level,
 		       created_at, updated_at
 		FROM lesson_plans WHERE id = $1
 	`
@@ -128,6 +130,8 @@ func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, erro
 		&lp.ViewCount, &lp.UseCount, &lp.Version,
 		&lp.CurrentStage, &lp.StageConfig,
 		&lp.TextbookPageIDs,
+                &lp.LessonIndex, &lp.IdxCognitiveLevel, &lp.IdxPedagogyIntensity,
+                &lp.IdxStructureType, &lp.IdxQualityLevel,
 		&lp.CreatedAt, &lp.UpdatedAt,
 	)
 	if err != nil {
@@ -140,7 +144,7 @@ func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, erro
 }
 
 // ListLessonPlans 获取教案列表（支持多条件筛选+分页）
-func ListLessonPlans(ctx context.Context, authorID string, groupID string, status string, subject string, grade string, limit int, offset int) ([]*models.LessonPlanListItem, int, error) {
+func ListLessonPlans(ctx context.Context, authorID string, groupID string, status string, subject string, grade string, limit int, offset int, qualityLevel int, structureType int, cognitiveLevel int, pedagogyIntensity int) ([]*models.LessonPlanListItem, int, error) {
 	where := " WHERE 1=1"
 	args := []interface{}{}
 	argIdx := 1
@@ -171,6 +175,28 @@ func ListLessonPlans(ctx context.Context, authorID string, groupID string, statu
 		argIdx++
 	}
 
+	// v86新增：AOCI索引维度筛选
+	if qualityLevel > 0 {
+		where += fmt.Sprintf(" AND lp.idx_quality_level >= $%d", argIdx)
+		args = append(args, qualityLevel)
+		argIdx++
+	}
+	if structureType > 0 {
+		where += fmt.Sprintf(" AND lp.idx_structure_type = $%d", argIdx)
+		args = append(args, structureType)
+		argIdx++
+	}
+	if cognitiveLevel > 0 {
+		where += fmt.Sprintf(" AND lp.idx_cognitive_level >= $%d", argIdx)
+		args = append(args, cognitiveLevel)
+		argIdx++
+	}
+	if pedagogyIntensity > 0 {
+		where += fmt.Sprintf(" AND lp.idx_pedagogy_intensity = $%d", argIdx)
+		args = append(args, pedagogyIntensity)
+		argIdx++
+	}
+
 	var total int
 	if err := database.DB.QueryRow(ctx, "SELECT COUNT(*) FROM lesson_plans lp"+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("查询教案总数失败: %w", err)
@@ -186,6 +212,8 @@ func ListLessonPlans(ctx context.Context, authorID string, groupID string, statu
 		       lp.ai_review_score, lp.fork_count, lp.view_count,
 		       lp.forked_from, lp.recipe_id,
 		       COALESCE(tr.name, '') AS recipe_name,
+                       COALESCE(lp.lesson_index, '') AS lesson_index,
+                       lp.idx_quality_level,
 		       lp.created_at, lp.updated_at
 		FROM lesson_plans lp
 		LEFT JOIN users u ON u.id = lp.author_id
@@ -209,7 +237,7 @@ func ListLessonPlans(ctx context.Context, authorID string, groupID string, statu
 			&item.ID, &item.Title, &item.Subject, &item.Grade, &item.Topic, &item.DurationMinutes,
 			&item.Status, &item.Visibility, &item.AuthorID, &item.AuthorName,
 			&item.AIReviewScore, &item.ForkCount, &item.ViewCount,
-			&item.ForkedFrom, &item.RecipeID, &item.RecipeName,
+			&item.ForkedFrom, &item.RecipeID, &item.RecipeName, &item.LessonIndex, &item.IdxQualityLevel,
 			&item.CreatedAt, &item.UpdatedAt,
 		)
 		if err != nil {
@@ -398,4 +426,29 @@ func ListLessonPlanReviews(ctx context.Context, lessonPlanID string) ([]*models.
 		items = append(items, item)
 	}
 	return items, nil
+}
+
+
+// ==================== v86新增：教案索引写入 ====================
+
+// UpdateLessonPlanIndex 更新教案的AOCI索引（索引文本+冗余列）
+func UpdateLessonPlanIndex(ctx context.Context, planID string, indexText string, cogLevel int, pedIntensity int, structType int, qualLevel int) error {
+	now := time.Now()
+	result, err := database.DB.Exec(ctx, `
+		UPDATE lesson_plans
+		SET lesson_index = $1,
+		    idx_cognitive_level = $2,
+		    idx_pedagogy_intensity = $3,
+		    idx_structure_type = $4,
+		    idx_quality_level = $5,
+		    updated_at = $6
+		WHERE id = $7
+	`, indexText, cogLevel, pedIntensity, structType, qualLevel, now, planID)
+	if err != nil {
+		return fmt.Errorf("更新教案索引失败: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrLessonPlanNotFound
+	}
+	return nil
 }

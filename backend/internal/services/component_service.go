@@ -11,6 +11,8 @@ package services
 //   - RefreshQualityScore        — 刷新组件质量分
 // 迭代4B-2新增：
 //   - SmartRecommendComponents   — 画像感知智能推荐（根据teaching_profile加权匹配）
+// v82变更：normalizeGradeForMatch 抽取为 utils.NormalizeGradeToNumber 统一工具函数
+// v89-2变更：AutoExtractFromLessonPlan的AI调用传入真实TraceContext
 
 import (
 	"context"
@@ -24,6 +26,7 @@ import (
 	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/repository"
+	"tedna/internal/utils"
 )
 
 // ==================== 错误常量 ====================
@@ -199,14 +202,15 @@ func (s *ComponentService) MatchComponents(ctx context.Context, req *models.Matc
 // SmartRecommendComponents 根据老师画像+学科+年级智能推荐组件
 // 从teaching_profile中提取风格标签，传给SmartMatchComponents进行加权匹配
 // 无画像时降级为普通匹配
+// v82变更：年级转换改用统一工具函数 utils.NormalizeGradeToNumber
 func (s *ComponentService) SmartRecommendComponents(ctx context.Context, subject string, gradeRange string, profile *models.TeachingProfile) ([]*models.MatchedComponentGroup, error) {
 	if strings.TrimSpace(subject) == "" {
 		return nil, errors.New("学科不能为空")
 	}
 
-	// v79-3：将中文年级转换为数字格式，确保SQL年级范围匹配能正常工作
+	// 将中文年级转换为数字格式，确保SQL年级范围匹配能正常工作
 	// 例如 "三年级" → "3"、"七年级" → "7"、"高一" → "10"
-	normalizedGrade := normalizeGradeForMatch(gradeRange)
+	normalizedGrade := utils.NormalizeGradeToNumber(gradeRange)
 	compLog.Info("智能推荐-年级转换", "original", gradeRange, "normalized", normalizedGrade)
 
 	req := &models.MatchComponentsRequest{
@@ -355,6 +359,7 @@ func (s *ComponentService) SaveExtractionFromChat(
 // ==================== Phase5：通道二——评审自动萃取 ====================
 
 // AutoExtractFromLessonPlan 从评审通过的高分教案自动萃取可复用设计逻辑
+// v89-2变更：传入真实TraceContext，记录planID用于成本追踪
 func (s *ComponentService) AutoExtractFromLessonPlan(
 	ctx context.Context,
 	planID string,
@@ -399,7 +404,14 @@ activity_design, questioning_strategy, pedagogy, assessment_strategy, cross_subj
 		subject, grade, planContent,
 	)
 
-	result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt, nil)
+	// v89-2：构建真实TraceContext，关联教案ID
+	pid := planID
+	traceCtx := &aiClient.TraceContext{
+		SceneCode:    "scanner", // 萃取属于scanner场景范畴
+		LessonPlanID: &pid,
+	}
+
+	result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt, traceCtx)
 	if err != nil {
 		return fmt.Errorf("AI萃取调用失败: %w", err)
 	}
@@ -564,75 +576,4 @@ func parseAutoExtractionResult(content string) ([]autoExtractionItem, error) {
 		return nil, fmt.Errorf("JSON解析失败: %w", err)
 	}
 	return items, nil
-}
-
-
-// normalizeGradeForMatch 将中文年级名转换为数字格式（用于组件匹配SQL）
-// v79-3新增：解决前端传入"三年级""七年级"等中文时SQL无法提取数字的问题
-// 转换规则：
-//   - 已含阿拉伯数字 → 直接提取数字部分（如"7年级"→"7"）
-//   - 中文数字 → 转换（如"三年级"→"3"、"十二年级"→"12"）
-//   - 别名 → 转换（如"初一"→"7"、"高一"→"10"）
-//   - 小学段 → 取中间值（如"小学低段"→"1-2"、"小学中段"→"3-4"、"小学高段"→"5-6"）
-//   - 无法识别 → 返回原值
-func normalizeGradeForMatch(grade string) string {
-	if strings.TrimSpace(grade) == "" {
-		return grade
-	}
-
-	// 1. 先检查是否已包含阿拉伯数字
-	var digits []byte
-	for _, b := range []byte(grade) {
-		if b >= '0' && b <= '9' {
-			digits = append(digits, b)
-		}
-	}
-	if len(digits) > 0 {
-		return string(digits)
-	}
-
-	// 2. 小学段别名（特殊处理，返回范围格式）
-	segmentMap := map[string]string{
-		"小学低段": "1-2",
-		"小学中段": "3-4",
-		"小学高段": "5-6",
-	}
-	for seg, num := range segmentMap {
-		if strings.Contains(grade, seg) {
-			return num
-		}
-	}
-
-	// 3. 初高中别名
-	aliasMap := map[string]string{
-		"初一": "7", "初二": "8", "初三": "9",
-		"高一": "10", "高二": "11", "高三": "12",
-	}
-	for alias, num := range aliasMap {
-		if strings.Contains(grade, alias) {
-			return num
-		}
-	}
-
-	// 4. 中文数字转换（先匹配长的"十一""十二"，再匹配短的）
-	cnMapLong := map[string]string{
-		"十一": "11", "十二": "12",
-	}
-	for cn, num := range cnMapLong {
-		if strings.Contains(grade, cn) {
-			return num
-		}
-	}
-	cnMap := map[string]string{
-		"一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
-		"六": "6", "七": "7", "八": "8", "九": "9", "十": "10",
-	}
-	for cn, num := range cnMap {
-		if strings.Contains(grade, cn) {
-			return num
-		}
-	}
-
-	// 5. 无法识别，返回原值
-	return grade
 }

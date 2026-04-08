@@ -183,6 +183,11 @@ func (s *LessonPlanService) GetLessonPlan(ctx context.Context, id string) (*mode
 		Version:           lp.Version,
 		RecipeID:          lp.RecipeID,
 		RecipeName:        recipeName,
+                LessonIndex:       lp.LessonIndex,
+                IdxCognitiveLevel: lp.IdxCognitiveLevel,
+                IdxPedagogyIntensity: lp.IdxPedagogyIntensity,
+                IdxStructureType:  lp.IdxStructureType,
+                IdxQualityLevel:   lp.IdxQualityLevel,
                 CurrentStage:     lp.CurrentStage,
                 StageConfig:      lp.StageConfig,
 		Reviews:           reviews,
@@ -193,8 +198,8 @@ func (s *LessonPlanService) GetLessonPlan(ctx context.Context, id string) (*mode
 }
 
 // ListLessonPlans 获取教案列表
-func (s *LessonPlanService) ListLessonPlans(ctx context.Context, authorID string, groupID string, status string, subject string, grade string, limit int, offset int) (*models.LessonPlanListResponse, error) {
-	items, total, err := repository.ListLessonPlans(ctx, authorID, groupID, status, subject, grade, limit, offset)
+func (s *LessonPlanService) ListLessonPlans(ctx context.Context, authorID string, groupID string, status string, subject string, grade string, limit int, offset int, qualityLevel int, structureType int, cognitiveLevel int, pedagogyIntensity int) (*models.LessonPlanListResponse, error) {
+	items, total, err := repository.ListLessonPlans(ctx, authorID, groupID, status, subject, grade, limit, offset, qualityLevel, structureType, cognitiveLevel, pedagogyIntensity)
 	if err != nil {
 		return nil, err
 	}

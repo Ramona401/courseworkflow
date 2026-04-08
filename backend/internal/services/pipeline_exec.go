@@ -530,12 +530,24 @@ func (s *PipelineService) executePipelineAsync(id string) {
 // ==================== AI调用包装方法 ====================
 
 // callAIWithSemaphore 通过引擎信号量控制AI并发调用
-func (s *PipelineService) callAIWithSemaphore(cfg *ai.EffectiveConfig, systemPrompt string, userPrompt string) (*ai.CallResult, error) {
+// v89-2变更：增加pipelineID参数，传入真实TraceContext用于成本追踪
+func (s *PipelineService) callAIWithSemaphore(cfg *ai.EffectiveConfig, systemPrompt string, userPrompt string, pipelineID string) (*ai.CallResult, error) {
 	if s.engine != nil {
 		s.engine.AcquireAI()
 		defer s.engine.ReleaseAI()
 	}
-	return ai.CallAI(cfg, systemPrompt, userPrompt, nil)
+
+	// v89-2：构建真实TraceContext，关联Pipeline ID
+	var traceCtx *ai.TraceContext
+	if pipelineID != "" {
+		pid := pipelineID
+		traceCtx = &ai.TraceContext{
+			SceneCode:  "scanner", // Pipeline步骤默认使用scanner场景（实际场景由cfg决定）
+			PipelineID: &pid,
+		}
+	}
+
+	return ai.CallAI(cfg, systemPrompt, userPrompt, traceCtx)
 }
 
 // ==================== SSE事件广播 ====================
@@ -679,7 +691,7 @@ func (s *PipelineService) doScanner(pipeline *models.Pipeline) (*models.ScannerR
 	systemPrompt := promptA.Content
 	userPrompt := fmt.Sprintf("请分析以下课程索引内容，按照要求输出JSON格式的定位信息：\n\n%s", courseIndex.IndexContent)
 
-	callResult, err := s.callAIWithSemaphore(aiCfg, systemPrompt, userPrompt)
+	callResult, err := s.callAIWithSemaphore(aiCfg, systemPrompt, userPrompt, pipeline.ID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrScannerAIFailed, err.Error())
 	}

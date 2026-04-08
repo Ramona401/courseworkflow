@@ -5,6 +5,10 @@ package services
 // 包含：六层系统提示词拼接 + 各上下文构建函数 + 对话规范 + 组件注入 + 辅助函数
 //
 // v76拆分：自然语言提取+废弃函数 移至 workshop_stage_extract.go
+// v82变更：normalizeGradeToNumber 抽取为 utils.NormalizeGradeToNumber 统一工具函数
+// v84变更：BuildStageChatPrompt 改造为分层记忆版本
+//          新增 BuildStageChatPromptV2 支持 Working+Episodic 分层上下文
+//          旧版 BuildStageChatPrompt 保留向下兼容（内部调用V2）
 
 import (
 	"context"
@@ -16,6 +20,7 @@ import (
 	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/repository"
+	"tedna/internal/utils"
 )
 
 // ==================== 阶段完整系统提示词构建（六层拼接）====================
@@ -393,12 +398,14 @@ func BuildSelectedComponentContext(ctx context.Context, componentIDs []string) s
 
 // ==================== 自动匹配阶段组件 ====================
 
+// AutoMatchStageComponents 根据阶段组件类型+学科+年级自动匹配组件
+// v82变更：年级转换改用统一工具函数 utils.NormalizeGradeToNumber
 func AutoMatchStageComponents(ctx context.Context, componentTypesJSON string, subject string, grade string) string {
 	var stageTypes []string
 	if err := json.Unmarshal([]byte(componentTypesJSON), &stageTypes); err != nil || len(stageTypes) == 0 {
 		return ""
 	}
-	normalizedGrade := normalizeGradeToNumber(grade)
+	normalizedGrade := utils.NormalizeGradeToNumber(grade)
 	groups, err := repository.MatchComponents(ctx, &models.MatchComponentsRequest{
 		Subject: subject, GradeRange: normalizedGrade, LibraryTypes: stageTypes, Limit: 2,
 	})
@@ -411,16 +418,15 @@ func AutoMatchStageComponents(ctx context.Context, componentTypesJSON string, su
 	for _, g := range groups {
 		sb.WriteString(fmt.Sprintf("\n【%s】\n", g.LibraryName))
 		for _, c := range g.Components {
-			sb.WriteString(fmt.Sprintf("▸ %s\n", c.DisplayLabel))
-			if c.DesignLogic != "" {
-				sb.WriteString(fmt.Sprintf("  设计逻辑：%s\n", c.DesignLogic))
-			}
-			if c.FullGuide != "" {
-				guide := c.FullGuide
-				if len(guide) > 1000 {
-					guide = guide[:1000] + "...(已截断)"
+			// v83: 优先用AOCI压缩索引（L2格式），无索引时降级为旧全文格式
+			if c.ComponentIndex != "" {
+				sb.WriteString(utils.FormatIndexForPrompt(c.ComponentIndex, c.DisplayLabel))
+				sb.WriteString("\n")
+			} else {
+				sb.WriteString(fmt.Sprintf("▸ %s\n", c.DisplayLabel))
+				if c.DesignLogic != "" {
+					sb.WriteString(fmt.Sprintf("  设计逻辑：%s\n", c.DesignLogic))
 				}
-				sb.WriteString(fmt.Sprintf("  完整指引：%s\n", guide))
 			}
 		}
 	}
@@ -429,11 +435,46 @@ func AutoMatchStageComponents(ctx context.Context, componentTypesJSON string, su
 	return sb.String()
 }
 
-// ==================== 阶段内对话提示词 ====================
+// ==================== 阶段内对话提示词（v84分层记忆改造）====================
 
+// BuildStageChatPrompt 构建阶段内对话的用户提示词（向下兼容版本）
+//
+// v84变更：内部改为调用 BuildStageChatPromptV2，传入空的episodicSummary
+// 保留此函数签名是为了兼容可能的外部调用
 func BuildStageChatPrompt(lp *models.LessonPlan, stageHistory []*models.ConversationMessage, userMsg *models.ConversationMessage) string {
+	return BuildStageChatPromptV2(lp, stageHistory, "", userMsg)
+}
+
+// BuildStageChatPromptV2 构建阶段内对话的用户提示词（v84分层记忆版）
+//
+// v84新增：支持三层记忆架构
+//   - Working Memory: currentStageMessages — 当前阶段的完整对话（由调用方从分隔符提取）
+//   - Episodic Memory: episodicSummary — 历史阶段的结构化摘要（由BuildEpisodicSummaryFromOutputs生成）
+//   - Semantic Memory: 教案正文+组件+配方 — 已在systemPrompt中注入，此处不重复
+//
+// 与旧版 BuildStageChatPrompt 的差异：
+//   1. stageHistory 现在只包含当前阶段的消息（不再是全量历史）
+//   2. 新增 episodicSummary 参数，注入历史阶段摘要
+//   3. 当前阶段对话截断阈值从15条提升到20条（因为不再跨阶段）
+//
+// 参数：
+//   - lp: 教案信息
+//   - currentStageMessages: 当前阶段的对话消息（Working Memory）
+//   - episodicSummary: 历史阶段摘要文本（Episodic Memory，可为空）
+//   - userMsg: 本轮用户输入
+func BuildStageChatPromptV2(
+	lp *models.LessonPlan,
+	currentStageMessages []*models.ConversationMessage,
+	episodicSummary string,
+	userMsg *models.ConversationMessage,
+) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("【当前备课信息】\n学科：%s\n年级：%s\n课题：%s\n课时：%d分钟\n\n", lp.Subject, lp.Grade, lp.Topic, lp.DurationMinutes))
+
+	// 第1部分：当前备课基本信息
+	sb.WriteString(fmt.Sprintf("【当前备课信息】\n学科：%s\n年级：%s\n课题：%s\n课时：%d分钟\n\n",
+		lp.Subject, lp.Grade, lp.Topic, lp.DurationMinutes))
+
+	// 第2部分：已有教案内容（Semantic Memory的一部分）
 	if lp.ContentMarkdown != "" {
 		content := lp.ContentMarkdown
 		if len(content) > 3000 {
@@ -443,9 +484,20 @@ func BuildStageChatPrompt(lp *models.LessonPlan, stageHistory []*models.Conversa
 		sb.WriteString(content)
 		sb.WriteString("\n\n")
 	}
-	recentHistory := stageHistory
-	if len(recentHistory) > 15 {
-		recentHistory = recentHistory[len(recentHistory)-15:]
+
+	// 第3部分：历史阶段摘要（Episodic Memory，v84新增）
+	// 只在有摘要内容时注入，避免空段干扰AI
+	if strings.TrimSpace(episodicSummary) != "" {
+		sb.WriteString(episodicSummary)
+		sb.WriteString("\n")
+	}
+
+	// 第4部分：当前阶段对话记录（Working Memory）
+	// v84改进：currentStageMessages已经只包含当前阶段的消息
+	// 截断阈值从15提升到20（因为不再跨阶段，20条纯当前阶段对话更合理）
+	recentHistory := currentStageMessages
+	if len(recentHistory) > 20 {
+		recentHistory = recentHistory[len(recentHistory)-20:]
 	}
 	if len(recentHistory) > 0 {
 		sb.WriteString("【本阶段对话记录】\n")
@@ -458,6 +510,8 @@ func BuildStageChatPrompt(lp *models.LessonPlan, stageHistory []*models.Conversa
 		}
 		sb.WriteString("\n")
 	}
+
+	// 第5部分：本轮用户输入
 	sb.WriteString(fmt.Sprintf("教师：%s\n\nAI助手：", userMsg.Content))
 	return sb.String()
 }
@@ -483,44 +537,6 @@ func BuildStageOpeningPrompt(lp *models.LessonPlan, stage *models.WorkshopStage,
 }
 
 // ==================== 辅助函数 ====================
-
-// normalizeGradeToNumber 将中文年级名转换为数字格式
-func normalizeGradeToNumber(grade string) string {
-	var digits []byte
-	for _, b := range []byte(grade) {
-		if b >= '0' && b <= '9' {
-			digits = append(digits, b)
-		}
-	}
-	if len(digits) > 0 {
-		return string(digits)
-	}
-	cnMap := map[string]string{
-		"一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
-		"六": "6", "七": "7", "八": "8", "九": "9", "十": "10",
-		"十一": "11", "十二": "12",
-	}
-	aliasMap := map[string]string{
-		"初一": "7", "初二": "8", "初三": "9",
-		"高一": "10", "高二": "11", "高三": "12",
-	}
-	for alias, num := range aliasMap {
-		if strings.Contains(grade, alias) {
-			return num
-		}
-	}
-	for cn, num := range cnMap {
-		if len(cn) > 3 && strings.Contains(grade, cn) {
-			return num
-		}
-	}
-	for cn, num := range cnMap {
-		if strings.Contains(grade, cn) {
-			return num
-		}
-	}
-	return grade
-}
 
 // stageCodeToName 阶段代码转中文名
 func stageCodeToName(code string) string {

@@ -14,6 +14,8 @@ package repository
 //   - 新增 DeleteRecipeStage 删除配方自定义阶段
 //   - 新增 GetRecipeStageByCode 按配方ID+阶段代码查询单个自定义阶段
 //   - 新增 CountRecipeStages 统计配方自定义阶段数量
+// v84 修改：
+//   - 新增 UpdateStageNarrativeOutput 单独更新narrative_output（分层记忆Episodic摘要保存）
 // BugFix：
 //   - UpdateStageOutputContent 存入前验证JSON有效性，无效时存{}并保留原始内容到narrative
 
@@ -444,6 +446,27 @@ func UpdateStageOutputContent(ctx context.Context, lessonPlanID string, stageCod
 	`, safeStructured, safeNarrative, modelUsed, tokensUsed, now, lessonPlanID, stageCode)
 	if err != nil {
 		return fmt.Errorf("更新阶段产出内容失败: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrStageOutputNotFound
+	}
+	return nil
+}
+
+// UpdateStageNarrativeOutput 单独更新阶段产出物的narrative_output字段
+//
+// v84新增：分层记忆架构中，阶段完成时生成Episodic摘要保存到narrative_output
+// 与 UpdateStageOutputContent 不同：此函数只更新 narrative_output，不影响其他字段
+// 使用场景：AdvanceStage/SkipStage 完成阶段前，自动生成摘要写入
+func UpdateStageNarrativeOutput(ctx context.Context, lessonPlanID string, stageCode string, narrativeOutput string) error {
+	now := time.Now()
+	result, err := database.DB.Exec(ctx, `
+		UPDATE workshop_stage_outputs
+		SET narrative_output = $1, updated_at = $2
+		WHERE lesson_plan_id = $3 AND stage_code = $4
+	`, narrativeOutput, now, lessonPlanID, stageCode)
+	if err != nil {
+		return fmt.Errorf("更新阶段摘要失败: %w", err)
 	}
 	if result.RowsAffected() == 0 {
 		return ErrStageOutputNotFound

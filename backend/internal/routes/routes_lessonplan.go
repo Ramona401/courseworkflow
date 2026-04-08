@@ -338,6 +338,8 @@ func registerLessonPlanRoutes(
 		case hasSuffix(path, "/stages/back") && r.Method == http.MethodPost:
 			wsStageHandler.BackStage(w, r)
 		// 迭代12新增：阶段推荐组件
+			case hasSuffix(path, "/completeness") && indexOf(path, "/stages/") >= 0 && r.Method == http.MethodGet:
+				wsStageHandler.GetStageCompleteness(w, r)
 			case hasSuffix(path, "/recommended-components") && indexOf(path, "/stages/") >= 0 && r.Method == http.MethodGet:
 				wsStageHandler.GetStageRecommendedComponents(w, r)
 			case hasSuffix(path, "/output") && indexOf(path, "/stages/") >= 0 && r.Method == http.MethodGet:
