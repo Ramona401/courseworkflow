@@ -6,10 +6,11 @@
  * 迭代2：流程搭建器（拖拽排序+启用/禁用+三级提示+预设模板+实时校验）
  * 迭代4：per_stage模式前端支持（备课模式3选1+阶段级对话模式下拉）
  * 迭代5：自定义阶段编辑器（添加/编辑/删除自定义阶段，与系统阶段混排）
+ * v88-fix：sessionStorage草稿自动保存 — 编辑过程中自动暂存，页面离开/刷新不丢失
  *
  * 路由：/lesson-plans/recipes/new | /lesson-plans/recipes/:id/edit
  */
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import {
   getRecipe, createRecipe, updateRecipe, previewRecipeContext,
@@ -61,6 +62,45 @@ const DEFAULT_FLOW: StageFlowItem[] = [
   { stage_code: 'revise',  enabled: true, order: 5 },
 ]
 
+/* ==================== v88-fix：草稿自动保存辅助函数 ==================== */
+
+/** 构建草稿在sessionStorage中的key */
+const getDraftKey = (recipeId?: string) => recipeId ? `recipe_draft_${recipeId}` : 'recipe_draft_new'
+
+/** 草稿数据结构（包含所有表单字段） */
+interface RecipeDraft {
+  name: string; description: string; subject: string; gradeRange: string
+  studentProfile: string; teachingStyle: string; schoolRequirements: string
+  customNotes: string; customPrompt: string; selectedCompIds: string[]
+  lessonStructure: LessonStructureBlock[]; promptMode: PromptMode
+  stageFlow: StageFlowItem[]; savedAt: number  // 保存时间戳（毫秒）
+}
+
+/** 保存草稿到sessionStorage */
+const saveDraft = (key: string, draft: RecipeDraft) => {
+  try { sessionStorage.setItem(key, JSON.stringify(draft)) } catch { /* sessionStorage满或不可用时静默忽略 */ }
+}
+
+/** 从sessionStorage读取草稿 */
+const loadDraft = (key: string): RecipeDraft | null => {
+  try {
+    const raw = sessionStorage.getItem(key)
+    if (!raw) return null
+    const draft = JSON.parse(raw) as RecipeDraft
+    // 草稿超过24小时自动过期
+    if (Date.now() - draft.savedAt > 24 * 60 * 60 * 1000) {
+      sessionStorage.removeItem(key)
+      return null
+    }
+    return draft
+  } catch { return null }
+}
+
+/** 清除草稿 */
+const clearDraft = (key: string) => {
+  try { sessionStorage.removeItem(key) } catch { /* 忽略 */ }
+}
+
 /* ==================== 样式辅助 ==================== */
 const labelStyle: React.CSSProperties = { display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }
 const textareaStyle: React.CSSProperties = {
@@ -86,6 +126,9 @@ export default function RecipeEditorPage() {
   const isEdit = !!id
   const location = useLocation()
   const fromPath = (location.state as { from?: string } | null)?.from || '/lesson-plans/recipes'
+
+  // v88-fix：草稿key（编辑模式用配方ID，新建模式用固定key）
+  const draftKey = getDraftKey(id)
 
   // ---- 表单状态 ----
   const [name, setName] = useState(''); const [description, setDescription] = useState('')
@@ -124,9 +167,31 @@ export default function RecipeEditorPage() {
   const [saving, setSaving] = useState(false)
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null)
 
+  // v88-fix：是否已从后端/草稿加载完成（避免初始状态触发草稿保存）
+  const dataLoadedRef = useRef(false)
+  // v88-fix：是否恢复了草稿（用于显示提示横幅）
+  const [draftRestored, setDraftRestored] = useState(false)
+
   const showToast = (msg: string, type: 'success' | 'error' = 'success') => {
     setToast({ msg, type }); setTimeout(() => setToast(null), 3000)
   }
+
+  // ==================== v88-fix：自动保存草稿（防抖500ms）====================
+  useEffect(() => {
+    if (!dataLoadedRef.current) return  // 数据未加载完成前不保存
+    const timer = setTimeout(() => {
+      const draft: RecipeDraft = {
+        name, description, subject, gradeRange: gradeRange,
+        studentProfile, teachingStyle, schoolRequirements: schoolRequirements,
+        customNotes, customPrompt, selectedCompIds: Array.from(selectedCompIds),
+        lessonStructure, promptMode, stageFlow, savedAt: Date.now(),
+      }
+      saveDraft(draftKey, draft)
+    }, 500)
+    return () => clearTimeout(timer)
+  }, [name, description, subject, gradeRange, studentProfile, teachingStyle,
+      schoolRequirements, customNotes, customPrompt, selectedCompIds,
+      lessonStructure, promptMode, stageFlow, draftKey])
 
   // ==================== 迭代4：切换备课模式时清理/初始化阶段级prompt_mode ====================
   const handlePromptModeChange = useCallback((newMode: PromptMode) => {
@@ -174,42 +239,78 @@ export default function RecipeEditorPage() {
 
   useEffect(() => { triggerValidation(stageFlow) }, [stageFlow, triggerValidation])
 
-  // ==================== 编辑模式：加载配方数据 ====================
+  // ==================== 编辑模式：加载配方数据（v88-fix：优先恢复草稿）====================
   useEffect(() => {
-    if (!id) return
+    if (!id) {
+      // 新建模式：尝试恢复草稿
+      const draft = loadDraft(draftKey)
+      if (draft) {
+        setName(draft.name); setDescription(draft.description)
+        setSubject(draft.subject); setGradeRange(draft.gradeRange)
+        setStudentProfile(draft.studentProfile); setTeachingStyle(draft.teachingStyle)
+        setSchoolReqs(draft.schoolRequirements); setCustomNotes(draft.customNotes)
+        setCustomPrompt(draft.customPrompt); setSelectedCompIds(new Set(draft.selectedCompIds))
+        if (draft.lessonStructure.length > 0) setLessonStructure(draft.lessonStructure)
+        setPromptMode(draft.promptMode)
+        if (draft.stageFlow.length > 0) setStageFlow(draft.stageFlow)
+        setDraftRestored(true)
+      }
+      dataLoadedRef.current = true
+      return
+    }
     const load = async () => {
       try {
         const detail = await getRecipe(id)
-        setName(detail.name); setDescription(detail.description || '')
-        setSubject(detail.subject); setGradeRange(detail.grade_range)
-        setStudentProfile(detail.student_profile || ''); setTeachingStyle(detail.teaching_style || '')
-        setSchoolReqs(detail.school_requirements || ''); setCustomNotes(detail.custom_notes || '')
-        setCustomPrompt(detail.custom_prompt || '')
-        // 解析component_ids（可能是JSON字符串或数组）
-        let compIds: string[] = []
-        if (detail.component_ids) {
-          try { compIds = JSON.parse(detail.component_ids) } catch { compIds = [] }
+
+        // v88-fix：检查是否有比后端数据更新的草稿
+        const draft = loadDraft(draftKey)
+        const detailUpdatedAt = new Date(detail.updated_at).getTime()
+        const hasFresherDraft = draft && draft.savedAt > detailUpdatedAt
+
+        if (hasFresherDraft && draft) {
+          // 草稿比后端新 → 恢复草稿内容
+          setName(draft.name); setDescription(draft.description)
+          setSubject(draft.subject); setGradeRange(draft.gradeRange)
+          setStudentProfile(draft.studentProfile); setTeachingStyle(draft.teachingStyle)
+          setSchoolReqs(draft.schoolRequirements); setCustomNotes(draft.customNotes)
+          setCustomPrompt(draft.customPrompt); setSelectedCompIds(new Set(draft.selectedCompIds))
+          if (draft.lessonStructure.length > 0) setLessonStructure(draft.lessonStructure)
+          setPromptMode(draft.promptMode)
+          if (draft.stageFlow.length > 0) setStageFlow(draft.stageFlow)
+          setDraftRestored(true)
+        } else {
+          // 无草稿或后端更新 → 从后端加载
+          setName(detail.name); setDescription(detail.description || '')
+          setSubject(detail.subject); setGradeRange(detail.grade_range)
+          setStudentProfile(detail.student_profile || ''); setTeachingStyle(detail.teaching_style || '')
+          setSchoolReqs(detail.school_requirements || ''); setCustomNotes(detail.custom_notes || '')
+          setCustomPrompt(detail.custom_prompt || '')
+          let compIds: string[] = []
+          if (detail.component_ids) {
+            try { compIds = JSON.parse(detail.component_ids) } catch { compIds = [] }
+          }
+          setSelectedCompIds(new Set(compIds))
+          if (detail.lesson_structure) {
+            try { const p = JSON.parse(detail.lesson_structure); if (Array.isArray(p) && p.length > 0) setLessonStructure(p) } catch {}
+          }
+          if (detail.prompt_mode) setPromptMode(detail.prompt_mode)
+          if (detail.stages_config) {
+            try {
+              const p = JSON.parse(detail.stages_config)
+              if (Array.isArray(p) && p.length > 0 && p[0].enabled !== undefined) setStageFlow(p)
+            } catch {}
+          }
         }
-        setSelectedCompIds(new Set(compIds))
-        // 迭代1：教案结构+备课模式
-        if (detail.lesson_structure) {
-          try { const p = JSON.parse(detail.lesson_structure); if (Array.isArray(p) && p.length > 0) setLessonStructure(p) } catch {}
-        }
-        if (detail.prompt_mode) setPromptMode(detail.prompt_mode)
-        // 迭代2+5：流程配置（保留is_custom+stage_name+prompt_mode字段）
-        if (detail.stages_config) {
-          try {
-            const p = JSON.parse(detail.stages_config)
-            if (Array.isArray(p) && p.length > 0 && p[0].enabled !== undefined) setStageFlow(p)
-          } catch {}
-        }
-        // 迭代5：加载自定义阶段
+        // 迭代5：加载自定义阶段（无论是否恢复草稿都需要）
         await loadCustomStages(id)
       } catch (e) { console.error('加载配方失败:', e); showToast('加载配方失败', 'error') }
-      finally { setPageLoading(false) }
+      finally {
+        setPageLoading(false)
+        dataLoadedRef.current = true
+      }
     }
     load()
-  }, [id, loadCustomStages])
+  }, [id, loadCustomStages, draftKey])
 
   // ==================== 加载推荐组件 ====================
   const loadRecommend = useCallback(async () => {
@@ -253,7 +354,6 @@ export default function RecipeEditorPage() {
 
   // ==================== 迭代2+5：流程操作 ====================
   const toggleStage = (code: string) => {
-    // 系统阶段：不可移除的不允许禁用
     const isCustom = stageFlow.find(s => s.stage_code === code)?.is_custom
     if (!isCustom && STAGE_REMOVABLE[code] === false) return
     setStageFlow(prev => prev.map(s => s.stage_code === code ? { ...s, enabled: !s.enabled } : s))
@@ -261,7 +361,6 @@ export default function RecipeEditorPage() {
   const moveStage = (idx: number, dir: -1 | 1) => {
     const target = idx + dir
     if (target < 0 || target >= stageFlow.length) return
-    // revise固定末位不可移动
     if (stageFlow[idx].stage_code === 'revise' || stageFlow[target].stage_code === 'revise') return
     setStageFlow(prev => {
       const n = [...prev]; [n[idx], n[target]] = [n[target], n[idx]]
@@ -269,7 +368,6 @@ export default function RecipeEditorPage() {
     })
   }
   const applyPreset = (preset: FlowPreset) => {
-    // 应用预设时保留自定义阶段（追加到预设阶段之后、revise之前）
     const customItems = stageFlow.filter(s => s.is_custom)
     let newFlow = preset.stages.map(s => ({ ...s }))
     if (customItems.length > 0) {
@@ -289,8 +387,6 @@ export default function RecipeEditorPage() {
   const enabledCount = useMemo(() => stageFlow.filter(s => s.enabled).length, [stageFlow])
 
   // ==================== 迭代5：自定义阶段操作 ====================
-
-  /** 打开创建自定义阶段弹窗 */
   const openCreateStageModal = () => {
     if (!isEdit || !id) { showToast('请先保存配方后再添加自定义阶段', 'error'); return }
     setStageModalMode('create')
@@ -298,12 +394,8 @@ export default function RecipeEditorPage() {
     setEditingStageData(null)
   }
 
-  /** 打开编辑自定义阶段弹窗（需先从后端加载完整数据） */
   const openEditStageModal = async (stageCode: string) => {
     if (!id) return
-    // 从customStages中获取基础信息，完整数据需要从API获取
-    // 但目前API返回的是精简版，编辑需要完整字段
-    // 暂时用精简数据填充，系统提示词等需要用户手动编辑
     const cs = customStages.find(s => s.stage_code === stageCode)
     if (!cs) return
     setStageModalMode('edit')
@@ -320,14 +412,12 @@ export default function RecipeEditorPage() {
     })
   }
 
-  /** 处理弹窗确认（创建或编辑） */
   const handleStageModalConfirm = async (data: CreateCustomStageRequest | UpdateCustomStageRequest) => {
     if (!id) return
     setStageSaving(true)
     try {
       if (stageModalMode === 'create') {
         const created = await createCustomStage(id, data as CreateCustomStageRequest)
-        // 将新阶段插入到流程中（revise之前）
         setStageFlow(prev => {
           const reviseIdx = prev.findIndex(s => s.stage_code === 'revise')
           const newItem: StageFlowItem = {
@@ -346,7 +436,6 @@ export default function RecipeEditorPage() {
         showToast(`自定义阶段「${created.stage_name}」已添加`)
       } else if (stageModalMode === 'edit') {
         await updateCustomStage(id, editingStageCode, data as UpdateCustomStageRequest)
-        // 更新流程中的stage_name
         const upd = data as UpdateCustomStageRequest
         setStageFlow(prev => prev.map(s =>
           s.stage_code === editingStageCode ? { ...s, stage_name: upd.stage_name } : s
@@ -360,14 +449,12 @@ export default function RecipeEditorPage() {
     } finally { setStageSaving(false) }
   }
 
-  /** 删除自定义阶段 */
   const handleDeleteCustomStage = async (stageCode: string) => {
     if (!id) return
     const cs = customStages.find(s => s.stage_code === stageCode)
     if (!confirm(`确认删除自定义阶段「${cs?.stage_name || stageCode}」？`)) return
     try {
       await deleteCustomStage(id, stageCode)
-      // 从流程中移除
       setStageFlow(prev => prev.filter(s => s.stage_code !== stageCode).map((s, i) => ({ ...s, order: i + 1 })))
       await loadCustomStages(id)
       showToast('自定义阶段已删除')
@@ -376,7 +463,7 @@ export default function RecipeEditorPage() {
     }
   }
 
-  // ==================== 保存 ====================
+  // ==================== 保存（v88-fix：保存成功后清除草稿）====================
   const handleSave = async () => {
     if (!name.trim()) { showToast('请填写配方名称', 'error'); return }
     if (!flowValid) { showToast('流程配置有阻断错误，请先修正', 'error'); return }
@@ -393,9 +480,15 @@ export default function RecipeEditorPage() {
         stages_config: JSON.stringify(stageFlow),
       }
       if (isEdit && id) {
-        await updateRecipe(id, payload); showToast('配方已更新 ✓'); handlePreview(id)
+        await updateRecipe(id, payload)
+        clearDraft(draftKey)  // v88-fix：保存成功后清除草稿
+        setDraftRestored(false)
+        showToast('配方已更新 ✓'); handlePreview(id)
       } else {
-        const created = await createRecipe(payload); showToast('配方已创建 ✓')
+        const created = await createRecipe(payload)
+        clearDraft(draftKey)  // v88-fix：保存成功后清除草稿
+        setDraftRestored(false)
+        showToast('配方已创建 ✓')
         navigate(`/lesson-plans/recipes/${created.id}/edit`, { replace: true, state: { from: fromPath } })
       }
     } catch (e: unknown) {
@@ -403,7 +496,15 @@ export default function RecipeEditorPage() {
     } finally { setSaving(false) }
   }
 
-  // ==================== 获取阶段显示信息辅助函数（迭代5） ====================
+  // ==================== v88-fix：放弃草稿，重新从后端加载 ====================
+  const handleDiscardDraft = () => {
+    clearDraft(draftKey)
+    setDraftRestored(false)
+    // 重新加载页面以从后端获取最新数据
+    window.location.reload()
+  }
+
+  // ==================== 获取阶段显示信息辅助函数（迭代5）====================
   const getStageName = (stage: StageFlowItem) => {
     if (stage.is_custom) return stage.stage_name || stage.stage_code
     return STAGE_CODE_NAME[stage.stage_code] || stage.stage_code
@@ -456,6 +557,29 @@ export default function RecipeEditorPage() {
             background: saving || !name.trim() ? C.border : C.primary, color: saving || !name.trim() ? C.textMuted : '#fff',
           }}>{saving ? '保存中...' : isEdit ? '更新配方' : '创建配方'}</button>
         </div>
+
+        {/* v88-fix：草稿恢复提示横幅 */}
+        {draftRestored && (
+          <div style={{
+            marginBottom: '16px', padding: '12px 18px', borderRadius: '10px',
+            background: 'linear-gradient(135deg, rgba(245,158,11,0.08), rgba(251,191,36,0.05))',
+            border: '1px solid rgba(245,158,11,0.25)',
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            fontSize: '13px', color: '#92400E',
+          }}>
+            <span>📋 已恢复上次未保存的编辑内容</span>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button onClick={handleDiscardDraft} style={{
+                padding: '4px 12px', borderRadius: '6px', border: '1px solid rgba(245,158,11,0.3)',
+                background: 'transparent', fontSize: '12px', color: '#B45309', cursor: 'pointer',
+              }}>放弃草稿</button>
+              <button onClick={() => setDraftRestored(false)} style={{
+                padding: '4px 12px', borderRadius: '6px', border: 'none',
+                background: '#F59E0B', fontSize: '12px', color: '#fff', cursor: 'pointer', fontWeight: 600,
+              }}>继续编辑</button>
+            </div>
+          </div>
+        )}
 
         {/* 基本信息卡片 */}
         <div style={{ background: C.card, borderRadius: '12px', border: `1px solid ${C.border}`, padding: '24px', marginBottom: '16px' }}>
@@ -513,7 +637,6 @@ export default function RecipeEditorPage() {
             <div style={{ fontSize: '15px', fontWeight: 600, color: C.text }}>
               🔧 备课流程 <span style={{ fontSize: '12px', fontWeight: 400, color: C.textMuted }}>（{enabledCount}个阶段启用）</span>
             </div>
-            {/* 迭代5：添加自定义阶段按钮 */}
             <button onClick={openCreateStageModal} style={{
               fontSize: '12px', color: C.primary, background: C.primaryLight, border: 'none',
               padding: '6px 14px', borderRadius: '6px', cursor: 'pointer', fontWeight: 600,
@@ -521,7 +644,6 @@ export default function RecipeEditorPage() {
           </div>
           <div style={{ fontSize: '13px', color: C.textMuted, marginBottom: '14px' }}>配置备课的阶段流程，可启用/禁用阶段、调整顺序，或快速选择预设模板</div>
 
-          {/* 预设模板快速选择 */}
           {flowPresets.length > 0 && (
             <div style={{ display: 'flex', gap: '8px', marginBottom: '16px', flexWrap: 'wrap' }}>
               {flowPresets.map(preset => (
@@ -539,7 +661,6 @@ export default function RecipeEditorPage() {
             </div>
           )}
 
-          {/* 阶段列表（迭代5：统一渲染系统阶段+自定义阶段） */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
             {stageFlow.map((stage, idx) => {
               const removable = isStageRemovable(stage)
@@ -552,15 +673,12 @@ export default function RecipeEditorPage() {
                   background: stage.enabled ? (stage.is_custom ? 'rgba(79,123,232,0.03)' : '#FAFBFC') : 'rgba(156,163,175,0.04)',
                   opacity: stage.enabled ? 1 : 0.6, transition: 'all 150ms ease',
                 }}>
-                  {/* 排序按钮 */}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
                     <button onClick={() => moveStage(idx, -1)} disabled={idx === 0 || isRevise}
                       style={{ border: 'none', background: 'none', cursor: idx === 0 || isRevise ? 'default' : 'pointer', fontSize: '10px', color: idx === 0 || isRevise ? C.border : C.textMuted, padding: '0' }}>▲</button>
                     <button onClick={() => moveStage(idx, 1)} disabled={idx === stageFlow.length - 1 || isRevise}
                       style={{ border: 'none', background: 'none', cursor: idx === stageFlow.length - 1 || isRevise ? 'default' : 'pointer', fontSize: '10px', color: idx === stageFlow.length - 1 || isRevise ? C.border : C.textMuted, padding: '0' }}>▼</button>
                   </div>
-
-                  {/* 启用/禁用开关 */}
                   <div onClick={() => toggleStage(stage.stage_code)} style={{
                     width: '36px', height: '20px', borderRadius: '10px', cursor: removable ? 'pointer' : 'not-allowed',
                     background: stage.enabled ? C.success : '#D1D5DB', position: 'relative', transition: 'background 200ms ease', flexShrink: 0,
@@ -570,11 +688,7 @@ export default function RecipeEditorPage() {
                       left: stage.enabled ? '18px' : '2px', transition: 'left 200ms ease', boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
                     }} />
                   </div>
-
-                  {/* 阶段图标 */}
                   <span style={{ fontSize: '18px', flexShrink: 0 }}>{getStageEmoji(stage)}</span>
-
-                  {/* 阶段信息 */}
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                       <span style={{ fontSize: '14px', fontWeight: 600, color: stage.enabled ? C.text : C.textMuted }}>
@@ -591,8 +705,6 @@ export default function RecipeEditorPage() {
                       {getStageRole(stage)} · {getStageDesc(stage)}
                     </div>
                   </div>
-
-                  {/* per_stage模式下的阶段级对话模式选择器 */}
                   {showPerStageSelector && (
                     <select
                       value={stage.prompt_mode || 'guided'}
@@ -608,8 +720,6 @@ export default function RecipeEditorPage() {
                       ))}
                     </select>
                   )}
-
-                  {/* 迭代5：自定义阶段操作按钮 */}
                   {stage.is_custom && (
                     <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
                       <button onClick={() => openEditStageModal(stage.stage_code)} title="编辑"
@@ -618,8 +728,6 @@ export default function RecipeEditorPage() {
                         style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: '13px', color: C.danger, padding: '2px 4px' }}>🗑️</button>
                     </div>
                   )}
-
-                  {/* 序号标识 */}
                   <span style={{ fontSize: '12px', color: C.textMuted, flexShrink: 0 }}>
                     {stage.enabled ? `第${stageFlow.filter((s, j) => j <= idx && s.enabled).length}步` : '已禁用'}
                   </span>
@@ -628,7 +736,6 @@ export default function RecipeEditorPage() {
             })}
           </div>
 
-          {/* 三级提示消息 */}
           {flowMessages.length > 0 && (
             <div style={{ marginTop: '14px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
               {flowMessages.map((msg, i) => {

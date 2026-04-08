@@ -350,10 +350,10 @@ func MatchComponents(ctx context.Context, req *models.MatchComponentsRequest) ([
 	// 使用ROW_NUMBER()窗口函数实现分组取TopN
 	query := fmt.Sprintf(`
 		SELECT library_type, id, display_label, COALESCE(design_logic, ''), COALESCE(example_snippet, ''),
-		       COALESCE(full_guide, ''), quality_score, usage_count, select_count, tags
+		       COALESCE(full_guide, ''), quality_score, usage_count, select_count, tags, COALESCE(component_index, '') AS component_index
 		FROM (
 			SELECT c.library_type, c.id, c.display_label, COALESCE(c.design_logic, '') AS design_logic, COALESCE(c.example_snippet, '') AS example_snippet,
-			       COALESCE(c.full_guide, '') AS full_guide, c.quality_score, c.usage_count, c.select_count, c.tags,
+			       COALESCE(c.full_guide, '') AS full_guide, c.quality_score, c.usage_count, c.select_count, c.tags, COALESCE(c.component_index, '') AS component_index,
 			       ROW_NUMBER() OVER (PARTITION BY c.library_type ORDER BY c.quality_score DESC, c.select_count DESC) AS rn
 			FROM lesson_plan_components c
 			%s
@@ -378,7 +378,7 @@ func MatchComponents(ctx context.Context, req *models.MatchComponentsRequest) ([
 		mc := &models.MatchedComponent{}
 		err := rows.Scan(
 			&libraryType, &mc.ID, &mc.DisplayLabel, &mc.DesignLogic, &mc.ExampleSnippet,
-			&mc.FullGuide, &mc.QualityScore, &mc.UsageCount, &mc.SelectCount, &mc.Tags,
+			&mc.FullGuide, &mc.QualityScore, &mc.UsageCount, &mc.SelectCount, &mc.Tags, &mc.ComponentIndex,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("扫描匹配结果行失败: %w", err)
@@ -490,7 +490,7 @@ func SmartMatchComponents(ctx context.Context, req *models.MatchComponentsReques
 	// 按最终分排序替代原来的quality_score排序
 	query := fmt.Sprintf(`
 		SELECT library_type, id, display_label, design_logic, example_snippet,
-		       full_guide, final_score, usage_count, select_count, tags
+		       full_guide, final_score, usage_count, select_count, tags, COALESCE(component_index, '')
 		FROM (
 			SELECT c.library_type, c.id, c.display_label,
 			       COALESCE(c.design_logic, '') AS design_logic,
@@ -524,7 +524,7 @@ func SmartMatchComponents(ctx context.Context, req *models.MatchComponentsReques
 		mc := &models.MatchedComponent{}
 		err := rows.Scan(
 			&libraryType, &mc.ID, &mc.DisplayLabel, &mc.DesignLogic, &mc.ExampleSnippet,
-			&mc.FullGuide, &mc.QualityScore, &mc.UsageCount, &mc.SelectCount, &mc.Tags,
+			&mc.FullGuide, &mc.QualityScore, &mc.UsageCount, &mc.SelectCount, &mc.Tags, &mc.ComponentIndex,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("扫描智能匹配结果行失败: %w", err)
