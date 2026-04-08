@@ -9,21 +9,16 @@ package services
 //   4. ApplyAISuggestions — 将AI建议应用到教案内容（优化+重新评审）
 //   5. GetConversation    — 获取教案对话历史
 //
-// v74 重大优化：
-//   1. 统一走阶段化流程——不管有没有配方，StartConversation始终初始化阶段
-//   2. write/revise阶段防重复生成——教案已保存后追加系统指令禁止AI重新生成
-//   3. write/revise阶段成功提取教案后自动标记产出物completed
-//
-// v75 重大重构（标签体系去除）：
-//   1. 删除 streamFilterState — AI输出直接推送用户，不过滤XML标签
-//   2. processChatStageAsync 不再调用 ParseStageOutput/DetectStageComplete
-//   3. 改用 ExtractStructuredFromNaturalReply 从自然语言中提取结构化数据
-//   4. 不再推送 LPSSEStageComplete 事件 — 阶段完成由用户手动控制
-//   5. genStageOpeningMessage 去掉 CleanStageMarkers 调用
-//
-// v78 改动：
-//   1. 所有 GetEffectiveConfig 调用传入 sceneCode="lesson_plan"，支持独立模型场景配置
-//   2. 教案生成可在AI配置中心独立配置模型/温度/max_tokens，不再依赖全局默认模型
+// v74 重大优化：统一走阶段化流程，write/revise防重复生成
+// v75 重大重构：去标签体系，AI输出直接推送
+// v78 改动：独立场景配置 lessonPlanSceneCode
+// v84 改动：分层记忆架构改造
+//   - Chat() 改用 GetCurrentStageMessages 获取当前阶段消息（Working Memory）
+//   - processChatStageAsync 使用 BuildStageChatPromptV2 构建分层上下文
+//   - Episodic Memory 从 workshop_stage_outputs.narrative_output 获取
+// v87 改动：AI教练集成
+//   - processChatStageAsync 对话完成后检测停滞，超过3轮无进展插入教练建议
+//   - 教练建议通过SSE推送给前端（使用现有LPSSEMessageDone事件类型）
 
 import (
 	"context"
@@ -34,8 +29,10 @@ import (
 	"time"
 
 	aiClient "tedna/internal/ai"
+	"tedna/internal/utils"
 	"tedna/internal/logger"
 	"tedna/internal/models"
+	"tedna/internal/config"
 	"tedna/internal/repository"
 )
 
@@ -214,8 +211,8 @@ func (s *LessonPlanGenService) genStageOpeningMessage(
 		return nil, fmt.Errorf("AI开场白生成失败: %w", err)
 	}
 
-	// v75：AI不再输出标签，直接使用内容（保留CleanStageMarkers作为安全网）
-	content := CleanStageMarkers(result.Content)
+	// v75/v82：AI不再输出标签，直接使用TrimSpace清理内容
+	content := strings.TrimSpace(result.Content)
 
 	return &models.ConversationMessage{
 		ID:        generateMsgID(),
@@ -242,6 +239,7 @@ func (s *LessonPlanGenService) buildSilentComponentContext(ctx context.Context, 
 // Chat 处理教师输入，AI生成回复并通过SSE流式推送
 //
 // v74改动：统一走阶段化对话，移除旧模式判断
+// v84改动：改用分层记忆加载当前阶段消息
 func (s *LessonPlanGenService) Chat(
 	ctx context.Context,
 	req *models.LessonPlanChatRequest,
@@ -252,9 +250,12 @@ func (s *LessonPlanGenService) Chat(
 		return err
 	}
 
-	history, err := s.loadConversation(ctx, lp.ID)
+	// v84改动：只加载当前阶段的对话消息（Working Memory）
+	// 替代旧的 loadConversation（全量加载）
+	currentStageMsgs, err := repository.GetCurrentStageMessages(ctx, lp.ID)
 	if err != nil {
-		history = []*models.ConversationMessage{}
+		lpGenLog.Warn("加载当前阶段消息失败，降级为空历史", "plan_id", lp.ID, "error", err)
+		currentStageMsgs = []*models.ConversationMessage{}
 	}
 
 	userMsg := &models.ConversationMessage{
@@ -275,32 +276,33 @@ func (s *LessonPlanGenService) Chat(
 		lpGenLog.Warn("写入用户消息失败", "plan_id", lp.ID, "error", err)
 	}
 
-	// v74：统一走阶段化对话
+	// v84改动：传入当前阶段消息而非全量历史
 	go func() {
 		bgCtx := context.Background()
-		s.processChatStageAsync(bgCtx, lp, userMsg, history, req)
+		s.processChatStageAsync(bgCtx, lp, userMsg, currentStageMsgs, req)
 	}()
 
 	return nil
 }
 
-// ==================== 2.1 阶段化对话（v75重构：去标签）====================
+// ==================== 2.1 阶段化对话（v84分层记忆改造 + v87教练集成）====================
 
 // processChatStageAsync 阶段模式：异步处理AI流式回复
 //
-// v75重大重构：
-//   1. 删除 streamFilterState — AI输出直接推送给用户，不过滤标签
-//   2. AI回复完成后使用 ExtractStructuredFromNaturalReply 从自然语言中提取结构化数据
-//   3. 不再调用 ParseStageOutput / DetectStageComplete
-//   4. 不再推送 LPSSEStageComplete 事件 — 阶段完成由用户手动点击按钮
-//   5. write/revise阶段防重复生成逻辑保留
-//
-// v78改动：sceneCode改为lessonPlanSceneCode，使用独立场景配置
+// v75重大重构：去标签，AI输出直接推送
+// v78改动：独立场景配置
+// v84改动：分层记忆架构
+//   - history参数现在只包含当前阶段的消息（Working Memory）
+//   - 新增Episodic Memory从workshop_stage_outputs获取
+//   - 使用BuildStageChatPromptV2构建分层上下文
+// v87改动：AI教练集成
+//   - 对话完成后异步检测停滞
+//   - 停滞时插入教练建议消息并通过SSE推送
 func (s *LessonPlanGenService) processChatStageAsync(
 	ctx context.Context,
 	lp *models.LessonPlan,
 	userMsg *models.ConversationMessage,
-	history []*models.ConversationMessage,
+	currentStageMsgs []*models.ConversationMessage,
 	req *models.LessonPlanChatRequest,
 ) {
 	planID := lp.ID
@@ -329,11 +331,8 @@ func (s *LessonPlanGenService) processChatStageAsync(
 	}
 
 	// ===== v74保留：write阶段防重复生成 =====
-	// 如果教案正文已经有内容（之前已成功生成），追加指令防止AI重新生成整篇教案
 	if currentStage == "write" {
 		latestLP, freshErr := repository.GetLessonPlanByID(ctx, planID)
-		// v76修复：只有教案内容超过2000字符才注入防重复指令
-		// 短于2000字符说明可能是不完整的提取，应允许AI重新生成
 		if freshErr == nil && len(strings.TrimSpace(latestLP.ContentMarkdown)) > 2000 {
 			contentLen := len(latestLP.ContentMarkdown)
 			stageSystemPrompt += fmt.Sprintf(`
@@ -355,8 +354,28 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		}
 	}
 
-	// 构建用户提示词
-	userPrompt := BuildStageChatPrompt(lp, history, userMsg)
+	// ===== v84新增：构建Episodic Memory =====
+	// 从之前阶段的workshop_stage_outputs中获取narrative_output摘要
+	allOutputs, _ := repository.ListStageOutputs(ctx, planID)
+	var priorOutputs []*models.WorkshopStageOutput
+	for _, out := range allOutputs {
+		if out.StageCode == currentStage {
+			break
+		}
+		priorOutputs = append(priorOutputs, out)
+	}
+	episodicSummary := repository.BuildEpisodicSummaryFromOutputs(priorOutputs)
+
+	// v84改动：使用BuildStageChatPromptV2构建分层上下文
+	userPrompt := BuildStageChatPromptV2(lp, currentStageMsgs, episodicSummary, userMsg)
+
+	lpGenLog.Info("v84分层记忆上下文构建完成",
+		"plan_id", planID,
+		"stage", currentStage,
+		"working_msgs", len(currentStageMsgs),
+		"episodic_len", len(episodicSummary),
+		"prior_stages", len(priorOutputs),
+	)
 
 	// ===== v75：流式推送——直接推送所有内容，不过滤标签 =====
 	chunkCount := 0
@@ -387,7 +406,7 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		rawContent = fullContent.String()
 	}
 
-	// ===== v75：从自然语言中提取结构化数据（替代旧的ParseStageOutput）=====
+	// ===== v75：从自然语言中提取结构化数据 =====
 	structuredJSON, narrative, hasContent := ExtractStructuredFromNaturalReply(currentStage, rawContent)
 	if hasContent {
 		// 保存阶段产出物
@@ -397,10 +416,10 @@ func (s *LessonPlanGenService) processChatStageAsync(
 			lpGenLog.Info("阶段产出物已保存", "plan_id", planID, "stage", currentStage)
 		}
 
-		// 处理阶段副作用（write→保存教案正文，review→保存评审结果）
+		// 处理阶段副作用
 		s.handleStageOutputSideEffects(ctx, planID, lp, currentStage, structuredJSON, rawContent)
 
-		// 推送产出物事件（通知前端刷新阶段面板）
+		// 推送产出物事件
 		GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
 			EventType: models.LPSSEStageOutput,
 			PlanID:    planID,
@@ -410,9 +429,6 @@ func (s *LessonPlanGenService) processChatStageAsync(
 			},
 		})
 	}
-
-	// v75：不再检测stage_complete标签，不再推送LPSSEStageComplete事件
-	// 阶段完成完全由用户手动点击"完成本阶段"按钮控制
 
 	// 构造AI回复消息并保存
 	aiReply := s.parseAIReply(ctx, rawContent, lp)
@@ -429,13 +445,74 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		Message:   aiReply,
 	})
 
-	lpGenLog.Info("AI对话流式回复完成（阶段模式·v75无标签）",
+	lpGenLog.Info("AI对话流式回复完成（v84分层记忆）",
 		"plan_id", planID,
 		"stage", currentStage,
 		"tokens", result.TokensUsed,
 		"latency_ms", result.LatencyMs,
 		"chunks", chunkCount,
 		"has_content", hasContent,
+		"working_msgs", len(currentStageMsgs),
+	)
+
+	// ===== v87新增：对话完成后异步检测停滞，插入教练建议 =====
+	go s.checkAndInsertCoachAdvice(ctx, planID, currentStage)
+}
+
+// ==================== v87新增：停滞检测+教练建议插入 ====================
+
+// checkAndInsertCoachAdvice 对话完成后检测停滞，插入教练建议
+//
+// 在每轮AI回复完成后异步调用。如果检测到对话停滞（连续3轮无实质进展），
+// 自动插入一条教练建议消息并通过SSE推送给前端。
+//
+// 设计决策：
+//   - 异步执行，不影响AI回复的主路径延迟
+//   - 教练建议使用预设模板（不调AI），确保零额外成本
+//   - 建议消息作为assistant角色插入对话历史，前端正常展示
+//   - 短暂延迟（500ms）确保AI回复先到达前端
+func (s *LessonPlanGenService) checkAndInsertCoachAdvice(ctx context.Context, planID string, stageCode string) {
+	// 短暂延迟，确保AI回复已经完整推送到前端
+	time.Sleep(500 * time.Millisecond)
+
+	// 检测停滞
+	stagnation := DetectStagnation(ctx, planID, stageCode)
+	if stagnation == nil || !stagnation.IsStagnant {
+		return
+	}
+
+	// 生成教练建议
+	suggestion := GenerateCoachSuggestion(stagnation)
+	if suggestion == "" {
+		return
+	}
+
+	// 构建教练建议消息
+	coachMsg := &models.ConversationMessage{
+		ID:        generateMsgID(),
+		Role:      models.ConvRoleAssistant,
+		Type:      models.ConvMsgTypeText,
+		Content:   suggestion,
+		CreatedAt: time.Now(),
+	}
+
+	// 保存到对话历史
+	if err := s.appendMessage(ctx, planID, coachMsg); err != nil {
+		lpGenLog.Warn("v87教练建议-写入消息失败", "plan_id", planID, "error", err)
+		return
+	}
+
+	// 通过SSE推送给前端
+	GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
+		EventType: models.LPSSEMessageDone,
+		PlanID:    planID,
+		MessageID: coachMsg.ID,
+		Message:   coachMsg,
+	})
+
+	lpGenLog.Info("v87教练建议已插入",
+		"plan_id", planID, "stage", stageCode,
+		"user_rounds", stagnation.ConsecutiveRounds,
 	)
 }
 
@@ -457,9 +534,6 @@ func (s *LessonPlanGenService) handleStageOutputSideEffects(
 }
 
 // handleWriteStageOutput 处理write/revise阶段产出物
-//
-// v74保留：成功提取教案内容后，自动将该阶段产出物标记为completed
-// v75改动：structuredJSON 现在来自 ExtractStructuredFromNaturalReply（从自然语言提取）
 func (s *LessonPlanGenService) handleWriteStageOutput(
 	ctx context.Context,
 	planID string,
@@ -469,7 +543,7 @@ func (s *LessonPlanGenService) handleWriteStageOutput(
 ) {
 	content := ""
 
-	// 正常路径：structuredJSON有效（由ExtractStructuredFromNaturalReply提取）
+	// 正常路径：structuredJSON有效
 	if structuredJSON != "" && structuredJSON != "{}" {
 		var structured map[string]interface{}
 		if err := json.Unmarshal([]byte(structuredJSON), &structured); err == nil {
@@ -488,7 +562,6 @@ func (s *LessonPlanGenService) handleWriteStageOutput(
 			lpGenLog.Info("write阶段从rawContent fallback提取教案内容",
 				"plan_id", planID, "content_len", len(content))
 
-			// 将fallback提取的内容回写到structured_output
 			updatedStructured := map[string]interface{}{
 				"content_markdown": content,
 			}
@@ -526,7 +599,7 @@ func (s *LessonPlanGenService) handleWriteStageOutput(
 	lpGenLog.Info("write/revise阶段教案正文已更新", "plan_id", planID, "content_len", len(content))
 }
 
-// handleReviewStageOutput 处理review阶段产出物——解析评审结果并保存到教案
+// handleReviewStageOutput 处理review阶段产出物
 func (s *LessonPlanGenService) handleReviewStageOutput(
 	ctx context.Context,
 	planID string,
@@ -536,7 +609,6 @@ func (s *LessonPlanGenService) handleReviewStageOutput(
 		return
 	}
 
-	// v75：尝试解析为AIReviewResult
 	var reviewResult *models.AIReviewResult
 	if err := json.Unmarshal([]byte(structuredJSON), &reviewResult); err != nil || reviewResult == nil {
 		lpGenLog.Warn("解析review阶段structured为AIReviewResult失败", "plan_id", planID, "error", err)
@@ -567,6 +639,9 @@ func (s *LessonPlanGenService) handleReviewStageOutput(
 	})
 
 	lpGenLog.Info("review阶段评审结果已保存并推送", "plan_id", planID, "score", reviewResult.TotalScore)
+
+        // v89新增：review阶段完成后自动触发教案索引生成
+        go s.triggerAutoLessonIndex(ctx, planID, &reviewResult.TotalScore)
 }
 
 // ==================== 3. 触发AI评审 ====================
@@ -593,8 +668,6 @@ func (s *LessonPlanGenService) TriggerAIReview(
 }
 
 // executeAIReviewAsync 异步执行AI评审
-//
-// v78改动：sceneCode改为lessonPlanSceneCode，使用独立场景配置
 func (s *LessonPlanGenService) executeAIReviewAsync(ctx context.Context, lp *models.LessonPlan) {
 	planID := lp.ID
 
@@ -603,7 +676,6 @@ func (s *LessonPlanGenService) executeAIReviewAsync(ctx context.Context, lp *mod
 		PlanID:    planID,
 	})
 
-	// v78改动：传入lessonPlanSceneCode，使用教案生成独立场景配置
 	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
 	if err != nil {
 		s.broadcastError(planID, "AI评审配置失败: "+err.Error())
@@ -681,8 +753,6 @@ func (s *LessonPlanGenService) ApplyAISuggestions(
 }
 
 // applyAndReviewAsync 异步应用建议并重新评审
-//
-// v78改动：sceneCode改为lessonPlanSceneCode，使用独立场景配置
 func (s *LessonPlanGenService) applyAndReviewAsync(
 	ctx context.Context,
 	lp *models.LessonPlan,
@@ -695,7 +765,6 @@ func (s *LessonPlanGenService) applyAndReviewAsync(
 		PlanID:    planID,
 	})
 
-	// v78改动：传入lessonPlanSceneCode，使用教案生成独立场景配置
 	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
 	if err != nil {
 		s.broadcastError(planID, "AI配置失败: "+err.Error())
@@ -741,6 +810,7 @@ func (s *LessonPlanGenService) applyAndReviewAsync(
 // ==================== 5. 获取对话历史 ====================
 
 // GetConversation 获取教案对话历史
+// 注意：此API仍返回全量对话（前端展示需要），分层记忆只影响AI上下文构建
 func (s *LessonPlanGenService) GetConversation(
 	ctx context.Context,
 	planID string,
@@ -787,7 +857,7 @@ func (s *LessonPlanGenService) appendMessage(ctx context.Context, planID string,
 	return repository.AppendConversationMessage(ctx, planID, msg)
 }
 
-// loadConversation 加载教案对话历史
+// loadConversation 加载教案全量对话历史（前端展示用，不用于AI上下文）
 func (s *LessonPlanGenService) loadConversation(ctx context.Context, planID string) ([]*models.ConversationMessage, error) {
 	return repository.GetConversationLog(ctx, planID)
 }
@@ -850,8 +920,6 @@ func (s *LessonPlanGenService) parseAIReply(ctx context.Context, content string,
 }
 
 // genOpeningMessage 旧版开场白生成（保留兼容，已不常用）
-//
-// v78改动：sceneCode改为lessonPlanSceneCode，使用独立场景配置
 func (s *LessonPlanGenService) genOpeningMessage(
 	ctx context.Context,
 	req *models.StartConversationRequest,
@@ -859,7 +927,6 @@ func (s *LessonPlanGenService) genOpeningMessage(
 	genRules string,
 	backgroundContext string,
 ) (*models.ConversationMessage, error) {
-	// v78改动：传入lessonPlanSceneCode，使用教案生成独立场景配置
 	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
 	if err != nil {
 		return nil, err
@@ -893,4 +960,61 @@ func (s *LessonPlanGenService) genOpeningMessage(
 		Content:   result.Content,
 		CreatedAt: time.Now(),
 	}, nil
+}
+
+// ==================== v89新增：自动教案索引触发 ====================
+
+// triggerAutoLessonIndex review阶段完成后自动生成教案AOCI索引
+//
+// 异步执行，不阻塞用户操作。失败时只记录日志不影响主流程。
+// 使用scanner场景（Haiku模型）低成本压缩。
+//
+// 触发条件：review阶段评审结果保存成功后
+// 跳过条件：教案已有索引（lesson_index非空）
+func (s *LessonPlanGenService) triggerAutoLessonIndex(ctx context.Context, planID string, aiScore *float64) {
+	// 延迟1秒，确保评审数据完全写入
+	time.Sleep(1 * time.Second)
+
+	// 查询教案完整信息
+	lp, err := repository.GetLessonPlanByID(ctx, planID)
+	if err != nil {
+		lpGenLog.Warn("v89自动索引-查询教案失败", "plan_id", planID, "error", err)
+		return
+	}
+
+	// 跳过已有索引的教案
+	if lp.LessonIndex != "" {
+		lpGenLog.Debug("v89自动索引-教案已有索引，跳过", "plan_id", planID)
+		return
+	}
+
+	// 跳过无内容的教案
+	if strings.TrimSpace(lp.ContentMarkdown) == "" {
+		lpGenLog.Debug("v89自动索引-教案无内容，跳过", "plan_id", planID)
+		return
+	}
+
+	lpGenLog.Info("v89自动索引-开始生成", "plan_id", planID, "title", lp.Title)
+
+	// 构建全文
+	fullText := utils.BuildLessonFullText(
+		lp.Subject, lp.Grade, lp.Topic, lp.Title, lp.DurationMinutes,
+		lp.ContentMarkdown, lp.ContentStructured, lp.AIReviewResult, lp.MatchedComponents,
+	)
+
+	// 创建索引服务实例并压缩
+	liService := NewLessonIndexService(s.cfg.(*config.Config))
+	indexText, err := liService.CompressLessonIndex(fullText)
+	if err != nil {
+		lpGenLog.Warn("v89自动索引-AI压缩失败", "plan_id", planID, "error", err)
+		return
+	}
+
+	// 保存索引
+	if err := liService.SaveLessonIndex(ctx, planID, indexText, aiScore, string(lp.Status)); err != nil {
+		lpGenLog.Warn("v89自动索引-保存失败", "plan_id", planID, "error", err)
+		return
+	}
+
+	lpGenLog.Info("v89自动索引-生成完成", "plan_id", planID, "index_len", len(indexText))
 }
