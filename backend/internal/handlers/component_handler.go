@@ -2,10 +2,6 @@ package handlers
 
 // 组件库管理HTTP处理器
 // 负责组件CRUD、匹配、审核、萃取队列管理的HTTP接口
-//
-// Phase5新增端点：
-//   GET  /api/v1/lesson-plans/extractions              — 待审萃取列表
-//   POST /api/v1/lesson-plans/extractions/{id}/confirm — 确认/拒绝萃取记录
 
 import (
 	"encoding/json"
@@ -32,11 +28,9 @@ func NewComponentHandler(compService *services.ComponentService) *ComponentHandl
 
 // ==================== 组件列表 ====================
 
-// ListComponents 获取组件列表
-// GET /api/v1/lesson-plans/components?library_type=&subject=&review_status=&scope=&limit=50&offset=0
 func (h *ComponentHandler) ListComponents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	q := r.URL.Query()
@@ -58,25 +52,21 @@ func (h *ComponentHandler) ListComponents(w http.ResponseWriter, r *http.Request
 
 // ==================== 创建组件 ====================
 
-// CreateComponent 创建组件
-// POST /api/v1/lesson-plans/components
 func (h *ComponentHandler) CreateComponent(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	userID := getCurrentUserID(r)
 	if userID == "" {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	var req models.CreateComponentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
-
 	comp, err := h.compService.CreateComponent(r.Context(), &req, userID)
 	if err != nil {
 		h.handleCompError(w, err)
@@ -87,11 +77,9 @@ func (h *ComponentHandler) CreateComponent(w http.ResponseWriter, r *http.Reques
 
 // ==================== 获取组件详情 ====================
 
-// GetComponent 获取组件详情
-// GET /api/v1/lesson-plans/components/{id}
 func (h *ComponentHandler) GetComponent(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	id := extractComponentID(r.URL.Path)
@@ -109,11 +97,9 @@ func (h *ComponentHandler) GetComponent(w http.ResponseWriter, r *http.Request) 
 
 // ==================== 更新组件 ====================
 
-// UpdateComponent 更新组件
-// PUT /api/v1/lesson-plans/components/{id}
 func (h *ComponentHandler) UpdateComponent(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
 		return
 	}
 	id := extractComponentID(r.URL.Path)
@@ -121,13 +107,11 @@ func (h *ComponentHandler) UpdateComponent(w http.ResponseWriter, r *http.Reques
 		utils.BadRequest(w, "缺少组件ID")
 		return
 	}
-
 	var req models.UpdateComponentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
-
 	if err := h.compService.UpdateComponent(r.Context(), id, &req); err != nil {
 		h.handleCompError(w, err)
 		return
@@ -137,11 +121,9 @@ func (h *ComponentHandler) UpdateComponent(w http.ResponseWriter, r *http.Reques
 
 // ==================== 删除组件 ====================
 
-// DeleteComponent 删除组件（软删除）
-// DELETE /api/v1/lesson-plans/components/{id}
 func (h *ComponentHandler) DeleteComponent(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodDeleteOnly)
 		return
 	}
 	id := extractComponentID(r.URL.Path)
@@ -149,7 +131,6 @@ func (h *ComponentHandler) DeleteComponent(w http.ResponseWriter, r *http.Reques
 		utils.BadRequest(w, "缺少组件ID")
 		return
 	}
-
 	if err := h.compService.DeleteComponent(r.Context(), id); err != nil {
 		h.handleCompError(w, err)
 		return
@@ -159,11 +140,9 @@ func (h *ComponentHandler) DeleteComponent(w http.ResponseWriter, r *http.Reques
 
 // ==================== 审核组件 ====================
 
-// ReviewComponent 审核组件
-// POST /api/v1/lesson-plans/components/{id}/review
 func (h *ComponentHandler) ReviewComponent(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	prefix := "/api/v1/lesson-plans/components/"
@@ -173,19 +152,16 @@ func (h *ComponentHandler) ReviewComponent(w http.ResponseWriter, r *http.Reques
 		utils.BadRequest(w, "缺少组件ID")
 		return
 	}
-
 	userID := getCurrentUserID(r)
 	if userID == "" {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	var req models.ReviewComponentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
-
 	if err := h.compService.ReviewComponent(r.Context(), id, userID, &req); err != nil {
 		h.handleCompError(w, err)
 		return
@@ -195,20 +171,16 @@ func (h *ComponentHandler) ReviewComponent(w http.ResponseWriter, r *http.Reques
 
 // ==================== 组件匹配 ====================
 
-// MatchComponents 匹配组件
-// POST /api/v1/lesson-plans/components/match
 func (h *ComponentHandler) MatchComponents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
-
 	var req models.MatchComponentsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
-
 	result, err := h.compService.MatchComponents(r.Context(), &req)
 	if err != nil {
 		h.handleCompError(w, err)
@@ -217,20 +189,17 @@ func (h *ComponentHandler) MatchComponents(w http.ResponseWriter, r *http.Reques
 	utils.Success(w, result)
 }
 
-// ==================== Phase5：萃取队列管理 ====================
+// ==================== 萃取队列管理 ====================
 
-// ListExtractions 获取待审萃取列表（教研组长/骨干查看）
-// GET /api/v1/lesson-plans/extractions?limit=50
 func (h *ComponentHandler) ListExtractions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if limit <= 0 {
 		limit = 50
 	}
-
 	result, err := h.compService.ListPendingExtractionItems(r.Context(), limit)
 	if err != nil {
 		log.Printf("获取萃取列表失败: %v", err)
@@ -240,16 +209,11 @@ func (h *ComponentHandler) ListExtractions(w http.ResponseWriter, r *http.Reques
 	utils.Success(w, result)
 }
 
-// ConfirmExtraction 确认或拒绝萃取记录
-// POST /api/v1/lesson-plans/extractions/{id}/confirm
-// body: {"decision": "confirmed" | "rejected"}
 func (h *ComponentHandler) ConfirmExtraction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
-
-	// 从路径 /api/v1/lesson-plans/extractions/{id}/confirm 提取ID
 	prefix := "/api/v1/lesson-plans/extractions/"
 	suffix := "/confirm"
 	id := extractMiddleSegment(r.URL.Path, prefix, suffix)
@@ -257,19 +221,16 @@ func (h *ComponentHandler) ConfirmExtraction(w http.ResponseWriter, r *http.Requ
 		utils.BadRequest(w, "缺少萃取记录ID")
 		return
 	}
-
 	userID := getCurrentUserID(r)
 	if userID == "" {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	var req models.ConfirmExtractionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
-
 	if err := h.compService.ConfirmExtractionByID(r.Context(), id, userID, req.Decision); err != nil {
 		h.handleCompError(w, err)
 		return
@@ -299,7 +260,6 @@ func (h *ComponentHandler) handleCompError(w http.ResponseWriter, err error) {
 
 // ==================== 路径辅助函数 ====================
 
-// extractComponentID 从组件URL路径中提取ID
 func extractComponentID(path string) string {
 	prefix := "/api/v1/lesson-plans/components/"
 	if !strings.HasPrefix(path, prefix) {

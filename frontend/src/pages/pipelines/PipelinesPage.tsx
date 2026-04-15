@@ -12,6 +12,11 @@
  *   - 全局状态 + useMemo排序分页逻辑
  *   - 所有操作函数（handleCreate/handleStart/...）
  *   - 页面级渲染框架
+ *
+ * v100 修复：
+ *   - 移除误用 useRef 包装 sessionStorage 读取的写法（react-hooks/refs 警告根因）
+ *   - 改为模块级 readSavedState() 函数，幂等且无副作用
+ *   - 删除 3 处失效的 eslint-disable react-hooks/set-state-in-effect 注释
  */
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -35,6 +40,30 @@ import { StatusBadge, ProgressBar, ScoreCell, SortableHeader, Pagination } from 
 import { CreateDialog, BatchCreateDialog, AssignDialog } from './components/PipelineDialogs'
 import { PipelineBatchBar } from './components/PipelineBatchBar'
 
+// ==================== sessionStorage 持久化（模块级，不依赖 React 生命周期）====================
+
+/**
+ * 从 sessionStorage 读取保存的筛选/排序状态
+ * 设计要点：
+ *   - 模块级纯函数，每次调用都直接读 storage（同步、幂等、廉价）
+ *   - 失败时返回 null，调用方用 ?. 兜底默认值
+ *   - 不需要 useRef/useMemo 缓存：sessionStorage.getItem 是 O(1) 操作
+ */
+function readSavedFilterState(): {
+  statusFilter?: string
+  assigneeFilter?: string
+  sortField?: SortField
+  sortDir?: SortDirection
+  pageSize?: number
+} | null {
+  try {
+    const s = sessionStorage.getItem('pipelines_filter_state')
+    return s ? JSON.parse(s) : null
+  } catch {
+    return null
+  }
+}
+
 // ==================== Toast（局部，仅本页使用）====================
 function Toast({ message, type, onClose }: { message: string; type: 'ok' | 'err' | 'info'; onClose: () => void }) {
   useEffect(() => { const t = setTimeout(onClose, 5000); return () => clearTimeout(t) }, [onClose])
@@ -49,6 +78,11 @@ function Toast({ message, type, onClose }: { message: string; type: 'ok' | 'err'
 // ==================== 主组件 ====================
 export default function PipelinesPage() {
   const navigate = useNavigate()
+
+  // v100：组件挂载时一次性读取持久化状态（lazy initializer 内部调用，只执行一次）
+  // 注意：这里没有用 useRef/useMemo 缓存读取结果——因为每个 useState 的 lazy initializer
+  // 本身就只在首次渲染时执行一次，重复调用 readSavedFilterState() 完全没问题，
+  // 而且代码更直白，避免了 react-hooks/refs 的误报。
   const { user } = useAuth()
   const isAdmin    = user?.role === 'admin' || user?.role === 'senior_operator'
   const canOperate = user?.role === 'admin' || user?.role === 'operator' || user?.role === 'senior_operator'
@@ -67,17 +101,17 @@ export default function PipelinesPage() {
   const [selectedOperator, setSelectedOperator] = useState('')
   const [assigning, setAssigning]             = useState(false)
 
-  // ---- 筛选状态 ----
-  const [statusFilter, setStatusFilter]   = useState('')
-  const [assigneeFilter, setAssigneeFilter] = useState('')
+  // ---- 筛选状态（lazy init 从 sessionStorage 恢复）----
+  const [statusFilter, setStatusFilter]   = useState<string>(() => readSavedFilterState()?.statusFilter || '')
+  const [assigneeFilter, setAssigneeFilter] = useState<string>(() => readSavedFilterState()?.assigneeFilter || '')
 
-  // ---- 排序状态（默认按创建时间倒序）----
-  const [sortField, setSortField] = useState<SortField>('created_at')
-  const [sortDir, setSortDir]     = useState<SortDirection>('desc')
+  // ---- 排序状态（默认按课程编号升序，方便查找）----
+  const [sortField, setSortField] = useState<SortField>(() => (readSavedFilterState()?.sortField as SortField) || 'course_code')
+  const [sortDir, setSortDir]     = useState<SortDirection>(() => (readSavedFilterState()?.sortDir as SortDirection) || 'asc')
 
   // ---- 分页状态 ----
   const [currentPage, setCurrentPage] = useState(1)
-  const [pageSize, setPageSize]       = useState(50)
+  const [pageSize, setPageSize]       = useState<number>(() => readSavedFilterState()?.pageSize || 50)
 
   // ---- 多选状态 ----
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
@@ -99,8 +133,18 @@ export default function PipelinesPage() {
 
   // 筛选/排序变化时回到第1页并清空选中
   useEffect(() => { setSelectedIds(new Set()); setCurrentPage(1) }, [statusFilter, sortField, sortDir, assigneeFilter])
+
   // 每页条数变化时回到第1页
   useEffect(() => { setCurrentPage(1) }, [pageSize])
+
+  // 筛选/排序状态变化时持久化到 sessionStorage（从详情页返回时保持之前的状态）
+  useEffect(() => {
+    try {
+      sessionStorage.setItem('pipelines_filter_state', JSON.stringify({
+        statusFilter, assigneeFilter, sortField, sortDir, pageSize
+      }))
+    } catch { /* ignore */ }
+  }, [statusFilter, assigneeFilter, sortField, sortDir, pageSize])
 
   // ==================== 排序逻辑 ====================
 
@@ -300,6 +344,7 @@ export default function PipelinesPage() {
 
   // ---- 多选操作 ----
   const toggleSelect = (id: string) => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
     setSelectedIds(prev => { const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next })
   }
 
@@ -322,8 +367,8 @@ export default function PipelinesPage() {
   const total       = pipelines.length
   const running     = pipelines.filter(p => p.status === 'running').length
   const reviewQueue = pipelines.filter(p => p.status === 'review_queue').length
-  const failed      = pipelines.filter(p => p.status === 'failed').length
-  const passedCount = pipelines.filter(p => p.eval_avg_score !== null && p.eval_avg_score >= 9.0).length
+  const failed     = pipelines.filter(p => p.status === 'failed').length
+  const passedCount = pipelines.filter(p => p.eval_avg_score !== null && p.eval_avg_score >= 8.5).length
 
   // ---- 样式常量 ----
   const stat: React.CSSProperties = { background: 'rgba(255,255,255,0.72)', backdropFilter: 'blur(20px)', border: '1px solid rgba(0,0,0,0.06)', borderRadius: 14, padding: '16px 20px', flex: 1, minWidth: 100 }
@@ -343,7 +388,7 @@ export default function PipelinesPage() {
           { label: '运行中',     value: running,     color: '#007aff' },
           { label: '待审核',     value: reviewQueue, color: '#ff9500' },
           { label: '失败',       value: failed,      color: '#ff3b30' },
-          { label: '达标(≥9.0)', value: passedCount, color: '#34c759' },
+          { label: '达标(≥8.5)', value: passedCount, color: '#34c759' },
         ].map(s => (
           <div key={s.label} style={stat}>
             <div style={{ fontSize: 11, color: '#8e8e93', fontWeight: 600, marginBottom: 4 }}>{s.label}</div>

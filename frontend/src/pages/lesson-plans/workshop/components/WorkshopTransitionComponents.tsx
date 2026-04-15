@@ -324,12 +324,14 @@ interface StageSummaryModalProps {
 
 export function StageSummaryModal({
   stageCode, stageName, stageOrder, totalStages, nextStageItem,
-  structuredOutput, narrative, loading, onConfirm, onCancel, completeness,
+  structuredOutput, narrative: _narrative, loading, onConfirm, onCancel, completeness,
 }: StageSummaryModalProps) {
   const [userNote, setUserNote] = useState('')
   const isLastStage = !nextStageItem || stageOrder >= totalStages
   const hasStructured = structuredOutput && structuredOutput !== '{}'
 
+   
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { setUserNote('') }, [stageCode])
 
   return (

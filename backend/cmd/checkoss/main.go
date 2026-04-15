@@ -19,7 +19,11 @@ func main() {
 	rows, _ := database.DB.Query(context.Background(), "SELECT external_module_id FROM courses WHERE course_code='G1-01'")
 	defer rows.Close()
 	for rows.Next() {
-		rows.Scan(&moduleID)
+		// v94修复errcheck: 检查Scan返回值
+		if err := rows.Scan(&moduleID); err != nil {
+			fmt.Println("Scan error:", err)
+			continue
+		}
 	}
 
 	ossService := services.NewOSSService(cfg)

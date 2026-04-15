@@ -32,7 +32,7 @@ export function UserSearchPicker({
       setSearching(true)
       const data = await getAdminUsers({ keyword: q, page: 1, page_size: 8 })
       setResults(data.users)
-    } catch { } finally { setSearching(false) }
+    } catch { /* 忽略 */ } finally { setSearching(false) }
   }, [])
 
   const handleKwChange = (v: string) => {
@@ -86,7 +86,7 @@ export function UserSearchPicker({
           <input
             value={kw}
             onChange={e => handleKwChange(e.target.value)}
-            onFocus={() => kw && setOpen(true)}
+            onFocus={e => { kw && setOpen(true); e.currentTarget.style.borderColor = C.primary }}
             onBlur={() => setTimeout(() => setOpen(false), 200)}
             placeholder={placeholder || '输入用户名或显示名搜索...'}
             style={{
@@ -94,7 +94,6 @@ export function UserSearchPicker({
               border: `1px solid ${C.border}`, fontSize: '14px',
               outline: 'none', boxSizing: 'border-box',
             }}
-            onFocus={e => { e.currentTarget.style.borderColor = C.primary }}
           />
           {/* 下拉结果列表 */}
           {open && (results.length > 0 || searching) && (

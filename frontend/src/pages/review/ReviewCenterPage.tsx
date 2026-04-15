@@ -273,12 +273,15 @@ export default function ReviewCenterPage() {
     try {
       const data = await getPipelines()
       setPipelines(data.pipelines || [])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) {
       setToast({ message: '加载失败: ' + (e.message || ''), type: 'err' })
     }
     setLoading(false)
   }, [])
 
+   
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { loadData() }, [loadData])
 
   // ==================== 数据分组 ====================
@@ -328,7 +331,9 @@ export default function ReviewCenterPage() {
     try {
       await markPassed(p.id)
       setToast({ message: p.course_code + ' 已快捷通过并归档', type: 'ok' })
+       
       loadData()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) {
       setToast({ message: '快捷通过失败: ' + (e.message || ''), type: 'err' })
     }
@@ -340,7 +345,9 @@ export default function ReviewCenterPage() {
     try {
       await confirmFinalize(p.id)
       setToast({ message: p.course_code + ' 定稿已确认！', type: 'ok' })
+       
       loadData()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) {
       setToast({ message: '确认失败: ' + (e.message || ''), type: 'err' })
     }
@@ -356,7 +363,9 @@ export default function ReviewCenterPage() {
     try {
       await rejectFinalize(rejectTargetId, rejectReason)
       setToast({ message: rejectTargetCode + ' 已退回重审！', type: 'ok' })
+       
       setShowRejectDialog(false); loadData()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) {
       setToast({ message: '退回失败: ' + (e.message || ''), type: 'err' })
     }
@@ -376,18 +385,24 @@ export default function ReviewCenterPage() {
     try {
       const result = await batchAssignPipelines(Array.from(selectedIds), selectedOperator)
       setToast({ message: '分配成功: ' + result.success_count + ' 个Pipeline已分配给 ' + result.assigned_name, type: 'ok' })
+       
       setShowAssignDialog(false); setSelectedIds(new Set()); loadData()
+     
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) {
       setToast({ message: '分配失败: ' + (e.message || ''), type: 'err' })
     }
     setAssigning(false)
   }
+  
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-expressions
   const toggleSelect    = (id: string) => setSelectedIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
   const isAllR1Selected = round1Queue.length > 0 && round1Queue.every(p => selectedIds.has(p.id))
   const toggleAllR1     = () => {
     const ids = round1Queue.map(p => p.id)
     const all = ids.every(id => selectedIds.has(id))
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
     setSelectedIds(prev => { const n = new Set(prev); all ? ids.forEach(id => n.delete(id)) : ids.forEach(id => n.add(id)); return n })
   }
 

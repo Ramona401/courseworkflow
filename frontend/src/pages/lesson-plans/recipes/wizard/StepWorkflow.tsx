@@ -53,6 +53,8 @@ export default function StepWorkflow({ formData, updateForm }: StepWorkflowProps
     }
   }, [])
 
+   
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { triggerValidation(formData.stageFlow) }, [formData.stageFlow, triggerValidation])
 
   // 启用阶段数

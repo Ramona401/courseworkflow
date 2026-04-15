@@ -2,15 +2,18 @@ package services
 
 // recipe_service.go — 备课配方业务逻辑层
 //
-// Phase 7A 新增：
-//   - CRUD + Fork + Share + 学情更新
-//   - BuildRecipeContext：将配方转化为AI提示词上下文
-//   - RecommendRecipe：根据学科+年级智能推荐组件组合
-//   - PreviewContext：预览注入给AI的完整上下文文本
-// 迭代2 修改：
-//   - CreateRecipe：传递 StagesConfig 到模型
-//   - ValidateStageFlow：流程完整性校验
-//   - GetFlowPresets：返回预设流程模板
+// 本文件包含：
+//   - RecipeService 定义 + 错误常量
+//   - CRUD（创建/查询/更新/删除）
+//   - Fork + 共享
+//   - BuildRecipeContext（配方→AI提示词上下文）
+//   - PreviewContext（预览上下文）
+//   - RecommendComponents（智能推荐）
+//   - GetRecipeStats（效果统计）
+//   - ListMarketRecipes（市场排行榜）
+//
+// 流程校验（ValidateStageFlow）和预设模板（GetFlowPresets）
+// 已拆分至 recipe_flow_service.go（v92重构）
 
 import (
 	"context"
@@ -48,7 +51,6 @@ func NewRecipeService() *RecipeService {
 // ==================== 创建配方 ====================
 
 // CreateRecipe 创建备课配方
-// 迭代2：新增 StagesConfig 字段传递
 func (s *RecipeService) CreateRecipe(ctx context.Context, req *models.CreateRecipeRequest, authorID string) (*models.TeachingRecipe, error) {
 	if strings.TrimSpace(req.Name) == "" {
 		return nil, ErrRecipeNameRequired
@@ -67,19 +69,19 @@ func (s *RecipeService) CreateRecipe(ctx context.Context, req *models.CreateReci
 		componentJSON = string(b)
 	}
 
-	// 迭代1：教案结构
+	// 教案结构
 	lessonStructure := req.LessonStructure
 	if lessonStructure == "" {
 		lessonStructure = "[]"
 	}
 
-	// 迭代1：备课模式
+	// 备课模式
 	promptMode := req.PromptMode
 	if promptMode == "" {
 		promptMode = models.PromptModeGuided
 	}
 
-	// 迭代2：流程配置
+	// 流程配置
 	stagesConfig := req.StagesConfig
 	if stagesConfig == "" {
 		stagesConfig = "[]"
@@ -98,9 +100,9 @@ func (s *RecipeService) CreateRecipe(ctx context.Context, req *models.CreateReci
 		CustomPrompt:       req.CustomPrompt,
 		Scope:              models.RecipeScopePersonal,
 		AuthorID:           authorID,
-		StagesConfig:       stagesConfig,       // 迭代2：流程配置穿透
-		LessonStructure:    lessonStructure,     // 迭代1：教案结构
-		PromptMode:         promptMode,          // 迭代1：备课模式
+		StagesConfig:       stagesConfig,
+		LessonStructure:    lessonStructure,
+		PromptMode:         promptMode,
 	}
 
 	if err := repository.CreateRecipe(ctx, r); err != nil {
@@ -362,193 +364,16 @@ func (s *RecipeService) RecommendComponents(ctx context.Context, subject string,
 	return groups, nil
 }
 
-// ==================== 迭代2新增：流程校验 ====================
-
-// ValidateStageFlow 校验流程配置的完整性
-// 返回校验结果，包含三级提示（info/warning/error）
-func (s *RecipeService) ValidateStageFlow(stages []models.StageFlowItem) *models.FlowValidationResult {
-	result := &models.FlowValidationResult{Valid: true, Messages: []models.FlowValidationMessage{}}
-
-	// 筛选出已启用的阶段，按order排序
-	var enabled []models.StageFlowItem
-	for _, st := range stages {
-		if st.Enabled {
-			enabled = append(enabled, st)
-		}
-	}
-
-	// 规则1（阻断）：流程不能为空
-	if len(enabled) == 0 {
-		result.Valid = false
-		result.Messages = append(result.Messages, models.FlowValidationMessage{
-			Level: models.FlowMsgError, Code: "flow_empty", Message: "流程不能为空，至少需要保留「教案撰写」和「修订定稿」",
-		})
-		return result
-	}
-
-	// 构建已启用阶段的code集合和顺序映射
-	enabledSet := make(map[string]bool)
-	orderMap := make(map[string]int)
-	for _, st := range enabled {
-		enabledSet[st.StageCode] = true
-		orderMap[st.StageCode] = st.Order
-	}
-
-	// 规则2（阻断）：不可移除的阶段必须保留（write和revise）
-	for code, rule := range models.SystemStageFlowRules {
-		if !rule.Removable && !enabledSet[code] {
-			result.Valid = false
-			result.Messages = append(result.Messages, models.FlowValidationMessage{
-				Level: models.FlowMsgError, Code: "required_stage_missing",
-				Message: fmt.Sprintf("「%s」是必须保留的阶段，不可移除", rule.StageName),
-			})
-		}
-	}
-
-	// 规则3（阻断）：修订定稿必须在最后
-	if enabledSet["revise"] {
-		reviseOrder := orderMap["revise"]
-		for _, st := range enabled {
-			if st.StageCode != "revise" && st.Order > reviseOrder {
-				result.Valid = false
-				result.Messages = append(result.Messages, models.FlowValidationMessage{
-					Level: models.FlowMsgError, Code: "revise_not_last",
-					Message: "「修订定稿」必须是最后一个阶段",
-				})
-				break
-			}
-		}
-	}
-
-	// 规则4（阻断）：review必须在write之后
-	if enabledSet["review"] && enabledSet["write"] {
-		if orderMap["review"] < orderMap["write"] {
-			result.Valid = false
-			result.Messages = append(result.Messages, models.FlowValidationMessage{
-				Level: models.FlowMsgError, Code: "review_before_write",
-				Message: "「AI评审」必须在「教案撰写」之后",
-			})
-		}
-	}
-
-	// 规则5（阻断）：阶段不能重复
-	codeCount := make(map[string]int)
-	for _, st := range stages {
-		codeCount[st.StageCode]++
-	}
-	for code, count := range codeCount {
-		if count > 1 {
-			result.Valid = false
-			rule := models.SystemStageFlowRules[code]
-			name := code
-			if rule.StageName != "" {
-				name = rule.StageName
-			}
-			result.Messages = append(result.Messages, models.FlowValidationMessage{
-				Level: models.FlowMsgError, Code: "stage_duplicate",
-				Message: fmt.Sprintf("阶段「%s」重复出现", name),
-			})
-		}
-	}
-
-	// 规则6（警告）：跳过分析阶段
-	if !enabledSet["analyze"] {
-		result.Messages = append(result.Messages, models.FlowValidationMessage{
-			Level: models.FlowMsgWarning, Code: "skip_analyze",
-			Message: "跳过「教学分析」后，AI缺少学情和课标依据，教案质量可能下降",
-		})
-	}
-
-	// 规则7（警告）：跳过设计阶段
-	if !enabledSet["design"] && enabledSet["write"] {
-		result.Messages = append(result.Messages, models.FlowValidationMessage{
-			Level: models.FlowMsgWarning, Code: "skip_design",
-			Message: "跳过「教学设计」后，AI将直接撰写教案，缺少系统化的教学设计环节",
-		})
-	}
-
-	// 规则8（警告）：跳过评审阶段
-	if !enabledSet["review"] {
-		result.Messages = append(result.Messages, models.FlowValidationMessage{
-			Level: models.FlowMsgWarning, Code: "skip_review",
-			Message: "跳过「AI评审」后，教案将不经过自动质量检查",
-		})
-	}
-
-	// 规则9（信息）：极简模式提示
-	if len(enabled) <= 2 {
-		result.Messages = append(result.Messages, models.FlowValidationMessage{
-			Level: models.FlowMsgInfo, Code: "minimal_flow",
-			Message: "极简流程适合经验丰富的老师快速出稿，新手建议使用更完整的流程",
-		})
-	}
-
-	return result
-}
-
-// ==================== 迭代2新增：预设流程模板 ====================
-
-// GetFlowPresets 返回预设流程模板列表
-// 硬编码4个模板，供前端快速选择
-func (s *RecipeService) GetFlowPresets() []*models.FlowPreset {
-	return []*models.FlowPreset{
-		{
-			Key: "full_guided", Name: "完整引导", Description: "5步全开，逐步引导，适合新手或重要课程",
-			Duration: "15-25分钟", Icon: "🎓", PromptMode: models.PromptModeGuided,
-			Stages: []models.StageFlowItem{
-				{StageCode: "analyze", Enabled: true, Order: 1},
-				{StageCode: "design", Enabled: true, Order: 2},
-				{StageCode: "write", Enabled: true, Order: 3},
-				{StageCode: "review", Enabled: true, Order: 4},
-				{StageCode: "revise", Enabled: true, Order: 5},
-			},
-		},
-		{
-			Key: "standard", Name: "标准协作", Description: "跳过AI评审，分析+设计+撰写+修订",
-			Duration: "10-15分钟", Icon: "🤝", PromptMode: models.PromptModeGuided,
-			Stages: []models.StageFlowItem{
-				{StageCode: "analyze", Enabled: true, Order: 1},
-				{StageCode: "design", Enabled: true, Order: 2},
-				{StageCode: "write", Enabled: true, Order: 3},
-				{StageCode: "review", Enabled: false, Order: 4},
-				{StageCode: "revise", Enabled: true, Order: 5},
-			},
-		},
-		{
-			Key: "quick_draft", Name: "快速出稿", Description: "跳过设计和评审，分析+撰写+修订",
-			Duration: "5-10分钟", Icon: "⚡", PromptMode: models.PromptModeEfficient,
-			Stages: []models.StageFlowItem{
-				{StageCode: "analyze", Enabled: true, Order: 1},
-				{StageCode: "design", Enabled: false, Order: 2},
-				{StageCode: "write", Enabled: true, Order: 3},
-				{StageCode: "review", Enabled: false, Order: 4},
-				{StageCode: "revise", Enabled: true, Order: 5},
-			},
-		},
-		{
-			Key: "express", Name: "极速模式", Description: "仅撰写+修订，适合老手快速完成",
-			Duration: "3-5分钟", Icon: "🚀", PromptMode: models.PromptModeEfficient,
-			Stages: []models.StageFlowItem{
-				{StageCode: "analyze", Enabled: false, Order: 1},
-				{StageCode: "design", Enabled: false, Order: 2},
-				{StageCode: "write", Enabled: true, Order: 3},
-				{StageCode: "review", Enabled: false, Order: 4},
-				{StageCode: "revise", Enabled: true, Order: 5},
-			},
-		},
-	}
-}
-
-// ==================== 迭代6新增：配方效果统计 ====================
+// ==================== 配方效果统计 ====================
 
 // RecipeStatsResponse 配方效果统计响应
 type RecipeStatsResponse struct {
-	RecipeID     string                       `json:"recipe_id"`
-	RecipeName   string                       `json:"recipe_name"`
-	TotalUsage   int                          `json:"total_usage"`    // 总使用次数
-	TotalPlans   int                          `json:"total_plans"`    // 产出教案总数
-	AvgScore     float64                      `json:"avg_score"`      // 教案平均分
-	RecentUsages []repository.RecipeUsageRow  `json:"recent_usages"` // 最近使用记录
+	RecipeID     string                      `json:"recipe_id"`
+	RecipeName   string                      `json:"recipe_name"`
+	TotalUsage   int                         `json:"total_usage"`
+	TotalPlans   int                         `json:"total_plans"`
+	AvgScore     float64                     `json:"avg_score"`
+	RecentUsages []repository.RecipeUsageRow `json:"recent_usages"`
 }
 
 // GetRecipeStats 获取配方效果统计
@@ -576,7 +401,7 @@ func (s *RecipeService) GetRecipeStats(ctx context.Context, recipeID string) (*R
 	}, nil
 }
 
-// ==================== 迭代6新增：配方市场排行榜 ====================
+// ==================== 配方市场排行榜 ====================
 
 // MarketRecipesResponse 配方市场响应
 type MarketRecipesResponse struct {

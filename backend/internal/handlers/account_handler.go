@@ -4,13 +4,9 @@ package handlers
  * AccountHandler — 通用用户中心处理器
  *
  * 提供跨系统共用的个人账户管理接口：
- *   - GET  /api/v1/account/profile      获取当前用户详情（含登录记录）
+ *   - GET  /api/v1/account/profile      获取当前用户详情
  *   - PUT  /api/v1/account/profile      更新个人信息（display_name）
  *   - PUT  /api/v1/account/password     修改自己的密码（需验证旧密码）
- *
- * 与 UserHandler 的区别：
- *   UserHandler   → admin管理其他用户（CRUD、重置密码）
- *   AccountHandler → 任何已登录用户管理自己的账户
  */
 
 import (
@@ -35,46 +31,40 @@ func NewAccountHandler() *AccountHandler {
 
 // UpdateProfileRequest 更新个人信息请求体
 type UpdateProfileRequest struct {
-	DisplayName string `json:"display_name"` // 显示名称（必填）
+	DisplayName string `json:"display_name"`
 }
 
 // ChangePasswordRequest 修改密码请求体
 type ChangePasswordRequest struct {
-	OldPassword string `json:"old_password"` // 旧密码（必填，用于验证身份）
-	NewPassword string `json:"new_password"` // 新密码（必填，最少6位）
+	OldPassword string `json:"old_password"`
+	NewPassword string `json:"new_password"`
 }
 
 // ProfileResponse 个人信息响应体
 type ProfileResponse struct {
-	ID           string  `json:"id"`            // 用户UUID
-	Username     string  `json:"username"`      // 登录用户名
-	DisplayName  string  `json:"display_name"`  // 显示名称
-	Role         string  `json:"role"`          // 系统角色
-	Status       string  `json:"status"`        // 账户状态
-	LoginCount   int     `json:"login_count"`   // 累计登录次数
-	LastLoginAt  *string `json:"last_login_at"` // 最近登录时间（ISO8601）
-	CreatedAt    string  `json:"created_at"`    // 注册时间
+	ID          string  `json:"id"`
+	Username    string  `json:"username"`
+	DisplayName string  `json:"display_name"`
+	Role        string  `json:"role"`
+	Status      string  `json:"status"`
+	LoginCount  int     `json:"login_count"`
+	LastLoginAt *string `json:"last_login_at"`
+	CreatedAt   string  `json:"created_at"`
 }
 
 // ==================== 获取个人信息 ====================
 
-// GetProfile 获取当前登录用户的个人信息
-// GET /api/v1/account/profile
-// 响应：ProfileResponse
+// GetProfile GET /api/v1/account/profile
 func (h *AccountHandler) GetProfile(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
-
-	// 从JWT Claims获取当前用户ID
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
-		utils.Unauthorized(w, "未获取到用户信息")
+		utils.Unauthorized(w, utils.MsgUnauthorized)
 		return
 	}
-
-	// 查询用户完整信息
 	user, err := repository.FindUserByID(r.Context(), claims.UserID)
 	if err != nil {
 		utils.InternalError(w, "获取用户信息失败")
@@ -84,14 +74,11 @@ func (h *AccountHandler) GetProfile(w http.ResponseWriter, r *http.Request) {
 		utils.Fail(w, http.StatusNotFound, "用户不存在")
 		return
 	}
-
-	// 格式化时间字段
 	var lastLoginStr *string
 	if user.LastLoginAt != nil {
 		s := user.LastLoginAt.Format("2006-01-02 15:04:05")
 		lastLoginStr = &s
 	}
-
 	resp := ProfileResponse{
 		ID:          user.ID,
 		Username:    user.Username,
@@ -102,34 +89,27 @@ func (h *AccountHandler) GetProfile(w http.ResponseWriter, r *http.Request) {
 		LastLoginAt: lastLoginStr,
 		CreatedAt:   user.CreatedAt.Format("2006-01-02 15:04:05"),
 	}
-
 	utils.Success(w, resp)
 }
 
 // ==================== 更新个人信息 ====================
 
-// UpdateProfile 更新当前用户的显示名称
-// PUT /api/v1/account/profile
-// 请求体：{"display_name":"新名称"}
+// UpdateProfile PUT /api/v1/account/profile
 func (h *AccountHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
 		return
 	}
-
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
-		utils.Unauthorized(w, "未获取到用户信息")
+		utils.Unauthorized(w, utils.MsgUnauthorized)
 		return
 	}
-
 	var req UpdateProfileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
-
-	// 校验显示名称
 	if len([]rune(req.DisplayName)) == 0 {
 		utils.BadRequest(w, "显示名称不能为空")
 		return
@@ -138,13 +118,10 @@ func (h *AccountHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 		utils.BadRequest(w, "显示名称不能超过50个字符")
 		return
 	}
-
-	// 更新数据库
 	if err := repository.UpdateUserDisplayName(r.Context(), claims.UserID, req.DisplayName); err != nil {
 		utils.InternalError(w, "更新失败，请稍后重试")
 		return
 	}
-
 	utils.Success(w, map[string]string{
 		"message":      "个人信息更新成功",
 		"display_name": req.DisplayName,
@@ -153,28 +130,22 @@ func (h *AccountHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 
 // ==================== 修改密码 ====================
 
-// ChangePassword 当前用户修改自己的密码
-// PUT /api/v1/account/password
-// 请求体：{"old_password":"旧密码","new_password":"新密码"}
+// ChangePassword PUT /api/v1/account/password
 func (h *AccountHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
 		return
 	}
-
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
-		utils.Unauthorized(w, "未获取到用户信息")
+		utils.Unauthorized(w, utils.MsgUnauthorized)
 		return
 	}
-
 	var req ChangePasswordRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
-
-	// 参数校验
 	if req.OldPassword == "" {
 		utils.BadRequest(w, "请输入旧密码")
 		return
@@ -187,8 +158,6 @@ func (h *AccountHandler) ChangePassword(w http.ResponseWriter, r *http.Request) 
 		utils.BadRequest(w, "新密码不能与旧密码相同")
 		return
 	}
-
-	// 调用Repository层验证旧密码+更新
 	if err := repository.ChangeUserPassword(r.Context(), claims.UserID, req.OldPassword, req.NewPassword); err != nil {
 		if errors.Is(err, repository.ErrWrongPassword) {
 			utils.BadRequest(w, "旧密码不正确")
@@ -197,6 +166,5 @@ func (h *AccountHandler) ChangePassword(w http.ResponseWriter, r *http.Request) 
 		utils.InternalError(w, "密码修改失败，请稍后重试")
 		return
 	}
-
 	utils.Success(w, map[string]string{"message": "密码修改成功，请重新登录"})
 }

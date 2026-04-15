@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 /**
  * 步骤面板通用组件
  * P4.5-B: 提供KV行、分数卡片、AI输出查看器、提示词信息等通用UI组件
@@ -140,7 +141,9 @@ export function AIOutputViewer({ output, label = 'AI原始输出', maxPreviewLen
 
 // ==================== 提示词信息行 ====================
 
+ 
 /** 提示词版本信息（如果step_data中包含prompt信息则显示） */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function PromptInfo({ data }: { data: any }) {
   if (!data?.prompt_key) return null
   return (
@@ -181,7 +184,9 @@ export function SectionTitle({ title }: { title: string }) {
 
 // ==================== JSON 查看器 ====================
 
+ 
 /** JSON数据查看器（折叠式） */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function JsonViewer({ data, label = '原始JSON' }: { data: any; label?: string }) {
   const [expanded, setExpanded] = useState(false)
 

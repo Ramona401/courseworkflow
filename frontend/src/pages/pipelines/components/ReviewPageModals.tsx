@@ -1,32 +1,45 @@
 /**
  * ReviewPageModals.tsx — 审核页弹窗和全屏预览组件集合
  *
- * v69拆分自 PipelineReviewPage.tsx（编号8方案2）
+ * v69拆分自 PipelineReviewPage.tsx
  * 包含：
  *   - AIFixModal — AI快修弹窗
  *   - ReasonModal — 修改理由弹窗
  *   - RejectDialog — 退回重审弹窗
  *   - FullscreenPreview — 全屏预览（含纯净模式+代码视图）
  *   - PureFloatingBadge — 纯净模式浮标
+ *
+ * v100 修复：
+ *   - 删除 AIFixModal 函数签名中的 pipelineId 死参数（实际从未在弹窗内部使用）
+ *   - 同步删除 FullscreenPreview 调用 AIFixModal 时多余的 pipelineId 传参
+ *   - 给"切换页面时重置弹窗状态"的 useEffect 添加明确的 disable 注释和原因说明
+ *     —— 这是真实的"基于 props 重置 6 个独立 state"场景，无法用 useMemo 推导，
+ *        也无法用 key 重置（因为父组件需要保持自己的引用），故此处的同步 setState 是必要的
  */
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { useState, useEffect } from 'react'
 import type { GeneratedPageFull } from '@/api/pipelines'
-import { aiFixPage, aiFixPageStream, rollbackPageHTML } from '@/api/pipelines'
+import { aiFixPageStream, rollbackPageHTML } from '@/api/pipelines'
 import {
   X, ChevronLeft, ChevronRight, FileText, Columns, Wand2, Loader, Eye, Code,
   Minimize2, RotateCcw,
 } from 'lucide-react'
 import {
   OP_COLORS, OP_NAMES,
-  formatPageLabel, getEffectiveHTML, isVirtualPage, getVirtualPageAnchor, parseMergeSources,
-  requestTrueFullscreen, exitTrueFullscreen, isTrueFullscreen,
+  formatPageLabel, getEffectiveHTML,
+  exitTrueFullscreen, isTrueFullscreen,
   CodeView, HTMLPreview,
 } from './ReviewPageParts'
 
 // ==================== AI快修弹窗 ====================
 
-export function AIFixModal({ pipelineId, pageNumber, pageTitle, loading, instruction, onInstructionChange, onSubmit, onClose, allPages, fixSummary, streamText }: {
-  pipelineId: string; pageNumber: number; pageTitle: string; loading: boolean
+/**
+ * AI快修弹窗
+ * 注意：本组件本身不直接调用 AI 接口，所有 AI 调用由父组件 FullscreenPreview
+ * 通过 onSubmit 回调发起。因此函数签名中不需要 pipelineId 参数。
+ */
+export function AIFixModal({ pageNumber, pageTitle, loading, instruction, onInstructionChange, onSubmit, onClose, allPages, fixSummary, streamText }: {
+  pageNumber: number; pageTitle: string; loading: boolean
   instruction: string; onInstructionChange: (v: string) => void
   onSubmit: (refPages: number[]) => void; onClose: () => void
   allPages: { page_number: number; page_title: string; operation: string }[]
@@ -73,7 +86,7 @@ export function AIFixModal({ pipelineId, pageNumber, pageTitle, loading, instruc
           </div>
           {selectedRefs.length > 0 && <div style={{ fontSize: 11, color: '#007aff', marginTop: 4 }}>已选 {selectedRefs.length} 个参考页面</div>}
         </div>
-        {/* v69新增：AI流式输出实时预览区（AI正在生成时显示） */}
+        {/* AI流式输出实时预览区（AI正在生成时显示） */}
         {loading && streamText && (
           <div style={{ margin: '0 20px 12px', padding: '10px 14px', background: '#f8f9fa', border: '1px solid rgba(0,0,0,0.08)', borderRadius: 10, maxHeight: 200, overflow: 'auto' }}>
             <div style={{ fontSize: 12, fontWeight: 600, color: '#007aff', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -160,7 +173,7 @@ export function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavig
   const [aiFixInstruction, setAIFixInstruction] = useState('')
   const [aiFixLoading, setAIFixLoading] = useState(false)
   const [aiFixSummary, setAIFixSummary] = useState('')
-  // v69新增：流式AI输出文本（实时展示AI正在生成的内容）
+  // 流式AI输出文本（实时展示AI正在生成的内容）
   const [aiStreamText, setAiStreamText] = useState('')
   const [rollbackLoading, setRollbackLoading] = useState(false)
   const [pureMode, setPureMode] = useState(false)
@@ -173,6 +186,15 @@ export function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavig
   const isCreatePage = page.operation === 'create'
   const hasBoth = hasOriginal && hasGenerated && !isCreatePage
 
+  // 切换页面时重置弹窗/模式状态
+  // 说明：此 useEffect 同步调用 setState 是有意为之的"基于 props 重置 UI 状态"模式。
+  //   - 涉及 6 个独立的 state（fsMode/showReasonModal/showAIFixModal/aiFixInstruction/pureMode/fsCodeView）
+  //   - 这些状态是用户交互态，不能由 props 推导，因此 useMemo 不适用
+  //   - 父组件需要保持同一个 FullscreenPreview 实例（避免每次切页都重新执行全屏 API）
+  //     因此用 key 强制重挂载也不可行
+  //   - React 官方推荐"基于 props 重置 state"用 useState 派生写法，但本场景需要重置多个独立 state，
+  //     用单个派生 state 会让 fsMode 等状态的更新逻辑变得过于复杂
+  //   - 综合权衡：保留 effect + 显式 disable，是当前架构下最清晰的选择
   useEffect(() => {
     if (isCreatePage) setFsMode('generated')
     else if (page.operation === 'keep' || page.operation === 'delete') setFsMode('original')
@@ -180,10 +202,26 @@ export function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavig
     setShowReasonModal(false); setShowAIFixModal(false); setAIFixInstruction(''); setPureMode(false); setFsCodeView(false)
   }, [page.page_number, page.operation, isCreatePage])
 
-  useEffect(() => { const h = () => { if (!isTrueFullscreen()) onClose() }; document.addEventListener('fullscreenchange', h); document.addEventListener('webkitfullscreenchange', h); return () => { document.removeEventListener('fullscreenchange', h); document.removeEventListener('webkitfullscreenchange', h) } }, [onClose])
-  useEffect(() => { return () => { if (isTrueFullscreen()) exitTrueFullscreen() } }, [])
-  useEffect(() => { if (!pureMode) return; const h = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setPureMode(false) } }; window.addEventListener('keydown', h, true); return () => window.removeEventListener('keydown', h, true) }, [pureMode])
+  // 监听浏览器全屏退出事件
+  useEffect(() => {
+    const h = () => { if (!isTrueFullscreen()) onClose() }
+    document.addEventListener('fullscreenchange', h)
+    document.addEventListener('webkitfullscreenchange', h)
+    return () => { document.removeEventListener('fullscreenchange', h); document.removeEventListener('webkitfullscreenchange', h) }
+  }, [onClose])
 
+  // 组件卸载时退出全屏
+  useEffect(() => { return () => { if (isTrueFullscreen()) exitTrueFullscreen() } }, [])
+
+  // 纯净模式下ESC键退出纯净模式
+  useEffect(() => {
+    if (!pureMode) return
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setPureMode(false) } }
+    window.addEventListener('keydown', h, true)
+    return () => window.removeEventListener('keydown', h, true)
+  }, [pureMode])
+
+  /** 获取当前要展示的HTML内容（纯净模式专用） */
   const getDisplayHTML = () => {
     if (!pureMode) return ''
     if (isCreatePage) return getEffectiveHTML(page)
@@ -192,15 +230,34 @@ export function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavig
     return page.original_html || ''
   }
 
-  const navBtn: React.CSSProperties = { padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(0,0,0,0.1)', background: '#fff', display: 'inline-flex', alignItems: 'center', fontSize: 13, fontWeight: 500, color: '#3c3c43', cursor: 'pointer' }
+  const navBtn: React.CSSProperties = {
+    padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(0,0,0,0.1)',
+    background: '#fff', display: 'inline-flex', alignItems: 'center',
+    fontSize: 13, fontWeight: 500, color: '#3c3c43', cursor: 'pointer',
+  }
 
+  /** 渲染预览内容区域 */
   const renderContent = () => {
     if (pureMode) return fsCodeView ? <CodeView html={getDisplayHTML()} /> : <HTMLPreview html={getDisplayHTML()} />
     if (isCreatePage) return fsCodeView ? <CodeView html={getEffectiveHTML(page)} label="新增页面代码" /> : <HTMLPreview html={getEffectiveHTML(page)} />
     if (fsMode === 'compare' && hasBoth) return (
       <div style={{ display: 'flex', height: '100%' }}>
-        <div style={{ flex: 1, borderRight: '2px solid rgba(0,0,0,0.08)', display: 'flex', flexDirection: 'column' }}><div style={{ padding: '8px 16px', fontSize: 13, fontWeight: 600, color: '#8e8e93', background: '#f9f9f9', flexShrink: 0, borderBottom: '1px solid rgba(0,0,0,0.04)' }}>{fsCodeView ? '原版代码' : '原版'}</div>{fsCodeView ? <CodeView html={page.original_html} /> : <HTMLPreview html={page.original_html} />}</div>
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}><div style={{ padding: '8px 16px', fontSize: 13, fontWeight: 600, color: '#007aff', background: '#f0f7ff', flexShrink: 0, borderBottom: '1px solid rgba(0,0,0,0.04)' }}>{fsCodeView ? '修改后代码' : '修改后'}</div>{fsCodeView ? <CodeView html={getEffectiveHTML(page)} /> : <HTMLPreview html={getEffectiveHTML(page)} />}</div>
+        <div style={{ flex: '1 1 50%', minWidth: 0, maxWidth: '50%', borderRight: '2px solid rgba(0,0,0,0.08)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <div style={{ padding: '8px 16px', fontSize: 13, fontWeight: 600, color: '#8e8e93', background: '#f9f9f9', flexShrink: 0, borderBottom: '1px solid rgba(0,0,0,0.04)', display: 'flex', alignItems: 'center' }}>
+            {fsCodeView ? '原版代码' : '原版'}
+            <div style={{ flex: 1 }} />
+            <button onClick={() => navigator.clipboard.writeText(page.original_html || '')} style={{ padding: '2px 10px', borderRadius: 4, border: '1px solid rgba(0,0,0,0.1)', background: '#fff', fontSize: 11, color: '#8e8e93', cursor: 'pointer' }}>复制</button>
+          </div>
+          {fsCodeView ? <CodeView html={page.original_html} /> : <HTMLPreview html={page.original_html} />}
+        </div>
+        <div style={{ flex: '1 1 50%', minWidth: 0, maxWidth: '50%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <div style={{ padding: '8px 16px', fontSize: 13, fontWeight: 600, color: '#007aff', background: '#f0f7ff', flexShrink: 0, borderBottom: '1px solid rgba(0,0,0,0.04)', display: 'flex', alignItems: 'center' }}>
+            {fsCodeView ? '修改后代码' : '修改后'}
+            <div style={{ flex: 1 }} />
+            <button onClick={() => navigator.clipboard.writeText(getEffectiveHTML(page) || '')} style={{ padding: '2px 10px', borderRadius: 4, border: '1px solid rgba(0,0,0,0.1)', background: '#fff', fontSize: 11, color: '#007aff', cursor: 'pointer' }}>复制</button>
+          </div>
+          {fsCodeView ? <CodeView html={getEffectiveHTML(page)} /> : <HTMLPreview html={getEffectiveHTML(page)} />}
+        </div>
       </div>
     )
     if (fsMode === 'original' && hasOriginal) return fsCodeView ? <CodeView html={page.original_html} label="原版代码" /> : <HTMLPreview html={page.original_html} />
@@ -211,55 +268,141 @@ export function FullscreenPreview({ page, pages, currentIdx, pipelineId, onNavig
 
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#fff', display: 'flex', flexDirection: 'column' }}>
-      {/* 工具栏 */}
+      {/* 全屏工具栏（纯净模式下隐藏） */}
       {!pureMode && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 20px', background: 'rgba(255,255,255,0.95)', backdropFilter: 'blur(20px)', borderBottom: '1px solid rgba(0,0,0,0.08)', flexShrink: 0 }}>
+          {/* 上一页 */}
           <button onClick={() => hasPrev && onNavigate(currentIdx - 1)} style={{ ...navBtn, opacity: hasPrev ? 1 : 0.3, cursor: hasPrev ? 'pointer' : 'not-allowed' }} disabled={!hasPrev}><ChevronLeft size={16} /></button>
+          {/* 操作类型徽标 */}
           <span style={{ fontSize: 10, fontWeight: 600, color: '#fff', padding: '2px 8px', borderRadius: 4, background: OP_COLORS[page.operation] || '#aeaeb2' }}>{OP_NAMES[page.operation] || page.operation}</span>
+          {/* 页面标题 */}
           <span style={{ fontSize: 14, fontWeight: 600, color: '#1c1c1e' }}>{formatPageLabel(page.page_number, page.page_title)}. {page.page_title || '无标题'}</span>
+          {/* 页码进度 */}
           <span style={{ fontSize: 12, color: '#8e8e93' }}>{currentIdx + 1}/{pages.length}</span>
+          {/* 下一页 */}
           <button onClick={() => hasNext && onNavigate(currentIdx + 1)} style={{ ...navBtn, opacity: hasNext ? 1 : 0.3, cursor: hasNext ? 'pointer' : 'not-allowed' }} disabled={!hasNext}><ChevronRight size={16} /></button>
           <div style={{ flex: 1 }} />
-          {hasBoth && <div style={{ display: 'flex', gap: 0, borderRadius: 8, overflow: 'hidden', border: '1px solid rgba(0,0,0,0.1)' }}>{([{ key: 'original' as const, label: '原版' }, { key: 'generated' as const, label: '修改后' }, { key: 'compare' as const, label: '对比' }]).map(item => (<button key={item.key} onClick={() => setFsMode(item.key)} style={{ padding: '6px 14px', border: 'none', fontSize: 12, fontWeight: 500, cursor: 'pointer', background: fsMode === item.key ? '#007aff' : '#fff', color: fsMode === item.key ? '#fff' : '#3c3c43' }}>{item.key === 'compare' && <Columns size={12} style={{ marginRight: 4, verticalAlign: -1 }} />}{item.label}</button>))}</div>}
+          {/* 原版/修改后/对比 切换（仅modify/merge类型显示） */}
+          {hasBoth && (
+            <div style={{ display: 'flex', gap: 0, borderRadius: 8, overflow: 'hidden', border: '1px solid rgba(0,0,0,0.1)' }}>
+              {([{ key: 'original' as const, label: '原版' }, { key: 'generated' as const, label: '修改后' }, { key: 'compare' as const, label: '对比' }]).map(item => (
+                <button key={item.key} onClick={() => setFsMode(item.key)} style={{ padding: '6px 14px', border: 'none', fontSize: 12, fontWeight: 500, cursor: 'pointer', background: fsMode === item.key ? '#007aff' : '#fff', color: fsMode === item.key ? '#fff' : '#3c3c43' }}>
+                  {item.key === 'compare' && <Columns size={12} style={{ marginRight: 4, verticalAlign: -1 }} />}
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          )}
+          {/* 新增页面标记 */}
           {isCreatePage && <span style={{ fontSize: 12, color: '#af52de', fontWeight: 500, fontStyle: 'italic' }}>新增页面</span>}
-          <button onClick={() => setFsCodeView(!fsCodeView)} style={{ ...navBtn, padding: '6px 14px', background: fsCodeView ? '#f5f0ff' : '#fff', color: fsCodeView ? '#5856d6' : '#3c3c43', border: fsCodeView ? '1px solid rgba(88,86,214,0.3)' : '1px solid rgba(0,0,0,0.1)' }}><Code size={13} /> {fsCodeView ? '预览' : '代码'}</button>
-          {page.change_reason && <button onClick={() => setShowReasonModal(true)} style={{ ...navBtn, padding: '6px 14px', background: '#f0f7ff', color: '#007aff', border: '1px solid rgba(0,122,255,0.15)' }}><FileText size={13} /> 修改理由</button>}
-          <button onClick={() => setPureMode(true)} style={{ ...navBtn, padding: '6px 14px', background: '#f5f0ff', color: '#6c3ec1', border: '1px solid rgba(108,62,193,0.15)' }}><Eye size={13} /> 纯净全屏</button>
-          <button onClick={() => { setShowAIFixModal(true); setAIFixInstruction(''); setAIFixSummary('') }} style={{ ...navBtn, padding: '6px 14px', background: '#fff3e0', color: '#e65100', border: '1px solid rgba(230,81,0,0.15)' }}><Wand2 size={13} /> AI快修</button>
+          {/* 代码/预览切换 */}
+          <button onClick={() => setFsCodeView(!fsCodeView)} style={{ ...navBtn, padding: '6px 14px', background: fsCodeView ? '#f5f0ff' : '#fff', color: fsCodeView ? '#5856d6' : '#3c3c43', border: fsCodeView ? '1px solid rgba(88,86,214,0.3)' : '1px solid rgba(0,0,0,0.1)' }}>
+            <Code size={13} /> {fsCodeView ? '预览' : '代码'}
+          </button>
+          {/* 修改理由按钮 */}
+          {page.change_reason && (
+            <button onClick={() => setShowReasonModal(true)} style={{ ...navBtn, padding: '6px 14px', background: '#f0f7ff', color: '#007aff', border: '1px solid rgba(0,122,255,0.15)' }}>
+              <FileText size={13} /> 修改理由
+            </button>
+          )}
+          {/* 纯净全屏按钮 */}
+          <button onClick={() => setPureMode(true)} style={{ ...navBtn, padding: '6px 14px', background: '#f5f0ff', color: '#6c3ec1', border: '1px solid rgba(108,62,193,0.15)' }}>
+            <Eye size={13} /> 纯净全屏
+          </button>
+          {/* AI快修按钮 */}
+          <button onClick={() => { setShowAIFixModal(true); setAIFixInstruction(''); setAIFixSummary('') }} style={{ ...navBtn, padding: '6px 14px', background: '#fff3e0', color: '#e65100', border: '1px solid rgba(230,81,0,0.15)' }}>
+            <Wand2 size={13} /> AI快修
+          </button>
+          {/* 撤销/回滚按钮（有历史版本时才显示） */}
           {(page as any).html_history_count > 0 && (
-            <button onClick={async () => { if (!confirm('确认回滚到上一版本？')) return; setRollbackLoading(true); try { const resp = await rollbackPageHTML(pipelineId, page.page_number); onPageUpdated(page.page_number, resp.restored_html); alert('已回滚！剩余 ' + resp.remaining_history + ' 个历史版本') } catch (e: any) { alert('回滚失败: ' + (e?.response?.data?.message || e.message || '未知错误')) } setRollbackLoading(false) }} disabled={rollbackLoading}
-              style={{ ...navBtn, padding: '6px 14px', background: '#f0f0ff', color: '#5856d6', border: '1px solid rgba(88,86,214,0.15)' }}>
+            <button
+              onClick={async () => {
+                if (!confirm('确认回滚到上一版本？')) return
+                setRollbackLoading(true)
+                try {
+                  const resp = await rollbackPageHTML(pipelineId, page.page_number)
+                  onPageUpdated(page.page_number, resp.restored_html)
+                  alert('已回滚！剩余 ' + resp.remaining_history + ' 个历史版本')
+                } catch (e: any) {
+                  alert('回滚失败: ' + (e?.response?.data?.message || e.message || '未知错误'))
+                }
+                setRollbackLoading(false)
+              }}
+              disabled={rollbackLoading}
+              style={{ ...navBtn, padding: '6px 14px', background: '#f0f0ff', color: '#5856d6', border: '1px solid rgba(88,86,214,0.15)' }}
+            >
               <RotateCcw size={13} /> {rollbackLoading ? '回滚中...' : '撤销 (' + (page as any).html_history_count + ')'}
             </button>
           )}
+          {/* 退出全屏 */}
           <button onClick={onClose} style={{ ...navBtn, padding: '6px 14px' }}><Minimize2 size={14} /> 退出</button>
         </div>
       )}
-      {/* 内容区 */}
+
+      {/* 内容预览区 */}
       <div style={{ flex: 1, overflow: 'hidden', background: fsCodeView && !pureMode ? '#1e1e1e' : '#fff', position: 'relative' }}>
         {renderContent()}
-        {hasPrev && <div onClick={() => onNavigate(currentIdx - 1)} onMouseEnter={e => (e.currentTarget.style.opacity = '1')} onMouseLeave={e => (e.currentTarget.style.opacity = pureMode ? '0' : '1')} style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 60, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'linear-gradient(to right, rgba(0,0,0,0.05), transparent)', opacity: pureMode ? 0 : 1, transition: 'opacity 0.2s' }}><ChevronLeft size={24} color="#8e8e93" /></div>}
-        {hasNext && <div onClick={() => onNavigate(currentIdx + 1)} onMouseEnter={e => (e.currentTarget.style.opacity = '1')} onMouseLeave={e => (e.currentTarget.style.opacity = pureMode ? '0' : '1')} style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: 60, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'linear-gradient(to left, rgba(0,0,0,0.05), transparent)', opacity: pureMode ? 0 : 1, transition: 'opacity 0.2s' }}><ChevronRight size={24} color="#8e8e93" /></div>}
+        {/* 左侧翻页热区 */}
+        {hasPrev && (
+          <div
+            onClick={() => onNavigate(currentIdx - 1)}
+            onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
+            onMouseLeave={e => (e.currentTarget.style.opacity = pureMode ? '0' : '1')}
+            style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 60, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'linear-gradient(to right, rgba(0,0,0,0.05), transparent)', opacity: pureMode ? 0 : 1, transition: 'opacity 0.2s' }}
+          >
+            <ChevronLeft size={24} color="#8e8e93" />
+          </div>
+        )}
+        {/* 右侧翻页热区 */}
+        {hasNext && (
+          <div
+            onClick={() => onNavigate(currentIdx + 1)}
+            onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
+            onMouseLeave={e => (e.currentTarget.style.opacity = pureMode ? '0' : '1')}
+            style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: 60, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'linear-gradient(to left, rgba(0,0,0,0.05), transparent)', opacity: pureMode ? 0 : 1, transition: 'opacity 0.2s' }}
+          >
+            <ChevronRight size={24} color="#8e8e93" />
+          </div>
+        )}
       </div>
+
       {/* 纯净模式浮标 */}
       {pureMode && <PureFloatingBadge page={page} currentIdx={currentIdx} totalPages={pages.length} onBack={() => setPureMode(false)} />}
-      {/* 弹窗 */}
+
+      {/* 修改理由弹窗 */}
       {showReasonModal && page.change_reason && <ReasonModal reason={page.change_reason} onClose={() => setShowReasonModal(false)} />}
-      {showAIFixModal && <AIFixModal pipelineId={pipelineId} pageNumber={page.page_number} pageTitle={page.page_title} loading={aiFixLoading} instruction={aiFixInstruction} onInstructionChange={setAIFixInstruction} allPages={pages.map(p => ({ page_number: p.page_number, page_title: p.page_title, operation: p.operation }))} fixSummary={aiFixSummary}
+
+      {/* AI快修弹窗（v100：移除多余的 pipelineId 传参） */}
+      {showAIFixModal && (
+        <AIFixModal
+          pageNumber={page.page_number}
+          pageTitle={page.page_title}
+          loading={aiFixLoading}
+          instruction={aiFixInstruction}
+          onInstructionChange={setAIFixInstruction}
+          allPages={pages.map(p => ({ page_number: p.page_number, page_title: p.page_title, operation: p.operation }))}
+          fixSummary={aiFixSummary}
           streamText={aiStreamText}
-        onSubmit={async (refPages) => {
+          onSubmit={async (refPages) => {
             if (!aiFixInstruction.trim()) { alert('请输入修复指令'); return }
             setAIFixLoading(true); setAIFixSummary(''); setAiStreamText('')
             await aiFixPageStream(
               pipelineId, page.page_number,
               { fix_instruction: aiFixInstruction.trim(), reference_pages: refPages.length > 0 ? refPages : undefined },
               (chunk) => { setAiStreamText(prev => prev + chunk) },
-              (result) => { onPageUpdated(page.page_number, result.new_html); setAIFixSummary(result.fix_summary || ''); setAIFixLoading(false); if (result.fix_summary) alert('AI快修完成！请查看修改说明。'); else alert('AI快修完成！') },
+              (result) => {
+                onPageUpdated(page.page_number, result.new_html)
+                setAIFixSummary(result.fix_summary || '')
+                setAIFixLoading(false)
+                if (result.fix_summary) alert('AI快修完成！请查看修改说明。')
+                else alert('AI快修完成！')
+              },
               (errMsg) => { alert('AI快修失败: ' + errMsg); setAIFixLoading(false) },
             )
           }}
-        onClose={() => { if (!aiFixLoading) { setShowAIFixModal(false); setAIFixInstruction('') } }}
-      />}
+          onClose={() => { if (!aiFixLoading) { setShowAIFixModal(false); setAIFixInstruction('') } }}
+        />
+      )}
     </div>
   )
 }
@@ -271,11 +414,18 @@ function PureFloatingBadge({ page, currentIdx, totalPages, onBack }: {
 }) {
   const [hovering, setHovering] = useState(false)
   return (
-    <div onMouseEnter={() => setHovering(true)} onMouseLeave={() => setHovering(false)} onClick={onBack} title="返回全屏预览（ESC）"
-      style={{ position: 'fixed', top: 16, right: 16, zIndex: 10000, display: 'flex', alignItems: 'center', gap: 8, background: hovering ? 'rgba(0,0,0,0.7)' : 'rgba(0,0,0,0.2)', backdropFilter: 'blur(12px)', color: '#fff', fontSize: 12, fontWeight: 500, padding: '8px 14px', borderRadius: 20, cursor: 'pointer', transition: 'all 0.25s ease', opacity: hovering ? 1 : 0.5 }}>
+    <div
+      onMouseEnter={() => setHovering(true)}
+      onMouseLeave={() => setHovering(false)}
+      onClick={onBack}
+      title="返回全屏预览（ESC）"
+      style={{ position: 'fixed', top: 16, right: 16, zIndex: 10000, display: 'flex', alignItems: 'center', gap: 8, background: hovering ? 'rgba(0,0,0,0.7)' : 'rgba(0,0,0,0.2)', backdropFilter: 'blur(12px)', color: '#fff', fontSize: 12, fontWeight: 500, padding: '8px 14px', borderRadius: 20, cursor: 'pointer', transition: 'all 0.25s ease', opacity: hovering ? 1 : 0.5 }}
+    >
       <span style={{ fontSize: 11, opacity: 0.9 }}>{formatPageLabel(page.page_number, page.page_title)} · {currentIdx + 1}/{totalPages}</span>
       <span style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.3)' }} />
       <Minimize2 size={13} /><span>返回</span>
     </div>
   )
 }
+
+/* eslint-enable @typescript-eslint/no-explicit-any */

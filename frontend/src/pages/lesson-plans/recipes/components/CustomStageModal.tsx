@@ -58,6 +58,8 @@ export default function CustomStageModal({ mode, initial, onConfirm, onCancel, s
     if (initial?.prompt_variants) {
       try {
         const pv = JSON.parse(initial.prompt_variants)
+         
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setGuidedVariant(pv.guided || '')
         setEfficientVariant(pv.efficient || '')
       } catch { /* 忽略解析错误 */ }

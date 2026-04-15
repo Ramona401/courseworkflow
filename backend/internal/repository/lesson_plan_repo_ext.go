@@ -132,7 +132,6 @@ func ListPromptTemplates(ctx context.Context, level string, ownerID string) ([]*
 	if ownerID != "" {
 		where += fmt.Sprintf(" AND pt.owner_id = $%d", argIdx)
 		args = append(args, ownerID)
-		argIdx++
 	}
 
 	query := `

@@ -1,5 +1,18 @@
 package repository
 
+// component_repo.go — 组件库数据访问层
+//
+// 职责：
+//   - 组件CRUD（创建/查询/列表/更新/软删除/审核）
+//   - 组件匹配引擎（MatchComponents：基础匹配）
+//   - 画像感知智能匹配（SmartMatchComponents：加权匹配）
+//   - 组件统计更新（使用/选中/质量分）
+//   - 年级范围匹配SQL片段构建
+//   - AOCI索引冗余列筛选SQL片段构建（v89-4）
+//
+// 审查修复CR-01：CreateComponent的INSERT SQL列名中误用COALESCE函数，
+//   修正为正确的列名（design_logic/example_snippet/full_guide）
+
 import (
 	"context"
 	"errors"
@@ -18,6 +31,7 @@ var (
 )
 
 // ==================== 年级范围匹配 SQL 片段 ====================
+
 // buildGradeRangeCondition 构建年级范围包含匹配的SQL条件
 // 核心逻辑：从grade_range字段（格式"X-Y"或"X"）中提取起止年级，
 // 判断输入的年级数字是否落在[起始,结束]范围内。
@@ -62,14 +76,54 @@ func buildGradeRangeCondition(argIdx int) string {
 	)`, argIdx, argIdx, argIdx, argIdx, argIdx, argIdx)
 }
 
+// ==================== AOCI索引冗余列筛选 SQL 片段（v89-4新增）====================
+
+// buildIndexColumnConditions 构建AOCI索引冗余列的可选WHERE条件
+// 当请求中传入了 CognitiveLevel / StageTiming / PedagogyIntensity 数组时，
+// 使用 idx_xxx = ANY($N) 进行筛选，同时兼容冗余列为0（未索引）的组件不被排除。
+// 参数：
+//   - req: 匹配请求（含可选冗余列筛选数组）
+//   - args: 当前SQL参数切片（追加新参数）
+//   - argIdx: 当前参数索引（返回更新后的索引）
+//
+// 返回：追加的WHERE子句片段、更新后的args、更新后的argIdx
+func buildIndexColumnConditions(req *models.MatchComponentsRequest, args []interface{}, argIdx int) (string, []interface{}, int) {
+	var conditions string
+
+	// 认知层级筛选：idx_cognitive_level = ANY($N) OR idx_cognitive_level = 0
+	// idx_cognitive_level=0 表示该组件未建索引，保留兼容不排除
+	if len(req.CognitiveLevel) > 0 {
+		conditions += fmt.Sprintf(" AND (c.idx_cognitive_level = ANY($%d) OR c.idx_cognitive_level = 0)", argIdx)
+		args = append(args, req.CognitiveLevel)
+		argIdx++
+	}
+
+	// 课堂时机筛选：idx_stage_timing = ANY($N) OR idx_stage_timing = 0
+	if len(req.StageTiming) > 0 {
+		conditions += fmt.Sprintf(" AND (c.idx_stage_timing = ANY($%d) OR c.idx_stage_timing = 0)", argIdx)
+		args = append(args, req.StageTiming)
+		argIdx++
+	}
+
+	// 教法强度筛选：idx_pedagogy_intensity = ANY($N) OR idx_pedagogy_intensity = 0
+	if len(req.PedagogyIntensity) > 0 {
+		conditions += fmt.Sprintf(" AND (c.idx_pedagogy_intensity = ANY($%d) OR c.idx_pedagogy_intensity = 0)", argIdx)
+		args = append(args, req.PedagogyIntensity)
+		argIdx++
+	}
+
+	return conditions, args, argIdx
+}
+
 // ==================== 组件 CRUD ====================
 
 // CreateComponent 创建组件
+// 审查修复CR-01：INSERT列名中误用COALESCE函数已修正为正确的列名
 func CreateComponent(ctx context.Context, c *models.LessonPlanComponent) error {
 	query := `
 		INSERT INTO lesson_plan_components (
 			library_type, subject, grade_range, tags, injection_mode,
-			display_label, COALESCE(design_logic, ''), COALESCE(example_snippet, ''), COALESCE(full_guide, ''), content,
+			display_label, design_logic, example_snippet, full_guide, content,
 			source, source_ref, scope, scope_ref_id, created_by, review_status, status
 		) VALUES (
 			$1, $2, $3, $4, $5,
@@ -297,6 +351,7 @@ func ReviewComponent(ctx context.Context, id string, reviewerID string, decision
 // MatchComponents 根据学科+学段匹配组件（核心匹配接口）
 // 返回按library_type分组的匹配结果，每组按quality_score降序排列
 // v70改进：年级匹配从精确匹配升级为范围包含匹配
+// v89-4新增：支持AOCI索引冗余列（认知层/课堂时机/教法强度）可选筛选
 func MatchComponents(ctx context.Context, req *models.MatchComponentsRequest) ([]*models.MatchedComponentGroup, error) {
 	// 构建WHERE条件
 	where := " WHERE c.status = 'active' AND c.review_status = 'approved'"
@@ -340,6 +395,11 @@ func MatchComponents(ctx context.Context, req *models.MatchComponentsRequest) ([
 			argIdx++
 		}
 	}
+
+	// v89-4新增：AOCI索引冗余列筛选（认知层/课堂时机/教法强度）
+	// 仅当请求中传入了对应数组时才加WHERE条件，兼容冗余列为0（未索引）的组件
+	indexConditions, args, argIdx := buildIndexColumnConditions(req, args, argIdx)
+	where += indexConditions
 
 	limit := req.Limit
 	if limit <= 0 {
@@ -417,6 +477,7 @@ func MatchComponents(ctx context.Context, req *models.MatchComponentsRequest) ([
 //
 // profileTags参数：由service层根据teaching_profile解析出的匹配标签列表
 // v70改进：年级匹配从精确匹配升级为范围包含匹配
+// v89-4新增：支持AOCI索引冗余列（认知层/课堂时机/教法强度）可选筛选
 func SmartMatchComponents(ctx context.Context, req *models.MatchComponentsRequest, profileTags []string) ([]*models.MatchedComponentGroup, error) {
 	// 如果没有画像标签，降级为普通匹配
 	if len(profileTags) == 0 {
@@ -460,6 +521,10 @@ func SmartMatchComponents(ctx context.Context, req *models.MatchComponentsReques
 			argIdx++
 		}
 	}
+
+	// v89-4新增：AOCI索引冗余列筛选（认知层/课堂时机/教法强度）
+	indexConditions, args, argIdx := buildIndexColumnConditions(req, args, argIdx)
+	where += indexConditions
 
 	limit := req.Limit
 	if limit <= 0 {

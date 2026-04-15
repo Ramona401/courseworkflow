@@ -118,12 +118,15 @@ export default function DashboardPage() {
       setStats(statsData)
       // 取最近8条Pipeline
       setRecentPipelines((plData.pipelines || []).slice(0, 8))
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) {
       console.error('加载仪表盘数据失败:', e)
     }
     setLoading(false)
   }, [])
 
+   
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { loadData() }, [loadData])
 
   return (
@@ -217,7 +220,7 @@ export default function DashboardPage() {
           系统信息
         </h3>
         <p style={{ fontSize: 13, color: '#86868b', margin: 0, lineHeight: 1.8 }}>
-          版本 0.29.0 · Phase 6 · Go + React + PostgreSQL · 8步Pipeline自动评估引擎 + 审核中心
+          版本 0.37.0 · Go + React + PostgreSQL · 8步Pipeline自动评估引擎 + AI备课工坊 + 教案评审系统
         </p>
       </div>
     </div>

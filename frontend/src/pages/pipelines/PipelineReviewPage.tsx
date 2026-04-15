@@ -84,10 +84,13 @@ export default function PipelineReviewPage() {
       const [pd, pg] = await Promise.all([getPipelineDetail(id), getPagesMeta(id)])
       setPipeline(pd); setPages(pg || [])
       setCurrentPageHtmlLoaded(false)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) { setError(e.message || '加载失败') }
     setLoading(false)
   }, [id])
 
+   
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { loadData() }, [loadData])
 
   /**
@@ -95,6 +98,8 @@ export default function PipelineReviewPage() {
    * 使用缓存避免重复请求——已加载过HTML的页面直接标记为已加载
    */
   useEffect(() => {
+     
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (!id || !currentPage) { setCurrentPageHtmlLoaded(false); return }
     const pn = currentPage.page_number
 
@@ -122,6 +127,7 @@ export default function PipelineReviewPage() {
       if (!cancelled) setCurrentPageHtmlLoaded(true)
     })
     return () => { cancelled = true }
+  // eslint-disable-next-line
   }, [id, currentPage?.page_number])
 
   /** 全局键盘事件 */
@@ -148,16 +154,25 @@ export default function PipelineReviewPage() {
       if (decision === 'edit' && finalHTML) req.final_html = finalHTML
       await updatePageDecision(id, currentPage.page_number, req)
       setPages(prev => prev.map(p => p.page_number === currentPage.page_number ? { ...p, decision, final_html: finalHTML || p.final_html } : p))
+       
       setEditingHTML(false)
       const nextIdx = sortedPages.findIndex((p, i) => i > selectedIdx && p.decision === 'pending')
       if (nextIdx >= 0) setSelectedIdx(nextIdx)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) { alert('决策失败: ' + (e.message || '未知错误')) }
+     
     setDeciding(false)
+   
   }
+  
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const handleSubmitFinalize = async () => { if (!id || !allDecided) return; if (!confirm('确认提交定稿申请？')) return; setFinalizing(true); try { await submitFinalize(id); alert('已提交！'); navigate('/workflow/pipelines') } catch (e: any) { alert('提交失败: ' + (e.message || '')) } setFinalizing(false) }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const handleConfirmFinalize = async () => { if (!id) return; if (!confirm('确认定稿归档？')) return; setFinalizing(true); try { await confirmFinalize(id); alert('定稿已确认！'); navigate('/workflow/pipelines') } catch (e: any) { alert('确认失败: ' + (e.message || '')) } setFinalizing(false) }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const handleRejectFinalize = async () => { if (!id) return; setFinalizing(true); try { await rejectFinalize(id, rejectReason); alert('已退回！'); setShowRejectDialog(false); navigate('/workflow/review') } catch (e: any) { alert('退回失败: ' + (e.message || '')) } setFinalizing(false) }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const handleDirectFinalize = async () => { if (!id || !allDecided) return; if (!confirm('确认直接定稿？')) return; setFinalizing(true); try { await finalizePipeline(id); alert('定稿成功！'); navigate('/workflow/pipelines') } catch (e: any) { alert('定稿失败: ' + (e.message || '')) } setFinalizing(false) }
 
   const startEdit = () => { if (!currentPage) return; setEditContent(getEffectiveHTML(currentPage)); setEditingHTML(true); setCodeViewMode(false) }

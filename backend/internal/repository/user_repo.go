@@ -327,7 +327,7 @@ func ReplaceUserAssignments(ctx context.Context, userID string, courseCodes []st
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	// 1. 删除该用户所有旧的课程分配
 	_, err = tx.Exec(ctx, `DELETE FROM user_course_assignments WHERE user_id = $1`, userID)

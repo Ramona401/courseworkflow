@@ -359,7 +359,7 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("verify: 获取AI配置失败: %s", err.Error())
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// ==================== v68：高分早停pipeline快速验收 ====================
@@ -409,7 +409,7 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("%s: %s", ErrVerifyIndexGenFailed.Error(), indexCallErr.Error())
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	generatedIndex := indexCallResult.Content
@@ -420,7 +420,7 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("%s (输出长度: %d字符)", ErrVerifyIndexTooShort.Error(), len(generatedIndex))
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// ==================== 第二步：多轮评估（v63核心改造） ====================
@@ -432,6 +432,18 @@ func (s *PipelineService) executeVerify(pipeline *models.Pipeline) error {
 	if abilityTable != nil && len(abilityTable.Content) > 20 {
 		evalUserParts = append(evalUserParts, "", "【能力定位表】", abilityTable.Content)
 	}
+
+	// v90机制优化2：验收评估注入一审修改方案上下文
+	// 原因：验收评估完全独立评分，不知道一审做了什么修改，
+	// 导致验收评分与元评估仲裁差异大（元评估高分→验收低分→2审大幅修改→反复不通过）
+	// 修复：注入一审meta修改方案摘要，让验收评估在相同上下文下评分，提高一致性
+	if pipeline.ReviewRound >= 1 {
+		firstRoundCtx := buildFirstRoundContextForEval(pipeline.ID)
+		if firstRoundCtx != "" {
+			evalUserParts = append(evalUserParts, "", firstRoundCtx)
+		}
+	}
+
 	evalUserParts = append(evalUserParts, "", "禁止输出<thinking>标签或任何思维过程标记。")
 	evalUserPrompt := strings.Join(evalUserParts, "\n")
 
@@ -742,7 +754,7 @@ func (s *PipelineService) BatchVerify() (*BatchVerifyResult, error) {
 			}
 		} else {
 			go func(vid string) {
-				s.VerifyPipeline(vid)
+				_, _ = s.VerifyPipeline(vid)
 			}(capturedID)
 			result.StartedIDs = append(result.StartedIDs, capturedID)
 		}

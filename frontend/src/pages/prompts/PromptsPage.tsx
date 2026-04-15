@@ -8,8 +8,8 @@
  */
 import { useState, useEffect, useCallback } from 'react'
 import {
-  FileText, Save, RotateCcw, ChevronDown, ChevronUp,
-  Clock, Hash, CheckCircle, AlertCircle, X, History,
+  Save, RotateCcw, ChevronDown, ChevronUp,
+  Clock, Hash, CheckCircle, AlertCircle, History,
 } from 'lucide-react'
 import {
   getPrompts, updatePrompt, getPromptVersions, rollbackPromptVersion,
@@ -81,6 +81,7 @@ export default function PromptsPage() {
       setLoading(true)
       const data = await getPrompts()
       setPrompts(data.prompts || [])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (err: any) {
       setToast({ message: '加载提示词失败: ' + (err?.message || '未知错误'), type: 'error' })
     } finally {
@@ -116,6 +117,7 @@ export default function PromptsPage() {
       setExpandedKey(null)
       setEditContent('')
       await loadPrompts()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (err: any) {
       setToast({ message: '保存失败: ' + (err?.message || '未知错误'), type: 'error' })
     } finally {
@@ -137,6 +139,7 @@ export default function PromptsPage() {
       setPreviewVersion(null)
       const data = await getPromptVersions(key)
       setVersions(data.versions || [])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (err: any) {
       setToast({ message: '加载版本历史失败: ' + (err?.message || '未知错误'), type: 'error' })
     } finally {
@@ -156,6 +159,7 @@ export default function PromptsPage() {
       setPreviewVersion(null)
       setExpandedKey(null)
       await loadPrompts()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (err: any) {
       setToast({ message: '回滚失败: ' + (err?.message || '未知错误'), type: 'error' })
     } finally {

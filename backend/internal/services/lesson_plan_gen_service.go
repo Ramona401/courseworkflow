@@ -212,16 +212,6 @@ func (s *LessonPlanGenService) genStageOpeningMessage(
 	}, nil
 }
 
-// buildSilentComponentContext 静默匹配背景类组件构建上下文（配方不存在时的兜底）
-func (s *LessonPlanGenService) buildSilentComponentContext(ctx context.Context, subject string, grade string) string {
-	silentGroups, _ := repository.MatchComponents(ctx, &models.MatchComponentsRequest{
-		Subject:       subject,
-		GradeRange:    grade,
-		InjectionMode: "silent",
-		Limit:         3,
-	})
-	return buildSilentContext(silentGroups)
-}
 
 // ==================== 2. 对话轮次（流式SSE推送）====================
 
@@ -516,16 +506,6 @@ func (s *LessonPlanGenService) loadConversation(ctx context.Context, planID stri
 	return repository.GetConversationLog(ctx, planID)
 }
 
-// resolveTemplateForGen 解析教案生成模板（暂保留，未来可能恢复使用）
-func (s *LessonPlanGenService) resolveTemplateForGen(ctx context.Context, templateID string, subject string) (systemPrompt string, genRules string) {
-	if templateID != "" {
-		resolved, err := repository.ResolvePromptTemplateChain(ctx, templateID)
-		if err == nil {
-			return resolved.SystemPrompt, resolved.GenerationRules
-		}
-	}
-	return buildDefaultSystemPrompt(subject), buildDefaultGenRules()
-}
 
 // resolveTemplateForReview 解析评审模板
 func (s *LessonPlanGenService) resolveTemplateForReview(ctx context.Context, subject string) (systemPrompt string, reviewRules string) {

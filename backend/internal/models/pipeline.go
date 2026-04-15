@@ -65,7 +65,7 @@ type PipelineConfig struct {
 func DefaultPipelineConfig() *PipelineConfig {
 	return &PipelineConfig{
 		EvalRounds:   3,
-		Threshold:    9.0,
+		Threshold:    8.5,
 		VarianceWarn: 1.5,
 		MaxMetaRetry: 3,
 		MaxTRLoop:    3,
@@ -94,7 +94,7 @@ func ParsePipelineConfig(jsonStr string) *PipelineConfig {
 		cfg.EvalRounds = 3
 	}
 	if cfg.Threshold <= 0 {
-		cfg.Threshold = 9.0
+		cfg.Threshold = 8.5
 	}
 	if cfg.VarianceWarn <= 0 {
 		cfg.VarianceWarn = 1.5
@@ -118,8 +118,10 @@ type DbCheckResult struct {
 	IndexHash   string `json:"index_hash"`
 	PageCount   int    `json:"page_count"`
 	TotalLength int    `json:"total_length"`
-	IsValid     bool   `json:"is_valid"`
-	ErrorDetail string `json:"error_detail"`
+	IsValid       bool   `json:"is_valid"`
+	ErrorDetail   string `json:"error_detail"`
+	// PageCountWarn 页数范围警告（不阻断流程，仅供审核人员参考）
+	PageCountWarn string `json:"page_count_warn,omitempty"`
 }
 
 func (r *DbCheckResult) ToJSON() string {

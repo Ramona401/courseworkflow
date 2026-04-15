@@ -2,18 +2,7 @@ package services
 
 // stage_coach_rules.go — 阶段教练：规则引擎完成度检测
 //
-// v81新增（原stage_coach.go的规则引擎部分）
-// v89-3拆分：从stage_coach.go中拆出规则引擎检测逻辑
-//
-// 职责：
-//   1. CheckStageCompleteness — 规则引擎完成度检测（各阶段关键词+字数检测）
-//   2. 各阶段专属检测规则（analyze/design/write/review/revise/generic）
-//   3. countUserMessagesInStage — 统计当前阶段用户消息数
-//   4. 通用检查辅助函数（关键词检测/字数检测/用户参与度/产出物读取）
-//
-// 被引用：
-//   stage_coach.go — fallbackToRuleResult降级调用
-//   handlers/workshop_stage_handler.go — GetStageCompleteness接口
+// v81新增，v89-3拆分，v97重构：拆分countUserMessagesInStage降低认知复杂度
 
 import (
 	"context"
@@ -27,57 +16,69 @@ import (
 // ==================== 规则引擎完成度检测 ====================
 
 // CheckStageCompleteness 检测指定阶段的产出物完成度（规则引擎版）
-// 这是原v81的核心逻辑，保留作为基础检测和LLM降级兜底
 func CheckStageCompleteness(ctx context.Context, lessonPlanID string, stageCode string) (*StageCompletenessResponse, error) {
-	// 获取教案信息
 	lp, err := repository.GetLessonPlanByID(ctx, lessonPlanID)
 	if err != nil {
 		return nil, err
 	}
 
-	// 获取阶段产出物
 	output, _ := repository.GetStageOutput(ctx, lessonPlanID, stageCode)
-
-	// 统计当前阶段的用户消息数（关键：排除AI开场白的干扰）
 	userMsgCount := countUserMessagesInStage(ctx, lessonPlanID, stageCode, lp)
-
-	// 获取阶段名称
 	stageName := stageCodeToName(stageCode)
 
-	// 如果用户完全没发言，直接返回0%
+	// 用户完全没发言时，检查是否已有阶段产出物
+	// 如果已有产出物（如AI已生成完整教案），不应返回0%，而是走正常检测流程
 	if userMsgCount == 0 {
-		hints := []string{"你还没有在本阶段与AI对话，先聊聊你的想法吧"}
-		return &StageCompletenessResponse{
-			StageCode:    stageCode,
-			StageName:    stageName,
-			Percentage:   0,
-			IsComplete:   false,
-			UserMessages: 0,
-			CheckedItems: []CompletenessItem{
-				{Label: "用户参与", Passed: false, Detail: "你还没有在本阶段与AI对话，先聊聊你的想法吧"},
-			},
-			MissingHints: hints,
-		}, nil
+		hasOutput := output != nil && (output.NarrativeOutput != "" || output.StructuredOutput != "")
+		if !hasOutput {
+			return buildZeroCompletenessResponse(stageCode, stageName), nil
+		}
+		// 有产出物但无用户消息：将userMsgCount视为1，走正常检测流程
+		userMsgCount = 1
 	}
 
 	// 根据阶段代码分派检测规则
-	var items []CompletenessItem
+	items := dispatchStageCheck(stageCode, output, lp, userMsgCount)
+
+	// 计算完成度
+	return buildCompletenessResponse(stageCode, stageName, items, userMsgCount, lessonPlanID), nil
+}
+
+// buildZeroCompletenessResponse 构建0%完成度响应（用户未发言时）
+func buildZeroCompletenessResponse(stageCode, stageName string) *StageCompletenessResponse {
+	return &StageCompletenessResponse{
+		StageCode:    stageCode,
+		StageName:    stageName,
+		Percentage:   0,
+		IsComplete:   false,
+		UserMessages: 0,
+		CheckedItems: []CompletenessItem{
+			{Label: "用户参与", Passed: false, Detail: "你还没有在本阶段与AI对话，先聊聊你的想法吧"},
+		},
+		MissingHints: []string{"你还没有在本阶段与AI对话，先聊聊你的想法吧"},
+	}
+}
+
+// dispatchStageCheck 根据阶段代码分派检测规则
+func dispatchStageCheck(stageCode string, output *models.WorkshopStageOutput, lp *models.LessonPlan, userMsgCount int) []CompletenessItem {
 	switch stageCode {
 	case "analyze":
-		items = checkAnalyzeStage(output, userMsgCount)
+		return checkAnalyzeStage(output, userMsgCount)
 	case "design":
-		items = checkDesignStage(output, userMsgCount)
+		return checkDesignStage(output, userMsgCount)
 	case "write":
-		items = checkWriteStage(output, lp, userMsgCount)
+		return checkWriteStage(output, lp, userMsgCount)
 	case "review":
-		items = checkReviewStage(output)
+		return checkReviewStage(output)
 	case "revise":
-		items = checkReviseStage(output, lp, userMsgCount)
+		return checkReviseStage(output, lp, userMsgCount)
 	default:
-		items = checkGenericStage(output, userMsgCount)
+		return checkGenericStage(output, userMsgCount)
 	}
+}
 
-	// 计算完成度百分比
+// buildCompletenessResponse 根据检查项计算完成度并构建响应
+func buildCompletenessResponse(stageCode, stageName string, items []CompletenessItem, userMsgCount int, planID string) *StageCompletenessResponse {
 	passedCount := 0
 	var missingHints []string
 	for _, item := range items {
@@ -93,7 +94,13 @@ func CheckStageCompleteness(ctx context.Context, lessonPlanID string, stageCode 
 		percentage = passedCount * 100 / len(items)
 	}
 
-	resp := &StageCompletenessResponse{
+	coachLog.Info("阶段完成度检测（规则引擎）",
+		"plan_id", planID, "stage", stageCode,
+		"user_msgs", userMsgCount, "percentage", percentage,
+		"passed", passedCount, "total", len(items),
+	)
+
+	return &StageCompletenessResponse{
 		StageCode:    stageCode,
 		StageName:    stageName,
 		Percentage:   percentage,
@@ -102,24 +109,14 @@ func CheckStageCompleteness(ctx context.Context, lessonPlanID string, stageCode 
 		CheckedItems: items,
 		MissingHints: missingHints,
 	}
-
-	coachLog.Info("阶段完成度检测（规则引擎）",
-		"plan_id", lessonPlanID, "stage", stageCode,
-		"user_msgs", userMsgCount, "percentage", percentage,
-		"passed", passedCount, "total", len(items),
-	)
-
-	return resp, nil
 }
 
 // ==================== 各阶段规则检测 ====================
 
-// checkAnalyzeStage 教学分析阶段检测
 func checkAnalyzeStage(output *models.WorkshopStageOutput, userMsgs int) []CompletenessItem {
 	narrative := getOutputNarrative(output)
 	structured := getOutputStructured(output)
 	combined := narrative + " " + structured
-
 	return []CompletenessItem{
 		checkUserEngagement(userMsgs, 2, "建议至少与AI交流2轮，讨论课程定位和学情"),
 		checkContainsKeywords("教学目标", combined, []string{"教学目标", "学习目标", "目标"}, userMsgs),
@@ -128,12 +125,10 @@ func checkAnalyzeStage(output *models.WorkshopStageOutput, userMsgs int) []Compl
 	}
 }
 
-// checkDesignStage 教学设计阶段检测
 func checkDesignStage(output *models.WorkshopStageOutput, userMsgs int) []CompletenessItem {
 	narrative := getOutputNarrative(output)
 	structured := getOutputStructured(output)
 	combined := narrative + " " + structured
-
 	return []CompletenessItem{
 		checkUserEngagement(userMsgs, 2, "建议至少与AI交流2轮，讨论教学活动和方法"),
 		checkContainsKeywords("教学活动", combined, []string{"活动", "环节", "导入", "探究", "练习", "拓展", "小组"}, userMsgs),
@@ -142,7 +137,6 @@ func checkDesignStage(output *models.WorkshopStageOutput, userMsgs int) []Comple
 	}
 }
 
-// checkWriteStage 教案撰写阶段检测
 func checkWriteStage(output *models.WorkshopStageOutput, lp *models.LessonPlan, userMsgs int) []CompletenessItem {
 	content := ""
 	if lp != nil && lp.ContentMarkdown != "" {
@@ -151,7 +145,6 @@ func checkWriteStage(output *models.WorkshopStageOutput, lp *models.LessonPlan, 
 	if content == "" {
 		content = getOutputNarrative(output)
 	}
-
 	return []CompletenessItem{
 		checkUserEngagement(userMsgs, 1, "建议至少确认一次教案框架"),
 		checkMinLength("教案篇幅", content, 2000, "教案内容偏短，建议继续完善各教学环节"),
@@ -160,23 +153,13 @@ func checkWriteStage(output *models.WorkshopStageOutput, lp *models.LessonPlan, 
 	}
 }
 
-// checkReviewStage AI评审阶段检测（评审是AI自动做的，不需要用户参与度检查）
 func checkReviewStage(output *models.WorkshopStageOutput) []CompletenessItem {
 	structured := getOutputStructured(output)
 	narrative := getOutputNarrative(output)
 	combined := structured + " " + narrative
-
-	hasScore := strings.Contains(combined, "total_score") ||
-		strings.Contains(combined, "总分") ||
-		strings.Contains(combined, "评分")
-
-	hasImprovements := strings.Contains(combined, "improvements") ||
-		strings.Contains(combined, "改进") ||
-		strings.Contains(combined, "建议")
-
-	hasDimensions := strings.Contains(combined, "dimensions") ||
-		strings.Contains(combined, "维度")
-
+	hasScore := strings.Contains(combined, "total_score") || strings.Contains(combined, "总分") || strings.Contains(combined, "评分")
+	hasImprovements := strings.Contains(combined, "improvements") || strings.Contains(combined, "改进") || strings.Contains(combined, "建议")
+	hasDimensions := strings.Contains(combined, "dimensions") || strings.Contains(combined, "维度")
 	return []CompletenessItem{
 		{Label: "评审评分", Passed: hasScore, Detail: boolHint(hasScore, "已获得评审评分", "尚未获得评审评分，请等待AI完成评审")},
 		{Label: "维度分析", Passed: hasDimensions, Detail: boolHint(hasDimensions, "已完成多维度分析", "缺少多维度评分分析")},
@@ -184,11 +167,9 @@ func checkReviewStage(output *models.WorkshopStageOutput) []CompletenessItem {
 	}
 }
 
-// checkReviseStage 修订定稿阶段检测
 func checkReviseStage(output *models.WorkshopStageOutput, lp *models.LessonPlan, userMsgs int) []CompletenessItem {
 	hasContent := lp != nil && len(lp.ContentMarkdown) > 2000
 	hasNarrative := len(getOutputNarrative(output)) > 100
-
 	return []CompletenessItem{
 		checkUserEngagement(userMsgs, 1, "建议至少与AI讨论一轮修订方案"),
 		{Label: "教案内容", Passed: hasContent, Detail: boolHint(hasContent, "教案内容已更新", "教案内容尚未更新，请与AI讨论修订方案")},
@@ -196,10 +177,8 @@ func checkReviseStage(output *models.WorkshopStageOutput, lp *models.LessonPlan,
 	}
 }
 
-// checkGenericStage 通用阶段检测（自定义阶段）
 func checkGenericStage(output *models.WorkshopStageOutput, userMsgs int) []CompletenessItem {
 	hasOutput := output != nil && output.Status != "pending"
-
 	return []CompletenessItem{
 		checkUserEngagement(userMsgs, 1, "建议至少与AI交流1轮"),
 		{Label: "阶段产出", Passed: hasOutput, Detail: boolHint(hasOutput, "已有阶段产出", "尚未开始此阶段")},
@@ -209,63 +188,63 @@ func checkGenericStage(output *models.WorkshopStageOutput, userMsgs int) []Compl
 // ==================== 统计当前阶段用户消息数 ====================
 
 // countUserMessagesInStage 统计当前阶段中用户发送的消息数
-// 通过conversation_log中的阶段分隔符定位当前阶段的消息范围
-// 然后计算role=user的消息数（排除系统自动触发的指令消息）
 func countUserMessagesInStage(ctx context.Context, lessonPlanID string, stageCode string, lp *models.LessonPlan) int {
-	// 读取对话记录（返回 []*models.ConversationMessage）
 	messages, err := repository.GetConversationLog(ctx, lessonPlanID)
 	if err != nil || len(messages) == 0 {
 		return 0
 	}
 
-	// 获取阶段配置，用于定位阶段分隔符
+	snapshots := parseStageSnapshots(lp)
+	startIdx, endIdx := findStageMessageRange(messages, snapshots, stageCode)
+
+	if startIdx < 0 {
+		return 0
+	}
+
+	return countNonAutoUserMessages(messages, startIdx, endIdx)
+}
+
+// parseStageSnapshots 从教案的stage_config解析阶段快照列表
+func parseStageSnapshots(lp *models.LessonPlan) []models.StageConfigSnapshot {
 	var snapshots []models.StageConfigSnapshot
 	if lp.StageConfig != "" && lp.StageConfig != "[]" {
 		_ = json.Unmarshal([]byte(lp.StageConfig), &snapshots)
 	}
+	return snapshots
+}
 
+// findStageMessageRange 在消息列表中定位指定阶段的起止索引
+// 返回 (startIdx, endIdx)，startIdx<0 表示未找到
+func findStageMessageRange(messages []*models.ConversationMessage, snapshots []models.StageConfigSnapshot, stageCode string) (int, int) {
 	// 构建阶段名→阶段代码映射
 	stageNameToCode := make(map[string]string)
 	for _, snap := range snapshots {
 		stageNameToCode[snap.StageName] = snap.StageCode
 	}
 
-	// 扫描消息，找到当前阶段的范围
-	startIdx := -1
-	endIdx := len(messages)
 	firstStageCode := ""
 	if len(snapshots) > 0 {
 		firstStageCode = snapshots[0].StageCode
 	}
 
+	startIdx := -1
+	endIdx := len(messages)
+
 	for i, msg := range messages {
-		if string(msg.Role) == "system" && strings.HasPrefix(msg.Content, "__STAGE_SEP__") {
-			// 解析分隔符：__STAGE_SEP__阶段名__AI角色
-			rest := msg.Content[len("__STAGE_SEP__"):]
-			parts := strings.SplitN(rest, "__", 2)
-			sepStageName := ""
-			if len(parts) > 0 {
-				sepStageName = parts[0]
-			}
-
-			// 查找匹配的阶段代码
-			sepStageCode := ""
-			if code, ok := stageNameToCode[sepStageName]; ok {
-				sepStageCode = code
-			}
-
-			if sepStageCode == stageCode {
-				startIdx = i // 当前阶段分隔符位置
-			} else if startIdx >= 0 && endIdx == len(messages) {
-				endIdx = i // 下一个分隔符位置
-			}
+		if string(msg.Role) != "system" || !strings.HasPrefix(msg.Content, "__STAGE_SEP__") {
+			continue
+		}
+		sepStageCode := parseStageSepCode(msg.Content, stageNameToCode)
+		if sepStageCode == stageCode {
+			startIdx = i
+		} else if startIdx >= 0 && endIdx == len(messages) {
+			endIdx = i
 		}
 	}
 
 	// 如果是第一个阶段且没有找到分隔符，从头开始
 	if startIdx < 0 && stageCode == firstStageCode {
 		startIdx = 0
-		// 找第一个分隔符作为结束
 		for i, msg := range messages {
 			if string(msg.Role) == "system" && strings.HasPrefix(msg.Content, "__STAGE_SEP__") {
 				endIdx = i
@@ -274,23 +253,35 @@ func countUserMessagesInStage(ctx context.Context, lessonPlanID string, stageCod
 		}
 	}
 
-	if startIdx < 0 {
-		return 0
-	}
+	return startIdx, endIdx
+}
 
-	// 自动触发消息的前缀（不算用户真正的发言）
+// parseStageSepCode 从阶段分隔符消息中解析阶段代码
+// 分隔符格式：__STAGE_SEP__阶段名__AI角色
+func parseStageSepCode(content string, stageNameToCode map[string]string) string {
+	rest := content[len("__STAGE_SEP__"):]
+	parts := strings.SplitN(rest, "__", 2)
+	if len(parts) == 0 {
+		return ""
+	}
+	if code, ok := stageNameToCode[parts[0]]; ok {
+		return code
+	}
+	return ""
+}
+
+// countNonAutoUserMessages 在指定消息范围内统计非自动触发的用户消息数
+func countNonAutoUserMessages(messages []*models.ConversationMessage, startIdx, endIdx int) int {
 	autoTriggerPrefixes := []string{
 		"我们进入",
 		"请对上一阶段完成的教案进行全面专业评审",
 	}
 
-	// 统计范围内的用户消息数
 	count := 0
 	for i := startIdx; i < endIdx && i < len(messages); i++ {
 		if string(messages[i].Role) != "user" {
 			continue
 		}
-		// 排除系统自动触发的指令消息
 		isAutoTrigger := false
 		for _, prefix := range autoTriggerPrefixes {
 			if strings.HasPrefix(messages[i].Content, prefix) {
@@ -302,13 +293,11 @@ func countUserMessagesInStage(ctx context.Context, lessonPlanID string, stageCod
 			count++
 		}
 	}
-
 	return count
 }
 
 // ==================== 通用辅助函数 ====================
 
-// getOutputNarrative 安全获取产出物的narrative
 func getOutputNarrative(output *models.WorkshopStageOutput) string {
 	if output == nil {
 		return ""
@@ -316,7 +305,6 @@ func getOutputNarrative(output *models.WorkshopStageOutput) string {
 	return output.NarrativeOutput
 }
 
-// getOutputStructured 安全获取产出物的structured输出（JSON字符串展平）
 func getOutputStructured(output *models.WorkshopStageOutput) string {
 	if output == nil || output.StructuredOutput == "" || output.StructuredOutput == "{}" {
 		return ""
@@ -329,24 +317,13 @@ func getOutputStructured(output *models.WorkshopStageOutput) string {
 	return output.StructuredOutput
 }
 
-// checkUserEngagement 检查用户参与度（对话轮次门槛）
 func checkUserEngagement(userMsgs int, minRounds int, hint string) CompletenessItem {
 	if userMsgs >= minRounds {
-		return CompletenessItem{
-			Label:  "对话参与",
-			Passed: true,
-			Detail: "已与AI充分交流",
-		}
+		return CompletenessItem{Label: "对话参与", Passed: true, Detail: "已与AI充分交流"}
 	}
-	return CompletenessItem{
-		Label:  "对话参与",
-		Passed: false,
-		Detail: hint,
-	}
+	return CompletenessItem{Label: "对话参与", Passed: false, Detail: hint}
 }
 
-// checkContainsKeywords 检查文本是否包含指定关键词组中的至少一个
-// 额外条件：用户消息数≥1才有意义（避免AI开场白中的关键词误判）
 func checkContainsKeywords(label string, text string, keywords []string, userMsgs int) CompletenessItem {
 	if userMsgs < 1 {
 		return CompletenessItem{Label: label, Passed: false, Detail: "缺少" + label + "相关内容，请先与AI对话"}
@@ -359,7 +336,6 @@ func checkContainsKeywords(label string, text string, keywords []string, userMsg
 	return CompletenessItem{Label: label, Passed: false, Detail: "缺少" + label + "相关内容，建议补充"}
 }
 
-// checkMinLength 检查文本是否达到最低字数
 func checkMinLength(label string, text string, minLen int, hint string) CompletenessItem {
 	textLen := len([]rune(strings.TrimSpace(text)))
 	if textLen >= minLen {
@@ -368,7 +344,6 @@ func checkMinLength(label string, text string, minLen int, hint string) Complete
 	return CompletenessItem{Label: label, Passed: false, Detail: hint}
 }
 
-// boolHint 根据布尔值返回不同提示
 func boolHint(passed bool, passMsg string, failMsg string) string {
 	if passed {
 		return passMsg

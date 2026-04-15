@@ -16,14 +16,16 @@
  * 角色名称与学校体系对齐：
  *   admin → 系统管理员 / senior_operator → 学校管理员
  *   operator → 骨干教师 / viewer → 普通教师
+ *
+ * FE-AD-01修复：添加searchTimer的useEffect卸载清理，防止组件卸载后触发setState
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import {
   getAdminStats, getAdminUsers, getAdminAuditLogs,
-  getAdminOrgs, createAdminOrg, updateAdminOrg, deleteAdminOrg,
+  getAdminOrgs, updateAdminOrg, deleteAdminOrg,
   getAdminGroups,
-  createAdminGroup, updateAdminGroup, deleteAdminGroup,
+  deleteAdminGroup,
 } from '@/api/admin'
 import type {
   AdminStats, AdminUserListItem, AuditLogItem,
@@ -147,13 +149,13 @@ export default function AdminPage() {
 
   const loadStats = useCallback(async () => {
     try { setStatsLoading(true); setStats(await getAdminStats()) }
-    catch { } finally { setStatsLoading(false) }
+    catch { /* 忽略 */ } finally { setStatsLoading(false) }
   }, [])
   useEffect(() => { loadStats() }, [loadStats])
 
   const loadRecentLogs = useCallback(async () => {
     try { setRecentLogsLoading(true); setRecentLogs((await getAdminAuditLogs({ page: 1, page_size: 10 })).logs) }
-    catch { } finally { setRecentLogsLoading(false) }
+    catch { /* 忽略 */ } finally { setRecentLogsLoading(false) }
   }, [])
   useEffect(() => { if (activeTab === 'overview') loadRecentLogs() }, [activeTab, loadRecentLogs])
 
@@ -161,7 +163,7 @@ export default function AdminPage() {
   const loadSchools = useCallback(async () => {
     if (schoolsLoaded) return
     try { const all = await getAdminOrgs(); setSchools(all.filter(o => o.type === 'school')); setSchoolsLoaded(true) }
-    catch { }
+    catch { /* 忽略 */ }
   }, [schoolsLoaded])
   useEffect(() => { if (activeTab === 'users') loadSchools() }, [activeTab, loadSchools])
 
@@ -188,14 +190,14 @@ export default function AdminPage() {
         try {
           const grps = await getAdminGroups(list[0].id)
           setGroups2(grps)
-        } catch { } finally { setGrpLoading(false) }
+        } catch { /* 忽略 */ } finally { setGrpLoading(false) }
       }
-    } catch { } finally { setSchLoading(false) }
+    } catch { /* 忽略 */ } finally { setSchLoading(false) }
   }, [])
 
   const loadGroups2 = useCallback(async (schoolId: string) => {
     try { setGrpLoading(true); setGroups2(await getAdminGroups(schoolId)) }
-    catch { } finally { setGrpLoading(false) }
+    catch { /* 忽略 */ } finally { setGrpLoading(false) }
   }, [])
 
   // ---- 组织架构：加载区域（带自动选中逻辑）----
@@ -210,7 +212,7 @@ export default function AdminPage() {
         setSelSchool(null); setSchools2([]); setGroups2([])
         await loadSchools2(list[0].id)
       }
-    } catch { } finally { setRegLoading(false) }
+    } catch { /* 忽略 */ } finally { setRegLoading(false) }
   }, [loadSchools2])
 
   useEffect(() => {
@@ -290,7 +292,7 @@ export default function AdminPage() {
         end_date: logFilters.endDate || undefined,
       })
       setLogs(data.logs); setLogTotal(data.total)
-    } catch { } finally { setLogLoading(false) }
+    } catch { /* 忽略 */ } finally { setLogLoading(false) }
   }, [logPage, logFilters])
   useEffect(() => { if (activeTab === 'logs') loadLogs() }, [activeTab, loadLogs])
 
@@ -308,6 +310,13 @@ export default function AdminPage() {
     if (searchTimer.current) clearTimeout(searchTimer.current)
     searchTimer.current = setTimeout(() => { setKeyword(v); setUserPage(1) }, 400)
   }
+
+  // FE-AD-01修复：组件卸载时清理防抖定时器，防止卸载后触发setState导致内存泄漏
+  useEffect(() => {
+    return () => {
+      if (searchTimer.current) clearTimeout(searchTimer.current)
+    }
+  }, [])
 
   const totalPages    = Math.ceil(userTotal / 15)
   const logTotalPages = Math.ceil(logTotal / 20)

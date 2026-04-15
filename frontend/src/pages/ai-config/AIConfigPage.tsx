@@ -9,7 +9,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { getGlobalConfig, updateGlobalConfig, getSceneConfigs, updateSceneConfig, testConnection, listModels } from '@/api/ai-config'
 import type { GlobalConfig, SceneConfig, UpdateSceneConfigRequest, TestConnectionResult, ModelInfo } from '@/api/ai-config'
-import { Bot, Save, Eye, EyeOff, RefreshCw, Zap, Wifi, WifiOff, Clock, List, ChevronDown, ChevronUp } from 'lucide-react'
+import { Save, Eye, EyeOff, RefreshCw, Zap, Wifi, WifiOff, Clock, List, ChevronDown, ChevronUp } from 'lucide-react'
 
 // ==================== 样式常量 ====================
 

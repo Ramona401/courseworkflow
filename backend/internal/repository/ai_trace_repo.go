@@ -434,7 +434,6 @@ func buildTraceWhere(params models.TraceQueryParams) (string, []interface{}) {
 	if params.Status != "" {
 		conditions = append(conditions, fmt.Sprintf("status = $%d", argIdx))
 		args = append(args, params.Status)
-		argIdx++
 	}
 
 	if len(conditions) == 0 {

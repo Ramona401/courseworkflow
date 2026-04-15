@@ -27,6 +27,12 @@ import (
 	"tedna/internal/utils"
 )
 
+// ==================== 路径前缀常量（消除S1192） ====================
+
+const (
+	adminUsersPrefix = "/api/v1/admin/users/"
+)
+
 // ==================== Handler结构体 ====================
 
 // AdminHandler 统一用户管理中心处理器
@@ -86,7 +92,7 @@ type AdminGroupMembership struct {
 // 用户管理统计（用于概览卡片：总用户/组织/教研组）
 func (h *AdminHandler) GetAdminStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	stats, err := repository.GetAdminStats(r.Context())
@@ -103,7 +109,7 @@ func (h *AdminHandler) GetAdminStats(w http.ResponseWriter, r *http.Request) {
 // 获取用户列表（含跨表权限摘要，支持role/status/keyword/school_id/group_id多维筛选+分页）
 func (h *AdminHandler) ListAdminUsers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 
@@ -139,12 +145,12 @@ func (h *AdminHandler) ListAdminUsers(w http.ResponseWriter, r *http.Request) {
 // 获取用户详情（含课程分配+教研组归属的跨系统权限全貌）
 func (h *AdminHandler) GetAdminUserDetail(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
-	userID := extractAdminPathID(r.URL.Path, "/api/v1/admin/users/")
+	userID := extractAdminPathID(r.URL.Path, adminUsersPrefix)
 	if userID == "" {
-		utils.BadRequest(w, "缺少用户ID")
+		utils.BadRequest(w, utils.MsgMissingUserID)
 		return
 	}
 	detail, err := repository.GetAdminUserDetail(r.Context(), userID)
@@ -161,12 +167,12 @@ func (h *AdminHandler) GetAdminUserDetail(w http.ResponseWriter, r *http.Request
 // 新建用户，写入审计日志
 func (h *AdminHandler) CreateAdminUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	var req models.CreateUserRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	userInfo, err := h.userService.CreateUser(r.Context(), &req)
@@ -192,22 +198,22 @@ func (h *AdminHandler) CreateAdminUser(w http.ResponseWriter, r *http.Request) {
 // 编辑用户角色和显示名
 func (h *AdminHandler) UpdateAdminUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
 		return
 	}
-	userID := extractAdminPathID(r.URL.Path, "/api/v1/admin/users/")
+	userID := extractAdminPathID(r.URL.Path, adminUsersPrefix)
 	if userID == "" {
-		utils.BadRequest(w, "缺少用户ID")
+		utils.BadRequest(w, utils.MsgMissingUserID)
 		return
 	}
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
-		utils.Unauthorized(w, "未获取到用户信息")
+		utils.Unauthorized(w, utils.MsgUnauthorized)
 		return
 	}
 	var req models.UpdateUserRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	userInfo, err := h.userService.UpdateUser(r.Context(), userID, claims.UserID, &req)
@@ -224,22 +230,22 @@ func (h *AdminHandler) UpdateAdminUser(w http.ResponseWriter, r *http.Request) {
 // 启用或禁用用户账户，写入审计日志
 func (h *AdminHandler) UpdateAdminUserStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
 		return
 	}
-	userID := extractAdminMiddleID(r.URL.Path, "/api/v1/admin/users/", "/status")
+	userID := extractAdminMiddleID(r.URL.Path, adminUsersPrefix, "/status")
 	if userID == "" {
-		utils.BadRequest(w, "缺少用户ID")
+		utils.BadRequest(w, utils.MsgMissingUserID)
 		return
 	}
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
-		utils.Unauthorized(w, "未获取到用户信息")
+		utils.Unauthorized(w, utils.MsgUnauthorized)
 		return
 	}
 	var req models.UpdateStatusRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	if err := h.userService.UpdateStatus(r.Context(), userID, claims.UserID, &req); err != nil {
@@ -258,17 +264,17 @@ func (h *AdminHandler) UpdateAdminUserStatus(w http.ResponseWriter, r *http.Requ
 // admin直接重置用户密码（无需旧密码），写入审计日志
 func (h *AdminHandler) ResetAdminUserPassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
 		return
 	}
-	userID := extractAdminMiddleID(r.URL.Path, "/api/v1/admin/users/", "/password")
+	userID := extractAdminMiddleID(r.URL.Path, adminUsersPrefix, "/password")
 	if userID == "" {
-		utils.BadRequest(w, "缺少用户ID")
+		utils.BadRequest(w, utils.MsgMissingUserID)
 		return
 	}
 	var req models.ResetPasswordRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	if err := h.userService.ResetPassword(r.Context(), userID, &req); err != nil {
@@ -289,12 +295,12 @@ func (h *AdminHandler) ResetAdminUserPassword(w http.ResponseWriter, r *http.Req
 // 获取用户的课程审核权限分配列表
 func (h *AdminHandler) GetAdminUserAssignments(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
-	userID := extractAdminMiddleID(r.URL.Path, "/api/v1/admin/users/", "/assignments")
+	userID := extractAdminMiddleID(r.URL.Path, adminUsersPrefix, "/assignments")
 	if userID == "" {
-		utils.BadRequest(w, "缺少用户ID")
+		utils.BadRequest(w, utils.MsgMissingUserID)
 		return
 	}
 	assignments, err := h.userService.GetAssignments(r.Context(), userID)
@@ -312,22 +318,22 @@ func (h *AdminHandler) GetAdminUserAssignments(w http.ResponseWriter, r *http.Re
 // 更新用户的课程审核权限分配（全量替换）
 func (h *AdminHandler) UpdateAdminUserAssignments(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
 		return
 	}
-	userID := extractAdminMiddleID(r.URL.Path, "/api/v1/admin/users/", "/assignments")
+	userID := extractAdminMiddleID(r.URL.Path, adminUsersPrefix, "/assignments")
 	if userID == "" {
-		utils.BadRequest(w, "缺少用户ID")
+		utils.BadRequest(w, utils.MsgMissingUserID)
 		return
 	}
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
-		utils.Unauthorized(w, "未获取到用户信息")
+		utils.Unauthorized(w, utils.MsgUnauthorized)
 		return
 	}
 	var req models.UpdateAssignmentsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	result, err := h.userService.UpdateAssignments(r.Context(), userID, claims.UserID, &req)
@@ -415,11 +421,10 @@ func extractAdminGroupMemberPath(path string) (string, string) {
 // extractUserGroupPath 从用户↔教研组路径提取 userID 和 groupID
 // 例：/api/v1/admin/users/uid123/groups/gid456 → "uid123", "gid456"
 func extractUserGroupPath(path string) (string, string) {
-	prefix := "/api/v1/admin/users/"
-	if !strings.HasPrefix(path, prefix) {
+	if !strings.HasPrefix(path, adminUsersPrefix) {
 		return "", ""
 	}
-	rest := strings.TrimPrefix(path, prefix)
+	rest := strings.TrimPrefix(path, adminUsersPrefix)
 	parts := strings.SplitN(rest, "/groups/", 2)
 	if len(parts) != 2 {
 		return "", ""

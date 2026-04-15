@@ -9,13 +9,14 @@ package services
 // v84变更：BuildStageChatPrompt 改造为分层记忆版本
 //          新增 BuildStageChatPromptV2 支持 Working+Episodic 分层上下文
 //          旧版 BuildStageChatPrompt 保留向下兼容（内部调用V2）
+// v89-4变更：AutoMatchStageComponents 根据阶段类型自动设置 StageTiming 参数
+//            提升组件匹配精准度——analyze阶段优先开场/贯穿组件，design/write优先主环节组件等
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"tedna/internal/logger"
 	"tedna/internal/models"
@@ -77,7 +78,8 @@ func BuildStageSystemPrompt(
 			componentCtx = BuildStageComponentContext(ctx, recipe, stage.ComponentTypes)
 		}
 		if componentCtx == "" {
-			componentCtx = AutoMatchStageComponents(ctx, stage.ComponentTypes, subject, grade)
+			// v89-4改进：传入stageCode让自动匹配根据阶段设置StageTiming
+			componentCtx = AutoMatchStageComponents(ctx, stage.ComponentTypes, subject, grade, stage.StageCode)
 		}
 		if componentCtx != "" {
 			sb.WriteString(componentCtx)
@@ -398,20 +400,57 @@ func BuildSelectedComponentContext(ctx context.Context, componentIDs []string) s
 
 // ==================== 自动匹配阶段组件 ====================
 
+// stageTimingMap 阶段代码→课堂时机筛选映射表（v89-4新增）
+// 根据PRD定义：
+//   - analyze(教学分析): 优先匹配 开场(1) 或 贯穿(4) 的组件
+//   - design(教学设计): 优先匹配 主环节(2) 或 贯穿(4) 的组件
+//   - write(教案撰写):  优先匹配 主环节(2) 的组件
+//   - review(AI评审):   优先匹配 贯穿(4) 的组件
+//   - revise(修订定稿): 不限定时机（无组件注入阶段，此处仅作兜底）
+var stageTimingMap = map[string][]int{
+	"analyze": {1, 4}, // 开场 + 贯穿
+	"design":  {2, 4}, // 主环节 + 贯穿
+	"write":   {2},    // 主环节
+	"review":  {4},    // 贯穿
+}
+
 // AutoMatchStageComponents 根据阶段组件类型+学科+年级自动匹配组件
 // v82变更：年级转换改用统一工具函数 utils.NormalizeGradeToNumber
-func AutoMatchStageComponents(ctx context.Context, componentTypesJSON string, subject string, grade string) string {
+// v89-4新增：根据stageCode自动设置StageTiming参数，提升匹配精准度
+//
+// 参数：
+//   - componentTypesJSON: 本阶段需要的组件类型JSON数组（如 ["pedagogy","activity_design"]）
+//   - subject: 学科
+//   - grade: 年级（支持中文，内部自动转换）
+//   - stageCode: 当前阶段代码（analyze/design/write/review/revise）
+func AutoMatchStageComponents(ctx context.Context, componentTypesJSON string, subject string, grade string, stageCode string) string {
 	var stageTypes []string
 	if err := json.Unmarshal([]byte(componentTypesJSON), &stageTypes); err != nil || len(stageTypes) == 0 {
 		return ""
 	}
+
+	// 年级格式标准化（中文→数字）
 	normalizedGrade := utils.NormalizeGradeToNumber(grade)
-	groups, err := repository.MatchComponents(ctx, &models.MatchComponentsRequest{
-		Subject: subject, GradeRange: normalizedGrade, LibraryTypes: stageTypes, Limit: 2,
-	})
+
+	// 构建匹配请求
+	matchReq := &models.MatchComponentsRequest{
+		Subject:      subject,
+		GradeRange:   normalizedGrade,
+		LibraryTypes: stageTypes,
+		Limit:        2,
+	}
+
+	// v89-4新增：根据阶段代码自动设置课堂时机筛选
+	// 例如analyze阶段会筛选idx_stage_timing IN (1,4)的组件（开场或贯穿）
+	if timings, ok := stageTimingMap[stageCode]; ok {
+		matchReq.StageTiming = timings
+	}
+
+	groups, err := repository.MatchComponents(ctx, matchReq)
 	if err != nil || len(groups) == 0 {
 		return ""
 	}
+
 	var sb strings.Builder
 	sb.WriteString("=== 本阶段参考资料（系统自动匹配）===\n")
 	sb.WriteString("以下是根据学科和年级自动匹配的教学参考组件，请在本阶段工作中适当参考：\n")
@@ -431,7 +470,7 @@ func AutoMatchStageComponents(ctx context.Context, componentTypesJSON string, su
 		}
 	}
 	wsPromptLog := logger.WithModule("workshop_stage_prompts")
-	wsPromptLog.Info("自动匹配阶段组件", "subject", subject, "grade", grade, "stage_types", stageTypes, "matched_groups", len(groups))
+	wsPromptLog.Info("自动匹配阶段组件", "subject", subject, "grade", grade, "stage_code", stageCode, "stage_types", stageTypes, "matched_groups", len(groups))
 	return sb.String()
 }
 
@@ -550,10 +589,6 @@ func stageCodeToName(code string) string {
 	return code
 }
 
-// generateStageOpeningMsgID 生成阶段开场消息ID
-func generateStageOpeningMsgID(stageCode string) string {
-	return fmt.Sprintf("msg_stage_%s_%d", stageCode, time.Now().UnixNano())
-}
 
 // safeUTF8Truncate 安全截断UTF-8字符串
 func safeUTF8Truncate(s string, maxChars int) string {

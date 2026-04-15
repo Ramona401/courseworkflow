@@ -63,7 +63,7 @@ export function UserDetailModal({ userId, onClose, onAction }: UserDetailModalPr
     try {
       const d = await getAdminUserDetail(userId)
       setDetail(d)
-    } catch { } finally { setLoading(false) }
+    } catch { /* 忽略 */ } finally { setLoading(false) }
   }, [userId])
 
   useEffect(() => { loadDetail() }, [loadDetail])
@@ -85,7 +85,7 @@ export function UserDetailModal({ userId, onClose, onAction }: UserDetailModalPr
       setSaving(true)
       await resetAdminUserPassword(userId, resetPwd)
       setResetPwd(''); onAction()
-    } catch { } finally { setSaving(false) }
+    } catch { /* 忽略 */ } finally { setSaving(false) }
   }
 
   // 启用/禁用账户
@@ -97,13 +97,12 @@ export function UserDetailModal({ userId, onClose, onAction }: UserDetailModalPr
       await updateAdminUserStatus(userId, newStatus)
       setDetail(p => p ? { ...p, status: newStatus } : p)
       onAction()
-    } catch { } finally { setSaving(false) }
+    } catch { /* 忽略 */ } finally { setSaving(false) }
   }
 
-  // 切换教研组角色（member ↔ backbone），组长不可切
+  // 切换教研组角色：member→backbone→lead 循环，支持多组长
   const handleSwitchRole = async (g: AdminGroupMembership) => {
-    if (g.is_lead) return
-    const newRole = g.role === 'backbone' ? 'member' : 'backbone'
+    const newRole = g.role === 'lead' ? 'member' : g.role === 'backbone' ? 'lead' : 'backbone'
     setSwitchingGroupId(g.group_id)
     try {
       await updateAdminGroupMemberRole(g.group_id, userId, newRole)
@@ -112,11 +111,11 @@ export function UserDetailModal({ userId, onClose, onAction }: UserDetailModalPr
         ...prev,
         teaching_groups: prev.teaching_groups.map(tg =>
           tg.group_id === g.group_id
-            ? { ...tg, role: newRole, role_name: newRole === 'backbone' ? '骨干教师' : '普通成员' }
+            ? { ...tg, role: newRole, role_name: newRole === 'lead' ? '教研组长' : newRole === 'backbone' ? '骨干教师' : '普通成员' }
             : tg
         ),
       } : prev)
-    } catch { } finally { setSwitchingGroupId(null) }
+    } catch { /* 忽略 */ } finally { setSwitchingGroupId(null) }
   }
 
   // 确认移出教研组
@@ -143,7 +142,7 @@ export function UserDetailModal({ userId, onClose, onAction }: UserDetailModalPr
     try {
       const orgs = await getAdminOrgs({ type: 'school' })
       setAddSchools(orgs); setAddSchoolsLoaded(true)
-    } catch { }
+    } catch { /* 忽略 */ }
   }
 
   // 选择学校后联动加载教研组
@@ -152,7 +151,7 @@ export function UserDetailModal({ userId, onClose, onAction }: UserDetailModalPr
     if (!schoolId) return
     setAddGroupsLoading(true)
     try { setAddGroups(await getAdminGroups(schoolId)) }
-    catch { } finally { setAddGroupsLoading(false) }
+    catch { /* 忽略 */ } finally { setAddGroupsLoading(false) }
   }
 
   // 确认加入教研组
@@ -173,7 +172,7 @@ export function UserDetailModal({ userId, onClose, onAction }: UserDetailModalPr
 
   // 归属记录角色标签样式
   const getMRLabel = (role: string, isLead: boolean) => {
-    if (isLead)              return { text: '组长',   bg: C.warningLight, color: C.warning }
+    if (role === 'lead' || isLead) return { text: '教研组长', bg: C.warningLight, color: C.warning }
     if (role === 'backbone') return { text: '骨干教师', bg: C.purpleLight,  color: C.purple  }
     return                          { text: '普通成员', bg: C.bg,           color: C.textSec }
   }
@@ -334,21 +333,21 @@ export function UserDetailModal({ userId, onClose, onAction }: UserDetailModalPr
                           <div style={{ fontSize: '11px', color: C.textMuted, whiteSpace: 'nowrap' }}>{fmt(g.joined_at)}</div>
                           {/* 操作按钮组 */}
                           <div style={{ display: 'flex', gap: '4px', minWidth: '110px', flexShrink: 0 }}>
-                            {/* 切换角色（组长不显示）*/}
-                            {!g.is_lead && (
+                            {/* 切换角色：三态循环 member→骨干→组长→member */}
+                            {(
                               <button
                                 onClick={() => handleSwitchRole(g)} disabled={isSwitching}
-                                title={g.role === 'backbone' ? '切换为普通成员' : '切换为骨干教师'}
+                                title={g.role === 'lead' ? '切换为普通成员' : g.role === 'backbone' ? '切换为教研组长' : '切换为骨干教师'}
                                 style={{ padding: '3px 7px', borderRadius: '5px', border: `1px solid ${C.purpleLight}`, background: C.purpleLight, color: C.purple, fontSize: '10px', cursor: isSwitching ? 'not-allowed' : 'pointer', fontWeight: 500, whiteSpace: 'nowrap', opacity: isSwitching ? 0.5 : 1 }}>
-                                {isSwitching ? '...' : g.role === 'backbone' ? '→普通' : '→骨干'}
+                                {isSwitching ? '...' : g.role === 'lead' ? '→普通' : g.role === 'backbone' ? '→组长' : '→骨干'}
                               </button>
                             )}
                             {/* 移除（组长灰色禁用）*/}
                             <button
-                              onClick={() => !g.is_lead && setRemoveTarget(g)} disabled={g.is_lead}
-                              title={g.is_lead ? '教研组长不能被移除，请先更换组长' : '移出该教研组'}
-                              style={{ padding: '3px 7px', borderRadius: '5px', border: `1px solid ${g.is_lead ? C.border : C.dangerLight}`, background: g.is_lead ? C.bg : C.dangerLight, color: g.is_lead ? C.textMuted : C.danger, fontSize: '10px', cursor: g.is_lead ? 'not-allowed' : 'pointer', fontWeight: 500, whiteSpace: 'nowrap' }}>
-                              {g.is_lead ? '组长🔒' : '移除'}
+                              onClick={() => !g.is_lead && setRemoveTarget(g)} disabled={false}
+                              title='移出该教研组'
+                              style={{ padding: '3px 7px', borderRadius: '5px', border: `1px solid ${g.is_lead ? C.border : C.dangerLight}`, background: C.dangerLight, color: C.danger, fontSize: '10px', cursor: 'pointer', fontWeight: 500, whiteSpace: 'nowrap' }}>
+                              移除
                             </button>
                           </div>
                         </div>
@@ -400,6 +399,7 @@ export function UserDetailModal({ userId, onClose, onAction }: UserDetailModalPr
                           <select value={addRole} onChange={e => setAddRole(e.target.value)} style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '13px', outline: 'none', background: C.white }}>
                             <option value="member">普通成员</option>
                             <option value="backbone">骨干教师</option>
+                            <option value="lead">教研组长</option>
                           </select>
                         </div>
                         <div style={{ paddingTop: '18px' }}>

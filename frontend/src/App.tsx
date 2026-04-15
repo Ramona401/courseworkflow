@@ -2,9 +2,10 @@
  * App 根组件
  * v7.0(迭代7)：新增课本管理页面路由 /lesson-plans/textbooks
  * v6.0(迭代3)：新增前测页面路由 /lesson-plans/assessment
- * v5.3：新增配方编辑器路由（Phase 7A）
- * v5.2：新增备课配方列表路由（Phase 7A）
- * v5.1：新增统一用户管理中心 /admin（独立路由，admin专属）
+ * v5.3：新增配方编辑器路由
+ * v5.2：新增备课配方列表路由
+ * v5.1：新增统一用户管理中心 /admin
+ * v106新增：/lesson-plans/review/:id 独立全屏评审工作台（脱离LPLayout，全屏布局）
  */
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AuthContext } from '@/store/auth'
@@ -37,6 +38,8 @@ import TemplatesPage from '@/pages/lesson-plans/templates/TemplatesPage'
 import TemplateEditorPage from '@/pages/lesson-plans/templates/TemplateEditorPage'
 import PlanDetailPage from '@/pages/lesson-plans/plan-detail/PlanDetailPage'
 import ReviewCenterLPPage from '@/pages/lesson-plans/review/ReviewCenterLPPage'
+// v106新增：独立全屏评审工作台
+import ReviewWorkbenchPage from '@/pages/lesson-plans/review/ReviewWorkbenchPage'
 // Phase 7A新增：备课配方
 import RecipesPage from '@/pages/lesson-plans/recipes/RecipesPage'
 import RecipeEditorPage from '@/pages/lesson-plans/recipes/RecipeEditorPage'
@@ -51,9 +54,7 @@ import TextbooksPage from '@/pages/lesson-plans/textbooks/TextbooksPage'
 /* ==================== 通用独立页面 ==================== */
 import AccountPage from '@/pages/account/AccountPage'
 import AICenterPage from '@/pages/ai-center/AICenterPage'
-// v80新增：AI调用追踪仪表盘
 import AITraceDashboardPage from '@/pages/ai-traces/AITraceDashboardPage'
-// v5.1 新增：统一用户管理中心
 import AdminPage from '@/pages/admin/AdminPage'
 
 /* ==================== 路由守卫 ==================== */
@@ -100,7 +101,6 @@ export default function App() {
           <Route path="/admin" element={
             <AuthGuard><RoleGuard roles={['admin']}><AdminPage /></RoleGuard></AuthGuard>
           } />
-          {/* v80新增：AI调用追踪仪表盘 */}
           <Route path="/ai-traces" element={
             <AuthGuard><RoleGuard roles={['admin']}><AITraceDashboardPage /></RoleGuard></AuthGuard>
           } />
@@ -121,6 +121,12 @@ export default function App() {
           </Route>
 
           {/* ==================== 教案系统 ==================== */}
+
+          {/* v106新增：独立全屏评审工作台（必须在 /lesson-plans 布局路由之前注册，否则被LPLayout包裹） */}
+          <Route path="/lesson-plans/review/:id" element={
+            <AuthGuard><ReviewWorkbenchPage /></AuthGuard>
+          } />
+
           <Route path="/lesson-plans" element={<AuthGuard><LPLayout /></AuthGuard>}>
             <Route index element={<WorkshopPage />} />
             <Route path="my-plans"         element={<MyPlansPage />} />
@@ -130,17 +136,12 @@ export default function App() {
             <Route path="components"       element={<ComponentsPage />} />
             <Route path="templates"        element={<TemplatesPage />} />
             <Route path="templates/:id"    element={<TemplateEditorPage />} />
-            {/* Phase 7A新增：备课配方路由 */}
             <Route path="recipes"          element={<RecipesPage />} />
             <Route path="recipes/wizard"   element={<RecipeWizardPage />} />
-            {/* 原编辑器路由保留（直接URL访问或编辑模式） */}
             <Route path="recipes/new"      element={<RecipeEditorPage />} />
             <Route path="recipes/:id/edit" element={<RecipeEditorPage />} />
-            {/* 阶段管理（admin专用）*/}
-            <Route path="stages-config" element={<RoleGuard roles={['admin']}><StagesConfigPage /></RoleGuard>} />
-            {/* 迭代3新增：教学风格前测 */}
+            <Route path="stages-config"    element={<RoleGuard roles={['admin']}><StagesConfigPage /></RoleGuard>} />
             <Route path="assessment"       element={<AssessmentPage />} />
-            {/* 迭代7新增：课本管理 */}
             <Route path="textbooks"        element={<TextbooksPage />} />
           </Route>
 

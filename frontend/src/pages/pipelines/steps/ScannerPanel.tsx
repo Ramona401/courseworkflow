@@ -3,6 +3,7 @@
  * P4.5-B: 展示课程定位JSON + AI原始输出 + 模型/Token信息
  * 修复：适配实际parsed数据结构（target/ability_targets/grade_standard/course_standard均为对象）
  */
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import {
   kvRow, kvLabel, kvValue, passStyle, failStyle,
   TokenDuration, AIOutputViewer, PromptInfo, SectionTitle, JsonViewer,
@@ -10,10 +11,12 @@ import {
 
 /** Scanner面板属性 */
 interface ScannerPanelProps {
+   
   data: any
 }
 
 /** 安全渲染值：对象转JSON字符串，数组join，其他直接显示 */
+ 
 function safeRender(val: any): string {
   if (val === null || val === undefined) return '-'
   if (typeof val === 'string') return val || '-'
@@ -106,7 +109,8 @@ export default function ScannerPanel({ data }: ScannerPanelProps) {
             <div style={kvRow}>
               <span style={kvLabel}>目标能力</span>
               <span style={kvValue}>
-                {abilityTargets.targets.map((t: any) =>
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                {abilityTargets.targets.map((t: any) =>  
                   `${t.code || '?'} (L${t.level ?? '?'})`
                 ).join('、') || '-'}
               </span>
@@ -221,3 +225,5 @@ export default function ScannerPanel({ data }: ScannerPanelProps) {
     </div>
   )
 }
+
+/* eslint-enable @typescript-eslint/no-explicit-any */

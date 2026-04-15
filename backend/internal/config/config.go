@@ -11,7 +11,8 @@ import (
 // AppVersion 应用版本号
 // 修复R-03：从硬编码迁移到配置，healthHandler和其他需要版本号的地方统一读取此常量
 // 发版时只需修改此处一个位置，避免多处硬编码漏改
-const AppVersion = "0.31.0"
+// 审查修复C-01：版本号必须与实际发布版本保持一致
+const AppVersion = "0.37.0"
 
 // Config 全局配置结构体
 type Config struct {
@@ -29,7 +30,7 @@ type Config struct {
 	// JWT 配置
 	JWTSecret string
 
-	// AES 加密密钥
+	// AES 加密密钥（用于加密存储AI API Key等敏感数据）
 	AESKey string
 
 	// AI API 配置
@@ -39,6 +40,7 @@ type Config struct {
 }
 
 // Load 从环境变量加载配置
+// 优先读取 .env 文件，不存在则使用系统环境变量
 func Load() *Config {
 	if err := godotenv.Load(); err != nil {
 		log.Println("未找到 .env 文件，使用系统环境变量")
@@ -59,12 +61,16 @@ func Load() *Config {
 		AIDefaultModel: getEnv("AI_DEFAULT_MODEL", "anthropic/claude-sonnet-4-5"),
 	}
 
-	// 验证必要配置
+	// 验证必要配置——缺失任何一项均无法安全运行，启动阶段直接退出
 	if cfg.JWTSecret == "" {
 		log.Fatal("JWT_SECRET 未配置")
 	}
 	if cfg.DBPassword == "" {
 		log.Fatal("DB_PASSWORD 未配置")
+	}
+	// 审查修复C-02：AES密钥用于加密AI API Key等核心凭据，缺失将导致运行时panic
+	if cfg.AESKey == "" {
+		log.Fatal("AES_KEY 未配置，该密钥用于加密存储AI API密钥等敏感数据")
 	}
 
 	return cfg
@@ -79,6 +85,7 @@ func getEnv(key, defaultVal string) string {
 }
 
 // GetIntEnv 获取整型环境变量
+// 解析失败时返回默认值，不会报错
 func GetIntEnv(key string, defaultVal int) int {
 	val := os.Getenv(key)
 	if val == "" {
@@ -89,16 +96,6 @@ func GetIntEnv(key string, defaultVal int) int {
 		return defaultVal
 	}
 	return intVal
-}
-
-// GetDSN 返回 PostgreSQL 连接字符串
-func (c *Config) GetDSN() string {
-	return "host=" + c.DBHost +
-		" port=" + c.DBPort +
-		" user=" + c.DBUser +
-		" password=" + c.DBPassword +
-		" dbname=" + c.DBName +
-		" sslmode=disable TimeZone=Asia/Shanghai"
 }
 
 // GetAESKey 返回AES加密密钥（满足LessonPlanGenService依赖接口）

@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 /**
  * ReviewPageParts.tsx — 审核页子组件集合
  *
@@ -11,11 +12,11 @@
  *   - PagePreview — 页面预览区（支持代码视图+编辑+双版本对比）
  *   - MergeCompareView — 合并页对比视图
  */
-import { useState, useRef } from 'react'
+import { useRef } from 'react'
 import type { GeneratedPageFull } from '@/api/pipelines'
 import {
-  Check, X, Edit3, CheckCircle, Send,
-  Maximize2, ChevronLeft, ChevronRight, FileText, Wand2, Code,
+  Check, X, Edit3, CheckCircle,
+  Maximize2, FileText, Code,
 } from 'lucide-react'
 
 // ==================== 常量（导出供主组件和弹窗组件使用）====================
@@ -69,6 +70,13 @@ export function getEffectiveHTML(page: GeneratedPageFull): string {
   return page.final_html || page.generated_html || ''
 }
 
+/** v99优化7：检测modify页面的change_reason中是否包含合并操作描述 */
+export function hasHiddenMerge(page: GeneratedPageFull): boolean {
+  if (page.operation !== 'modify' || !page.change_reason) return false
+  const reason = page.change_reason
+  return reason.includes('合并') || reason.includes('merge') || /原P\d+\+P\d+/.test(reason) || /P\d+\+P\d+合并/.test(reason)
+}
+
 /** 判断事件目标是否为输入元素 */
 export function isInputElement(target: EventTarget | null): boolean {
   if (!target || !(target instanceof HTMLElement)) return false
@@ -119,14 +127,20 @@ export function sortPagesLogically(pages: GeneratedPageFull[]): GeneratedPageFul
 
 export function requestTrueFullscreen() {
   const t = document.documentElement
+   
   if (t.requestFullscreen) t.requestFullscreen().catch(() => {})
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   else if ((t as any).webkitRequestFullscreen) (t as any).webkitRequestFullscreen()
 }
 export function exitTrueFullscreen() {
+   
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {})
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   else if ((document as any).webkitFullscreenElement) (document as any).webkitExitFullscreen()
 }
+ 
 export function isTrueFullscreen(): boolean {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return !!(document.fullscreenElement || (document as any).webkitFullscreenElement)
 }
 
@@ -139,6 +153,8 @@ export function CodeView({ html, label }: { html: string; label?: string }) {
       {label && (
         <div style={{ padding: '8px 12px', fontSize: 12, fontWeight: 600, color: '#5856d6', background: '#f5f0ff', flexShrink: 0, borderBottom: '1px solid rgba(88,86,214,0.1)', display: 'flex', alignItems: 'center', gap: 6 }}>
           <Code size={12} /> {label}
+          <div style={{ flex: 1 }} />
+          <button onClick={() => { navigator.clipboard.writeText(html || '').then(() => { const btn = document.activeElement as HTMLButtonElement; if (btn) { btn.textContent = '已复制 ✓'; setTimeout(() => { btn.textContent = '复制'; }, 1500) } }).catch(() => {}) }} style={{ padding: '2px 10px', borderRadius: 4, border: '1px solid rgba(88,86,214,0.2)', background: 'rgba(88,86,214,0.08)', fontSize: 11, fontWeight: 500, color: '#5856d6', cursor: 'pointer' }}>复制</button>
         </div>
       )}
       <div style={{ flex: 1, overflow: 'auto', background: '#1e1e1e', padding: 0, fontFamily: 'Monaco, Consolas, "Courier New", monospace', fontSize: 12, lineHeight: 1.7 }}>
@@ -205,6 +221,9 @@ export function PageSidebar({ sortedPages, selectedIdx, opStats, totalPages, onS
           {isVirtualPage(page.page_number) && (
             <div style={{ fontSize: 10, color: '#af52de', marginTop: 2, paddingLeft: 42 }}>新增于 P{String(getVirtualPageAnchor(page)).padStart(2, '0')} 之后</div>
           )}
+          {hasHiddenMerge(page) && (
+            <div style={{ fontSize: 10, color: '#ff9500', marginTop: 2, paddingLeft: 42 }}>含页面合并</div>
+          )}
           <div style={{ fontSize: 11, marginTop: 3, paddingLeft: 42, color: DECISION_COLORS[page.decision] || '#c7c7cc', fontWeight: page.decision !== 'pending' ? 600 : 400 }}>{DECISION_NAMES[page.decision] || page.decision}</div>
         </div>
       ))}
@@ -229,6 +248,7 @@ export function PageToolbar({ page, btn, editingHTML, deciding, isPendingFinaliz
       <span style={{ fontSize: 14, fontWeight: 600, color: '#1c1c1e' }}>{formatPageLabel(page.page_number, page.page_title)}. {page.page_title || '无标题'}</span>
       {page.operation === 'merge' && page.merge_sources && page.merge_sources !== 'null' && <span style={{ fontSize: 11, color: '#ff9500', fontWeight: 500 }}>(合并自 {parseMergeSources(page.merge_sources).map(n => 'P' + n).join(' + ')})</span>}
       {isVirtualPage(page.page_number) && <span style={{ fontSize: 11, color: '#af52de', fontWeight: 500 }}>（新增页面，位于 P{String(getVirtualPageAnchor(page)).padStart(2, '0')} 之后）</span>}
+      {hasHiddenMerge(page) && <span style={{ fontSize: 11, color: '#ff9500', fontWeight: 500 }}>（含页面合并）</span>}
       {/* v69新增：HTML未加载提示 */}
       {!htmlLoaded && !editingHTML && <span style={{ fontSize: 11, color: '#007aff', fontWeight: 500 }}>⏳ 加载中...</span>}
       <div style={{ flex: 1 }} />
@@ -288,8 +308,8 @@ export function PagePreview({ page, editingHTML, editContent, onEditContentChang
 
   // 代码视图
   if (codeViewMode) {
-    if (page.operation === 'modify') return <div style={{ display: 'flex', height: '100%' }}><div style={{ flex: 1, borderRight: '1px solid rgba(0,0,0,0.06)', display: 'flex', flexDirection: 'column' }}><CodeView html={page.original_html} label="原版代码" /></div><div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}><CodeView html={getEffectiveHTML(page)} label="修改后代码" /></div></div>
-    if (page.operation === 'merge') return <div style={{ display: 'flex', height: '100%' }}><div style={{ flex: 1, borderRight: '1px solid rgba(0,0,0,0.06)', display: 'flex', flexDirection: 'column' }}><CodeView html={page.original_html} label="源页面代码" /></div><div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}><CodeView html={getEffectiveHTML(page)} label="合并结果代码" /></div></div>
+    if (page.operation === 'modify') return <div style={{ display: 'flex', height: '100%' }}><div style={{ flex: '1 1 50%', minWidth: 0, maxWidth: '50%', borderRight: '2px solid rgba(0,0,0,0.08)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}><CodeView html={page.original_html} label="原版代码" /></div><div style={{ flex: '1 1 50%', minWidth: 0, maxWidth: '50%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}><CodeView html={getEffectiveHTML(page)} label="修改后代码" /></div></div>
+    if (page.operation === 'merge') return <div style={{ display: 'flex', height: '100%' }}><div style={{ flex: '1 1 50%', minWidth: 0, maxWidth: '50%', borderRight: '2px solid rgba(0,0,0,0.08)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}><CodeView html={page.original_html} label="源页面代码" /></div><div style={{ flex: '1 1 50%', minWidth: 0, maxWidth: '50%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}><CodeView html={getEffectiveHTML(page)} label="合并结果代码" /></div></div>
     if (page.operation === 'create') return <CodeView html={getEffectiveHTML(page)} label="新增页面代码" />
     if (page.operation === 'delete') return <CodeView html={page.original_html} label="待删除页面代码" />
     return <CodeView html={page.original_html || page.final_html || ''} label="页面代码" />
@@ -299,8 +319,8 @@ export function PagePreview({ page, editingHTML, editContent, onEditContentChang
   if (page.operation === 'merge') return <MergeCompareView page={page} mergeSourceTab={mergeSourceTab} onTabChange={onMergeSourceTabChange} />
   if (page.operation === 'modify') return (
     <div style={{ display: 'flex', height: '100%' }}>
-      <div style={{ flex: 1, borderRight: '1px solid rgba(0,0,0,0.06)', display: 'flex', flexDirection: 'column' }}><div style={{ padding: '8px 12px', fontSize: 12, fontWeight: 600, color: '#8e8e93', background: '#f9f9f9', flexShrink: 0 }}>原版</div><HTMLPreview html={page.original_html} /></div>
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}><div style={{ padding: '8px 12px', fontSize: 12, fontWeight: 600, color: '#007aff', background: '#f0f7ff', flexShrink: 0 }}>修改后</div><HTMLPreview html={getEffectiveHTML(page)} /></div>
+      <div style={{ flex: '1 1 50%', minWidth: 0, maxWidth: '50%', borderRight: '2px solid rgba(0,0,0,0.08)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}><div style={{ padding: '8px 12px', fontSize: 12, fontWeight: 600, color: '#8e8e93', background: '#f9f9f9', flexShrink: 0, display: 'flex', alignItems: 'center' }}>原版<div style={{ flex: 1 }} /><button onClick={() => navigator.clipboard.writeText(page.original_html || '')} style={{ padding: '2px 8px', borderRadius: 4, border: '1px solid rgba(0,0,0,0.1)', background: '#fff', fontSize: 11, color: '#8e8e93', cursor: 'pointer' }}>复制</button></div><HTMLPreview html={page.original_html} /></div>
+      <div style={{ flex: '1 1 50%', minWidth: 0, maxWidth: '50%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}><div style={{ padding: '8px 12px', fontSize: 12, fontWeight: 600, color: '#007aff', background: '#f0f7ff', flexShrink: 0, display: 'flex', alignItems: 'center' }}>修改后<div style={{ flex: 1 }} /><button onClick={() => navigator.clipboard.writeText(getEffectiveHTML(page) || '')} style={{ padding: '2px 8px', borderRadius: 4, border: '1px solid rgba(0,0,0,0.1)', background: '#fff', fontSize: 11, color: '#007aff', cursor: 'pointer' }}>复制</button></div><HTMLPreview html={getEffectiveHTML(page)} /></div>
     </div>
   )
   if (page.operation === 'create') return <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}><div style={{ padding: '8px 12px', fontSize: 12, fontWeight: 600, color: '#af52de', background: '#faf5ff', flexShrink: 0 }}>新增页面（{formatPageLabel(page.page_number, page.page_title)}）</div><HTMLPreview html={getEffectiveHTML(page)} /></div>
@@ -311,8 +331,8 @@ export function PagePreview({ page, editingHTML, editContent, onEditContentChang
     const beforeHTML = page.generated_html || page.original_html || ''
     return (
       <div style={{ display: 'flex', height: '100%' }}>
-        <div style={{ flex: 1, borderRight: '1px solid rgba(0,0,0,0.06)', display: 'flex', flexDirection: 'column' }}><div style={{ padding: '8px 12px', fontSize: 12, fontWeight: 600, color: '#8e8e93', background: '#f9f9f9', flexShrink: 0 }}>编辑前</div><HTMLPreview html={beforeHTML} /></div>
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}><div style={{ padding: '8px 12px', fontSize: 12, fontWeight: 600, color: '#ff9500', background: '#fff8f0', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6 }}><Edit3 size={12} /> 编辑后</div><HTMLPreview html={page.final_html} /></div>
+        <div style={{ flex: '1 1 50%', minWidth: 0, maxWidth: '50%', borderRight: '2px solid rgba(0,0,0,0.08)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}><div style={{ padding: '8px 12px', fontSize: 12, fontWeight: 600, color: '#8e8e93', background: '#f9f9f9', flexShrink: 0, display: 'flex', alignItems: 'center' }}>编辑前<div style={{ flex: 1 }} /><button onClick={() => navigator.clipboard.writeText(beforeHTML || '')} style={{ padding: '2px 8px', borderRadius: 4, border: '1px solid rgba(0,0,0,0.1)', background: '#fff', fontSize: 11, color: '#8e8e93', cursor: 'pointer' }}>复制</button></div><HTMLPreview html={beforeHTML} /></div>
+        <div style={{ flex: '1 1 50%', minWidth: 0, maxWidth: '50%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}><div style={{ padding: '8px 12px', fontSize: 12, fontWeight: 600, color: '#ff9500', background: '#fff8f0', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6 }}><Edit3 size={12} /> 编辑后<div style={{ flex: 1 }} /><button onClick={() => navigator.clipboard.writeText(page.final_html || '')} style={{ padding: '2px 8px', borderRadius: 4, border: '1px solid rgba(0,0,0,0.1)', background: '#fff', fontSize: 11, color: '#ff9500', cursor: 'pointer' }}>复制</button></div><HTMLPreview html={page.final_html} /></div>
       </div>
     )
   }

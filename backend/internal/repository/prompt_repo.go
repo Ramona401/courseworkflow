@@ -121,7 +121,7 @@ func CreatePromptVersion(key string, content string, version int, userID string)
 	if err != nil {
 		return nil, fmt.Errorf("开启事务失败: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	// 步骤1：将该 prompt_key 的所有现有版本标记为非当前
 	_, err = tx.Exec(ctx,
@@ -164,7 +164,7 @@ func RollbackPromptVersion(key string, targetID string) error {
 	if err != nil {
 		return fmt.Errorf("开启事务失败: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	// 步骤1：将该 prompt_key 的所有版本标记为非当前
 	_, err = tx.Exec(ctx,

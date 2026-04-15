@@ -296,7 +296,7 @@ func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("evaluator: 课程 %s 不存在", pipeline.CourseCode)
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// 索引读取：一轮读原始索引(course_indexes)，二审读定稿索引(pipeline_indexes)
@@ -308,7 +308,7 @@ func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 			durationMs := time.Since(startTime).Milliseconds()
 			errMsg := fmt.Sprintf("evaluator(2审): 定稿索引不存在，请确认一轮verify已完成: %s", pIdxErr.Error())
 			_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-			return fmt.Errorf(errMsg)
+			return fmt.Errorf("%s", errMsg)
 		}
 		evalIndexContent = pipelineIdx.IndexContent
 	} else {
@@ -318,7 +318,7 @@ func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 			durationMs := time.Since(startTime).Milliseconds()
 			errMsg := "evaluator: 课程索引不存在"
 			_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-			return fmt.Errorf(errMsg)
+			return fmt.Errorf("%s", errMsg)
 		}
 		evalIndexContent = tmpIdx.IndexContent
 	}
@@ -339,7 +339,7 @@ func (s *PipelineService) executeEvaluator(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("evaluator: 获取AI配置失败: %s", err.Error())
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// 构建用户提示词
@@ -511,7 +511,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("meta: 课程 %s 不存在", pipeline.CourseCode)
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// 索引读取：一轮读原始索引(course_indexes)，二审读定稿索引(pipeline_indexes)
@@ -523,7 +523,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 			durationMs := time.Since(startTime).Milliseconds()
 			errMsg := fmt.Sprintf("meta(2审): 定稿索引不存在，请确认一轮verify已完成: %s", pIdxErr.Error())
 			_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-			return fmt.Errorf(errMsg)
+			return fmt.Errorf("%s", errMsg)
 		}
 		metaIndexContent = pipelineIdx.IndexContent
 	} else {
@@ -533,7 +533,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 			durationMs := time.Since(startTime).Milliseconds()
 			errMsg := "meta: 课程索引不存在"
 			_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-			return fmt.Errorf(errMsg)
+			return fmt.Errorf("%s", errMsg)
 		}
 		metaIndexContent = tmpIdx.IndexContent
 	}
@@ -557,7 +557,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := "meta: 无法获取评估轮次数据"
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// 组装多轮评估报告文本
@@ -579,7 +579,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := "meta: 无有效的评估报告（所有轮次均失败）"
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 	roundsText := strings.Join(roundsTextParts, "\n\n")
 
@@ -591,7 +591,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("meta: 获取AI配置失败: %s", err.Error())
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// 构建用户提示词
@@ -632,7 +632,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 				durationMs := time.Since(startTime).Milliseconds()
 				errMsg := fmt.Sprintf("%s (第%d次): %s", ErrMetaAIFailed.Error(), attempt, callErr.Error())
 				_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-				return fmt.Errorf(errMsg)
+				return fmt.Errorf("%s", errMsg)
 			}
 			continue
 		}
@@ -693,7 +693,7 @@ func (s *PipelineService) executeMeta(pipeline *models.Pipeline) error {
 			errMsg := fmt.Sprintf("%s (最终得分: %.1f, 阈值: %.1f, 共%d次尝试)",
 				ErrMetaAllRetriesFailed.Error(), metaResult.TotalFinal, threshold, maxRetry)
 			_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-			return fmt.Errorf(errMsg)
+			return fmt.Errorf("%s", errMsg)
 		}
 	}
 

@@ -226,8 +226,8 @@ function buildMetaTable(plan: LessonPlanExportData): Table {
       bottom:  { style: BorderStyle.SINGLE, size: 4, color: 'E5E7EB' },
       left:    { style: BorderStyle.SINGLE, size: 4, color: 'E5E7EB' },
       right:   { style: BorderStyle.SINGLE, size: 4, color: 'E5E7EB' },
-      insideH: { style: BorderStyle.SINGLE, size: 4, color: 'E5E7EB' },
-      insideV: { style: BorderStyle.SINGLE, size: 4, color: 'E5E7EB' },
+      insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: 'E5E7EB' },
+      insideVertical: { style: BorderStyle.SINGLE, size: 4, color: 'E5E7EB' },
     },
   })
 }

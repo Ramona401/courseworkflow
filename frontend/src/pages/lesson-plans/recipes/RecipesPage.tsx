@@ -208,7 +208,7 @@ export default function RecipesPage() {
   const loadRecipes = useCallback(async () => {
     setLoading(true)
     try {
-      const params: Record<string, string | number> = { limit: 100 }
+      const params: Record<string, string> = { limit: '100' }
       if (scopeFilter !== 'all') params.scope = scopeFilter
       if (subjectFilter !== '全部') params.subject = subjectFilter
       const resp = await getRecipes(params)

@@ -12,6 +12,7 @@
  * - 阶段化备课工坊（Phase 7B-9：阶段查询/前进/跳过/回退/产出物）
  *
  * v88新增：SSE自动重连机制（指数退避+连接状态回调+重连补齐）
+ * v101修复：submitLessonPlanForReview 增加 groupId 参数，修复提交评审参数错误
  */
 import apiClient from './client'
 
@@ -492,11 +493,6 @@ const SSE_RECONNECT_MAX_DELAY_MS = 30000      // 最大重连延迟（30秒）
  *   - 连接状态变化回调（connected/reconnecting/disconnected）
  *   - 重连成功后自动拉取最新对话补齐丢失消息
  *   - 手动关闭（close方法）
- *
- * 使用方式：
- *   const conn = createLessonPlanSSE(planId, token, handlers)
- *   // ... 需要关闭时：
- *   conn.close()
  */
 export interface SSEConnection {
   /** 手动关闭连接（同时停止重连计时器） */
@@ -712,13 +708,24 @@ export async function publishLessonPlanPersonal(id: string) {
   return resp.data.data as void
 }
 
-export async function submitLessonPlanForReview(id: string) {
-  const resp = await apiClient.post(`/lesson-plans/plans/${id}/submit-review`)
+/**
+ * 提交教案到教研组评审
+ *
+ * v101修复：增加 groupId 参数，后端 SubmitForReview 强制要求 group_id 不为空，
+ * 原来调用时未传 body 导致 400 参数错误。
+ *
+ * @param id      教案ID
+ * @param groupId 目标教研组ID（必填）
+ */
+export async function submitLessonPlanForReview(id: string, groupId: string) {
+  const resp = await apiClient.post(`/lesson-plans/plans/${id}/submit-review`, {
+    group_id: groupId,
+  })
   return resp.data.data as void
 }
 
 export async function reviewLessonPlan(id: string, data: {
-  decision: string; score?: number; comments?: string; suggestions?: string[]
+  decision: string; score?: number; comments?: string; suggestions?: string
 }) {
   const resp = await apiClient.post(`/lesson-plans/plans/${id}/review`, data)
   return resp.data.data as void
@@ -783,14 +790,6 @@ export async function getConversation(planId: string) {
  *   - onReconnected：重连成功后回调，用于拉取最新对话补齐丢失消息
  *   - 自动重连机制：指数退避（1s/2s/4s/8s/16s），最多5次
  *   - 返回SSEConnection对象，支持手动close
- *
- * 重连策略：
- *   1. EventSource的onerror触发时（包括网络断开、服务端关闭连接、空闲超时）
- *   2. 先关闭当前EventSource
- *   3. 状态切换为reconnecting，通知前端显示黄色指示器
- *   4. 等待指数退避延迟后创建新的EventSource
- *   5. 新连接收到connected事件后，状态切换为connected，触发onReconnected
- *   6. 5次全部失败后，状态切换为disconnected，通知前端显示红色指示器
  */
 export function createLessonPlanSSE(
   planId: string,
@@ -802,33 +801,25 @@ export function createLessonPlanSSE(
     onContentUpdate?: (content: string) => void
     onReviewDone?: (review: AIReviewResult) => void
     onExtractionHint?: (hint: ExtractionHint) => void
-    onStageStarted?: (data: StageEventData) => void    // Phase 7B-9：进入新阶段
-    onStageComplete?: (data: StageEventData) => void   // Phase 7B-9：AI建议完成当前阶段
-    onStageOutput?: (data: StageEventData) => void     // Phase 7B-9：阶段产出物已生成
+    onStageStarted?: (data: StageEventData) => void
+    onStageComplete?: (data: StageEventData) => void
+    onStageOutput?: (data: StageEventData) => void
     onError?: (error: string) => void
     onDone?: () => void
-    onConnectionStateChange?: (state: SSEConnectionState) => void  // v88新增：连接状态变化
-    onReconnected?: () => void                                      // v88新增：重连成功回调
+    onConnectionStateChange?: (state: SSEConnectionState) => void
+    onReconnected?: () => void
   }
 ): SSEConnection {
-  // v88：内部状态管理
-  let currentES: EventSource | null = null    // 当前EventSource实例
-  let retryCount = 0                          // 当前重连次数
-  let retryTimer: ReturnType<typeof setTimeout> | null = null  // 重连计时器
-  let isClosed = false                        // 是否已手动关闭
-  let isFirstConnect = true                   // 是否首次连接（首次不触发onReconnected）
+  let currentES: EventSource | null = null
+  let retryCount = 0
+  let retryTimer: ReturnType<typeof setTimeout> | null = null
+  let isClosed = false
+  let isFirstConnect = true
 
-  /**
-   * 绑定EventSource的所有事件监听器
-   * 提取为独立函数，首次连接和重连共用
-   */
   const bindEventListeners = (es: EventSource) => {
-    // 连接建立成功
     es.addEventListener('connected', () => {
-      // 重连成功：重置重连计数，通知状态恢复
       retryCount = 0
       handlers.onConnectionStateChange?.('connected')
-      // 非首次连接时触发重连回调（首次连接不需要补齐）
       if (!isFirstConnect) {
         handlers.onReconnected?.()
       }
@@ -874,7 +865,6 @@ export function createLessonPlanSSE(
       } catch { /* 忽略解析错误 */ }
     })
 
-    // Phase 7B-9：监听阶段化备课工坊事件
     es.addEventListener('stage_started', (e: MessageEvent) => {
       try {
         const event: LPSSEEvent = JSON.parse(e.data)
@@ -896,57 +886,34 @@ export function createLessonPlanSSE(
       } catch { /* 忽略解析错误 */ }
     })
 
-    // 业务级错误事件（后端主动推送的error事件，带error字段）
     es.addEventListener('error', (e: MessageEvent) => {
-      // 连接级断开（e.data为空）：触发重连而非报错给用户
       if (!e.data) return
       try {
         const event: LPSSEEvent = JSON.parse(e.data)
-        // 只有明确的业务错误才报给用户
         if (event.error) {
           handlers.onError?.(event.error)
         }
-      } catch {
-        // JSON解析失败也静默忽略，避免误报
-      }
+      } catch { /* 静默忽略 */ }
     })
 
     es.addEventListener('done', () => {
       handlers.onDone?.()
-      // done是正常结束，不触发重连
       isClosed = true
       es.close()
     })
 
-    /**
-     * v88核心：EventSource原生onerror处理器
-     *
-     * 当EventSource遇到连接错误时触发（网络断开、服务端关闭、空闲超时等）
-     * 注意：EventSource默认会自动重连，但我们需要自行控制重连逻辑以便：
-     *   1. 通知前端连接状态变化（显示指示器）
-     *   2. 控制重连次数上限
-     *   3. 重连成功后触发消息补齐
-     * 因此：先关闭当前EventSource（禁止其默认自动重连），再自行管理重连
-     */
     es.onerror = () => {
-      // 已手动关闭，不重连
       if (isClosed) return
-
-      // 关闭当前连接（阻止EventSource默认的自动重连行为）
       es.close()
       currentES = null
 
-      // 检查是否还有重连次数
       if (retryCount >= SSE_RECONNECT_MAX_RETRIES) {
-        // 超过最大重连次数，切换为disconnected状态
         handlers.onConnectionStateChange?.('disconnected')
         return
       }
 
-      // 切换为reconnecting状态
       handlers.onConnectionStateChange?.('reconnecting')
 
-      // 指数退避计算延迟：1s, 2s, 4s, 8s, 16s（上限30s）
       const delay = Math.min(
         SSE_RECONNECT_BASE_DELAY_MS * Math.pow(2, retryCount),
         SSE_RECONNECT_MAX_DELAY_MS
@@ -955,7 +922,6 @@ export function createLessonPlanSSE(
 
       console.log(`[SSE] 连接断开，${delay / 1000}秒后尝试第${retryCount}次重连... (planId: ${planId})`)
 
-      // 延迟后重连
       retryTimer = setTimeout(() => {
         if (isClosed) return
         connectSSE()
@@ -963,32 +929,23 @@ export function createLessonPlanSSE(
     }
   }
 
-  /**
-   * 创建并连接EventSource
-   * 首次连接和重连共用此函数
-   */
   const connectSSE = () => {
     if (isClosed) return
-
     const url = `/api/v1/lesson-plans/sse/plans/${planId}/stream?token=${encodeURIComponent(token)}`
     const es = new EventSource(url)
     currentES = es
     bindEventListeners(es)
   }
 
-  // 首次连接
   connectSSE()
 
-  // 返回可控连接对象
   return {
     close: () => {
       isClosed = true
-      // 清除重连计时器
       if (retryTimer) {
         clearTimeout(retryTimer)
         retryTimer = null
       }
-      // 关闭EventSource
       if (currentES) {
         currentES.close()
         currentES = null
@@ -1024,8 +981,8 @@ export interface RecommendedComponentItem {
   library_name: string
   display_label: string
   design_logic: string
-  full_guide: string         // 完整指引（v78新增）
-  example_snippet: string    // 示例片段（v78新增）
+  full_guide: string
+  example_snippet: string
   quality_score: number
   source: 'recipe' | 'auto'
 }
@@ -1077,7 +1034,6 @@ export async function switchToStage(planId: string, targetStageCode: string) {
   return resp.data
 }
 
-
 /** 回退到上一阶段 */
 export async function backStage(planId: string) {
   const resp = await apiClient.post(`/lesson-plans/plans/${planId}/stages/back`, {})
@@ -1099,10 +1055,8 @@ export async function confirmExtraction(id: string, decision: 'confirmed' | 'rej
   return resp.data.data as { message: string }
 }
 
-
 /* ==================== API函数：阶段管理（Admin专用，Phase 7B新增）==================== */
 
-/** 获取全部系统阶段（含disabled，admin专用） */
 /** 获取全部系统阶段（admin专用，含disabled） — 迭代1：增加prompt_variants字段 */
 export async function getAdminStages() {
   const resp = await apiClient.get('/admin/workshop-stages')
@@ -1126,7 +1080,6 @@ export async function updateAdminStage(stageCode: string, data: {
   const resp = await apiClient.put(`/admin/workshop-stages/${stageCode}`, data)
   return resp.data.data
 }
-
 
 // ==================== P0-2新增：阶段完成度检测 ====================
 
@@ -1153,4 +1106,32 @@ export async function getStageCompleteness(planId: string, stageCode: string): P
     `/lesson-plans/plans/${planId}/stages/${stageCode}/completeness`
   )
   return res.data.data
+}
+
+/* ==================== v108新增：导入已有教案 ==================== */
+
+/** 导入已有教案请求体 */
+export interface ImportExistingPlanRequest {
+  subject: string
+  grade: string
+  topic: string
+  duration_minutes?: number
+  content_markdown: string       // 前端已解析的纯文本内容
+  recipe_id?: string
+  group_id?: string
+  textbook_page_ids?: string[]
+  source_type: 'paste' | 'docx' | 'pdf'
+}
+
+/** 导入已有教案响应 */
+export interface ImportExistingPlanResponse {
+  plan: LessonPlan
+  opening_message: ConversationMessage
+  skipped_stages: string[]
+}
+
+/** 导入已有教案 */
+export async function importExistingPlan(data: ImportExistingPlanRequest): Promise<ImportExistingPlanResponse> {
+  const resp = await apiClient.post('/lesson-plans/plans/import-existing', data)
+  return resp.data.data as ImportExistingPlanResponse
 }

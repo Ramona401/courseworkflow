@@ -22,12 +22,12 @@ import (
 // GetGeneratedPages GET /api/v1/pipelines/{id}/pages
 func (h *PipelineHandler) GetGeneratedPages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	id := extractPipelineIDWithSuffix(r.URL.Path, "/pages")
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	pages, err := h.pipelineService.GetGeneratedPages(id)
@@ -45,12 +45,12 @@ func (h *PipelineHandler) GetGeneratedPages(w http.ResponseWriter, r *http.Reque
 // UpdatePageDecision PUT /api/v1/pipelines/{id}/pages/{num}/decision
 func (h *PipelineHandler) UpdatePageDecision(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
 		return
 	}
 	pipelineID, pageNumber := extractPipelineIDAndPageNumber(r.URL.Path)
 	if pipelineID == "" || pageNumber <= 0 {
-		utils.BadRequest(w, "缺少Pipeline ID或页码")
+		utils.BadRequest(w, utils.MsgMissingPipelinePage)
 		return
 	}
 	var req struct {
@@ -58,7 +58,7 @@ func (h *PipelineHandler) UpdatePageDecision(w http.ResponseWriter, r *http.Requ
 		FinalHTML *string `json:"final_html"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	if err := h.pipelineService.UpdatePageDecision(pipelineID, pageNumber, req.Decision, req.FinalHTML); err != nil {
@@ -77,12 +77,12 @@ func (h *PipelineHandler) UpdatePageDecision(w http.ResponseWriter, r *http.Requ
 // FinalizePipeline POST /api/v1/pipelines/{id}/finalize
 func (h *PipelineHandler) FinalizePipeline(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	id := extractPipelineIDWithSuffix(r.URL.Path, "/finalize")
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	if err := h.pipelineService.FinalizePipeline(id); err != nil {
@@ -102,12 +102,12 @@ func (h *PipelineHandler) FinalizePipeline(w http.ResponseWriter, r *http.Reques
 // SubmitFinalize POST /api/v1/pipelines/{id}/submit-finalize
 func (h *PipelineHandler) SubmitFinalize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	id := extractPipelineIDWithSuffix(r.URL.Path, "/submit-finalize")
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	if err := h.pipelineService.SubmitFinalize(id); err != nil {
@@ -125,12 +125,12 @@ func (h *PipelineHandler) SubmitFinalize(w http.ResponseWriter, r *http.Request)
 // ConfirmFinalize POST /api/v1/pipelines/{id}/confirm-finalize
 func (h *PipelineHandler) ConfirmFinalize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	id := extractPipelineIDWithSuffix(r.URL.Path, "/confirm-finalize")
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	if err := h.pipelineService.ConfirmFinalize(id); err != nil {
@@ -148,12 +148,12 @@ func (h *PipelineHandler) ConfirmFinalize(w http.ResponseWriter, r *http.Request
 // RejectFinalize POST /api/v1/pipelines/{id}/reject-finalize
 func (h *PipelineHandler) RejectFinalize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	id := extractPipelineIDWithSuffix(r.URL.Path, "/reject-finalize")
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	var req struct {
@@ -178,12 +178,12 @@ func (h *PipelineHandler) RejectFinalize(w http.ResponseWriter, r *http.Request)
 // MarkPassed POST /api/v1/pipelines/{id}/mark-passed
 func (h *PipelineHandler) MarkPassed(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	id := extractPipelineIDWithSuffix(r.URL.Path, "/mark-passed")
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	if err := h.pipelineService.MarkPassed(id); err != nil {
@@ -204,12 +204,12 @@ func (h *PipelineHandler) MarkPassed(w http.ResponseWriter, r *http.Request) {
 // v68增强：接收reference_pages参数（参考页码数组）+ 返回fix_summary修改说明
 func (h *PipelineHandler) AIFixPage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	pipelineID, pageNumber := extractPipelineIDAndPageNumberForAIFix(r.URL.Path)
 	if pipelineID == "" || pageNumber <= 0 {
-		utils.BadRequest(w, "缺少Pipeline ID或页码")
+		utils.BadRequest(w, utils.MsgMissingPipelinePage)
 		return
 	}
 
@@ -219,7 +219,7 @@ func (h *PipelineHandler) AIFixPage(w http.ResponseWriter, r *http.Request) {
 		ReferencePages []int  `json:"reference_pages"` // v68新增：参考页码数组（可选）
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	if req.FixInstruction == "" {
@@ -243,19 +243,18 @@ func (h *PipelineHandler) AIFixPage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-
 // ==================== 回滚接口（v68新增）====================
 
 // RollbackPageHTML POST /api/v1/pipelines/{id}/pages/{num}/rollback
 // 将指定页面的HTML回滚到上一个历史版本（撤销最近一次编辑/AI快修）
 func (h *PipelineHandler) RollbackPageHTML(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	pipelineID, pageNumber := extractPipelineIDAndPageNumberForRollback(r.URL.Path)
 	if pipelineID == "" || pageNumber <= 0 {
-		utils.BadRequest(w, "缺少Pipeline ID或页码")
+		utils.BadRequest(w, utils.MsgMissingPipelinePage)
 		return
 	}
 
@@ -266,10 +265,10 @@ func (h *PipelineHandler) RollbackPageHTML(w http.ResponseWriter, r *http.Reques
 	}
 
 	utils.Success(w, map[string]interface{}{
-		"message":          "已回滚到上一版本",
-		"page_number":      pageNumber,
-		"restored_html":    restoredHTML,
-		"html_length":      len(restoredHTML),
+		"message":           "已回滚到上一版本",
+		"page_number":       pageNumber,
+		"restored_html":     restoredHTML,
+		"html_length":       len(restoredHTML),
 		"remaining_history": remainingCount,
 	})
 }
@@ -279,12 +278,12 @@ func (h *PipelineHandler) RollbackPageHTML(w http.ResponseWriter, r *http.Reques
 // VerifyPipeline POST /api/v1/pipelines/{id}/verify
 func (h *PipelineHandler) VerifyPipeline(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	id := extractPipelineIDWithSuffix(r.URL.Path, "/verify")
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	resp, err := h.pipelineService.VerifyPipeline(id)
@@ -303,7 +302,7 @@ func (h *PipelineHandler) VerifyPipeline(w http.ResponseWriter, r *http.Request)
 // BatchVerify POST /api/v1/pipelines/batch-verify
 func (h *PipelineHandler) BatchVerify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	result, err := h.pipelineService.BatchVerify()
@@ -344,12 +343,12 @@ func (h *PipelineHandler) PublishPipeline(w http.ResponseWriter, r *http.Request
 // v69新增：审核页HTML懒加载——前端选中页面时按需加载单页完整HTML
 func (h *PipelineHandler) GetSinglePageHTML(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	pipelineID, pageNumber := extractPipelineIDAndPageNumberForHTML(r.URL.Path)
 	if pipelineID == "" || pageNumber <= 0 {
-		utils.BadRequest(w, "缺少Pipeline ID或页码")
+		utils.BadRequest(w, utils.MsgMissingPipelinePage)
 		return
 	}
 	page, err := h.pipelineService.GetSinglePageHTML(pipelineID, pageNumber)
@@ -364,12 +363,12 @@ func (h *PipelineHandler) GetSinglePageHTML(w http.ResponseWriter, r *http.Reque
 // v69新增：审核页首次加载只获取轻量元数据列表（不含HTML），大幅减少传输数据量
 func (h *PipelineHandler) GetGeneratedPagesLightweight(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	id := extractPipelineIDWithSuffix(r.URL.Path, "/pages-meta")
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	pages, err := h.pipelineService.GetGeneratedPagesLightweight(id)
@@ -389,18 +388,19 @@ func (h *PipelineHandler) GetGeneratedPagesLightweight(w http.ResponseWriter, r 
 // AIFixPageStream POST /api/v1/pipelines/{id}/pages/{num}/ai-fix-stream
 // v69新增：AI快修流式返回——通过SSE逐token推送AI输出，前端实时展示
 // SSE事件格式：
-//   event: chunk   data: {"content":"..."}     — AI输出的增量token
-//   event: done    data: {"new_html":"...","fix_summary":"...","html_length":N}  — 完成
-//   event: error   data: {"message":"..."}     — 错误
+//
+//	event: chunk   data: {"content":"..."}     — AI输出的增量token
+//	event: done    data: {"new_html":"...","fix_summary":"...","html_length":N}  — 完成
+//	event: error   data: {"message":"..."}     — 错误
 func (h *PipelineHandler) AIFixPageStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 
 	pipelineID, pageNumber := extractPipelineIDAndPageNumberForAIFixStream(r.URL.Path)
 	if pipelineID == "" || pageNumber <= 0 {
-		utils.BadRequest(w, "缺少Pipeline ID或页码")
+		utils.BadRequest(w, utils.MsgMissingPipelinePage)
 		return
 	}
 
@@ -409,7 +409,7 @@ func (h *PipelineHandler) AIFixPageStream(w http.ResponseWriter, r *http.Request
 		ReferencePages []int  `json:"reference_pages"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	if req.FixInstruction == "" {

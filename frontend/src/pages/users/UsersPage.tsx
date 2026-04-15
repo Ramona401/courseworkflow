@@ -212,6 +212,7 @@ export default function UsersPage() {
       setLoading(true)
       const result = await getUsers()
       setUsers(result.users || [])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (err: any) {
       showToast(err.message || '加载用户列表失败', 'error')
     } finally {
@@ -243,6 +244,7 @@ export default function UsersPage() {
       setShowCreateModal(false)
       setCreateForm({ username: '', display_name: '', password: '', role: 'operator' })
       loadUsers()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (err: any) {
       showToast(err.message || '创建失败', 'error')
     } finally {
@@ -269,6 +271,7 @@ export default function UsersPage() {
       setShowEditModal(false)
       setEditingUser(null)
       loadUsers()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (err: any) {
       showToast(err.message || '更新失败', 'error')
     } finally {
@@ -294,6 +297,7 @@ export default function UsersPage() {
       showToast(`已重置 ${editingUser.display_name} 的密码`, 'success')
       setShowPasswordModal(false)
       setEditingUser(null)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (err: any) {
       showToast(err.message || '重置失败', 'error')
     } finally {
@@ -318,6 +322,7 @@ export default function UsersPage() {
       await updateUserStatus(u.id, { status: newStatus })
       showToast(`已${actionText}用户 ${u.display_name}`, 'success')
       loadUsers()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (err: any) {
       showToast(err.message || '操作失败', 'error')
     }
@@ -531,6 +536,7 @@ export default function UsersPage() {
               <div>
                 <label style={labelStyle}>角色</label>
                 <select style={selectStyle} value={createForm.role}
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
                   onChange={e => setCreateForm({ ...createForm, role: e.target.value as any })}
                   onFocus={handleFocus} onBlur={handleBlur}>
                   <option value="operator">骨干教师</option>
@@ -582,6 +588,7 @@ export default function UsersPage() {
               <div>
                 <label style={labelStyle}>角色</label>
                 <select style={selectStyle} value={editForm.role}
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
                   onChange={e => setEditForm({ ...editForm, role: e.target.value as any })}
                   onFocus={handleFocus} onBlur={handleBlur}
                   disabled={editingUser.id === currentUser?.id}>

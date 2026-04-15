@@ -1,11 +1,14 @@
 /**
  * GroupFormModal.tsx — 教研组 新建/编辑弹窗
+ *
+ * v109改动：
+ *   - 移除单一"教研组长"选择器（已由成员管理支持多组长）
+ *   - 新增提示说明，引导通过成员面板设置组长
  */
 import { useState } from 'react'
 import { createAdminGroup, updateAdminGroup } from '@/api/admin'
 import type { GroupListItem, CreateGroupRequest, UpdateGroupRequest } from '@/api/admin'
 import { C } from './adminConstants'
-import { UserSearchPicker } from './UserSearchPicker'
 
 interface GroupFormModalProps {
   mode: 'create' | 'edit'
@@ -22,8 +25,6 @@ export function GroupFormModal({
   const [name, setName]             = useState(initial?.name || '')
   const [subject, setSubject]       = useState(initial?.subject || '')
   const [gradeRange, setGradeRange] = useState(initial?.grade_range || '')
-  const [leadId, setLeadId]         = useState(initial?.lead_user_id || '')
-  const [leadName, setLeadName]     = useState(initial?.lead_user_name || '')
   const [desc, setDesc]             = useState('')
   const [saving, setSaving]         = useState(false)
   const [error, setError]           = useState('')
@@ -41,18 +42,18 @@ export function GroupFormModal({
       setSaving(true); setError('')
       if (mode === 'create') {
         const req: CreateGroupRequest = {
-          name: name.trim(), school_id: schoolId,
+          name: name.trim(),
+          school_id: schoolId,
           subject: subject.trim(),
           grade_range: gradeRange.trim() || undefined,
-          lead_user_id: leadId || null,
           description: desc.trim() || undefined,
         }
         await createAdminGroup(req)
       } else {
         const req: UpdateGroupRequest = {
-          name: name.trim(), subject: subject.trim(),
+          name: name.trim(),
+          subject: subject.trim(),
           grade_range: gradeRange.trim() || undefined,
-          lead_user_id: leadId || null,
           description: desc.trim() || undefined,
         }
         await updateAdminGroup(initial!.id, req)
@@ -96,7 +97,7 @@ export function GroupFormModal({
         {/* 表单 */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
           {error && (
-            <div style={{ padding: '10px 14px', borderRadius: '8px', marginBottom: '14px', background: C.dangerLight, color: C.danger, fontSize: '13px' }}>
+            <div style={{ padding: '10px 14px', borderRadius: '8px', marginBottom: '14px', background: '#FEF2F2', color: '#EF4444', fontSize: '13px' }}>
               {error}
             </div>
           )}
@@ -104,9 +105,10 @@ export function GroupFormModal({
           {/* 教研组名称 */}
           <div style={{ marginBottom: '14px' }}>
             <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '6px' }}>
-              教研组名称 <span style={{ color: C.danger }}>*</span>
+              教研组名称 <span style={{ color: '#EF4444' }}>*</span>
             </label>
-            <input value={name} onChange={e => setName(e.target.value)} placeholder="例如：七年级AI课程教研组"
+            <input value={name} onChange={e => setName(e.target.value)}
+              placeholder="例如：七年级AI课程教研组"
               style={fieldStyle}
               onFocus={e => { e.currentTarget.style.borderColor = C.primary }}
               onBlur={e => { e.currentTarget.style.borderColor = C.border }}
@@ -116,9 +118,10 @@ export function GroupFormModal({
           {/* 学科 */}
           <div style={{ marginBottom: '14px' }}>
             <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '6px' }}>
-              学科 <span style={{ color: C.danger }}>*</span>
+              学科 <span style={{ color: '#EF4444' }}>*</span>
             </label>
-            <input value={subject} onChange={e => setSubject(e.target.value)} placeholder="例如：AI课程"
+            <input value={subject} onChange={e => setSubject(e.target.value)}
+              placeholder="例如：AI课程"
               style={fieldStyle}
               onFocus={e => { e.currentTarget.style.borderColor = C.primary }}
               onBlur={e => { e.currentTarget.style.borderColor = C.border }}
@@ -130,20 +133,13 @@ export function GroupFormModal({
             <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '6px' }}>
               年级范围（可选）
             </label>
-            <input value={gradeRange} onChange={e => setGradeRange(e.target.value)} placeholder="例如：G7-G9"
+            <input value={gradeRange} onChange={e => setGradeRange(e.target.value)}
+              placeholder="例如：G7-G9"
               style={fieldStyle}
               onFocus={e => { e.currentTarget.style.borderColor = C.primary }}
               onBlur={e => { e.currentTarget.style.borderColor = C.border }}
             />
           </div>
-
-          {/* 教研组长 */}
-          <UserSearchPicker
-            label="教研组长（可选）"
-            value={leadId} valueName={leadName}
-            onChange={(id, n) => { setLeadId(id); setLeadName(n) }}
-            placeholder="搜索并选择组长..."
-          />
 
           {/* 描述 */}
           <div style={{ marginBottom: '14px' }}>
@@ -159,17 +155,32 @@ export function GroupFormModal({
             />
           </div>
 
+          {/* 多组长说明提示：引导用户通过成员管理设置组长 */}
+          <div style={{
+            padding: '12px 14px', borderRadius: '10px', marginBottom: '16px',
+            background: '#FFFBEB', border: '1px solid #FDE68A',
+            fontSize: '13px', color: '#92400E', lineHeight: 1.7,
+          }}>
+            👑 <strong>组长设置</strong>：创建后在「成员管理」中将成员角色改为「教研组长」即可设置组长。
+            支持多个组长，组长拥有教案评审权限。
+          </div>
+
           {/* 操作按钮 */}
           <div style={{ display: 'flex', gap: '10px' }}>
-            <button onClick={onClose} style={{ flex: 1, padding: '10px', borderRadius: '10px', border: `1px solid ${C.border}`, background: C.bg, fontSize: '14px', color: C.textSec, cursor: 'pointer' }}>
+            <button onClick={onClose} style={{
+              flex: 1, padding: '10px', borderRadius: '10px',
+              border: `1px solid ${C.border}`, background: C.bg,
+              fontSize: '14px', color: C.textSec, cursor: 'pointer',
+            }}>
               取消
             </button>
             <button
               onClick={handleSave} disabled={saving}
               style={{
                 flex: 2, padding: '10px', borderRadius: '10px', border: 'none',
-                background: saving ? C.textMuted : `linear-gradient(135deg,${C.primary},#7C3AED)`,
-                color: '#fff', fontSize: '14px', fontWeight: 600,
+                background: saving ? '#E5E7EB' : `linear-gradient(135deg,${C.primary},#7C3AED)`,
+                color: saving ? '#9CA3AF' : '#fff',
+                fontSize: '14px', fontWeight: 600,
                 cursor: saving ? 'not-allowed' : 'pointer',
               }}>
               {saving ? '保存中...' : (mode === 'create' ? '创建' : '保存')}

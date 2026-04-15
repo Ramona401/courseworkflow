@@ -16,6 +16,7 @@ import {
   getRecipe, createRecipe, updateRecipe, previewRecipeContext,
   smartRecommendComponents, getFlowPresets, validateFlow,
   getCustomStages, createCustomStage, updateCustomStage, deleteCustomStage,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   type RecipeDetail, type RecipeContextPreview, type RecommendedComponentGroup,
   type LessonStructureBlock, type LessonStructureSubSection, type PromptMode,
   type StageFlowItem, type FlowPreset, type FlowValidationMessage,
@@ -200,6 +201,7 @@ export default function RecipeEditorPage() {
       setStageFlow(prev => prev.map(s => ({ ...s, prompt_mode: s.prompt_mode || 'guided' })))
     } else {
       setStageFlow(prev => prev.map(s => {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         const { prompt_mode: _, ...rest } = s
         return rest as StageFlowItem
       }))
@@ -291,14 +293,14 @@ export default function RecipeEditorPage() {
           }
           setSelectedCompIds(new Set(compIds))
           if (detail.lesson_structure) {
-            try { const p = JSON.parse(detail.lesson_structure); if (Array.isArray(p) && p.length > 0) setLessonStructure(p) } catch {}
+            try { const p = JSON.parse(detail.lesson_structure); if (Array.isArray(p) && p.length > 0) setLessonStructure(p) } catch { /* 忽略 */ }
           }
           if (detail.prompt_mode) setPromptMode(detail.prompt_mode)
           if (detail.stages_config) {
             try {
               const p = JSON.parse(detail.stages_config)
               if (Array.isArray(p) && p.length > 0 && p[0].enabled !== undefined) setStageFlow(p)
-            } catch {}
+            } catch { /* 忽略 */ }
           }
         }
         // 迭代5：加载自定义阶段（无论是否恢复草稿都需要）
@@ -323,6 +325,7 @@ export default function RecipeEditorPage() {
   useEffect(() => { loadRecommend() }, [loadRecommend])
 
   const toggleComp = (compId: string) => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
     setSelectedCompIds(prev => { const next = new Set(prev); next.has(compId) ? next.delete(compId) : next.add(compId); return next })
   }
 

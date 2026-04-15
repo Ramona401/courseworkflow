@@ -3,6 +3,10 @@
  *   CreateDialog        — 单个Pipeline创建弹窗
  *   BatchCreateDialog   — 批量创建弹窗
  *   AssignDialog        — 批量分配审核员弹窗
+ *
+ * v99修改：
+ *   - CreateDialog: threshold默认值从9.0改为8.5，与后端DefaultPipelineConfig一致
+ *   - handleSubmit: parseFloat fallback从9.0改为8.5
  */
 import { useState } from 'react'
 import { Layers, UserPlus, X as XIcon, CheckCircle as CheckCircleIcon } from 'lucide-react'
@@ -17,7 +21,8 @@ interface CreateDialogProps {
 
 export function CreateDialog({ onClose, onCreate }: CreateDialogProps) {
   const [courseCode, setCourseCode]     = useState('')
-  const [threshold, setThreshold]       = useState('9.0')
+  // v99修复Bug1+Bug2：默认阈值从9.0改为8.5，与后端models/pipeline.go DefaultPipelineConfig一致
+  const [threshold, setThreshold]       = useState('8.5')
   const [evalRounds, setEvalRounds]     = useState('3')
   const [maxTRLoop, setMaxTRLoop]       = useState('3')
   const [maxMetaRetry, setMaxMetaRetry] = useState('3')
@@ -29,7 +34,8 @@ export function CreateDialog({ onClose, onCreate }: CreateDialogProps) {
     onCreate({
       course_code: courseCode.trim(),
       config: {
-        threshold:      parseFloat(threshold)  || 9.0,
+        // v99修复Bug1+Bug2：parseFloat fallback从9.0改为8.5
+        threshold:      parseFloat(threshold)  || 8.5,
         eval_rounds:    parseInt(evalRounds)   || 3,
         max_tr_loop:    parseInt(maxTRLoop)    || 3,
         max_meta_retry: parseInt(maxMetaRetry) || 3,

@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 /**
  * AICenterConstants — AI管理中心共享常量+小组件
  *

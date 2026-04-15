@@ -162,6 +162,8 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction }: ActionBarP
         break
       case 'revision':
         buttons.push({ label: '修改后重提', style: primaryBtn, action: 'submit' })
+        // 支持退回备课工坊深度修改（大改场景）
+        buttons.push({ label: '🛠 返回备课工坊', style: secondaryBtn, action: 'workshop' })
         break
       case 'approved':
       case 'published_shared':
@@ -201,6 +203,12 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction }: ActionBarP
             if (btn.action === 'view_pipeline') {
               if (plan.linked_pipeline_id) navigate(`/workflow/pipelines/${plan.linked_pipeline_id}`)
               else navigate('/workflow/pipelines')
+              return
+            }
+            // 返回备课工坊：写入sessionStorage后跳转，工坊会自动加载该教案
+            if (btn.action === 'workshop') {
+              sessionStorage.setItem('workshop_active_plan_id', plan.id)
+              navigate('/lesson-plans')
               return
             }
             onAction(btn.action)

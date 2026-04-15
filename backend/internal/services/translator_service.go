@@ -3,6 +3,10 @@ package services
 // Translator + Reviewer 循环执行服务
 // v46修复：所有AI调用改用 callAIWithSemaphore，通过引擎信号量控制并发
 //          修复之前直接调用 ai.CallAI() 绕过信号量导致AI API并发过高卡死的问题
+// v100修复Bug1：修复QUALITY_GATE判定逻辑——QUALITY_GATE=FAIL时不再直接判失败，
+//               改为对比用户设置的threshold；只有 score < threshold 才真正不通过。
+//               原逻辑导致用户设置8.5阈值但得分8.9时仍被判失败，原因是prompt_d内置
+//               的QUALITY_GATE标准是9分，与用户阈值不同步。
 
 import (
 	"encoding/json"
@@ -32,9 +36,14 @@ var (
 // ==================== Translator+Reviewer 步骤执行（P4-5新增）====================
 
 // executeTranslator 执行translator步骤：Translator(Prompt C) + Reviewer(Prompt D) 循环
-// 循环逻辑：Reviewer评分≥threshold且QUALITY_GATE=PASS → 通过
-//           否则提取反馈重跑Translator（最多max_tr_loop次）
+// 循环逻辑：
+//   - QUALITY_GATE=PASS → 直接通过
+//   - QUALITY_GATE=FAIL 且 score >= threshold → 通过（用户阈值优先于提示词内置标准）
+//   - QUALITY_GATE=FAIL 且 score < threshold → 不通过，继续重试
+//   - QUALITY_GATE为空 → 纯分数判定：score >= threshold → 通过
+//
 // v46修复：所有AI调用改用 s.callAIWithSemaphore() 以遵守引擎并发限制
+// v100修复Bug1：QUALITY_GATE=FAIL时改为对比threshold，不再无条件判失败
 func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 	startTime := time.Now()
 	stepName := models.StepTranslator
@@ -45,7 +54,7 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 
 	// 解析Pipeline配置
 	pCfg := models.ParsePipelineConfig(pipeline.Config)
-	threshold := pCfg.Threshold // 默认9.0
+	threshold := pCfg.Threshold // 从用户配置读取，默认8.5
 	maxLoop := pCfg.MaxTRLoop   // 默认3
 
 	// 1. 加载 Prompt C（Translator提示词）
@@ -70,14 +79,14 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("translator: 课程 %s 不存在", pipeline.CourseCode)
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 	courseIndex, err := repository.GetCourseIndex(course.ID)
 	if err != nil {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := "translator: 课程索引不存在"
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// 4. 获取Scanner步骤的parsed结果（课程定位JSON）
@@ -110,7 +119,7 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("translator: 获取Translator AI配置失败: %s", err.Error())
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// 7. 获取AI配置（使用reviewer场景）
@@ -125,7 +134,18 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("translator: 获取Reviewer AI配置失败: %s", err.Error())
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
+	}
+
+	// v90机制优化3：2审时读取1审translator的最终翻译方案
+	// 原因：2审Translator只能看到2审meta的修改方案，但不知道1审translator具体怎么做的
+	// 注入1审方案后，2审Translator可以在1审基础上增量修改，而不是从零开始翻译
+	var firstRoundTransOutput string
+	if pipeline.ReviewRound >= 2 {
+		transStepR1, _ := repository.GetStepByNameAndRound(pipeline.ID, models.StepTranslator, 1)
+		if transStepR1 != nil && transStepR1.Status == models.StepStatusDone && transStepR1.StepData != "" {
+			firstRoundTransOutput = extractTranslatorFinalOutput(transStepR1.StepData)
+		}
 	}
 
 	// 8. 循环执行 Translator → Reviewer
@@ -150,6 +170,7 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 			metaRawOutput,
 			feedback,
 			loop,
+			firstRoundTransOutput,
 		)
 
 		transResult, transErr := s.callAIWithSemaphore(aiCfgTrans, promptC.Content, transUserPrompt, pipeline.ID)
@@ -166,7 +187,7 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 				s.saveStepData(pipeline.ID, stepName, result.ToJSON())
 				errMsg := fmt.Sprintf("%s (第%d轮): %s", ErrTransTranslatorFailed.Error(), loop, transErr.Error())
 				_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-				return fmt.Errorf(errMsg)
+				return fmt.Errorf("%s", errMsg)
 			}
 			continue
 		}
@@ -201,7 +222,7 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 				s.saveStepData(pipeline.ID, stepName, result.ToJSON())
 				errMsg := fmt.Sprintf("%s (第%d轮): %s", ErrTransReviewerFailed.Error(), loop, reviewErr.Error())
 				_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-				return fmt.Errorf(errMsg)
+				return fmt.Errorf("%s", errMsg)
 			}
 			continue
 		}
@@ -224,15 +245,28 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 		roundRecord.E4 = scoreInfo.e4
 
 		// ---- 8d. 判断是否通过 ----
-		// 通过规则：QUALITY_GATE=PASS直接通过；QUALITY_GATE=FAIL直接不通过（有必须修复项）；
-		// QUALITY_GATE为空时（未提取到）用分数≥threshold判定
+		// v100修复Bug1：修正判定逻辑，以用户配置的threshold为最终裁决标准
+		//
+		// 背景：prompt_d（Reviewer提示词）内部有固定的QUALITY_GATE标准（通常是9分），
+		// 与用户在创建Pipeline时设置的threshold（如8.5）不同步。
+		// 原逻辑：QUALITY_GATE=FAIL → 直接判不通过，导致8.9分被8.5阈值错误拦截。
+		//
+		// 新判定规则：
+		//   1. QUALITY_GATE=PASS → 通过（提示词和阈值都认为合格）
+		//   2. QUALITY_GATE=FAIL → 不直接判失败，改为对比threshold：
+		//      - score >= threshold → 通过（用户阈值已满足，QUALITY_GATE仅供参考）
+		//      - score < threshold  → 不通过，继续重试
+		//   3. QUALITY_GATE为空（未提取到）→ 纯分数判定：score >= threshold → 通过
 		var passed bool
 		if scoreInfo.qualityGate == "PASS" {
+			// 提示词判定通过，直接采纳
 			passed = true
 		} else if scoreInfo.qualityGate == "FAIL" {
-			passed = false
+			// 提示词判定不通过，但以用户阈值为准
+			// 若score已达到用户设定的threshold，仍视为通过
+			passed = scoreInfo.score > 0 && scoreInfo.score >= threshold
 		} else {
-			// 未提取到QUALITY_GATE，回退到分数判定
+			// 未提取到QUALITY_GATE，回退到纯分数判定
 			passed = scoreInfo.score > 0 && scoreInfo.score >= threshold
 		}
 		roundRecord.Passed = passed
@@ -288,7 +322,7 @@ func (s *PipelineService) executeTranslator(pipeline *models.Pipeline) error {
 	errMsg := fmt.Sprintf("%s (最终得分: %.1f, 阈值: %.1f, 共%d轮)",
 		ErrTransAllLoopsFailed.Error(), lastRound.Score, threshold, maxLoop)
 	_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-	return fmt.Errorf(errMsg)
+	return fmt.Errorf("%s", errMsg)
 }
 
 // ==================== Translator/Reviewer 输入构造（P4-5新增）====================
@@ -301,6 +335,7 @@ func buildTranslatorUserPrompt(
 	metaRawOutput string,
 	feedback string,
 	round int,
+	firstRoundTransOutput string,
 ) string {
 	parts := []string{
 		"【课程定位】",
@@ -311,6 +346,25 @@ func buildTranslatorUserPrompt(
 		"",
 		"【Meta元评估完整输出（含修改方案+修改后索引）】",
 		metaRawOutput,
+	}
+
+	// v90机制优化3：2审首轮时注入1审translator的最终翻译方案
+	// 让2审translator在1审逐页修改指令基础上进行增量优化，而非从零开始
+	if round == 1 && firstRoundTransOutput != "" {
+		r1Summary := firstRoundTransOutput
+		if len([]rune(r1Summary)) > 8000 {
+			r1Summary = string([]rune(r1Summary)[:8000]) + "\n...（已截取）"
+		}
+		parts = append(parts,
+			"",
+			"【一审逐页修改指令（重要参考：请在此基础上增量优化）】",
+			"以下是一审translator已完成的逐页修改方案。二审应在此基础上：",
+			"1. 保留一审中合理的修改（交互增强、能力评估、页面调整等）",
+			"2. 针对验收未通过的扣分项进行增量修复",
+			"3. 不要推翻一审已确认的修改方向，除非有明确质量问题",
+			"",
+			r1Summary,
+		)
 	}
 
 	// 非首轮：追加Reviewer反馈

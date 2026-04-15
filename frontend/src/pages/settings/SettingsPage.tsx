@@ -84,6 +84,7 @@ export default function SettingsPage() {
       const res = await fetch('/api/v1/health')
       const data = await res.json()
       setHealth(data)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) {
       setHealthError(e.message || '连接失败')
     }
@@ -97,7 +98,9 @@ export default function SettingsPage() {
     setEngineError('')
     try {
       const res = await client.get('/engine/stats')
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       setEngine((res.data as any).data as EngineStats)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) {
       setEngineError(e.message || '获取失败')
     }
@@ -105,6 +108,7 @@ export default function SettingsPage() {
   }, [isAdmin])
 
   useEffect(() => {
+    // eslint-disable-next-line
     checkHealth()
     loadEngineStats()
   }, [checkHealth, loadEngineStats])

@@ -7,6 +7,10 @@ package repository
 //   - 新增RollbackPageHTML：从html_history回滚到指定版本
 //   - 新增GetPageHTMLHistoryCount：获取指定页面的历史版本数量
 //   - GeneratedPageFullRow新增HtmlHistoryCount字段
+//
+// v90-2修复：
+//   - GetPrevRoundFinalHTMLMap：增加decision字段读取，reject页面返回original_html
+//     原因：1审拒绝的页面，2审generator仍基于修改后版本（final_html），导致拒绝决策未生效
 
 import (
 	"context"
@@ -116,9 +120,9 @@ func CreateGeneratedPage(pipelineID string, pageNumber int, pageTitle string,
 
 	_, err := database.DB.Exec(ctx,
 		`INSERT INTO generated_pages (pipeline_id, page_number, page_title,
-                        operation, original_html, generated_html, final_html,
-                        decision, lesson_id, merge_sources, change_reason, review_round)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9::jsonb, $10, $11)`,
+			operation, original_html, generated_html, final_html,
+			decision, lesson_id, merge_sources, change_reason, review_round)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9::jsonb, $10, $11)`,
 		pipelineID, pageNumber, pageTitle,
 		operation, originalHTML, generatedHTML, finalHTML,
 		lessonID, mergeParam, changeReason, reviewRound)
@@ -136,14 +140,14 @@ func GetGeneratedPagesByPipelineID(pipelineID string) ([]*GeneratedPageRow, erro
 
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, pipeline_id, page_number, page_title, operation,
-                        LENGTH(COALESCE(original_html,'')) as orig_len,
-                        LENGTH(COALESCE(generated_html,'')) as gen_len,
-                        LENGTH(COALESCE(final_html,'')) as final_len,
-                        decision, lesson_id, merge_sources::text,
-                        created_at, updated_at
-                 FROM generated_pages
-                 WHERE pipeline_id = $1 AND review_round = $2
-                 ORDER BY page_number ASC`, pipelineID, reviewRound)
+			LENGTH(COALESCE(original_html,'')) as orig_len,
+			LENGTH(COALESCE(generated_html,'')) as gen_len,
+			LENGTH(COALESCE(final_html,'')) as final_len,
+			decision, lesson_id, merge_sources::text,
+			created_at, updated_at
+		 FROM generated_pages
+		 WHERE pipeline_id = $1 AND review_round = $2
+		 ORDER BY page_number ASC`, pipelineID, reviewRound)
 	if err != nil {
 		return nil, fmt.Errorf("查询生成页面失败: %w", err)
 	}
@@ -189,16 +193,16 @@ func GetGeneratedPagesWithHTML(pipelineID string) ([]*GeneratedPageFullRow, erro
 
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, pipeline_id, page_number, page_title, operation,
-                        COALESCE(original_html, '') as original_html,
-                        COALESCE(generated_html, '') as generated_html,
-                        COALESCE(final_html, '') as final_html,
-                        decision, lesson_id, merge_sources::text,
-                        COALESCE(change_reason, '') as change_reason,
-                        jsonb_array_length(COALESCE(html_history, '[]'::jsonb)) as html_history_count,
-                        created_at, updated_at
-                 FROM generated_pages
-                 WHERE pipeline_id = $1 AND review_round = $2
-                 ORDER BY page_number ASC`, pipelineID, reviewRound)
+			COALESCE(original_html, '') as original_html,
+			COALESCE(generated_html, '') as generated_html,
+			COALESCE(final_html, '') as final_html,
+			decision, lesson_id, merge_sources::text,
+			COALESCE(change_reason, '') as change_reason,
+			jsonb_array_length(COALESCE(html_history, '[]'::jsonb)) as html_history_count,
+			created_at, updated_at
+		 FROM generated_pages
+		 WHERE pipeline_id = $1 AND review_round = $2
+		 ORDER BY page_number ASC`, pipelineID, reviewRound)
 	if err != nil {
 		return nil, fmt.Errorf("查询生成页面（含HTML）失败: %w", err)
 	}
@@ -249,8 +253,8 @@ func UpdatePageDecision(pipelineID string, pageNumber int, decision string, fina
 
 		_, err := database.DB.Exec(ctx,
 			`UPDATE generated_pages
-                         SET decision = $3, final_html = $4, updated_at = NOW()
-                         WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $5`,
+			 SET decision = $3, final_html = $4, updated_at = NOW()
+			 WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $5`,
 			pipelineID, pageNumber, decision, *finalHTML, reviewRound)
 		if err != nil {
 			return fmt.Errorf("更新页面P%d决策（含HTML）失败: %w", pageNumber, err)
@@ -258,8 +262,8 @@ func UpdatePageDecision(pipelineID string, pageNumber int, decision string, fina
 	} else {
 		_, err := database.DB.Exec(ctx,
 			`UPDATE generated_pages
-                         SET decision = $3, updated_at = NOW()
-                         WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $4`,
+			 SET decision = $3, updated_at = NOW()
+			 WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $4`,
 			pipelineID, pageNumber, decision, reviewRound)
 		if err != nil {
 			return fmt.Errorf("更新页面P%d决策失败: %w", pageNumber, err)
@@ -276,20 +280,20 @@ func GetPageDecisionStats(pipelineID string) (total int, decided int, err error)
 
 	err = database.DB.QueryRow(ctx,
 		`SELECT COUNT(*),
-                        COUNT(*) FILTER (WHERE decision IN ('approve', 'reject', 'edit'))
-                 FROM generated_pages gp
-                 WHERE gp.pipeline_id = $1
-                   AND gp.review_round = $2
-                   AND NOT (
-                         gp.page_number >= 1000
-                         AND EXISTS (
-                                 SELECT 1 FROM generated_pages gp2
-                                 WHERE gp2.pipeline_id = gp.pipeline_id
-                                   AND gp2.page_number = gp.page_number % 1000
-                                   AND gp2.page_number < 1000
-                                   AND gp2.review_round = gp.review_round
-                         )
-                   )`, pipelineID, reviewRound).Scan(&total, &decided)
+			COUNT(*) FILTER (WHERE decision IN ('approve', 'reject', 'edit'))
+		 FROM generated_pages gp
+		 WHERE gp.pipeline_id = $1
+		   AND gp.review_round = $2
+		   AND NOT (
+			 gp.page_number >= 1000
+			 AND EXISTS (
+				 SELECT 1 FROM generated_pages gp2
+				 WHERE gp2.pipeline_id = gp.pipeline_id
+				   AND gp2.page_number = gp.page_number % 1000
+				   AND gp2.page_number < 1000
+				   AND gp2.review_round = gp.review_round
+			 )
+		   )`, pipelineID, reviewRound).Scan(&total, &decided)
 	if err != nil {
 		return 0, 0, fmt.Errorf("查询页面决策统计失败: %w", err)
 	}
@@ -326,8 +330,8 @@ func UpdateGeneratedPageHTML(pipelineID string, pageNumber int, generatedHTML st
 
 	_, err := database.DB.Exec(ctx,
 		`UPDATE generated_pages
-                 SET generated_html = $3, final_html = $4, updated_at = NOW()
-                 WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $5`,
+		 SET generated_html = $3, final_html = $4, updated_at = NOW()
+		 WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $5`,
 		pipelineID, pageNumber, generatedHTML, finalHTML, reviewRound)
 	if err != nil {
 		return fmt.Errorf("更新页面P%d的HTML失败: %w", pageNumber, err)
@@ -345,7 +349,7 @@ func appendHTMLHistory(ctx context.Context, pipelineID string, pageNumber int, r
 	var finalHTML, genHTML *string
 	_ = database.DB.QueryRow(ctx,
 		`SELECT final_html, generated_html FROM generated_pages
-                 WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $3`,
+		 WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $3`,
 		pipelineID, pageNumber, reviewRound,
 	).Scan(&finalHTML, &genHTML)
 
@@ -377,15 +381,15 @@ func appendHTMLHistory(ctx context.Context, pipelineID string, pageNumber int, r
 	// 先追加，再截取最新的20个
 	_, _ = database.DB.Exec(ctx,
 		`UPDATE generated_pages
-                 SET html_history = (
-                     SELECT CASE
-                         WHEN jsonb_array_length(COALESCE(html_history, '[]'::jsonb) || $4::jsonb) > 20
-                         THEN (COALESCE(html_history, '[]'::jsonb) || $4::jsonb) - 0
-                         ELSE COALESCE(html_history, '[]'::jsonb) || $4::jsonb
-                     END
-                 ),
-                 updated_at = NOW()
-                 WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $3`,
+		 SET html_history = (
+		     SELECT CASE
+			 WHEN jsonb_array_length(COALESCE(html_history, '[]'::jsonb) || $4::jsonb) > 20
+			 THEN (COALESCE(html_history, '[]'::jsonb) || $4::jsonb) - 0
+			 ELSE COALESCE(html_history, '[]'::jsonb) || $4::jsonb
+		     END
+		 ),
+		 updated_at = NOW()
+		 WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $3`,
 		pipelineID, pageNumber, reviewRound, string(entryJSON))
 }
 
@@ -401,7 +405,7 @@ func RollbackPageHTML(pipelineID string, pageNumber int) (string, int, error) {
 	var historyJSON *string
 	err := database.DB.QueryRow(ctx,
 		`SELECT html_history::text FROM generated_pages
-                 WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $3`,
+		 WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $3`,
 		pipelineID, pageNumber, reviewRound,
 	).Scan(&historyJSON)
 	if err != nil {
@@ -435,10 +439,10 @@ func RollbackPageHTML(pipelineID string, pageNumber int) (string, int, error) {
 	// 更新：将最后一条快照恢复为final_html和generated_html，同时更新html_history
 	_, err = database.DB.Exec(ctx,
 		`UPDATE generated_pages
-                 SET generated_html = $4, final_html = $4,
-                     html_history = $5::jsonb,
-                     updated_at = NOW()
-                 WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $3`,
+		 SET generated_html = $4, final_html = $4,
+		     html_history = $5::jsonb,
+		     updated_at = NOW()
+		 WHERE pipeline_id = $1 AND page_number = $2 AND review_round = $3`,
 		pipelineID, pageNumber, reviewRound, lastEntry.Html, string(remainingJSON))
 	if err != nil {
 		return "", 0, fmt.Errorf("回滚页面P%d失败: %w", pageNumber, err)
@@ -476,7 +480,7 @@ func AssignPipeline(pipelineID string, assignedTo *string) error {
 	ctx := context.Background()
 	_, err := database.DB.Exec(ctx,
 		`UPDATE pipelines SET assigned_to = $2, updated_at = NOW()
-                 WHERE id = $1`, pipelineID, assignedTo)
+		 WHERE id = $1`, pipelineID, assignedTo)
 	if err != nil {
 		return fmt.Errorf("分配Pipeline失败: %w", err)
 	}
@@ -491,8 +495,8 @@ func BatchAssignPipelines(pipelineIDs []string, assignedTo *string) (int, error)
 	ctx := context.Background()
 	result, err := database.DB.Exec(ctx,
 		`UPDATE pipelines
-                 SET assigned_to = $2, updated_at = NOW()
-                 WHERE id = ANY($1)`,
+		 SET assigned_to = $2, updated_at = NOW()
+		 WHERE id = ANY($1)`,
 		pipelineIDs, assignedTo)
 	if err != nil {
 		return 0, fmt.Errorf("批量分配Pipeline失败: %w", err)
@@ -505,9 +509,9 @@ func ListOperatorUsers() ([]map[string]string, error) {
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, username, display_name, role
-                 FROM users
-                 WHERE status = 'active' AND role IN ('admin', 'operator', 'senior_operator')
-                 ORDER BY role ASC, display_name ASC`)
+		 FROM users
+		 WHERE status = 'active' AND role IN ('admin', 'operator', 'senior_operator')
+		 ORDER BY role ASC, display_name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("查询审核员列表失败: %w", err)
 	}
@@ -533,18 +537,28 @@ func ListOperatorUsers() ([]map[string]string, error) {
 // ==================== 2审辅助：上一轮定稿HTML映射 ====================
 
 // GetPrevRoundFinalHTMLMap 获取上一轮所有页面的定稿HTML映射
+//
+// v90-2修复：增加decision字段读取，根据审核决策决定返回哪个HTML版本
+//   - decision='reject' → 返回original_html（审核员拒绝了AI修改，应回退到原始版本）
+//   - decision='approve' → 返回generated_html优先，降级final_html
+//   - decision='edit' → 返回final_html（审核员手动编辑的版本）
+//   - 其他（pending等）→ 保持原有逻辑：final_html > generated_html > original_html
+//
+// 原始问题：该函数不读取decision字段，对所有页面统一按final_html>generated_html>original_html
+// 取HTML，导致1审拒绝的页面在2审时仍然基于AI修改后的版本进行处理
 func GetPrevRoundFinalHTMLMap(pipelineID string, prevRound int) map[int]string {
 	ctx := context.Background()
 	result := make(map[int]string)
 
 	rows, err := database.DB.Query(ctx,
 		`SELECT page_number,
-                        COALESCE(final_html, '') as final_html,
-                        COALESCE(generated_html, '') as generated_html,
-                        COALESCE(original_html, '') as original_html
-                 FROM generated_pages
-                 WHERE pipeline_id = $1 AND review_round = $2
-                 ORDER BY page_number ASC`, pipelineID, prevRound)
+			COALESCE(final_html, '') as final_html,
+			COALESCE(generated_html, '') as generated_html,
+			COALESCE(original_html, '') as original_html,
+			COALESCE(decision, 'pending') as decision
+		 FROM generated_pages
+		 WHERE pipeline_id = $1 AND review_round = $2
+		 ORDER BY page_number ASC`, pipelineID, prevRound)
 	if err != nil {
 		return result
 	}
@@ -552,17 +566,51 @@ func GetPrevRoundFinalHTMLMap(pipelineID string, prevRound int) map[int]string {
 
 	for rows.Next() {
 		var pageNum int
-		var finalHTML, genHTML, origHTML string
-		if err := rows.Scan(&pageNum, &finalHTML, &genHTML, &origHTML); err != nil {
+		var finalHTML, genHTML, origHTML, decision string
+		if err := rows.Scan(&pageNum, &finalHTML, &genHTML, &origHTML, &decision); err != nil {
 			continue
 		}
-		html := finalHTML
-		if html == "" {
-			html = genHTML
-		}
-		if html == "" {
+
+		// v90-2修复：根据审核决策决定返回哪个HTML版本
+		var html string
+		switch decision {
+		case "reject":
+			// 审核员拒绝了AI修改，应回退到原始版本
+			// 这样2审的generator会基于原始课件重新修改，而不是基于被拒绝的AI修改版本
 			html = origHTML
+			if html == "" {
+				html = finalHTML
+			}
+		case "approve":
+			// v99修复Bug5：审核员批准了AI修改，优先使用finalHTML
+			// 原因：打回重审后operator可能编辑了finalHTML，此时应使用编辑后版本
+			html = finalHTML
+			if html == "" {
+				html = genHTML
+			}
+			if html == "" {
+				html = origHTML
+			}
+		case "edit":
+			// 审核员手动编辑，使用编辑后版本
+			html = finalHTML
+			if html == "" {
+				html = genHTML
+			}
+			if html == "" {
+				html = origHTML
+			}
+		default:
+			// pending或其他状态，保持原有逻辑
+			html = finalHTML
+			if html == "" {
+				html = genHTML
+			}
+			if html == "" {
+				html = origHTML
+			}
 		}
+
 		if len(html) > 100 {
 			result[pageNum] = html
 		}

@@ -197,8 +197,9 @@ export function PlanCard({ plan, onAction, loadingId }: PlanCardProps) {
 
       {/* 退回说明 */}
       {plan.status === 'revision' && (
-        <div style={{ padding: '8px 12px', background: 'rgba(249,115,22,0.06)', borderRadius: '8px', fontSize: '12px', color: C.warning, marginBottom: '12px', lineHeight: 1.6 }}>
-          💬 {statusCfg.desc}
+        <div style={{ padding: '10px 14px', background: 'rgba(249,115,22,0.06)', borderRadius: '8px', fontSize: '12px', color: C.warning, marginBottom: '12px', lineHeight: 1.7, borderLeft: '3px solid #F97316' }}>
+          <div style={{ fontWeight: 600, marginBottom: '4px' }}>↩️ 已被退回修改</div>
+          <div style={{ color: '#6B7280' }}>评审员已留下修改意见，点击「查看详情」可查看完整评审意见和改进建议。</div>
         </div>
       )}
 

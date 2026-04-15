@@ -107,7 +107,7 @@ func CreatePipeline(p *models.Pipeline) error {
 	if err != nil {
 		return fmt.Errorf("开启事务失败: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	// 插入Pipeline主记录
 	err = tx.QueryRow(ctx,

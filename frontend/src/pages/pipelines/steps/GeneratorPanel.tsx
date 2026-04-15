@@ -9,6 +9,7 @@ import {
 
 /** Generator面板属性 */
 interface GeneratorPanelProps {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   data: any
 }
 
@@ -61,7 +62,8 @@ export default function GeneratorPanel({ data }: GeneratorPanelProps) {
               </tr>
             </thead>
             <tbody>
-              {(data.pages || []).map((p: any) => {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              {(data.pages || []).map((p: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
                 const opColor = opColorMap[p.operation] || opColorMap.keep
                 return (
                   <tr key={p.page_number} style={{ borderBottom: '1px solid rgba(0,0,0,0.03)' }}>

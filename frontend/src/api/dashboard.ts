@@ -1,8 +1,21 @@
 /**
  * 仪表盘API封装
  * P4.5-D新增：获取仪表盘统计数据
+ * FE-CS-01修复：消除 (res.data as any).data 类型绕过，改用 extractData 辅助函数
  */
 import client from './client'
+import type { ApiResponse } from './client'
+import type { AxiosResponse } from 'axios'
+
+// ==================== 辅助函数 ====================
+
+/**
+ * extractData 从 Axios 响应中安全提取业务数据
+ * FE-CS-01修复：替代 (res.data as any).data 写法
+ */
+function extractData<T>(res: AxiosResponse<ApiResponse<T>>): T {
+  return res.data.data as T
+}
 
 // ==================== 类型定义 ====================
 
@@ -32,6 +45,6 @@ export interface DashboardStats {
 
 /** 获取仪表盘统计数据 */
 export async function getDashboardStats(): Promise<DashboardStats> {
-  const res = await client.get('/dashboard/stats')
-  return (res.data as any).data as DashboardStats
+  const res = await client.get<ApiResponse<DashboardStats>>('/dashboard/stats')
+  return extractData<DashboardStats>(res)
 }

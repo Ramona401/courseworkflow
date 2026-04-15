@@ -8,7 +8,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { getExternalDataConfigs, updateExternalDataConfigs } from '@/api/external-data'
 import type { ExternalDataConfigItem } from '@/api/external-data'
-import { Database, Save, RefreshCw, Eye, EyeOff, Cloud, Send } from 'lucide-react'
+import { Save, RefreshCw, Eye, EyeOff, Cloud, Send } from 'lucide-react'
 
 // ==================== 样式常量 ====================
 

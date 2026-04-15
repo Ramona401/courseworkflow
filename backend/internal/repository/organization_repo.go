@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,17 +15,16 @@ import (
 // ==================== 错误常量 ====================
 
 var (
-	ErrOrgNotFound       = errors.New("组织不存在")
-	ErrOrgNameExists     = errors.New("同类型下组织名称已存在")
-	ErrGroupNotFound     = errors.New("教研组不存在")
-	ErrGroupNameExists   = errors.New("该学校下教研组名称已存在")
-	ErrMemberExists      = errors.New("该用户已是教研组成员")
-	ErrMemberNotFound    = errors.New("教研组成员不存在")
+	ErrOrgNotFound    = errors.New("组织不存在")
+	ErrOrgNameExists  = errors.New("同类型下组织名称已存在")
+	ErrGroupNotFound  = errors.New("教研组不存在")
+	ErrGroupNameExists = errors.New("该学校下教研组名称已存在")
+	ErrMemberExists   = errors.New("该用户已是教研组成员")
+	ErrMemberNotFound = errors.New("教研组成员不存在")
 )
 
 // ==================== 组织 CRUD ====================
 
-// CreateOrganization 创建组织（区域/学校）
 func CreateOrganization(ctx context.Context, org *models.Organization) error {
 	query := `
 		INSERT INTO organizations (name, type, parent_id, admin_user_id, settings, status)
@@ -44,7 +44,6 @@ func CreateOrganization(ctx context.Context, org *models.Organization) error {
 	return nil
 }
 
-// GetOrganizationByID 根据ID查询组织
 func GetOrganizationByID(ctx context.Context, id string) (*models.Organization, error) {
 	org := &models.Organization{}
 	query := `
@@ -64,9 +63,7 @@ func GetOrganizationByID(ctx context.Context, id string) (*models.Organization, 
 	return org, nil
 }
 
-// ListOrganizations 获取组织列表（支持按类型和父级筛选）
 func ListOrganizations(ctx context.Context, orgType string, parentID string) ([]*models.OrganizationListItem, error) {
-	// 动态构建查询条件
 	query := `
 		SELECT o.id, o.name, o.type, o.parent_id, o.admin_user_id, o.status, o.created_at,
 		       COALESCE(p.name, '') AS parent_name,
@@ -90,7 +87,6 @@ func ListOrganizations(ctx context.Context, orgType string, parentID string) ([]
 	if parentID != "" {
 		query += fmt.Sprintf(" AND o.parent_id = $%d", argIdx)
 		args = append(args, parentID)
-		argIdx++
 	}
 	query += " ORDER BY o.type ASC, o.name ASC"
 
@@ -117,7 +113,6 @@ func ListOrganizations(ctx context.Context, orgType string, parentID string) ([]
 	return items, nil
 }
 
-// UpdateOrganization 更新组织信息
 func UpdateOrganization(ctx context.Context, id string, req *models.UpdateOrganizationRequest) error {
 	query := `
 		UPDATE organizations
@@ -145,7 +140,6 @@ func UpdateOrganization(ctx context.Context, id string, req *models.UpdateOrgani
 	return nil
 }
 
-// DeleteOrganization 删除组织（物理删除，需先确认无下属）
 func DeleteOrganization(ctx context.Context, id string) error {
 	result, err := database.DB.Exec(ctx, `DELETE FROM organizations WHERE id = $1`, id)
 	if err != nil {
@@ -157,7 +151,6 @@ func DeleteOrganization(ctx context.Context, id string) error {
 	return nil
 }
 
-// CheckOrgNameExists 检查同类型下组织名称是否已存在
 func CheckOrgNameExists(ctx context.Context, name string, orgType string, excludeID string) (bool, error) {
 	query := `SELECT COUNT(*) FROM organizations WHERE name = $1 AND type = $2`
 	args := []interface{}{name, orgType}
@@ -173,7 +166,6 @@ func CheckOrgNameExists(ctx context.Context, name string, orgType string, exclud
 	return count > 0, nil
 }
 
-// GetSchoolsByRegion 获取某区域下所有学校
 func GetSchoolsByRegion(ctx context.Context, regionID string) ([]*models.Organization, error) {
 	query := `
 		SELECT id, name, type, parent_id, admin_user_id, settings, status, created_at, updated_at
@@ -203,7 +195,6 @@ func GetSchoolsByRegion(ctx context.Context, regionID string) ([]*models.Organiz
 
 // ==================== 教研组 CRUD ====================
 
-// CreateTeachingGroup 创建教研组
 func CreateTeachingGroup(ctx context.Context, tg *models.TeachingGroup) error {
 	query := `
 		INSERT INTO teaching_groups (name, school_id, subject, grade_range, lead_user_id, description, settings, status)
@@ -224,7 +215,6 @@ func CreateTeachingGroup(ctx context.Context, tg *models.TeachingGroup) error {
 	return nil
 }
 
-// GetTeachingGroupByID 根据ID查询教研组
 func GetTeachingGroupByID(ctx context.Context, id string) (*models.TeachingGroup, error) {
 	tg := &models.TeachingGroup{}
 	query := `
@@ -246,14 +236,22 @@ func GetTeachingGroupByID(ctx context.Context, id string) (*models.TeachingGroup
 	return tg, nil
 }
 
-// ListTeachingGroups 获取教研组列表（支持按学校筛选）
+// ListTeachingGroups 获取教研组列表
+// v109改动：lead_user_names 从成员角色表聚合所有 role='lead' 的成员名称（逗号分隔）
 func ListTeachingGroups(ctx context.Context, schoolID string) ([]*models.TeachingGroupListItem, error) {
 	query := `
 		SELECT tg.id, tg.name, tg.school_id, tg.subject, tg.grade_range,
 		       tg.lead_user_id, tg.status, tg.created_at,
 		       COALESCE(o.name, '') AS school_name,
 		       COALESCE(u.display_name, '') AS lead_user_name,
-		       (SELECT COUNT(*) FROM teaching_group_members tgm WHERE tgm.group_id = tg.id) AS member_count
+		       (SELECT COUNT(*) FROM teaching_group_members tgm WHERE tgm.group_id = tg.id) AS member_count,
+		       COALESCE(
+		         (SELECT string_agg(u2.display_name, '、' ORDER BY tgm2.joined_at)
+		          FROM teaching_group_members tgm2
+		          JOIN users u2 ON u2.id = tgm2.user_id
+		          WHERE tgm2.group_id = tg.id AND tgm2.role = 'lead'),
+		         ''
+		       ) AS lead_user_names
 		FROM teaching_groups tg
 		LEFT JOIN organizations o ON o.id = tg.school_id
 		LEFT JOIN users u ON u.id = tg.lead_user_id
@@ -265,7 +263,6 @@ func ListTeachingGroups(ctx context.Context, schoolID string) ([]*models.Teachin
 	if schoolID != "" {
 		query += fmt.Sprintf(" AND tg.school_id = $%d", argIdx)
 		args = append(args, schoolID)
-		argIdx++
 	}
 	query += " ORDER BY tg.name ASC"
 
@@ -282,6 +279,7 @@ func ListTeachingGroups(ctx context.Context, schoolID string) ([]*models.Teachin
 			&item.ID, &item.Name, &item.SchoolID, &item.Subject, &item.GradeRange,
 			&item.LeadUserID, &item.Status, &item.CreatedAt,
 			&item.SchoolName, &item.LeadUserName, &item.MemberCount,
+			&item.LeadUserNames,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("扫描教研组行失败: %w", err)
@@ -291,13 +289,12 @@ func ListTeachingGroups(ctx context.Context, schoolID string) ([]*models.Teachin
 	return items, nil
 }
 
-// UpdateTeachingGroup 更新教研组信息
 func UpdateTeachingGroup(ctx context.Context, id string, req *models.UpdateTeachingGroupRequest) error {
 	query := `
 		UPDATE teaching_groups
-		SET name = $1, subject = $2, grade_range = $3, lead_user_id = $4,
-		    description = $5, settings = $6, status = $7, updated_at = $8
-		WHERE id = $9
+		SET name = $1, subject = $2, grade_range = $3,
+		    description = $4, settings = $5, status = $6, updated_at = $7
+		WHERE id = $8
 	`
 	settings := req.Settings
 	if settings == "" {
@@ -309,7 +306,7 @@ func UpdateTeachingGroup(ctx context.Context, id string, req *models.UpdateTeach
 	}
 	now := time.Now()
 	result, err := database.DB.Exec(ctx, query,
-		req.Name, req.Subject, req.GradeRange, req.LeadUserID,
+		req.Name, req.Subject, req.GradeRange,
 		req.Description, settings, status, now, id,
 	)
 	if err != nil {
@@ -321,7 +318,6 @@ func UpdateTeachingGroup(ctx context.Context, id string, req *models.UpdateTeach
 	return nil
 }
 
-// DeleteTeachingGroup 删除教研组（级联删除成员）
 func DeleteTeachingGroup(ctx context.Context, id string) error {
 	result, err := database.DB.Exec(ctx, `DELETE FROM teaching_groups WHERE id = $1`, id)
 	if err != nil {
@@ -333,7 +329,6 @@ func DeleteTeachingGroup(ctx context.Context, id string) error {
 	return nil
 }
 
-// CheckGroupNameExists 检查同一学校下教研组名称是否已存在
 func CheckGroupNameExists(ctx context.Context, schoolID string, name string, excludeID string) (bool, error) {
 	query := `SELECT COUNT(*) FROM teaching_groups WHERE school_id = $1 AND name = $2`
 	args := []interface{}{schoolID, name}
@@ -351,7 +346,6 @@ func CheckGroupNameExists(ctx context.Context, schoolID string, name string, exc
 
 // ==================== 教研组成员 CRUD ====================
 
-// AddGroupMember 添加教研组成员
 func AddGroupMember(ctx context.Context, member *models.TeachingGroupMember) error {
 	query := `
 		INSERT INTO teaching_group_members (group_id, user_id, role)
@@ -371,7 +365,6 @@ func AddGroupMember(ctx context.Context, member *models.TeachingGroupMember) err
 	return nil
 }
 
-// RemoveGroupMember 移除教研组成员
 func RemoveGroupMember(ctx context.Context, groupID string, userID string) error {
 	result, err := database.DB.Exec(ctx,
 		`DELETE FROM teaching_group_members WHERE group_id = $1 AND user_id = $2`,
@@ -386,14 +379,15 @@ func RemoveGroupMember(ctx context.Context, groupID string, userID string) error
 	return nil
 }
 
-// ListGroupMembers 获取教研组成员列表
 func ListGroupMembers(ctx context.Context, groupID string) ([]*models.GroupMemberItem, error) {
 	query := `
 		SELECT tgm.id, tgm.user_id, u.username, u.display_name, tgm.role, tgm.joined_at
 		FROM teaching_group_members tgm
 		JOIN users u ON u.id = tgm.user_id
 		WHERE tgm.group_id = $1
-		ORDER BY tgm.joined_at ASC
+		ORDER BY
+		  CASE tgm.role WHEN 'lead' THEN 0 WHEN 'backbone' THEN 1 ELSE 2 END,
+		  tgm.joined_at ASC
 	`
 	rows, err := database.DB.Query(ctx, query, groupID)
 	if err != nil {
@@ -416,7 +410,6 @@ func ListGroupMembers(ctx context.Context, groupID string) ([]*models.GroupMembe
 	return items, nil
 }
 
-// UpdateGroupMemberRole 更新成员角色
 func UpdateGroupMemberRole(ctx context.Context, groupID string, userID string, role string) error {
 	result, err := database.DB.Exec(ctx,
 		`UPDATE teaching_group_members SET role = $1 WHERE group_id = $2 AND user_id = $3`,
@@ -431,7 +424,6 @@ func UpdateGroupMemberRole(ctx context.Context, groupID string, userID string, r
 	return nil
 }
 
-// CheckMemberExists 检查用户是否已是教研组成员
 func CheckMemberExists(ctx context.Context, groupID string, userID string) (bool, error) {
 	var count int
 	err := database.DB.QueryRow(ctx,
@@ -444,14 +436,20 @@ func CheckMemberExists(ctx context.Context, groupID string, userID string) (bool
 	return count > 0, nil
 }
 
-// GetUserTeachingGroups 获取用户所属的所有教研组（用于判断教案权限）
 func GetUserTeachingGroups(ctx context.Context, userID string) ([]*models.TeachingGroupListItem, error) {
 	query := `
 		SELECT tg.id, tg.name, tg.school_id, tg.subject, tg.grade_range,
 		       tg.lead_user_id, tg.status, tg.created_at,
 		       COALESCE(o.name, '') AS school_name,
 		       COALESCE(u.display_name, '') AS lead_user_name,
-		       (SELECT COUNT(*) FROM teaching_group_members tgm2 WHERE tgm2.group_id = tg.id) AS member_count
+		       (SELECT COUNT(*) FROM teaching_group_members tgm2 WHERE tgm2.group_id = tg.id) AS member_count,
+		       COALESCE(
+		         (SELECT string_agg(u2.display_name, '、' ORDER BY tgm3.joined_at)
+		          FROM teaching_group_members tgm3
+		          JOIN users u2 ON u2.id = tgm3.user_id
+		          WHERE tgm3.group_id = tg.id AND tgm3.role = 'lead'),
+		         ''
+		       ) AS lead_user_names
 		FROM teaching_group_members tgm
 		JOIN teaching_groups tg ON tg.id = tgm.group_id
 		LEFT JOIN organizations o ON o.id = tg.school_id
@@ -472,6 +470,7 @@ func GetUserTeachingGroups(ctx context.Context, userID string) ([]*models.Teachi
 			&item.ID, &item.Name, &item.SchoolID, &item.Subject, &item.GradeRange,
 			&item.LeadUserID, &item.Status, &item.CreatedAt,
 			&item.SchoolName, &item.LeadUserName, &item.MemberCount,
+			&item.LeadUserNames,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("扫描教研组行失败: %w", err)
@@ -482,21 +481,32 @@ func GetUserTeachingGroups(ctx context.Context, userID string) ([]*models.Teachi
 }
 
 // IsGroupLead 检查用户是否是某教研组的组长
+// v109改动：从成员角色表查 role='lead'（支持多组长），不再只查 lead_user_id 字段
 func IsGroupLead(ctx context.Context, groupID string, userID string) (bool, error) {
 	var count int
 	err := database.DB.QueryRow(ctx,
-		`SELECT COUNT(*) FROM teaching_groups WHERE id = $1 AND lead_user_id = $2`,
+		`SELECT COUNT(*) FROM teaching_group_members
+		 WHERE group_id = $1 AND user_id = $2 AND role = 'lead'`,
 		groupID, userID,
 	).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("检查组长权限失败: %w", err)
 	}
+	// 兼容旧数据：同时检查 teaching_groups.lead_user_id
+	if count == 0 {
+		err = database.DB.QueryRow(ctx,
+			`SELECT COUNT(*) FROM teaching_groups WHERE id = $1 AND lead_user_id = $2`,
+			groupID, userID,
+		).Scan(&count)
+		if err != nil {
+			return false, fmt.Errorf("检查组长权限(兼容)失败: %w", err)
+		}
+	}
 	return count > 0, nil
 }
 
-// IsGroupLeadOrBackbone 检查用户是否是组长或骨干（有审核权限）
+// IsGroupLeadOrBackbone 检查用户是否有评审权限（组长或骨干）
 func IsGroupLeadOrBackbone(ctx context.Context, groupID string, userID string) (bool, error) {
-	// 先检查是否是组长
 	isLead, err := IsGroupLead(ctx, groupID, userID)
 	if err != nil {
 		return false, err
@@ -504,14 +514,37 @@ func IsGroupLeadOrBackbone(ctx context.Context, groupID string, userID string) (
 	if isLead {
 		return true, nil
 	}
-	// 再检查是否是骨干成员
 	var count int
 	err = database.DB.QueryRow(ctx,
-		`SELECT COUNT(*) FROM teaching_group_members WHERE group_id = $1 AND user_id = $2 AND role = 'backbone'`,
+		`SELECT COUNT(*) FROM teaching_group_members
+		 WHERE group_id = $1 AND user_id = $2 AND role = 'backbone'`,
 		groupID, userID,
 	).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("检查骨干权限失败: %w", err)
 	}
 	return count > 0, nil
+}
+
+// GetGroupLeadNames 获取教研组所有组长的名称列表（逗号分隔）
+func GetGroupLeadNames(ctx context.Context, groupID string) (string, error) {
+	var names []string
+	rows, err := database.DB.Query(ctx,
+		`SELECT u.display_name FROM teaching_group_members tgm
+		 JOIN users u ON u.id = tgm.user_id
+		 WHERE tgm.group_id = $1 AND tgm.role = 'lead'
+		 ORDER BY tgm.joined_at`,
+		groupID,
+	)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err == nil {
+			names = append(names, name)
+		}
+	}
+	return strings.Join(names, "、"), nil
 }

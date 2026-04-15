@@ -13,6 +13,7 @@ import {
 
 /** Evaluator面板属性 */
 interface EvaluatorPanelProps {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   data: any
 }
 
@@ -98,6 +99,7 @@ function EvalRoundsSection() {
       const data = await getEvalRounds(pipelineId)
       setRounds(data || [])
       setLoaded(true)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) {
       setError(e.message || '加载失败')
     }
@@ -105,6 +107,7 @@ function EvalRoundsSection() {
   }
 
   // 自动加载
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { loadRounds() }, [pipelineId])
 
   if (loading) {

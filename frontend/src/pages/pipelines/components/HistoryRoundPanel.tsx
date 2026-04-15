@@ -209,12 +209,14 @@ function getEvalScore(detail: PipelineDetailResponse): number | undefined {
 }
 
 /** 从detail步骤中提取Meta分数 */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function getMetaScore(detail: PipelineDetailResponse): number | undefined {
   // 同理，列表级别没有分数数据
   return undefined
 }
 
 /** 获取验收分数（需要从verify步骤获取，但列表级别无数据） */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function getVerifyScore(_detail: PipelineDetailResponse, _round: number): number | undefined {
   return undefined
 }
@@ -429,6 +431,8 @@ export function HistoryRoundPanel({ pipelineId, currentRound }: { pipelineId: st
   // 加载选中轮次的数据
   useEffect(() => {
     if (!selectedRound || !expanded) return
+     
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true)
     getPipelineHistory(pipelineId, selectedRound)
       .then(data => {

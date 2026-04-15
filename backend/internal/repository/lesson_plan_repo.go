@@ -251,6 +251,10 @@ func ListLessonPlans(ctx context.Context, authorID string, groupID string, statu
 
 // UpdateLessonPlanContent 更新教案内容
 func UpdateLessonPlanContent(ctx context.Context, id string, title string, contentMd string, contentStruct string, durMinutes int) error {
+	// 防御性编程：空字符串不是有效JSON，PostgreSQL的jsonb列会报错
+	if contentStruct == "" {
+		contentStruct = "{}"
+	}
 	now := time.Now()
 	result, err := database.DB.Exec(ctx, `
 		UPDATE lesson_plans

@@ -3,8 +3,8 @@ package services
 // 教案管理业务逻辑层
 // 负责教案CRUD、状态流转、AI评审、Fork、评审管理、提示词模板管理
 //
-// Phase5改动：ReviewLessonPlan 触发通道二自动萃取
-// Phase6改动：StartDevelopment 创建关联Pipeline并返回pipeline_id
+// v104改动：SubmitForReview 提交评审前自动将所有 pending 批注归档，
+//           防止新旧轮次批注混显
 
 import (
 	"context"
@@ -183,13 +183,13 @@ func (s *LessonPlanService) GetLessonPlan(ctx context.Context, id string) (*mode
 		Version:           lp.Version,
 		RecipeID:          lp.RecipeID,
 		RecipeName:        recipeName,
-                LessonIndex:       lp.LessonIndex,
-                IdxCognitiveLevel: lp.IdxCognitiveLevel,
-                IdxPedagogyIntensity: lp.IdxPedagogyIntensity,
-                IdxStructureType:  lp.IdxStructureType,
-                IdxQualityLevel:   lp.IdxQualityLevel,
-                CurrentStage:     lp.CurrentStage,
-                StageConfig:      lp.StageConfig,
+		LessonIndex:       lp.LessonIndex,
+		IdxCognitiveLevel: lp.IdxCognitiveLevel,
+		IdxPedagogyIntensity: lp.IdxPedagogyIntensity,
+		IdxStructureType:  lp.IdxStructureType,
+		IdxQualityLevel:   lp.IdxQualityLevel,
+		CurrentStage:     lp.CurrentStage,
+		StageConfig:      lp.StageConfig,
 		Reviews:           reviews,
 		LinkedPipelineID:  linkedPipelineID,
 		CreatedAt:         lp.CreatedAt,
@@ -284,6 +284,10 @@ func (s *LessonPlanService) PublishPersonal(ctx context.Context, id string, call
 }
 
 // SubmitForReview 提交评审
+//
+// v104改动：提交前自动将所有 pending 批注归档（archived），
+// 防止老师重新提交后，评审员新建的批注和上一轮未处理的批注混在一起显示。
+// 只归档 pending 状态；已 resolved 的批注保持不变，作为历史记录保留。
 func (s *LessonPlanService) SubmitForReview(ctx context.Context, id string, callerID string, groupID string) error {
 	lp, err := repository.GetLessonPlanByID(ctx, id)
 	if err != nil {
@@ -299,6 +303,14 @@ func (s *LessonPlanService) SubmitForReview(ctx context.Context, id string, call
 		lp.Status != models.LPStatusPublishedPersonal &&
 		lp.Status != models.LPStatusRevision {
 		return ErrLPCannotSubmit
+	}
+
+	// v104：自动归档本轮所有 pending 批注，避免新旧轮次混显
+	// 归档失败不阻断提交流程，仅记录日志
+	if archiveErr := repository.ArchiveAnnotationsByPlanID(ctx, id); archiveErr != nil {
+		lpLog.Error("归档批注失败（不影响提交）", "plan_id", id, "error", archiveErr)
+	} else {
+		lpLog.Info("已归档本轮待处理批注", "plan_id", id)
 	}
 
 	if err := repository.UpdateLessonPlanVisibility(ctx, id, models.LPVisibilityGroup, &groupID); err != nil {
@@ -385,13 +397,6 @@ func (s *LessonPlanService) PublishShared(ctx context.Context, id string, caller
 }
 
 // StartDevelopment 进入课件开发
-// Phase6改动：
-//   1. 创建关联 Pipeline（course_code 使用 subject+grade，lesson_plan_id 写入关联）
-//   2. 更新教案状态为 developing
-//   3. 返回 StartDevelopmentResult{PipelineID}
-//
-// 注意：Pipeline 创建后需要管理员在课件审核系统手动绑定正确的课程，
-// 这里仅做最小化衔接：让教案和Pipeline产生关联关系
 func (s *LessonPlanService) StartDevelopment(ctx context.Context, id string, callerID string) (*StartDevelopmentResult, error) {
 	lp, err := repository.GetLessonPlanByID(ctx, id)
 	if err != nil {
@@ -412,7 +417,6 @@ func (s *LessonPlanService) StartDevelopment(ctx context.Context, id string, cal
 	// 检查是否已有关联Pipeline（防止重复创建）
 	existingPipeline, err := repository.GetPipelineByLessonPlanID(id)
 	if err == nil && existingPipeline != nil {
-		// 已有关联Pipeline，直接返回
 		lpLog.Info("教案已有关联Pipeline，跳过创建", "plan_id", id, "pipeline_id", existingPipeline.ID)
 		_ = repository.UpdateLessonPlanStatus(ctx, id, models.LPStatusDeveloping)
 		return &StartDevelopmentResult{
@@ -421,8 +425,6 @@ func (s *LessonPlanService) StartDevelopment(ctx context.Context, id string, cal
 		}, nil
 	}
 
-	// 创建新Pipeline（以学科+年级作为course_code占位，管理员后续可修改）
-	// 注意：这里用 subject-grade 作为临时 course_code，实际业务中需要管理员指定正确课程
 	courseCode := fmt.Sprintf("LP-%s-%s", lp.Subject, lp.Grade)
 	courseName := fmt.Sprintf("%s %s — %s", lp.Grade, lp.Subject, lp.Topic)
 	lessonPlanID := id
@@ -438,7 +440,6 @@ func (s *LessonPlanService) StartDevelopment(ctx context.Context, id string, cal
 		ReviewRound:  1,
 		LessonPlanID: &lessonPlanID,
 	}
-	// 设置默认配置
 	defaultCfg := models.DefaultPipelineConfig()
 	cfgBytes, _ := jsonMarshal(defaultCfg)
 	pipeline.Config = string(cfgBytes)
@@ -448,7 +449,6 @@ func (s *LessonPlanService) StartDevelopment(ctx context.Context, id string, cal
 		return nil, fmt.Errorf("创建课件开发任务失败: %w", err)
 	}
 
-	// 更新教案状态
 	if err := repository.UpdateLessonPlanStatus(ctx, id, models.LPStatusDeveloping); err != nil {
 		lpLog.Error("更新教案状态失败", "plan_id", id, "error", err)
 		return nil, err

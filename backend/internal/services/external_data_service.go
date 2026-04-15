@@ -88,7 +88,7 @@ func (s *ExternalDataService) GetAllConfigs() (*models.ExternalDataConfigListRes
 //   - 非敏感字段：直接更新（空字符串也会写入，表示清空）
 //   - 敏感字段：空字符串表示不修改，非空则AES加密后存储
 func (s *ExternalDataService) UpdateConfigs(req *models.UpdateExternalDataConfigsRequest, userID string) error {
-	if req.Configs == nil || len(req.Configs) == 0 {
+	if len(req.Configs) == 0 {
 		return ErrEDConfigsRequired
 	}
 

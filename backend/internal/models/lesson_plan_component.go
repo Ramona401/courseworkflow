@@ -11,51 +11,51 @@ import (
 // 支持三种注入模式：silent(静默) / recommend(推荐+确认) / on_demand(按需)
 // 四层展开：DisplayLabel → DesignLogic → ExampleSnippet → FullGuide
 type LessonPlanComponent struct {
-	ID            string     `json:"id"`              // UUID主键
-	LibraryType   string     `json:"library_type"`    // 组件库类型（13种）
-	Subject       string     `json:"subject"`         // 学科（general=通用）
-	GradeRange    string      `json:"grade_range"`     // 适用学段
-	Tags          string     `json:"tags"`            // 标签数组JSON，匹配引擎使用
-	InjectionMode string     `json:"injection_mode"`  // 注入模式：silent/recommend/on_demand
-	DisplayLabel  string     `json:"display_label"`   // 第一层：展示标签（emoji+大白话）
-	DesignLogic   string      `json:"design_logic"`    // 第二层：设计逻辑
-	ExampleSnippet string    `json:"example_snippet"` // 第三层：参考案例片段
-	FullGuide     string      `json:"full_guide"`      // 第四层：完整指引（仅AI使用）
-	Content       string     `json:"content"`         // 结构化内容JSON
-	Source        string     `json:"source"`          // 来源：manual/ai_extracted/user_contributed
-	SourceRef     string      `json:"source_ref"`      // 来源引用
-	QualityScore  float64    `json:"quality_score"`   // 综合质量分
-	UsageCount    int        `json:"usage_count"`     // 被使用次数
-	SelectCount   int        `json:"select_count"`    // 被选中次数
-	LikeCount     int        `json:"like_count"`      // 点赞数
-	DislikeCount  int        `json:"dislike_count"`   // 点踩数
-	Scope         string     `json:"scope"`           // 可见范围：global/region/school/group/personal
-	ScopeRefID    *string    `json:"scope_ref_id"`    // 范围引用ID
-	CreatedBy     *string    `json:"created_by"`      // 创建者用户ID
-	ReviewStatus  string     `json:"review_status"`   // 审核状态：draft/captured/pending/approved/rejected
-	ReviewedBy    *string    `json:"reviewed_by"`     // 审核人用户ID
-	ReviewedAt    *time.Time `json:"reviewed_at"`     // 审核时间
-	Status        string     `json:"status"`          // 状态：active/disabled/archived
-	CreatedAt     *time.Time `json:"created_at"`      // 创建时间
-	UpdatedAt     *time.Time `json:"updated_at"`      // 更新时间
+	ID             string     `json:"id"`              // UUID主键
+	LibraryType    string     `json:"library_type"`    // 组件库类型（13种）
+	Subject        string     `json:"subject"`         // 学科（general=通用）
+	GradeRange     string     `json:"grade_range"`     // 适用学段
+	Tags           string     `json:"tags"`            // 标签数组JSON，匹配引擎使用
+	InjectionMode  string     `json:"injection_mode"`  // 注入模式：silent/recommend/on_demand
+	DisplayLabel   string     `json:"display_label"`   // 第一层：展示标签（emoji+大白话）
+	DesignLogic    string     `json:"design_logic"`    // 第二层：设计逻辑
+	ExampleSnippet string     `json:"example_snippet"` // 第三层：参考案例片段
+	FullGuide      string     `json:"full_guide"`      // 第四层：完整指引（仅AI使用）
+	Content        string     `json:"content"`         // 结构化内容JSON
+	Source         string     `json:"source"`          // 来源：manual/ai_extracted/user_contributed
+	SourceRef      string     `json:"source_ref"`      // 来源引用
+	QualityScore   float64    `json:"quality_score"`   // 综合质量分
+	UsageCount     int        `json:"usage_count"`     // 被使用次数
+	SelectCount    int        `json:"select_count"`    // 被选中次数
+	LikeCount      int        `json:"like_count"`      // 点赞数
+	DislikeCount   int        `json:"dislike_count"`   // 点踩数
+	Scope          string     `json:"scope"`           // 可见范围：global/region/school/group/personal
+	ScopeRefID     *string    `json:"scope_ref_id"`    // 范围引用ID
+	CreatedBy      *string    `json:"created_by"`      // 创建者用户ID
+	ReviewStatus   string     `json:"review_status"`   // 审核状态：draft/captured/pending/approved/rejected
+	ReviewedBy     *string    `json:"reviewed_by"`     // 审核人用户ID
+	ReviewedAt     *time.Time `json:"reviewed_at"`     // 审核时间
+	Status         string     `json:"status"`          // 状态：active/disabled/archived
+	CreatedAt      *time.Time `json:"created_at"`      // 创建时间
+	UpdatedAt      *time.Time `json:"updated_at"`      // 更新时间
 }
 
 // ==================== 组件库类型常量（13种） ====================
 
 const (
-	LibCurriculumStandard  = "curriculum_standard"   // 课标与能力框架库
-	LibKnowledgeGraph      = "knowledge_graph"       // 知识图谱库
-	LibStudentProfile      = "student_profile"       // 学情特征库
-	LibPedagogy            = "pedagogy"              // 教学法库
-	LibAssessmentStrategy  = "assessment_strategy"   // 评估策略库
-	LibActivityDesign      = "activity_design"       // 活动设计方案库
-	LibQuestioningStrategy = "questioning_strategy"  // 提问引导策略库
-	LibCrossSubject        = "cross_subject"         // 跨学科连接库
-	LibTeachingTool        = "teaching_tool"         // 教学工具库
-	LibScenarioMaterial    = "scenario_material"     // 素材情境库
-	LibQualityRubric       = "quality_rubric"        // 质量评估标准库
-	LibDesignDefect        = "design_defect"         // 常见设计缺陷库
-	LibReviewRubric        = "review_rubric"         // 教案评审规则库
+	LibCurriculumStandard  = "curriculum_standard"  // 课标与能力框架库
+	LibKnowledgeGraph      = "knowledge_graph"      // 知识图谱库
+	LibStudentProfile      = "student_profile"      // 学情特征库
+	LibPedagogy            = "pedagogy"             // 教学法库
+	LibAssessmentStrategy  = "assessment_strategy"  // 评估策略库
+	LibActivityDesign      = "activity_design"      // 活动设计方案库
+	LibQuestioningStrategy = "questioning_strategy" // 提问引导策略库
+	LibCrossSubject        = "cross_subject"        // 跨学科连接库
+	LibTeachingTool        = "teaching_tool"        // 教学工具库
+	LibScenarioMaterial    = "scenario_material"    // 素材情境库
+	LibQualityRubric       = "quality_rubric"       // 质量评估标准库
+	LibDesignDefect        = "design_defect"        // 常见设计缺陷库
+	LibReviewRubric        = "review_rubric"        // 教案评审规则库
 )
 
 // ValidLibraryTypes 有效的组件库类型列表
@@ -184,6 +184,7 @@ type UpdateComponentRequest struct {
 
 // MatchComponentsRequest 组件匹配请求
 // 匹配引擎根据学科+学段+标签+注入模式查找最合适的组件
+// v89-4新增：支持AOCI索引冗余列筛选（认知层/课堂时机/教法强度）
 type MatchComponentsRequest struct {
 	Subject       string   `json:"subject"`        // 学科（必填）
 	GradeRange    string   `json:"grade_range"`    // 学段（必填）
@@ -191,6 +192,13 @@ type MatchComponentsRequest struct {
 	InjectionMode string   `json:"injection_mode"` // 筛选注入模式（可选，空=全部）
 	Tags          []string `json:"tags"`           // 标签筛选（可选）
 	Limit         int      `json:"limit"`          // 每种类型返回数量上限（默认5）
+
+	// v89-4新增：AOCI索引冗余列筛选（可选，0=不筛选）
+	// 支持传入多个值，SQL使用 ANY 匹配其中任一
+	// 例如 StageTiming=[1,4] 表示匹配"开场"或"贯穿"的组件
+	CognitiveLevel     []int `json:"cognitive_level"`      // 认知层级筛选：1记忆/2理解/3应用/4分析/5评价/6创造
+	StageTiming        []int `json:"stage_timing"`         // 课堂时机筛选：1开场/2主环节/3收尾/4贯穿
+	PedagogyIntensity  []int `json:"pedagogy_intensity"`   // 教法强度筛选：1通用/2特定/3专精
 }
 
 // ReviewComponentRequest 审核组件请求（教研组长/骨干）
@@ -211,7 +219,7 @@ type ComponentListResponse struct {
 type ComponentListItem struct {
 	ID            string     `json:"id"`
 	LibraryType   string     `json:"library_type"`
-	LibraryName   string     `json:"library_name"`    // 组件库类型中文名
+	LibraryName   string     `json:"library_name"`  // 组件库类型中文名
 	Subject       string     `json:"subject"`
 	GradeRange    string     `json:"grade_range"`
 	InjectionMode string     `json:"injection_mode"`
@@ -228,23 +236,23 @@ type ComponentListItem struct {
 
 // MatchedComponentGroup 匹配结果分组（按library_type分组）
 type MatchedComponentGroup struct {
-	LibraryType string                `json:"library_type"`  // 组件库类型
-	LibraryName string                `json:"library_name"`  // 中文名
-	Components  []*MatchedComponent   `json:"components"`    // 匹配到的组件列表
+	LibraryType string              `json:"library_type"` // 组件库类型
+	LibraryName string              `json:"library_name"` // 中文名
+	Components  []*MatchedComponent `json:"components"`   // 匹配到的组件列表
 }
 
 // MatchedComponent 匹配到的单个组件（返回给前端/AI）
 type MatchedComponent struct {
 	ID             string  `json:"id"`
-	DisplayLabel   string  `json:"display_label"`    // 第一层：展示标签
-	DesignLogic    string  `json:"design_logic"`     // 第二层：设计逻辑
-	ExampleSnippet string  `json:"example_snippet"`  // 第三层：参考案例
-	FullGuide      string  `json:"full_guide"`       // 第四层：完整指引（仅AI使用时返回）
-	QualityScore   float64 `json:"quality_score"`    // 质量分
-	UsageCount     int     `json:"usage_count"`      // 使用次数
-	SelectCount    int     `json:"select_count"`     // 选中次数
-	Tags           string  `json:"tags"`             // 标签
-	ComponentIndex string  `json:"component_index"`  // v83: AOCI压缩索引
+	DisplayLabel   string  `json:"display_label"`   // 第一层：展示标签
+	DesignLogic    string  `json:"design_logic"`    // 第二层：设计逻辑
+	ExampleSnippet string  `json:"example_snippet"` // 第三层：参考案例
+	FullGuide      string  `json:"full_guide"`      // 第四层：完整指引（仅AI使用时返回）
+	QualityScore   float64 `json:"quality_score"`   // 质量分
+	UsageCount     int     `json:"usage_count"`     // 使用次数
+	SelectCount    int     `json:"select_count"`    // 选中次数
+	Tags           string  `json:"tags"`            // 标签
+	ComponentIndex string  `json:"component_index"` // v83: AOCI压缩索引
 }
 
 // MatchComponentsResponse 组件匹配响应

@@ -104,7 +104,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := "generator: Translator输出为空"
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// 3. 获取Scanner定位
@@ -121,7 +121,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("generator: 课程 %s 不存在", pipeline.CourseCode)
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 	if course.ExternalModuleID == nil || *course.ExternalModuleID == 0 {
 		durationMs := time.Since(startTime).Milliseconds()
@@ -137,7 +137,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("%s: %s", ErrGenPageMapFailed.Error(), err.Error())
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// 6. 提取"逐页修改指令"区域，解析页面操作列表
@@ -162,7 +162,7 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 		durationMs := time.Since(startTime).Milliseconds()
 		errMsg := fmt.Sprintf("generator: 获取modify AI配置失败: %s", err.Error())
 		_ = repository.FailStep(pipeline.ID, stepName, durationMs, errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	aiCfgCreate, err := ai.GetEffectiveConfig(
@@ -369,6 +369,52 @@ func (s *PipelineService) executeGenerator(pipeline *models.Pipeline) error {
 			}
 
 		case models.PageOpCreate:
+				// v99修复Bug4：2审时如果1审已经创建过该页面，降级为modify
+				// 原因：2审Translator可能对1审已新建的页面仍输出create指令，
+				// 但该页面在1审定稿中已存在HTML，应基于1审版本修改而非重新创建
+				if pipeline.ReviewRound >= 2 && prevRoundHTMLMap != nil {
+					if prevHTML, hasPrev := prevRoundHTMLMap[realPageNum]; hasPrev && len(prevHTML) > 100 {
+						// 1审已创建该页面，降级为modify
+						fmt.Printf("[generator] 2审降级: P%d create→modify（1审已创建，基于定稿版本修改）\n", op.PageNumber)
+						op.Operation = models.PageOpModify
+						pageRec.Operation = "modify"
+						result.CreatedPages--
+						result.ModifiedPages++
+						// 使用modify流程：基于1审定稿版本修改
+						pageRec.HasOrigHTML = true
+						pageRec.OrigHTMLLen = len(prevHTML)
+						userPrompt := buildModifyUserPrompt(pipeline.CourseCode, op, prevHTML)
+						callStart := time.Now()
+						callResult, callErr := s.callAIWithSemaphore(aiCfgModify, promptF.Content, userPrompt, pipeline.ID)
+						pageRec.LatencyMs = time.Since(callStart).Milliseconds()
+						if callErr != nil {
+							pageRec.Status = "failed"
+							pageRec.Error = "2审降级modify失败: " + callErr.Error()
+							result.FailedPages++
+							result.ModifiedPages--
+							_ = repository.CreateGeneratedPage(
+								pipeline.ID, op.PageNumber, op.Title,
+								"modify", prevHTML, "", prevHTML,
+								nil, "", changeReason,
+							)
+						} else {
+							genHTML := extractGeneratedHTML(callResult.Content)
+							pageRec.GenHTMLLen = len(genHTML)
+							pageRec.TokensUsed = callResult.TokensUsed
+							pageRec.Status = "done"
+							totalTokens += callResult.TokensUsed
+							lastModelUsed = callResult.ModelUsed
+							_ = repository.CreateGeneratedPage(
+								pipeline.ID, op.PageNumber, op.Title,
+								"modify", prevHTML, genHTML, genHTML,
+								nil, "", changeReason,
+							)
+						}
+						result.Pages = append(result.Pages, pageRec)
+						continue
+					}
+				}
+
 			// create：用邻近页作为格式参考，Opus生成新页面（从零创建需要更强创意）
 			result.CreatedPages++
 			refHTML := findReferencePageHTML(ossService, pageLessonMap, realPageNum)

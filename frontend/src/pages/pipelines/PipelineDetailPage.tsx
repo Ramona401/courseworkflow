@@ -16,7 +16,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
-  getPipelineDetail, getStepDetail, verifyPipeline, restartFromStep,
+  getPipelineDetail, verifyPipeline, restartFromStep,
   type PipelineDetailResponse,
 } from '@/api/pipelines'
 import { ArrowLeft, RefreshCw, ClipboardCheck, ShieldCheck } from 'lucide-react'
@@ -132,6 +132,7 @@ export default function PipelineDetailPage() {
 
     connectSSE()
     return cleanup
+  // eslint-disable-next-line
   }, [detail?.status, id, silentRefresh, token])
 
   // ==================== 验收 ====================

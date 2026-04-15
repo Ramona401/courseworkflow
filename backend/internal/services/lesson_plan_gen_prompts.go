@@ -20,62 +20,10 @@ import (
 	"tedna/internal/models"
 )
 
-// ==================== 静默注入组件上下文 ====================
-
-// buildSilentContext 将静默注入组件转为系统上下文文本
-// 用于StartConversation时给AI提供背景参考资料
-func buildSilentContext(groups []*models.MatchedComponentGroup) string {
-	if len(groups) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	sb.WriteString("\n\n【背景参考资料（请纳入教学设计考量）】\n")
-	for _, g := range groups {
-		sb.WriteString(fmt.Sprintf("\n### %s\n", g.LibraryName))
-		for _, c := range g.Components {
-			sb.WriteString(fmt.Sprintf("- %s\n", c.DisplayLabel))
-			if c.DesignLogic != "" {
-				sb.WriteString(fmt.Sprintf("  参考逻辑：%s\n", c.DesignLogic))
-			}
-		}
-	}
-	return sb.String()
-}
 
 // ==================== 系统提示词 ====================
 
-// buildDefaultSystemPrompt 默认系统提示词（备课助手角色设定）
-func buildDefaultSystemPrompt(subject string) string {
-	return fmt.Sprintf(`你是一位专业的%s课AI备课助手，帮助教师设计高质量教案。
 
-工作原则：
-1. 用友好的对话方式引导教师，每次只问2-3个问题
-2. 提供具体可操作的建议，避免空泛描述
-3. 遵循"学生为主体，教师为引导"的教学理念
-4. 考虑AI课程的特殊性：技术体验真实性、批判性思维、工具可用性
-5. 生成教案时使用Markdown格式，结构清晰
-
-教案标准结构：
-## 教学目标（三维：知识与技能/过程与方法/情感态度价值观）
-## 教学重难点
-## 课前准备
-## 教学过程（含时间分配）
-### 导入（5-8分钟）
-### 主体活动（25-30分钟）
-### 总结延伸（5-8分钟）
-## 作业设计
-## 板书设计`, subject)
-}
-
-// buildDefaultGenRules 默认教案生成规则
-func buildDefaultGenRules() string {
-	return `教学流程设计规则：
-1. 导入环节：创设情境，激发兴趣，与学生生活经验关联
-2. 主体活动：学生实操为主，教师讲解不超过总时间的30%
-3. 总结延伸：引发深度思考，布置有价值的课后任务
-4. 每个环节标注预计时间（分钟）
-5. 活动描述要具体到"教师说什么/学生做什么"`
-}
 
 // buildDefaultReviewRules 默认评审规则（含学科专属维度）
 func buildDefaultReviewRules(subject string) string {
@@ -130,44 +78,6 @@ func buildReviewSystemPrompt(subject string) string {
 
 // ==================== 对话提示词 ====================
 
-// buildChatPrompt 组装对话上下文提示词
-// 将历史对话+当前用户消息+教案状态组合为AI输入
-func buildChatPrompt(history []*models.ConversationMessage, userMsg *models.ConversationMessage, lp *models.LessonPlan) string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("【当前备课信息】\n学科：%s\n年级：%s\n课题：%s\n课时：%d分钟\n\n",
-		lp.Subject, lp.Grade, lp.Topic, lp.DurationMinutes))
-
-	// 附加已有教案内容（截断防止超token）
-	if lp.ContentMarkdown != "" {
-		sb.WriteString("【已生成教案内容】\n")
-		content := lp.ContentMarkdown
-		if len(content) > 2000 {
-			content = content[:2000] + "\n...(教案内容已截断)"
-		}
-		sb.WriteString(content)
-		sb.WriteString("\n\n")
-	}
-
-	// 最近10轮对话历史
-	recentHistory := history
-	if len(recentHistory) > 10 {
-		recentHistory = recentHistory[len(recentHistory)-10:]
-	}
-	if len(recentHistory) > 0 {
-		sb.WriteString("【对话记录】\n")
-		for _, h := range recentHistory {
-			role := "教师"
-			if h.Role == models.ConvRoleAssistant {
-				role = "AI助手"
-			}
-			sb.WriteString(fmt.Sprintf("%s：%s\n", role, h.Content))
-		}
-		sb.WriteString("\n")
-	}
-
-	sb.WriteString(fmt.Sprintf("教师：%s\n\nAI助手：", userMsg.Content))
-	return sb.String()
-}
 
 // buildReviewPrompt 组装评审用户提示词
 func buildReviewPrompt(lp *models.LessonPlan, reviewRules string) string {
@@ -270,14 +180,6 @@ func extractSuggestionsByIDs(reviewResultJSON string, ids []string) []string {
 	return suggestions
 }
 
-// extractContentFromReply 从AI回复中判断并提取教案内容
-// 仅当回复包含教案标识关键词时才提取
-func extractContentFromReply(content string) string {
-	if strings.Contains(content, "## 教学目标") || strings.Contains(content, "# 教案") {
-		return content
-	}
-	return ""
-}
 
 // ==================== 组件格式转换 ====================
 
@@ -332,47 +234,3 @@ func generateMsgID() string {
 
 // ==================== Phase 7A：带配方上下文的对话提示词 ====================
 
-// buildChatPromptWithRecipe 组装带配方上下文的对话提示词
-// 如果有配方上下文，将其注入到对话历史之前，让AI始终保持全局视角
-func buildChatPromptWithRecipe(history []*models.ConversationMessage, userMsg *models.ConversationMessage, lp *models.LessonPlan, recipeContext string) string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("【当前备课信息】\n学科：%s\n年级：%s\n课题：%s\n课时：%d分钟\n\n",
-		lp.Subject, lp.Grade, lp.Topic, lp.DurationMinutes))
-
-	// Phase 7A：注入配方上下文（组件+学情+风格+心得）
-	if recipeContext != "" {
-		sb.WriteString(recipeContext)
-		sb.WriteString("\n")
-	}
-
-	// 附加已有教案内容（截断防止超token）
-	if lp.ContentMarkdown != "" {
-		sb.WriteString("【已生成教案内容】\n")
-		content := lp.ContentMarkdown
-		if len(content) > 2000 {
-			content = content[:2000] + "\n...(教案内容已截断)"
-		}
-		sb.WriteString(content)
-		sb.WriteString("\n\n")
-	}
-
-	// 最近10轮对话历史
-	recentHistory := history
-	if len(recentHistory) > 10 {
-		recentHistory = recentHistory[len(recentHistory)-10:]
-	}
-	if len(recentHistory) > 0 {
-		sb.WriteString("【对话记录】\n")
-		for _, h := range recentHistory {
-			role := "教师"
-			if h.Role == models.ConvRoleAssistant {
-				role = "AI助手"
-			}
-			sb.WriteString(fmt.Sprintf("%s：%s\n", role, h.Content))
-		}
-		sb.WriteString("\n")
-	}
-
-	sb.WriteString(fmt.Sprintf("教师：%s\n\nAI助手：", userMsg.Content))
-	return sb.String()
-}

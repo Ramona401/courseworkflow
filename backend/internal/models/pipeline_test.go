@@ -1,5 +1,6 @@
 // Package models 数据模型单元测试
 // 测试范围：DefaultPipelineConfig / ParsePipelineConfig(string) / 常量完整性
+// v92更新：Threshold期望值从9.0改为8.5（v90已变更默认阈值）
 package models
 
 import (
@@ -8,6 +9,7 @@ import (
 )
 
 // TestDefaultPipelineConfig 测试默认配置值符合业务规范
+// v90变更：Threshold从9.0改为8.5
 func TestDefaultPipelineConfig(t *testing.T) {
 	cfg := DefaultPipelineConfig()
 	if cfg == nil {
@@ -16,8 +18,8 @@ func TestDefaultPipelineConfig(t *testing.T) {
 	if cfg.EvalRounds != 3 {
 		t.Errorf("EvalRounds期望3, 实际%d", cfg.EvalRounds)
 	}
-	if cfg.Threshold != 9.0 {
-		t.Errorf("Threshold期望9.0, 实际%.1f", cfg.Threshold)
+	if cfg.Threshold != 8.5 {
+		t.Errorf("Threshold期望8.5, 实际%.1f", cfg.Threshold)
 	}
 	if cfg.VarianceWarn != 1.5 {
 		t.Errorf("VarianceWarn期望1.5, 实际%.1f", cfg.VarianceWarn)

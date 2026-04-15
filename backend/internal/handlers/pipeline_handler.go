@@ -34,7 +34,7 @@ func NewPipelineHandler(pipelineService *services.PipelineService) *PipelineHand
 // GetDashboardStats GET /api/v1/dashboard/stats
 func (h *PipelineHandler) GetDashboardStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	stats, err := h.pipelineService.GetDashboardStats()
@@ -50,17 +50,17 @@ func (h *PipelineHandler) GetDashboardStats(w http.ResponseWriter, r *http.Reque
 // CreatePipeline POST /api/v1/pipelines
 func (h *PipelineHandler) CreatePipeline(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
 	var req models.CreatePipelineRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	resp, err := h.pipelineService.CreatePipeline(&req, claims.UserID)
@@ -74,12 +74,12 @@ func (h *PipelineHandler) CreatePipeline(w http.ResponseWriter, r *http.Request)
 // ListPipelines GET /api/v1/pipelines
 func (h *PipelineHandler) ListPipelines(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
 	resp, err := h.pipelineService.ListPipelines(claims.UserID, claims.Role)
@@ -93,12 +93,12 @@ func (h *PipelineHandler) ListPipelines(w http.ResponseWriter, r *http.Request) 
 // GetPipelineDetail GET /api/v1/pipelines/{id}
 func (h *PipelineHandler) GetPipelineDetail(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	id := extractPipelineID(r.URL.Path)
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	resp, err := h.pipelineService.GetPipelineDetail(id)
@@ -112,12 +112,12 @@ func (h *PipelineHandler) GetPipelineDetail(w http.ResponseWriter, r *http.Reque
 // StartPipeline POST /api/v1/pipelines/{id}/start
 func (h *PipelineHandler) StartPipeline(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	id := extractPipelineIDWithSuffix(r.URL.Path, "/start")
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	resp, err := h.pipelineService.StartPipeline(id)
@@ -131,12 +131,12 @@ func (h *PipelineHandler) StartPipeline(w http.ResponseWriter, r *http.Request) 
 // CancelPipeline POST /api/v1/pipelines/{id}/cancel
 func (h *PipelineHandler) CancelPipeline(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	id := extractPipelineIDWithSuffix(r.URL.Path, "/cancel")
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	if err := h.pipelineService.CancelPipeline(id); err != nil {
@@ -149,12 +149,12 @@ func (h *PipelineHandler) CancelPipeline(w http.ResponseWriter, r *http.Request)
 // DeletePipeline DELETE /api/v1/pipelines/{id}
 func (h *PipelineHandler) DeletePipeline(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodDeleteOnly)
 		return
 	}
 	id := extractPipelineID(r.URL.Path)
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	if err := h.pipelineService.DeletePipeline(id); err != nil {
@@ -169,12 +169,12 @@ func (h *PipelineHandler) DeletePipeline(w http.ResponseWriter, r *http.Request)
 // GetSteps GET /api/v1/pipelines/{id}/steps
 func (h *PipelineHandler) GetSteps(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	id := extractPipelineIDWithSuffix(r.URL.Path, "/steps")
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	resp, err := h.pipelineService.GetPipelineDetail(id)
@@ -194,7 +194,7 @@ func (h *PipelineHandler) GetSteps(w http.ResponseWriter, r *http.Request) {
 // v68改动：从JWT提取调用者角色，传给服务层用于verify步骤数据脱敏
 func (h *PipelineHandler) GetStepDetail(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	pipelineID, stepName := extractPipelineIDAndStepName(r.URL.Path)
@@ -218,12 +218,12 @@ func (h *PipelineHandler) GetStepDetail(w http.ResponseWriter, r *http.Request) 
 // GetEvalRounds GET /api/v1/pipelines/{id}/eval-rounds
 func (h *PipelineHandler) GetEvalRounds(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	id := extractPipelineIDWithSuffix(r.URL.Path, "/eval-rounds")
 	if id == "" {
-		utils.BadRequest(w, "缺少Pipeline ID")
+		utils.BadRequest(w, utils.MsgMissingPipelineID)
 		return
 	}
 	rounds, err := h.pipelineService.GetEvalRounds(id)

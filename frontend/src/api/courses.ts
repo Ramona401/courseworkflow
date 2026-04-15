@@ -1,8 +1,21 @@
 /**
  * 课程管理API封装
  * P3-3: 课程列表 + 注册 + OSS目录 + 索引拉取
+ * FE-CS-01修复：消除全部 (res.data as any).data 类型绕过，改用 extractData 辅助函数
  */
 import client from './client'
+import type { ApiResponse } from './client'
+import type { AxiosResponse } from 'axios'
+
+// ==================== 辅助函数 ====================
+
+/**
+ * extractData 从 Axios 响应中安全提取业务数据
+ * FE-CS-01修复：替代全部 (res.data as any).data 写法，与 pipelines.ts 保持一致
+ */
+function extractData<T>(res: AxiosResponse<ApiResponse<T>>): T {
+  return res.data.data as T
+}
 
 // ==================== 类型定义 ====================
 
@@ -83,31 +96,31 @@ export interface IndexSummary {
 // ==================== API方法 ====================
 
 /** 获取课程列表 */
-export async function getCourses() {
-  const res = await client.get('/courses')
-  return (res.data as any).data as CourseListResponse
+export async function getCourses(): Promise<CourseListResponse> {
+  const res = await client.get<ApiResponse<CourseListResponse>>('/courses')
+  return extractData<CourseListResponse>(res)
 }
 
 /** 注册新课程 */
-export async function createCourse(req: CreateCourseRequest) {
-  const res = await client.post('/courses', req)
-  return (res.data as any).data
+export async function createCourse(req: CreateCourseRequest): Promise<CourseListItem> {
+  const res = await client.post<ApiResponse<CourseListItem>>('/courses', req)
+  return extractData<CourseListItem>(res)
 }
 
 /** 获取OSS目录（含注册状态） */
-export async function getOSSCatalog() {
-  const res = await client.get('/courses/oss-catalog')
-  return (res.data as any).data as OSSCatalogResponse
+export async function getOSSCatalog(): Promise<OSSCatalogResponse> {
+  const res = await client.get<ApiResponse<OSSCatalogResponse>>('/courses/oss-catalog')
+  return extractData<OSSCatalogResponse>(res)
 }
 
 /** 从OSS拉取课程索引 */
-export async function fetchCourseIndex(courseCode: string) {
-  const res = await client.post('/courses/' + courseCode + '/fetch-index')
-  return (res.data as any).data as FetchIndexResult
+export async function fetchCourseIndex(courseCode: string): Promise<FetchIndexResult> {
+  const res = await client.post<ApiResponse<FetchIndexResult>>('/courses/' + courseCode + '/fetch-index')
+  return extractData<FetchIndexResult>(res)
 }
 
 /** 获取索引摘要 */
-export async function getIndexSummary(courseCode: string) {
-  const res = await client.get('/courses/' + courseCode + '/index-summary')
-  return (res.data as any).data as IndexSummary
+export async function getIndexSummary(courseCode: string): Promise<IndexSummary> {
+  const res = await client.get<ApiResponse<IndexSummary>>('/courses/' + courseCode + '/index-summary')
+  return extractData<IndexSummary>(res)
 }

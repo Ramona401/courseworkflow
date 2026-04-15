@@ -208,3 +208,26 @@ type ExtractionListResponse struct {
 	Extractions []*ExtractionListItem `json:"extractions"`
 	Total       int                   `json:"total"`
 }
+
+// ==================== v108新增：已有教案导入 ====================
+
+// ImportExistingPlanRequest 导入已有教案请求
+// 支持三种来源：粘贴文本、Word解析后文本、PDF解析后文本（均在前端完成解析）
+type ImportExistingPlanRequest struct {
+        Subject         string   `json:"subject"`          // 学科（必填）
+        Grade           string   `json:"grade"`            // 年级（必填）
+        Topic           string   `json:"topic"`            // 课题（必填）
+        DurationMinutes int      `json:"duration_minutes"` // 课时（默认45）
+        ContentMarkdown string   `json:"content_markdown"` // 教案正文（必填，前端已解析为纯文本）
+        RecipeID        string   `json:"recipe_id"`        // 配方ID（可选）
+        GroupID         string   `json:"group_id"`         // 教研组ID（可选）
+        TextbookPageIDs []string `json:"textbook_page_ids"` // 关联课本图片（可选）
+        SourceType      string   `json:"source_type"`      // 来源：paste/docx/pdf
+}
+
+// ImportExistingPlanResponse 导入已有教案响应
+type ImportExistingPlanResponse struct {
+        Plan           *LessonPlan          `json:"plan"`
+        OpeningMessage *ConversationMessage  `json:"opening_message"`
+        SkippedStages  []string             `json:"skipped_stages"` // 跳过的阶段列表
+}

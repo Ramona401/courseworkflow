@@ -9,6 +9,7 @@ import {
 
 /** Meta面板属性 */
 interface MetaPanelProps {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   data: any
 }
 

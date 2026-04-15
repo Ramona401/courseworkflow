@@ -23,6 +23,7 @@ export function PublishButton({ pipelineId, onPublished }: PublishButtonProps) {
       await publishPipeline(pipelineId)
       setShowConfirm(false)
       onPublished()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) {
       alert('发布确认失败: ' + (e.message || '请重试'))
     }

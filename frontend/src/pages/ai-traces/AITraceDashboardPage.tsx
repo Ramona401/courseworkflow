@@ -73,6 +73,7 @@ export default function AITraceDashboardPage() {
       if (dateTo) params.date_to = dateTo
       const result = await getTraceDashboard(params)
       setData(result)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) {
       setError(e?.response?.data?.message || e?.message || '加载失败')
     } finally {
@@ -84,6 +85,7 @@ export default function AITraceDashboardPage() {
 
   // 返回来源页面
   const goBack = () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const from = (location.state as any)?.from
     if (from) navigate(from)
     else navigate('/')

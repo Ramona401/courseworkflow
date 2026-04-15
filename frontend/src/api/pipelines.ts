@@ -5,6 +5,7 @@
  * Phase8修复P-02：PipelineDetailResponse 新增 reject_reason 字段
  * v34修复A-01：消除全部 (res.data as any).data 类型绕过
  * v36新增：restartFromStep() 断点续跑API
+ * v90-1修复：aiFixPageStream token获取从错误的'auth-storage'改为正确的'token'键
  */
 import client from './client'
 import type { ApiResponse } from './client'
@@ -118,7 +119,7 @@ export interface StepDetailResponse {
   completed_at: string | null
   duration_ms: number
   attempts: number
-  step_data: any
+  step_data: Record<string, unknown>
   error_message: string
   model_used: string
   tokens_used: number
@@ -290,6 +291,8 @@ export interface GeneratedPageFull {
   change_reason: string
   created_at: string | null
   updated_at: string | null
+  /** FE-RM-01修复：后端可能返回的HTML历史版本数（回滚功能用） */
+  html_history_count?: number
 }
 
 export interface UpdatePageDecisionRequest {
@@ -683,7 +686,7 @@ export interface HistoryStepItem {
   tokens_used: number
   has_data: boolean
   error_message: string
-  step_data?: any
+  step_data?: Record<string, unknown>
 }
 
 export interface HistoryEvalRound {
@@ -708,13 +711,13 @@ export interface PipelineHistoryResponse {
 
 /** 获取可用历史轮次列表 */
 export async function getPipelineAvailableRounds(id: string): Promise<number[]> {
-  const res = await client.get<{ available_rounds: number[] }>(`/pipelines/${id}/history`)
+  const res = await client.get<{ code: number; data: { available_rounds: number[] } }>(`/pipelines/${id}/history`)
   return res.data.data?.available_rounds || []
 }
 
 /** 获取指定轮次的历史数据 */
 export async function getPipelineHistory(id: string, round: number): Promise<PipelineHistoryResponse> {
-  const res = await client.get<PipelineHistoryResponse>(`/pipelines/${id}/history?round=${round}`)
+  const res = await client.get<{ code: number; data: PipelineHistoryResponse }>(`/pipelines/${id}/history?round=${round}`)
   return res.data.data!
 }
 
@@ -747,6 +750,10 @@ export async function getSinglePageHTML(pipelineId: string, pageNumber: number):
  * v69新增：通过POST请求建立SSE连接，逐token接收AI输出
  * 注意：这不是标准EventSource（EventSource只支持GET），而是用fetch+ReadableStream实现
  *
+ * v90-1修复：token获取方式改为直接从localStorage.getItem('token')读取，
+ * 与client.ts中axios拦截器保持一致。原来错误地从'auth-storage'（zustand格式）读取，
+ * 但本项目使用React Context + 手动localStorage存储，导致token始终为空。
+ *
  * @param pipelineId - Pipeline ID
  * @param pageNumber - 页码
  * @param req - 请求参数（同aiFixPage）
@@ -762,14 +769,12 @@ export async function aiFixPageStream(
   onDone: (result: { new_html: string; fix_summary: string; html_length: number }) => void,
   onError: (message: string) => void,
 ): Promise<void> {
-  // 从localStorage获取token用于认证
-  const authData = localStorage.getItem('auth-storage')
-  let token = ''
-  if (authData) {
-    try {
-      const parsed = JSON.parse(authData)
-      token = parsed?.state?.token || ''
-    } catch { /* ignore */ }
+  // v90-1修复：直接从localStorage读取token，与client.ts拦截器保持一致
+  const token = localStorage.getItem('token') || ''
+
+  if (!token) {
+    onError('未登录或认证已过期，请重新登录')
+    return
   }
 
   try {
@@ -856,7 +861,7 @@ export async function aiFixPageStream(
         }
       }
     }
-  } catch (e: any) {
-    onError('网络错误: ' + (e.message || '连接失败'))
+  } catch (e: unknown) {
+    onError('网络错误: ' + (e instanceof Error ? e.message : '连接失败'))
   }
 }

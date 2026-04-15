@@ -46,13 +46,13 @@ func hasRole(role string, allowed ...string) bool {
 func forbiddenJSON(w http.ResponseWriter, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusForbidden)
-	json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": message})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": message})
 }
 
 func methodNotAllowedJSON(w http.ResponseWriter, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusMethodNotAllowed)
-	json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": message})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": message})
 }
 
 // ==================== 主入口 ====================
@@ -108,6 +108,8 @@ func Setup(cfg *config.Config) http.Handler {
 	orgHandler      := handlers.NewOrganizationHandler(orgService)
 	compHandler     := handlers.NewComponentHandler(compService)
 	lpHandler       := handlers.NewLessonPlanHandler(lpService)
+	annotationHandler := handlers.NewAnnotationHandler(cfg)
+	reviewAIHandler   := handlers.NewReviewAIHandler(cfg)
 	lpGenHandler    := handlers.NewLessonPlanGenHandler(lpGenService, authService)
 	recipeHandler   := handlers.NewRecipeHandler(recipeService, compService)
 	wsStageHandler  := handlers.NewWorkshopStageHandler(wsStageService)
@@ -133,7 +135,7 @@ func Setup(cfg *config.Config) http.Handler {
 		stats := engine.GetStats()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"code": 0,
 			"data": map[string]interface{}{
 				"total_submitted":       stats.TotalSubmitted,
@@ -178,7 +180,8 @@ func Setup(cfg *config.Config) http.Handler {
 	// ---- 注册各模块路由（v80: aiTraceHandler传入registerAdminRoutes）----
 	registerAdminRoutes(mux, authMW, adminOnly, adminHandler, roleHandler, userHandler, aiConfigHandler, promptHandler, edHandler, courseHandler, wsStageHandler, aiTraceHandler)
 	registerPipelineRoutes(mux, authMW, pipelineHandler, sseHandler)
-	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler)
+	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler,
+                annotationHandler, reviewAIHandler)
 
 	// ---- v83新增：组件索引批量压缩（admin only）----
 	mux.Handle("/api/v1/admin/component-index/batch-compress", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -198,7 +201,7 @@ func Setup(cfg *config.Config) http.Handler {
 		}()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "message": "批量压缩已开始，请查看服务日志"})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "message": "批量压缩已开始，请查看服务日志"})
 	}), authMW, adminOnly))
 
 	// ---- v86新增：教案索引批量生成（admin only）----
@@ -211,7 +214,7 @@ func Setup(cfg *config.Config) http.Handler {
 		go liService.BatchIndexAllLessonPlans()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "message": "批量教案索引已开始，请查看服务日志"})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "message": "批量教案索引已开始，请查看服务日志"})
 	}), authMW, adminOnly))
 
 	engine.StartGracefulShutdown()
@@ -327,7 +330,7 @@ func makeHealthHandler(engine *services.Engine) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  overallStatus,
 			"version": config.AppVersion,
 			"time":    time.Now().Format(time.RFC3339),

@@ -1,7 +1,6 @@
 package handlers
 
 // 组织与教研组管理HTTP处理器
-// 负责组织CRUD、教研组CRUD、成员管理的HTTP接口
 
 import (
 	"encoding/json"
@@ -20,24 +19,18 @@ type OrganizationHandler struct {
 	orgService *services.OrganizationService
 }
 
-// NewOrganizationHandler 创建组织管理处理器实例
 func NewOrganizationHandler(orgService *services.OrganizationService) *OrganizationHandler {
 	return &OrganizationHandler{orgService: orgService}
 }
 
 // ==================== 组织 CRUD ====================
 
-// ListOrganizations 获取组织列表
-// GET /api/v1/lesson-plans/organizations?type=school&parent_id=xxx
 func (h *OrganizationHandler) ListOrganizations(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
-	orgType := r.URL.Query().Get("type")
-	parentID := r.URL.Query().Get("parent_id")
-
-	result, err := h.orgService.ListOrganizations(r.Context(), orgType, parentID)
+	result, err := h.orgService.ListOrganizations(r.Context(), r.URL.Query().Get("type"), r.URL.Query().Get("parent_id"))
 	if err != nil {
 		log.Printf("获取组织列表失败: %v", err)
 		utils.InternalError(w, "获取组织列表失败")
@@ -46,16 +39,14 @@ func (h *OrganizationHandler) ListOrganizations(w http.ResponseWriter, r *http.R
 	utils.Success(w, result)
 }
 
-// CreateOrganization 创建组织
-// POST /api/v1/lesson-plans/organizations
 func (h *OrganizationHandler) CreateOrganization(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	var req models.CreateOrganizationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	org, err := h.orgService.CreateOrganization(r.Context(), &req)
@@ -66,16 +57,14 @@ func (h *OrganizationHandler) CreateOrganization(w http.ResponseWriter, r *http.
 	utils.Success(w, org)
 }
 
-// GetOrganization 获取组织详情
-// GET /api/v1/lesson-plans/organizations/{id}
 func (h *OrganizationHandler) GetOrganization(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
-	id := extractIDFromPath(r.URL.Path, "/api/v1/lesson-plans/organizations/")
+	id := extractIDFromPath(r.URL.Path, utils.PathOrgPrefix)
 	if id == "" {
-		utils.BadRequest(w, "缺少组织ID")
+		utils.BadRequest(w, utils.MsgMissingOrgID)
 		return
 	}
 	org, err := h.orgService.GetOrganization(r.Context(), id)
@@ -86,21 +75,19 @@ func (h *OrganizationHandler) GetOrganization(w http.ResponseWriter, r *http.Req
 	utils.Success(w, org)
 }
 
-// UpdateOrganization 更新组织
-// PUT /api/v1/lesson-plans/organizations/{id}
 func (h *OrganizationHandler) UpdateOrganization(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
 		return
 	}
-	id := extractIDFromPath(r.URL.Path, "/api/v1/lesson-plans/organizations/")
+	id := extractIDFromPath(r.URL.Path, utils.PathOrgPrefix)
 	if id == "" {
-		utils.BadRequest(w, "缺少组织ID")
+		utils.BadRequest(w, utils.MsgMissingOrgID)
 		return
 	}
 	var req models.UpdateOrganizationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	if err := h.orgService.UpdateOrganization(r.Context(), id, &req); err != nil {
@@ -110,16 +97,14 @@ func (h *OrganizationHandler) UpdateOrganization(w http.ResponseWriter, r *http.
 	utils.Success(w, map[string]string{"message": "更新成功"})
 }
 
-// DeleteOrganization 删除组织
-// DELETE /api/v1/lesson-plans/organizations/{id}
 func (h *OrganizationHandler) DeleteOrganization(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodDeleteOnly)
 		return
 	}
-	id := extractIDFromPath(r.URL.Path, "/api/v1/lesson-plans/organizations/")
+	id := extractIDFromPath(r.URL.Path, utils.PathOrgPrefix)
 	if id == "" {
-		utils.BadRequest(w, "缺少组织ID")
+		utils.BadRequest(w, utils.MsgMissingOrgID)
 		return
 	}
 	if err := h.orgService.DeleteOrganization(r.Context(), id); err != nil {
@@ -131,15 +116,12 @@ func (h *OrganizationHandler) DeleteOrganization(w http.ResponseWriter, r *http.
 
 // ==================== 教研组 CRUD ====================
 
-// ListTeachingGroups 获取教研组列表
-// GET /api/v1/lesson-plans/teaching-groups?school_id=xxx
 func (h *OrganizationHandler) ListTeachingGroups(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
-	schoolID := r.URL.Query().Get("school_id")
-	result, err := h.orgService.ListTeachingGroups(r.Context(), schoolID)
+	result, err := h.orgService.ListTeachingGroups(r.Context(), r.URL.Query().Get("school_id"))
 	if err != nil {
 		log.Printf("获取教研组列表失败: %v", err)
 		utils.InternalError(w, "获取教研组列表失败")
@@ -148,16 +130,14 @@ func (h *OrganizationHandler) ListTeachingGroups(w http.ResponseWriter, r *http.
 	utils.Success(w, result)
 }
 
-// CreateTeachingGroup 创建教研组
-// POST /api/v1/lesson-plans/teaching-groups
 func (h *OrganizationHandler) CreateTeachingGroup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
 	var req models.CreateTeachingGroupRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	tg, err := h.orgService.CreateTeachingGroup(r.Context(), &req)
@@ -168,19 +148,16 @@ func (h *OrganizationHandler) CreateTeachingGroup(w http.ResponseWriter, r *http
 	utils.Success(w, tg)
 }
 
-// GetTeachingGroupDetail 获取教研组详情
-// GET /api/v1/lesson-plans/teaching-groups/{id}
 func (h *OrganizationHandler) GetTeachingGroupDetail(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
-	id := extractIDFromPath(r.URL.Path, "/api/v1/lesson-plans/teaching-groups/")
+	id := extractIDFromPath(r.URL.Path, utils.PathGroupPrefix)
 	if id == "" {
-		utils.BadRequest(w, "缺少教研组ID")
+		utils.BadRequest(w, utils.MsgMissingGroupID)
 		return
 	}
-	// 截断子路径（如 /members）
 	if idx := strings.Index(id, "/"); idx > 0 {
 		id = id[:idx]
 	}
@@ -192,21 +169,19 @@ func (h *OrganizationHandler) GetTeachingGroupDetail(w http.ResponseWriter, r *h
 	utils.Success(w, detail)
 }
 
-// UpdateTeachingGroup 更新教研组
-// PUT /api/v1/lesson-plans/teaching-groups/{id}
 func (h *OrganizationHandler) UpdateTeachingGroup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
 		return
 	}
-	id := extractIDFromPath(r.URL.Path, "/api/v1/lesson-plans/teaching-groups/")
+	id := extractIDFromPath(r.URL.Path, utils.PathGroupPrefix)
 	if id == "" {
-		utils.BadRequest(w, "缺少教研组ID")
+		utils.BadRequest(w, utils.MsgMissingGroupID)
 		return
 	}
 	var req models.UpdateTeachingGroupRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	if err := h.orgService.UpdateTeachingGroup(r.Context(), id, &req); err != nil {
@@ -216,16 +191,14 @@ func (h *OrganizationHandler) UpdateTeachingGroup(w http.ResponseWriter, r *http
 	utils.Success(w, map[string]string{"message": "更新成功"})
 }
 
-// DeleteTeachingGroup 删除教研组
-// DELETE /api/v1/lesson-plans/teaching-groups/{id}
 func (h *OrganizationHandler) DeleteTeachingGroup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodDeleteOnly)
 		return
 	}
-	id := extractIDFromPath(r.URL.Path, "/api/v1/lesson-plans/teaching-groups/")
+	id := extractIDFromPath(r.URL.Path, utils.PathGroupPrefix)
 	if id == "" {
-		utils.BadRequest(w, "缺少教研组ID")
+		utils.BadRequest(w, utils.MsgMissingGroupID)
 		return
 	}
 	if err := h.orgService.DeleteTeachingGroup(r.Context(), id); err != nil {
@@ -237,21 +210,19 @@ func (h *OrganizationHandler) DeleteTeachingGroup(w http.ResponseWriter, r *http
 
 // ==================== 教研组成员管理 ====================
 
-// AddGroupMember 添加教研组成员
-// POST /api/v1/lesson-plans/teaching-groups/{id}/members
 func (h *OrganizationHandler) AddGroupMember(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
-	groupID := extractMiddleSegment(r.URL.Path, "/api/v1/lesson-plans/teaching-groups/", "/members")
+	groupID := extractMiddleSegment(r.URL.Path, utils.PathGroupPrefix, "/members")
 	if groupID == "" {
-		utils.BadRequest(w, "缺少教研组ID")
+		utils.BadRequest(w, utils.MsgMissingGroupID)
 		return
 	}
 	var req models.AddGroupMemberRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	if err := h.orgService.AddGroupMember(r.Context(), groupID, &req); err != nil {
@@ -261,21 +232,17 @@ func (h *OrganizationHandler) AddGroupMember(w http.ResponseWriter, r *http.Requ
 	utils.Success(w, map[string]string{"message": "添加成功"})
 }
 
-// RemoveGroupMember 移除教研组成员
-// DELETE /api/v1/lesson-plans/teaching-groups/{id}/members/{user_id}
 func (h *OrganizationHandler) RemoveGroupMember(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodDeleteOnly)
 		return
 	}
-	// 从路径提取 groupID 和 userID
 	path := r.URL.Path
-	prefix := "/api/v1/lesson-plans/teaching-groups/"
-	if !strings.HasPrefix(path, prefix) {
+	if !strings.HasPrefix(path, utils.PathGroupPrefix) {
 		utils.BadRequest(w, "路径格式错误")
 		return
 	}
-	rest := strings.TrimPrefix(path, prefix)
+	rest := strings.TrimPrefix(path, utils.PathGroupPrefix)
 	parts := strings.Split(rest, "/members/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		utils.BadRequest(w, "缺少教研组ID或成员ID")
@@ -283,7 +250,6 @@ func (h *OrganizationHandler) RemoveGroupMember(w http.ResponseWriter, r *http.R
 	}
 	groupID := parts[0]
 	userID := strings.TrimSuffix(parts[1], "/")
-
 	if err := h.orgService.RemoveGroupMember(r.Context(), groupID, userID); err != nil {
 		h.handleOrgError(w, err)
 		return
@@ -291,16 +257,14 @@ func (h *OrganizationHandler) RemoveGroupMember(w http.ResponseWriter, r *http.R
 	utils.Success(w, map[string]string{"message": "移除成功"})
 }
 
-// GetUserTeachingGroups 获取当前用户所属教研组列表
-// GET /api/v1/lesson-plans/my-groups
 func (h *OrganizationHandler) GetUserTeachingGroups(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
 	userID := getCurrentUserID(r)
 	if userID == "" {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
 	groups, err := h.orgService.GetUserTeachingGroups(r.Context(), userID)
@@ -349,8 +313,6 @@ func (h *OrganizationHandler) handleOrgError(w http.ResponseWriter, err error) {
 
 // ==================== 辅助函数 ====================
 
-// extractIDFromPath 从URL路径中提取末尾ID
-// 示例："/api/v1/lesson-plans/organizations/xxx-yyy" → "xxx-yyy"
 func extractIDFromPath(path string, prefix string) string {
 	if !strings.HasPrefix(path, prefix) {
 		return ""
@@ -360,15 +322,12 @@ func extractIDFromPath(path string, prefix string) string {
 	return id
 }
 
-// extractMiddleSegment 从含子路径的URL中提取中间段
-// 示例："/api/v1/.../xxx-yyy/members" → "xxx-yyy"
 func extractMiddleSegment(path string, prefix string, suffix string) string {
 	if !strings.HasPrefix(path, prefix) {
 		return ""
 	}
 	rest := strings.TrimPrefix(path, prefix)
 	if !strings.HasSuffix(rest, suffix) {
-		// 可能还有尾部斜杠
 		rest = strings.TrimSuffix(rest, "/")
 		if !strings.HasSuffix(rest, suffix) {
 			return ""

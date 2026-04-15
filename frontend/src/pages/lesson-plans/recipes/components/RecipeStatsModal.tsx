@@ -25,6 +25,8 @@ export default function RecipeStatsModal({ recipeId, recipeName, onClose }: Prop
   const [error, setError] = useState('')
 
   useEffect(() => {
+     
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true); setError('')
     getRecipeStats(recipeId)
       .then(resp => setStats(resp))

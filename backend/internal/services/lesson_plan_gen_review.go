@@ -335,55 +335,6 @@ func (s *LessonPlanGenService) applyAndReviewAsync(
 	s.executeAIReviewAsync(ctx, lp)
 }
 
-// ==================== 旧版开场白（保留兼容）====================
-
-// genOpeningMessage 旧版开场白生成（保留兼容，已不常用）
-func (s *LessonPlanGenService) genOpeningMessage(
-	ctx context.Context,
-	req *models.StartConversationRequest,
-	systemPrompt string,
-	genRules string,
-	backgroundContext string,
-) (*models.ConversationMessage, error) {
-	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
-	if err != nil {
-		return nil, err
-	}
-
-	recipeHint := ""
-	if req.RecipeID != "" && backgroundContext != "" {
-		recipeHint = "\n注意：老师已选择了备课配方，你已经了解了学情、教学风格等背景信息。开场时可以直接体现你对学生情况的了解，不需要从零开始问学情。可以直接进入教学方案探讨。"
-	}
-
-	userPrompt := fmt.Sprintf(`教师想开始备课：
-学科：%s
-年级：%s
-课题：%s
-课时：%d分钟
-%s
-%s
-请用友好的对话方式开场，采集2-3个关于学情的关键问题。
-不要超过150字，用自然的口吻，可以用emoji增加亲和力。`,
-		req.Subject, req.Grade, req.Topic, req.DurationMinutes, backgroundContext, recipeHint)
-
-	// v89-2：构建TraceContext（旧版开场白保留兼容，仅标记场景）
-	oldOpeningTraceCtx := &aiClient.TraceContext{
-		SceneCode: lessonPlanSceneCode,
-	}
-	result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt, oldOpeningTraceCtx)
-	if err != nil {
-		return nil, err
-	}
-
-	return &models.ConversationMessage{
-		ID:        generateMsgID(),
-		Role:      models.ConvRoleAssistant,
-		Type:      models.ConvMsgTypeText,
-		Content:   result.Content,
-		CreatedAt: time.Now(),
-	}, nil
-}
-
 // ==================== 自动教案索引触发 ====================
 
 // triggerAutoLessonIndex review阶段完成后自动生成教案AOCI索引

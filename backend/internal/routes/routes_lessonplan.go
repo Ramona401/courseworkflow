@@ -28,6 +28,8 @@ func registerLessonPlanRoutes(
 	wsStageHandler *handlers.WorkshopStageHandler,
 	assessHandler *handlers.AssessmentHandler,
 	tbHandler *handlers.TextbookHandler,
+	annotationHandler *handlers.AnnotationHandler,
+	reviewAIHandler *handlers.ReviewAIHandler,
 ) {
 	// ---- 教案SSE推送（内部JWT验证）----
 	mux.HandleFunc("/api/v1/lesson-plans/sse/", lpGenHandler.StreamPlan)
@@ -35,6 +37,10 @@ func registerLessonPlanRoutes(
 	// ---- 开始对话（特殊路径，需在/plans/前注册）----
 	mux.Handle("/api/v1/lesson-plans/plans/start-conversation",
 		middleware.Chain(http.HandlerFunc(lpGenHandler.StartConversation), authMW))
+
+	// ---- v108新增：导入已有教案（需在/plans/通配路由前注册）----
+	mux.Handle("/api/v1/lesson-plans/plans/import-existing",
+		middleware.Chain(http.HandlerFunc(lpGenHandler.ImportExistingPlan), authMW))
 
 	// ==================== 阶段化备课工坊（Phase 7B 新增）====================
 
@@ -223,7 +229,7 @@ func registerLessonPlanRoutes(
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "未知的萃取子路径"})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "未知的萃取子路径"})
 	}), authMW))
 
 	// ==================== 备课配方 ====================
@@ -366,6 +372,20 @@ func registerLessonPlanRoutes(
 			lpHandler.StartDevelopment(w, r)
 		case hasSuffix(path, "/fork"):
 			lpHandler.ForkLessonPlan(w, r)
+                // ---- 段落批注路由 ----
+                case hasSuffix(path, "/resolve") && indexOf(path, "/annotations/") >= 0 && r.Method == http.MethodPut:
+                        annotationHandler.ResolveAnnotation(w, r)
+                // ai-fix：批注驱动的AI辅助修改（SSE流式）
+                case hasSuffix(path, "/ai-fix") && indexOf(path, "/annotations/") >= 0 && r.Method == http.MethodPost:
+                        annotationHandler.AIFixAnnotation(w, r)
+                case indexOf(path, "/annotations/") >= 0 && r.Method == http.MethodPut:
+                        annotationHandler.UpdateAnnotation(w, r)
+                case indexOf(path, "/annotations/") >= 0 && r.Method == http.MethodDelete:
+                        annotationHandler.DeleteAnnotation(w, r)
+                case hasSuffix(path, "/annotations") && r.Method == http.MethodGet:
+                        annotationHandler.ListAnnotations(w, r)
+                case hasSuffix(path, "/annotations") && r.Method == http.MethodPost:
+                        annotationHandler.CreateAnnotation(w, r)
 		default:
 			switch r.Method {
 			case http.MethodGet:
@@ -381,6 +401,12 @@ func registerLessonPlanRoutes(
 	}), authMW))
 
 	// ==================== 提示词模板 ====================
+
+	// ---- 审核员AI辅助（overview + chat）----
+	mux.Handle("/api/v1/lesson-plans/review-ai/overview",
+		authMW(http.HandlerFunc(reviewAIHandler.Overview)))
+	mux.Handle("/api/v1/lesson-plans/review-ai/chat",
+		authMW(http.HandlerFunc(reviewAIHandler.Chat)))
 
 	mux.Handle("/api/v1/lesson-plans/templates", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {

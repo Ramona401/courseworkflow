@@ -12,6 +12,8 @@
  *   - SSE自动重连（指数退避，最多5次）
  *   - 重连后自动拉取最新对话补齐丢失消息
  *   - 消息发送失败自动重试1次
+ * v108 新增：
+ *   - 首屏双入口：新建备课 / 导入已有教案（并列卡片，点击左卡展开表单，点击右卡弹导入弹窗）
  */
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
@@ -36,6 +38,7 @@ import {
 } from './components/WorkshopTransitionComponents'
 import StageComponentsModal from './components/StageComponentsModal'
 import { getAssessmentResult } from '@/api/assessment'
+import ImportPlanModal from './components/ImportPlanModal'
 
 const STAGE_SEP_PREFIX = '__STAGE_SEP__'
 
@@ -50,13 +53,16 @@ export default function WorkshopPage() {
   const navigate  = useNavigate()
   const location  = useLocation()
 
-  const resumePlanId = (location.state as { resumePlanId?: string } | null)?.resumePlanId
+  const resumePlanId  = (location.state as { resumePlanId?: string } | null)?.resumePlanId
   const sessionPlanId = sessionStorage.getItem('workshop_active_plan_id')
   const effectivePlanId = resumePlanId || sessionPlanId || null
 
   const [phase, setPhase]               = useState<'start' | 'chatting' | 'resuming'>(effectivePlanId ? 'resuming' : 'start')
   const [startLoading, setStartLoading] = useState(false)
   const [resumeError, setResumeError]   = useState<string | null>(null)
+
+  // v108：首屏模式：选择卡片 | 展开新建表单
+  const [startMode, setStartMode] = useState<'choose' | 'new'>('choose')
 
   const [plan, setPlan] = useState<LessonPlan | null>(null)
   const [messages, setMessages]     = useState<ConversationMessage[]>([])
@@ -77,6 +83,7 @@ export default function WorkshopPage() {
   const [isStageMode, setIsStageMode]   = useState(false)
   const isStageModeRef = useRef(false)
   const [needsAssessment, setNeedsAssessment] = useState<boolean | null>(null)
+  const [showImportModal, setShowImportModal] = useState(false)  // v108：导入弹窗
   const [isStageProcessing, setIsStageProcessing] = useState(false)
 
   // P1：AI建议完成提示
@@ -107,6 +114,9 @@ export default function WorkshopPage() {
 
   // v88新增：SSE连接状态（connected=绿色 | reconnecting=黄色 | disconnected=红色）
   const [sseConnectionState, setSseConnectionState] = useState<SSEConnectionState>('connected')
+
+  // v105 P1-7：退回修改模式提示条（用户手动关闭后不再显示）
+  const [revisionBannerDismissed, setRevisionBannerDismissed] = useState(false)
 
   // v88：SSE连接引用改为SSEConnection类型（支持close方法）
   const sseRef         = useRef<SSEConnection | null>(null)
@@ -168,11 +178,14 @@ export default function WorkshopPage() {
         setReviewLoading(false); setApplyingReview(false)
         setReview(r); setRightPanel('review')
       },
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       onStageStarted: (_data: StageEventData) => { refreshStages(planId) },
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       onStageComplete: (_data: StageEventData) => {
         setIsStageProcessing(false)
         refreshStages(planId)
       },
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       onStageOutput: (_data: StageEventData) => { refreshStages(planId) },
       onError: err => {
         setIsThinking(false); setStreaming(null)
@@ -184,25 +197,20 @@ export default function WorkshopPage() {
           created_at: new Date().toISOString(),
         }])
       },
-
       // v88新增：连接状态变化回调 → 驱动顶部指示器颜色
       onConnectionStateChange: (state: SSEConnectionState) => {
         setSseConnectionState(state)
       },
-
       // v88新增：重连成功后自动补齐丢失消息
       onReconnected: async () => {
         const currentPlanId = planIdRef.current
         if (!currentPlanId) return
         try {
           console.log('[SSE] 重连成功，开始补齐对话消息...')
-          // 拉取服务端最新的完整对话记录
           const convData = await getConversation(currentPlanId)
           const serverMsgs = (convData.messages || []).filter(
             (m: ConversationMessage) => m.role === 'user' || m.role === 'assistant' || m.role === 'system'
           )
-          // 用服务端完整消息替换本地消息（服务端是真实来源）
-          // 只在服务端消息数量大于本地时才替换，避免重连瞬间本地正在streaming的消息被覆盖
           setMessages(prev => {
             if (serverMsgs.length > prev.length) {
               console.log(`[SSE] 补齐完成：本地${prev.length}条 → 服务端${serverMsgs.length}条`)
@@ -211,13 +219,11 @@ export default function WorkshopPage() {
             console.log(`[SSE] 无需补齐：本地${prev.length}条 >= 服务端${serverMsgs.length}条`)
             return prev
           })
-          // 同时刷新教案内容和阶段状态
           const planData = await getLessonPlan(currentPlanId)
           if (planData.content_markdown) setPlanContent(planData.content_markdown)
           if (planData.current_stage && planData.stage_config) {
             await refreshStages(currentPlanId)
           }
-          // 清理可能残留的streaming状态
           setIsThinking(false)
           setStreaming(null)
         } catch (err) {
@@ -260,13 +266,40 @@ export default function WorkshopPage() {
     resumePlan()
   }, [effectivePlanId, phase, connectSSE, refreshStages])
 
+  // v108：导入教案成功后回调
+  const handleImportSuccess = async (planId: string, openingMessage: ConversationMessage) => {
+    setShowImportModal(false)
+    try {
+      const [planData, convData] = await Promise.all([
+        getLessonPlan(planId),
+        getConversation(planId),
+      ])
+      setPlan(planData)
+      const serverMsgs = (convData.messages || []).filter(
+        (m: ConversationMessage) => m.role === 'user' || m.role === 'assistant' || m.role === 'system'
+      )
+      setMessages(serverMsgs.length > 0 ? serverMsgs : [openingMessage])
+      if (planData.content_markdown) setPlanContent(planData.content_markdown)
+      setPhase('chatting')
+      sessionStorage.setItem('workshop_active_plan_id', planId)
+      connectSSE(planId)
+      if (planData.current_stage && planData.stage_config) {
+        await refreshStages(planId)
+      }
+      setRightPanel('review')  // 自动切到评审面板等待AI评审
+    } catch (err) {
+      console.error('导入后加载教案失败:', err)
+      alert('导入成功但加载失败，请刷新页面重试')
+    }
+  }
+
   const handleStart = async (subject: string, grade: string, topic: string, duration: number, recipeId?: string, textbookPageIds?: string[]) => {
     setStartLoading(true)
     try {
       const req: Record<string, unknown> = { subject, grade, topic, duration_minutes: duration }
       if (recipeId) req.recipe_id = recipeId
       if (textbookPageIds && textbookPageIds.length > 0) req.textbook_page_ids = textbookPageIds
-      const resp = await startConversation(req as Parameters<typeof startConversation>[0])
+      const resp = await startConversation(req as unknown as Parameters<typeof startConversation>[0])
       setPlan(resp.plan)
       setMessages([resp.opening_message])
       setPhase('chatting')
@@ -287,7 +320,6 @@ export default function WorkshopPage() {
     const msgText = inputText.trim()
     setInputText('')
 
-    // 乐观更新：立即将用户消息显示在UI中
     const localMsg: ConversationMessage = {
       id: `local_${Date.now()}`, role: 'user' as const, type: 'text' as const,
       content: msgText || `已选择${selectedComponentIds.size}个组件`,
@@ -297,8 +329,6 @@ export default function WorkshopPage() {
     setIsThinking(true)
 
     const componentIds = Array.from(selectedComponentIds)
-
-    // 带重试的发送逻辑
     let lastErr: unknown = null
     for (let attempt = 0; attempt <= SEND_RETRY_MAX; attempt++) {
       try {
@@ -315,7 +345,6 @@ export default function WorkshopPage() {
       }
     }
 
-    // 所有重试都失败
     if (lastErr) {
       setIsThinking(false)
       console.error('发送消息失败（含重试）:', lastErr)
@@ -324,13 +353,13 @@ export default function WorkshopPage() {
         content: '⚠️ 消息发送失败，请检查网络后重试。你刚才的内容已保留在输入框中。',
         created_at: new Date().toISOString(),
       }])
-      // 将消息内容恢复到输入框，方便用户重试
       setInputText(msgText)
     }
   }
 
   const handleSelectComponent = (comp: ConvComponent) => {
     setSelectedComponentIds(prev => {
+      // eslint-disable-next-line @typescript-eslint/no-unused-expressions
       const next = new Set(prev); next.has(comp.id) ? next.delete(comp.id) : next.add(comp.id); return next
     })
   }
@@ -358,17 +387,14 @@ export default function WorkshopPage() {
     } catch (err) { console.error('发布失败:', err); alert('发布失败，请稍后重试') }
   }
 
-  // ==================== v79-2：退出备课（保存草稿+回到首屏）====================
+  // v79-2：退出备课（保存草稿+回到首屏）
   const handleExitWorkshop = () => {
     if (!plan) return
     const confirmMsg = '确定退出当前备课吗？\n\n教案已自动保存为草稿，你可以随时从「我的教案」继续。'
     if (!confirm(confirmMsg)) return
-    // 关闭SSE连接
     sseRef.current?.close()
     sseRef.current = null
-    // 清除session状态
     sessionStorage.removeItem('workshop_active_plan_id')
-    // 重置所有状态回到首屏
     setPlan(null)
     setMessages([])
     setPlanContent('')
@@ -383,18 +409,20 @@ export default function WorkshopPage() {
     setStreaming(null)
     setInputText('')
     setSelectedComponentIds(new Set())
-    setSseConnectionState('connected')  // v88：重置连接状态
+    setSseConnectionState('connected')
+    setRevisionBannerDismissed(false)
+    setStartMode('choose')  // v108：退出后回到选择卡片状态
     setPhase('start')
   }
 
-  // v88新增：手动重连按钮（disconnected状态时可用）
+  // v88新增：手动重连
   const handleManualReconnect = () => {
     if (!plan) return
     setSseConnectionState('reconnecting')
     connectSSE(plan.id)
   }
 
-  // ==================== P2：点击完成本阶段 ====================
+  // P2：点击完成本阶段
   const handleCompleteStageClick = async () => {
     if (!plan || !currentStage) return
     setSummaryLoading(true)
@@ -417,9 +445,8 @@ export default function WorkshopPage() {
     setSummaryLoading(false)
   }
 
-  // ==================== 迭代12：实际执行 advanceStage 并插入分隔符 ====================
+  // 迭代12：实际执行 advanceStage 并插入分隔符
   const doAdvanceStage = async (planId: string, nextStageItem: StageProgressItem | null, selectedCompIds: string[]) => {
-    // 插入阶段分隔符气泡
     if (nextStageItem) {
       const sepMsg = {
         id: `stage_sep_${Date.now()}`,
@@ -438,7 +465,7 @@ export default function WorkshopPage() {
     } catch (err) { console.error('进入下一阶段失败:', err) }
   }
 
-  // ==================== 迭代12：组件弹窗回调 ====================
+  // 迭代12：组件弹窗回调
   const handleComponentsConfirm = async (selectedIds: string[]) => {
     if (!plan) return
     setShowComponentsModal(false)
@@ -455,14 +482,14 @@ export default function WorkshopPage() {
     setPendingTransitionStage(null)
   }
 
-  // ==================== P2+P3：确认进入下一阶段 ====================
+  // P2+P3：确认进入下一阶段
   const handleConfirmTransition = async () => {
     if (!plan) return
     setShowSummaryModal(false)
 
-    const currentIdx = stageItems.findIndex(s => s.stage_code === currentStage)
+    const currentIdx      = stageItems.findIndex(s => s.stage_code === currentStage)
     const currentStageItem = stageItems[currentIdx]
-    const nextStageItem = currentIdx >= 0 && currentIdx < stageItems.length - 1
+    const nextStageItem   = currentIdx >= 0 && currentIdx < stageItems.length - 1
       ? stageItems[currentIdx + 1] : null
     const isLastStage = !nextStageItem
 
@@ -472,7 +499,6 @@ export default function WorkshopPage() {
       return
     }
 
-    // P3：启动过渡动画
     setTransitionInfo({
       currentName: currentStageItem?.stage_name || currentStage,
       nextName: nextStageItem.stage_name,
@@ -483,20 +509,14 @@ export default function WorkshopPage() {
 
     const t1 = setTimeout(() => setTransitionStep(1), 700)
     const t2 = setTimeout(() => setTransitionStep(2), 1400)
-
-    // 过渡动画结束后：判断是否需要组件弹窗
     const t3 = setTimeout(() => {
       setIsTransitioning(false)
       setTransitionStep(0)
       setTransitionInfo(null)
-
-      // 迭代12：判断下一阶段是否有组件映射
       if (nextStageItem && STAGES_WITH_COMPONENTS.includes(nextStageItem.stage_code)) {
-        // 有组件映射 → 弹出组件推荐弹窗，暂不调用 advanceStage
         setPendingTransitionStage(nextStageItem.stage_code)
         setShowComponentsModal(true)
       } else {
-        // 无组件映射（如revise）→ 直接进入下一阶段
         doAdvanceStage(plan.id, nextStageItem, [])
       }
     }, 2200)
@@ -526,7 +546,6 @@ export default function WorkshopPage() {
     if (!confirm(`确定要重启「${stageName}」阶段吗？\n\n该阶段及之后阶段的产出物和对话将被清空。`)) return
     try {
       await resetStage(plan.id, stageCode)
-      // v77：截断前端消息（保留目标阶段分隔符之前的消息）
       const targetItem = stageItems.find(s => s.stage_code === stageCode)
       if (targetItem) {
         const sepIdx = messages.findIndex(m =>
@@ -574,8 +593,10 @@ export default function WorkshopPage() {
     return (
       <div style={{ height: 'calc(100vh - 120px)', overflow: 'hidden', margin: '-28px -32px', display: 'flex', flexDirection: 'column' }}>
         <div style={{ flex: 1, overflowY: 'auto', padding: '0 32px' }}>
+
+          {/* 风格前测引导（首次使用） */}
           {needsAssessment === true && (
-            <div style={{ margin: '24px auto 20px', maxWidth: '600px', padding: '24px 28px', background: 'linear-gradient(135deg, rgba(79,123,232,0.06) 0%, rgba(16,185,129,0.06) 100%)', borderRadius: '16px', border: '1px solid rgba(79,123,232,0.15)', textAlign: 'center' }}>
+            <div style={{ margin: '24px auto 20px', maxWidth: '680px', padding: '24px 28px', background: 'linear-gradient(135deg, rgba(79,123,232,0.06) 0%, rgba(16,185,129,0.06) 100%)', borderRadius: '16px', border: '1px solid rgba(79,123,232,0.15)', textAlign: 'center' }}>
               <div style={{ fontSize: '32px', marginBottom: '12px' }}>🎓</div>
               <h3 style={{ fontSize: '18px', fontWeight: 700, color: '#1F2937', margin: '0 0 8px' }}>欢迎！先来了解一下您的备课风格</h3>
               <p style={{ fontSize: '14px', color: '#6B7280', lineHeight: 1.6, margin: '0 0 20px' }}>只需2-3分钟的轻松对话，AI就能为您量身定制备课配方</p>
@@ -585,8 +606,104 @@ export default function WorkshopPage() {
               </div>
             </div>
           )}
-          <StartForm onStart={handleStart} loading={startLoading} />
+
+          {/* ===== v108：双入口选择卡片 ===== */}
+          {startMode === 'choose' && (
+            <div style={{ maxWidth: '680px', margin: '32px auto 0' }}>
+              <div style={{ textAlign: 'center', marginBottom: '28px' }}>
+                <h1 style={{ fontSize: '22px', fontWeight: 700, color: C.text, margin: '0 0 6px' }}>✨ 开始今天的备课</h1>
+                <p style={{ fontSize: '14px', color: C.textSec, margin: 0 }}>选择适合您的方式，AI全程陪伴</p>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+
+                {/* 左卡：新建备课 */}
+                <div
+                  onClick={() => setStartMode('new')}
+                  style={{ padding: '32px 28px', borderRadius: '16px', border: `2px solid ${C.border}`, background: C.card, cursor: 'pointer', transition: 'all 200ms ease', boxShadow: '0 2px 12px rgba(0,0,0,0.04)', display: 'flex', flexDirection: 'column', gap: '12px' }}
+                  onMouseEnter={e => { const el = e.currentTarget as HTMLDivElement; el.style.borderColor = C.primary; el.style.boxShadow = `0 8px 28px rgba(79,123,232,0.16)` }}
+                  onMouseLeave={e => { const el = e.currentTarget as HTMLDivElement; el.style.borderColor = C.border; el.style.boxShadow = '0 2px 12px rgba(0,0,0,0.04)' }}
+                >
+                  <div style={{ width: '52px', height: '52px', borderRadius: '14px', background: 'linear-gradient(135deg, #4F7BE8, #818CF8)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '24px' }}>✨</div>
+                  <div>
+                    <div style={{ fontSize: '17px', fontWeight: 700, color: C.text, marginBottom: '6px' }}>新建备课</div>
+                    <div style={{ fontSize: '13px', color: C.textSec, lineHeight: 1.7 }}>
+                      告诉AI要上什么课<br />
+                      AI全程陪你从零设计教案<br />
+                      可选配方、关联课本图片
+                    </div>
+                  </div>
+                  <div style={{ marginTop: 'auto', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', fontWeight: 600, color: C.primary }}>
+                    开始备课 <span style={{ fontSize: '16px' }}>→</span>
+                  </div>
+                </div>
+
+                {/* 右卡：导入已有教案 */}
+                <div
+                  onClick={() => setShowImportModal(true)}
+                  style={{ padding: '32px 28px', borderRadius: '16px', border: `2px solid ${C.border}`, background: C.card, cursor: 'pointer', transition: 'all 200ms ease', boxShadow: '0 2px 12px rgba(0,0,0,0.04)', display: 'flex', flexDirection: 'column', gap: '12px' }}
+                  onMouseEnter={e => { const el = e.currentTarget as HTMLDivElement; el.style.borderColor = '#10B981'; el.style.boxShadow = '0 8px 28px rgba(16,185,129,0.16)' }}
+                  onMouseLeave={e => { const el = e.currentTarget as HTMLDivElement; el.style.borderColor = C.border; el.style.boxShadow = '0 2px 12px rgba(0,0,0,0.04)' }}
+                >
+                  <div style={{ width: '52px', height: '52px', borderRadius: '14px', background: 'linear-gradient(135deg, #10B981, #34D399)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '24px' }}>📂</div>
+                  <div>
+                    <div style={{ fontSize: '17px', fontWeight: 700, color: C.text, marginBottom: '6px' }}>导入已有教案</div>
+                    <div style={{ fontSize: '13px', color: C.textSec, lineHeight: 1.7 }}>
+                      已有教案直接上传<br />
+                      AI自动评审并给出改进建议<br />
+                      支持粘贴文本 · Word · PDF
+                    </div>
+                  </div>
+                  <div style={{ marginTop: 'auto', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', fontWeight: 600, color: '#10B981' }}>
+                    导入并AI评审 <span style={{ fontSize: '16px' }}>→</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* 快捷入口 */}
+              <div style={{ display: 'flex', justifyContent: 'center', gap: '8px', marginTop: '32px' }}>
+                {[
+                  { icon: '📋', text: '我的教案', path: '/lesson-plans/my-plans' },
+                  { icon: '📦', text: '配方管理', path: '/lesson-plans/recipes' },
+                  { icon: '📚', text: '教案库',   path: '/lesson-plans/library' },
+                  { icon: '📷', text: '课本管理', path: '/lesson-plans/textbooks' },
+                ].map(item => (
+                  <button key={item.path} onClick={() => navigate(item.path)}
+                    style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: C.textSec, background: 'transparent', border: 'none', padding: '6px 12px', borderRadius: '8px', cursor: 'pointer', transition: 'all 150ms ease' }}
+                    onMouseEnter={e => { const el = e.currentTarget as HTMLButtonElement; el.style.background = C.primaryLight; el.style.color = C.primary }}
+                    onMouseLeave={e => { const el = e.currentTarget as HTMLButtonElement; el.style.background = 'transparent'; el.style.color = C.textSec }}>
+                    <span>{item.icon}</span><span>{item.text}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ===== 新建备课表单（点击左卡后展开）===== */}
+          {startMode === 'new' && (
+            <div>
+              {/* 返回按钮 */}
+              <div style={{ maxWidth: '960px', margin: '20px auto 0' }}>
+                <button
+                  onClick={() => setStartMode('choose')}
+                  style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: C.textSec, background: 'none', border: 'none', cursor: 'pointer', padding: 0, marginBottom: '8px' }}
+                >
+                  ← 返回选择
+                </button>
+              </div>
+              <StartForm onStart={handleStart} loading={startLoading} />
+            </div>
+          )}
+
         </div>
+
+        {/* v108：导入已有教案弹窗（必须在首屏return块内，否则phase=start时不渲染）*/}
+        {showImportModal && (
+          <ImportPlanModal
+            onSuccess={handleImportSuccess}
+            onCancel={() => setShowImportModal(false)}
+          />
+        )}
       </div>
     )
   }
@@ -597,20 +714,20 @@ export default function WorkshopPage() {
   const isBusy = isAIActive || reviewLoading || isTransitioning || isViewingHistory
   const canCompleteStage = isStageMode && currentStage && !isAIActive && !isTransitioning && !summaryLoading
 
-  const currentStageIdx = stageItems.findIndex(s => s.stage_code === currentStage)
+  const currentStageIdx   = stageItems.findIndex(s => s.stage_code === currentStage)
   const nextStageForSummary = currentStageIdx >= 0 && currentStageIdx < stageItems.length - 1
     ? stageItems[currentStageIdx + 1] : null
 
-  const planAny = plan as Record<string, unknown> | null
+  const planAny    = plan as Record<string, unknown> | null
   const recipeName = planAny?.recipe_name ? String(planAny.recipe_name) : ''
   const recipeId   = planAny?.recipe_id   ? String(planAny.recipe_id)   : ''
 
   const fallbackSteps = [
-    { key: 'info', label: '了解学情', done: messages.length >= 2 },
-    { key: 'plan', label: '确认方案', done: messages.length >= 4 },
+    { key: 'info',     label: '了解学情', done: messages.length >= 2 },
+    { key: 'plan',     label: '确认方案', done: messages.length >= 4 },
     { key: 'generate', label: '生成教案', done: !!planContent },
-    { key: 'review', label: 'AI评审', done: !!review },
-    { key: 'save', label: '保存发布', done: false },
+    { key: 'review',   label: 'AI评审',  done: !!review },
+    { key: 'save',     label: '保存发布', done: false },
   ]
 
   return (
@@ -624,7 +741,7 @@ export default function WorkshopPage() {
           {sidebarCollapsed ? <span style={{ fontSize: '14px' }}>»</span> : <><span style={{ fontWeight: 600, letterSpacing: '0.5px' }}>备课进度</span><span style={{ fontSize: '14px' }}>«</span></>}
         </button>
 
-        {/* v79-2：退出备课快捷入口（展开时显示） */}
+        {/* 退出备课快捷入口 */}
         {!sidebarCollapsed && plan && (
           <button onClick={handleExitWorkshop} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px', width: '100%', padding: '5px 8px', borderRadius: '6px', border: `1px dashed ${C.border}`, background: 'transparent', fontSize: '11px', color: C.textMuted, cursor: 'pointer', marginBottom: '4px', transition: 'all 150ms ease' }}
             onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.borderColor = '#EF4444'; el.style.color = '#EF4444'; el.style.background = 'rgba(239,68,68,0.04)' }}
@@ -640,7 +757,6 @@ export default function WorkshopPage() {
                 const isViewing = viewingStage === stage.stage_code
                 const statusColor = STAGE_STATUS_COLOR[stage.status] || C.textMuted
                 const statusIcon  = STAGE_STATUS_ICON[stage.status]  || '○'
-                // v77：点击阶段切换查看历史对话（已完成/进行中的阶段才可点击）
                 const canView = stage.status === 'completed' || stage.status === 'in_progress' || isCurrent
                 return (
                   <div key={stage.stage_code} onClick={() => { if (canView) setViewingStage(isViewing || isCurrent ? null : stage.stage_code) }} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 10px', borderRadius: '8px', background: isViewing ? 'rgba(79,123,232,0.12)' : isCurrent ? C.primaryLight : 'transparent', transition: 'background 150ms ease', cursor: canView ? 'pointer' : 'default', border: isViewing ? '1px solid rgba(79,123,232,0.3)' : '1px solid transparent' }}>
@@ -711,43 +827,33 @@ export default function WorkshopPage() {
           <StageTransitionView currentStageName={transitionInfo.currentName} nextStageName={transitionInfo.nextName} nextStageRole={transitionInfo.nextRole} step={transitionStep} />
         )}
 
-        {/* v88新增：网络状态指示器（仅在非connected状态时显示） */}
-        {phase === 'chatting' && sseConnectionState !== 'connected' && (
-          <div style={{
-            padding: '7px 16px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            gap: '8px',
-            fontSize: '13px',
-            fontWeight: 500,
-            borderBottom: `1px solid ${sseConnectionState === 'reconnecting' ? 'rgba(245,158,11,0.3)' : 'rgba(239,68,68,0.3)'}`,
-            background: sseConnectionState === 'reconnecting'
-              ? 'linear-gradient(135deg, rgba(245,158,11,0.08), rgba(251,191,36,0.05))'
-              : 'linear-gradient(135deg, rgba(239,68,68,0.08), rgba(248,113,113,0.05))',
-            color: sseConnectionState === 'reconnecting' ? '#92400E' : '#991B1B',
-            animation: sseConnectionState === 'reconnecting' ? 'sseReconnectPulse 2s ease-in-out infinite' : 'none',
-          }}>
-            {/* 状态圆点 */}
-            <div style={{
-              width: '8px', height: '8px', borderRadius: '50%', flexShrink: 0,
-              background: sseConnectionState === 'reconnecting' ? '#F59E0B' : '#EF4444',
-              boxShadow: sseConnectionState === 'reconnecting'
-                ? '0 0 6px rgba(245,158,11,0.5)'
-                : '0 0 6px rgba(239,68,68,0.5)',
-            }} />
+        {/* 退回修改模式提示条 */}
+        {plan?.status === 'revision' && !revisionBannerDismissed && (
+          <div style={{ padding: '10px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', background: 'linear-gradient(135deg, #FFF7ED, #FFF3E0)', borderBottom: '2px solid #F97316', flexShrink: 0, flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flex: 1 }}>
+              <span style={{ fontSize: '18px' }}>📋</span>
+              <div>
+                <div style={{ fontSize: '13px', fontWeight: 700, color: '#C2410C' }}>当前为退回修改模式</div>
+                <div style={{ fontSize: '12px', color: '#92400E', marginTop: '2px', lineHeight: 1.5 }}>教案已被退回，请根据评审批注修改后重新提交——修改完成后前往「教案详情」页提交评审</div>
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+              <button onClick={() => { if (plan) window.open('/lesson-plans/plans/' + plan.id, '_blank') }} style={{ padding: '5px 14px', borderRadius: '8px', border: '1px solid #F97316', background: 'transparent', fontSize: '12px', fontWeight: 600, color: '#C2410C', cursor: 'pointer', whiteSpace: 'nowrap' }}>📝 查看批注</button>
+              <button onClick={() => setRevisionBannerDismissed(true)} style={{ padding: '5px 10px', borderRadius: '8px', border: '1px solid #FED7AA', background: 'transparent', fontSize: '12px', color: '#9CA3AF', cursor: 'pointer' }}>×</button>
+            </div>
+          </div>
+        )}
+
+        {/* 网络状态指示器 */}
+        {sseConnectionState !== 'connected' && (
+          <div style={{ padding: '7px 16px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', fontSize: '13px', fontWeight: 500, borderBottom: `1px solid ${sseConnectionState === 'reconnecting' ? 'rgba(245,158,11,0.3)' : 'rgba(239,68,68,0.3)'}`, background: sseConnectionState === 'reconnecting' ? 'linear-gradient(135deg, rgba(245,158,11,0.08), rgba(251,191,36,0.05))' : 'linear-gradient(135deg, rgba(239,68,68,0.08), rgba(248,113,113,0.05))', color: sseConnectionState === 'reconnecting' ? '#92400E' : '#991B1B', animation: sseConnectionState === 'reconnecting' ? 'sseReconnectPulse 2s ease-in-out infinite' : 'none' }}>
+            <div style={{ width: '8px', height: '8px', borderRadius: '50%', flexShrink: 0, background: sseConnectionState === 'reconnecting' ? '#F59E0B' : '#EF4444', boxShadow: sseConnectionState === 'reconnecting' ? '0 0 6px rgba(245,158,11,0.5)' : '0 0 6px rgba(239,68,68,0.5)' }} />
             {sseConnectionState === 'reconnecting' ? (
               <span>网络连接中断，正在尝试重新连接...</span>
             ) : (
               <>
                 <span>网络连接已断开</span>
-                <button onClick={handleManualReconnect} style={{
-                  padding: '3px 12px', borderRadius: '12px',
-                  border: '1px solid rgba(239,68,68,0.4)',
-                  background: 'rgba(239,68,68,0.08)',
-                  fontSize: '12px', color: '#DC2626', cursor: 'pointer',
-                  fontWeight: 600,
-                }}>点击重连</button>
+                <button onClick={handleManualReconnect} style={{ padding: '3px 12px', borderRadius: '12px', border: '1px solid rgba(239,68,68,0.4)', background: 'rgba(239,68,68,0.08)', fontSize: '12px', color: '#DC2626', cursor: 'pointer', fontWeight: 600 }}>点击重连</button>
               </>
             )}
           </div>
@@ -763,21 +869,7 @@ export default function WorkshopPage() {
                   <span style={{ fontSize: '13px', fontWeight: 600, color: C.primary }}>{cur?.stage_name || currentStage}</span>
                   {cur?.ai_role && <span style={{ fontSize: '11px', color: C.textMuted, marginLeft: '8px' }}>· {cur.ai_role}</span>}
                 </div>
-                {/* v88：阶段标题栏右侧的小型连接状态点 */}
-                <div title={
-                  sseConnectionState === 'connected' ? '连接正常' :
-                  sseConnectionState === 'reconnecting' ? '重连中...' : '连接断开'
-                } style={{
-                  width: '6px', height: '6px', borderRadius: '50%', marginLeft: '4px',
-                  background: sseConnectionState === 'connected' ? '#10B981' :
-                              sseConnectionState === 'reconnecting' ? '#F59E0B' : '#EF4444',
-                  boxShadow: sseConnectionState === 'connected'
-                    ? '0 0 4px rgba(16,185,129,0.4)'
-                    : sseConnectionState === 'reconnecting'
-                    ? '0 0 4px rgba(245,158,11,0.4)'
-                    : '0 0 4px rgba(239,68,68,0.4)',
-                  transition: 'background 300ms ease, box-shadow 300ms ease',
-                }} />
+                <div title={sseConnectionState === 'connected' ? '连接正常' : sseConnectionState === 'reconnecting' ? '重连中...' : '连接断开'} style={{ width: '6px', height: '6px', borderRadius: '50%', marginLeft: '4px', background: sseConnectionState === 'connected' ? '#10B981' : sseConnectionState === 'reconnecting' ? '#F59E0B' : '#EF4444', boxShadow: sseConnectionState === 'connected' ? '0 0 4px rgba(16,185,129,0.4)' : sseConnectionState === 'reconnecting' ? '0 0 4px rgba(245,158,11,0.4)' : '0 0 4px rgba(239,68,68,0.4)', transition: 'background 300ms ease, box-shadow 300ms ease' }} />
               </div>
               <span style={{ fontSize: '12px', color: C.textMuted }}>{currentStageIdx + 1} / {stageItems.length}</span>
             </div>
@@ -791,13 +883,11 @@ export default function WorkshopPage() {
             </div>
           )}
           {(() => {
-            // v77：按阶段分隔符过滤消息 — viewingStage非null时只显示该阶段的消息
             const targetStage = viewingStage || currentStage
             let filteredMsgs = messages
             if (isStageMode && targetStage && stageItems.length > 0) {
-              // 找到目标阶段的分隔符索引和下一个分隔符索引
               let startIdx = -1
-              let endIdx = messages.length
+              let endIdx   = messages.length
               for (let i = 0; i < messages.length; i++) {
                 const m = messages[i]
                 if ((m.role as string) === 'system' && m.content.startsWith(STAGE_SEP_PREFIX)) {
@@ -805,21 +895,19 @@ export default function WorkshopPage() {
                   const sepStageName = rest.split('__')[0] || ''
                   const matchItem = stageItems.find(s => s.stage_name === sepStageName || s.stage_code === sepStageName)
                   if (matchItem && matchItem.stage_code === targetStage) {
-                    startIdx = i  // 包含分隔符本身
+                    startIdx = i
                   } else if (startIdx >= 0 && endIdx === messages.length) {
-                    endIdx = i  // 下一个分隔符位置
+                    endIdx = i
                   }
                 }
               }
               if (startIdx >= 0) {
                 filteredMsgs = messages.slice(startIdx, endIdx)
               } else if (targetStage === stageItems[0]?.stage_code) {
-                // 第一个阶段没有分隔符，显示从头到第一个分隔符之前的消息
                 const firstSepIdx = messages.findIndex(m => (m.role as string) === 'system' && m.content.startsWith(STAGE_SEP_PREFIX))
                 filteredMsgs = firstSepIdx >= 0 ? messages.slice(0, firstSepIdx) : messages
               }
             }
-            // v77：过滤掉系统自动触发的指令消息（不显示给用户）
             return filteredMsgs.filter(m => {
               if (m.role === 'user' && m.content.startsWith('我们进入') && m.content.includes('阶段了。请先简要介绍')) return false
               if (m.role === 'user' && m.content === '请对上一阶段完成的教案进行全面专业评审，直接输出评审报告，包含各维度评分和改进建议。') return false
@@ -951,7 +1039,8 @@ export default function WorkshopPage() {
                   ) : (
                     <>
                       <div style={{ fontSize: '14px', lineHeight: 1.6, marginBottom: '16px' }}>生成教案后可触发AI评审<br />获取质量分析和改进建议</div>
-                      {reviewLoading ? <div style={{ fontSize: '13px', color: C.primary }}>AI正在评审中...</div>
+                      {reviewLoading
+                        ? <div style={{ fontSize: '13px', color: C.primary }}>AI正在评审中...</div>
                         : <button onClick={handleTriggerReview} disabled={!planContent} style={{ padding: '10px 20px', borderRadius: '8px', border: 'none', background: !planContent ? '#E5E7EB' : C.primary, color: !planContent ? C.textMuted : '#fff', fontSize: '14px', fontWeight: 600, cursor: !planContent ? 'not-allowed' : 'pointer' }}>触发AI评审</button>
                       }
                     </>
@@ -996,7 +1085,7 @@ export default function WorkshopPage() {
         )}
       </div>
 
-      {/* 迭代12：阶段组件推荐弹窗 */}
+      {/* 阶段组件推荐弹窗 */}
       {showComponentsModal && plan && pendingTransitionStage && (
         <StageComponentsModal
           planId={plan.id}
@@ -1008,7 +1097,7 @@ export default function WorkshopPage() {
         />
       )}
 
-      {/* P2弹窗 */}
+      {/* 阶段完成弹窗 */}
       {showSummaryModal && plan && (
         <StageSummaryModal
           stageCode={currentStage}
@@ -1022,6 +1111,14 @@ export default function WorkshopPage() {
           onConfirm={handleConfirmTransition}
           onCancel={() => setShowSummaryModal(false)}
           completeness={stageCompleteness}
+        />
+      )}
+
+      {/* v108：导入已有教案弹窗 */}
+      {showImportModal && (
+        <ImportPlanModal
+          onSuccess={handleImportSuccess}
+          onCancel={() => setShowImportModal(false)}
         />
       )}
 

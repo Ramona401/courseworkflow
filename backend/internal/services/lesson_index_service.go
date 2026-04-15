@@ -312,8 +312,6 @@ func cleanLessonIndexOutput(text string) string {
 	}
 	// 去掉结尾的 ```
 	cleaned = strings.TrimSpace(cleaned)
-	if strings.HasSuffix(cleaned, "```") {
-		cleaned = cleaned[:len(cleaned)-3]
-	}
+	cleaned = strings.TrimSuffix(cleaned, "```")
 	return strings.TrimSpace(cleaned)
 }

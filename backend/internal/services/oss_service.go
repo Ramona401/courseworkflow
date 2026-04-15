@@ -222,6 +222,21 @@ func (s *OSSService) BuildIndexContent(indexFile *models.OSSIndexFile) string {
 	}
 	entries := make([]*models.OSSIndexEntry, len(indexFile.Indexes))
 	copy(entries, indexFile.Indexes)
+	// v99修复Bug3+Bug8：过滤模块级摘要条目，只保留实际页面条目
+	// 改用Content字段判断（Name格式因模块而异，Content格式统一）
+	// 页面条目Content以"P数字:"开头，摘要条目Content以"PG:"开头
+	var pageEntries []*models.OSSIndexEntry
+	for _, e := range entries {
+		c := strings.TrimSpace(e.Content)
+		if len(c) >= 4 && c[0] == 'P' && c[1] >= '0' && c[1] <= '9' {
+			// 排除模块摘要"PG:"开头
+			if len(c) >= 3 && c[1] == 'G' {
+				continue
+			}
+			pageEntries = append(pageEntries, e)
+		}
+	}
+	entries = pageEntries
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].SortOrder < entries[j].SortOrder
 	})
@@ -363,10 +378,16 @@ func (s *OSSService) BuildPageLessonMap(moduleID int) (map[int]int, error) {
 	fallbackIdx := 1 // 解析失败时的兜底页码
 
 	for _, lesson := range detail.Lessons {
+		// v90-3修复Bug3：过滤禁用页面，避免被纳入索引压缩和AI评估
+		// Status != 1 表示课时被禁用；StudentDisabled == 1 表示对学生不可见
+		// 这类页面不应参与Pipeline评估和优化流程
+		if lesson.Status != 1 || lesson.StudentDisabled == 1 {
+			continue
+		}
 		m := pageNumRe.FindStringSubmatch(lesson.Title)
 		if m != nil {
 			pageNum := 0
-			fmt.Sscanf(m[1], "%d", &pageNum)
+			_, _ = fmt.Sscanf(m[1], "%d", &pageNum)
 			if pageNum > 0 {
 				// title解析成功，直接用页码
 				pageMap[pageNum] = lesson.ID

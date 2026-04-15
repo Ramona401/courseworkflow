@@ -1,11 +1,6 @@
 package handlers
 
 // workshop_stage_handler.go — 阶段化备课工坊HTTP处理器
-//
-// Phase 7B 新增：6个REST接口（阶段操作）
-// 迭代5 新增：4个REST接口（自定义阶段CRUD）
-// 迭代12 新增：1个REST接口（阶段推荐组件）
-//   GET    /api/v1/lesson-plans/plans/{id}/stages/{code}/recommended-components — 获取阶段推荐组件
 
 import (
 	"encoding/json"
@@ -32,7 +27,6 @@ func NewWorkshopStageHandler(ss *services.WorkshopStageService) *WorkshopStageHa
 
 // ==================== 获取系统默认阶段 ====================
 
-// GetDefaultStages GET /api/v1/lesson-plans/workshop/stages/defaults
 func (h *WorkshopStageHandler) GetDefaultStages(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.stageService.GetDefaultStages(r.Context())
 	if err != nil {
@@ -44,20 +38,17 @@ func (h *WorkshopStageHandler) GetDefaultStages(w http.ResponseWriter, r *http.R
 
 // ==================== 获取教案阶段进度 ====================
 
-// GetStageStatus GET /api/v1/lesson-plans/plans/{id}/stages
 func (h *WorkshopStageHandler) GetStageStatus(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	planID := extractPlanIDBeforeStages(r.URL.Path)
 	if planID == "" {
-		utils.BadRequest(w, "教案ID无效")
+		utils.BadRequest(w, utils.MsgInvalidPlanID)
 		return
 	}
-
 	resp, err := h.stageService.GetStageStatus(r.Context(), planID, claims.UserID)
 	if err != nil {
 		handleStageError(w, err)
@@ -68,20 +59,17 @@ func (h *WorkshopStageHandler) GetStageStatus(w http.ResponseWriter, r *http.Req
 
 // ==================== 获取阶段产出物 ====================
 
-// GetStageOutput GET /api/v1/lesson-plans/plans/{id}/stages/{code}/output
 func (h *WorkshopStageHandler) GetStageOutput(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	planID, stageCode := extractPlanIDAndStageCode(r.URL.Path)
 	if planID == "" || stageCode == "" {
-		utils.BadRequest(w, "教案ID或阶段代码无效")
+		utils.BadRequest(w, utils.MsgInvalidPlanOrStage)
 		return
 	}
-
 	resp, err := h.stageService.GetStageOutput(r.Context(), planID, stageCode, claims.UserID)
 	if err != nil {
 		handleStageError(w, err)
@@ -90,29 +78,24 @@ func (h *WorkshopStageHandler) GetStageOutput(w http.ResponseWriter, r *http.Req
 	utils.Success(w, resp)
 }
 
-// ==================== 迭代12新增：重启指定阶段 ====================
+// ==================== 重启指定阶段 ====================
 
-// ResetStage POST /api/v1/lesson-plans/plans/{id}/stages/reset
-// 重启指定阶段：清空该阶段及后续阶段产出物，重置当前阶段，清空对话，重新触发开场白
 func (h *WorkshopStageHandler) ResetStage(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	planID := extractPlanIDBeforeStages(r.URL.Path)
 	if planID == "" {
-		utils.BadRequest(w, "教案ID无效")
+		utils.BadRequest(w, utils.MsgInvalidPlanID)
 		return
 	}
-
 	var req models.ResetStageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TargetStageCode == "" {
 		utils.BadRequest(w, "请指定要重启的阶段代码")
 		return
 	}
-
 	stage, err := h.stageService.ResetStage(r.Context(), planID, req.TargetStageCode, claims.UserID)
 	if err != nil {
 		handleStageError(w, err)
@@ -121,25 +104,19 @@ func (h *WorkshopStageHandler) ResetStage(w http.ResponseWriter, r *http.Request
 	utils.Success(w, stage)
 }
 
+// ==================== 阶段完成度检测 ====================
 
-// ==================== P0-2新增：阶段完成度检测 ====================
-
-// GetStageCompleteness GET /api/v1/lesson-plans/plans/{id}/stages/{code}/completeness
-// 返回指定阶段的完成度百分比和缺失要素清单（纯规则引擎，无AI调用）
 func (h *WorkshopStageHandler) GetStageCompleteness(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	planID, stageCode := extractPlanIDAndStageCode(r.URL.Path)
 	if planID == "" || stageCode == "" {
-		utils.BadRequest(w, "教案ID或阶段代码无效")
+		utils.BadRequest(w, utils.MsgInvalidPlanOrStage)
 		return
 	}
-
-	// 验证教案所有权
 	lp, err := services.GetLessonPlanForCheck(r.Context(), planID)
 	if err != nil {
 		utils.Fail(w, 404, "教案不存在")
@@ -149,7 +126,6 @@ func (h *WorkshopStageHandler) GetStageCompleteness(w http.ResponseWriter, r *ht
 		utils.Fail(w, 403, "无权操作此教案")
 		return
 	}
-
 	resp, err := services.CheckStageCompleteness(r.Context(), planID, stageCode)
 	if err != nil {
 		handleStageError(w, err)
@@ -158,23 +134,19 @@ func (h *WorkshopStageHandler) GetStageCompleteness(w http.ResponseWriter, r *ht
 	utils.Success(w, resp)
 }
 
-// ==================== 迭代12新增：获取阶段推荐组件 ====================
+// ==================== 获取阶段推荐组件 ====================
 
-// GetStageRecommendedComponents GET /api/v1/lesson-plans/plans/{id}/stages/{code}/recommended-components
-// 获取指定阶段的推荐教学组件列表，供用户在阶段过渡时勾选
 func (h *WorkshopStageHandler) GetStageRecommendedComponents(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	planID, stageCode := extractPlanIDAndStageCode(r.URL.Path)
 	if planID == "" || stageCode == "" {
-		utils.BadRequest(w, "教案ID或阶段代码无效")
+		utils.BadRequest(w, utils.MsgInvalidPlanOrStage)
 		return
 	}
-
 	resp, err := h.stageService.GetRecommendedComponents(r.Context(), planID, stageCode, claims.UserID)
 	if err != nil {
 		handleStageError(w, err)
@@ -185,29 +157,21 @@ func (h *WorkshopStageHandler) GetStageRecommendedComponents(w http.ResponseWrit
 
 // ==================== 进入下一阶段 ====================
 
-// AdvanceStage POST /api/v1/lesson-plans/plans/{id}/stages/advance
-// 迭代12增强：支持 selected_component_ids 参数，用户在阶段过渡弹窗选中组件后传入
 func (h *WorkshopStageHandler) AdvanceStage(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	planID := extractPlanIDBeforeStages(r.URL.Path)
 	if planID == "" {
-		utils.BadRequest(w, "教案ID无效")
+		utils.BadRequest(w, utils.MsgInvalidPlanID)
 		return
 	}
-
-	// 迭代12：尝试解析带组件ID的请求体
 	var req models.AdvanceStageWithComponentsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		// body可以为空，默认进入下一个
 		req = models.AdvanceStageWithComponentsRequest{}
 	}
-
-	// 如果有选中组件，走带组件的逻辑
 	var stage interface{}
 	var err error
 	if len(req.SelectedComponentIDs) > 0 {
@@ -224,25 +188,21 @@ func (h *WorkshopStageHandler) AdvanceStage(w http.ResponseWriter, r *http.Reque
 
 // ==================== 跳过当前阶段 ====================
 
-// SkipStage POST /api/v1/lesson-plans/plans/{id}/stages/skip
 func (h *WorkshopStageHandler) SkipStage(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	planID := extractPlanIDBeforeStages(r.URL.Path)
 	if planID == "" {
-		utils.BadRequest(w, "教案ID无效")
+		utils.BadRequest(w, utils.MsgInvalidPlanID)
 		return
 	}
-
 	var req models.SkipStageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		req = models.SkipStageRequest{}
 	}
-
 	stage, err := h.stageService.SkipStage(r.Context(), planID, req.TargetStageCode, claims.UserID)
 	if err != nil {
 		handleStageError(w, err)
@@ -253,20 +213,17 @@ func (h *WorkshopStageHandler) SkipStage(w http.ResponseWriter, r *http.Request)
 
 // ==================== 回退到上一阶段 ====================
 
-// BackStage POST /api/v1/lesson-plans/plans/{id}/stages/back
 func (h *WorkshopStageHandler) BackStage(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	planID := extractPlanIDBeforeStages(r.URL.Path)
 	if planID == "" {
-		utils.BadRequest(w, "教案ID无效")
+		utils.BadRequest(w, utils.MsgInvalidPlanID)
 		return
 	}
-
 	stage, err := h.stageService.BackStage(r.Context(), planID, claims.UserID)
 	if err != nil {
 		handleStageError(w, err)
@@ -275,17 +232,14 @@ func (h *WorkshopStageHandler) BackStage(w http.ResponseWriter, r *http.Request)
 	utils.Success(w, stage)
 }
 
-// ==================== 迭代5新增：自定义阶段 CRUD ====================
+// ==================== 自定义阶段 CRUD ====================
 
-// ListCustomStages GET /api/v1/lesson-plans/recipes/{id}/custom-stages
-// 获取配方的自定义阶段列表
 func (h *WorkshopStageHandler) ListCustomStages(w http.ResponseWriter, r *http.Request) {
 	recipeID := extractRecipeIDFromCustomStagePath(r.URL.Path)
 	if recipeID == "" {
-		utils.BadRequest(w, "配方ID无效")
+		utils.BadRequest(w, utils.MsgInvalidRecipeID)
 		return
 	}
-
 	stages, err := h.stageService.ListCustomStages(r.Context(), recipeID)
 	if err != nil {
 		utils.InternalError(w, "获取自定义阶段失败")
@@ -294,27 +248,22 @@ func (h *WorkshopStageHandler) ListCustomStages(w http.ResponseWriter, r *http.R
 	utils.Success(w, map[string]interface{}{"stages": stages})
 }
 
-// CreateCustomStage POST /api/v1/lesson-plans/recipes/{id}/custom-stages
-// 创建配方自定义阶段
 func (h *WorkshopStageHandler) CreateCustomStage(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	recipeID := extractRecipeIDFromCustomStagePath(r.URL.Path)
 	if recipeID == "" {
-		utils.BadRequest(w, "配方ID无效")
+		utils.BadRequest(w, utils.MsgInvalidRecipeID)
 		return
 	}
-
 	var req models.CreateCustomStageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数无效")
+		utils.BadRequest(w, utils.MsgBadRequestArgs)
 		return
 	}
-
 	resp, err := h.stageService.CreateCustomStage(r.Context(), recipeID, &req, claims.UserID)
 	if err != nil {
 		handleCustomStageError(w, err)
@@ -323,27 +272,22 @@ func (h *WorkshopStageHandler) CreateCustomStage(w http.ResponseWriter, r *http.
 	utils.Success(w, resp)
 }
 
-// UpdateCustomStage PUT /api/v1/lesson-plans/recipes/{id}/custom-stages/{code}
-// 更新配方自定义阶段
 func (h *WorkshopStageHandler) UpdateCustomStage(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	recipeID, stageCode := extractRecipeIDAndStageCodeFromCustomStagePath(r.URL.Path)
 	if recipeID == "" || stageCode == "" {
 		utils.BadRequest(w, "配方ID或阶段代码无效")
 		return
 	}
-
 	var req models.UpdateCustomStageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数无效")
+		utils.BadRequest(w, utils.MsgBadRequestArgs)
 		return
 	}
-
 	if err := h.stageService.UpdateCustomStage(r.Context(), recipeID, stageCode, &req, claims.UserID); err != nil {
 		handleCustomStageError(w, err)
 		return
@@ -351,21 +295,17 @@ func (h *WorkshopStageHandler) UpdateCustomStage(w http.ResponseWriter, r *http.
 	utils.Success(w, map[string]string{"message": "更新成功"})
 }
 
-// DeleteCustomStage DELETE /api/v1/lesson-plans/recipes/{id}/custom-stages/{code}
-// 删除配方自定义阶段
 func (h *WorkshopStageHandler) DeleteCustomStage(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	recipeID, stageCode := extractRecipeIDAndStageCodeFromCustomStagePath(r.URL.Path)
 	if recipeID == "" || stageCode == "" {
 		utils.BadRequest(w, "配方ID或阶段代码无效")
 		return
 	}
-
 	if err := h.stageService.DeleteCustomStage(r.Context(), recipeID, stageCode, claims.UserID); err != nil {
 		handleCustomStageError(w, err)
 		return
@@ -375,8 +315,6 @@ func (h *WorkshopStageHandler) DeleteCustomStage(w http.ResponseWriter, r *http.
 
 // ==================== 辅助函数 ====================
 
-// extractPlanIDBeforeStages 从路径 .../plans/{id}/stages/... 中提取教案ID
-// 查找 "plans" 后面的那个段
 func extractPlanIDBeforeStages(path string) string {
 	parts := strings.Split(strings.TrimSuffix(path, "/"), "/")
 	for i, p := range parts {
@@ -390,7 +328,6 @@ func extractPlanIDBeforeStages(path string) string {
 	return ""
 }
 
-// extractPlanIDAndStageCode 从路径 .../plans/{id}/stages/{code}/output 中提取教案ID和阶段代码
 func extractPlanIDAndStageCode(path string) (string, string) {
 	parts := strings.Split(strings.TrimSuffix(path, "/"), "/")
 	planID := ""
@@ -401,8 +338,7 @@ func extractPlanIDAndStageCode(path string) (string, string) {
 		}
 		if p == "stages" && i+1 < len(parts) {
 			candidate := parts[i+1]
-			// 排除操作路径（advance/skip/back/defaults）
-			if candidate != "advance" && candidate != "skip" && candidate != "back" && candidate != "defaults" {
+			if candidate != "advance" && candidate != "skip" && candidate != "back" && candidate != "defaults" && candidate != "reset" && candidate != "switch" {
 				stageCode = candidate
 			}
 		}
@@ -410,8 +346,6 @@ func extractPlanIDAndStageCode(path string) (string, string) {
 	return planID, stageCode
 }
 
-// extractRecipeIDFromCustomStagePath 从路径 .../recipes/{id}/custom-stages 中提取配方ID
-// 迭代5新增
 func extractRecipeIDFromCustomStagePath(path string) string {
 	parts := strings.Split(strings.TrimSuffix(path, "/"), "/")
 	for i, p := range parts {
@@ -425,8 +359,6 @@ func extractRecipeIDFromCustomStagePath(path string) string {
 	return ""
 }
 
-// extractRecipeIDAndStageCodeFromCustomStagePath 从路径 .../recipes/{id}/custom-stages/{code} 中提取配方ID和阶段代码
-// 迭代5新增
 func extractRecipeIDAndStageCodeFromCustomStagePath(path string) (string, string) {
 	parts := strings.Split(strings.TrimSuffix(path, "/"), "/")
 	recipeID := ""
@@ -445,7 +377,6 @@ func extractRecipeIDAndStageCodeFromCustomStagePath(path string) (string, string
 	return recipeID, stageCode
 }
 
-// handleStageError 统一阶段错误处理
 func handleStageError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, services.ErrStageNotInitialized):
@@ -467,7 +398,6 @@ func handleStageError(w http.ResponseWriter, err error) {
 	}
 }
 
-// handleCustomStageError 迭代5新增：自定义阶段错误处理
 func handleCustomStageError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, services.ErrRecipeNotFound):
@@ -490,10 +420,8 @@ func handleCustomStageError(w http.ResponseWriter, err error) {
 	}
 }
 
-// ==================== Admin管理：获取全部系统阶段（含disabled）====================
+// ==================== Admin管理 ====================
 
-// ListAllSystemStages GET /api/v1/admin/workshop-stages
-// Admin专用：返回全部系统阶段（含disabled），包含完整字段
 func (h *WorkshopStageHandler) ListAllSystemStages(w http.ResponseWriter, r *http.Request) {
 	stages, err := repository.GetAllSystemStages(r.Context())
 	if err != nil {
@@ -503,12 +431,7 @@ func (h *WorkshopStageHandler) ListAllSystemStages(w http.ResponseWriter, r *htt
 	utils.Success(w, &models.AdminStageListResponse{Stages: stages})
 }
 
-// ==================== Admin管理：更新系统阶段 ====================
-
-// UpdateSystemStage PUT /api/v1/admin/workshop-stages/{code}
-// Admin专用：更新系统阶段的可编辑字段
 func (h *WorkshopStageHandler) UpdateSystemStage(w http.ResponseWriter, r *http.Request) {
-	// 从路径中提取 stage_code
 	path := r.URL.Path
 	parts := strings.Split(strings.TrimSuffix(path, "/"), "/")
 	stageCode := ""
@@ -522,14 +445,11 @@ func (h *WorkshopStageHandler) UpdateSystemStage(w http.ResponseWriter, r *http.
 		utils.BadRequest(w, "阶段代码无效")
 		return
 	}
-
 	var req models.UpdateStageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求体解析失败")
+		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
-
-	// 基本校验
 	if strings.TrimSpace(req.StageName) == "" {
 		utils.BadRequest(w, "阶段名称不能为空")
 		return
@@ -546,7 +466,6 @@ func (h *WorkshopStageHandler) UpdateSystemStage(w http.ResponseWriter, r *http.
 		utils.BadRequest(w, "状态无效，可选值：active/disabled")
 		return
 	}
-
 	if err := repository.UpdateSystemStage(r.Context(), stageCode, &req); err != nil {
 		if errors.Is(err, repository.ErrStageNotFound) {
 			utils.Fail(w, 404, "阶段不存在")
@@ -555,39 +474,30 @@ func (h *WorkshopStageHandler) UpdateSystemStage(w http.ResponseWriter, r *http.
 		utils.InternalError(w, "更新阶段失败: "+err.Error())
 		return
 	}
-
-	// 返回更新后的阶段数据
 	updated, err := repository.GetStageByCode(r.Context(), models.StageSourceSystem, stageCode)
 	if err != nil {
-		// 如果刚设为disabled，GetStageByCode(active)会找不到，直接返回成功
 		utils.Success(w, map[string]string{"message": "更新成功", "stage_code": stageCode})
 		return
 	}
 	utils.Success(w, updated)
 }
 
-// SwitchToStage 切换到指定阶段继续对话（v77d新增）
-// POST /api/v1/lesson-plans/plans/{id}/stages/switch
-// 只更新current_stage，不清产出物、不清对话、不触发AI开场白
 func (h *WorkshopStageHandler) SwitchToStage(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-
 	planID := extractPlanIDBeforeStages(r.URL.Path)
 	if planID == "" {
-		utils.BadRequest(w, "教案ID无效")
+		utils.BadRequest(w, utils.MsgInvalidPlanID)
 		return
 	}
-
 	var req models.ResetStageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TargetStageCode == "" {
 		utils.BadRequest(w, "请指定要切换的阶段代码")
 		return
 	}
-
 	stage, err := h.stageService.SwitchToStage(r.Context(), planID, req.TargetStageCode, claims.UserID)
 	if err != nil {
 		handleStageError(w, err)
@@ -595,4 +505,3 @@ func (h *WorkshopStageHandler) SwitchToStage(w http.ResponseWriter, r *http.Requ
 	}
 	utils.Success(w, stage)
 }
-

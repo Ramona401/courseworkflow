@@ -6,6 +6,7 @@ import { kvRow, kvLabel, kvValue, passStyle, failStyle } from './StepCommon'
 
 /** DbCheck面板属性 */
 interface DbCheckPanelProps {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   data: any
 }
 

@@ -3,9 +3,11 @@
  * 对应后端 /api/v1/admin/* 和 /api/v1/lesson-plans/organizations/* 路由
  * 仅 admin 可调用（路由层保护）
  *
- * v52任务六新增：
- *   - addUserToGroup    POST /admin/users/{uid}/groups   将用户加入教研组
- *   - removeUserFromGroup DELETE /admin/users/{uid}/groups/{gid} 将用户移出教研组
+ * v109改动：
+ *   - GroupListItem 新增 lead_user_names（所有组长名称，逗号分隔）
+ *   - GroupDetail 新增 lead_user_names
+ *   - CreateGroupRequest / UpdateGroupRequest 移除 lead_user_id（改由成员角色管理）
+ *   - GroupMemberItem.role 支持 'lead' / 'backbone' / 'member'
  */
 import client from './client'
 
@@ -139,7 +141,10 @@ export interface UpdateOrgRequest {
   settings?: string
 }
 
-/** 教研组列表项（后端 TeachingGroupListItem） */
+/**
+ * 教研组列表项（后端 TeachingGroupListItem）
+ * v109改动：新增 lead_user_names（所有组长名称，中文顿号分隔）
+ */
 export interface GroupListItem {
   id: string
   name: string
@@ -147,24 +152,31 @@ export interface GroupListItem {
   school_name: string
   subject: string
   grade_range: string
-  lead_user_id: string | null
-  lead_user_name: string
+  lead_user_id: string | null    // 兼容保留
+  lead_user_name: string         // 兼容保留（第一个组长名称）
+  lead_user_names: string        // v109新增：所有组长名称，如"张老师、李老师"
   member_count: number
   status: string
   created_at: string
 }
 
-/** 教研组成员列表项（后端 GroupMemberItem） */
+/**
+ * 教研组成员列表项（后端 GroupMemberItem）
+ * v109改动：role 支持 'lead' / 'backbone' / 'member'
+ */
 export interface GroupMemberItem {
   id: string
   user_id: string
   username: string
   display_name: string
-  role: string           // member / backbone
+  role: string           // lead=组长 / backbone=骨干 / member=普通
   joined_at: string | null
 }
 
-/** 教研组详情（含成员列表，后端 TeachingGroupDetailResponse） */
+/**
+ * 教研组详情（含成员列表，后端 TeachingGroupDetailResponse）
+ * v109改动：新增 lead_user_names
+ */
 export interface GroupDetail {
   id: string
   name: string
@@ -172,8 +184,9 @@ export interface GroupDetail {
   school_name: string
   subject: string
   grade_range: string
-  lead_user_id: string | null
-  lead_user_name: string
+  lead_user_id: string | null    // 兼容保留
+  lead_user_name: string         // 兼容保留
+  lead_user_names: string        // v109新增：所有组长名称
   description: string
   settings: string
   status: string
@@ -182,22 +195,26 @@ export interface GroupDetail {
   updated_at: string
 }
 
-/** 创建教研组请求 */
+/**
+ * 创建教研组请求
+ * v109改动：移除 lead_user_id（改由成员角色管理多组长）
+ */
 export interface CreateGroupRequest {
   name: string
   school_id: string
   subject: string
   grade_range?: string
-  lead_user_id?: string | null
   description?: string
 }
 
-/** 更新教研组请求 */
+/**
+ * 更新教研组请求
+ * v109改动：移除 lead_user_id
+ */
 export interface UpdateGroupRequest {
   name: string
   subject: string
   grade_range?: string
-  lead_user_id?: string | null
   description?: string
   status?: string
 }
@@ -252,14 +269,8 @@ export async function updateAdminUserAssignments(id: string, course_codes: strin
   await client.put(`/admin/users/${id}/assignments`, { course_codes })
 }
 
-// ==================== 用户↔教研组双向分配 API（v52任务六新增）====================
+// ==================== 用户↔教研组双向分配 API ====================
 
-/**
- * addUserToGroup — 将用户加入指定教研组
- * POST /api/v1/admin/users/{userId}/groups
- * @param userId  要操作的用户ID（URL路径中）
- * @param data    { group_id: 教研组ID, role: 'member' | 'backbone' }
- */
 export async function addUserToGroup(
   userId: string,
   data: { group_id: string; role: string }
@@ -267,24 +278,12 @@ export async function addUserToGroup(
   await client.post(`/admin/users/${userId}/groups`, data)
 }
 
-/**
- * removeUserFromGroup — 将用户移出教研组
- * DELETE /api/v1/admin/users/{userId}/groups/{groupId}
- * 后端会检查是否为组长，组长会返回 400 错误
- * @param userId  要操作的用户ID
- * @param groupId 要移出的教研组ID
- */
 export async function removeUserFromGroup(userId: string, groupId: string): Promise<void> {
   await client.delete(`/admin/users/${userId}/groups/${groupId}`)
 }
 
-// ==================== 组织管理 API（对应 /lesson-plans/organizations/*）====================
+// ==================== 组织管理 API ====================
 
-/**
- * 获取组织列表
- * 后端返回 { organizations: [...], total: N }
- * type: 'region' | 'school' | ''（空=全部）
- */
 export async function getAdminOrgs(params?: {
   type?: string
   parent_id?: string
@@ -296,7 +295,6 @@ export async function getAdminOrgs(params?: {
   return res.data.data?.organizations ?? []
 }
 
-/** 获取单个组织详情 */
 export async function getAdminOrg(id: string): Promise<OrgListItem> {
   const res = await client.get<{ code: number; data: OrgListItem }>(
     `/lesson-plans/organizations/${id}`
@@ -304,7 +302,6 @@ export async function getAdminOrg(id: string): Promise<OrgListItem> {
   return res.data.data!
 }
 
-/** 创建组织（区域或学校） */
 export async function createAdminOrg(data: CreateOrgRequest): Promise<OrgListItem> {
   const res = await client.post<{ code: number; data: OrgListItem }>(
     '/lesson-plans/organizations', data
@@ -312,22 +309,16 @@ export async function createAdminOrg(data: CreateOrgRequest): Promise<OrgListIte
   return res.data.data!
 }
 
-/** 更新组织信息 */
 export async function updateAdminOrg(id: string, data: UpdateOrgRequest): Promise<void> {
   await client.put(`/lesson-plans/organizations/${id}`, data)
 }
 
-/** 删除组织 */
 export async function deleteAdminOrg(id: string): Promise<void> {
   await client.delete(`/lesson-plans/organizations/${id}`)
 }
 
-// ==================== 教研组管理 API（对应 /lesson-plans/teaching-groups/*）====================
+// ==================== 教研组管理 API ====================
 
-/**
- * 获取教研组列表
- * 后端返回 { groups: [...], total: N }
- */
 export async function getAdminGroups(school_id?: string): Promise<GroupListItem[]> {
   const res = await client.get<{
     code: number
@@ -338,7 +329,6 @@ export async function getAdminGroups(school_id?: string): Promise<GroupListItem[
   return res.data.data?.groups ?? []
 }
 
-/** 获取教研组详情（含成员列表） */
 export async function getAdminGroupDetail(id: string): Promise<GroupDetail> {
   const res = await client.get<{ code: number; data: GroupDetail }>(
     `/lesson-plans/teaching-groups/${id}`
@@ -346,7 +336,6 @@ export async function getAdminGroupDetail(id: string): Promise<GroupDetail> {
   return res.data.data!
 }
 
-/** 创建教研组 */
 export async function createAdminGroup(data: CreateGroupRequest): Promise<GroupListItem> {
   const res = await client.post<{ code: number; data: GroupListItem }>(
     '/lesson-plans/teaching-groups', data
@@ -354,19 +343,16 @@ export async function createAdminGroup(data: CreateGroupRequest): Promise<GroupL
   return res.data.data!
 }
 
-/** 更新教研组 */
 export async function updateAdminGroup(id: string, data: UpdateGroupRequest): Promise<void> {
   await client.put(`/lesson-plans/teaching-groups/${id}`, data)
 }
 
-/** 删除教研组 */
 export async function deleteAdminGroup(id: string): Promise<void> {
   await client.delete(`/lesson-plans/teaching-groups/${id}`)
 }
 
 // ==================== 教研组成员管理 API ====================
 
-/** 获取教研组成员列表（通过 admin 路由） */
 export async function getAdminGroupMembers(groupId: string): Promise<GroupMemberItem[]> {
   const res = await client.get<{ code: number; data: GroupMemberItem[] }>(
     `/admin/groups/${groupId}/members`
@@ -374,21 +360,18 @@ export async function getAdminGroupMembers(groupId: string): Promise<GroupMember
   return res.data.data ?? []
 }
 
-/** 添加教研组成员 */
 export async function addAdminGroupMember(groupId: string, data: {
   user_id: string; role?: string
 }): Promise<void> {
   await client.post(`/admin/groups/${groupId}/members`, data)
 }
 
-/** 更新教研组成员角色 */
 export async function updateAdminGroupMemberRole(
   groupId: string, userId: string, role: string
 ): Promise<void> {
   await client.put(`/admin/groups/${groupId}/members/${userId}`, { role })
 }
 
-/** 移除教研组成员 */
 export async function removeAdminGroupMember(groupId: string, userId: string): Promise<void> {
   await client.delete(`/admin/groups/${groupId}/members/${userId}`)
 }

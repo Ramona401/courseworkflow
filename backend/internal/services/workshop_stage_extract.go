@@ -64,6 +64,10 @@ func DetectLessonPlanContent(content string) string {
 		"教学目标", "教学重点", "教学难点", "教学重难点",
 		"教学过程", "教学准备", "作业布置", "板书设计",
 		"教学方法", "教学评价", "课时安排",
+		// 扩展变体（AI实际输出中常见）
+		"课后作业", "课后练习", "课堂小结", "课堂总结",
+		"教学内容", "学习目标", "学习重点", "教学环节",
+		"导入", "新课", "巩固练习", "小结",
 	}
 	markerCount := 0
 	for _, marker := range lessonMarkers {
@@ -71,7 +75,8 @@ func DetectLessonPlanContent(content string) string {
 			markerCount++
 		}
 	}
-	if markerCount < 5 {
+	// 放宽阈值：只需3个核心标记词即可（AI输出格式多样，不同教案结构差异大）
+	if markerCount < 3 {
 		return ""
 	}
 	lines := strings.Split(content, "\n")
@@ -99,8 +104,19 @@ func DetectLessonPlanContent(content string) string {
 		return ""
 	}
 
-	hasProcess := strings.Contains(content, "教学过程")
-	hasEnding := strings.Contains(content, "作业布置") || strings.Contains(content, "板书设计")
+	// 教学过程：支持多种命名方式
+	hasProcess := strings.Contains(content, "教学过程") ||
+		strings.Contains(content, "教学环节") ||
+		strings.Contains(content, "教学活动")
+	// 结尾标记：支持多种命名方式（AI输出变体较多）
+	hasEnding := strings.Contains(content, "作业布置") ||
+		strings.Contains(content, "板书设计") ||
+		strings.Contains(content, "课后作业") ||
+		strings.Contains(content, "课后练习") ||
+		strings.Contains(content, "课堂小结") ||
+		strings.Contains(content, "课堂总结") ||
+		strings.Contains(content, "教学反思") ||
+		strings.Contains(content, "小结与作业")
 	if !hasProcess || !hasEnding {
 		return ""
 	}
@@ -108,7 +124,8 @@ func DetectLessonPlanContent(content string) string {
 	lessonLines := lines[startIdx:]
 	result := strings.TrimSpace(strings.Join(lessonLines, "\n"))
 	result = trimTrailingChatter(result)
-	if len(result) < 2000 {
+	// 放宽最小长度：800字符以上即视为有效教案内容
+	if len(result) < 800 {
 		return ""
 	}
 	return result
@@ -187,11 +204,124 @@ func extractReviewStageFromNatural(content string) (string, string, bool) {
 }
 
 // extractTotalScoreFromReview 从评审报告中提取总分
+// v104修复：扩展关键词列表，并跳过括号内的说明文字（如"满分10分"），支持更多AI输出格式
 func extractTotalScoreFromReview(content string) float64 {
+	// 优先尝试完整关键词匹配（更精确）
 	totalPatterns := []string{
-		"总分", "总评分", "综合评分", "综合得分", "总体评分",
+		"总评分", "总分", "综合评分", "综合得分", "总体评分",
+		"TOTAL", "总体得分", "评审总分", "最终评分",
 	}
-	return extractScoreFromText(content, totalPatterns)
+	score := extractScoreFromTextSkipParens(content, totalPatterns)
+	if score > 0 {
+		return score
+	}
+	// 降级：尝试表格格式的最后一行总分（如Markdown表格末行）
+	return extractTotalScoreFromTable(content)
+}
+
+// extractScoreFromTextSkipParens 提取分数时跳过括号内容（如"总评分(满分10分)：8.2"）
+func extractScoreFromTextSkipParens(text string, keywords []string) float64 {
+	for _, kw := range keywords {
+		idx := strings.Index(text, kw)
+		if idx == -1 {
+			continue
+		}
+		after := text[idx+len(kw):]
+		runes := []rune(after)
+		ri := 0
+		// 跳过空白和冒号
+		for ri < len(runes) {
+			r := runes[ri]
+			if r == ':' || r == '：' || r == ' ' || r == '\t' {
+				ri++
+				continue
+			}
+			break
+		}
+		// 跳过括号内容（如"(满分10分)"）
+		if ri < len(runes) && (runes[ri] == '(' || runes[ri] == '（') {
+			closeChar := rune(')')
+			if runes[ri] == '（' {
+				closeChar = '）'
+			}
+			ri++
+			for ri < len(runes) && runes[ri] != closeChar {
+				ri++
+			}
+			if ri < len(runes) {
+				ri++ // 跳过闭括号
+			}
+			// 再次跳过空白和冒号
+			for ri < len(runes) {
+				r := runes[ri]
+				if r == ':' || r == '：' || r == ' ' || r == '\t' {
+					ri++
+					continue
+				}
+				break
+			}
+		}
+		// 跳过星号（粗体标记 **）
+		for ri < len(runes) && runes[ri] == '*' {
+			ri++
+		}
+		if ri >= len(runes) {
+			continue
+		}
+		// 提取数字
+		numStr := ""
+		for j := ri; j < len(runes); j++ {
+			r := runes[j]
+			if (r >= '0' && r <= '9') || r == '.' {
+				numStr += string(r)
+			} else {
+				break
+			}
+		}
+		if numStr == "" {
+			continue
+		}
+		var score float64
+		if _, err := fmt.Sscanf(numStr, "%f", &score); err == nil && score > 0 && score <= 10 {
+			return score
+		}
+	}
+	return 0
+}
+
+// extractTotalScoreFromTable 从Markdown表格中提取总分行
+// 匹配类似 "| 总分 | 8.5 |" 的表格行
+func extractTotalScoreFromTable(content string) float64 {
+	lines := strings.Split(content, "\n")
+	scoreRegex := regexp.MustCompile(`(\d+\.?\d*)`)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "|") {
+			continue
+		}
+		if strings.Contains(trimmed, "---") {
+			continue
+		}
+		// 检查是否包含总分关键词
+		isTotal := false
+		for _, kw := range []string{"总分", "总评分", "综合评分", "TOTAL", "总体"} {
+			if strings.Contains(trimmed, kw) {
+				isTotal = true
+				break
+			}
+		}
+		if !isTotal {
+			continue
+		}
+		matches := scoreRegex.FindAllString(trimmed, -1)
+		for _, m := range matches {
+			var score float64
+			if _, err := fmt.Sscanf(m, "%f", &score); err == nil && score > 0 && score <= 10 {
+				return score
+			}
+		}
+	}
+	return 0
 }
 
 // extractDimensionsFromTable 从Markdown表格中提取维度评分

@@ -42,18 +42,24 @@ export function StartForm({ onStart, loading }: StartFormProps) {
   const [textbooksLoaded, setTextbooksLoaded] = useState(false)
   const [selectedTextbookIds, setSelectedTBIds] = useState<Set<string>>(new Set())
 
+  // v104修复：配方列表不再精确过滤grade_range（会导致新建配方看不见）
+  // 改为只按学科过滤，加载更多配方（limit:50），并支持"全部"/"当前学科"切换
+  const [recipeFilter, setRecipeFilter] = useState<'subject' | 'all'>('subject')
+
   useEffect(() => {
     const loadRecipes = async () => {
       setRecipesLoad(true)
       try {
-        const resp = await getRecipes({ subject, grade_range: grade, limit: 20 })
+        const params: Record<string, string> = { limit: '50' }
+        if (recipeFilter === 'subject' && subject) params.subject = subject
+        const resp = await getRecipes(params)
         setRecipes(resp.recipes || [])
         setSelectedId(null)
       } catch { setRecipes([]) }
       finally { setRecipesLoad(false) }
     }
     loadRecipes()
-  }, [subject, grade])
+  }, [subject, grade, recipeFilter])
 
   useEffect(() => {
     const loadTextbooks = async () => {
@@ -69,6 +75,7 @@ export function StartForm({ onStart, loading }: StartFormProps) {
   }, [subject, grade])
 
   const toggleTextbook = (id: string) => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
     setSelectedTBIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
   }
 
@@ -147,15 +154,26 @@ export function StartForm({ onStart, loading }: StartFormProps) {
 
         {/* 右栏：配方选择 */}
         <div style={{ width: '320px', flexShrink: 0, background: '#FFFBEB', borderRadius: '16px', padding: '24px', border: '1px solid #FDE68A', boxShadow: '0 4px 24px rgba(0,0,0,0.04)' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
             <label style={{ fontSize: '15px', fontWeight: 600, color: C.text }}>📦 备课配方</label>
             <button onClick={() => navigate('/lesson-plans/recipes/new', { state: { from: '/lesson-plans' } })} style={{ fontSize: '12px', color: C.primary, background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}>
               + 新建
             </button>
           </div>
-          <p style={{ fontSize: '12px', color: '#92400E', margin: '0 0 12px', lineHeight: 1.5 }}>
+          <p style={{ fontSize: '12px', color: '#92400E', margin: '0 0 8px', lineHeight: 1.5 }}>
             选配方后AI自动带入学情、风格等知识
           </p>
+          {/* v104：学科/全部切换，解决配方看不见的问题 */}
+          <div style={{ display: 'flex', gap: '4px', marginBottom: '10px' }}>
+            <button
+              onClick={() => setRecipeFilter('subject')}
+              style={{ flex: 1, padding: '4px 0', borderRadius: '6px', border: `1px solid ${recipeFilter === 'subject' ? C.primary : C.border}`, background: recipeFilter === 'subject' ? C.primaryLight : 'transparent', fontSize: '12px', color: recipeFilter === 'subject' ? C.primary : C.textSec, cursor: 'pointer', fontWeight: recipeFilter === 'subject' ? 600 : 400 }}
+            >当前学科</button>
+            <button
+              onClick={() => setRecipeFilter('all')}
+              style={{ flex: 1, padding: '4px 0', borderRadius: '6px', border: `1px solid ${recipeFilter === 'all' ? C.primary : C.border}`, background: recipeFilter === 'all' ? C.primaryLight : 'transparent', fontSize: '12px', color: recipeFilter === 'all' ? C.primary : C.textSec, cursor: 'pointer', fontWeight: recipeFilter === 'all' ? 600 : 400 }}
+            >全部配方</button>
+          </div>
           {recipesLoading ? (
             <div style={{ fontSize: '13px', color: C.textMuted, padding: '20px 0', textAlign: 'center' }}>加载中...</div>
           ) : (
@@ -179,9 +197,13 @@ export function StartForm({ onStart, loading }: StartFormProps) {
               ))}
               {recipes.length === 0 && !recipesLoading && (
                 <div style={{ fontSize: '13px', color: C.textMuted, padding: '16px 0', textAlign: 'center', lineHeight: 1.6 }}>
-                  暂无匹配配方<br />
-                  <button onClick={() => navigate('/lesson-plans/recipes/new', { state: { from: '/lesson-plans' } })} style={{ color: C.primary, background: 'none', border: 'none', cursor: 'pointer', fontSize: '13px', textDecoration: 'underline', padding: 0, marginTop: '4px' }}>
-                    去创建一个
+                  {recipeFilter === 'subject' ? `暂无「${subject}」学科配方` : '暂无配方'}<br />
+                  <button onClick={() => setRecipeFilter('all')} style={{ color: C.primary, background: 'none', border: 'none', cursor: 'pointer', fontSize: '12px', textDecoration: 'underline', padding: 0, marginTop: '4px' }}>
+                    查看全部配方
+                  </button>
+                  <span style={{ color: C.textMuted, fontSize: '12px' }}> 或 </span>
+                  <button onClick={() => navigate('/lesson-plans/recipes/new', { state: { from: '/lesson-plans' } })} style={{ color: C.primary, background: 'none', border: 'none', cursor: 'pointer', fontSize: '12px', textDecoration: 'underline', padding: 0 }}>
+                    新建配方
                   </button>
                 </div>
               )}

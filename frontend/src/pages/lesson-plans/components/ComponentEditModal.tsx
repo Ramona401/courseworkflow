@@ -11,6 +11,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import {
   getComponent, createComponent, updateComponent,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   type LessonPlanComponent, type LibraryType, type InjectionMode,
 } from '../../../api/lesson-plans'
 

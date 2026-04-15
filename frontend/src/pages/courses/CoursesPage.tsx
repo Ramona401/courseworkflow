@@ -14,7 +14,7 @@ import {
 import client from '@/api/client'
 import {
   BookOpen, Download, RefreshCw, Plus, Search,
-  CheckCircle, AlertCircle, Layers, Zap, Square, CheckSquare, FileText, X,
+  CheckCircle, AlertCircle, Zap, Square, CheckSquare, FileText, X,
 } from 'lucide-react'
 
 // ==================== Toast 提示组件 ====================
@@ -70,6 +70,8 @@ function IndexSummaryModal({
   const [error, setError] = useState('')
 
   useEffect(() => {
+     
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true)
     getIndexSummary(courseCode)
       .then(data => { setSummary(data); setLoading(false) })
@@ -183,16 +185,22 @@ export default function CoursesPage() {
 
   const loadCourses = useCallback(async () => {
     setLoading(true)
+     
     try { const data = await getCourses(); setCourses(data.courses || []) }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     catch (e: any) { setToast({ message: '加载失败: ' + (e.message || ''), type: 'err' }) }
     setLoading(false)
   }, [])
 
+   
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { loadCourses() }, [loadCourses])
 
   const loadCatalog = async () => {
+     
     setCatalogLoading(true)
     try { const data = await getOSSCatalog(); setCatalogModules(data.modules || []) }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     catch (e: any) { setToast({ message: '加载OSS目录失败: ' + (e.message || ''), type: 'err' }) }
     setCatalogLoading(false)
   }
@@ -209,11 +217,15 @@ export default function CoursesPage() {
     setRegisteringId(mod.id)
     try {
       const res = await client.post('/courses/register-fetch', {
+         
         external_module_id: mod.id, course_code: extractCode(mod), course_name: (mod.name || '').trim(),
       })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const d = (res.data as any).data
+       
       setToast({ message: extractCode(mod) + ' 注册成功' + (d?.index_fetched ? ' · ' + d.page_count + '页' : ''), type: 'ok' })
       loadCatalog(); loadCourses()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) { setToast({ message: '注册失败: ' + (e.message || ''), type: 'err' }) }
     setRegisteringId(null)
   }
@@ -272,11 +284,15 @@ export default function CoursesPage() {
     if (!confirm('确认对所有已注册课程重新拉取索引？')) return
     setBatchRunning(true)
     setToast({ message: '批量拉取索引中...', type: 'info' })
+     
     try {
       const res = await client.post('/courses/batch-fetch')
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const d = (res.data as any).data
+       
       setToast({ message: '批量拉取完成: 成功' + d.success + '个' + (d.failed > 0 ? ', 失败' + d.failed + '个' : ''), type: d.failed > 0 ? 'info' : 'ok' })
       loadCourses()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) { setToast({ message: '批量拉取失败: ' + (e.message || ''), type: 'err' }) }
     setBatchRunning(false)
   }
@@ -285,8 +301,10 @@ export default function CoursesPage() {
     setFetchingIndex(code)
     try {
       const r = await fetchCourseIndex(code)
+       
       setToast({ message: code + ' 索引拉取成功: ' + r.page_count + '页', type: 'ok' })
       loadCourses()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (e: any) { setToast({ message: '拉取失败: ' + (e.message || ''), type: 'err' }) }
     setFetchingIndex(null)
   }

@@ -38,6 +38,7 @@ const STEP_CN_MAP: Record<string, string> = {
 
 interface StepPanelRouterProps {
   stepName: string
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   data: any
   pipelineId?: string
   pipelineStatus?: string
@@ -64,7 +65,7 @@ function StepPanelRouter({ stepName, data, pipelineId, pipelineStatus, stepStatu
         />
       )
     case 'generator':  return <GeneratorPanel data={data} />
-    case 'verify':     return <VerifyPanel data={data} />
+    case 'verify':     return <VerifyPanel data={data} pipelineId={pipelineId} />
     default:
       return (
         <pre style={{ fontSize: 12, color: '#3c3c43', overflow: 'auto', maxHeight: 400, margin: 0, whiteSpace: 'pre-wrap' }}>
@@ -91,6 +92,7 @@ export function StepCard({
   onRestartFromStep, restarting, isHighRole,
 }: StepCardProps) {
   const [expanded, setExpanded]     = useState(false)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [stepData, setStepData]     = useState<any>(null)
   const [loadingData, setLoadingData] = useState(false)
 

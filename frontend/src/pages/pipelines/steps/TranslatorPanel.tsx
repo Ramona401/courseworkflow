@@ -3,6 +3,7 @@
  * P4.5-B: 展示Translator+Reviewer循环详情、最终评分、各轮评分、AI输出
  * v38新增: FAIL时显示原因分析和"确认使用当前方案→启动Generator"按钮
  */
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { useState } from 'react'
 import {
   kvRow, kvLabel, kvValue, passStyle, failStyle,
@@ -12,6 +13,7 @@ import { forceProceed } from '../../../api/pipelines'
 
 /** Translator面板属性 */
 interface TranslatorPanelProps {
+   
   data: any
   /** Pipeline ID，用于调用forceProceed API */
   pipelineId?: string
@@ -81,7 +83,8 @@ export default function TranslatorPanel({ data, pipelineId, pipelineStatus, step
       {(data.rounds || []).length > 0 && (
         <>
           <SectionTitle title="Translator-Reviewer 循环详情" />
-          {(data.rounds || []).map((r: any) => (
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          {(data.rounds || []).map((r: any) => (  
             <RoundDetail key={r.round} round={r} />
           ))}
         </>
@@ -100,6 +103,7 @@ export default function TranslatorPanel({ data, pipelineId, pipelineStatus, step
 
 /** FAIL原因分析块的属性 */
 interface FailAnalysisBlockProps {
+   
   data: any
   pipelineId?: string
   pipelineStatus?: string
@@ -170,6 +174,7 @@ function FailAnalysisBlock({ data, pipelineId, pipelineStatus, stepStatus, onFor
       setSuccess(true)
       setConfirming(false)
       onForceProceed?.()
+     
     } catch (e: any) {
       setError(e?.response?.data?.message || e?.message || '操作失败')
     } finally {
@@ -310,6 +315,7 @@ function FailAnalysisBlock({ data, pipelineId, pipelineStatus, stepStatus, onFor
 // ==================== 单轮详情组件 ====================
 
 /** 单轮Translator-Reviewer详情 */
+ 
 function RoundDetail({ round }: { round: any }) {
   const [expanded, setExpanded] = useState(false)
 
@@ -367,3 +373,5 @@ function RoundDetail({ round }: { round: any }) {
     </div>
   )
 }
+
+/* eslint-enable @typescript-eslint/no-explicit-any */

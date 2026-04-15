@@ -11,6 +11,14 @@ package services
 //   - executeScanner / doScanner Scanner步骤
 //   - callAIWithSemaphore AI调用包装
 //   - broadcastStepUpdate SSE事件广播
+//
+// v100修复：
+//   Bug2 — doDbCheck 自动重拉索引：每次创建Pipeline执行dbCheck时，
+//           自动从OSS重新拉取最新索引，避免隔天数据不同步问题。
+//   Bug3 — doScanner 字段校验：兼容prompt_a新格式（ability_targets）
+//           和旧格式（target），任一存在即通过校验。
+//   优化  — doDbCheck 新增页数范围校验：中学课件（初中/高中）允许25-35页，
+//           小学课件允许15-30页，超出范围给出警告而不阻断流程。
 
 import (
 	"context"
@@ -273,6 +281,37 @@ func (s *PipelineService) BatchRestartFromStep(pipelineIDs []string, stepName st
 // executePipelineAsync 异步执行Pipeline全链路
 // Phase8修复P-01：扩展断点续跑逻辑，覆盖全部8步
 func (s *PipelineService) executePipelineAsync(id string) {
+	// v90功能优化2：Pipeline执行总超时监控（60分钟）
+	// 启动一个goroutine定期检查执行时间，超时后自动标记失败并广播通知
+	pipelineStartTime := time.Now()
+	// v99优化4：Pipeline执行总超时从60分钟提升到120分钟，适应页面生成步骤较长的场景
+	const pipelineTimeout = 120 * time.Minute
+	timeoutCtx, timeoutCancel := context.WithCancel(context.Background())
+	defer timeoutCancel()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-timeoutCtx.Done():
+				return
+			case <-ticker.C:
+				elapsed := time.Since(pipelineStartTime)
+				if elapsed > pipelineTimeout {
+					// 总超时：标记Pipeline失败
+					p, pErr := repository.GetPipelineByID(id)
+					if pErr == nil && p.Status == models.PipelineStatusRunning {
+						timeoutMsg := fmt.Sprintf("Pipeline执行超时（已运行%d分钟，上限%d分钟），已自动标记失败。请检查AI服务状态后重试。",
+							int(elapsed.Minutes()), int(pipelineTimeout.Minutes()))
+						_ = repository.UpdatePipelineError(id, p.CurrentStep, timeoutMsg)
+						s.broadcastStepUpdate(id, "pipeline_error", p.CurrentStep, "failed", "failed", timeoutMsg)
+					}
+					return
+				}
+			}
+		}
+	}()
+
 	pipeline, err := repository.GetPipelineByID(id)
 	if err != nil {
 		_ = repository.UpdatePipelineError(id, models.StepDbCheck, "异步执行: 读取Pipeline失败: "+err.Error())
@@ -305,7 +344,6 @@ func (s *PipelineService) executePipelineAsync(id string) {
 					s.broadcastStepUpdate(id, "pipeline_error", "scanner", "failed", "failed", scanErr.Error())
 					return
 				}
-				resumeStep = models.StepEvaluator
 				fallthrough
 
 			case models.StepEvaluator:
@@ -335,7 +373,6 @@ func (s *PipelineService) executePipelineAsync(id string) {
 						fmt.Sprintf("高分早停：Evaluator均分%.1f达标（阈值%.1f），直接进入审核队列", avgStop, pCfgStop.Threshold))
 					return
 				}
-				resumeStep = models.StepMeta
 				fallthrough
 
 			case models.StepMeta:
@@ -350,7 +387,6 @@ func (s *PipelineService) executePipelineAsync(id string) {
 					s.broadcastStepUpdate(id, "pipeline_error", "meta", "failed", "failed", metaErr.Error())
 					return
 				}
-				resumeStep = models.StepTranslator
 				fallthrough
 
 			case models.StepTranslator:
@@ -365,7 +401,6 @@ func (s *PipelineService) executePipelineAsync(id string) {
 					s.broadcastStepUpdate(id, "pipeline_error", "translator", "failed", "failed", transErr.Error())
 					return
 				}
-				resumeStep = models.StepGenerator
 				fallthrough
 
 			case models.StepGenerator:
@@ -489,7 +524,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 
 		pipeline, err = repository.GetPipelineByID(id)
 		if err != nil {
-			_ = repository.UpdatePipelineError(id, models.StepTranslator, "读取Pipeline失败: "+err.Error())
+			_ = repository.UpdatePipelineError(id, models.StepMeta, "读取Pipeline失败: "+err.Error())
 			return
 		}
 
@@ -531,6 +566,7 @@ func (s *PipelineService) executePipelineAsync(id string) {
 
 // callAIWithSemaphore 通过引擎信号量控制AI并发调用
 // v89-2变更：增加pipelineID参数，传入真实TraceContext用于成本追踪
+// v99优化5：增加单步AI调用超时监控（15分钟），超时后记录警告日志
 func (s *PipelineService) callAIWithSemaphore(cfg *ai.EffectiveConfig, systemPrompt string, userPrompt string, pipelineID string) (*ai.CallResult, error) {
 	if s.engine != nil {
 		s.engine.AcquireAI()
@@ -547,7 +583,21 @@ func (s *PipelineService) callAIWithSemaphore(cfg *ai.EffectiveConfig, systemPro
 		}
 	}
 
-	return ai.CallAI(cfg, systemPrompt, userPrompt, traceCtx)
+	// v99优化5：单步AI调用超时监控
+	// 启动一个goroutine在15分钟后打印警告日志（AI调用本身通过HTTP超时控制）
+	// 这里不强制cancel，因为HTTP client有自己的超时，这里只是监控告警
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-time.After(15 * time.Minute):
+			fmt.Printf("[WARN] AI调用超过15分钟未返回 pipeline=%s model=%s\n", pipelineID, cfg.Model)
+		}
+	}()
+	result, err := ai.CallAI(cfg, systemPrompt, userPrompt, traceCtx)
+	close(done)
+	return result, err
 }
 
 // ==================== SSE事件广播 ====================
@@ -596,6 +646,15 @@ func (s *PipelineService) executeDbCheck(pipeline *models.Pipeline) error {
 }
 
 // doDbCheck 执行数据检查的具体逻辑
+//
+// v100修复Bug2：每次执行dbCheck时，自动从OSS重新拉取最新索引并更新数据库。
+// 背景：用户在课件平台更新课件后，需要手动触发"拉取索引"才能在AI审核平台同步。
+// 修复后，每次创建新Pipeline执行dbCheck时，系统自动重拉，无需手动操作。
+// 失败时不阻断流程，仅打印警告，继续使用数据库中现有索引。
+//
+// v100功能优化：新增页数范围警告
+// 中学课件（GradeNum >= 7）允许 25-35 页；小学课件（GradeNum < 7）允许 15-30 页。
+// 超出范围时记录 PageCountWarn 警告，不阻断 Pipeline 执行。
 func (s *PipelineService) doDbCheck(pipeline *models.Pipeline, result *models.DbCheckResult) error {
 	course, err := repository.GetCourseByCode(pipeline.CourseCode)
 	if err != nil {
@@ -604,6 +663,19 @@ func (s *PipelineService) doDbCheck(pipeline *models.Pipeline, result *models.Db
 	result.CourseID = course.ID
 	if course.ExternalModuleID != nil {
 		result.ModuleID = *course.ExternalModuleID
+	}
+
+	// v100修复Bug2：自动重拉OSS索引，确保每次Pipeline使用最新索引
+	// 仅在课程绑定了外部模块ID时执行，失败不阻断流程
+	if course.ExternalModuleID != nil && *course.ExternalModuleID > 0 {
+		courseService := NewCourseService(s.cfg)
+		if _, fetchErr := courseService.FetchIndex(pipeline.CourseCode); fetchErr != nil {
+			// 索引重拉失败，打印警告但不中断流程，继续用数据库现有索引
+			fmt.Printf("[WARN] dbCheck自动重拉索引失败 course=%s err=%s，继续使用现有索引\n",
+				pipeline.CourseCode, fetchErr.Error())
+		} else {
+			fmt.Printf("[INFO] dbCheck自动重拉索引成功 course=%s\n", pipeline.CourseCode)
+		}
 	}
 
 	idx, err := repository.GetCourseIndex(course.ID)
@@ -625,6 +697,44 @@ func (s *PipelineService) doDbCheck(pipeline *models.Pipeline, result *models.Db
 	if actualHash != idx.IndexHash {
 		return fmt.Errorf("%w (存储: %s, 实际: %s)",
 			ErrDbCheckIndexHashMismatch, idx.IndexHash[:16]+"...", actualHash[:16]+"...")
+	}
+
+	// v90-4修复Bug4：用BuildPageLessonMap计算过滤禁用页面后的实际可用页面数
+	// course_indexes.page_count来自索引条目数（可能包含禁用页面），与后续Pipeline步骤使用的实际页面数不一致
+	// 这里用实际可用页面数覆盖，确保dbCheck展示的页面数与元评估仲裁等步骤一致
+	if course.ExternalModuleID != nil && *course.ExternalModuleID > 0 {
+		ossService := NewOSSService(s.cfg)
+		if pageMap, mapErr := ossService.BuildPageLessonMap(*course.ExternalModuleID); mapErr == nil && len(pageMap) > 0 {
+			result.PageCount = len(pageMap)
+		}
+	}
+
+	// v100功能优化：页数范围校验
+	// 中学课件（初中7年级及以上）允许 25-35 页
+	// 小学课件（6年级及以下）允许 15-30 页
+	// 超出范围记录警告信息，不阻断流程
+	if result.PageCount > 0 {
+		var minPages, maxPages int
+		var stageLabel string
+		if course.GradeNum != nil && *course.GradeNum >= 7 {
+			// 中学阶段（初中+高中）
+			minPages = 25
+			maxPages = 35
+			stageLabel = "中学"
+		} else {
+			// 小学阶段
+			minPages = 15
+			maxPages = 30
+			stageLabel = "小学"
+		}
+		if result.PageCount < minPages || result.PageCount > maxPages {
+			result.PageCountWarn = fmt.Sprintf(
+				"⚠️ %s课件页数为%d页，建议范围%d-%d页，请确认课件结构是否合理",
+				stageLabel, result.PageCount, minPages, maxPages,
+			)
+			fmt.Printf("[WARN] 页数范围警告 course=%s pages=%d range=%d-%d(%s)\n",
+				pipeline.CourseCode, result.PageCount, minPages, maxPages, stageLabel)
+		}
 	}
 
 	return nil
@@ -663,6 +773,11 @@ func (s *PipelineService) executeScanner(pipeline *models.Pipeline) error {
 }
 
 // doScanner 执行Scanner的具体逻辑
+//
+// v100修复Bug3：兼容prompt_a新旧两种输出格式的顶层字段名
+// 旧格式：顶层字段为 "target"（字符串）
+// 新格式：顶层字段为 "ability_targets"（数组）
+// 只要两者之一存在即通过校验，避免因prompt_a升级后Scanner步骤报错。
 func (s *PipelineService) doScanner(pipeline *models.Pipeline) (*models.ScannerResult, error) {
 	result := &models.ScannerResult{}
 
@@ -713,9 +828,15 @@ func (s *PipelineService) doScanner(pipeline *models.Pipeline) (*models.ScannerR
 		return result, fmt.Errorf("%w (JSON解析错误: %s)", ErrScannerParseFailed, err.Error())
 	}
 
-	if _, hasTarget := parsed["target"]; !hasTarget {
+	// v100修复Bug3：兼容新旧两种顶层字段名
+	// 旧格式 prompt_a 输出包含 "target" 字段
+	// 新格式 prompt_a 输出包含 "ability_targets" 字段（数组形式）
+	// 只要其中一个存在即视为有效，避免因提示词升级导致Scanner报字段缺失错误
+	_, hasTarget := parsed["target"]
+	_, hasAbilityTargets := parsed["ability_targets"]
+	if !hasTarget && !hasAbilityTargets {
 		result.IsValid = false
-		return result, fmt.Errorf("%w (缺少必要字段target，实际字段: %v)",
+		return result, fmt.Errorf("%w (缺少必要字段 target 或 ability_targets，实际字段: %v)",
 			ErrScannerParseFailed, getMapKeys(parsed))
 	}
 

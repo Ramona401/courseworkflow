@@ -199,7 +199,9 @@ func (s *CourseService) FetchIndex(courseCode string) (*models.CourseIndex, erro
 		return nil, ErrIndexContentEmpty
 	}
 	indexHash := utils.SHA256Hash(indexContent)
-	pageCount := len(indexFile.Indexes)
+	// v99修复Bug3：过滤索引文件中的模块级摘要条目（Name不以P数字开头）
+	// 摘要条目的Content以PG:开头（如"PG:20|KD:15%..."），不是实际页面
+	pageCount := countPageEntries(indexFile.Indexes)
 	idx := &models.CourseIndex{
 		CourseID: course.ID, IndexContent: indexContent,
 		IndexHash: indexHash, PageCount: pageCount, TotalLength: len(indexContent),
@@ -314,3 +316,40 @@ func extractPageTitlesFromContent(content string) []string {
 	}
 	return titles
 }
+
+// countPageEntries 计算索引条目中实际页面条目的数量
+// v99新增：索引文件最后一条通常是模块级摘要（Name为课程名如"G1-03-表情翻译机"，Content以"PG:"开头）
+// 这类条目不是实际页面，不应计入页面数
+func countPageEntries(entries []*models.OSSIndexEntry) int {
+	count := 0
+	for _, e := range entries {
+		if isPageEntry(e) {
+			count++
+		}
+	}
+	return count
+}
+
+// isPageEntry 判断索引条目是否为实际页面（而非模块级摘要）
+// 页面条目的Name以"P数字"开头（如"P01-课程封面-V1.0"）
+// 模块级摘要的Name为课程名（如"G1-03-表情翻译机"），Content以"PG:"开头
+// isPageEntry 判断索引条目是否为实际页面（而非模块级摘要）
+// v99修复：改用Content字段判断，因为Name格式因模块而异（有的用小写p，有的用课程名前缀）
+// 页面条目的Content统一以"P数字:"开头（如"P01: PT:ST|..."），格式稳定可靠
+// 模块级摘要的Content以"PG:"开头（如"PG:20|KD:15%..."）
+func isPageEntry(e *models.OSSIndexEntry) bool {
+	content := strings.TrimSpace(e.Content)
+	if len(content) < 4 {
+		return false
+	}
+	// 页面条目Content以P后跟数字再跟冒号开头（如"P01:"、"P10:"）
+	if content[0] == 'P' && content[1] >= '0' && content[1] <= '9' {
+		// 排除模块摘要"PG:"开头
+		if len(content) >= 3 && content[1] == 'G' {
+			return false
+		}
+		return true
+	}
+	return false
+}
+

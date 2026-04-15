@@ -4,6 +4,9 @@
  * v73新增：
  *   renderMarkdown 增强——预处理清理孤立的*和#符号，
  *   确保AI输出的任何格式符号都不会以原始字符形式显示给用户。
+ *
+ * FE-WC-01修复：preprocessText 中的占位符从 §BOLD§/§END§ 改为 Unicode 私用区字符
+ *   U+E001/U+E002，避免AI输出中恰好包含 § 字符时导致正则碰撞。
  */
 
 // ==================== 颜色常量 ====================
@@ -24,7 +27,8 @@ export const C = {
 }
 
 // ==================== 学科和年级选项 ====================
-export const SUBJECTS = ['AI','人工智能','语文','数学','英语','物理','化学','生物','历史','地理','政治','信息技术']
+// v106修复：删除重复的 'AI'，统一使用 '人工智能'
+export const SUBJECTS = ['人工智能','语文','数学','英语','物理','化学','生物','历史','地理','政治','信息技术']
 export const GRADES   = ['七年级','八年级','九年级','高一','高二','高三','小学低段','小学中段','小学高段']
 
 // ==================== 流式消息状态类型 ====================
@@ -120,6 +124,14 @@ export const STAGE_PROMPT_MODE_OPTIONS: { value: string; label: string }[] = [
 // ==================== 文本预处理：清理不规范的格式符号 ====================
 
 /**
+ * FE-WC-01修复：使用 Unicode 私用区字符作为临时占位符
+ * U+E001 和 U+E002 属于 Private Use Area（PUA），不会出现在任何正常文本或AI输出中，
+ * 彻底避免了原来使用 §BOLD§/§END§ 时可能与AI输出中的 § 字符发生正则碰撞的问题。
+ */
+const PUA_BOLD_START = '\uE001'
+const PUA_BOLD_END   = '\uE002'
+
+/**
  * preprocessText 在渲染前清理AI输出中的格式符号
  *
  * 处理规则（按顺序）：
@@ -129,6 +141,9 @@ export const STAGE_PROMPT_MODE_OPTIONS: { value: string; label: string }[] = [
  * 4. 保留标准markdown：## 标题、**粗体**、- 列表、1. 列表、--- 分隔线
  */
 function preprocessText(text: string): string {
+  // FE-WC-01修复：构建基于PUA字符的正则，替代原来的 §BOLD§/§END§
+  const puaBoldRe   = new RegExp(PUA_BOLD_START + '([^' + PUA_BOLD_START + PUA_BOLD_END + ']+)' + PUA_BOLD_END, 'g')
+
   return text
     .split('\n')
     .map(line => {
@@ -145,11 +160,11 @@ function preprocessText(text: string): string {
       let result = line.replace(/^(\s*)#+([^#\s])/, '$1$2')
 
       // 行内孤立的单个*（不是**粗体**的部分）→ 去掉
-      // 先保护**粗体**，再清理孤立*，再还原
+      // 先用PUA字符保护**粗体**，再清理孤立*，再还原
       result = result
-        .replace(/\*\*([^*]+)\*\*/g, '§BOLD§$1§END§')  // 保护**粗体**
-        .replace(/\*/g, '')                               // 去掉所有孤立*
-        .replace(/§BOLD§([^§]+)§END§/g, '**$1**')       // 还原**粗体**
+        .replace(/\*\*([^*]+)\*\*/g, PUA_BOLD_START + '$1' + PUA_BOLD_END)  // 保护**粗体**为PUA占位符
+        .replace(/\*/g, '')                                                    // 去掉所有孤立*
+        .replace(puaBoldRe, '**$1**')                                          // 还原**粗体**
 
       return result
     })
