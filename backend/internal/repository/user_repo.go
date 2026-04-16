@@ -7,6 +7,11 @@ package repository
 //   - 所有Scan新增 &user.TeachingProfileJSON 字段
 //   - 新增 UpdateTeachingProfile：更新用户教学风格前测结果
 //   - 新增 GetTeachingProfile：获取用户教学风格前测结果（解析后）
+//
+// v110修改：
+//   - users 新增 school_id 字段支持（方案A）
+//   - 新增学校管理员查询辅助函数：GetUserSchoolID / ListUsersBySchool / IsUserInSchool
+//   - CreateUser / UpdateUser 支持 school_id 读写
 
 import (
 	"context"
@@ -33,13 +38,13 @@ var (
 // ==================== 内部常量：统一的SELECT列清单 ====================
 
 // userSelectColumns 用户表查询的标准列清单
-// v64(迭代3)：新增 teaching_profile 列
+// v64：teaching_profile
+// v110：school_id
 const userSelectColumns = `id, username, display_name, password_hash,
        role, status, last_login_at, login_count,
-       created_at, updated_at, teaching_profile`
+       created_at, updated_at, teaching_profile, school_id`
 
-// scanUser 统一的用户行扫描函数，避免每个查询重复写Scan字段
-// v64(迭代3)：新增 &user.TeachingProfileJSON 字段
+// scanUser 统一的用户行扫描函数
 func scanUser(row pgx.Row) (*models.User, error) {
 	user := &models.User{}
 	err := row.Scan(
@@ -54,6 +59,7 @@ func scanUser(row pgx.Row) (*models.User, error) {
 		&user.CreatedAt,
 		&user.UpdatedAt,
 		&user.TeachingProfileJSON,
+		&user.SchoolID,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -81,6 +87,7 @@ func scanUsers(rows pgx.Rows) ([]*models.User, error) {
 			&user.CreatedAt,
 			&user.UpdatedAt,
 			&user.TeachingProfileJSON,
+			&user.SchoolID,
 		)
 		if err != nil {
 			return nil, err
@@ -101,10 +108,24 @@ func FindUserByUsername(ctx context.Context, username string) (*models.User, err
 	return scanUser(database.DB.QueryRow(ctx, query, username))
 }
 
-// FindUserByID 根据 UUID 查找用户（用于 JWT 验证后获取用户信息，也用于组件萃取列表查创建者名称）
+// FindUserByID 根据 UUID 查找用户
 func FindUserByID(ctx context.Context, id string) (*models.User, error) {
 	query := `SELECT ` + userSelectColumns + ` FROM users WHERE id = $1`
 	return scanUser(database.DB.QueryRow(ctx, query, id))
+}
+
+// GetUserSchoolID 获取用户所属学校ID（可为空）
+func GetUserSchoolID(ctx context.Context, userID string) (*string, error) {
+	var schoolID *string
+	query := `SELECT school_id FROM users WHERE id = $1`
+	err := database.DB.QueryRow(ctx, query, userID).Scan(&schoolID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	return schoolID, nil
 }
 
 // UpdateLoginInfo 更新用户登录时间和登录次数
@@ -134,7 +155,29 @@ func ListUsers(ctx context.Context) ([]*models.User, error) {
 	return scanUsers(rows)
 }
 
-// CheckUsernameExists 检查用户名是否已存在（用于创建/编辑时校验）
+// ListUsersBySchool 按学校ID获取用户列表（学校管理员使用）
+func ListUsersBySchool(ctx context.Context, schoolID string) ([]*models.User, error) {
+	query := `SELECT ` + userSelectColumns + ` FROM users WHERE school_id = $1 ORDER BY created_at ASC`
+	rows, err := database.DB.Query(ctx, query, schoolID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanUsers(rows)
+}
+
+// IsUserInSchool 校验指定用户是否属于某学校
+func IsUserInSchool(ctx context.Context, userID string, schoolID string) (bool, error) {
+	var count int
+	query := `SELECT COUNT(*) FROM users WHERE id = $1 AND school_id = $2`
+	err := database.DB.QueryRow(ctx, query, userID, schoolID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// CheckUsernameExists 检查用户名是否已存在（全局唯一）
 func CheckUsernameExists(ctx context.Context, username string) (bool, error) {
 	var count int
 	query := `SELECT COUNT(*) FROM users WHERE username = $1`
@@ -145,11 +188,11 @@ func CheckUsernameExists(ctx context.Context, username string) (bool, error) {
 	return count > 0, nil
 }
 
-// CreateUser 创建新用户（仅admin调用）
+// CreateUser 创建新用户
 func CreateUser(ctx context.Context, user *models.User) error {
 	query := `
-		INSERT INTO users (id, username, display_name, password_hash, role, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO users (id, username, display_name, password_hash, role, status, created_at, updated_at, school_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`
 	now := time.Now()
 	_, err := database.DB.Exec(ctx, query,
@@ -161,19 +204,20 @@ func CreateUser(ctx context.Context, user *models.User) error {
 		user.Status,
 		now,
 		now,
+		user.SchoolID,
 	)
 	return err
 }
 
-// UpdateUser 更新用户基本信息（显示名+角色，admin管理其他用户用）
-func UpdateUser(ctx context.Context, id string, displayName string, role string) error {
+// UpdateUser 更新用户基本信息（显示名+角色+school_id）
+func UpdateUser(ctx context.Context, id string, displayName string, role string, schoolID *string) error {
 	query := `
 		UPDATE users
-		SET display_name = $1, role = $2, updated_at = $3
-		WHERE id = $4
+		SET display_name = $1, role = $2, school_id = $3, updated_at = $4
+		WHERE id = $5
 	`
 	now := time.Now()
-	result, err := database.DB.Exec(ctx, query, displayName, role, now, id)
+	result, err := database.DB.Exec(ctx, query, displayName, role, schoolID, now, id)
 	if err != nil {
 		return err
 	}
@@ -222,7 +266,6 @@ func UpdateStatus(ctx context.Context, id string, status string) error {
 // ==================== 用户中心自助操作（AccountHandler调用） ====================
 
 // UpdateUserDisplayName 用户自己更新显示名称
-// 与 UpdateUser 不同：只改 display_name，不涉及 role
 func UpdateUserDisplayName(ctx context.Context, userID string, displayName string) error {
 	query := `
 		UPDATE users
@@ -241,8 +284,6 @@ func UpdateUserDisplayName(ctx context.Context, userID string, displayName strin
 }
 
 // ChangeUserPassword 用户自己修改密码（需要验证旧密码）
-// 流程：查询旧密码哈希 → bcrypt验证 → 哈希新密码 → 更新
-// 返回 ErrWrongPassword 表示旧密码不正确
 func ChangeUserPassword(ctx context.Context, userID string, oldPassword string, newPassword string) error {
 	// 第1步：查询当前密码哈希
 	var currentHash string
@@ -320,7 +361,6 @@ func GetUserAssignments(ctx context.Context, userID string) ([]*models.CourseAss
 }
 
 // ReplaceUserAssignments 全量替换用户的课程分配（事务操作）
-// 先删除该用户所有旧分配，再批量插入新分配
 func ReplaceUserAssignments(ctx context.Context, userID string, courseCodes []string, assignedBy string) error {
 	// 开启事务
 	tx, err := database.DB.Begin(ctx)
@@ -341,7 +381,7 @@ func ReplaceUserAssignments(ctx context.Context, userID string, courseCodes []st
 		for _, code := range courseCodes {
 			_, err = tx.Exec(ctx,
 				`INSERT INTO user_course_assignments (id, user_id, course_code, assigned_by, assigned_at)
-				 VALUES (gen_random_uuid(), $1, $2, $3, $4)`,
+                 VALUES (gen_random_uuid(), $1, $2, $3, $4)`,
 				userID, code, assignedBy, now,
 			)
 			if err != nil {
@@ -357,7 +397,6 @@ func ReplaceUserAssignments(ctx context.Context, userID string, courseCodes []st
 // ==================== v64(迭代3)新增：教学风格前测 ====================
 
 // UpdateTeachingProfile 更新用户教学风格前测结果
-// profileJSON: 序列化后的 TeachingProfile JSON字符串
 func UpdateTeachingProfile(ctx context.Context, userID string, profileJSON string) error {
 	query := `
 		UPDATE users
@@ -376,7 +415,6 @@ func UpdateTeachingProfile(ctx context.Context, userID string, profileJSON strin
 }
 
 // GetTeachingProfile 获取用户教学风格前测结果（解析后的结构体）
-// 如果用户未完成前测（teaching_profile IS NULL），返回 nil, nil
 func GetTeachingProfile(ctx context.Context, userID string) (*models.TeachingProfile, error) {
 	var profileJSON *string
 	query := `SELECT teaching_profile FROM users WHERE id = $1`

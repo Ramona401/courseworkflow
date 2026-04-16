@@ -1,0 +1,6 @@
+projectKey=tedna-backend
+serverUrl=http://localhost:9000
+serverVersion=26.3.0.120487
+dashboardUrl=http://localhost:9000/dashboard?id=tedna-backend
+ceTaskId=a20146cb-33b0-4dfc-b6e1-3c1cb2fff6ad
+ceTaskUrl=http://localhost:9000/api/ce/task?id=a20146cb-33b0-4dfc-b6e1-3c1cb2fff6ad

@@ -9,40 +9,38 @@ import (
 
 // User 用户模型，对应数据库 users 表
 // v64(迭代3)新增：TeachingProfile 字段（JSONB，教学风格前测结果）
+// v110新增：SchoolID 字段（所属学校，方案A）
 type User struct {
 	ID           string     `json:"id"`           // UUID 主键
 	Username     string     `json:"username"`     // 用户名（唯一）
 	DisplayName  string     `json:"display_name"` // 显示名称
 	PasswordHash string     `json:"-"`            // 密码哈希（不输出到JSON）
 	// Role 用户角色：admin / senior_operator / operator / viewer
-	// 修复M-01：原注释遗漏 senior_operator，已补充
-	//   admin          : 全部功能，含用户管理、AI配置、批量验收、直接定稿
-	//   senior_operator: Pipeline创建/启动/审核/提交定稿/确认定稿/退回/分配审核任务
-	//   operator       : Pipeline创建/启动/审核/提交定稿/批量创建/批量启动
-	//   viewer         : 只读，仅可查看数据
 	Role        string     `json:"role"`
 	Status      string     `json:"status"`        // 状态：active / disabled
 	LastLoginAt *time.Time `json:"last_login_at"` // 最后登录时间
 	LoginCount  int        `json:"login_count"`   // 登录次数
 	CreatedAt   *time.Time `json:"created_at"`    // 创建时间
 	UpdatedAt   *time.Time `json:"updated_at"`    // 更新时间
-	// v64(迭代3)新增：教学风格前测结果（JSONB，可能为NULL）
+	// v64新增：教学风格前测结果（JSONB，可能为NULL）
 	TeachingProfileJSON *string `json:"-"` // 原始JSON字符串（不直接输出）
+	// v110新增：所属学校ID（可为空，向后兼容）
+	SchoolID *string `json:"school_id,omitempty"`
 }
 
 // UserInfo 返回给前端的用户信息（不含敏感字段）
-// v64(迭代3)新增：HasTeachingProfile 标记是否已完成前测
 type UserInfo struct {
-	ID                  string     `json:"id"`
-	Username            string     `json:"username"`
-	DisplayName         string     `json:"display_name"`
-	Role                string     `json:"role"`
-	Status              string     `json:"status"`
-	LastLoginAt         *time.Time `json:"last_login_at"`
-	LoginCount          int        `json:"login_count"`
-	CreatedAt           *time.Time `json:"created_at"`
-	UpdatedAt           *time.Time `json:"updated_at"`
-	HasTeachingProfile  bool       `json:"has_teaching_profile"`  // 是否已完成前测
+	ID                 string     `json:"id"`
+	Username           string     `json:"username"`
+	DisplayName        string     `json:"display_name"`
+	Role               string     `json:"role"`
+	Status             string     `json:"status"`
+	LastLoginAt        *time.Time `json:"last_login_at"`
+	LoginCount         int        `json:"login_count"`
+	CreatedAt          *time.Time `json:"created_at"`
+	UpdatedAt          *time.Time `json:"updated_at"`
+	HasTeachingProfile bool       `json:"has_teaching_profile"` // 是否已完成前测
+	SchoolID           *string    `json:"school_id,omitempty"`  // v110新增
 }
 
 // ToUserInfo 将 User 转换为 UserInfo（过滤敏感信息）
@@ -58,11 +56,11 @@ func (u *User) ToUserInfo() *UserInfo {
 		CreatedAt:          u.CreatedAt,
 		UpdatedAt:          u.UpdatedAt,
 		HasTeachingProfile: u.TeachingProfileJSON != nil,
+		SchoolID:           u.SchoolID,
 	}
 }
 
 // GetTeachingProfile 解析 TeachingProfile JSON 为结构体
-// 如果未完成前测（NULL），返回 nil
 func (u *User) GetTeachingProfile() *TeachingProfile {
 	if u.TeachingProfileJSON == nil {
 		return nil
@@ -76,92 +74,78 @@ func (u *User) GetTeachingProfile() *TeachingProfile {
 
 // ==================== 认证相关请求/响应 ====================
 
-// LoginRequest 登录请求体
 type LoginRequest struct {
-	Username string `json:"username"` // 用户名
-	Password string `json:"password"` // 密码（明文，服务端验证）
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
-// LoginResponse 登录成功响应
 type LoginResponse struct {
-	Token string    `json:"token"` // JWT access token
-	User  *UserInfo `json:"user"`  // 用户信息
+	Token string    `json:"token"`
+	User  *UserInfo `json:"user"`
 }
 
 // ==================== 用户管理请求/响应 ====================
 
-// CreateUserRequest 创建用户请求体（仅admin可调用）
-// 修复M-01：Role字段注释补充 senior_operator
+// CreateUserRequest 创建用户请求体
+// v110新增：SchoolID 可选（学校管理员创建用户时写入本校ID）
 type CreateUserRequest struct {
-	Username    string `json:"username"`     // 用户名（必填，唯一）
-	DisplayName string `json:"display_name"` // 显示名称（必填）
-	Password    string `json:"password"`     // 初始密码（必填，>=6位）
-	// Role 角色（必填）：admin / senior_operator / operator / viewer
-	Role string `json:"role"`
+	Username    string  `json:"username"`
+	DisplayName string  `json:"display_name"`
+	Password    string  `json:"password"`
+	Role        string  `json:"role"`
+	SchoolID    *string `json:"school_id,omitempty"`
 }
 
-// UpdateUserRequest 编辑用户请求体（仅admin可调用）
-// 修复M-01：Role字段注释补充 senior_operator
+// UpdateUserRequest 编辑用户请求体
+// v110新增：SchoolID 可选（系统管理员可用于纠偏；学校管理员接口不暴露修改能力）
 type UpdateUserRequest struct {
-	DisplayName string `json:"display_name"` // 显示名称（必填）
-	// Role 角色（必填）：admin / senior_operator / operator / viewer
-	Role string `json:"role"`
+	DisplayName string  `json:"display_name"`
+	Role        string  `json:"role"`
+	SchoolID    *string `json:"school_id,omitempty"`
 }
 
-// ResetPasswordRequest 重置密码请求体（仅admin可调用）
 type ResetPasswordRequest struct {
-	NewPassword string `json:"new_password"` // 新密码（必填，>=6位）
+	NewPassword string `json:"new_password"`
 }
 
-// UpdateStatusRequest 启用/禁用用户请求体（仅admin可调用）
 type UpdateStatusRequest struct {
-	Status string `json:"status"` // 状态（必填：active/disabled）
+	Status string `json:"status"`
 }
 
-// UpdateAssignmentsRequest 更新课程分配请求体（仅admin可调用）
 type UpdateAssignmentsRequest struct {
-	CourseCodes []string `json:"course_codes"` // 分配的课程代码列表（全量替换）
+	CourseCodes []string `json:"course_codes"`
 }
 
-// CourseAssignment 课程分配记录（返回给前端）
 type CourseAssignment struct {
-	ID         string     `json:"id"`          // UUID
-	UserID     string     `json:"user_id"`     // 用户ID
-	CourseCode string     `json:"course_code"` // 课程代码
-	AssignedBy string     `json:"assigned_by"` // 分配人ID
-	AssignedAt *time.Time `json:"assigned_at"` // 分配时间
+	ID         string     `json:"id"`
+	UserID     string     `json:"user_id"`
+	CourseCode string     `json:"course_code"`
+	AssignedBy string     `json:"assigned_by"`
+	AssignedAt *time.Time `json:"assigned_at"`
 }
 
-// UserListResponse 用户列表响应（含分页信息）
 type UserListResponse struct {
-	Users []*UserInfo `json:"users"` // 用户列表
-	Total int         `json:"total"` // 总数
+	Users []*UserInfo `json:"users"`
+	Total int         `json:"total"`
 }
 
 // ==================== 角色与状态常量 ====================
 
-// 角色常量
-// 修复M-01：四个角色均有明确说明，与系统实际权限矩阵对应
 const (
-	RoleAdmin          = "admin"           // 管理员：全部权限
-	RoleSeniorOperator = "senior_operator" // 高级操作员：可分配+创建Pipeline+确认定稿+看全部
-	RoleOperator       = "operator"        // 操作员：课程处理+审核+提交定稿
-	RoleViewer         = "viewer"          // 查看者：只读
+	RoleAdmin          = "admin"
+	RoleSeniorOperator = "senior_operator" // 学校管理员
+	RoleOperator       = "operator"        // 骨干教师
+	RoleViewer         = "viewer"          // 普通教师
 )
 
-// 用户状态常量
 const (
-	StatusActive   = "active"   // 正常
-	StatusDisabled = "disabled" // 禁用
+	StatusActive   = "active"
+	StatusDisabled = "disabled"
 )
 
-// ValidRoles 有效角色列表（用于校验），含全部4个角色
 var ValidRoles = []string{RoleAdmin, RoleSeniorOperator, RoleOperator, RoleViewer}
-
-// ValidStatuses 有效状态列表（用于校验）
 var ValidStatuses = []string{StatusActive, StatusDisabled}
 
-// IsValidRole 检查角色是否有效
 func IsValidRole(role string) bool {
 	for _, r := range ValidRoles {
 		if r == role {
@@ -171,10 +155,25 @@ func IsValidRole(role string) bool {
 	return false
 }
 
-// IsValidStatus 检查状态是否有效
 func IsValidStatus(status string) bool {
 	for _, s := range ValidStatuses {
 		if s == status {
+			return true
+		}
+	}
+	return false
+}
+
+// SchoolAdminCreatableRoles 学校管理员可创建的角色（仅比自己低级）
+var SchoolAdminCreatableRoles = []string{
+	RoleOperator,
+	RoleViewer,
+}
+
+// IsSchoolAdminCreatableRole 校验学校管理员可创建角色
+func IsSchoolAdminCreatableRole(role string) bool {
+	for _, r := range SchoolAdminCreatableRoles {
+		if r == role {
 			return true
 		}
 	}

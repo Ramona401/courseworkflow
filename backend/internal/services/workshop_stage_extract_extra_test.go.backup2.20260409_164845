@@ -1,0 +1,367 @@
+package services
+
+// workshop_stage_extract_extra_test.go — 阶段产出物提取补充测试
+//
+// 补充覆盖 workshop_stage_extract.go 中未被 extract_test.go 覆盖的函数：
+//   - extractWriteStageFromNatural：write阶段教案提取
+//   - extractReviewStageFromNatural：review阶段评审报告提取
+//   - extractGenericStageFromNatural：通用阶段提取
+//   - extractTotalScoreFromReview：评审总分提取
+//   - extractSummary：总评段落提取
+//   - ExtractStructuredFromNaturalReply：更多阶段场景覆盖
+
+import (
+"encoding/json"
+"strings"
+"testing"
+)
+
+// ==================== extractWriteStageFromNatural 测试 ====================
+
+// TestExtractWriteStage_WithFullLesson 包含完整教案的write阶段回复
+func TestExtractWriteStage_WithFullLesson(t *testing.T) {
+content := `好的，以下是完整的教案：
+
+# 一元一次方程教学设计
+
+## 教学目标
+1. 理解一元一次方程的定义
+2. 掌握基本求解方法
+
+## 教学重难点
+重点：方程的基本解法
+难点：移项变号的理解
+
+## 教学准备
+PPT课件、练习题
+
+## 教学方法
+讲授法、合作探究法
+
+## 教学过程
+
+### 一、导入新课（5分钟）
+通过生活情境引入方程概念，激发学生兴趣。
+
+### 二、探究新知（20分钟）
+引导学生发现方程的本质特征，通过具体实例推导解法。
+
+### 三、巩固练习（15分钟）
+分层练习设计，基础题与提高题结合。
+
+### 四、课堂小结（5分钟）
+总结本课重点知识，回顾方程定义和解法步骤。
+
+## 作业布置
+1. 课本第42页练习1-5
+2. 思考题一道
+
+## 板书设计
+一元一次方程
+定义 → 解法 → 应用
+` + strings.Repeat("这是补充内容确保教案长度足够。\n", 80)
+
+structured, narrative, hasContent := extractWriteStageFromNatural(content)
+if !hasContent {
+t.Error("包含完整教案应返回hasContent=true")
+}
+if structured == "" || structured == "{}" {
+t.Error("structured不应为空")
+}
+// structured应包含content_markdown
+var data map[string]interface{}
+if err := json.Unmarshal([]byte(structured), &data); err != nil {
+t.Fatalf("structured应为合法JSON: %v", err)
+}
+if _, ok := data["content_markdown"]; !ok {
+t.Error("应包含content_markdown字段")
+}
+_ = narrative // narrative可能为空或有值，不强制断言
+}
+
+// TestExtractWriteStage_ShortContent 内容太短不构成教案
+func TestExtractWriteStage_ShortContent(t *testing.T) {
+content := "好的，我来帮你写教案。首先确认一下课题。"
+structured, _, hasContent := extractWriteStageFromNatural(content)
+// 短内容没有教案标记，应走fallback
+if hasContent && structured != "{}" {
+var data map[string]interface{}
+if err := json.Unmarshal([]byte(structured), &data); err == nil {
+if _, ok := data["content_markdown"]; ok {
+// 有content_markdown说明检测到了教案，但内容太短
+t.Logf("短内容也检测到教案（可能是宽松匹配），structured长度=%d", len(structured))
+}
+}
+}
+// 不管hasContent值，不应panic
+t.Logf("短内容: hasContent=%v, structured长度=%d", hasContent, len(structured))
+}
+
+// TestExtractWriteStage_Empty 空内容
+func TestExtractWriteStage_Empty(t *testing.T) {
+structured, narrative, hasContent := extractWriteStageFromNatural("")
+if hasContent {
+t.Error("空内容应返回false")
+}
+if structured != "{}" {
+t.Errorf("空内容structured应为'{}'，实际%q", structured)
+}
+if narrative != "" {
+t.Errorf("空内容narrative应为空，实际%q", narrative)
+}
+}
+
+// ==================== extractReviewStageFromNatural 测试 ====================
+
+// TestExtractReviewStage_FullReview 完整评审报告
+func TestExtractReviewStage_FullReview(t *testing.T) {
+content := `# 教案评审报告
+
+## 评审维度
+
+| 维度 | 评分 | 点评 |
+|------|------|------|
+| T1 教学目标 | 8.5 | 目标明确，层次分明 |
+| T2 教学内容 | 7.0 | 内容基本合理 |
+| T3 教学方法 | 8.0 | 方法多样 |
+| T4 教学评价 | 7.5 | 评价较为全面 |
+
+## 做得好的点
+
+**1. 教学目标设定清晰**
+三维目标覆盖完整，可观察可评估。
+
+**2. 活动设计丰富**
+探究活动和小组合作结合良好。
+
+## 改进建议
+
+**1. 导入环节时间偏长**
+建议将导入从10分钟缩短到5分钟。
+
+**2. 缺少形成性评价**
+建议增加课堂即时检测环节。
+
+## 总评
+
+综合评分：7.8/10
+
+整体来看，这是一份结构完整的教案，教学目标明确，但在时间分配和评价方式上还有提升空间。
+`
+structured, narrative, hasContent := extractReviewStageFromNatural(content)
+if !hasContent {
+t.Error("完整评审报告应返回hasContent=true")
+}
+if structured == "" || structured == "{}" {
+t.Error("structured不应为空")
+}
+var data map[string]interface{}
+if err := json.Unmarshal([]byte(structured), &data); err != nil {
+t.Fatalf("structured应为合法JSON: %v", err)
+}
+// 验证总分
+if score, ok := data["total_score"]; ok {
+if s, ok := score.(float64); !ok || s <= 0 {
+t.Errorf("total_score应>0，实际%v", score)
+}
+} else {
+t.Error("应包含total_score")
+}
+// 验证维度
+if dims, ok := data["dimensions"]; ok {
+if dimArr, ok := dims.([]interface{}); ok {
+if len(dimArr) < 2 {
+t.Errorf("应至少有2个维度，实际%d", len(dimArr))
+}
+}
+}
+if narrative == "" {
+t.Log("narrative为空（可能正常，评审全在structured中）")
+}
+}
+
+// TestExtractReviewStage_NoScore 无评分的评审内容
+func TestExtractReviewStage_NoScore(t *testing.T) {
+content := "这是一些评审意见，但没有具体评分。教案需要改进导入环节。"
+structured, _, hasContent := extractReviewStageFromNatural(content)
+// 无评分可能返回false或简单结构
+t.Logf("无评分评审: hasContent=%v, structured=%s", hasContent, structured)
+}
+
+// TestExtractReviewStage_Empty 空内容
+func TestExtractReviewStage_Empty(t *testing.T) {
+_, _, hasContent := extractReviewStageFromNatural("")
+if hasContent {
+t.Error("空内容应返回false")
+}
+}
+
+// ==================== extractGenericStageFromNatural 测试 ====================
+
+// TestExtractGenericStage_Normal 通用阶段正常内容
+func TestExtractGenericStage_Normal(t *testing.T) {
+content := "这是自定义阶段的AI回复，包含了一些分析结果和建议。"
+structured, narrative, hasContent := extractGenericStageFromNatural("custom_stage", content)
+if !hasContent {
+t.Error("非空内容应返回hasContent=true")
+}
+var data map[string]interface{}
+if err := json.Unmarshal([]byte(structured), &data); err != nil {
+t.Fatalf("structured应为合法JSON: %v", err)
+}
+if data["stage"] != "custom_stage" {
+t.Errorf("stage应为custom_stage，实际%v", data["stage"])
+}
+if narrative == "" {
+t.Error("narrative不应为空")
+}
+}
+
+// TestExtractGenericStage_Empty 空内容
+func TestExtractGenericStage_Empty(t *testing.T) {
+structured, _, hasContent := extractGenericStageFromNatural("test", "")
+if hasContent {
+t.Error("空内容应返回false")
+}
+if structured != "{}" {
+t.Errorf("空内容structured应为'{}'，实际%q", structured)
+}
+}
+
+// TestExtractGenericStage_AnalyzeCode 使用analyze代码但走通用路径
+func TestExtractGenericStage_AnalyzeCode(t *testing.T) {
+// ExtractStructuredFromNaturalReply会分派到checkAnalyzeStage等，
+// 但extractGenericStageFromNatural是直接测试通用逻辑
+content := "经过分析，该班学情特征如下：学生基础参差不齐，需要分层教学。"
+structured, narrative, hasContent := extractGenericStageFromNatural("analyze", content)
+if !hasContent {
+t.Error("非空内容应返回true")
+}
+if narrative == "" {
+t.Error("narrative不应为空")
+}
+_ = structured
+}
+
+// ==================== extractTotalScoreFromReview 测试 ====================
+
+// TestExtractTotalScoreFromReview_Various 各种格式的评审总分
+func TestExtractTotalScoreFromReview_Various(t *testing.T) {
+tests := []struct {
+name    string
+content string
+expect  float64
+}{
+{"标准格式", "综合评分：8.5/10", 8.5},
+{"总分格式", "总分：9.0", 9.0},
+{"总评分格式", "总评分: 7.5/10分", 7.5},
+{"综合得分", "综合得分：8.0", 8.0},
+{"总体评分", "总体评分（7.0）", 7.0},
+{"无分数", "这里没有任何分数", 0},
+}
+for _, tt := range tests {
+t.Run(tt.name, func(t *testing.T) {
+got := extractTotalScoreFromReview(tt.content)
+if got != tt.expect {
+t.Errorf("extractTotalScoreFromReview=%f, want %f", got, tt.expect)
+}
+})
+}
+}
+
+// ==================== extractSummary 测试 ====================
+
+// TestExtractSummary_WithSection 有总评段落
+func TestExtractSummary_WithSection(t *testing.T) {
+content := `## 维度评分
+各维度表现良好。
+
+## 总评
+
+整体来看，这是一份不错的教案，教学目标清晰，结构完整。建议在互动环节上进一步加强。
+
+## 附录
+其他信息`
+result := extractSummary(content)
+if result == "" {
+t.Error("有总评段落应提取到内容")
+}
+if !strings.Contains(result, "不错的教案") {
+t.Errorf("应包含总评内容，实际%q", result)
+}
+}
+
+// TestExtractSummary_NoSection 无总评段落
+func TestExtractSummary_NoSection(t *testing.T) {
+content := "这里只有维度评分，没有总评段落。"
+result := extractSummary(content)
+if result != "" {
+t.Errorf("无总评段落应返回空，实际%q", result)
+}
+}
+
+// TestExtractSummary_AlternativeHeaders 使用不同的总评标题
+func TestExtractSummary_AlternativeHeaders(t *testing.T) {
+tests := []struct {
+name    string
+header  string
+}{
+{"总评", "总评"},
+{"综述", "综述"},
+{"整体评价", "整体评价"},
+{"综合评价", "综合评价"},
+}
+for _, tt := range tests {
+t.Run(tt.name, func(t *testing.T) {
+content := "## " + tt.header + "\n\n这是评价内容，教案质量良好。"
+result := extractSummary(content)
+if result == "" {
+t.Errorf("标题%q应能被识别", tt.header)
+}
+})
+}
+}
+
+// ==================== ExtractStructuredFromNaturalReply 更多场景 ====================
+
+// TestExtractStructured_WriteStage write阶段入口测试
+func TestExtractStructured_WriteStage(t *testing.T) {
+longLesson := "# 教案\n## 教学目标\n目标内容\n## 教学重难点\n重难点\n## 教学准备\n准备\n## 教学方法\n方法\n## 教学过程\n### 导入\n导入内容\n### 新授\n新授内容\n## 作业布置\n作业\n## 板书设计\n板书\n" + strings.Repeat("内容补充\n", 100)
+structured, _, hasContent := ExtractStructuredFromNaturalReply("write", longLesson)
+if !hasContent {
+t.Error("write阶段有教案内容应返回true")
+}
+if structured == "{}" {
+t.Error("structured不应为空JSON")
+}
+}
+
+// TestExtractStructured_ReviseStage revise阶段入口测试
+func TestExtractStructured_ReviseStage(t *testing.T) {
+content := "根据评审意见，我对教案做了以下修改：\n1. 缩短导入时间\n2. 增加互动环节"
+structured, narrative, hasContent := ExtractStructuredFromNaturalReply("revise", content)
+if !hasContent {
+t.Error("revise阶段有内容应返回true")
+}
+_ = structured
+_ = narrative
+}
+
+// TestExtractStructured_DesignStage design阶段入口测试
+func TestExtractStructured_DesignStage(t *testing.T) {
+content := "教学设计方案：\n1. 采用5E教学模型\n2. 导入5分钟，探究20分钟"
+structured, narrative, hasContent := ExtractStructuredFromNaturalReply("design", content)
+if !hasContent {
+t.Error("design阶段有内容应返回true")
+}
+var data map[string]interface{}
+if err := json.Unmarshal([]byte(structured), &data); err != nil {
+t.Fatalf("structured应为合法JSON: %v", err)
+}
+if data["stage"] != "design" {
+t.Errorf("stage应为design，实际%v", data["stage"])
+}
+if narrative == "" {
+t.Error("narrative不应为空")
+}
+}

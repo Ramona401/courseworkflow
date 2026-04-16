@@ -1,18 +1,5 @@
 package routes
 
-// routes.go — 路由注册主入口
-//
-// v73新增：wsStageService.SetGenService(lpGenService) 注入依赖
-//   WorkshopStageService.AdvanceStage 进入review/revise阶段时自动触发Chat，
-//   需要持有genService引用，通过SetGenService在routes层注入，避免循环依赖。
-//
-// v80新增：InitTraceWriter() 启动AI调用追踪异步写入器
-//   AITraceHandler 注册到 registerAdminRoutes
-//
-// v87新增：wsStageService.SetAESKey(cfg.GetAESKey()) 注入AES密钥
-//   WorkshopStageService.AdvanceStage 阶段过渡时调用LLM教练评估，
-//   需要AES密钥获取AI配置，通过SetAESKey在routes层注入。
-
 import (
 	"context"
 	"encoding/json"
@@ -28,11 +15,9 @@ import (
 	"tedna/internal/services"
 )
 
-// ==================== 权限常量 ====================
-
-const roleAdmin          = "admin"
+const roleAdmin = "admin"
 const roleSeniorOperator = "senior_operator"
-const roleOperator       = "operator"
+const roleOperator = "operator"
 
 func hasRole(role string, allowed ...string) bool {
 	for _, r := range allowed {
@@ -55,78 +40,69 @@ func methodNotAllowedJSON(w http.ResponseWriter, message string) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": message})
 }
 
-// ==================== 主入口 ====================
-
 func Setup(cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 
-	// ---- v80新增：启动AI调用追踪异步写入器 ----
 	repository.InitTraceWriter()
 
-	// ---- 初始化服务层 ----
-	authService     := services.NewAuthService(cfg)
-	userService     := services.NewUserService()
+	authService := services.NewAuthService(cfg)
+	userService := services.NewUserService()
 	aiConfigService := services.NewAIConfigService(cfg)
-	promptService   := services.NewPromptService()
-	edService       := services.NewExternalDataService(cfg)
-	courseService   := services.NewCourseService(cfg)
+	promptService := services.NewPromptService()
+	edService := services.NewExternalDataService(cfg)
+	courseService := services.NewCourseService(cfg)
 	pipelineService := services.NewPipelineService(cfg)
-	orgService      := services.NewOrganizationService()
-	compService     := services.NewComponentService(cfg)
-	lpService       := services.NewLessonPlanService(compService)
-	lpGenService    := services.NewLessonPlanGenService(cfg)
-	roleService     := services.NewRoleService()
-	recipeService   := services.NewRecipeService()
-	wsStageService  := services.NewWorkshopStageService()
-	assessService   := services.NewAssessmentService(recipeService, cfg)
-	tbService       := services.NewTextbookService(cfg)
-	ciService       := services.NewComponentIndexService(cfg)
-	liService       := services.NewLessonIndexService(cfg)
+	orgService := services.NewOrganizationService()
+	compService := services.NewComponentService(cfg)
+	lpService := services.NewLessonPlanService(compService)
+	lpGenService := services.NewLessonPlanGenService(cfg)
+	roleService := services.NewRoleService()
+	recipeService := services.NewRecipeService()
+	wsStageService := services.NewWorkshopStageService()
+	assessService := services.NewAssessmentService(recipeService, cfg)
+	tbService := services.NewTextbookService(cfg)
+	ciService := services.NewComponentIndexService(cfg)
+	liService := services.NewLessonIndexService(cfg)
 
-	// v73：注入genService到wsStageService，使review/revise阶段可自动触发Chat
-	// 必须在两个service都初始化完成后才能注入，避免循环依赖
 	wsStageService.SetGenService(lpGenService)
-
-	// v87：注入AES密钥到wsStageService，使阶段过渡时LLM教练评估可获取AI配置
 	wsStageService.SetAESKey(cfg.GetAESKey())
 
 	engine := services.NewEngine(8, 8, 100)
 	pipelineService.SetEngine(engine)
 
-	// ---- 初始化处理器层 ----
-	authHandler     := handlers.NewAuthHandler(authService)
-	userHandler     := handlers.NewUserHandler(userService)
+	authHandler := handlers.NewAuthHandler(authService)
+	userHandler := handlers.NewUserHandler(userService)
 	aiConfigHandler := handlers.NewAIConfigHandler(aiConfigService)
-	promptHandler   := handlers.NewPromptHandler(promptService)
-	edHandler       := handlers.NewExternalDataHandler(edService)
-	courseHandler   := handlers.NewCourseHandler(courseService)
+	promptHandler := handlers.NewPromptHandler(promptService)
+	edHandler := handlers.NewExternalDataHandler(edService)
+	courseHandler := handlers.NewCourseHandler(courseService)
 	pipelineHandler := handlers.NewPipelineHandler(pipelineService)
-	sseHandler      := handlers.NewSSEHandler(authService)
-	accountHandler  := handlers.NewAccountHandler()
-	adminHandler    := handlers.NewAdminHandler(userService, orgService)
-	roleHandler     := handlers.NewRoleHandler(roleService)
-	orgHandler      := handlers.NewOrganizationHandler(orgService)
-	compHandler     := handlers.NewComponentHandler(compService)
-	lpHandler       := handlers.NewLessonPlanHandler(lpService)
+	sseHandler := handlers.NewSSEHandler(authService)
+	accountHandler := handlers.NewAccountHandler()
+	adminHandler := handlers.NewAdminHandler(userService, orgService)
+	roleHandler := handlers.NewRoleHandler(roleService)
+	orgHandler := handlers.NewOrganizationHandler(orgService)
+	compHandler := handlers.NewComponentHandler(compService)
+	lpHandler := handlers.NewLessonPlanHandler(lpService)
 	annotationHandler := handlers.NewAnnotationHandler(cfg)
-	reviewAIHandler   := handlers.NewReviewAIHandler(cfg)
-	lpGenHandler    := handlers.NewLessonPlanGenHandler(lpGenService, authService)
-	recipeHandler   := handlers.NewRecipeHandler(recipeService, compService)
-	wsStageHandler  := handlers.NewWorkshopStageHandler(wsStageService)
-	assessHandler   := handlers.NewAssessmentHandler(assessService)
-	tbHandler       := handlers.NewTextbookHandler(tbService)
+	reviewAIHandler := handlers.NewReviewAIHandler(cfg)
+	lpGenHandler := handlers.NewLessonPlanGenHandler(lpGenService, authService)
+	recipeHandler := handlers.NewRecipeHandler(recipeService, compService)
+	wsStageHandler := handlers.NewWorkshopStageHandler(wsStageService)
+	assessHandler := handlers.NewAssessmentHandler(assessService)
+	tbHandler := handlers.NewTextbookHandler(tbService)
+	aiTraceHandler := handlers.NewAITraceHandler()
 
-	// v80新增：AI调用追踪处理器
-	aiTraceHandler  := handlers.NewAITraceHandler()
+	// v110：学校管理员处理器
+	schoolAdminHandler := handlers.NewSchoolAdminHandler(userService, orgService)
 
-	authMW    := middleware.AuthMiddleware(authService)
+	authMW := middleware.AuthMiddleware(authService)
 	adminOnly := middleware.RequireRole(roleAdmin)
+	seniorOperatorOnly := middleware.RequireRole(roleSeniorOperator)
 
-	// ---- 健康检查（公开）----
 	mux.HandleFunc("/api/v1/health", makeHealthHandler(engine))
 	pipelineService.StartNightlyVerifyScheduler()
 
-	// ---- 引擎状态（admin only）----
 	mux.Handle("/api/v1/engine/stats", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			methodNotAllowedJSON(w, "仅支持GET请求")
@@ -152,14 +128,10 @@ func Setup(cfg *config.Config) http.Handler {
 		})
 	}), authMW, adminOnly))
 
-	// ---- 认证路由（公开）----
 	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
+	mux.Handle("/api/v1/auth/me", middleware.Chain(http.HandlerFunc(authHandler.GetMe), authMW))
+	mux.Handle("/api/v1/auth/logout", middleware.Chain(http.HandlerFunc(authHandler.Logout), authMW))
 
-	// ---- 认证路由（需登录）----
-	mux.Handle("/api/v1/auth/me",     middleware.Chain(http.HandlerFunc(authHandler.GetMe),    authMW))
-	mux.Handle("/api/v1/auth/logout", middleware.Chain(http.HandlerFunc(authHandler.Logout),   authMW))
-
-	// ---- 通用用户中心 ----
 	mux.Handle("/api/v1/account/profile", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -170,29 +142,25 @@ func Setup(cfg *config.Config) http.Handler {
 			methodNotAllowedJSON(w, "仅支持GET/PUT请求")
 		}
 	}), authMW))
-	mux.Handle("/api/v1/account/password", middleware.Chain(
-		http.HandlerFunc(accountHandler.ChangePassword), authMW))
+	mux.Handle("/api/v1/account/password", middleware.Chain(http.HandlerFunc(accountHandler.ChangePassword), authMW))
 
-	// ---- 仪表盘 ----
-	mux.Handle("/api/v1/dashboard/stats", middleware.Chain(
-		http.HandlerFunc(pipelineHandler.GetDashboardStats), authMW))
+	mux.Handle("/api/v1/dashboard/stats", middleware.Chain(http.HandlerFunc(pipelineHandler.GetDashboardStats), authMW))
 
-	// ---- 注册各模块路由（v80: aiTraceHandler传入registerAdminRoutes）----
 	registerAdminRoutes(mux, authMW, adminOnly, adminHandler, roleHandler, userHandler, aiConfigHandler, promptHandler, edHandler, courseHandler, wsStageHandler, aiTraceHandler)
 	registerPipelineRoutes(mux, authMW, pipelineHandler, sseHandler)
-	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler,
-                annotationHandler, reviewAIHandler)
+	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler, annotationHandler, reviewAIHandler)
 
-	// ---- v83新增：组件索引批量压缩（admin only）----
+	// v110：注册学校管理员路由
+	registerSchoolAdminRoutes(mux, authMW, seniorOperatorOnly, schoolAdminHandler)
+
 	mux.Handle("/api/v1/admin/component-index/batch-compress", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			methodNotAllowedJSON(w, "仅支持POST请求")
 			return
 		}
-		// 异步执行批量压缩，立即返回
 		go func() {
-			import_ctx := context.Background()
-			success, failed, err := ciService.BatchCompressAllComponents(import_ctx, 20, 800)
+			importCtx := context.Background()
+			success, failed, err := ciService.BatchCompressAllComponents(importCtx, 20, 800)
 			if err != nil {
 				log.Printf("批量压缩组件索引错误: %v", err)
 			} else {
@@ -204,13 +172,11 @@ func Setup(cfg *config.Config) http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "message": "批量压缩已开始，请查看服务日志"})
 	}), authMW, adminOnly))
 
-	// ---- v86新增：教案索引批量生成（admin only）----
 	mux.Handle("/api/v1/admin/lesson-index/batch-index", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			methodNotAllowedJSON(w, "仅支持POST请求")
 			return
 		}
-		// 异步执行批量索引，立即返回
 		go liService.BatchIndexAllLessonPlans()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -220,8 +186,6 @@ func Setup(cfg *config.Config) http.Handler {
 	engine.StartGracefulShutdown()
 	return corsMiddleware(mux)
 }
-
-// ==================== 公共辅助函数 ====================
 
 func hasSuffix(path string, suffix string) bool {
 	return len(path) >= len(suffix) && path[len(path)-len(suffix):] == suffix
@@ -289,8 +253,6 @@ func containsUserGroupGID(path string) bool {
 	return len(rest) > 0
 }
 
-// ==================== CORS中间件 ====================
-
 func corsMiddleware(next http.Handler) http.Handler {
 	const allowedOrigin = "https://workflow.pkuailab.com"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -309,8 +271,6 @@ func corsMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
-
-// ==================== 健康检查处理器 ====================
 
 func makeHealthHandler(engine *services.Engine) http.HandlerFunc {
 	startTime := time.Now()

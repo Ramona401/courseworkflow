@@ -5,6 +5,11 @@ package services
 //   - 数据库查询/写入失败 → ERROR（系统级错误，需要处理）
 //   - 业务成功操作（创建/更新/重置密码） → INFO（含关键字段便于审计）
 //   - 密码哈希失败 → ERROR（加密库错误，极少发生）
+//
+// v110修改：
+//   - CreateUser 支持写入 SchoolID
+//   - UpdateUser 支持更新/保留 SchoolID（兼容旧调用方）
+//   - 保持原有接口行为不变，避免影响既有模块
 
 import (
 	"context"
@@ -86,7 +91,7 @@ func (s *UserService) CreateUser(ctx context.Context, req *models.CreateUserRequ
 		return nil, ErrInvalidRole
 	}
 
-	// 2. 检查用户名唯一性
+	// 2. 检查用户名全局唯一性（数据库本身也有唯一约束）
 	exists, err := repository.CheckUsernameExists(ctx, req.Username)
 	if err != nil {
 		userLog.Error("检查用户名唯一性失败",
@@ -109,7 +114,7 @@ func (s *UserService) CreateUser(ctx context.Context, req *models.CreateUserRequ
 		return nil, err
 	}
 
-	// 4. 构造用户对象
+	// 4. 构造用户对象（v110：支持SchoolID）
 	user := &models.User{
 		ID:           uuid.New().String(),
 		Username:     req.Username,
@@ -117,6 +122,7 @@ func (s *UserService) CreateUser(ctx context.Context, req *models.CreateUserRequ
 		PasswordHash: passwordHash,
 		Role:         req.Role,
 		Status:       models.StatusActive, // 新建用户默认启用
+		SchoolID:     req.SchoolID,        // v110
 	}
 
 	// 5. 写入数据库
@@ -124,6 +130,7 @@ func (s *UserService) CreateUser(ctx context.Context, req *models.CreateUserRequ
 		userLog.Error("创建用户失败",
 			"username", req.Username,
 			"role", req.Role,
+			"school_id", req.SchoolID,
 			"error", err,
 		)
 		return nil, err
@@ -134,6 +141,7 @@ func (s *UserService) CreateUser(ctx context.Context, req *models.CreateUserRequ
 		"username", user.Username,
 		"user_id", user.ID,
 		"role", user.Role,
+		"school_id", user.SchoolID,
 	)
 
 	// 6. 重新查询完整用户信息（含created_at等数据库生成字段）
@@ -148,6 +156,7 @@ func (s *UserService) CreateUser(ctx context.Context, req *models.CreateUserRequ
 // ==================== 编辑用户 ====================
 
 // UpdateUser 更新用户基本信息（显示名+角色）
+// v110：支持 req.SchoolID（若为空则保留原值，避免误清空）
 func (s *UserService) UpdateUser(ctx context.Context, userID string, currentUserID string, req *models.UpdateUserRequest) (*models.UserInfo, error) {
 	// 1. 参数校验
 	req.DisplayName = strings.TrimSpace(req.DisplayName)
@@ -159,31 +168,41 @@ func (s *UserService) UpdateUser(ctx context.Context, userID string, currentUser
 		return nil, ErrInvalidRole
 	}
 
-	// 2. 不允许修改自己的角色（防止admin把自己降级）
-	if userID == currentUserID {
-		existing, err := repository.FindUserByID(ctx, userID)
-		if err != nil {
-			return nil, err
+	// 2. 查询目标用户（用于：自改角色保护 + 保留school_id）
+	existing, err := repository.FindUserByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, repository.ErrUserNotFound) {
+			return nil, ErrUserNotFound
 		}
-		if existing.Role != req.Role {
-			return nil, ErrCannotChangeOwnRole
-		}
+		return nil, err
 	}
 
-	// 3. 更新数据库
-	if err := repository.UpdateUser(ctx, userID, req.DisplayName, req.Role); err != nil {
+	// 3. 不允许修改自己的角色（防止admin把自己降级）
+	if userID == currentUserID && existing.Role != req.Role {
+		return nil, ErrCannotChangeOwnRole
+	}
+
+	// 4. 计算目标 schoolID（req没传则保持原值）
+	targetSchoolID := existing.SchoolID
+	if req.SchoolID != nil {
+		targetSchoolID = req.SchoolID
+	}
+
+	// 5. 更新数据库
+	if err := repository.UpdateUser(ctx, userID, req.DisplayName, req.Role, targetSchoolID); err != nil {
 		if errors.Is(err, repository.ErrUserNotFound) {
 			return nil, ErrUserNotFound
 		}
 		userLog.Error("更新用户失败",
 			"user_id", userID,
 			"new_role", req.Role,
+			"target_school_id", targetSchoolID,
 			"error", err,
 		)
 		return nil, err
 	}
 
-	// 4. 返回更新后的用户信息
+	// 6. 返回更新后的用户信息
 	updated, err := repository.FindUserByID(ctx, userID)
 	if err != nil {
 		return nil, err
@@ -194,6 +213,7 @@ func (s *UserService) UpdateUser(ctx context.Context, userID string, currentUser
 		"username", updated.Username,
 		"user_id", userID,
 		"role", updated.Role,
+		"school_id", updated.SchoolID,
 		"operator_id", currentUserID,
 	)
 	return updated.ToUserInfo(), nil
@@ -279,7 +299,7 @@ func (s *UserService) UpdateStatus(ctx context.Context, userID string, currentUs
 		return err
 	}
 
-	// INFO：状态变更成功（enable/disable都是重要操作，记录审计）
+	// INFO：状态变更成功
 	userLog.Info("更新用户状态成功",
 		"username", user.Username,
 		"user_id", userID,

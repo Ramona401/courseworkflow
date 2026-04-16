@@ -1,0 +1,6 @@
+nohup: ignoring input
+{"time":"2026-04-14T13:08:25.919+08:00","level":"INFO","msg":"数据库连接成功","module":"database","host":"127.0.0.1","port":"5432","dbname":"tedna","max_conns":30,"min_conns":5}
+{"time":"2026-04-14T13:08:25.919+08:00","level":"INFO","msg":"AI调用追踪异步写入器已启动","module":"ai_trace_repo","buffer_size":500}
+{"time":"2026-04-14T13:08:25.919+08:00","level":"INFO","msg":"并发引擎已启动","module":"engine","max_workers":8,"max_ai_concurrency":8,"queue_capacity":100}
+{"time":"2026-04-14T13:08:25.920+08:00","level":"INFO","msg":"TE-DNA 2.0 服务启动","module":"main","port":"8080","version":"0.37.0","read_timeout":"30s","write_timeout":"600s"}
+{"time":"2026-04-14T13:08:25.920+08:00","level":"INFO","msg":"夜间验收调度器等待中","module":"verify","next_run":"2026-04-15 02:00:00","wait_duration":"12h51m34.079891843s"}

@@ -63,6 +63,30 @@ func GetOrganizationByID(ctx context.Context, id string) (*models.Organization, 
 	return org, nil
 }
 
+
+// GetSchoolByAdminUserID 根据学校管理员用户ID获取其管理的学校
+// 规则：仅返回 type='school' 的组织；若无则返回 ErrOrgNotFound
+func GetSchoolByAdminUserID(ctx context.Context, adminUserID string) (*models.Organization, error) {
+        org := &models.Organization{}
+        query := `
+                SELECT id, name, type, parent_id, admin_user_id, settings, status, created_at, updated_at
+                FROM organizations
+                WHERE admin_user_id = $1 AND type = 'school'
+                LIMIT 1
+        `
+        err := database.DB.QueryRow(ctx, query, adminUserID).Scan(
+                &org.ID, &org.Name, &org.Type, &org.ParentID, &org.AdminUserID,
+                &org.Settings, &org.Status, &org.CreatedAt, &org.UpdatedAt,
+        )
+        if err != nil {
+                if errors.Is(err, pgx.ErrNoRows) {
+                        return nil, ErrOrgNotFound
+                }
+                return nil, fmt.Errorf("查询学校管理员所属学校失败: %w", err)
+        }
+        return org, nil
+}
+
 func ListOrganizations(ctx context.Context, orgType string, parentID string) ([]*models.OrganizationListItem, error) {
 	query := `
 		SELECT o.id, o.name, o.type, o.parent_id, o.admin_user_id, o.status, o.created_at,
