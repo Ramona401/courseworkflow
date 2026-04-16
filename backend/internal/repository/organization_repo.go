@@ -572,3 +572,19 @@ func GetGroupLeadNames(ctx context.Context, groupID string) (string, error) {
 	}
 	return strings.Join(names, "、"), nil
 }
+
+// IsUserInSchoolByGroup 检查用户是否通过教研组归属于某学校
+// 不依赖 users.school_id，基于现有 teaching_group_members 组织体系
+// v110新增：用于学校管理员权限校验
+func IsUserInSchoolByGroup(ctx context.Context, userID string, schoolID string) (bool, error) {
+	var count int
+	err := database.DB.QueryRow(ctx, `
+		SELECT COUNT(*) FROM teaching_group_members tgm
+		JOIN teaching_groups tg ON tg.id = tgm.group_id
+		WHERE tgm.user_id = $1 AND tg.school_id = $2
+	`, userID, schoolID).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("检查用户学校归属失败: %w", err)
+	}
+	return count > 0, nil
+}

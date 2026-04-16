@@ -6,6 +6,7 @@
  * v5.2：新增备课配方列表路由
  * v5.1：新增统一用户管理中心 /admin
  * v106新增：/lesson-plans/review/:id 独立全屏评审工作台（脱离LPLayout，全屏布局）
+ * v110新增：/school-admin 学校管理员管理中心（senior_operator专属）
  */
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AuthContext } from '@/store/auth'
@@ -56,6 +57,8 @@ import AccountPage from '@/pages/account/AccountPage'
 import AICenterPage from '@/pages/ai-center/AICenterPage'
 import AITraceDashboardPage from '@/pages/ai-traces/AITraceDashboardPage'
 import AdminPage from '@/pages/admin/AdminPage'
+// v110新增：学校管理员管理中心
+import SchoolAdminPage from '@/pages/account/SchoolAdminPage'
 
 /* ==================== 路由守卫 ==================== */
 function AuthGuard({ children }: { children: React.ReactNode }) {
@@ -95,6 +98,17 @@ export default function App() {
 
           {/* ==================== 通用独立页面 ==================== */}
           <Route path="/account" element={<AuthGuard><AccountPage /></AuthGuard>} />
+
+          {/* v110新增：学校管理员管理中心
+              仅要求登录+senior_operator角色，是否真正绑定学校由页面内部校验 */}
+          <Route path="/school-admin" element={
+            <AuthGuard>
+              <RoleGuard roles={['senior_operator']}>
+                <SchoolAdminPage />
+              </RoleGuard>
+            </AuthGuard>
+          } />
+
           <Route path="/ai-center" element={
             <AuthGuard><RoleGuard roles={['admin']}><AICenterPage /></RoleGuard></AuthGuard>
           } />
@@ -122,7 +136,7 @@ export default function App() {
 
           {/* ==================== 教案系统 ==================== */}
 
-          {/* v106新增：独立全屏评审工作台（必须在 /lesson-plans 布局路由之前注册，否则被LPLayout包裹） */}
+          {/* v106新增：独立全屏评审工作台（必须在 /lesson-plans 布局路由之前注册） */}
           <Route path="/lesson-plans/review/:id" element={
             <AuthGuard><ReviewWorkbenchPage /></AuthGuard>
           } />

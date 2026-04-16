@@ -7,11 +7,6 @@ package repository
 //   - 所有Scan新增 &user.TeachingProfileJSON 字段
 //   - 新增 UpdateTeachingProfile：更新用户教学风格前测结果
 //   - 新增 GetTeachingProfile：获取用户教学风格前测结果（解析后）
-//
-// v110修改：
-//   - users 新增 school_id 字段支持（方案A）
-//   - 新增学校管理员查询辅助函数：GetUserSchoolID / ListUsersBySchool / IsUserInSchool
-//   - CreateUser / UpdateUser 支持 school_id 读写
 
 import (
 	"context"
@@ -31,20 +26,17 @@ var (
 	ErrUserNotFound      = errors.New("用户不存在")
 	ErrUsernameExists    = errors.New("用户名已存在")
 	ErrCannotDisableSelf = errors.New("不能禁用自己的账户")
-	// ErrWrongPassword 旧密码验证失败（用于用户自改密码）
-	ErrWrongPassword = errors.New("旧密码不正确")
+	ErrWrongPassword     = errors.New("旧密码不正确")
 )
 
-// ==================== 内部常量：统一的SELECT列清单 ====================
+// ==================== SELECT列清单 ====================
 
-// userSelectColumns 用户表查询的标准列清单
-// v64：teaching_profile
-// v110：school_id
+// userSelectColumns 用户表查询标准列
 const userSelectColumns = `id, username, display_name, password_hash,
        role, status, last_login_at, login_count,
-       created_at, updated_at, teaching_profile, school_id`
+       created_at, updated_at, teaching_profile`
 
-// scanUser 统一的用户行扫描函数
+// scanUser 扫描单行用户
 func scanUser(row pgx.Row) (*models.User, error) {
 	user := &models.User{}
 	err := row.Scan(
@@ -59,7 +51,6 @@ func scanUser(row pgx.Row) (*models.User, error) {
 		&user.CreatedAt,
 		&user.UpdatedAt,
 		&user.TeachingProfileJSON,
-		&user.SchoolID,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -70,7 +61,7 @@ func scanUser(row pgx.Row) (*models.User, error) {
 	return user, nil
 }
 
-// scanUsers 统一的用户列表行扫描函数
+// scanUsers 扫描多行用户
 func scanUsers(rows pgx.Rows) ([]*models.User, error) {
 	var users []*models.User
 	for rows.Next() {
@@ -87,7 +78,6 @@ func scanUsers(rows pgx.Rows) ([]*models.User, error) {
 			&user.CreatedAt,
 			&user.UpdatedAt,
 			&user.TeachingProfileJSON,
-			&user.SchoolID,
 		)
 		if err != nil {
 			return nil, err
@@ -102,49 +92,28 @@ func scanUsers(rows pgx.Rows) ([]*models.User, error) {
 
 // ==================== 认证相关查询 ====================
 
-// FindUserByUsername 根据用户名查找用户（用于登录验证）
 func FindUserByUsername(ctx context.Context, username string) (*models.User, error) {
 	query := `SELECT ` + userSelectColumns + ` FROM users WHERE username = $1`
 	return scanUser(database.DB.QueryRow(ctx, query, username))
 }
 
-// FindUserByID 根据 UUID 查找用户
 func FindUserByID(ctx context.Context, id string) (*models.User, error) {
 	query := `SELECT ` + userSelectColumns + ` FROM users WHERE id = $1`
 	return scanUser(database.DB.QueryRow(ctx, query, id))
 }
 
-// GetUserSchoolID 获取用户所属学校ID（可为空）
-func GetUserSchoolID(ctx context.Context, userID string) (*string, error) {
-	var schoolID *string
-	query := `SELECT school_id FROM users WHERE id = $1`
-	err := database.DB.QueryRow(ctx, query, userID).Scan(&schoolID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrUserNotFound
-		}
-		return nil, err
-	}
-	return schoolID, nil
-}
-
-// UpdateLoginInfo 更新用户登录时间和登录次数
 func UpdateLoginInfo(ctx context.Context, userID string) error {
 	query := `
 		UPDATE users
-		SET last_login_at = $1,
-		    login_count = login_count + 1,
-		    updated_at = $1
+		SET last_login_at = $1, login_count = login_count + 1, updated_at = $1
 		WHERE id = $2
 	`
-	now := time.Now()
-	_, err := database.DB.Exec(ctx, query, now, userID)
+	_, err := database.DB.Exec(ctx, query, time.Now(), userID)
 	return err
 }
 
-// ==================== 用户管理 CRUD（admin操作） ====================
+// ==================== 用户管理 CRUD ====================
 
-// ListUsers 获取所有用户列表（仅admin调用）
 func ListUsers(ctx context.Context) ([]*models.User, error) {
 	query := `SELECT ` + userSelectColumns + ` FROM users ORDER BY created_at ASC`
 	rows, err := database.DB.Query(ctx, query)
@@ -155,69 +124,37 @@ func ListUsers(ctx context.Context) ([]*models.User, error) {
 	return scanUsers(rows)
 }
 
-// ListUsersBySchool 按学校ID获取用户列表（学校管理员使用）
-func ListUsersBySchool(ctx context.Context, schoolID string) ([]*models.User, error) {
-	query := `SELECT ` + userSelectColumns + ` FROM users WHERE school_id = $1 ORDER BY created_at ASC`
-	rows, err := database.DB.Query(ctx, query, schoolID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanUsers(rows)
-}
-
-// IsUserInSchool 校验指定用户是否属于某学校
-func IsUserInSchool(ctx context.Context, userID string, schoolID string) (bool, error) {
-	var count int
-	query := `SELECT COUNT(*) FROM users WHERE id = $1 AND school_id = $2`
-	err := database.DB.QueryRow(ctx, query, userID, schoolID).Scan(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}
-
-// CheckUsernameExists 检查用户名是否已存在（全局唯一）
 func CheckUsernameExists(ctx context.Context, username string) (bool, error) {
 	var count int
-	query := `SELECT COUNT(*) FROM users WHERE username = $1`
-	err := database.DB.QueryRow(ctx, query, username).Scan(&count)
+	err := database.DB.QueryRow(ctx,
+		`SELECT COUNT(*) FROM users WHERE username = $1`, username,
+	).Scan(&count)
 	if err != nil {
 		return false, err
 	}
 	return count > 0, nil
 }
 
-// CreateUser 创建新用户
 func CreateUser(ctx context.Context, user *models.User) error {
 	query := `
-		INSERT INTO users (id, username, display_name, password_hash, role, status, created_at, updated_at, school_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		INSERT INTO users (id, username, display_name, password_hash, role, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`
 	now := time.Now()
 	_, err := database.DB.Exec(ctx, query,
-		user.ID,
-		user.Username,
-		user.DisplayName,
-		user.PasswordHash,
-		user.Role,
-		user.Status,
-		now,
-		now,
-		user.SchoolID,
+		user.ID, user.Username, user.DisplayName, user.PasswordHash,
+		user.Role, user.Status, now, now,
 	)
 	return err
 }
 
-// UpdateUser 更新用户基本信息（显示名+角色+school_id）
-func UpdateUser(ctx context.Context, id string, displayName string, role string, schoolID *string) error {
+func UpdateUser(ctx context.Context, id string, displayName string, role string) error {
 	query := `
 		UPDATE users
-		SET display_name = $1, role = $2, school_id = $3, updated_at = $4
-		WHERE id = $5
+		SET display_name = $1, role = $2, updated_at = $3
+		WHERE id = $4
 	`
-	now := time.Now()
-	result, err := database.DB.Exec(ctx, query, displayName, role, schoolID, now, id)
+	result, err := database.DB.Exec(ctx, query, displayName, role, time.Now(), id)
 	if err != nil {
 		return err
 	}
@@ -227,15 +164,11 @@ func UpdateUser(ctx context.Context, id string, displayName string, role string,
 	return nil
 }
 
-// UpdatePassword admin重置用户密码（直接覆盖，不验证旧密码）
 func UpdatePassword(ctx context.Context, id string, passwordHash string) error {
-	query := `
-		UPDATE users
-		SET password_hash = $1, updated_at = $2
-		WHERE id = $3
-	`
-	now := time.Now()
-	result, err := database.DB.Exec(ctx, query, passwordHash, now, id)
+	result, err := database.DB.Exec(ctx,
+		`UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3`,
+		passwordHash, time.Now(), id,
+	)
 	if err != nil {
 		return err
 	}
@@ -245,15 +178,11 @@ func UpdatePassword(ctx context.Context, id string, passwordHash string) error {
 	return nil
 }
 
-// UpdateStatus 更新用户状态（启用/禁用）
 func UpdateStatus(ctx context.Context, id string, status string) error {
-	query := `
-		UPDATE users
-		SET status = $1, updated_at = $2
-		WHERE id = $3
-	`
-	now := time.Now()
-	result, err := database.DB.Exec(ctx, query, status, now, id)
+	result, err := database.DB.Exec(ctx,
+		`UPDATE users SET status = $1, updated_at = $2 WHERE id = $3`,
+		status, time.Now(), id,
+	)
 	if err != nil {
 		return err
 	}
@@ -263,17 +192,13 @@ func UpdateStatus(ctx context.Context, id string, status string) error {
 	return nil
 }
 
-// ==================== 用户中心自助操作（AccountHandler调用） ====================
+// ==================== 用户中心自助操作 ====================
 
-// UpdateUserDisplayName 用户自己更新显示名称
 func UpdateUserDisplayName(ctx context.Context, userID string, displayName string) error {
-	query := `
-		UPDATE users
-		SET display_name = $1, updated_at = $2
-		WHERE id = $3
-	`
-	now := time.Now()
-	result, err := database.DB.Exec(ctx, query, displayName, now, userID)
+	result, err := database.DB.Exec(ctx,
+		`UPDATE users SET display_name = $1, updated_at = $2 WHERE id = $3`,
+		displayName, time.Now(), userID,
+	)
 	if err != nil {
 		return err
 	}
@@ -283,9 +208,7 @@ func UpdateUserDisplayName(ctx context.Context, userID string, displayName strin
 	return nil
 }
 
-// ChangeUserPassword 用户自己修改密码（需要验证旧密码）
 func ChangeUserPassword(ctx context.Context, userID string, oldPassword string, newPassword string) error {
-	// 第1步：查询当前密码哈希
 	var currentHash string
 	err := database.DB.QueryRow(ctx,
 		`SELECT password_hash FROM users WHERE id = $1`, userID,
@@ -296,23 +219,16 @@ func ChangeUserPassword(ctx context.Context, userID string, oldPassword string, 
 		}
 		return err
 	}
-
-	// 第2步：验证旧密码
 	if !utils.CheckPassword(oldPassword, currentHash) {
 		return ErrWrongPassword
 	}
-
-	// 第3步：哈希新密码
 	newHash, err := utils.HashPassword(newPassword)
 	if err != nil {
 		return err
 	}
-
-	// 第4步：更新密码
-	now := time.Now()
 	result, err := database.DB.Exec(ctx,
 		`UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3`,
-		newHash, now, userID,
+		newHash, time.Now(), userID,
 	)
 	if err != nil {
 		return err
@@ -325,7 +241,6 @@ func ChangeUserPassword(ctx context.Context, userID string, oldPassword string, 
 
 // ==================== 课程分配 ====================
 
-// GetUserAssignments 获取用户的课程分配列表
 func GetUserAssignments(ctx context.Context, userID string) ([]*models.CourseAssignment, error) {
 	query := `
 		SELECT id, user_id, course_code, assigned_by, assigned_at
@@ -342,14 +257,7 @@ func GetUserAssignments(ctx context.Context, userID string) ([]*models.CourseAss
 	var assignments []*models.CourseAssignment
 	for rows.Next() {
 		a := &models.CourseAssignment{}
-		err := rows.Scan(
-			&a.ID,
-			&a.UserID,
-			&a.CourseCode,
-			&a.AssignedBy,
-			&a.AssignedAt,
-		)
-		if err != nil {
+		if err := rows.Scan(&a.ID, &a.UserID, &a.CourseCode, &a.AssignedBy, &a.AssignedAt); err != nil {
 			return nil, err
 		}
 		assignments = append(assignments, a)
@@ -360,28 +268,24 @@ func GetUserAssignments(ctx context.Context, userID string) ([]*models.CourseAss
 	return assignments, nil
 }
 
-// ReplaceUserAssignments 全量替换用户的课程分配（事务操作）
 func ReplaceUserAssignments(ctx context.Context, userID string, courseCodes []string, assignedBy string) error {
-	// 开启事务
 	tx, err := database.DB.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// 1. 删除该用户所有旧的课程分配
 	_, err = tx.Exec(ctx, `DELETE FROM user_course_assignments WHERE user_id = $1`, userID)
 	if err != nil {
 		return err
 	}
 
-	// 2. 批量插入新的课程分配
 	if len(courseCodes) > 0 {
 		now := time.Now()
 		for _, code := range courseCodes {
 			_, err = tx.Exec(ctx,
 				`INSERT INTO user_course_assignments (id, user_id, course_code, assigned_by, assigned_at)
-                 VALUES (gen_random_uuid(), $1, $2, $3, $4)`,
+				 VALUES (gen_random_uuid(), $1, $2, $3, $4)`,
 				userID, code, assignedBy, now,
 			)
 			if err != nil {
@@ -389,22 +293,16 @@ func ReplaceUserAssignments(ctx context.Context, userID string, courseCodes []st
 			}
 		}
 	}
-
-	// 3. 提交事务
 	return tx.Commit(ctx)
 }
 
-// ==================== v64(迭代3)新增：教学风格前测 ====================
+// ==================== 教学风格前测 ====================
 
-// UpdateTeachingProfile 更新用户教学风格前测结果
 func UpdateTeachingProfile(ctx context.Context, userID string, profileJSON string) error {
-	query := `
-		UPDATE users
-		SET teaching_profile = $1::jsonb, updated_at = $2
-		WHERE id = $3
-	`
-	now := time.Now()
-	result, err := database.DB.Exec(ctx, query, profileJSON, now, userID)
+	result, err := database.DB.Exec(ctx,
+		`UPDATE users SET teaching_profile = $1::jsonb, updated_at = $2 WHERE id = $3`,
+		profileJSON, time.Now(), userID,
+	)
 	if err != nil {
 		return err
 	}
@@ -414,11 +312,11 @@ func UpdateTeachingProfile(ctx context.Context, userID string, profileJSON strin
 	return nil
 }
 
-// GetTeachingProfile 获取用户教学风格前测结果（解析后的结构体）
 func GetTeachingProfile(ctx context.Context, userID string) (*models.TeachingProfile, error) {
 	var profileJSON *string
-	query := `SELECT teaching_profile FROM users WHERE id = $1`
-	err := database.DB.QueryRow(ctx, query, userID).Scan(&profileJSON)
+	err := database.DB.QueryRow(ctx,
+		`SELECT teaching_profile FROM users WHERE id = $1`, userID,
+	).Scan(&profileJSON)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound
@@ -426,7 +324,7 @@ func GetTeachingProfile(ctx context.Context, userID string) (*models.TeachingPro
 		return nil, err
 	}
 	if profileJSON == nil {
-		return nil, nil // 未完成前测
+		return nil, nil
 	}
 	var profile models.TeachingProfile
 	if err := json.Unmarshal([]byte(*profileJSON), &profile); err != nil {
