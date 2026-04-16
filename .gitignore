@@ -19,3 +19,15 @@ frontend/dist/
 *.backup.*
 backup_*.sql
 backup/
+
+# 数据库备份（本地保留，不提交到git）
+db-backups/
+*.sql
+*.sql.gz
+# 服务器二进制和临时文件
+backend/server
+backend/server.backup.*
+backend/server.new.*
+backend/tedna_server
+backend/server.log*
+backend/.scannerwork/
