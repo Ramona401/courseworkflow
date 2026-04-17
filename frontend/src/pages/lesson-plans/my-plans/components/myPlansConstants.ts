@@ -48,5 +48,5 @@ export const STATUS_FILTERS: Array<{
   { key: 'dev',      label: '开发中', statuses: ['developing', 'completed'] },
 ]
 
-export const SUBJECTS = ['全部','AI','人工智能','语文','数学','英语','物理','化学','生物','历史','地理','政治','信息技术']
+export const SUBJECTS = ['全部','人工智能','语文','数学','英语','物理','化学','生物','历史','地理','政治','信息技术']
 export const GRADES   = ['全部','七年级','八年级','九年级','高一','高二','高三','小学低段','小学中段','小学高段']

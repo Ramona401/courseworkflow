@@ -22,6 +22,7 @@ import {
   type LessonPlanStatus,
   type TeachingGroup,
 } from '@/api/lesson-plans'
+import { SUBJECTS } from '@/pages/lesson-plans/workshop/components/workshopConstants'
 
 /* ==================== 样式常量 ==================== */
 const C = {
@@ -50,7 +51,6 @@ const SCOPE_TABS = [
   { key: 'region' as LibraryScope, label: '区域库',   icon: '🌏', desc: '跨校共享的精品教案' },
 ]
 
-const SUBJECTS = ['全部', 'AI', '人工智能', '语文', '数学', '英语', '物理', '化学', '生物', '历史', '地理', '政治', '信息技术']
 const GRADES   = ['全部', '七年级', '八年级', '九年级', '高一', '高二', '高三', '小学低段', '小学中段', '小学高段']
 
 /* ==================== 状态配置 ==================== */

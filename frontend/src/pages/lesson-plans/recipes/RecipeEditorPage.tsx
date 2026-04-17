@@ -25,6 +25,7 @@ import {
 import {
   STAGE_CODE_EMOJI, STAGE_CODE_NAME, STAGE_CODE_ROLE, STAGE_CODE_DESC,
   STAGE_REMOVABLE, FLOW_MSG_COLORS, PROMPT_MODE_OPTIONS, STAGE_PROMPT_MODE_OPTIONS,
+  SUBJECTS
 } from '../workshop/components/workshopConstants'
 import CustomStageModal from './components/CustomStageModal'
 
@@ -36,7 +37,6 @@ const C = {
   card: '#FFFFFF', border: '#F3F4F6', borderHover: '#E5E7EB', bg: '#FAFBFC',
 }
 
-const SUBJECTS = ['AI','人工智能','语文','数学','英语','物理','化学','生物','历史','地理','政治','信息技术']
 const GRADES = ['七年级','八年级','九年级','高一','高二','高三','小学低段','小学中段','小学高段']
 
 /* ==================== 默认教案结构模板 ==================== */
@@ -88,6 +88,10 @@ const loadDraft = (key: string): RecipeDraft | null => {
     const raw = sessionStorage.getItem(key)
     if (!raw) return null
     const draft = JSON.parse(raw) as RecipeDraft
+    // 兼容转换：旧草稿的subject='AI'自动转为'人工智能'
+    if (draft.subject === 'AI') {
+      draft.subject = '人工智能'
+    }
     // 草稿超过24小时自动过期
     if (Date.now() - draft.savedAt > 24 * 60 * 60 * 1000) {
       sessionStorage.removeItem(key)
@@ -133,7 +137,7 @@ export default function RecipeEditorPage() {
 
   // ---- 表单状态 ----
   const [name, setName] = useState(''); const [description, setDescription] = useState('')
-  const [subject, setSubject] = useState('AI'); const [gradeRange, setGradeRange] = useState('七年级')
+  const [subject, setSubject] = useState('人工智能'); const [gradeRange, setGradeRange] = useState('七年级')
   const [studentProfile, setStudentProfile] = useState(''); const [teachingStyle, setTeachingStyle] = useState('')
   const [schoolRequirements, setSchoolReqs] = useState(''); const [customNotes, setCustomNotes] = useState('')
   const [customPrompt, setCustomPrompt] = useState(''); const [selectedCompIds, setSelectedCompIds] = useState<Set<string>>(new Set())

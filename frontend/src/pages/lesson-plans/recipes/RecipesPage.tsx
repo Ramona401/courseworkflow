@@ -16,6 +16,7 @@ import {
   type RecipeListItem, type MarketRecipeItem,
 } from '@/api/recipes'
 import RecipeStatsModal from './components/RecipeStatsModal'
+import { SUBJECTS } from '@/pages/lesson-plans/workshop/components/workshopConstants'
 
 /* ==================== 颜色常量 ==================== */
 const C = {
@@ -35,8 +36,6 @@ const SCOPE_FILTERS = [
   { key: 'all', label: '全部' }, { key: 'personal', label: '个人' },
   { key: 'group', label: '教研组共享' }, { key: 'school', label: '全校共享' },
 ]
-
-const SUBJECTS = ['全部','AI','人工智能','语文','数学','英语','物理','化学','生物','历史','地理','政治','信息技术']
 
 const MARKET_SORTS = [
   { key: 'composite', label: '综合排序' }, { key: 'use_count', label: '使用最多' },
