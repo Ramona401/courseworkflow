@@ -64,6 +64,17 @@ func Setup(cfg *config.Config) http.Handler {
 	ciService := services.NewComponentIndexService(cfg)
 	liService := services.NewLessonIndexService(cfg)
 
+	// v110(TE-DNA 3.0 P0)新增:AI 助手服务
+	aiAssistantService := services.NewAIAssistantService()
+
+	// v113(TE-DNA 3.0 P0.5)新增:AI 助手对话式创作服务(Meta-Prompt + AOCI 组件库检索)
+	assistantDesignerService := services.NewAssistantDesignerService(
+		cfg.AESKey, cfg.AIAPIBaseURL, cfg.AIAPIKey, cfg.AIDefaultModel,
+	)
+
+	// v110(TE-DNA 3.0 P0 STEP 3):将 AI 助手服务注入教案生成服务,使 Chat 支持 assistant_id
+	lpGenService.SetAssistantService(aiAssistantService)
+
 	wsStageService.SetGenService(lpGenService)
 	wsStageService.SetAESKey(cfg.GetAESKey())
 
@@ -85,7 +96,10 @@ func Setup(cfg *config.Config) http.Handler {
 	compHandler := handlers.NewComponentHandler(compService)
 	lpHandler := handlers.NewLessonPlanHandler(lpService)
 	annotationHandler := handlers.NewAnnotationHandler(cfg)
-	reviewAIHandler := handlers.NewReviewAIHandler(cfg)
+
+	// v110(TE-DNA 3.0 P0)改动:NewReviewAIHandler 签名增加 aiAssistantService
+	reviewAIHandler := handlers.NewReviewAIHandler(cfg, aiAssistantService)
+
 	lpGenHandler := handlers.NewLessonPlanGenHandler(lpGenService, authService)
 	recipeHandler := handlers.NewRecipeHandler(recipeService, compService)
 	wsStageHandler := handlers.NewWorkshopStageHandler(wsStageService)
@@ -93,8 +107,18 @@ func Setup(cfg *config.Config) http.Handler {
 	tbHandler := handlers.NewTextbookHandler(tbService)
 	aiTraceHandler := handlers.NewAITraceHandler()
 
-	// v110：学校管理员处理器
+	// v110:学校管理员处理器
 	schoolAdminHandler := handlers.NewSchoolAdminHandler(userService, orgService)
+
+	// v110(TE-DNA 3.0 P0)新增:AI 助手处理器
+	aiAssistantHandler := handlers.NewAIAssistantHandler(aiAssistantService)
+
+	// v113(TE-DNA 3.0 P0.5)新增:AI 助手对话式创作处理器(SSE 流式接口)
+	assistantDesignerHandler := handlers.NewAssistantDesignerHandler(assistantDesignerService)
+
+	// v121(P1 收尾 · 2026-04-20)新增:AI 助手反馈处理器
+	// 无依赖 service(反馈逻辑简单,直接调 repository)
+	assistantFeedbackHandler := handlers.NewAssistantFeedbackHandler()
 
 	authMW := middleware.AuthMiddleware(authService)
 	adminOnly := middleware.RequireRole(roleAdmin)
@@ -150,8 +174,18 @@ func Setup(cfg *config.Config) http.Handler {
 	registerPipelineRoutes(mux, authMW, pipelineHandler, sseHandler)
 	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler, annotationHandler, reviewAIHandler)
 
-	// v110：注册学校管理员路由
+	// v110:注册学校管理员路由
 	registerSchoolAdminRoutes(mux, authMW, seniorOperatorOnly, schoolAdminHandler)
+
+	// v110(TE-DNA 3.0 P0)新增:注册 AI 助手路由
+	registerAIAssistantRoutes(mux, authMW, aiAssistantHandler, assistantDesignerHandler)
+
+	// v121(P1 收尾 · 2026-04-20)新增:注册 AI 助手反馈路由
+	// - POST   /api/v1/assistant-feedback                创建反馈(登录即可)
+	// - DELETE /api/v1/assistant-feedback/{id}           删除自己的反馈
+	// - GET    /api/v1/assistant-feedback                列表(admin only)
+	// - GET    /api/v1/assistants/{id}/feedback-stats    某助手的反馈统计
+	registerAssistantFeedbackRoutes(mux, authMW, adminOnly, assistantFeedbackHandler)
 
 	mux.Handle("/api/v1/admin/component-index/batch-compress", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -169,7 +203,7 @@ func Setup(cfg *config.Config) http.Handler {
 		}()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "message": "批量压缩已开始，请查看服务日志"})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "message": "批量压缩已开始,请查看服务日志"})
 	}), authMW, adminOnly))
 
 	mux.Handle("/api/v1/admin/lesson-index/batch-index", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -180,7 +214,7 @@ func Setup(cfg *config.Config) http.Handler {
 		go liService.BatchIndexAllLessonPlans()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "message": "批量教案索引已开始，请查看服务日志"})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "message": "批量教案索引已开始,请查看服务日志"})
 	}), authMW, adminOnly))
 
 	engine.StartGracefulShutdown()
@@ -291,10 +325,10 @@ func makeHealthHandler(engine *services.Engine) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  overallStatus,
-			"version": config.AppVersion,
-			"time":    time.Now().Format(time.RFC3339),
-			"uptime":  time.Since(startTime).Round(time.Second).String(),
+			"status":   overallStatus,
+			"version":  config.AppVersion,
+			"time":     time.Now().Format(time.RFC3339),
+			"uptime":   time.Since(startTime).Round(time.Second).String(),
 			"database": map[string]interface{}{"status": dbStatus},
 			"engine": map[string]interface{}{
 				"status":                engineStatus,

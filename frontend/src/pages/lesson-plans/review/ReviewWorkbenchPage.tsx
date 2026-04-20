@@ -4,6 +4,43 @@
  * v106新增：从列表页跳转到此页面，URL为 /lesson-plans/review/:id
  * 三列布局：教案预览（左44%）+ 评审面板（中26%）+ AI辅助侧边栏（右300px）
  * 布局脱离 LPLayout，使用全屏固定布局，最大化操作空间
+ *
+ * v112新增（TE-DNA 3.0 P0）：
+ *   - ReviewAISidebar 头部新增 AssistantSelector 下拉选择器
+ *   - 用户可在评审时选择不同 AI 助手风格（系统预置 / 本校 / 个人）
+ *   - 选中的 assistant_id 透传给 overview 和 chat 两个 API
+ *   - 切换助手自动清空 overview 缓存（让用户用新助手重新生成）
+ *   - 未选助手时（value=null）后端走兜底默认 prompt，完全向后兼容
+ *
+ * v112清理：
+ *   - 删除未使用的 renderPara 函数（v106 遗留死代码）
+ *   - 清理 2 处无用的 eslint-disable-next-line 指令
+ *
+ * v113改造（流式）：
+ *   - Overview 和 Chat 两个 AI 交互从一次性 JSON 响应改为 SSE 流式
+ *   - 用户看到"打字机效果"的逐字输出，体验大幅提升（原来要干等 5-15s 才有结果）
+ *   - 新增 consumeReviewAISSE 工具函数,封装 SSE 事件流消费逻辑
+ *   - Chat 消息采用"占位气泡 + 流式填充"模式:发消息后立即 push 空 assistant 消息,
+ *     chunk 事件到达时 append 到最后一条,视觉上就是 AI 在逐字回答
+ *   - Overview 面板同理:接收 chunk 就追加到 overview state,自然流出
+ *   - SSE 连接失败 / done 前中断 / 后端返回 error 事件,全部友好降级为错误提示
+ *
+ * v113改造(P0 STEP 6 Modal 挂载):
+ *   - 引入 AssistantEditModal 组件,给 AssistantSelector 加 onEdit/onCreateNew 两个回调
+ *   - 点击"+ 新建个人助手" → 打开 Modal(create-personal 模式)
+ *   - 点击个人助手的"✏️ 改" → 打开 Modal(edit 模式,预填原内容)
+ *   - 保存成功后自动 setAssistantId(新ID) → AssistantSelector 会自动刷新列表并选中
+ *   - Modal 的显示与否独立于 AssistantSelector,两个组件互不干扰
+ *
+ * v114修复(2026-04-20 对话气泡 Markdown 渲染):
+ *   - Bug: 评审对话气泡里 AI 输出的 **粗体** / *斜体* / ## 标题 等 Markdown 符号
+ *          以裸文本形式显示("满屏都是 ** 和 *"),严重影响可读性
+ *   - 根因: chatMsgs.map 的渲染位置直接用了 {msg.content}(裸字符串),没调用 renderMarkdown
+ *          同文件 overview 面板是对的(用了 renderMarkdown),对话区是唯一的遗漏
+ *   - 修复: 把对话气泡 assistant 消息的 {msg.content} 改成 {renderMarkdown(msg.content)}
+ *          用户消息保持裸文本(用户输入本来就没有 markdown 语义)
+ *   - 影响: 单文件单点改动,不改 renderMarkdown 本身(它已在工坊/教案详情/overview 三处生产验证)
+ *   - 不动 whiteSpace:'pre-wrap': renderMarkdown 输出结构化节点,pre-wrap 只影响内部纯文本换行,无冲突
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
@@ -14,6 +51,11 @@ import {
   type LessonPlan,
 } from '@/api/lesson-plans'
 import { getAnnotations, createAnnotation, deleteAnnotation, type Annotation } from '@/api/annotations'
+import { renderMarkdown } from '../plan-detail/components/planDetailConstants'
+import AssistantSelector from '@/components/ai-assistants/AssistantSelector'
+// v121 Bug 2 修复:个人助手删除操作
+import { deleteAssistant } from '@/api/ai-assistants'
+import AssistantEditModal, { type AssistantEditMode } from '@/components/ai-assistants/AssistantEditModal'
 
 /* ==================== 样式常量 ==================== */
 const C = {
@@ -49,18 +91,137 @@ function splitParagraphs(md: string): string[] {
   return md.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 0)
 }
 
-function renderPara(text: string): string {
-  let result = text
-    .replace(/^### (.+)$/gm, '<h3 style="font-size:15px;font-weight:700;color:#1F2937;margin:12px 0 6px">$1</h3>')
-    .replace(/^## (.+)$/gm, '<h2 style="font-size:17px;font-weight:700;color:#1F2937;margin:16px 0 8px">$1</h2>')
-    .replace(/^# (.+)$/gm, '<h1 style="font-size:19px;font-weight:700;color:#1F2937;margin:0 0 12px">$1</h1>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/^[*-] (.+)$/gm, '<li style="margin:3px 0;color:#374151">$1</li>')
-  result = result.replace(/(<li[^>]*>.*?<\/li>\n?)+/gs, (m) => `<ul style="margin:6px 0 6px 18px">${m}</ul>`)
-  if (!result.includes('<')) {
-    result = `<p style="margin:6px 0;line-height:1.8;color:#374151;font-size:14px">${text}</p>`
+/* ==================== SSE 流式消费工具 ==================== */
+
+/**
+ * SSE 事件回调定义
+ * 与后端 review_ai_handler.go 的 4 种 event 类型对应:
+ *   connected → 流已建立(本前端不做特殊处理,仅日志)
+ *   chunk     → AI 输出的一个文本片段
+ *   done      → AI 输出完成(携带完整内容和 tokens)
+ *   error     → 后端发生错误
+ */
+interface ReviewAISSEHandlers {
+  onChunk: (chunk: string) => void
+  onDone: (fullContent: string) => void
+  onError: (error: string) => void
+}
+
+/**
+ * consumeReviewAISSE — 消费 review-ai 接口的 SSE 流
+ *
+ * @param url      目标接口 URL(/api/v1/lesson-plans/review-ai/overview 或 /chat)
+ * @param body     请求体(会 JSON.stringify)
+ * @param handlers 事件回调
+ * @returns 返回一个可调用的关闭函数,用于中止请求(当前未使用但预留)
+ *
+ * 实现参考:api/annotations.ts 的 aiFixAnnotation(已在生产验证过的成熟模板)
+ * 关键点:
+ *   - 使用 fetch + ReadableStream(EventSource 不支持自定义 Header 所以不能用)
+ *   - 从 localStorage 读取 JWT(与 axios 拦截器保持一致)
+ *   - 按 \n\n 分割 SSE 事件,每个事件解析 event: 和 data: 两行
+ *   - 容错:JSON 解析失败的事件直接忽略,不中断流
+ */
+function consumeReviewAISSE(
+  url: string,
+  body: Record<string, unknown>,
+  handlers: ReviewAISSEHandlers,
+): () => void {
+  let isClosed = false
+  const controller = new AbortController()
+
+  const token = localStorage.getItem('token') || ''
+
+  fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+    signal: controller.signal,
+  }).then(async (response) => {
+    if (!response.ok) {
+      // 前置错误(鉴权失败/请求体错误/助手权限问题等)后端会走普通 JSON 而不是 SSE
+      // 尝试解析 message 字段作为错误信息展示
+      let errMsg = `请求失败: HTTP ${response.status}`
+      try {
+        const data = await response.json()
+        if (data?.message) errMsg = data.message
+      } catch {
+        // 解析失败保留默认错误
+      }
+      handlers.onError(errMsg)
+      return
+    }
+    if (!response.body) {
+      handlers.onError('浏览器不支持流式响应')
+      return
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (!isClosed) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+
+      // 按 SSE 格式解析:每条事件以 \n\n 分隔
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop() ?? ''
+
+      for (const part of parts) {
+        const lines = part.trim().split('\n')
+        let eventType = ''
+        let dataStr = ''
+
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            eventType = line.slice(7).trim()
+          } else if (line.startsWith('data: ')) {
+            dataStr = line.slice(6).trim()
+          }
+        }
+
+        if (!eventType || !dataStr) continue
+
+        try {
+          const data = JSON.parse(dataStr)
+          switch (eventType) {
+            case 'connected':
+              // 仅表示流已建立,前端不做特殊处理
+              break
+            case 'chunk':
+              if (typeof data.chunk === 'string') handlers.onChunk(data.chunk)
+              break
+            case 'done':
+              handlers.onDone(typeof data.full_content === 'string' ? data.full_content : '')
+              isClosed = true
+              break
+            case 'error':
+              handlers.onError(typeof data.error === 'string' ? data.error : 'AI 调用失败')
+              isClosed = true
+              break
+          }
+        } catch {
+          // 忽略 JSON 解析错误的事件
+        }
+      }
+    }
+
+    reader.cancel()
+  }).catch((err) => {
+    if (isClosed) return // 主动关闭不算错误
+    handlers.onError(`连接失败: ${err?.message ?? '未知错误'}`)
+  })
+
+  return () => {
+    isClosed = true
+    controller.abort()
   }
-  return result
 }
 
 /* ==================== AI辅助侧边栏 ==================== */
@@ -76,6 +237,18 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
   const [activePanel, setActivePanel]   = useState<'overview' | 'chat'>('overview')
   const chatEndRef = useRef<HTMLDivElement>(null)
 
+  // v112新增：AI助手选择状态
+  // null 表示未选，后端走兜底默认 prompt（完全向后兼容）
+  const [assistantId, setAssistantId] = useState<string | null>(null)
+
+  // v113 STEP 6 新增：AssistantEditModal 状态
+  // modalOpen=false 时 Modal 不渲染;modalMode 和 modalEditId 由触发点决定
+  const [modalOpen, setModalOpen]       = useState(false)
+  const [modalMode, setModalMode]       = useState<AssistantEditMode>('create-personal')
+  const [modalEditId, setModalEditId]   = useState<string | undefined>(undefined)
+  // 用于保存成功后强制 AssistantSelector 重新拉列表的 key
+  const [selectorKey, setSelectorKey]   = useState(0)
+
   const planContent = plan.content_markdown || ''
   const planMeta = `学科：${plan.subject}  年级：${plan.grade}  课题：${plan.topic}  课时：${plan.duration_minutes}分钟`
 
@@ -83,60 +256,137 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chatMsgs, chatLoading])
 
-  const loadOverview = useCallback(async () => {
-    if (overviewLoading || overview) return
-    if (!planContent) { setOverview('教案正文内容为空，无法生成概览。'); return }
-    setOvLoading(true)
-    try {
-      const token = localStorage.getItem('token') || ''
-      const resp = await fetch('/api/v1/lesson-plans/review-ai/overview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ plan_meta: planMeta, plan_content: planContent.slice(0, 3000) }),
-      })
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-      const data = await resp.json()
-      setOverview(data.data?.overview || '概览生成失败，请重试。')
-    } catch {
-      setOverview('概览生成失败，请重试。')
-    } finally {
-      setOvLoading(false)
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [overviewLoading, overview, planContent, planMeta])
-
+  // v112新增：切换助手时清空 overview 缓存
   useEffect(() => {
-    if (planContent) loadOverview()
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [planContent])
+    setOverview('')
+  }, [assistantId])
 
-  const sendChat = async () => {
+  /**
+   * v113 改造:loadOverview 改为 SSE 流式消费
+   */
+  const loadOverview = useCallback(() => {
+    if (overviewLoading) return
+    if (overview) return
+    if (!planContent) { setOverview('教案正文内容为空，无法生成概览。'); return }
+
+    setOvLoading(true)
+    setOverview('')
+
+    let accumulated = ''
+    consumeReviewAISSE(
+      '/api/v1/lesson-plans/review-ai/overview',
+      {
+        plan_meta: planMeta,
+        plan_content: planContent.slice(0, 3000),
+        assistant_id: assistantId ?? '',
+      },
+      {
+        onChunk: (chunk) => {
+          accumulated += chunk
+          setOverview(accumulated)
+        },
+        onDone: (fullContent) => {
+          if (fullContent && fullContent.length >= accumulated.length) {
+            setOverview(fullContent)
+          }
+          setOvLoading(false)
+        },
+        onError: (err) => {
+          setOverview(`⚠️ ${err}`)
+          setOvLoading(false)
+        },
+      },
+    )
+  }, [overviewLoading, overview, planContent, planMeta, assistantId])
+
+  /**
+   * v113 改造:sendChat 改为 SSE 流式消费
+   */
+  const sendChat = () => {
     if (!chatInput.trim() || chatLoading) return
     const userMsg = chatInput.trim()
     setChatInput('')
-    setChatMsgs(prev => [...prev, { role: 'user', content: userMsg }])
+
+    const history = chatMsgs.map(m => ({ role: m.role, content: m.content }))
+
+    setChatMsgs(prev => [
+      ...prev,
+      { role: 'user', content: userMsg },
+      { role: 'assistant', content: '' },
+    ])
     setChatLoading(true)
+
+    let accumulated = ''
+    consumeReviewAISSE(
+      '/api/v1/lesson-plans/review-ai/chat',
+      {
+        plan_meta: planMeta,
+        plan_content: planContent.slice(0, 4000),
+        history,
+        message: userMsg,
+        assistant_id: assistantId ?? '',
+      },
+      {
+        onChunk: (chunk) => {
+          accumulated += chunk
+          setChatMsgs(prev => {
+            if (prev.length === 0) return prev
+            const next = [...prev]
+            next[next.length - 1] = { role: 'assistant', content: accumulated }
+            return next
+          })
+        },
+        onDone: (fullContent) => {
+          if (fullContent && fullContent.length >= accumulated.length) {
+            setChatMsgs(prev => {
+              if (prev.length === 0) return prev
+              const next = [...prev]
+              next[next.length - 1] = { role: 'assistant', content: fullContent }
+              return next
+            })
+          }
+          setChatLoading(false)
+        },
+        onError: (err) => {
+          setChatMsgs(prev => {
+            if (prev.length === 0) return prev
+            const next = [...prev]
+            next[next.length - 1] = { role: 'assistant', content: `⚠️ ${err}` }
+            return next
+          })
+          setChatLoading(false)
+        },
+      },
+    )
+  }
+
+  // v113 STEP 6:Modal 触发函数
+  const handleEditAssistant = (id: string) => {
+    setModalMode('edit')
+    setModalEditId(id)
+    setModalOpen(true)
+  }
+  const handleCreateAssistant = () => {
+    setModalMode('create-personal')
+    setModalEditId(undefined)
+    setModalOpen(true)
+  }
+  // Modal 保存成功后的回调:切换到新 ID + 强制 Selector 刷新列表
+  // v121 Bug 2 修复:AssistantSelector 的 onDelete 回调
+  const handleDeleteAssistant = async (id: string) => {
     try {
-      const token = localStorage.getItem('token') || ''
-      const history = chatMsgs.map(m => ({ role: m.role, content: m.content }))
-      const resp = await fetch('/api/v1/lesson-plans/review-ai/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({
-          plan_meta: planMeta,
-          plan_content: planContent.slice(0, 4000),
-          history,
-          message: userMsg,
-        }),
-      })
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-      const data = await resp.json()
-      setChatMsgs(prev => [...prev, { role: 'assistant', content: data.data?.reply || '抱歉，AI暂时无法回答。' }])
-    } catch {
-      setChatMsgs(prev => [...prev, { role: 'assistant', content: '⚠️ 请求失败，请检查网络后重试。' }])
-    } finally {
-      setChatLoading(false)
+      await deleteAssistant(id)
+      if (assistantId === id) setAssistantId(null)
+      setSelectorKey(k => k + 1)
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : '删除失败'
+      alert('删除失败:' + msg)
     }
+  }
+  const handleAssistantSaved = (id: string) => {
+    setAssistantId(id)
+    // 通过变更 key 强制 AssistantSelector 重新 mount → 重新拉取列表
+    setSelectorKey(k => k + 1)
   }
 
   return (
@@ -146,6 +396,25 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
         <div style={{ fontSize: '13px', fontWeight: 700, color: C.primary, marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
           🤖 AI 评审助手
         </div>
+
+        {/* v112新增：AI助手选择器 */}
+        {/* v113 STEP 6 新增:onEdit + onCreateNew 回调触发 Modal */}
+        <div style={{ marginBottom: '8px' }}>
+          <AssistantSelector
+            key={selectorKey}
+            scene="review_workbench"
+            value={assistantId}
+            onChange={setAssistantId}
+            subject={plan.subject}
+            grade={plan.grade}
+            disabled={chatLoading || overviewLoading}
+            compact={true}
+            onEdit={handleEditAssistant}
+            onDelete={handleDeleteAssistant}
+            onCreateNew={handleCreateAssistant}
+          />
+        </div>
+
         <div style={{ display: 'flex', gap: '4px' }}>
           {(['overview', 'chat'] as const).map(p => (
             <button key={p} onClick={() => setActivePanel(p)}
@@ -182,7 +451,8 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
                 </button>
               )}
             </div>
-            {overviewLoading ? (
+            {/* v113 流式渲染 */}
+            {overviewLoading && !overview ? (
               <div style={{ padding: '16px', background: C.card, borderRadius: '8px', border: `1px solid ${C.border}`, textAlign: 'center' }}>
                 <div style={{ fontSize: '12px', color: C.textMuted, marginBottom: '8px' }}>AI正在解读教案...</div>
                 <div style={{ display: 'flex', gap: '4px', justifyContent: 'center' }}>
@@ -193,8 +463,12 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
                 <style>{`@keyframes pulse{0%,80%,100%{opacity:0.3;transform:scale(0.8)}40%{opacity:1;transform:scale(1.2)}}`}</style>
               </div>
             ) : overview ? (
-              <div style={{ padding: '12px', background: C.card, borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '13px', color: C.text, lineHeight: 1.8, whiteSpace: 'pre-wrap' }}>
-                {overview}
+              <div style={{ padding: '12px', background: C.card, borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '13px', color: C.text, lineHeight: 1.8 }}>
+                {renderMarkdown(overview)}
+                {overviewLoading && (
+                  <span style={{ display: 'inline-block', width: '8px', height: '14px', background: C.primary, marginLeft: '2px', animation: 'blink 1s infinite', verticalAlign: 'middle' }} />
+                )}
+                <style>{`@keyframes blink{0%,50%{opacity:1}51%,100%{opacity:0}}`}</style>
               </div>
             ) : (
               <button onClick={loadOverview} style={{ width: '100%', padding: '10px', borderRadius: '8px', border: `1px dashed ${C.primary}`, background: 'transparent', fontSize: '13px', color: C.primary, cursor: 'pointer' }}>
@@ -238,27 +512,42 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
               </div>
             )}
 
-            {chatMsgs.map((msg, i) => (
-              <div key={i} style={{ display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
-                {msg.role === 'assistant' && (
-                  <div style={{ width: '22px', height: '22px', borderRadius: '50%', background: 'linear-gradient(135deg,#4F7BE8,#818CF8)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', flexShrink: 0, marginRight: '6px', marginTop: '2px' }}>✨</div>
-                )}
-                <div style={{ maxWidth: '85%', padding: '8px 11px', borderRadius: msg.role === 'user' ? '12px 2px 12px 12px' : '2px 12px 12px 12px', background: msg.role === 'user' ? C.primary : C.card, color: msg.role === 'user' ? '#fff' : C.text, fontSize: '12px', lineHeight: 1.7, border: msg.role === 'assistant' ? `1px solid ${C.border}` : 'none', whiteSpace: 'pre-wrap' }}>
-                  {msg.content}
-                </div>
-              </div>
-            ))}
+            {/* v113 流式消息渲染 + v114 Markdown 渲染修复 */}
+            {chatMsgs.map((msg, i) => {
+              const isLastAssistant = i === chatMsgs.length - 1 && msg.role === 'assistant'
+              const isStreaming = isLastAssistant && chatLoading
+              const isEmpty = msg.role === 'assistant' && !msg.content
 
-            {chatLoading && (
-              <div style={{ display: 'flex', alignItems: 'flex-start', gap: '6px' }}>
-                <div style={{ width: '22px', height: '22px', borderRadius: '50%', background: 'linear-gradient(135deg,#4F7BE8,#818CF8)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', flexShrink: 0 }}>✨</div>
-                <div style={{ padding: '8px 12px', background: C.card, borderRadius: '2px 12px 12px 12px', border: `1px solid ${C.border}`, display: 'flex', gap: '4px', alignItems: 'center' }}>
-                  {[0,1,2].map(i => (
-                    <div key={i} style={{ width: '5px', height: '5px', borderRadius: '50%', background: C.primary, animation: `pulse 1.2s ease-in-out ${i*0.2}s infinite` }} />
-                  ))}
+              return (
+                <div key={i} style={{ display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
+                  {msg.role === 'assistant' && (
+                    <div style={{ width: '22px', height: '22px', borderRadius: '50%', background: 'linear-gradient(135deg,#4F7BE8,#818CF8)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', flexShrink: 0, marginRight: '6px', marginTop: '2px' }}>✨</div>
+                  )}
+                  <div style={{ maxWidth: '85%', padding: '8px 11px', borderRadius: msg.role === 'user' ? '12px 2px 12px 12px' : '2px 12px 12px 12px', background: msg.role === 'user' ? C.primary : C.card, color: msg.role === 'user' ? '#fff' : C.text, fontSize: '12px', lineHeight: 1.7, border: msg.role === 'assistant' ? `1px solid ${C.border}` : 'none', whiteSpace: 'pre-wrap' }}>
+                    {isEmpty && isStreaming ? (
+                      /* 空气泡 + 流式中:显示三点加载动画 */
+                      <div style={{ display: 'flex', gap: '4px', alignItems: 'center', padding: '2px 0' }}>
+                        {[0,1,2].map(d => (
+                          <div key={d} style={{ width: '5px', height: '5px', borderRadius: '50%', background: C.primary, animation: `pulse 1.2s ease-in-out ${d*0.2}s infinite` }} />
+                        ))}
+                      </div>
+                    ) : msg.role === 'assistant' ? (
+                      /* v114 修复:AI 消息走 renderMarkdown,让 **粗体** / *斜体* / ## 标题 正确渲染 */
+                      <>
+                        {renderMarkdown(msg.content)}
+                        {isStreaming && msg.content && (
+                          <span style={{ display: 'inline-block', width: '6px', height: '12px', background: C.primary, marginLeft: '2px', animation: 'blink 1s infinite', verticalAlign: 'middle' }} />
+                        )}
+                      </>
+                    ) : (
+                      /* 用户消息保持裸文本(用户输入本来就没有 markdown 语义,pre-wrap 保留换行即可) */
+                      <>{msg.content}</>
+                    )}
+                  </div>
                 </div>
-              </div>
-            )}
+              )
+            })}
+
             <div ref={chatEndRef} />
           </div>
 
@@ -286,6 +575,18 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
           </div>
         </>
       )}
+
+      {/* v113 STEP 6:AssistantEditModal 挂载点 */}
+      <AssistantEditModal
+        open={modalOpen}
+        mode={modalMode}
+        assistantId={modalEditId}
+        defaultScene="review_workbench"
+        defaultSubject={plan.subject}
+        defaultGrade={plan.grade}
+        onClose={() => setModalOpen(false)}
+        onSaved={(id) => handleAssistantSaved(id)}
+      />
     </div>
   )
 }
@@ -336,10 +637,9 @@ function PlanPreviewPanel({ plan, annotations, onAnnotationCreated, onAnnotation
               return (
                 <div key={idx} style={{ marginBottom: '6px', position: 'relative' }}>
                   <div style={{ display: 'flex', gap: '6px', alignItems: 'flex-start', borderLeft: paraAnnotations.length > 0 ? '3px solid #F97316' : '3px solid transparent', paddingLeft: paraAnnotations.length > 0 ? '8px' : '0' }}>
-                    <div
-                      style={{ flex: 1, fontSize: '13px', lineHeight: 1.8, color: C.text }}
-                      dangerouslySetInnerHTML={{ __html: renderPara(para) }}
-                    />
+                    <div style={{ flex: 1, fontSize: '13px', lineHeight: 1.8, color: C.text }}>
+                      {renderMarkdown(para)}
+                    </div>
                     <button
                       onClick={() => { setActiveAnnotIdx(isActive ? null : idx); setAnnotInput('') }}
                       title="添加批注"
@@ -455,7 +755,6 @@ function ReviewActionPanel({ plan, onSubmit, onCancel, submitting }: {
 
   const decisionCfg = DECISION_CONFIG[decision]
 
-  // 抑制 plan 未使用警告（保留 prop 以便后续扩展）
   void plan
 
   return (
@@ -585,7 +884,6 @@ export default function ReviewWorkbenchPage() {
     setTimeout(() => setToast(null), 3000)
   }
 
-  // 加载教案数据
   useEffect(() => {
     if (!id) return
     setLoading(true)
@@ -594,7 +892,6 @@ export default function ReviewWorkbenchPage() {
       .catch(() => { setLoading(false) })
   }, [id])
 
-  // 加载批注数据
   useEffect(() => {
     if (!id) return
     getAnnotations(id)
@@ -602,7 +899,6 @@ export default function ReviewWorkbenchPage() {
       .catch(() => setAnnotations([]))
   }, [id])
 
-  // 提交评审
   const handleSubmitReview = async (decision: string, score: number, comments: string, suggestions: string[]) => {
     if (!id || submitting) return
     setSubmitting(true)
@@ -618,7 +914,6 @@ export default function ReviewWorkbenchPage() {
     }
   }
 
-  // 加载中
   if (loading) {
     return (
       <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: C.bg }}>
@@ -631,7 +926,6 @@ export default function ReviewWorkbenchPage() {
     )
   }
 
-  // 教案不存在
   if (!plan) {
     return (
       <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '16px', background: C.bg }}>
@@ -665,18 +959,15 @@ export default function ReviewWorkbenchPage() {
         </div>
       </div>
 
-      {/* 主体三列布局（撑满剩余高度）*/}
+      {/* 主体三列布局 */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        {/* 左：教案预览（可滚动）*/}
         <PlanPreviewPanel
           plan={plan}
           annotations={annotations}
           onAnnotationCreated={a => setAnnotations(prev => [...prev, a])}
           onAnnotationDeleted={aid => setAnnotations(prev => prev.filter(a => a.id !== aid))}
         />
-        {/* 中：AI辅助侧边栏 */}
         <ReviewAISidebar plan={plan} />
-        {/* 右：评审操作面板 */}
         <ReviewActionPanel
           plan={plan}
           onSubmit={handleSubmitReview}
