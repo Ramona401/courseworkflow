@@ -126,43 +126,55 @@ const (
 	SceneStageCoach = "stage_coach" // 阶段教练评估（Haiku，低成本）
 )
 
-// ValidSceneCodes 有效场景代码列表（v87新增stage_coach）
+// v114新增：AI 助手对话式创作场景代码常量(TE-DNA 3.0 P0.5)
+// 对应 services/assistant_designer_service.go 的两阶段 AI 调用
+// 从 lesson_plan 场景中独立出来,便于单独调模型/温度/降级链(管理员可在 AI 管理中心前端界面直接调整,无需改代码)
+const (
+	SceneAssistantDesigner = "assistant_designer" // AI 助手对话式创作(Sonnet,可在管理界面切换)
+)
+
+// ValidSceneCodes 有效场景代码列表
+// v87新增 stage_coach;v114新增 assistant_designer
 var ValidSceneCodes = []string{
 	SceneScanner, SceneEvaluator, SceneMeta,
 	SceneTranslator, SceneReviewer,
 	SceneGenerator, SceneGeneratorCreate, SceneGeneratorMerge,
 	SceneAIFix, SceneLessonPlan,
 	SceneStageCoach,
+	SceneAssistantDesigner,
 }
 
 // SceneNameMap 场景代码→中文名映射
 var SceneNameMap = map[string]string{
-	SceneScanner:         "扫描定位",
-	SceneEvaluator:       "评估打分",
-	SceneMeta:            "元评估仲裁",
-	SceneTranslator:      "翻译转换",
-	SceneReviewer:        "审核检查",
-	SceneGenerator:       "页面生成-修改",
-	SceneGeneratorCreate: "页面生成-新增",
-	SceneGeneratorMerge:  "页面生成-合并",
-	SceneAIFix:           "AI快修",
-	SceneLessonPlan:      "教案备课对话",
-	SceneStageCoach:      "阶段教练评估",
+	SceneScanner:           "扫描定位",
+	SceneEvaluator:         "评估打分",
+	SceneMeta:              "元评估仲裁",
+	SceneTranslator:        "翻译转换",
+	SceneReviewer:          "审核检查",
+	SceneGenerator:         "页面生成-修改",
+	SceneGeneratorCreate:   "页面生成-新增",
+	SceneGeneratorMerge:    "页面生成-合并",
+	SceneAIFix:             "AI快修",
+	SceneLessonPlan:        "教案备课对话",
+	SceneStageCoach:        "阶段教练评估",
+	SceneAssistantDesigner: "AI助手对话式创作",
 }
 
-// SceneGroupMap 场景代码→分组映射（v78新增，v87补充stage_coach）
+// SceneGroupMap 场景代码→分组映射（v78新增，v87补充stage_coach，v114补充 assistant_designer）
+// 归入 lesson_plan 组:Designer 也服务于教案备课生态(老师创建 AI 助手→助手帮教师备课)
 var SceneGroupMap = map[string]string{
-	SceneScanner:         "pipeline",
-	SceneEvaluator:       "pipeline",
-	SceneMeta:            "pipeline",
-	SceneTranslator:      "pipeline",
-	SceneReviewer:        "pipeline",
-	SceneGenerator:       "pipeline",
-	SceneGeneratorCreate: "pipeline",
-	SceneGeneratorMerge:  "pipeline",
-	SceneAIFix:           "pipeline",
-	SceneLessonPlan:      "lesson_plan",
-	SceneStageCoach:      "lesson_plan",
+	SceneScanner:           "pipeline",
+	SceneEvaluator:         "pipeline",
+	SceneMeta:              "pipeline",
+	SceneTranslator:        "pipeline",
+	SceneReviewer:          "pipeline",
+	SceneGenerator:         "pipeline",
+	SceneGeneratorCreate:   "pipeline",
+	SceneGeneratorMerge:    "pipeline",
+	SceneAIFix:             "pipeline",
+	SceneLessonPlan:        "lesson_plan",
+	SceneStageCoach:        "lesson_plan",
+	SceneAssistantDesigner: "lesson_plan",
 }
 
 // IsValidSceneCode 检查场景代码是否有效

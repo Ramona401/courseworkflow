@@ -11,6 +11,14 @@ package services
 //   4. checkAndInsertCoachAdvice — 停滞检测+教练建议插入
 //   5. GetConversation    — 获取教案对话历史
 //   6. 内部辅助方法（checkPlanEditable/appendMessage/broadcastError/parseAIReply等）
+//
+// v110(TE-DNA 3.0 P0 STEP 3)改动:
+//   - LessonPlanGenService 新增 assistantService 字段(可选,运行时通过 SetAssistantService 注入)
+//   - Chat 接收 AssistantID,若非空则解析助手 full_prompt,透传到 processChatStageAsync
+//   - processChatStageAsync 新增 assistantPrompt 参数,调用 LoadStagePromptContextV2
+//   - 开场白路径(StartConversation 中的 genStageOpeningMessage)不注入助手:
+//     1) 时序原因:开场白在 StartConversation 时触发,前端还没机会选助手
+//     2) 语义原因:开场白需要保持稳定/熟悉的"备课助手"风格,切换助手应从首次对话开始
 
 import (
 	"context"
@@ -45,21 +53,34 @@ const lessonPlanSceneCode = "lesson_plan"
 // ==================== 服务结构体 ====================
 
 // LessonPlanGenService 教案生成服务
+// v110(TE-DNA 3.0 P0 STEP 3)新增 assistantService 字段,用于解析 AssistantID -> full_prompt
 type LessonPlanGenService struct {
-	cfg           interface{ GetAESKey() string }
-	recipeService *RecipeService
-	stageService  *WorkshopStageService
+	cfg              interface{ GetAESKey() string }
+	recipeService    *RecipeService
+	stageService     *WorkshopStageService
+	assistantService *AIAssistantService // v110 新增:运行时注入,用于加载 AI 助手(可选,nil 时不支持 assistant_id)
 }
 
 var lpGenLog = logger.WithModule("lp_gen")
 
 // NewLessonPlanGenService 创建教案生成服务
+//
+// v110 改动:构造函数签名保持不变以免 routes 层大改动;
+// 通过 SetAssistantService 单独注入助手服务,满足"服务初始化顺序无关"的灵活性
 func NewLessonPlanGenService(cfg interface{ GetAESKey() string }) *LessonPlanGenService {
 	return &LessonPlanGenService{
 		cfg:           cfg,
 		recipeService: NewRecipeService(),
 		stageService:  NewWorkshopStageService(),
 	}
+}
+
+// SetAssistantService 注入 AI 助手服务(由 routes 层调用)
+// v110 新增:将 assistant_id 解析能力注入进来
+//   - 未注入时 Chat 接收到 assistant_id 会静默降级到默认 system prompt
+//   - 注入后 Chat 可加载助手,用 full_prompt 替换第4层阶段角色
+func (s *LessonPlanGenService) SetAssistantService(as *AIAssistantService) {
+	s.assistantService = as
 }
 
 // ==================== 1. 开始备课会话 ====================
@@ -129,6 +150,7 @@ func (s *LessonPlanGenService) StartConversation(
 	lpGenLog.Info("阶段初始化成功", "plan_id", lp.ID, "stages_count", len(snapshots), "first_stage", snapshots[0].StageCode)
 
 	// 生成阶段化开场白
+	// v110 说明:开场白路径不注入 assistant_id,保持稳定"备课助手"风格
 	var openingMsg *models.ConversationMessage
 	openingMsg, err = s.genStageOpeningMessage(ctx, lp, snapshots)
 	if err != nil {
@@ -165,6 +187,9 @@ func (s *LessonPlanGenService) StartConversation(
 }
 
 // genStageOpeningMessage 阶段模式下生成第一阶段的AI开场白
+//
+// v110 说明:开场白路径走原 LoadStagePromptContext(内部等价于传空 assistantPrompt 的 V2)
+// 保持稳定/熟悉的"备课助手"开场体验,不受助手选择影响
 func (s *LessonPlanGenService) genStageOpeningMessage(
 	ctx context.Context,
 	lp *models.LessonPlan,
@@ -212,10 +237,15 @@ func (s *LessonPlanGenService) genStageOpeningMessage(
 	}, nil
 }
 
-
 // ==================== 2. 对话轮次（流式SSE推送）====================
 
 // Chat 处理教师输入，AI生成回复并通过SSE流式推送
+//
+// v110(TE-DNA 3.0 P0 STEP 3)改动:
+//   - 若 req.AssistantID 非空,同步解析助手(可见性+激活校验+使用量埋点)
+//   - 解析成功时将 full_prompt 透传到 processChatStageAsync
+//   - 解析失败时静默降级到默认 system prompt(不中断对话),记录 WARN 日志
+//   - assistant_id 为空时保持原行为 100% 不变
 func (s *LessonPlanGenService) Chat(
 	ctx context.Context,
 	req *models.LessonPlanChatRequest,
@@ -251,23 +281,87 @@ func (s *LessonPlanGenService) Chat(
 		lpGenLog.Warn("写入用户消息失败", "plan_id", lp.ID, "error", err)
 	}
 
+	// v110 新增:解析 AI 助手(若前端传了 assistant_id)
+	assistantPrompt := s.resolveAssistantPrompt(ctx, req.AssistantID, callerID)
+
 	go func() {
 		bgCtx := context.Background()
-		s.processChatStageAsync(bgCtx, lp, userMsg, currentStageMsgs, req)
+		s.processChatStageAsync(bgCtx, lp, userMsg, currentStageMsgs, req, assistantPrompt)
 	}()
 
 	return nil
 }
 
-// ==================== 2.1 阶段化对话（v84分层记忆 + v87教练集成）====================
+// resolveAssistantPrompt v110 新增:将 assistant_id 解析为 full_prompt
+//
+// 返回值:
+//   - 空字符串:表示不注入助手(原行为)。触发场景:
+//     1) req.AssistantID 为空(前端没选)
+//     2) assistantService 未注入
+//     3) 助手加载失败(记 WARN 日志,不中断对话)
+//     4) 助手 full_prompt 为空字符串(异常兜底)
+//   - 非空字符串:助手的 full_prompt,用于替换第4层阶段角色
+//
+// 设计原则:对话流程优先于助手能力,助手失败不应阻塞对话
+func (s *LessonPlanGenService) resolveAssistantPrompt(
+	ctx context.Context,
+	assistantID string,
+	callerID string,
+) string {
+	assistantID = strings.TrimSpace(assistantID)
+	if assistantID == "" {
+		return ""
+	}
+	if s.assistantService == nil {
+		lpGenLog.Warn("Chat 收到 assistant_id 但 assistantService 未注入,降级到默认 prompt",
+			"assistant_id", assistantID)
+		return ""
+	}
+
+	// 查询用户角色(用于可见性校验)
+	// 注意:这里只需要 role 字段,学校 ID 由 BuildActorFromClaims 按角色自动反查
+	user, err := repository.FindUserByID(ctx, callerID)
+	if err != nil {
+		lpGenLog.Warn("Chat 加载用户角色失败,降级到默认 prompt",
+			"caller_id", callerID, "error", err)
+		return ""
+	}
+
+	actor := BuildActorFromClaims(ctx, callerID, user.Role)
+	a, err := s.assistantService.LoadActiveAssistantForUse(ctx, actor, assistantID)
+	if err != nil {
+		lpGenLog.Warn("Chat 加载 AI 助手失败,降级到默认 prompt",
+			"assistant_id", assistantID, "caller_id", callerID, "error", err)
+		return ""
+	}
+
+	if strings.TrimSpace(a.FullPrompt) == "" {
+		lpGenLog.Warn("Chat 助手 full_prompt 为空,降级到默认 prompt",
+			"assistant_id", assistantID)
+		return ""
+	}
+
+	lpGenLog.Info("Chat 使用 AI 助手",
+		"assistant_id", assistantID, "assistant_name", a.Name,
+		"source", a.Source, "prompt_len", len(a.FullPrompt))
+	return a.FullPrompt
+}
+
+// ==================== 2.1 阶段化对话（v84分层记忆 + v87教练集成 + v110助手注入）====================
 
 // processChatStageAsync 阶段模式：异步处理AI流式回复
+//
+// v110(TE-DNA 3.0 P0 STEP 3)改动:
+//   - 新增 assistantPrompt 参数(空字符串表示不注入助手)
+//   - 调用 stageService.LoadStagePromptContextV2 透传 assistantPrompt
+//   - 其他逻辑完全保持不变(分层记忆/教练检测/write阶段防重复等)
 func (s *LessonPlanGenService) processChatStageAsync(
 	ctx context.Context,
 	lp *models.LessonPlan,
 	userMsg *models.ConversationMessage,
 	currentStageMsgs []*models.ConversationMessage,
 	req *models.LessonPlanChatRequest,
+	assistantPrompt string,
 ) {
 	planID := lp.ID
 	currentStage := lp.CurrentStage
@@ -285,8 +379,8 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		return
 	}
 
-	// 加载阶段系统提示词
-	stageSystemPrompt, err := s.stageService.LoadStagePromptContext(ctx, lp, currentStage)
+	// 加载阶段系统提示词(v110:使用 V2 版本支持 assistantPrompt 注入)
+	stageSystemPrompt, err := s.stageService.LoadStagePromptContextV2(ctx, lp, currentStage, assistantPrompt)
 	if err != nil {
 		lpGenLog.Warn("加载阶段提示词失败", "plan_id", planID, "stage", currentStage, "error", err)
 		s.broadcastError(planID, "加载阶段配置失败，请刷新重试")
@@ -331,7 +425,7 @@ func (s *LessonPlanGenService) processChatStageAsync(
 	lpGenLog.Info("v84分层记忆上下文构建完成",
 		"plan_id", planID, "stage", currentStage,
 		"working_msgs", len(currentStageMsgs), "episodic_len", len(episodicSummary),
-		"prior_stages", len(priorOutputs))
+		"prior_stages", len(priorOutputs), "assistant_injected", assistantPrompt != "")
 
 	// 流式推送
 	chunkCount := 0
@@ -401,11 +495,12 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		Message:   aiReply,
 	})
 
-	lpGenLog.Info("AI对话流式回复完成（v84分层记忆）",
+	lpGenLog.Info("AI对话流式回复完成（v84分层记忆+v110助手注入）",
 		"plan_id", planID, "stage", currentStage,
 		"tokens", result.TokensUsed, "latency_ms", result.LatencyMs,
 		"chunks", chunkCount, "has_content", hasContent,
-		"working_msgs", len(currentStageMsgs))
+		"working_msgs", len(currentStageMsgs),
+		"assistant_injected", assistantPrompt != "")
 
 	// v87：对话完成后异步检测停滞，插入教练建议
 	go s.checkAndInsertCoachAdvice(ctx, planID, currentStage)
@@ -505,7 +600,6 @@ func (s *LessonPlanGenService) appendMessage(ctx context.Context, planID string,
 func (s *LessonPlanGenService) loadConversation(ctx context.Context, planID string) ([]*models.ConversationMessage, error) {
 	return repository.GetConversationLog(ctx, planID)
 }
-
 
 // resolveTemplateForReview 解析评审模板
 func (s *LessonPlanGenService) resolveTemplateForReview(ctx context.Context, subject string) (systemPrompt string, reviewRules string) {

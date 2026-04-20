@@ -5,6 +5,8 @@ package models
 // Phase5：新增萃取提示事件类型（extraction_hint）
 // Phase 7A：StartConversationRequest 新增 RecipeID 字段
 // Phase 7B-8：LPSSEEvent 新增 StageData 字段，支持阶段化SSE事件推送
+// v110(TE-DNA 3.0 P0 STEP 3)：LessonPlanChatRequest 新增 AssistantID 字段
+//   前端若选中 AI 助手,透过此字段透传到 service 层,用助手 full_prompt 替换第4层阶段角色
 
 import "time"
 
@@ -81,12 +83,18 @@ type StartConversationRequest struct {
 	RecipeID        string `json:"recipe_id"`        // 备课配方ID（可选，Phase 7A新增）
 }
 
+// LessonPlanChatRequest 教案对话请求
+// v110(TE-DNA 3.0 P0 STEP 3) 新增 AssistantID 字段:
+//   - 空字符串 → 走原逻辑(使用阶段默认 system prompt)
+//   - 非空字符串 → 根据 ID 加载 AI 助手,用其 full_prompt 替换第4层阶段角色
+//   - 助手加载失败时静默降级到原逻辑(不中断对话流程),并记录告警日志
 type LessonPlanChatRequest struct {
 	PlanID             string   `json:"plan_id"`
 	Message            string   `json:"message"`
 	SelectedOptions    []string `json:"selected_options,omitempty"`
 	SelectedComponents []string `json:"selected_components,omitempty"`
 	CurrentSection     string   `json:"current_section,omitempty"`
+	AssistantID        string   `json:"assistant_id,omitempty"` // v110 新增:可选的 AI 助手 ID
 }
 
 type GenerateSectionRequest struct {
@@ -214,20 +222,20 @@ type ExtractionListResponse struct {
 // ImportExistingPlanRequest 导入已有教案请求
 // 支持三种来源：粘贴文本、Word解析后文本、PDF解析后文本（均在前端完成解析）
 type ImportExistingPlanRequest struct {
-        Subject         string   `json:"subject"`          // 学科（必填）
-        Grade           string   `json:"grade"`            // 年级（必填）
-        Topic           string   `json:"topic"`            // 课题（必填）
-        DurationMinutes int      `json:"duration_minutes"` // 课时（默认45）
-        ContentMarkdown string   `json:"content_markdown"` // 教案正文（必填，前端已解析为纯文本）
-        RecipeID        string   `json:"recipe_id"`        // 配方ID（可选）
-        GroupID         string   `json:"group_id"`         // 教研组ID（可选）
-        TextbookPageIDs []string `json:"textbook_page_ids"` // 关联课本图片（可选）
-        SourceType      string   `json:"source_type"`      // 来源：paste/docx/pdf
+	Subject         string   `json:"subject"`          // 学科（必填）
+	Grade           string   `json:"grade"`            // 年级（必填）
+	Topic           string   `json:"topic"`            // 课题（必填）
+	DurationMinutes int      `json:"duration_minutes"` // 课时（默认45）
+	ContentMarkdown string   `json:"content_markdown"` // 教案正文（必填，前端已解析为纯文本）
+	RecipeID        string   `json:"recipe_id"`        // 配方ID（可选）
+	GroupID         string   `json:"group_id"`         // 教研组ID（可选）
+	TextbookPageIDs []string `json:"textbook_page_ids"` // 关联课本图片（可选）
+	SourceType      string   `json:"source_type"`      // 来源：paste/docx/pdf
 }
 
 // ImportExistingPlanResponse 导入已有教案响应
 type ImportExistingPlanResponse struct {
-        Plan           *LessonPlan          `json:"plan"`
-        OpeningMessage *ConversationMessage  `json:"opening_message"`
-        SkippedStages  []string             `json:"skipped_stages"` // 跳过的阶段列表
+	Plan           *LessonPlan          `json:"plan"`
+	OpeningMessage *ConversationMessage `json:"opening_message"`
+	SkippedStages  []string             `json:"skipped_stages"` // 跳过的阶段列表
 }

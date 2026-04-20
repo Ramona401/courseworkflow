@@ -36,6 +36,10 @@ interface StageComponentsModalProps {
   stageCode: string
   stageName: string
   loading?: boolean
+  /** v121 任务B:
+   *  - 'transition'(默认):阶段过渡时打开,保留"跳过,直接开始"按钮
+   *  - 'pick-only':阶段进行中随时打开,隐藏"跳过",按钮文案改为"添加到对话" */
+  mode?: 'transition' | 'pick-only'
   onConfirm: (selectedIds: string[]) => void
   onSkip: () => void
   onCancel: () => void
@@ -47,6 +51,7 @@ export default function StageComponentsModal({
   stageCode,
   stageName,
   loading: externalLoading,
+  mode = 'transition',  // v121 任务B:默认过渡模式,向后兼容
   onConfirm,
   onSkip,
   onCancel,
@@ -147,10 +152,13 @@ export default function StageComponentsModal({
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
             <div>
               <h3 style={{ margin: 0, fontSize: '17px', fontWeight: 700, color: C.text }}>
-                📚 选择参考组件
+                {mode === 'pick-only' ? '📚 补充参考组件' : '📚 选择参考组件'}
               </h3>
               <p style={{ margin: '6px 0 0', fontSize: '13px', color: C.textMuted, lineHeight: 1.5 }}>
-                为「{stageName}」阶段选择教学参考组件，点击卡片可查看详情
+                {mode === 'pick-only'
+                  ? `从「${stageName}」阶段的组件库中挑选,选中后添加到下一条消息的上下文`
+                  : `为「${stageName}」阶段选择教学参考组件,点击卡片可查看详情`
+                }
               </p>
             </div>
             <button
@@ -389,39 +397,60 @@ export default function StageComponentsModal({
           )}
         </div>
 
-        {/* 底部操作栏 */}
+        {/* 底部操作栏
+            v121 任务B:pick-only 模式下隐藏"跳过"按钮(没有下一步可跳),
+            确认按钮文案改为"添加到对话" */}
         <div style={{
           padding: '16px 28px', borderTop: `1px solid ${C.border}`,
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          display: 'flex', alignItems: 'center',
+          justifyContent: mode === 'pick-only' ? 'flex-end' : 'space-between',
           background: '#FAFBFC',
+          gap: '12px',
         }}>
-          <button
-            onClick={onSkip}
-            style={{
-              padding: '9px 20px', borderRadius: '10px',
-              border: `1px solid ${C.border}`, background: 'transparent',
-              fontSize: '13px', color: C.textSec, cursor: 'pointer',
-            }}
-          >跳过，直接开始</button>
+          {mode === 'transition' && (
+            <button
+              onClick={onSkip}
+              style={{
+                padding: '9px 20px', borderRadius: '10px',
+                border: `1px solid ${C.border}`, background: 'transparent',
+                fontSize: '13px', color: C.textSec, cursor: 'pointer',
+              }}
+            >跳过,直接开始</button>
+          )}
+
+          {mode === 'pick-only' && (
+            <button
+              onClick={onCancel}
+              style={{
+                padding: '9px 20px', borderRadius: '10px',
+                border: `1px solid ${C.border}`, background: 'transparent',
+                fontSize: '13px', color: C.textSec, cursor: 'pointer',
+              }}
+            >取消</button>
+          )}
 
           <button
             onClick={() => onConfirm(Array.from(selectedIds))}
-            disabled={isLoading}
+            disabled={isLoading || (mode === 'pick-only' && selectedIds.size === 0)}
             style={{
               padding: '9px 24px', borderRadius: '10px', border: 'none',
               background: selectedIds.size > 0
                 ? 'linear-gradient(135deg, #4F7BE8, #818CF8)'
                 : C.primary,
               color: '#fff', fontSize: '14px', fontWeight: 600,
-              cursor: isLoading ? 'not-allowed' : 'pointer',
-              opacity: isLoading ? 0.6 : 1,
+              cursor: (isLoading || (mode === 'pick-only' && selectedIds.size === 0)) ? 'not-allowed' : 'pointer',
+              opacity: (isLoading || (mode === 'pick-only' && selectedIds.size === 0)) ? 0.5 : 1,
               boxShadow: selectedIds.size > 0 ? '0 3px 12px rgba(79,123,232,0.3)' : 'none',
               transition: 'all 200ms ease',
             }}
           >
-            {selectedIds.size > 0
-              ? `选好了，开始${stageName}（${selectedIds.size}个组件）`
-              : `开始${stageName}`
+            {mode === 'pick-only'
+              ? (selectedIds.size > 0
+                  ? `✅ 添加${selectedIds.size}个组件到对话`
+                  : '请至少选择1个组件')
+              : (selectedIds.size > 0
+                  ? `选好了,开始${stageName}(${selectedIds.size}个组件)`
+                  : `开始${stageName}`)
             }
           </button>
         </div>

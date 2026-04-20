@@ -12,6 +12,11 @@ package services
 //   - WorkshopStageService新增aesKey字段（用于AI配置获取）
 //   - SetAESKey方法注入密钥（由routes层调用）
 //   - advanceStageWithComponents中新增LLM评估+SSE推送评估结果
+// v110(TE-DNA 3.0 P0 STEP 3)改动:
+//   - 新增 LoadStagePromptContextV2(ctx, lp, stageCode, assistantPrompt) 方法
+//   - 原 LoadStagePromptContext 保持签名不变,内部转调 V2 传空 assistantPrompt
+//   - V2 调用 BuildStageSystemPromptV2 透传助手 prompt,用于替换第4层阶段角色
+//   - 其他层(配方/产出物/组件/教案结构/对话规范)完全保留,不受助手影响
 
 import (
 	"context"
@@ -495,7 +500,30 @@ func (s *WorkshopStageService) SaveStageOutput(ctx context.Context, lessonPlanID
 
 // ==================== 9. 加载阶段提示词上下文 ====================
 
+// LoadStagePromptContext 加载阶段提示词上下文(向后兼容版,v110 前原签名不变)
+// 对应场景:未选择 AI 助手的原有调用路径(StartConversation 开场白等)
+//
+// v110 改造:内部转调 V2,传空 assistantPrompt 走原行为
 func (s *WorkshopStageService) LoadStagePromptContext(ctx context.Context, lp *models.LessonPlan, stageCode string) (string, error) {
+	return s.LoadStagePromptContextV2(ctx, lp, stageCode, "")
+}
+
+// LoadStagePromptContextV2 v110(TE-DNA 3.0 P0 STEP 3)新增:支持 AI 助手 full_prompt 注入的版本
+//
+// assistantPrompt 语义:
+//   - 空字符串 → 完全走原行为(使用 stage.SystemPrompt + 变体段)
+//   - 非空字符串 → 整段替换第 4 层(阶段角色+变体段),其他层(配方/产出物/组件/教案结构/对话规范)保持不变
+//
+// 调用场景:
+//   - StartConversation 开场白路径:恒定传空(老师还没机会选助手)
+//   - processChatStageAsync 对话路径:老师选中助手时传 full_prompt,否则传空
+func (s *WorkshopStageService) LoadStagePromptContextV2(
+	ctx context.Context,
+	lp *models.LessonPlan,
+	stageCode string,
+	assistantPrompt string,
+) (string, error) {
+	// 判断是否为自定义阶段(来自配方 recipe_stages 表)
 	isCustomStage := false
 	if lp.StageConfig != "" && lp.StageConfig != "[]" {
 		var snapshots []models.StageConfigSnapshot
@@ -508,6 +536,8 @@ func (s *WorkshopStageService) LoadStagePromptContext(ctx context.Context, lp *m
 			}
 		}
 	}
+
+	// 加载阶段定义(优先级:自定义阶段 > 配方覆盖 > 系统默认)
 	var stage *models.WorkshopStage
 	var err error
 	if isCustomStage && lp.RecipeID != nil && *lp.RecipeID != "" {
@@ -527,6 +557,8 @@ func (s *WorkshopStageService) LoadStagePromptContext(ctx context.Context, lp *m
 	if err != nil {
 		return "", fmt.Errorf("加载阶段定义失败: %w", err)
 	}
+
+	// 加载配方(用于全局上下文+promptMode+lessonStructure)
 	var recipe *models.TeachingRecipe
 	promptMode := models.PromptModeGuided
 	lessonStructure := ""
@@ -541,6 +573,8 @@ func (s *WorkshopStageService) LoadStagePromptContext(ctx context.Context, lp *m
 			}
 		}
 	}
+
+	// 阶段级别的 promptMode 覆盖(StageConfig 快照中的配置优先)
 	if lp.StageConfig != "" && lp.StageConfig != "[]" {
 		var snapshots []models.StageConfigSnapshot
 		if json.Unmarshal([]byte(lp.StageConfig), &snapshots) == nil {
@@ -552,6 +586,8 @@ func (s *WorkshopStageService) LoadStagePromptContext(ctx context.Context, lp *m
 			}
 		}
 	}
+
+	// 加载前序阶段产出物
 	allOutputs, _ := repository.ListStageOutputs(ctx, lp.ID)
 	var priorOutputs []*models.WorkshopStageOutput
 	for _, out := range allOutputs {
@@ -560,11 +596,20 @@ func (s *WorkshopStageService) LoadStagePromptContext(ctx context.Context, lp *m
 		}
 		priorOutputs = append(priorOutputs, out)
 	}
+
+	// 读取用户为当前阶段选中的组件 ID
 	selectedCompIDs := s.getSelectedComponentIDsFromOutput(ctx, lp.ID, stageCode)
 	if len(selectedCompIDs) > 0 {
 		wsLog.Info("检测到用户选中的阶段组件", "plan_id", lp.ID, "stage", stageCode, "selected_count", len(selectedCompIDs))
 	}
-	return BuildStageSystemPrompt(ctx, stage, recipe, priorOutputs, lp.Subject, lp.Grade, promptMode, lessonStructure, selectedCompIDs), nil
+
+	// v110 核心改动:调用 V2 版本透传 assistantPrompt
+	// 为空时 V2 内部走原逻辑(完全等价于 V1);非空时替换第4层阶段角色
+	return BuildStageSystemPromptV2(
+		ctx, stage, recipe, priorOutputs,
+		lp.Subject, lp.Grade, promptMode, lessonStructure, selectedCompIDs,
+		assistantPrompt,
+	), nil
 }
 
 // ==================== 10. 重启指定阶段 ====================

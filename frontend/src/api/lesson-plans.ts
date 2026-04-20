@@ -1,22 +1,25 @@
 /**
  * 教案系统 API 封装
  *
- * 覆盖教案系统全部后端接口：
- * - 组织管理（organizations）
- * - 教研组管理（teaching-groups）
- * - 组件库管理（components）
- * - 教案管理（plans）
- * - 提示词模板管理（templates）
- * - 教案生成（Phase3：对话/评审/建议应用）
- * - 萃取队列管理（Phase5：萃取列表/确认拒绝）
- * - 阶段化备课工坊（Phase 7B-9：阶段查询/前进/跳过/回退/产出物）
+ * 覆盖教案系统全部后端接口:
+ * - 组织管理(organizations)
+ * - 教研组管理(teaching-groups)
+ * - 组件库管理(components)
+ * - 教案管理(plans)
+ * - 提示词模板管理(templates)
+ * - 教案生成(Phase3:对话/评审/建议应用)
+ * - 萃取队列管理(Phase5:萃取列表/确认拒绝)
+ * - 阶段化备课工坊(Phase 7B-9:阶段查询/前进/跳过/回退/产出物)
  *
- * v88新增：SSE自动重连机制（指数退避+连接状态回调+重连补齐）
- * v101修复：submitLessonPlanForReview 增加 groupId 参数，修复提交评审参数错误
+ * v88新增:SSE自动重连机制(指数退避+连接状态回调+重连补齐)
+ * v101修复:submitLessonPlanForReview 增加 groupId 参数,修复提交评审参数错误
+ * v112(P0 STEP 8)新增:LessonPlanChatRequest 新增 assistant_id 可选字段,
+ *   用于在备课工坊每轮对话时透传 AI 助手 ID 到后端,后端按 ID 加载 full_prompt 注入系统提示词。
+ *   向后兼容:不传或传 null 时,后端走兜底默认 prompt。
  */
 import apiClient from './client'
 
-/* ==================== 类型定义：组织 ==================== */
+/* ==================== 类型定义:组织 ==================== */
 
 export type OrgType = 'region' | 'school'
 
@@ -41,7 +44,7 @@ export interface OrganizationListResponse {
   total: number
 }
 
-/* ==================== 类型定义：教研组 ==================== */
+/* ==================== 类型定义:教研组 ==================== */
 
 export interface TeachingGroup {
   id: string
@@ -78,7 +81,7 @@ export interface TeachingGroupListResponse {
   total: number
 }
 
-/* ==================== 类型定义：组件库 ==================== */
+/* ==================== 类型定义:组件库 ==================== */
 
 export type LibraryType =
   | 'curriculum_standard'
@@ -145,7 +148,7 @@ export interface ComponentListResponse {
   total: number
 }
 
-/* ==================== 类型定义：提示词模板 ==================== */
+/* ==================== 类型定义:提示词模板 ==================== */
 
 export type TemplateLevel = 'region' | 'school' | 'group' | 'personal'
 
@@ -222,7 +225,7 @@ export interface UpdatePromptTemplateRequest {
   is_default?: boolean
 }
 
-/* ==================== 类型定义：教案 ==================== */
+/* ==================== 类型定义:教案 ==================== */
 
 export type LessonPlanStatus =
   | 'draft'
@@ -242,7 +245,7 @@ export interface LessonPlan {
   topic: string
   duration_minutes: number
   content_markdown: string | null
-  content_structured: Record<string, unknown>
+  content_structured: string | Record<string, unknown>
   status: LessonPlanStatus
   visibility: string
   author_id: string
@@ -254,8 +257,8 @@ export interface LessonPlan {
   recipe_id: string | null
   recipe_name: string | null
   version: number
-  current_stage: string | null       // Phase 7B-9：当前阶段代码
-  stage_config: string | null        // Phase 7B-9：阶段配置快照JSON
+  current_stage: string | null       // Phase 7B-9:当前阶段代码
+  stage_config: string | null        // Phase 7B-9:阶段配置快照JSON
   created_at: string
   updated_at: string
   author_name?: string
@@ -266,7 +269,7 @@ export interface LessonPlanListResponse {
   total: number
 }
 
-/* ==================== 类型定义：对话与生成（Phase3）==================== */
+/* ==================== 类型定义:对话与生成(Phase3)==================== */
 
 export type ConvRole = 'user' | 'assistant' | 'system'
 export type ConvMsgType = 'text' | 'options' | 'components' | 'generate' | 'content' | 'review' | 'action'
@@ -315,7 +318,7 @@ export interface StartConversationRequest {
   template_id?: string
   group_id?: string
   recipe_id?: string
-  textbook_page_ids?: string[]  // 迭代7B：关联课本图片ID列表
+  textbook_page_ids?: string[]  // 迭代7B:关联课本图片ID列表
 }
 
 export interface StartConversationResponse {
@@ -323,12 +326,23 @@ export interface StartConversationResponse {
   opening_message: ConversationMessage
 }
 
+/**
+ * 教案对话请求体
+ *
+ * v112(P0 STEP 8)新增 assistant_id 可选字段:
+ *   - 传入后端接收到助手 ID,在 Chat service 中调 LoadActiveAssistantForUse
+ *     加载助手的 full_prompt,注入到第 4 层(阶段角色)替换默认 AI 角色
+ *   - 不传/null/空字符串时后端走兜底默认 prompt,行为与 v110 及之前完全一致
+ *   - 前端由 AssistantSelector 组件产生该字段,跟随当前阶段 scene 自动匹配默认助手
+ */
 export interface LessonPlanChatRequest {
   plan_id: string
   message: string
   selected_options?: string[]
   selected_components?: string[]
   current_section?: string
+  /** v112(P0 STEP 8):AI 助手 ID,空/null 表示不使用助手走兜底 */
+  assistant_id?: string | null
 }
 
 export interface ApplyAISuggestionsRequest {
@@ -361,7 +375,7 @@ export interface AIReviewResult {
   reviewed_at: string
 }
 
-/* ==================== 类型定义：阶段化备课工坊（Phase 7B-9 新增）==================== */
+/* ==================== 类型定义:阶段化备课工坊(Phase 7B-9 新增)==================== */
 
 /** 阶段进度条目 */
 export interface StageProgressItem {
@@ -415,7 +429,7 @@ export interface StageEventData {
   can_skip?: boolean
 }
 
-/* ==================== SSE事件类型（Phase 7B-9：新增3个阶段事件）==================== */
+/* ==================== SSE事件类型(Phase 7B-9:新增3个阶段事件)==================== */
 
 export type LPSSEEventType =
   | 'connected'
@@ -425,13 +439,13 @@ export type LPSSEEventType =
   | 'content_update'
   | 'review_done'
   | 'extraction_hint'
-  | 'stage_started'     // Phase 7B-9：进入新阶段
-  | 'stage_complete'    // Phase 7B-9：AI建议完成当前阶段
-  | 'stage_output'      // Phase 7B-9：阶段产出物已生成
+  | 'stage_started'     // Phase 7B-9:进入新阶段
+  | 'stage_complete'    // Phase 7B-9:AI建议完成当前阶段
+  | 'stage_output'      // Phase 7B-9:阶段产出物已生成
   | 'error'
   | 'done'
 
-/** Phase5：萃取提示数据 */
+/** Phase5:萃取提示数据 */
 export interface ExtractionHint {
   hint_id: string
   display_text: string
@@ -440,7 +454,7 @@ export interface ExtractionHint {
   plan_id: string
 }
 
-/** SSE事件完整结构（Phase 7B-9：新增stage_data字段） */
+/** SSE事件完整结构(Phase 7B-9:新增stage_data字段) */
 export interface LPSSEEvent {
   type: LPSSEEventType
   plan_id: string
@@ -450,11 +464,11 @@ export interface LPSSEEvent {
   content?: string
   review?: AIReviewResult
   extraction_hint?: ExtractionHint
-  stage_data?: StageEventData         // Phase 7B-9：阶段事件数据
+  stage_data?: StageEventData         // Phase 7B-9:阶段事件数据
   error?: string
 }
 
-/* ==================== 类型定义：萃取队列（Phase5新增）==================== */
+/* ==================== 类型定义:萃取队列(Phase5新增)==================== */
 
 export interface ExtractionListItem {
   id: string
@@ -473,33 +487,33 @@ export interface ExtractionListResponse {
   total: number
 }
 
-/* ==================== v88新增：SSE连接状态类型 ==================== */
+/* ==================== v88新增:SSE连接状态类型 ==================== */
 
 /** SSE连接状态枚举 */
 export type SSEConnectionState = 'connected' | 'reconnecting' | 'disconnected'
 
 /** SSE重连配置常量 */
 const SSE_RECONNECT_MAX_RETRIES = 5           // 最大重连次数
-const SSE_RECONNECT_BASE_DELAY_MS = 1000      // 基础重连延迟（1秒）
-const SSE_RECONNECT_MAX_DELAY_MS = 30000      // 最大重连延迟（30秒）
+const SSE_RECONNECT_BASE_DELAY_MS = 1000      // 基础重连延迟(1秒)
+const SSE_RECONNECT_MAX_DELAY_MS = 30000      // 最大重连延迟(30秒)
 
-/* ==================== v88新增：可控SSE连接管理器 ==================== */
+/* ==================== v88新增:可控SSE连接管理器 ==================== */
 
 /**
  * SSEConnection — 可控的SSE连接包装器
  *
- * v88新增：封装EventSource，提供：
- *   - 自动重连（指数退避，最多5次）
- *   - 连接状态变化回调（connected/reconnecting/disconnected）
+ * v88新增:封装EventSource,提供:
+ *   - 自动重连(指数退避,最多5次)
+ *   - 连接状态变化回调(connected/reconnecting/disconnected)
  *   - 重连成功后自动拉取最新对话补齐丢失消息
- *   - 手动关闭（close方法）
+ *   - 手动关闭(close方法)
  */
 export interface SSEConnection {
-  /** 手动关闭连接（同时停止重连计时器） */
+  /** 手动关闭连接(同时停止重连计时器) */
   close: () => void
 }
 
-/* ==================== API函数：组织管理 ==================== */
+/* ==================== API函数:组织管理 ==================== */
 
 export async function getOrganizations(params?: { type?: OrgType; parent_id?: string }) {
   const query = new URLSearchParams()
@@ -530,7 +544,7 @@ export async function deleteOrganization(id: string) {
   return resp.data.data as void
 }
 
-/* ==================== API函数：教研组管理 ==================== */
+/* ==================== API函数:教研组管理 ==================== */
 
 export async function getTeachingGroups(params?: { school_id?: string }) {
   const query = new URLSearchParams()
@@ -578,7 +592,7 @@ export async function getMyGroups() {
   return resp.data.data as TeachingGroup[]
 }
 
-/* ==================== API函数：组件库管理 ==================== */
+/* ==================== API函数:组件库管理 ==================== */
 
 export async function getComponents(params?: {
   library_type?: LibraryType; subject?: string;
@@ -626,7 +640,7 @@ export async function matchComponents(data: { subject: string; grade: string; to
   return resp.data.data as Record<string, unknown>
 }
 
-/* ==================== API函数：提示词模板管理 ==================== */
+/* ==================== API函数:提示词模板管理 ==================== */
 
 export async function getPromptTemplates(params?: {
   level?: TemplateLevel; subject?: string; limit?: number; offset?: number
@@ -661,7 +675,7 @@ export async function resolvePromptTemplate(id: string) {
   return resp.data.data as ResolvedPromptTemplate
 }
 
-/* ==================== API函数：教案管理 ==================== */
+/* ==================== API函数:教案管理 ==================== */
 
 export async function getLessonPlans(params?: {
   author_id?: string; group_id?: string; status?: string;
@@ -711,11 +725,11 @@ export async function publishLessonPlanPersonal(id: string) {
 /**
  * 提交教案到教研组评审
  *
- * v101修复：增加 groupId 参数，后端 SubmitForReview 强制要求 group_id 不为空，
+ * v101修复:增加 groupId 参数,后端 SubmitForReview 强制要求 group_id 不为空,
  * 原来调用时未传 body 导致 400 参数错误。
  *
  * @param id      教案ID
- * @param groupId 目标教研组ID（必填）
+ * @param groupId 目标教研组ID(必填)
  */
 export async function submitLessonPlanForReview(id: string, groupId: string) {
   const resp = await apiClient.post(`/lesson-plans/plans/${id}/submit-review`, {
@@ -751,13 +765,20 @@ export async function forkLessonPlan(id: string) {
   return resp.data.data as LessonPlan
 }
 
-/* ==================== API函数：教案生成（Phase3）==================== */
+/* ==================== API函数:教案生成(Phase3)==================== */
 
 export async function startConversation(data: StartConversationRequest): Promise<StartConversationResponse> {
   const resp = await apiClient.post('/lesson-plans/plans/start-conversation', data)
   return resp.data.data as StartConversationResponse
 }
 
+/**
+ * 发送对话消息
+ *
+ * v112(P0 STEP 8):data 参数类型是 Omit<LessonPlanChatRequest,'plan_id'>,
+ * 由于 LessonPlanChatRequest 新增了 assistant_id 可选字段,调用方可在 data 中传入 assistant_id。
+ * 不传时后端走兜底默认 prompt,向后 100% 兼容。
+ */
 export async function sendChatMessage(planId: string, data: Omit<LessonPlanChatRequest, 'plan_id'>) {
   const resp = await apiClient.post(`/lesson-plans/plans/${planId}/chat`, { ...data, plan_id: planId })
   return resp.data.data as { status: string; message: string }
@@ -782,14 +803,14 @@ export async function getConversation(planId: string) {
 }
 
 /**
- * 创建教案SSE连接（v88增强版：自动重连+连接状态回调）
+ * 创建教案SSE连接(v88增强版:自动重连+连接状态回调)
  *
- * Phase 7B-9新增：onStageStarted/onStageComplete/onStageOutput 三个阶段事件回调
- * v88新增：
- *   - onConnectionStateChange：连接状态变化回调（connected/reconnecting/disconnected）
- *   - onReconnected：重连成功后回调，用于拉取最新对话补齐丢失消息
- *   - 自动重连机制：指数退避（1s/2s/4s/8s/16s），最多5次
- *   - 返回SSEConnection对象，支持手动close
+ * Phase 7B-9新增:onStageStarted/onStageComplete/onStageOutput 三个阶段事件回调
+ * v88新增:
+ *   - onConnectionStateChange:连接状态变化回调(connected/reconnecting/disconnected)
+ *   - onReconnected:重连成功后回调,用于拉取最新对话补齐丢失消息
+ *   - 自动重连机制:指数退避(1s/2s/4s/8s/16s),最多5次
+ *   - 返回SSEConnection对象,支持手动close
  */
 export function createLessonPlanSSE(
   planId: string,
@@ -920,7 +941,7 @@ export function createLessonPlanSSE(
       )
       retryCount++
 
-      console.log(`[SSE] 连接断开，${delay / 1000}秒后尝试第${retryCount}次重连... (planId: ${planId})`)
+      console.log(`[SSE] 连接断开,${delay / 1000}秒后尝试第${retryCount}次重连... (planId: ${planId})`)
 
       retryTimer = setTimeout(() => {
         if (isClosed) return
@@ -954,7 +975,7 @@ export function createLessonPlanSSE(
   }
 }
 
-/* ==================== API函数：阶段化备课工坊（Phase 7B-9 新增 6个接口）==================== */
+/* ==================== API函数:阶段化备课工坊(Phase 7B-9 新增 6个接口)==================== */
 
 /** 获取系统默认阶段列表 */
 export async function getDefaultStages() {
@@ -974,7 +995,7 @@ export async function getStageOutput(planId: string, stageCode: string) {
   return resp.data.data as StageOutputResponse
 }
 
-/** 迭代12新增：推荐组件条目 */
+/** 迭代12新增:推荐组件条目 */
 export interface RecommendedComponentItem {
   id: string
   library_type: string
@@ -987,20 +1008,20 @@ export interface RecommendedComponentItem {
   source: 'recipe' | 'auto'
 }
 
-/** 迭代12新增：阶段推荐组件响应 */
+/** 迭代12新增:阶段推荐组件响应 */
 export interface StageRecommendedComponentsResponse {
   stage_code: string
   stage_name: string
   components: RecommendedComponentItem[]
 }
 
-/** 迭代12新增：获取阶段推荐组件 */
+/** 迭代12新增:获取阶段推荐组件 */
 export async function getStageRecommendedComponents(planId: string, stageCode: string) {
   const resp = await apiClient.get(`/lesson-plans/plans/${planId}/stages/${stageCode}/recommended-components`)
   return resp.data.data as StageRecommendedComponentsResponse
 }
 
-/** 进入下一阶段（可指定目标阶段，迭代12：支持传入选中组件ID） */
+/** 进入下一阶段(可指定目标阶段,迭代12:支持传入选中组件ID) */
 export async function advanceStage(planId: string, targetStageCode?: string, selectedComponentIds?: string[]) {
   const body: Record<string, unknown> = {
     target_stage_code: targetStageCode || '',
@@ -1020,7 +1041,7 @@ export async function skipStage(planId: string, targetStageCode?: string) {
   return resp.data.data as { stage_code: string; stage_name: string }
 }
 
-/** 迭代12新增：重启指定阶段（清空该阶段及后续产出，重新触发开场白） */
+/** 迭代12新增:重启指定阶段(清空该阶段及后续产出,重新触发开场白) */
 export async function resetStage(planId: string, targetStageCode: string) {
   const resp = await apiClient.post(`/lesson-plans/plans/${planId}/stages/reset`, {
     target_stage_code: targetStageCode,
@@ -1028,7 +1049,7 @@ export async function resetStage(planId: string, targetStageCode: string) {
   return resp.data.data as { stage_code: string; stage_name: string }
 }
 
-/** v77d: 切换到指定阶段继续对话（不清产出物、不清对话） */
+/** v77d: 切换到指定阶段继续对话(不清产出物、不清对话) */
 export async function switchToStage(planId: string, targetStageCode: string) {
   const resp = await apiClient.post(`/lesson-plans/plans/${planId}/stages/switch`, { target_stage_code: targetStageCode })
   return resp.data
@@ -1040,7 +1061,7 @@ export async function backStage(planId: string) {
   return resp.data.data as { stage_code: string; stage_name: string }
 }
 
-/* ==================== API函数：萃取队列管理（Phase5新增）==================== */
+/* ==================== API函数:萃取队列管理(Phase5新增)==================== */
 
 export async function getExtractions(params?: { limit?: number }) {
   const query = new URLSearchParams()
@@ -1055,9 +1076,9 @@ export async function confirmExtraction(id: string, decision: 'confirmed' | 'rej
   return resp.data.data as { message: string }
 }
 
-/* ==================== API函数：阶段管理（Admin专用，Phase 7B新增）==================== */
+/* ==================== API函数:阶段管理(Admin专用,Phase 7B新增)==================== */
 
-/** 获取全部系统阶段（admin专用，含disabled） — 迭代1：增加prompt_variants字段 */
+/** 获取全部系统阶段(admin专用,含disabled) — 迭代1:增加prompt_variants字段 */
 export async function getAdminStages() {
   const resp = await apiClient.get('/admin/workshop-stages')
   return resp.data.data as { stages: Array<{
@@ -1070,7 +1091,7 @@ export async function getAdminStages() {
   }> }
 }
 
-/** 更新系统阶段（admin专用） — 迭代1：增加prompt_variants字段 */
+/** 更新系统阶段(admin专用) — 迭代1:增加prompt_variants字段 */
 export async function updateAdminStage(stageCode: string, data: {
   stage_name: string; ai_role: string; system_prompt: string;
   prompt_variants: string;
@@ -1081,7 +1102,7 @@ export async function updateAdminStage(stageCode: string, data: {
   return resp.data.data
 }
 
-// ==================== P0-2新增：阶段完成度检测 ====================
+// ==================== P0-2新增:阶段完成度检测 ====================
 
 /** 完成度检查项 */
 export interface CompletenessItem {
@@ -1108,7 +1129,7 @@ export async function getStageCompleteness(planId: string, stageCode: string): P
   return res.data.data
 }
 
-/* ==================== v108新增：导入已有教案 ==================== */
+/* ==================== v108新增:导入已有教案 ==================== */
 
 /** 导入已有教案请求体 */
 export interface ImportExistingPlanRequest {

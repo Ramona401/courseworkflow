@@ -41,8 +41,8 @@ const (
 	MsgInvalidRecipeID     = "配方ID无效"
 
 	// 公共路径前缀常量（消除路径字符串重复）
-	PathOrgPrefix   = "/api/v1/lesson-plans/organizations/"
-	PathGroupPrefix = "/api/v1/lesson-plans/teaching-groups/"
+	PathOrgPrefix    = "/api/v1/lesson-plans/organizations/"
+	PathGroupPrefix  = "/api/v1/lesson-plans/teaching-groups/"
 	PathPromptPrefix = "/api/v1/prompts/"
 	PathPagesSegment = "/pages/"
 )
@@ -96,4 +96,34 @@ func BadRequest(w http.ResponseWriter, message string) {
 // InternalError 返回 500
 func InternalError(w http.ResponseWriter, message string) {
 	Fail(w, http.StatusInternalServerError, message)
+}
+
+// ==================== 字符串工具函数 ====================
+
+// SafeTruncate 安全截断字符串,按 rune(Unicode 字符)计数而非字节,避免中文被截断在半个字符上。
+//
+// 参数:
+//
+//	s      — 原始字符串
+//	maxLen — 最大保留字符数(按 rune 计数,不是字节)
+//
+// 返回:
+//
+//	- 原字符串 rune 数 <= maxLen:原样返回
+//	- 超过:截断到 maxLen 个 rune,末尾追加 "...(truncated)"
+//
+// 典型用法:
+//   - 在日志里展示过长的 AI 响应原文 utils.SafeTruncate(raw, 300)
+//   - 在 prompt 里嵌入过长的用户草稿 utils.SafeTruncate(draft, 3000)
+//
+// v113(P0.5)新增:assistant_designer_service 和其它需要裁剪用户/AI 长文本的场景使用
+func SafeTruncate(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "...(truncated)"
 }
