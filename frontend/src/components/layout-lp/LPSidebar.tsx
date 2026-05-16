@@ -23,9 +23,11 @@ const menuItems: LPMenuItem[] = [
   { key: 'my-plans',   label: '我的教案',   icon: '📋', path: '/lesson-plans/my-plans',   description: '个人教案管理' },
   { key: 'library',    label: '教案库',     icon: '📚', path: '/lesson-plans/library',    description: '教研组共享教案' },
   { key: 'review',     label: '评审中心',   icon: '📝', path: '/lesson-plans/review',     description: '人工评审教案' },
+  { key: 'review-v2', label: '多级审核',   icon: '🔍', path: '/lesson-plans/review-v2', description: '三级审核工作台' },
   { key: 'textbooks',  label: '课本管理',   icon: '📷', path: '/lesson-plans/textbooks',  description: '上传课本图片供AI精准备课' },
   { key: 'components', label: '组件管理',   icon: '🧩', path: '/lesson-plans/components', description: '教学设计组件库' },
   { key: 'templates',  label: '提示词模板', icon: '📐', path: '/lesson-plans/templates',  description: '分层提示词模板配置' },
+  { key: 'tokens', label: '积分管理', icon: '🪙', path: '/lesson-plans/tokens', description: 'Token积分配额管理' },
   { key: 'stages-config', label: '阶段管理', icon: '⚙️', path: '/lesson-plans/stages-config', description: '备课阶段流程配置', adminOnly: true },
 ]
 
@@ -49,6 +51,10 @@ export default function LPSidebar() {
 
   const isActive = (path: string) => {
     if (path === '/lesson-plans') return location.pathname === '/lesson-plans'
+    // 精确匹配 /review 避免和 /review-v2 互相干扰
+    if (path === '/lesson-plans/review') {
+      return location.pathname === '/lesson-plans/review' || (location.pathname.startsWith('/lesson-plans/review/') && !location.pathname.startsWith('/lesson-plans/review-v2'))
+    }
     return location.pathname.startsWith(path)
   }
 
@@ -60,31 +66,43 @@ export default function LPSidebar() {
       borderRight: `1px solid ${COLORS.border}`,
       flexShrink: 0,
     }}>
-      {/* Logo 区域 */}
+      {/* Logo + 系统名区域 */}
       <div style={{
-        height: '64px', display: 'flex', alignItems: 'center',
-        padding: '0 22px', borderBottom: `1px solid ${COLORS.border}`,
+        display: 'flex', flexDirection: 'column',
+        borderBottom: `1px solid ${COLORS.border}`,
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        {/* 北大实验室 logo */}
+        <div
+          style={{ padding: '12px 18px 6px', cursor: 'pointer' }}
+          onClick={() => navigate('/')}
+          title="返回首页"
+        >
+          <img
+            src="/pkuailab.png"
+            alt="北京大学人工智能应用与创新实验室"
+            style={{ height: '26px', objectFit: 'contain', display: 'block' }}
+          />
+        </div>
+        {/* 系统名称 */}
+        <div style={{ padding: '6px 18px 12px', display: 'flex', alignItems: 'center', gap: '10px' }}>
           <div style={{
-            width: '36px', height: '36px',
+            width: '32px', height: '32px',
             background: 'linear-gradient(135deg, #4F7BE8, #818CF8)',
-            borderRadius: '10px',
+            borderRadius: '8px',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
-            boxShadow: '0 2px 8px rgba(79,123,232,0.25)',
+            boxShadow: '0 2px 6px rgba(79,123,232,0.2)',
+            flexShrink: 0,
           }}>
-            <span style={{ fontSize: '16px' }}>📝</span>
+            <span style={{ fontSize: '14px' }}>📝</span>
           </div>
           <div>
-            <div style={{ color: COLORS.textPrimary, fontSize: '15px', fontWeight: 600, letterSpacing: '-0.3px' }}>
-              备课工坊
-            </div>
-            <div style={{ color: COLORS.textMuted, fontSize: '11px', marginTop: '1px' }}>
-              AI辅助教案开发
-            </div>
+            <div style={{ color: COLORS.textPrimary, fontSize: '14px', fontWeight: 600, letterSpacing: '-0.3px' }}>备课工坊</div>
+            <div style={{ color: COLORS.textMuted, fontSize: '10px', marginTop: '1px' }}>AI辅助教案开发</div>
           </div>
         </div>
       </div>
+
+
 
       {/* 菜单列表 */}
       <nav style={{ flex: 1, padding: '16px 12px', overflowY: 'auto' }}>

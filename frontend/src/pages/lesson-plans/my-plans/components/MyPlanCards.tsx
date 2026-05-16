@@ -77,7 +77,7 @@ export function ActionButtons({ plan, onAction, loadingId }: ActionButtonsProps)
       break
     case 'published_personal':
       actions.push({ label: '✏️ 继续备课',  style: secondaryBtn, action: 'resume'  })
-      actions.push({ label: '进入课件开发', style: primaryBtn,   action: 'develop' })
+      actions.push({ label: '🎨 生成课件',  style: primaryBtn,   action: 'courseware' })
       actions.push({ label: '提交评审',    style: secondaryBtn, action: 'submit'  })
       break
     case 'submitted':
@@ -87,10 +87,10 @@ export function ActionButtons({ plan, onAction, loadingId }: ActionButtonsProps)
       break
     case 'approved':
     case 'published_shared':
-      actions.push({ label: '进入课件开发', style: primaryBtn, action: 'develop' })
+      actions.push({ label: '🎨 生成课件', style: primaryBtn, action: 'courseware' })
       break
     case 'developing':
-      actions.push({ label: '查看课件进度', style: primaryBtn, action: 'view_pipeline' })
+      actions.push({ label: '🎨 生成课件', style: primaryBtn, action: 'courseware' })
       break
     case 'completed':
       break
@@ -115,7 +115,7 @@ export function ActionButtons({ plan, onAction, loadingId }: ActionButtonsProps)
             e.stopPropagation()
             if (a.confirm && !window.confirm(a.confirm)) return
             // 查看课件进度：直接跳转，不走onAction
-            if (a.action === 'view_pipeline') { navigate('/workflow/pipelines'); return }
+            if (a.action === 'courseware') { onAction(plan.id, a.action); return }
             onAction(plan.id, a.action)
           }}>
           {a.label}

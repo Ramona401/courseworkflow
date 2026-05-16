@@ -5,6 +5,10 @@ package services
 //
 // v104改动：SubmitForReview 提交评审前自动将所有 pending 批注归档，
 //           防止新旧轮次批注混显
+// v121改动（AI辅助修改 Bug 修复 · 方案C）：
+//   ReviewLessonPlan 的 revision 分支：教研员退回教案时自动恢复最新一轮的
+//   archived 批注为 pending。业务含义是"退回即继续工作"——作者需要用 AI
+//   辅助修改继续处理上一轮未彻底解决的批注，不能让它们因为已归档而消失按钮。
 
 import (
 	"context"
@@ -154,6 +158,20 @@ func (s *LessonPlanService) GetLessonPlan(ctx context.Context, id string) (*mode
 		linkedPipelineID = &linkedPipeline.ID
 	}
 
+	// v125新增：查询教案互动数据（点赞/收藏计数+当前用户状态）
+	var interactionCounts *models.InteractionCounts
+	interactionCounts, _ = repository.GetInteractionCounts(ctx, id, lp.AuthorID)
+	// 注意：这里传的是 lp.AuthorID 作为 currentUserID 的占位
+	// 实际应该传调用者ID，但 GetLessonPlan 签名只有 id 没有 callerID
+	// 互动数据在详情页由前端单独调用 /interactions 接口获取用户态
+	// 这里只填充计数（is_liked/is_favorited 在详情接口中不保证准确）
+	likeCount := 0
+	favoriteCount := 0
+	if interactionCounts != nil {
+		likeCount = interactionCounts.LikeCount
+		favoriteCount = interactionCounts.FavoriteCount
+	}
+
 	return &models.LessonPlanDetailResponse{
 		ID:                lp.ID,
 		Title:             lp.Title,
@@ -190,6 +208,8 @@ func (s *LessonPlanService) GetLessonPlan(ctx context.Context, id string) (*mode
 		IdxQualityLevel:   lp.IdxQualityLevel,
 		CurrentStage:     lp.CurrentStage,
 		StageConfig:      lp.StageConfig,
+		LikeCount:     likeCount,
+		FavoriteCount: favoriteCount,
 		Reviews:           reviews,
 		LinkedPipelineID:  linkedPipelineID,
 		CreatedAt:         lp.CreatedAt,
@@ -222,9 +242,16 @@ func (s *LessonPlanService) UpdateLessonPlan(ctx context.Context, id string, cal
 	if lp.AuthorID != callerID {
 		return ErrLPNotAuthor
 	}
-	if lp.Status != models.LPStatusDraft &&
-		lp.Status != models.LPStatusPublishedPersonal &&
-		lp.Status != models.LPStatusRevision {
+	// v125改动：允许 approved/published_shared 状态编辑（老师持续改进）
+	// 仅 submitted（评审中锁定）和 developing/completed（课件关联锁定）不可编辑
+	editableStatuses := map[string]bool{
+		models.LPStatusDraft:             true,
+		models.LPStatusPublishedPersonal: true,
+		models.LPStatusRevision:          true,
+		models.LPStatusApproved:          true,
+		models.LPStatusPublishedShared:   true,
+	}
+	if !editableStatuses[lp.Status] {
 		return ErrLPCannotEdit
 	}
 
@@ -316,11 +343,28 @@ func (s *LessonPlanService) SubmitForReview(ctx context.Context, id string, call
 	if err := repository.UpdateLessonPlanVisibility(ctx, id, models.LPVisibilityGroup, &groupID); err != nil {
 		return err
 	}
+	// v127新增：自动设置 review_school_id（从教研组反查学校）
+	schoolID := ""
+	if groupID != "" {
+		if group, gErr := repository.GetTeachingGroupByID(ctx, groupID); gErr == nil {
+			schoolID = group.SchoolID
+		}
+	}
+	if schoolID != "" {
+		_ = repository.UpdateLessonPlanReviewLevel(ctx, id, 0, &schoolID)
+	}
+
 	return repository.UpdateLessonPlanStatus(ctx, id, models.LPStatusSubmitted)
 }
 
 // ReviewLessonPlan 评审教案
 // Phase5：approved且ai_review_score>=8.5时异步触发通道二自动萃取
+//
+// v121改动（AI辅助修改 Bug 修复 · 方案C）：
+//   revision 分支新增：教研员退回教案时,自动把最新一轮已归档(archived)的批注
+//   恢复为 pending。业务含义是"退回即继续工作"——作者需要用 AI 辅助修改继续
+//   处理上一轮未彻底解决的批注,不能让它们因为已归档而隐藏所有操作按钮。
+//   恢复失败不阻断退回流程,仅记录日志。
 func (s *LessonPlanService) ReviewLessonPlan(ctx context.Context, planID string, reviewerID string, req *models.CreateLessonPlanReviewRequest) error {
 	lp, err := repository.GetLessonPlanByID(ctx, planID)
 	if err != nil {
@@ -358,6 +402,14 @@ func (s *LessonPlanService) ReviewLessonPlan(ctx context.Context, planID string,
 		_ = repository.UpdateLessonPlanStatus(ctx, planID, models.LPStatusApproved)
 	case "revision":
 		_ = repository.UpdateLessonPlanStatus(ctx, planID, models.LPStatusRevision)
+		// v121新增：退回时恢复最新一轮 archived 批注为 pending
+		// 让作者能看到"🤖 AI辅助修改"按钮,继续处理上一轮未彻底解决的批注
+		// 恢复失败不影响退回主流程,只记录日志
+		if restoreErr := repository.RestoreArchivedAnnotationsForLatestRound(ctx, planID); restoreErr != nil {
+			lpLog.Error("恢复归档批注失败（不影响退回）", "plan_id", planID, "error", restoreErr)
+		} else {
+			lpLog.Info("已恢复最新一轮归档批注为待处理", "plan_id", planID)
+		}
 	case "rejected":
 		_ = repository.UpdateLessonPlanStatus(ctx, planID, models.LPStatusDraft)
 		_ = repository.UpdateLessonPlanVisibility(ctx, planID, models.LPVisibilityPersonal, nil)

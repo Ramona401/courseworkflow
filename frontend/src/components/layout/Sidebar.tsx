@@ -141,43 +141,38 @@ export default function Sidebar() {
       flexShrink: 0,
     }}>
 
-      {/* ── Logo 区域 ── */}
+      {/* ── Logo + 系统名区域 ── */}
       <div style={{
-        height: '64px',
-        display: 'flex',
-        alignItems: 'center',
-        padding: '0 22px',
+        display: 'flex', flexDirection: 'column',
         borderBottom: `1px solid ${COLORS.border}`,
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        {/* 北大实验室 logo */}
+        <div
+          style={{ padding: '12px 18px 6px', cursor: 'pointer' }}
+          onClick={() => navigate('/')}
+          title="返回首页"
+        >
+          <img
+            src="/pkuailab.png"
+            alt="北京大学人工智能应用与创新实验室"
+            style={{ height: '26px', objectFit: 'contain', display: 'block' }}
+          />
+        </div>
+        {/* 系统名称 */}
+        <div style={{ padding: '6px 18px 12px', display: 'flex', alignItems: 'center', gap: '10px' }}>
           <div style={{
-            width: '36px',
-            height: '36px',
+            width: '32px', height: '32px',
             background: 'linear-gradient(135deg, #4F7BE8, #818CF8)',
-            borderRadius: '10px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            boxShadow: '0 2px 8px rgba(79,123,232,0.25)',
+            borderRadius: '8px',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            boxShadow: '0 2px 6px rgba(79,123,232,0.2)',
+            flexShrink: 0,
           }}>
-            <span style={{ fontSize: '16px' }}>🎬</span>
+            <span style={{ fontSize: '14px' }}>🎬</span>
           </div>
           <div>
-            <div style={{
-              color: COLORS.textPrimary,
-              fontSize: '15px',
-              fontWeight: 600,
-              letterSpacing: '-0.3px',
-            }}>
-              课件审核
-            </div>
-            <div style={{
-              color: COLORS.textMuted,
-              fontSize: '11px',
-              marginTop: '1px',
-            }}>
-              AI 课件生成与审核
-            </div>
+            <div style={{ color: COLORS.textPrimary, fontSize: '14px', fontWeight: 600, letterSpacing: '-0.3px' }}>课件审核</div>
+            <div style={{ color: COLORS.textMuted, fontSize: '10px', marginTop: '1px' }}>AI 课件生成与审核</div>
           </div>
         </div>
       </div>

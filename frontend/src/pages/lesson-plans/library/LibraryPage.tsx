@@ -23,6 +23,7 @@ import {
   type TeachingGroup,
 } from '@/api/lesson-plans'
 import { SUBJECTS } from '@/pages/lesson-plans/workshop/components/workshopConstants'
+import { toggleInteraction, getInteractions, type InteractionCounts } from '@/api/lesson-plan-interactions'
 
 /* ==================== 样式常量 ==================== */
 const C = {
@@ -147,9 +148,13 @@ interface LibraryCardProps {
   currentUserId: string
   forkingId: string | null
   onFork: (plan: LessonPlan) => void
+  /** v125新增：互动数据 */
+  interactions?: InteractionCounts
+  /** v125新增：切换互动 */
+  onToggleInteraction?: (planId: string, type: 'like' | 'favorite') => void
 }
 
-function LibraryCard({ plan, currentUserId, forkingId, onFork }: LibraryCardProps) {
+function LibraryCard({ plan, currentUserId, forkingId, onFork, interactions, onToggleInteraction }: LibraryCardProps) {
   const [hovered, setHovered] = useState(false)
   const navigate   = useNavigate()
   const isForking  = forkingId === plan.id
@@ -255,6 +260,37 @@ function LibraryCard({ plan, currentUserId, forkingId, onFork }: LibraryCardProp
               textDecoration: 'underline', textDecorationColor: 'rgba(79,123,232,0.3)',
             }}
           >查看详情</button>
+          {/* v125新增：点赞/收藏小按钮（与卡片内其他按钮统一风格） */}
+          {interactions && onToggleInteraction && (
+            <>
+              <button
+                onClick={e => { e.stopPropagation(); onToggleInteraction(plan.id, 'like') }}
+                title={interactions.is_liked ? '取消点赞' : '点赞'}
+                style={{
+                  padding: '3px 10px', borderRadius: '6px',
+                  border: `1px solid ${interactions.is_liked ? 'rgba(239,68,68,0.25)' : C.border}`,
+                  background: interactions.is_liked ? 'rgba(239,68,68,0.06)' : 'transparent',
+                  fontSize: '12px', fontWeight: 500,
+                  color: interactions.is_liked ? '#DC2626' : C.textMuted,
+                  cursor: 'pointer', transition: 'all 150ms ease',
+                  display: 'inline-flex', alignItems: 'center', gap: '4px',
+                }}
+              >👍{interactions.like_count > 0 ? ` ${interactions.like_count}` : ''}</button>
+              <button
+                onClick={e => { e.stopPropagation(); onToggleInteraction(plan.id, 'favorite') }}
+                title={interactions.is_favorited ? '取消收藏' : '收藏'}
+                style={{
+                  padding: '3px 10px', borderRadius: '6px',
+                  border: `1px solid ${interactions.is_favorited ? 'rgba(245,158,11,0.25)' : C.border}`,
+                  background: interactions.is_favorited ? 'rgba(245,158,11,0.06)' : 'transparent',
+                  fontSize: '12px', fontWeight: 500,
+                  color: interactions.is_favorited ? '#D97706' : C.textMuted,
+                  cursor: 'pointer', transition: 'all 150ms ease',
+                  display: 'inline-flex', alignItems: 'center', gap: '4px',
+                }}
+              >📌{interactions.favorite_count > 0 ? ` ${interactions.favorite_count}` : ''}</button>
+            </>
+          )}
         </div>
 
         {/* Fork按钮 / 我的标记 */}
@@ -303,6 +339,9 @@ export default function LibraryPage() {
   const [forkingId, setForkingId] = useState<string | null>(null)
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null)
 
+  // v125新增：教案互动数据（按 planId 索引）
+  const [interactionsMap, setInteractionsMap] = useState<Record<string, InteractionCounts>>({})
+
   const showToast = (msg: string, type: 'success' | 'error' = 'success') => {
     setToast({ msg, type }); setTimeout(() => setToast(null), 3000)
   }
@@ -344,6 +383,18 @@ export default function LibraryPage() {
 
       merged.sort((a, b) => (b.ai_review_score ?? -1) - (a.ai_review_score ?? -1))
       setPlans(merged); setTotal(merged.length)
+
+      // v125新增：批量加载互动数据（逐个请求，不阻断列表显示）
+      const iMap: Record<string, InteractionCounts> = {}
+      for (const p of merged) {
+        try {
+          const ic = await getInteractions(p.id)
+          iMap[p.id] = ic
+        } catch {
+          iMap[p.id] = { like_count: 0, favorite_count: 0, is_liked: false, is_favorited: false }
+        }
+      }
+      setInteractionsMap(iMap)
     } catch (e) {
       console.error('加载教案库失败:', e); setError('加载失败，请稍后重试')
     } finally { setLoading(false) }
@@ -353,6 +404,29 @@ export default function LibraryPage() {
 
   const handleReset = () => { setKeyword(''); setSubjectFilter('全部'); setGradeFilter('全部'); setQualityFilter('全部'); setStructFilter('全部') }
   const isFiltered  = keyword.trim() !== '' || subjectFilter !== '全部' || gradeFilter !== '全部' || qualityFilter !== '全部' || structFilter !== '全部'
+
+  // v125新增：切换点赞/收藏
+  const handleToggleInteraction = async (planId: string, type: 'like' | 'favorite') => {
+    try {
+      const resp = await toggleInteraction(planId, type)
+      setInteractionsMap(prev => ({
+        ...prev,
+        [planId]: {
+          ...prev[planId],
+          ...(type === 'like'
+            ? { like_count: resp.new_count, is_liked: resp.active }
+            : { favorite_count: resp.new_count, is_favorited: resp.active }
+          ),
+        },
+      }))
+      showToast(resp.active
+        ? (type === 'like' ? '已点赞 👍' : '已收藏 📌')
+        : (type === 'like' ? '已取消点赞' : '已取消收藏')
+      )
+    } catch {
+      showToast('操作失败，请重试', 'error')
+    }
+  }
 
   const handleFork = async (plan: LessonPlan) => {
     if (forkingId) return
@@ -486,7 +560,7 @@ export default function LibraryPage() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: '16px' }}>
         {loading && Array.from({ length: 6 }).map((_, i) => <SkeletonCard key={i} />)}
         {!loading && plans.map(plan => (
-          <LibraryCard key={plan.id} plan={plan} currentUserId={user?.id || ''} forkingId={forkingId} onFork={handleFork} />
+          <LibraryCard key={plan.id} plan={plan} currentUserId={user?.id || ''} forkingId={forkingId} onFork={handleFork} interactions={interactionsMap[plan.id]} onToggleInteraction={handleToggleInteraction} />
         ))}
         {!loading && !error && plans.length === 0 && (
           <EmptyState filtered={isFiltered} scope={scope} onReset={handleReset} />

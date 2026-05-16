@@ -3,6 +3,7 @@
  * 登录后首先进入此页面，根据用户权限显示可用入口卡片：
  * - 📝 备课工坊：教案系统（所有active用户可见）
  * - 🖥️ 课件审核：课件审核系统（admin/senior_operator/operator可见）
+ * - 🎨 课件工坊：AI课件生成系统（所有active用户可见）
  *
  * 设计遵循PRD v1.0 §8.7：
  * - 简洁的两栏卡片布局
@@ -29,6 +30,14 @@ const entries: PortalEntry[] = [
     title: '备课工坊',
     description: 'AI辅助教案开发 · 教案库 · 教研协作',
     path: '/lesson-plans',
+    roles: 'all',
+  },
+  {
+    key: 'courseware',
+    icon: '🎨',
+    title: '课件工坊',
+    description: 'AI辅助课件生成 · 模板组件 · 多媒体',
+    path: '/courseware',
     roles: 'all',
   },
   {
@@ -70,7 +79,7 @@ const styles = {
     display: 'grid',
     gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
     gap: '24px',
-    maxWidth: '680px',
+    maxWidth: '1020px',
     width: '100%',
   },
   /* 单个入口卡片 */
@@ -131,6 +140,15 @@ export default function PortalPage() {
 
   return (
     <div style={styles.container}>
+      {/* 北大实验室 Logo */}
+      <div style={{ marginBottom: '32px' }}>
+        <img
+          src="/pkuailab.png"
+          alt="北京大学人工智能应用与创新实验室"
+          style={{ height: '44px', objectFit: 'contain' }}
+        />
+      </div>
+
       {/* 欢迎语 */}
       <div style={styles.greeting}>欢迎回来，{user.display_name}</div>
       <div style={styles.subtitle}>请选择要进入的工作区</div>
@@ -147,7 +165,7 @@ export default function PortalPage() {
       </div>
 
       {/* 页脚 */}
-      <div style={styles.footer}>TE-DNA 2.0 · 教案开发与课件审核平台</div>
+      <div style={styles.footer}>TE-DNA 2.0 · 北京大学人工智能应用与创新实验室</div>
     </div>
   )
 }

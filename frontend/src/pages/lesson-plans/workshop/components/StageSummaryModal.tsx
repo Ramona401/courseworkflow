@@ -1,17 +1,15 @@
 /**
- * WorkshopTransitionComponents.tsx — 备课工坊阶段过渡组件
+ * StageSummaryModal.tsx — 阶段完成确认弹窗
  *
- * P2：StageSummaryModal — 阶段完成确认弹窗（方案B：结构化产出展示）
- * P3：StageTransitionView — 阶段切换叙事动画
- * StageSeparatorBubble — 对话流中的阶段分隔符
- * P0-2：completeness prop — 阶段完成度提示（不阻止操作，友好提醒）
+ * 从 WorkshopTransitionComponents.tsx 拆分
+ * 包含: StageSummaryModal(导出) + StageSummaryCards(内部) + parseStructured(内部)
  */
 
 import { useState, useEffect } from 'react'
-import { C, STAGE_CODE_EMOJI } from './workshopConstants'
+import { C } from './workshopConstants'
 import type { StageProgressItem, StageCompletenessResponse } from '@/api/lesson-plans'
 
-// ==================== 各阶段结构化摘要渲染 ====================
+// ==================== 结构化摘要解析 ====================
 
 function parseStructured(structuredOutput: string): Record<string, unknown> | null {
   if (!structuredOutput || structuredOutput === '{}') return null
@@ -23,6 +21,8 @@ function parseStructured(structuredOutput: string): Record<string, unknown> | nu
     return null
   }
 }
+
+// ==================== 各阶段结构化摘要卡片 ====================
 
 function StageSummaryCards({ stageCode, structuredOutput }: {
   stageCode: string
@@ -306,7 +306,7 @@ function StageSummaryCards({ stageCode, structuredOutput }: {
   }
 }
 
-// ==================== P2：阶段完成确认弹窗 ====================
+// ==================== 阶段完成确认弹窗 ====================
 
 interface StageSummaryModalProps {
   stageCode: string
@@ -330,7 +330,6 @@ export function StageSummaryModal({
   const isLastStage = !nextStageItem || stageOrder >= totalStages
   const hasStructured = structuredOutput && structuredOutput !== '{}'
 
-   
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { setUserNote('') }, [stageCode])
 
@@ -463,7 +462,7 @@ export function StageSummaryModal({
           )}
         </div>
 
-        {/* P0-2：阶段完成度提示（不阻止操作，友好提醒） */}
+        {/* 完成度提示 */}
         {completeness && !completeness.is_complete && completeness.missing_hints && completeness.missing_hints.length > 0 && (
           <div style={{
             flexShrink: 0, padding: '12px 16px', borderRadius: '10px', marginBottom: '12px',
@@ -526,208 +525,6 @@ export function StageSummaryModal({
           )}
         </div>
       </div>
-    </div>
-  )
-}
-
-// ==================== P3：阶段切换叙事过渡动画 ====================
-
-interface StageTransitionViewProps {
-  currentStageName: string
-  nextStageName: string
-  nextStageRole: string
-  step: number
-}
-
-export function StageTransitionView({
-  currentStageName, nextStageName, nextStageRole, step,
-}: StageTransitionViewProps) {
-  const steps = [
-    { icon: '📋', text: `正在整理「${currentStageName}」的核心结论...` },
-    { icon: '🔗', text: `为「${nextStageName}」阶段准备背景信息...` },
-    { icon: '✨', text: `正在唤醒${nextStageRole}...` },
-  ]
-
-  return (
-    <div style={{
-      position: 'absolute', inset: 0,
-      background: 'rgba(250,251,252,0.96)', backdropFilter: 'blur(2px)',
-      display: 'flex', flexDirection: 'column',
-      alignItems: 'center', justifyContent: 'center',
-      zIndex: 100,
-    }}>
-      <div style={{
-        padding: '40px 48px', background: C.card, borderRadius: '20px',
-        boxShadow: '0 8px 40px rgba(0,0,0,0.08)',
-        border: `1px solid ${C.border}`, minWidth: '340px',
-      }}>
-        <div style={{
-          fontSize: '11px', fontWeight: 700, color: C.textMuted,
-          textTransform: 'uppercase', letterSpacing: '1.5px',
-          marginBottom: '22px', textAlign: 'center',
-        }}>
-          阶段交接中
-        </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-          {steps.map((s, i) => {
-            const isDone    = step > i
-            const isCurrent = step === i
-            const isPending = step < i
-            return (
-              <div key={i} style={{
-                display: 'flex', alignItems: 'center', gap: '14px',
-                opacity: isPending ? 0.25 : 1,
-                transform: isCurrent ? 'translateX(2px)' : 'none',
-                transition: 'all 450ms cubic-bezier(0.34,1.56,0.64,1)',
-              }}>
-                <div style={{
-                  width: '30px', height: '30px', borderRadius: '50%', flexShrink: 0,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: isDone ? '13px' : '14px',
-                  background: isDone
-                    ? 'linear-gradient(135deg, #10B981, #34D399)'
-                    : isCurrent ? C.primaryLight : '#F3F4F6',
-                  border: isDone
-                    ? '1px solid #6EE7B7'
-                    : isCurrent ? `1.5px solid ${C.primary}` : '1px solid transparent',
-                  color: isDone ? '#fff' : C.text,
-                  transition: 'all 400ms ease',
-                  boxShadow: isCurrent ? `0 0 0 4px ${C.primaryLight}` : 'none',
-                }}>
-                  {isDone ? '✓' : isCurrent ? (
-                    <div style={{
-                      width: '11px', height: '11px',
-                      border: `2px solid ${C.primary}`, borderTopColor: 'transparent',
-                      borderRadius: '50%', animation: 'tranSpin 0.7s linear infinite',
-                    }} />
-                  ) : s.icon}
-                </div>
-                <span style={{
-                  fontSize: '14px', lineHeight: 1.5,
-                  color: isDone ? C.success : isCurrent ? C.text : C.textMuted,
-                  fontWeight: isCurrent ? 600 : isDone ? 500 : 400,
-                  transition: 'all 400ms ease',
-                }}>
-                  {s.text}
-                </span>
-              </div>
-            )
-          })}
-        </div>
-        <style>{`@keyframes tranSpin { to { transform: rotate(360deg); } }`}</style>
-      </div>
-    </div>
-  )
-}
-
-// ==================== 阶段分隔符气泡 ====================
-
-interface StageSeparatorBubbleProps {
-  /** 即将进入的阶段名(中间徽章 + 下方开场条显示) */
-  stageName: string
-  /** 即将进入的阶段角色(下方开场条显示) */
-  aiRole: string
-  /** v121 任务C:可选——上一阶段名,用于顶部"阶段已完成"收束条
-   *  如果不传则不显示顶部收束条(例如流程第一个阶段,没有上一阶段) */
-  prevStageName?: string
-  /** v121 任务C:可选——即将进入的阶段代码,用于匹配 STAGE_CODE_EMOJI 图标
-   *  不传时默认用 ✨ */
-  nextStageCode?: string
-}
-
-export function StageSeparatorBubble({
-  stageName, aiRole, prevStageName, nextStageCode,
-}: StageSeparatorBubbleProps) {
-  // 根据阶段代码匹配图标,匹配不到用 ✨ 兜底
-  const stageIcon = nextStageCode ? (STAGE_CODE_EMOJI[nextStageCode] || '✨') : '✨'
-
-  return (
-    <div style={{
-      margin: '28px 0 20px',
-      padding: '0 4px',
-      display: 'flex', flexDirection: 'column', gap: '10px',
-    }}>
-      {/* ========== 顶部收束条:上一阶段已完成 ========== */}
-      {prevStageName && (
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: '10px',
-          opacity: 0.7,
-        }}>
-          <div style={{
-            flex: 1, height: '1px',
-            background: `linear-gradient(to right, transparent, ${C.success}40)`,
-          }} />
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: '6px',
-            padding: '3px 12px', borderRadius: '12px',
-            background: 'rgba(16,185,129,0.08)',
-            border: '1px solid rgba(16,185,129,0.15)',
-            fontSize: '11px', color: C.success, fontWeight: 500,
-            whiteSpace: 'nowrap',
-          }}>
-            <span>✅</span>
-            <span>{prevStageName} 阶段已完成</span>
-          </div>
-          <div style={{
-            flex: 1, height: '1px',
-            background: `linear-gradient(to left, transparent, ${C.success}40)`,
-          }} />
-        </div>
-      )}
-
-      {/* ========== 中间主徽章:进入下一阶段(保留原有渐变质感) ========== */}
-      <div style={{
-        display: 'flex', alignItems: 'center', gap: '14px',
-        padding: '0 4px',
-      }}>
-        <div style={{
-          flex: 1, height: '1px',
-          background: `linear-gradient(to right, transparent, ${C.border})`,
-        }} />
-        <div style={{
-          padding: '8px 20px', borderRadius: '22px',
-          background: 'linear-gradient(135deg, #4F7BE8, #818CF8)',
-          color: '#fff', fontSize: '13px', fontWeight: 700,
-          whiteSpace: 'nowrap',
-          boxShadow: '0 4px 14px rgba(79,123,232,0.32)',
-          display: 'flex', alignItems: 'center', gap: '8px',
-          animation: 'stageSepFadeIn 500ms ease-out',
-        }}>
-          <span style={{ fontSize: '15px' }}>{stageIcon}</span>
-          <span>进入{stageName}</span>
-        </div>
-        <div style={{
-          flex: 1, height: '1px',
-          background: `linear-gradient(to left, transparent, ${C.border})`,
-        }} />
-      </div>
-
-      {/* ========== 底部开场条:新阶段角色介绍(小字淡色,不抢戏但醒目) ========== */}
-      <div style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        gap: '6px',
-        fontSize: '12px', color: C.textSec,
-        padding: '0 4px',
-      }}>
-        <span style={{
-          display: 'inline-flex', alignItems: 'center', gap: '4px',
-          padding: '3px 10px', borderRadius: '10px',
-          background: C.primaryLight,
-          color: C.primary, fontWeight: 600,
-        }}>
-          <span>🎭</span>
-          <span>{aiRole}</span>
-        </span>
-        <span style={{ color: C.textMuted }}>即将协助你完成本阶段</span>
-      </div>
-
-      {/* 淡入动画 */}
-      <style>{`
-        @keyframes stageSepFadeIn {
-          from { opacity: 0; transform: translateY(-4px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
-      `}</style>
     </div>
   )
 }

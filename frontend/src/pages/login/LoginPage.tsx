@@ -84,26 +84,27 @@ export default function LoginPage() {
 
       {/* 登录卡片 */}
       <div style={{ width: '100%', maxWidth: '400px', position: 'relative', zIndex: 1 }}>
-        {/* Logo */}
+        {/* Logo — 北大人工智能应用与创新实验室 */}
         <div style={{ textAlign: 'center', marginBottom: '36px' }}>
           <div style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            width: '72px',
-            height: '72px',
-            background: 'rgba(255,255,255,0.2)',
+            display: 'inline-block',
+            padding: '12px 20px',
+            background: 'rgba(255,255,255,0.15)',
             backdropFilter: 'blur(20px)',
             WebkitBackdropFilter: 'blur(20px)',
-            borderRadius: '22px',
-            border: '1px solid rgba(255,255,255,0.3)',
+            borderRadius: '16px',
+            border: '1px solid rgba(255,255,255,0.25)',
             marginBottom: '16px',
             boxShadow: '0 8px 32px rgba(0,0,0,0.1)',
           }}>
-            <span style={{ color: '#fff', fontSize: '28px', fontWeight: 700, letterSpacing: '-0.5px' }}>TE</span>
+            <img
+              src="/pkuailab.png"
+              alt="北京大学人工智能应用与创新实验室"
+              style={{ height: '40px', display: 'block' }}
+            />
           </div>
           <h1 style={{ color: '#fff', fontSize: '28px', fontWeight: 600, letterSpacing: '-0.5px', margin: '0 0 4px 0' }}>TE-DNA 2.0</h1>
-          <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: '15px', margin: 0 }}>课程工作流平台</p>
+          <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: '15px', margin: 0 }}>K12 AI课程质量评估与教案开发平台</p>
         </div>
 
         {/* 表单卡片 */}

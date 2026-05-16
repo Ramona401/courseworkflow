@@ -1,0 +1,474 @@
+/**
+ * 课件风格模板页面 — CWTemplatesPage v3.0
+ *
+ * 功能：模板浏览 + 风格筛选 + iframe预览 + admin新建/编辑/删除
+ *       + 「组件预览」（选组件+选模板→实时渲染组合效果）
+ */
+import { useState, useEffect, useCallback } from 'react'
+import { getCWTemplates, createCWTemplate, updateCWTemplate, deleteCWTemplate, getCWComponents, getCWComponent, CW_STYLE_CONFIG, CW_COMP_TYPE_CONFIG } from '@/api/coursewares'
+import type { CoursewareTemplate, CWComponentListItem, CWComponentFull } from '@/api/coursewares'
+import { useAuth } from '@/store/auth'
+
+const C = {
+  primary: '#F59E0B', textPrimary: '#1F2937', textSecondary: '#6B7280',
+  textMuted: '#9CA3AF', border: '#E5E7EB', bgCard: '#FFFFFF', danger: '#EF4444',
+}
+const safeParse = (s: string): Record<string, string> => { try { return JSON.parse(s) || {} } catch { return {} } }
+const safeParseArray = (s: string): string[] => { try { const a = JSON.parse(s); return Array.isArray(a) ? a : [] } catch { return [] } }
+
+/** 将模板CSS变量注入到组件HTML中 */
+function injectStyleVars(html: string, cssVarsJson: string): string {
+  const vars = safeParse(cssVarsJson)
+  if (!Object.keys(vars).length) return html
+  const cssBlock = ':root{' + Object.entries(vars).map(([k, v]) => `${k}:${v}`).join(';') + '}'
+  if (html.includes('<head>')) return html.replace('<head>', '<head><style>' + cssBlock + '</style>')
+  if (html.includes('<style>')) return html.replace('<style>', '<style>' + cssBlock + '\n')
+  return '<style>' + cssBlock + '</style>' + html
+}
+
+export default function CWTemplatesPage() {
+  const { user } = useAuth()
+  const isAdmin = user?.role === 'admin'
+  const [templates, setTemplates] = useState<CoursewareTemplate[]>([])
+  const [loading, setLoading] = useState(true)
+  const [styleFilter, setStyleFilter] = useState('')
+  const [previewT, setPreviewT] = useState<CoursewareTemplate | null>(null)
+  const [editT, setEditT] = useState<CoursewareTemplate | null>(null)
+  const [showCreate, setShowCreate] = useState(false)
+  // 组件预览
+  const [showCompPreview, setShowCompPreview] = useState(false)
+
+  const loadData = useCallback(async () => {
+    setLoading(true)
+    try { setTemplates((await getCWTemplates()) || []) } catch { /* */ } finally { setLoading(false) }
+  }, [])
+  useEffect(() => { loadData() }, [loadData])
+
+  const handleDelete = async (id: string, name: string) => {
+    if (!window.confirm('确定删除模板「' + name + '」？此操作不可恢复。')) return
+    try { await deleteCWTemplate(id); loadData() } catch { alert('删除失败') }
+  }
+
+  const filtered = styleFilter ? templates.filter(t => t.style_category === styleFilter) : templates
+  const styleFilters = [{ value: '', label: '全部' }, ...Object.entries(CW_STYLE_CONFIG).map(([k, v]) => ({ value: k, label: v.emoji + ' ' + v.label }))]
+
+  return (
+    <div>
+      {/* 顶部操作栏 */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', flexWrap: 'wrap', gap: '12px' }}>
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+          {styleFilters.map(f => (
+            <button key={f.value} onClick={() => setStyleFilter(f.value)} style={{
+              padding: '6px 14px', borderRadius: '20px',
+              border: `1px solid ${styleFilter === f.value ? C.primary : C.border}`,
+              background: styleFilter === f.value ? 'rgba(245,158,11,0.08)' : 'transparent',
+              color: styleFilter === f.value ? C.primary : C.textSecondary,
+              fontSize: '13px', fontWeight: styleFilter === f.value ? 600 : 400, cursor: 'pointer',
+            }}>{f.label}</button>
+          ))}
+        </div>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button onClick={() => setShowCompPreview(true)} style={{
+            padding: '7px 16px', borderRadius: '8px', border: `1px solid #7C3AED`,
+            background: 'transparent', color: '#7C3AED', fontSize: '13px', fontWeight: 600, cursor: 'pointer',
+          }}>🧩 组件预览</button>
+          {isAdmin && (
+            <button onClick={() => { setEditT(null); setShowCreate(true) }} style={{
+              padding: '7px 16px', borderRadius: '8px', border: 'none',
+              background: 'linear-gradient(135deg, #F59E0B, #EF4444)', color: '#fff',
+              fontSize: '13px', fontWeight: 600, cursor: 'pointer', boxShadow: '0 2px 8px rgba(245,158,11,0.3)',
+            }}>+ 新建模板</button>
+          )}
+        </div>
+      </div>
+
+      <div style={{ fontSize: '13px', color: C.textMuted, marginBottom: '20px' }}>共 {filtered.length} 套风格模板</div>
+
+      {/* 模板列表 */}
+      {loading ? (
+        <div style={{ textAlign: 'center', padding: '60px 0', color: C.textMuted }}>加载中...</div>
+      ) : filtered.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: '80px 0' }}>
+          <div style={{ fontSize: '48px', marginBottom: '16px' }}>🎨</div>
+          <div style={{ fontSize: '16px', color: C.textSecondary, marginBottom: '8px' }}>暂无风格模板</div>
+          <div style={{ fontSize: '13px', color: C.textMuted }}>{isAdmin ? '点击「+ 新建模板」创建' : '等待管理员创建模板'}</div>
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '20px' }}>
+          {filtered.map(t => (
+            <TplCard key={t.id} t={t} isAdmin={isAdmin}
+              onPreview={() => setPreviewT(t)}
+              onEdit={() => { setEditT(t); setShowCreate(true) }}
+              onDelete={() => handleDelete(t.id, t.name)} />
+          ))}
+        </div>
+      )}
+
+      {/* 详情弹窗 */}
+      {previewT && <TplPreviewModal t={previewT} onClose={() => setPreviewT(null)} />}
+
+      {/* 新建/编辑弹窗 */}
+      {showCreate && <TplEditModal existing={editT} onClose={() => { setShowCreate(false); setEditT(null) }} onSaved={() => { setShowCreate(false); setEditT(null); loadData() }} />}
+
+      {/* 组件预览弹窗 */}
+      {showCompPreview && <CompStylePreview templates={templates} onClose={() => setShowCompPreview(false)} />}
+    </div>
+  )
+}
+
+/* ==================== 模板卡片 ==================== */
+function TplCard({ t, isAdmin, onPreview, onEdit, onDelete }: {
+  t: CoursewareTemplate; isAdmin: boolean; onPreview: () => void; onEdit: () => void; onDelete: () => void
+}) {
+  const [hovered, setHovered] = useState(false)
+  const sc = CW_STYLE_CONFIG[t.style_category] || { label: t.style_category, color: '#6B7280', bg: '#F3F4F6', emoji: '🎨' }
+  const colors = safeParse(t.color_scheme)
+  const pages = safeParseArray(t.sample_pages)
+
+  return (
+    <div onClick={onPreview} onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}
+      style={{
+        background: C.bgCard, borderRadius: '16px', overflow: 'hidden',
+        border: `1px solid ${hovered ? 'rgba(245,158,11,0.4)' : C.border}`,
+        cursor: 'pointer', transition: 'all 250ms ease',
+        transform: hovered ? 'translateY(-4px)' : 'none',
+        boxShadow: hovered ? '0 12px 40px rgba(0,0,0,0.1)' : '0 2px 8px rgba(0,0,0,0.04)',
+      }}>
+      <div style={{ height: '180px', position: 'relative', overflow: 'hidden', background: '#f1f5f9' }}>
+        {pages[0] ? (
+          <iframe srcDoc={pages[0]} style={{ width: '960px', height: '540px', border: 'none', transform: 'scale(0.3125)', transformOrigin: 'top left', pointerEvents: 'none' }} sandbox="" title={t.name} />
+        ) : (
+          <div style={{ height: '100%', background: colors.primary && colors.secondary ? `linear-gradient(135deg,${colors.primary},${colors.secondary})` : `linear-gradient(135deg,${sc.color}30,${sc.color}60)`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <span style={{ fontSize: '48px' }}>{sc.emoji}</span>
+          </div>
+        )}
+        {colors.primary && (
+          <div style={{ position: 'absolute', bottom: '8px', right: '8px', display: 'flex', gap: '3px', background: 'rgba(255,255,255,0.85)', borderRadius: '12px', padding: '4px 6px' }}>
+            {['primary', 'secondary', 'accent'].map(k => colors[k] ? <div key={k} style={{ width: '14px', height: '14px', borderRadius: '50%', background: colors[k], border: '1.5px solid rgba(255,255,255,0.8)' }} /> : null)}
+          </div>
+        )}
+      </div>
+      <div style={{ padding: '16px 20px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+          <div style={{ fontSize: '15px', fontWeight: 700, color: C.textPrimary }}>{t.name}</div>
+          <span style={{ padding: '2px 10px', borderRadius: '12px', fontSize: '11px', fontWeight: 600, color: sc.color, background: sc.bg }}>{sc.label}</span>
+        </div>
+        {t.description && <div style={{ fontSize: '13px', color: C.textSecondary, lineHeight: 1.5 }}>{t.description.length > 50 ? t.description.slice(0, 50) + '...' : t.description}</div>}
+        {isAdmin && (
+          <div style={{ marginTop: '10px', display: 'flex', justifyContent: 'flex-end', gap: '6px' }}>
+            <button onClick={e => { e.stopPropagation(); onEdit() }} style={{ padding: '2px 10px', borderRadius: '6px', border: `1px solid ${C.border}`, background: 'transparent', color: '#2563EB', fontSize: '11px', cursor: 'pointer' }}>编辑</button>
+            <button onClick={e => { e.stopPropagation(); onDelete() }} style={{ padding: '2px 10px', borderRadius: '6px', border: `1px solid ${C.border}`, background: 'transparent', color: C.danger, fontSize: '11px', cursor: 'pointer' }}>删除</button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/* ==================== 模板详情预览弹窗 ==================== */
+function TplPreviewModal({ t, onClose }: { t: CoursewareTemplate; onClose: () => void }) {
+  const pages = safeParseArray(t.sample_pages)
+  const colors = safeParse(t.color_scheme)
+  const cssVars = safeParse(t.css_variables)
+  const sc = CW_STYLE_CONFIG[t.style_category] || { label: t.style_category, color: '#6B7280', bg: '#F3F4F6', emoji: '🎨' }
+
+  return (
+    <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.6)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(4px)' }} onClick={onClose}>
+      <div style={{ background: '#fff', borderRadius: '20px', width: '92%', maxWidth: '820px', maxHeight: '88vh', overflow: 'auto' }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: '28px 32px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '6px' }}>
+              <span style={{ fontSize: '28px' }}>{sc.emoji}</span>
+              <span style={{ fontSize: '22px', fontWeight: 800, color: '#1F2937' }}>{t.name}</span>
+              <span style={{ padding: '3px 12px', borderRadius: '12px', fontSize: '12px', fontWeight: 600, color: sc.color, background: sc.bg }}>{sc.label}</span>
+            </div>
+            {t.description && <div style={{ fontSize: '14px', color: '#64748B', marginTop: '4px' }}>{t.description}</div>}
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', fontSize: '28px', cursor: 'pointer', color: '#9CA3AF', lineHeight: 1 }}>×</button>
+        </div>
+        {pages.length > 0 && (
+          <div style={{ padding: '0 32px 24px' }}>
+            <div style={{ fontSize: '15px', fontWeight: 700, color: '#1F2937', marginBottom: '14px' }}>📺 样例页面预览</div>
+            <div style={{ border: '1px solid #E2E8F0', borderRadius: '16px', overflow: 'hidden', background: '#f8fafc' }}>
+              <iframe srcDoc={pages[0]} style={{ width: '100%', height: '420px', border: 'none' }} sandbox="allow-scripts" title="样例预览" />
+            </div>
+          </div>
+        )}
+        <div style={{ padding: '0 32px 24px' }}>
+          <div style={{ fontSize: '15px', fontWeight: 700, color: '#1F2937', marginBottom: '14px' }}>🎨 配色方案</div>
+          <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
+            {Object.entries(colors).map(([k, v]) => (
+              <div key={k} style={{ textAlign: 'center' }}>
+                <div style={{ width: '56px', height: '56px', borderRadius: '14px', background: v, border: '2px solid rgba(0,0,0,0.06)', marginBottom: '6px', boxShadow: '0 2px 8px rgba(0,0,0,0.08)' }} />
+                <div style={{ fontSize: '11px', color: '#9CA3AF' }}>{k}</div>
+                <div style={{ fontSize: '11px', color: '#64748B', fontFamily: 'monospace' }}>{v}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div style={{ padding: '0 32px 32px' }}>
+          <div style={{ fontSize: '15px', fontWeight: 700, color: '#1F2937', marginBottom: '14px' }}>⚙️ CSS变量</div>
+          <div style={{ background: '#F8FAFC', borderRadius: '12px', padding: '16px 20px' }}>
+            {Object.entries(cssVars).map(([k, v]) => (
+              <div key={k} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', fontSize: '13px', borderBottom: '1px solid #F1F5F9' }}>
+                <span style={{ color: '#7C3AED', fontFamily: 'monospace', fontWeight: 500 }}>{k}</span>
+                <span style={{ color: '#64748B', fontFamily: 'monospace', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  {typeof v === 'string' && v.startsWith('#') && <span style={{ width: '14px', height: '14px', borderRadius: '4px', background: v, border: '1px solid #E2E8F0' }} />}
+                  {v}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ==================== 新建/编辑模板弹窗 ==================== */
+function TplEditModal({ existing, onClose, onSaved }: {
+  existing: CoursewareTemplate | null; onClose: () => void; onSaved: () => void
+}) {
+  const isEdit = !!existing
+  const [name, setName] = useState(existing?.name || '')
+  const [desc, setDesc] = useState(existing?.description || '')
+  const [category, setCategory] = useState(existing?.style_category || 'minimalist')
+  const [saving, setSaving] = useState(false)
+
+  // 配色（5色）
+  const initColors = existing ? safeParse(existing.color_scheme) : { primary: '#2563EB', secondary: '#60A5FA', background: '#F8FAFC', accent: '#F59E0B', text: '#1E293B' }
+  const [colors, setColors] = useState<Record<string, string>>(initColors)
+
+  // CSS变量（从配色自动派生）
+  const buildCssVars = (c: Record<string, string>) => ({
+    '--cw-primary': c.primary || '#2563EB', '--cw-secondary': c.secondary || '#60A5FA',
+    '--cw-bg': c.background || '#F8FAFC', '--cw-accent': c.accent || '#F59E0B',
+    '--cw-text': c.text || '#1E293B',
+    '--cw-font-heading': "'Inter',system-ui,sans-serif", '--cw-font-body': "'Inter',system-ui,sans-serif",
+    '--cw-radius': category === 'academic' ? '4px' : category === 'playful' ? '20px' : '12px',
+    '--cw-shadow': '0 4px 24px rgba(0,0,0,0.06)',
+  })
+
+  // 实时预览HTML
+  const previewHTML = `<div style="width:960px;height:540px;background:${colors.background || '#F8FAFC'};display:flex;align-items:center;justify-content:center;font-family:Inter,system-ui">
+    <div style="text-align:center">
+      <h1 style="font-size:48px;font-weight:800;color:${colors.primary || '#2563EB'};margin-bottom:16px">${name || '模板标题预览'}</h1>
+      <div style="width:80px;height:4px;background:linear-gradient(90deg,${colors.primary || '#2563EB'},${colors.accent || '#F59E0B'});border-radius:2px;margin:0 auto 20px"></div>
+      <p style="font-size:22px;color:${colors.text || '#1E293B'};opacity:0.6">${desc || '模板描述文字'}</p>
+    </div>
+  </div>`
+
+  const handleSave = async () => {
+    if (!name.trim()) { alert('请填写模板名称'); return }
+    setSaving(true)
+    try {
+      const cssVars = buildCssVars(colors)
+      const data = {
+        name: name.trim(), description: desc.trim(), style_category: category,
+        color_scheme: JSON.stringify(colors), css_variables: JSON.stringify(cssVars),
+        sample_pages: JSON.stringify([previewHTML]),
+      }
+      if (isEdit && existing) {
+        await updateCWTemplate(existing.id, data)
+      } else {
+        await createCWTemplate(data)
+      }
+      onSaved()
+    } catch { alert('保存失败') } finally { setSaving(false) }
+  }
+
+  const colorKeys = [
+    { key: 'primary', label: '主色' }, { key: 'secondary', label: '辅色' },
+    { key: 'background', label: '背景色' }, { key: 'accent', label: '强调色' }, { key: 'text', label: '文字色' },
+  ]
+
+  const categories = Object.entries(CW_STYLE_CONFIG).map(([k, v]) => ({ value: k, label: v.emoji + ' ' + v.label }))
+
+  return (
+    <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.6)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(4px)' }} onClick={onClose}>
+      <div style={{ background: '#fff', borderRadius: '20px', width: '92%', maxWidth: '900px', maxHeight: '90vh', overflow: 'auto', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+        {/* 头部 */}
+        <div style={{ padding: '24px 28px 16px', borderBottom: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div style={{ fontSize: '20px', fontWeight: 700, color: C.textPrimary }}>{isEdit ? '✏️ 编辑模板' : '✨ 新建模板'}</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', fontSize: '24px', cursor: 'pointer', color: C.textMuted }}>×</button>
+        </div>
+
+        <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+          {/* 左侧表单 */}
+          <div style={{ flex: 1, padding: '24px 28px', overflow: 'auto', borderRight: `1px solid ${C.border}` }}>
+            {/* 名称 */}
+            <div style={{ marginBottom: '16px' }}>
+              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, display: 'block', marginBottom: '6px' }}>模板名称 *</label>
+              <input value={name} onChange={e => setName(e.target.value)} placeholder="如：简约清新-天际蓝"
+                style={{ width: '100%', padding: '10px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none' }} />
+            </div>
+            {/* 描述 */}
+            <div style={{ marginBottom: '16px' }}>
+              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, display: 'block', marginBottom: '6px' }}>描述</label>
+              <input value={desc} onChange={e => setDesc(e.target.value)} placeholder="简短描述模板特点和适用场景"
+                style={{ width: '100%', padding: '10px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none' }} />
+            </div>
+            {/* 风格类别 */}
+            <div style={{ marginBottom: '20px' }}>
+              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, display: 'block', marginBottom: '6px' }}>风格类别 *</label>
+              <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                {categories.map(c => (
+                  <button key={c.value} onClick={() => setCategory(c.value)} style={{
+                    padding: '6px 14px', borderRadius: '16px', fontSize: '12px', cursor: 'pointer',
+                    border: `1.5px solid ${category === c.value ? C.primary : C.border}`,
+                    background: category === c.value ? 'rgba(245,158,11,0.08)' : 'transparent',
+                    color: category === c.value ? C.primary : C.textSecondary, fontWeight: category === c.value ? 600 : 400,
+                  }}>{c.label}</button>
+                ))}
+              </div>
+            </div>
+            {/* 配色 */}
+            <div style={{ marginBottom: '16px' }}>
+              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, display: 'block', marginBottom: '10px' }}>🎨 配色方案</label>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '10px' }}>
+                {colorKeys.map(ck => (
+                  <div key={ck.key} style={{ textAlign: 'center' }}>
+                    <label style={{ fontSize: '11px', color: C.textMuted, display: 'block', marginBottom: '4px' }}>{ck.label}</label>
+                    <input type="color" value={colors[ck.key] || '#000000'}
+                      onChange={e => setColors({ ...colors, [ck.key]: e.target.value })}
+                      style={{ width: '100%', height: '40px', border: `2px solid ${C.border}`, borderRadius: '8px', cursor: 'pointer', padding: '2px' }} />
+                    <div style={{ fontSize: '10px', color: C.textSecondary, fontFamily: 'monospace', marginTop: '2px' }}>{colors[ck.key]}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* 右侧实时预览 */}
+          <div style={{ width: '380px', padding: '24px', background: '#F8FAFC', display: 'flex', flexDirection: 'column' }}>
+            <div style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '12px' }}>📺 实时预览</div>
+            <div style={{ flex: 1, border: `1px solid ${C.border}`, borderRadius: '12px', overflow: 'hidden', background: '#fff' }}>
+              <iframe srcDoc={previewHTML} style={{ width: '960px', height: '540px', border: 'none', transform: 'scale(0.35)', transformOrigin: 'top left', pointerEvents: 'none' }} sandbox="" title="预览" />
+            </div>
+            <div style={{ marginTop: '12px', display: 'flex', gap: '4px', justifyContent: 'center' }}>
+              {colorKeys.map(ck => (
+                <div key={ck.key} style={{ width: '20px', height: '20px', borderRadius: '50%', background: colors[ck.key], border: '2px solid rgba(0,0,0,0.08)' }} title={ck.label} />
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* 底部按钮 */}
+        <div style={{ padding: '16px 28px', borderTop: `1px solid ${C.border}`, display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+          <button onClick={onClose} style={{ padding: '8px 20px', borderRadius: '8px', border: `1px solid ${C.border}`, background: 'transparent', color: C.textSecondary, fontSize: '14px', cursor: 'pointer' }}>取消</button>
+          <button onClick={handleSave} disabled={saving} style={{
+            padding: '8px 24px', borderRadius: '8px', border: 'none',
+            background: 'linear-gradient(135deg, #F59E0B, #EF4444)', color: '#fff',
+            fontSize: '14px', fontWeight: 600, cursor: saving ? 'wait' : 'pointer',
+          }}>{saving ? '保存中...' : isEdit ? '保存修改' : '创建模板'}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ==================== 组件+风格 组合预览弹窗 ==================== */
+function CompStylePreview({ templates, onClose }: { templates: CoursewareTemplate[]; onClose: () => void }) {
+  const [comps, setComps] = useState<CWComponentListItem[]>([])
+  const [selectedCompId, setSelectedCompId] = useState('')
+  const [selectedTplId, setSelectedTplId] = useState(templates[0]?.id || '')
+  const [compCode, setCompCode] = useState('')
+  const [loadingComp, setLoadingComp] = useState(false)
+
+  useEffect(() => {
+    getCWComponents({ limit: 100 }).then(r => setComps(r.components || [])).catch(() => {})
+  }, [])
+
+  const selectedTpl = templates.find(t => t.id === selectedTplId)
+
+  const loadCompCode = async (id: string) => {
+    setSelectedCompId(id); setLoadingComp(true)
+    try {
+      const full: CWComponentFull = await getCWComponent(id)
+      setCompCode(full.code_content)
+    } catch { setCompCode('') } finally { setLoadingComp(false) }
+  }
+
+  const combinedHTML = compCode && selectedTpl ? injectStyleVars(compCode, selectedTpl.css_variables) : ''
+
+  return (
+    <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.6)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(4px)' }} onClick={onClose}>
+      <div style={{ background: '#fff', borderRadius: '20px', width: '95%', maxWidth: '1100px', maxHeight: '90vh', overflow: 'auto' }} onClick={e => e.stopPropagation()}>
+        {/* 头部 */}
+        <div style={{ padding: '24px 28px 16px', borderBottom: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            <div style={{ fontSize: '20px', fontWeight: 700, color: C.textPrimary }}>🧩 组件 + 风格 组合预览</div>
+            <div style={{ fontSize: '13px', color: C.textSecondary, marginTop: '4px' }}>选择一个组件和一套风格模板，查看组合渲染效果</div>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', fontSize: '24px', cursor: 'pointer', color: C.textMuted }}>×</button>
+        </div>
+
+        <div style={{ display: 'flex', gap: '0' }}>
+          {/* 左侧选择器 */}
+          <div style={{ width: '320px', padding: '20px', borderRight: `1px solid ${C.border}`, overflow: 'auto', maxHeight: '60vh' }}>
+            {/* 选择组件 */}
+            <div style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '10px' }}>选择组件</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '20px' }}>
+              {comps.map(c => {
+                const tc = CW_COMP_TYPE_CONFIG[c.component_type] || { label: c.component_type, color: '#6B7280', bg: '#F3F4F6' }
+                return (
+                  <div key={c.id} onClick={() => loadCompCode(c.id)} style={{
+                    padding: '10px 12px', borderRadius: '8px', cursor: 'pointer',
+                    border: `1.5px solid ${selectedCompId === c.id ? '#F59E0B' : '#E5E7EB'}`,
+                    background: selectedCompId === c.id ? 'rgba(245,158,11,0.05)' : '#fff',
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary }}>{c.name}</span>
+                      <span style={{ padding: '1px 8px', borderRadius: '8px', fontSize: '10px', color: tc.color, background: tc.bg }}>{tc.label}</span>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+
+            {/* 选择风格 */}
+            <div style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '10px' }}>选择风格</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              {templates.map(t => {
+                const sc = CW_STYLE_CONFIG[t.style_category] || { emoji: '🎨' }
+                const cols = safeParse(t.color_scheme)
+                return (
+                  <div key={t.id} onClick={() => setSelectedTplId(t.id)} style={{
+                    padding: '10px 12px', borderRadius: '8px', cursor: 'pointer',
+                    border: `1.5px solid ${selectedTplId === t.id ? '#F59E0B' : '#E5E7EB'}`,
+                    background: selectedTplId === t.id ? 'rgba(245,158,11,0.05)' : '#fff',
+                    display: 'flex', alignItems: 'center', gap: '10px',
+                  }}>
+                    <div style={{ display: 'flex', gap: '3px' }}>
+                      {['primary', 'secondary', 'accent'].map(k => cols[k] ? <div key={k} style={{ width: '12px', height: '12px', borderRadius: '50%', background: cols[k], border: '1px solid rgba(0,0,0,0.08)' }} /> : null)}
+                    </div>
+                    <span style={{ fontSize: '12px', color: C.textPrimary }}>{sc.emoji} {t.name}</span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* 右侧预览 */}
+          <div style={{ flex: 1, padding: '20px', display: 'flex', flexDirection: 'column' }}>
+            <div style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '12px' }}>
+              渲染效果 {selectedTpl && <span style={{ fontWeight: 400, color: C.textMuted }}>— {selectedTpl.name}</span>}
+            </div>
+            {loadingComp ? (
+              <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textMuted }}>加载组件中...</div>
+            ) : !combinedHTML ? (
+              <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textMuted, flexDirection: 'column', gap: '8px' }}>
+                <div style={{ fontSize: '40px' }}>👈</div>
+                <div>请在左侧选择一个组件</div>
+              </div>
+            ) : (
+              <div style={{ border: `1px solid ${C.border}`, borderRadius: '12px', overflow: 'hidden', background: '#f8fafc' }}>
+                <iframe srcDoc={combinedHTML} style={{ width: '100%', height: '450px', border: 'none' }} sandbox="allow-scripts" title="组合预览" />
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}

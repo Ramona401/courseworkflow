@@ -39,6 +39,10 @@ import TemplatesPage from '@/pages/lesson-plans/templates/TemplatesPage'
 import TemplateEditorPage from '@/pages/lesson-plans/templates/TemplateEditorPage'
 import PlanDetailPage from '@/pages/lesson-plans/plan-detail/PlanDetailPage'
 import ReviewCenterLPPage from '@/pages/lesson-plans/review/ReviewCenterLPPage'
+// v127新增：多级审核工作台
+import ReviewV2DashboardPage from '@/pages/lesson-plans/review-v2/ReviewV2DashboardPage'
+// v128新增：Token积分管理
+import TokenDashboardPage from '@/pages/tokens/TokenDashboardPage'
 // v106新增：独立全屏评审工作台
 import ReviewWorkbenchPage from '@/pages/lesson-plans/review/ReviewWorkbenchPage'
 // Phase 7A新增：备课配方
@@ -51,6 +55,13 @@ import StagesConfigPage from '@/pages/lesson-plans/stages-config/StagesConfigPag
 import AssessmentPage from '@/pages/lesson-plans/assessment/AssessmentPage'
 // 迭代7新增：课本管理
 import TextbooksPage from '@/pages/lesson-plans/textbooks/TextbooksPage'
+
+/* ==================== 课件工坊 ==================== */
+import CWLayout from '@/components/layout-cw/CWLayout'
+import CoursewareListPage from '@/pages/courseware/CoursewareListPage'
+import CWComponentsPage from '@/pages/courseware/CWComponentsPage'
+import CWTemplatesPage from '@/pages/courseware/CWTemplatesPage'
+import CoursewareWorkshopPage from '@/pages/courseware/CoursewareWorkshopPage'
 
 /* ==================== 通用独立页面 ==================== */
 import AccountPage from '@/pages/account/AccountPage'
@@ -113,7 +124,7 @@ export default function App() {
             <AuthGuard><RoleGuard roles={['admin']}><AICenterPage /></RoleGuard></AuthGuard>
           } />
           <Route path="/admin" element={
-            <AuthGuard><RoleGuard roles={['admin']}><AdminPage /></RoleGuard></AuthGuard>
+            <AuthGuard><RoleGuard roles={['admin','senior_operator']}><AdminPage /></RoleGuard></AuthGuard>
           } />
           <Route path="/ai-traces" element={
             <AuthGuard><RoleGuard roles={['admin']}><AITraceDashboardPage /></RoleGuard></AuthGuard>
@@ -134,6 +145,14 @@ export default function App() {
             <Route path="settings"      element={<RoleGuard roles={['admin']}><SettingsPage /></RoleGuard>} />
           </Route>
 
+          {/* ==================== 课件工坊 ==================== */}
+          <Route path="/courseware" element={<AuthGuard><CWLayout /></AuthGuard>}>
+            <Route index element={<CoursewareListPage />} />
+            <Route path="components" element={<CWComponentsPage />} />
+            <Route path="templates" element={<CWTemplatesPage />} />
+            <Route path=":id" element={<CoursewareWorkshopPage />} />
+          </Route>
+
           {/* ==================== 教案系统 ==================== */}
 
           {/* v106新增：独立全屏评审工作台（必须在 /lesson-plans 布局路由之前注册） */}
@@ -147,6 +166,8 @@ export default function App() {
             <Route path="library"          element={<LibraryPage />} />
             <Route path="plans/:id"        element={<PlanDetailPage />} />
             <Route path="review"           element={<ReviewCenterLPPage />} />
+            <Route path="review-v2"        element={<ReviewV2DashboardPage />} />
+            <Route path="tokens"           element={<TokenDashboardPage />} />
             <Route path="components"       element={<ComponentsPage />} />
             <Route path="templates"        element={<TemplatesPage />} />
             <Route path="templates/:id"    element={<TemplateEditorPage />} />

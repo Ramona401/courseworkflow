@@ -1,5 +1,15 @@
 /**
  * planDetailConstants.ts — 教案详情页共用常量、类型、工具函数
+ *
+ * v124 改动(图片插入预览修复):
+ *   - renderMarkdown 新增三种 Markdown 元素支持:
+ *     1. 整行图片 ![alt](url) → 居中块级 <img>(maxHeight 480px),
+ *        alt 作为灰色斜体图注显示在图下方,加载失败显示红色占位
+ *     2. 行内图片(图片与文字混在一行) → 行内小图(maxHeight 200px)
+ *     3. 链接 [text](url) → <a target="_blank"> 蓝色下划线
+ *   - parseInline 升级:用统一正则切分粗体/图片/链接,顺序判断避免误匹配
+ *     (! 前缀的图片必须先于普通链接判断)
+ *   - 不破坏既有功能:标题/列表/粗体/分割线一切照旧
  */
 import type { LessonPlanStatus } from '@/api/lesson-plans'
 
@@ -83,7 +93,16 @@ export function fmtDate(iso: string): string {
 
 /**
  * 轻量Markdown渲染器
- * 支持：#/##/### 标题、**粗体**、- 无序列表、1. 有序列表、--- 分割线
+ * v124 支持的语法:
+ *   块级:
+ *     # ## ###  标题
+ *     - / 1.    列表
+ *     ---       分割线
+ *     ![alt](url)  整行图片 → 居中大图+图注 (v124 新增)
+ *   行内(在 parseInline 中处理):
+ *     **粗体**
+ *     ![alt](url)  行内小图 (v124 新增)
+ *     [text](url)  链接,新标签页打开 (v124 新增)
  */
 export function renderMarkdown(text: string): React.ReactNode {
   if (!text) return null
@@ -93,14 +112,54 @@ export function renderMarkdown(text: string): React.ReactNode {
   let listType: 'ul' | 'ol' | null = null
   let key = 0
 
+  /**
+   * 解析行内元素(粗体/图片/链接)
+   * 用统一捕获组正则一次性切分,再按类型回填渲染
+   *
+   * 注意正则顺序:
+   *   1. !\[...\]\(...\)  图片必须放最前面,因为它含 [ ] 会被链接正则误匹配
+   *   2. \[...\]\(...\)   链接
+   *   3. \*\*...\*\*      粗体
+   */
   const parseInline = (line: string): React.ReactNode => {
-    const parts = line.split(/(\*\*[^*]+\*\*)/)
+    const INLINE_RE = /(!\[[^\]]*\]\([^)]+\)|\[[^\]]+\]\([^)]+\)|\*\*[^*]+\*\*)/g
+    const parts = line.split(INLINE_RE)
     if (parts.length === 1) return line
-    return <>{parts.map((p, i) =>
-      p.startsWith('**') && p.endsWith('**')
-        ? <strong key={i} style={{ fontWeight: 700, color: C.text }}>{p.slice(2, -2)}</strong>
-        : p
-    )}</>
+    return <>{parts.map((p, i) => {
+      if (!p) return null
+      // 行内图片(放在文字中,最大高 200px 不破坏行高)
+      const imgM = p.match(/^!\[([^\]]*)\]\(([^)]+)\)$/)
+      if (imgM) {
+        return (
+          <img
+            key={i}
+            src={imgM[2]}
+            alt={imgM[1]}
+            style={{
+              maxWidth: '100%', maxHeight: '200px',
+              verticalAlign: 'middle', borderRadius: '4px', margin: '0 4px',
+            }}
+            onError={(e) => { (e.currentTarget as HTMLImageElement).style.opacity = '0.3' }}
+          />
+        )
+      }
+      // 链接
+      const linkM = p.match(/^\[([^\]]+)\]\(([^)]+)\)$/)
+      if (linkM) {
+        return (
+          <a key={i} href={linkM[2]} target="_blank" rel="noopener noreferrer"
+            style={{ color: C.primary, textDecoration: 'underline' }}>
+            {linkM[1]}
+          </a>
+        )
+      }
+      // 粗体
+      if (p.startsWith('**') && p.endsWith('**')) {
+        return <strong key={i} style={{ fontWeight: 700, color: C.text }}>{p.slice(2, -2)}</strong>
+      }
+      // 普通文本
+      return p
+    })}</>
   }
 
   const flushList = () => {
@@ -114,6 +173,57 @@ export function renderMarkdown(text: string): React.ReactNode {
   for (const line of lines) {
     const t = line.trim()
     if (!t) { flushList(); continue }
+
+    // ==================== v124: 整行只有图片 → 居中块级大图 ====================
+    const imgOnly = t.match(/^!\[([^\]]*)\]\(([^)]+)\)$/)
+    if (imgOnly) {
+      flushList()
+      const alt = imgOnly[1]
+      const url = imgOnly[2]
+      nodes.push(
+        <div key={key++} style={{ textAlign: 'center', margin: '14px 0' }}>
+          <img
+            src={url}
+            alt={alt}
+            style={{
+              maxWidth: '100%', maxHeight: '480px',
+              borderRadius: '6px',
+              boxShadow: '0 1px 4px rgba(0,0,0,0.1)',
+              display: 'inline-block',
+            }}
+            onError={(e) => {
+              // 图片加载失败:隐藏 img,显示后面的红色占位 div
+              const img = e.currentTarget as HTMLImageElement
+              img.style.display = 'none'
+              const placeholder = img.nextElementSibling as HTMLDivElement | null
+              if (placeholder) placeholder.style.display = 'inline-block'
+            }}
+          />
+          {/* 加载失败时的占位提示(默认 hidden,onError 时显示) */}
+          <div style={{
+            display: 'none',
+            padding: '14px 20px',
+            background: 'rgba(239,68,68,0.06)',
+            border: '1px dashed rgba(239,68,68,0.3)',
+            borderRadius: '6px',
+            color: C.danger,
+            fontSize: '13px',
+          }}>
+            ⚠️ 图片加载失败:{alt || '(未命名)'}
+          </div>
+          {alt && (
+            <div style={{
+              fontSize: '12px', color: C.textMuted,
+              marginTop: '6px', fontStyle: 'italic',
+            }}>
+              {alt}
+            </div>
+          )}
+        </div>
+      )
+      continue
+    }
+
     // 分割线
     if (/^---+$/.test(t)) {
       flushList()

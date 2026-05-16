@@ -1,19 +1,30 @@
 package handlers
 
-// admin_handler.go — 统一用户管理中心处理器（主文件）
+// admin_handler.go — 统一用户管理中心处理器(主文件)
 //
-// 职责：
+// v122 方案B 改动(修复: 学校管理员新建老师看不见):
+//   - CreateAdminUser: senior_operator 创建成功后自动调 AddSchoolMember 写入 school_members
+//   - ensureUserInScope: 从 IsUserInSchoolByGroup 换为 IsUserInSchool (school_members 主判 + 教研组兜底)
+//   - resolveSchoolScope: 逻辑不变(仍用 GetSchoolByAdminUserID 反查学校)
+//
+// v122 原改动(AdminPage 权限统一):
+//   - resolveSchoolScope: 根据登录者角色决定数据范围
+//     * admin 可看全系统,传入的 school_id 照常使用
+//     * senior_operator 强制过滤为自己管理的学校,忽略前端传的 school_id
+//   - ListAdminUsers / GetAdminUserDetail 调用 resolveSchoolScope 过滤数据
+//   - CreateAdminUser / UpdateAdminUser 校验操作者角色:
+//     * senior_operator 不能创建/编辑 role=admin 或 senior_operator 的用户
+//
+// 职责:
 //   - AdminHandler struct定义与构造
 //   - 用户列表/详情/创建/编辑/启用禁用/重置密码
 //   - 课程分配查询与更新
 //   - 统计摘要
 //   - 错误处理函数
 //   - 路径提取工具函数
-//
-// 教研组成员管理 → admin_handler_groups.go
-// 组织列表+日志查询 → admin_handler_logs.go
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -27,7 +38,7 @@ import (
 	"tedna/internal/utils"
 )
 
-// ==================== 路径前缀常量（消除S1192） ====================
+// ==================== 路径前缀常量 ====================
 
 const (
 	adminUsersPrefix = "/api/v1/admin/users/"
@@ -35,13 +46,11 @@ const (
 
 // ==================== Handler结构体 ====================
 
-// AdminHandler 统一用户管理中心处理器
 type AdminHandler struct {
 	userService *services.UserService
 	orgService  *services.OrganizationService
 }
 
-// NewAdminHandler 构造函数
 func NewAdminHandler(userService *services.UserService, orgService *services.OrganizationService) *AdminHandler {
 	return &AdminHandler{
 		userService: userService,
@@ -51,7 +60,6 @@ func NewAdminHandler(userService *services.UserService, orgService *services.Org
 
 // ==================== 本地类型定义 ====================
 
-// AdminUserListItem 用户管理列表项（跨表联合，包含完整权限信息）
 type AdminUserListItem struct {
 	ID          string  `json:"id"`
 	Username    string  `json:"username"`
@@ -68,14 +76,12 @@ type AdminUserListItem struct {
 	GroupCount  int     `json:"group_count"`
 }
 
-// AdminUserDetail 用户详情（含跨系统完整权限）
 type AdminUserDetail struct {
 	AdminUserListItem
 	CourseAssignments []*models.CourseAssignment `json:"course_assignments"`
 	TeachingGroups    []AdminGroupMembership     `json:"teaching_groups"`
 }
 
-// AdminGroupMembership 用户的教研组归属信息
 type AdminGroupMembership struct {
 	GroupID    string `json:"group_id"`
 	GroupName  string `json:"group_name"`
@@ -86,10 +92,40 @@ type AdminGroupMembership struct {
 	IsLead     bool   `json:"is_lead"`
 }
 
+// ==================== v122 新增:权限范围辅助 ====================
+
+// resolveSchoolScope 根据登录者角色决定数据范围
+// 返回 (effectiveSchoolID, userRole, error)
+//   - admin: 返回前端传的 schoolID(可以为空 → 全系统)
+//   - senior_operator: 强制返回其管理的学校 ID(忽略前端传入),未绑定学校则返回错误
+//   - 其他角色: 此处不应走到(中间件已拦截),保险起见返回错误
+func resolveSchoolScope(ctx context.Context, requestedSchoolID string) (string, string, error) {
+	claims, ok := middleware.GetClaims(ctx)
+	if !ok {
+		return "", "", fmt.Errorf("未登录")
+	}
+
+	switch claims.Role {
+	case models.RoleAdmin:
+		return requestedSchoolID, claims.Role, nil
+
+	case models.RoleSeniorOperator:
+		school, err := repository.GetSchoolByAdminUserID(ctx, claims.UserID)
+		if err != nil {
+			return "", claims.Role, fmt.Errorf("您尚未绑定学校,请联系系统管理员")
+		}
+		if school == nil || school.ID == "" {
+			return "", claims.Role, fmt.Errorf("您尚未绑定学校,请联系系统管理员")
+		}
+		return school.ID, claims.Role, nil
+
+	default:
+		return "", claims.Role, fmt.Errorf("权限不足")
+	}
+}
+
 // ==================== 统计摘要 ====================
 
-// GetAdminStats GET /api/v1/admin/stats
-// 用户管理统计（用于概览卡片：总用户/组织/教研组）
 func (h *AdminHandler) GetAdminStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
@@ -105,8 +141,6 @@ func (h *AdminHandler) GetAdminStats(w http.ResponseWriter, r *http.Request) {
 
 // ==================== 用户列表 ====================
 
-// ListAdminUsers GET /api/v1/admin/users
-// 获取用户列表（含跨表权限摘要，支持role/status/keyword/school_id/group_id多维筛选+分页）
 func (h *AdminHandler) ListAdminUsers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
@@ -123,13 +157,19 @@ func (h *AdminHandler) ListAdminUsers(w http.ResponseWriter, r *http.Request) {
 		pageSize = 20
 	}
 
+	effectiveSchoolID, _, scopeErr := resolveSchoolScope(r.Context(), q.Get("school_id"))
+	if scopeErr != nil {
+		utils.Forbidden(w, scopeErr.Error())
+		return
+	}
+
 	result, err := repository.ListAdminUsers(r.Context(), repository.AdminUserListParams{
 		Page:     page,
 		PageSize: pageSize,
 		Role:     q.Get("role"),
 		Status:   q.Get("status"),
 		Keyword:  q.Get("keyword"),
-		SchoolID: q.Get("school_id"),
+		SchoolID: effectiveSchoolID,
 		GroupID:  q.Get("group_id"),
 	})
 	if err != nil {
@@ -141,8 +181,6 @@ func (h *AdminHandler) ListAdminUsers(w http.ResponseWriter, r *http.Request) {
 
 // ==================== 用户详情 ====================
 
-// GetAdminUserDetail GET /api/v1/admin/users/{id}
-// 获取用户详情（含课程分配+教研组归属的跨系统权限全貌）
 func (h *AdminHandler) GetAdminUserDetail(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
@@ -153,6 +191,12 @@ func (h *AdminHandler) GetAdminUserDetail(w http.ResponseWriter, r *http.Request
 		utils.BadRequest(w, utils.MsgMissingUserID)
 		return
 	}
+
+	if err := ensureUserInScope(r.Context(), userID); err != nil {
+		utils.Forbidden(w, err.Error())
+		return
+	}
+
 	detail, err := repository.GetAdminUserDetail(r.Context(), userID)
 	if err != nil {
 		utils.InternalError(w, "获取用户详情失败: "+err.Error())
@@ -164,7 +208,8 @@ func (h *AdminHandler) GetAdminUserDetail(w http.ResponseWriter, r *http.Request
 // ==================== 创建用户 ====================
 
 // CreateAdminUser POST /api/v1/admin/users
-// 新建用户，写入审计日志
+// v122 方案B: senior_operator 创建成功后自动调 AddSchoolMember 写入 school_members
+// 修复: 学校管理员新建老师后在列表看不见的 bug
 func (h *AdminHandler) CreateAdminUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
@@ -175,27 +220,66 @@ func (h *AdminHandler) CreateAdminUser(w http.ResponseWriter, r *http.Request) {
 		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		return
+	}
+
+	// v122: senior_operator 角色白名单校验
+	if claims.Role == models.RoleSeniorOperator {
+		if req.Role == models.RoleAdmin {
+			utils.Forbidden(w, "学校管理员不能创建系统管理员账号")
+			return
+		}
+		if req.Role == models.RoleSeniorOperator {
+			utils.Forbidden(w, "学校管理员不能创建其他学校管理员账号")
+			return
+		}
+	}
+
+	// v122 方案B: senior_operator 创建前,先反查其管理的学校(供创建成功后自动入校用)
+	// admin 创建用户不自动入校(admin 可能为任意学校创建,意图不明确,交给后续手动或教研组绑定)
+	var targetSchoolID string
+	if claims.Role == models.RoleSeniorOperator {
+		school, err := repository.GetSchoolByAdminUserID(r.Context(), claims.UserID)
+		if err != nil || school == nil || school.ID == "" {
+			utils.Forbidden(w, "您尚未绑定学校,无法创建本校用户")
+			return
+		}
+		targetSchoolID = school.ID
+	}
+
+	// 调 service 创建用户
 	userInfo, err := h.userService.CreateUser(r.Context(), &req)
 	if err != nil {
 		handleAdminUserError(w, err)
 		return
 	}
-	// 写入审计日志
-	if claims, ok := middleware.GetClaims(r.Context()); ok {
-		repository.WriteAuditLog(claims.UserID, "admin.user_create",
-			map[string]interface{}{
-				"target_user": userInfo.ID,
-				"username":    userInfo.Username,
-				"role":        userInfo.Role,
-			}, repository.GetClientIP(r.RemoteAddr))
+
+	// v122 方案B: 如果是 senior_operator 创建,自动写入 school_members
+	// 失败时不阻断响应(用户已创建成功),但写 warning 日志
+	if targetSchoolID != "" {
+		if addErr := repository.AddSchoolMember(r.Context(), targetSchoolID, userInfo.ID, "admin_create"); addErr != nil {
+			// 降级处理:不阻断,避免用户已建但响应失败造成二次创建
+			fmt.Printf("[WARN] admin_handler.CreateAdminUser: 写入 school_members 失败 user_id=%s school_id=%s err=%v\n",
+				userInfo.ID, targetSchoolID, addErr)
+		}
 	}
+
+	repository.WriteAuditLog(claims.UserID, "admin.user_create",
+		map[string]interface{}{
+			"target_user": userInfo.ID,
+			"username":    userInfo.Username,
+			"role":        userInfo.Role,
+			"school_id":   targetSchoolID, // v122 方案B: 记录入校学校
+		}, repository.GetClientIP(r.RemoteAddr))
 	utils.Success(w, userInfo)
 }
 
 // ==================== 编辑用户 ====================
 
-// UpdateAdminUser PUT /api/v1/admin/users/{id}
-// 编辑用户角色和显示名
 func (h *AdminHandler) UpdateAdminUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
@@ -211,11 +295,25 @@ func (h *AdminHandler) UpdateAdminUser(w http.ResponseWriter, r *http.Request) {
 		utils.Unauthorized(w, utils.MsgUnauthorized)
 		return
 	}
+
+	if err := ensureUserInScope(r.Context(), userID); err != nil {
+		utils.Forbidden(w, err.Error())
+		return
+	}
+
 	var req models.UpdateUserRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
+
+	if claims.Role == models.RoleSeniorOperator {
+		if req.Role == models.RoleAdmin || req.Role == models.RoleSeniorOperator {
+			utils.Forbidden(w, "学校管理员不能授予 admin 或 senior_operator 角色")
+			return
+		}
+	}
+
 	userInfo, err := h.userService.UpdateUser(r.Context(), userID, claims.UserID, &req)
 	if err != nil {
 		handleAdminUserError(w, err)
@@ -226,8 +324,6 @@ func (h *AdminHandler) UpdateAdminUser(w http.ResponseWriter, r *http.Request) {
 
 // ==================== 启用/禁用 ====================
 
-// UpdateAdminUserStatus PUT /api/v1/admin/users/{id}/status
-// 启用或禁用用户账户，写入审计日志
 func (h *AdminHandler) UpdateAdminUserStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
@@ -243,6 +339,12 @@ func (h *AdminHandler) UpdateAdminUserStatus(w http.ResponseWriter, r *http.Requ
 		utils.Unauthorized(w, utils.MsgUnauthorized)
 		return
 	}
+
+	if err := ensureUserInScope(r.Context(), userID); err != nil {
+		utils.Forbidden(w, err.Error())
+		return
+	}
+
 	var req models.UpdateStatusRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestBody)
@@ -260,8 +362,6 @@ func (h *AdminHandler) UpdateAdminUserStatus(w http.ResponseWriter, r *http.Requ
 
 // ==================== 重置密码 ====================
 
-// ResetAdminUserPassword PUT /api/v1/admin/users/{id}/password
-// admin直接重置用户密码（无需旧密码），写入审计日志
 func (h *AdminHandler) ResetAdminUserPassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
@@ -272,6 +372,12 @@ func (h *AdminHandler) ResetAdminUserPassword(w http.ResponseWriter, r *http.Req
 		utils.BadRequest(w, utils.MsgMissingUserID)
 		return
 	}
+
+	if err := ensureUserInScope(r.Context(), userID); err != nil {
+		utils.Forbidden(w, err.Error())
+		return
+	}
+
 	var req models.ResetPasswordRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestBody)
@@ -291,8 +397,6 @@ func (h *AdminHandler) ResetAdminUserPassword(w http.ResponseWriter, r *http.Req
 
 // ==================== 课程分配 ====================
 
-// GetAdminUserAssignments GET /api/v1/admin/users/{id}/assignments
-// 获取用户的课程审核权限分配列表
 func (h *AdminHandler) GetAdminUserAssignments(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
@@ -314,8 +418,6 @@ func (h *AdminHandler) GetAdminUserAssignments(w http.ResponseWriter, r *http.Re
 	utils.Success(w, assignments)
 }
 
-// UpdateAdminUserAssignments PUT /api/v1/admin/users/{id}/assignments
-// 更新用户的课程审核权限分配（全量替换）
 func (h *AdminHandler) UpdateAdminUserAssignments(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
@@ -344,9 +446,44 @@ func (h *AdminHandler) UpdateAdminUserAssignments(w http.ResponseWriter, r *http
 	utils.Success(w, result)
 }
 
+// ==================== v122 新增:范围校验辅助 ====================
+
+// ensureUserInScope 校验目标用户是否在登录者的数据范围内
+// v122 方案B: senior 校验从 IsUserInSchoolByGroup 换为 IsUserInSchool
+//   (school_members 主判 + teaching_group_members 兜底)
+// - admin: 总是允许
+// - senior_operator: 目标用户必须属于其管理的学校(通过 school_members 或 教研组)
+func ensureUserInScope(ctx context.Context, targetUserID string) error {
+	claims, ok := middleware.GetClaims(ctx)
+	if !ok {
+		return fmt.Errorf("未登录")
+	}
+
+	if claims.Role == models.RoleAdmin {
+		return nil
+	}
+
+	if claims.Role == models.RoleSeniorOperator {
+		school, err := repository.GetSchoolByAdminUserID(ctx, claims.UserID)
+		if err != nil || school == nil || school.ID == "" {
+			return fmt.Errorf("您尚未绑定学校,请联系系统管理员")
+		}
+		// v122 方案B: 使用 IsUserInSchool(school_members ∪ teaching_group_members)
+		inSchool, err := repository.IsUserInSchool(ctx, targetUserID, school.ID)
+		if err != nil {
+			return fmt.Errorf("校验用户所属学校失败")
+		}
+		if !inSchool {
+			return fmt.Errorf("该用户不属于您管理的学校")
+		}
+		return nil
+	}
+
+	return fmt.Errorf("权限不足")
+}
+
 // ==================== 错误处理 ====================
 
-// handleAdminUserError 将服务层用户操作错误映射到HTTP状态码
 func handleAdminUserError(w http.ResponseWriter, err error) {
 	switch err {
 	case services.ErrUsernameRequired,
@@ -367,8 +504,6 @@ func handleAdminUserError(w http.ResponseWriter, err error) {
 
 // ==================== 路径提取工具函数 ====================
 
-// extractAdminPathID 提取路径末尾ID
-// 例：/api/v1/admin/users/abc-123 → "abc-123"
 func extractAdminPathID(path, prefix string) string {
 	if !strings.HasPrefix(path, prefix) {
 		return ""
@@ -381,8 +516,6 @@ func extractAdminPathID(path, prefix string) string {
 	return id
 }
 
-// extractAdminMiddleID 提取路径中间ID
-// 例：/api/v1/admin/users/abc-123/status → "abc-123"（prefix="/api/v1/admin/users/", suffix="/status"）
 func extractAdminMiddleID(path, prefix, suffix string) string {
 	if !strings.HasPrefix(path, prefix) {
 		return ""
@@ -398,8 +531,6 @@ func extractAdminMiddleID(path, prefix, suffix string) string {
 	return ""
 }
 
-// extractAdminGroupMemberPath 从教研组成员路径提取 groupID 和 userID
-// 例：/api/v1/admin/groups/gid123/members/uid456 → "gid123", "uid456"
 func extractAdminGroupMemberPath(path string) (string, string) {
 	prefix := "/api/v1/admin/groups/"
 	if !strings.HasPrefix(path, prefix) {
@@ -418,8 +549,6 @@ func extractAdminGroupMemberPath(path string) (string, string) {
 	return gid, uid
 }
 
-// extractUserGroupPath 从用户↔教研组路径提取 userID 和 groupID
-// 例：/api/v1/admin/users/uid123/groups/gid456 → "uid123", "gid456"
 func extractUserGroupPath(path string) (string, string) {
 	if !strings.HasPrefix(path, adminUsersPrefix) {
 		return "", ""
@@ -439,7 +568,6 @@ func extractUserGroupPath(path string) (string, string) {
 
 // ==================== 格式化辅助 ====================
 
-// formatRoleName 角色中文名映射
 func formatRoleName(role string) string {
 	names := map[string]string{
 		"admin":           "系统管理员",
@@ -453,12 +581,10 @@ func formatRoleName(role string) string {
 	return role
 }
 
-// isSchoolAdmin 判断当前用户是否是某学校的管理员（保留占位）
 func isSchoolAdmin(_ interface{ Value(key interface{}) interface{} }, _ string) (string, bool) {
 	return "", false
 }
 
-// 抑制编译器未使用警告
 var _ = fmt.Sprintf
 var _ = isSchoolAdmin
 var _ = formatRoleName

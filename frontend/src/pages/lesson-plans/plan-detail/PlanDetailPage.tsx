@@ -30,6 +30,8 @@ import {
   type TeachingGroup,
 } from '@/api/lesson-plans'
 import { getAnnotations, type Annotation } from '@/api/annotations'
+import { createCourseware } from '@/api/coursewares'
+import { getInteractions, toggleInteraction, type InteractionCounts } from '@/api/lesson-plan-interactions'
 
 // ---- 子组件 ----
 import { C, TABS, type TabKey } from './components/planDetailConstants'
@@ -268,6 +270,11 @@ export default function PlanDetailPage() {
   const [annotations, setAnnotations]           = useState<Annotation[]>([])
   const [annotationsLoading, setAnnotationsLoading] = useState(false)
 
+  // v125新增：教案互动数据（点赞/收藏）
+  const [interactions, setInteractions] = useState<InteractionCounts>({
+    like_count: 0, favorite_count: 0, is_liked: false, is_favorited: false,
+  })
+
   // ---- 教研组选择弹窗状态 ----
   const [submitModal, setSubmitModal] = useState<{
     groups: TeachingGroup[]
@@ -303,11 +310,43 @@ export default function PlanDetailPage() {
     }
   }, [])
 
+  // v125新增：加载互动数据
+  const loadInteractions = useCallback(async (planId: string) => {
+    try {
+      const data = await getInteractions(planId)
+      setInteractions(data)
+    } catch {
+      // 互动数据加载失败不影响主流程
+    }
+  }, [])
+
   useEffect(() => {
     if (plan?.id) {
       loadAnnotations(plan.id)
+      loadInteractions(plan.id)
     }
-  }, [plan?.id, loadAnnotations])
+  }, [plan?.id, loadAnnotations, loadInteractions])
+
+  // v125新增：切换点赞/收藏
+  const handleToggleInteraction = useCallback(async (type: 'like' | 'favorite') => {
+    if (!plan) return
+    try {
+      const resp = await toggleInteraction(plan.id, type)
+      setInteractions(prev => ({
+        ...prev,
+        ...(type === 'like'
+          ? { like_count: resp.new_count, is_liked: resp.active }
+          : { favorite_count: resp.new_count, is_favorited: resp.active }
+        ),
+      }))
+      showToast(resp.active
+        ? (type === 'like' ? '已点赞 👍' : '已收藏 📌')
+        : (type === 'like' ? '已取消点赞' : '已取消收藏')
+      )
+    } catch {
+      showToast('操作失败，请重试', 'error')
+    }
+  }, [plan])
 
   // ---- 批注变化回调（ContentTab调用，更新页面层批注状态） ----
   // ContentTab 通过此回调通知页面层，RevisionBanner会自动响应
@@ -371,6 +410,18 @@ export default function PlanDetailPage() {
           await publishLessonPlanPersonal(plan.id)
           showToast('教案已个人发布 ✓')
           break
+
+        case 'courseware': {
+          // Phase 3: 创建课件并跳转到课件工坊
+          try {
+            const cw = await createCourseware({ lesson_plan_id: plan.id })
+            showToast('课件创建成功，正在跳转... ✓')
+            setTimeout(() => navigate('/courseware/' + (cw as { id: string }).id), 500)
+          } catch {
+            showToast('创建课件失败，请稍后重试', 'error')
+          }
+          return
+        }
 
         case 'develop': {
           const result = await startDevelopment(plan.id) as StartDevelopmentResult
@@ -474,7 +525,7 @@ export default function PlanDetailPage() {
         </div>
 
         {/* 操作按钮组 */}
-        <ActionBar plan={plan} isOwner={isOwner} actionLoading={actionLoading} onAction={handleAction} />
+        <ActionBar plan={plan} isOwner={isOwner} actionLoading={actionLoading} onAction={handleAction} interactions={interactions} onToggleInteraction={handleToggleInteraction} />
       </div>
 
       {/* ---- revision状态：批注待处理提示条（v104：使用共享批注数据，数字实时响应） ---- */}

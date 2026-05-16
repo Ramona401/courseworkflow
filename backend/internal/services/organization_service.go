@@ -2,15 +2,21 @@ package services
 
 // organization_service.go — 组织与教研组管理业务逻辑层
 //
-// v109改动：
-//   - 支持多组长：组长通过 teaching_group_members.role='lead' 管理
+// v122 方案B 改动:
+//   - AddGroupMember: 成功后顺便 upsert school_members(保险机制)
+//     语义: 加入本校教研组 = 本校成员
+//     作用: 未来通过教研组加入的新老师也会自动在 school_members 中留痕
+//
+// v109 原改动:
+//   - 支持多组长: 组长通过 teaching_group_members.role='lead' 管理
 //   - CreateTeachingGroup / UpdateTeachingGroup 移除单一 LeadUserID 参数
 //   - 角色校验新增 'lead' 选项
-//   - GetTeachingGroupDetail 返回 lead_user_names（所有组长名称）
+//   - GetTeachingGroupDetail 返回 lead_user_names(所有组长名称)
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"tedna/internal/logger"
@@ -40,7 +46,6 @@ var (
 	ErrNoReviewPermission   = errors.New("无评审权限，需要是教研组长或骨干教师")
 )
 
-// OrganizationService 组织与教研组管理服务
 type OrganizationService struct{}
 
 var orgLog = logger.WithModule("organization")
@@ -175,8 +180,6 @@ func (s *OrganizationService) DeleteOrganization(ctx context.Context, id string)
 
 // ==================== 教研组 CRUD ====================
 
-// CreateTeachingGroup 创建教研组
-// v109改动：移除单一 LeadUserID 参数，组长通过成员管理设置
 func (s *OrganizationService) CreateTeachingGroup(ctx context.Context, req *models.CreateTeachingGroupRequest) (*models.TeachingGroup, error) {
 	req.Name = strings.TrimSpace(req.Name)
 	req.Subject = strings.TrimSpace(req.Subject)
@@ -233,8 +236,6 @@ func (s *OrganizationService) ListTeachingGroups(ctx context.Context, schoolID s
 	return &models.TeachingGroupListResponse{Groups: items, Total: len(items)}, nil
 }
 
-// GetTeachingGroupDetail 获取教研组详情（含成员列表）
-// v109改动：LeadUserNames 从成员角色表聚合
 func (s *OrganizationService) GetTeachingGroupDetail(ctx context.Context, id string) (*models.TeachingGroupDetailResponse, error) {
 	tg, err := repository.GetTeachingGroupByID(ctx, id)
 	if err != nil {
@@ -255,7 +256,6 @@ func (s *OrganizationService) GetTeachingGroupDetail(ctx context.Context, id str
 		schoolName = school.Name
 	}
 
-	// 兼容保留：第一个组长名称
 	leadUserName := ""
 	if tg.LeadUserID != nil {
 		leadUser, err := repository.FindUserByID(ctx, *tg.LeadUserID)
@@ -264,7 +264,6 @@ func (s *OrganizationService) GetTeachingGroupDetail(ctx context.Context, id str
 		}
 	}
 
-	// v109新增：所有组长名称（逗号分隔）
 	leadUserNames, _ := repository.GetGroupLeadNames(ctx, id)
 
 	return &models.TeachingGroupDetailResponse{
@@ -286,8 +285,6 @@ func (s *OrganizationService) GetTeachingGroupDetail(ctx context.Context, id str
 	}, nil
 }
 
-// UpdateTeachingGroup 更新教研组
-// v109改动：移除单一 LeadUserID 参数
 func (s *OrganizationService) UpdateTeachingGroup(ctx context.Context, id string, req *models.UpdateTeachingGroupRequest) error {
 	req.Name = strings.TrimSpace(req.Name)
 	req.Subject = strings.TrimSpace(req.Subject)
@@ -337,13 +334,16 @@ func (s *OrganizationService) DeleteTeachingGroup(ctx context.Context, id string
 // ==================== 教研组成员管理 ====================
 
 // AddGroupMember 添加教研组成员
-// v109改动：角色校验允许 'lead'
+// v122 方案B 改动: 成功后顺便 upsert school_members(保险机制)
+//   语义: 加入本校教研组 = 本校成员
+// v109 原改动: 角色校验允许 'lead'
 func (s *OrganizationService) AddGroupMember(ctx context.Context, groupID string, req *models.AddGroupMemberRequest) error {
 	if req.UserID == "" {
 		return ErrMemberUserRequired
 	}
 
-	_, err := repository.GetTeachingGroupByID(ctx, groupID)
+	// 先取教研组详情,用于后续写 school_members
+	tg, err := repository.GetTeachingGroupByID(ctx, groupID)
 	if err != nil {
 		return ErrGroupNotFound
 	}
@@ -373,7 +373,15 @@ func (s *OrganizationService) AddGroupMember(ctx context.Context, groupID string
 		orgLog.Error("添加教研组成员失败", "group_id", groupID, "user_id", req.UserID, "error", err)
 		return err
 	}
-	orgLog.Info("添加教研组成员成功", "group_id", groupID, "user_id", req.UserID, "role", role)
+
+	// v122 方案B: 顺便写入 school_members(加入本校教研组 = 本校成员)
+	// 失败时不回滚,只记 warning 日志(教研组成员已添加,可由后续 UNION 兜底查询继续工作)
+	if addErr := repository.AddSchoolMember(ctx, tg.SchoolID, req.UserID, "group_member"); addErr != nil {
+		fmt.Printf("[WARN] organization_service.AddGroupMember: 写入 school_members 失败 user_id=%s school_id=%s err=%v\n",
+			req.UserID, tg.SchoolID, addErr)
+	}
+
+	orgLog.Info("添加教研组成员成功", "group_id", groupID, "user_id", req.UserID, "role", role, "school_id", tg.SchoolID)
 	return nil
 }
 
@@ -385,12 +393,13 @@ func (s *OrganizationService) RemoveGroupMember(ctx context.Context, groupID str
 		orgLog.Error("移除教研组成员失败", "group_id", groupID, "user_id", userID, "error", err)
 		return err
 	}
+	// 注意: 不主动从 school_members 移除
+	//   语义: 老师可能属于本校但不在某个具体教研组,school_members 应保留
+	//   如需移除本校身份,通过专门的"移除本校成员"接口(未来可能需要)
 	orgLog.Info("移除教研组成员成功", "group_id", groupID, "user_id", userID)
 	return nil
 }
 
-// UpdateGroupMemberRole 更新成员角色
-// v109改动：允许设置为 'lead'
 func (s *OrganizationService) UpdateGroupMemberRole(ctx context.Context, groupID string, userID string, role string) error {
 	if !models.IsValidGroupMemberRole(role) {
 		return errors.New("无效的成员角色，可选值：member/backbone/lead")

@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"time"
 
+	"tedna/internal/ai"
 	"tedna/internal/config"
 	"tedna/internal/database"
 	"tedna/internal/handlers"
 	"tedna/internal/middleware"
+	"tedna/internal/models"
 	"tedna/internal/repository"
 	"tedna/internal/services"
 )
@@ -18,6 +20,7 @@ import (
 const roleAdmin = "admin"
 const roleSeniorOperator = "senior_operator"
 const roleOperator = "operator"
+const roleDistrictInspector = "district_inspector"
 
 func hasRole(role string, allowed ...string) bool {
 	for _, r := range allowed {
@@ -61,6 +64,7 @@ func Setup(cfg *config.Config) http.Handler {
 	wsStageService := services.NewWorkshopStageService()
 	assessService := services.NewAssessmentService(recipeService, cfg)
 	tbService := services.NewTextbookService(cfg)
+        assetService := services.NewLessonPlanAssetService()
 	ciService := services.NewComponentIndexService(cfg)
 	liService := services.NewLessonIndexService(cfg)
 
@@ -105,10 +109,86 @@ func Setup(cfg *config.Config) http.Handler {
 	wsStageHandler := handlers.NewWorkshopStageHandler(wsStageService)
 	assessHandler := handlers.NewAssessmentHandler(assessService)
 	tbHandler := handlers.NewTextbookHandler(tbService)
+        assetHandler := handlers.NewLessonPlanAssetHandler(assetService)
+        // v125新增：教案互动服务（点赞/收藏）
+        interactionService := services.NewLessonPlanInteractionService()
+
+	// v127新增：多级审核 + 抽查服务
+	reviewV2Service := services.NewReviewV2Service(compService)
+
+	// v128新增：Token积分系统
+	// v129改造：启用积分检查 + 注入精确积分计算钩子
+	tokenService := services.NewTokenService()
+	creditPolicyService := services.NewCreditPolicyService()
+	tokenGuard := services.NewTokenGuard(true) // v129: 启用积分前置检查
+
+	// v129新增：注入AI调用积分回调钩子（对齐AOCI的ai_proxy.go积分扣减链路）
+	// 所有 CallAI/CallAIStream/CallAIMultimodal 成功后自动触发积分计算和扣减
+	ai.SetCreditHook(
+		// 消费回调：AI调用成功后计算积分并扣减
+		func(traceCtx *ai.TraceContext, modelUsed string, inputTokens int, outputTokens int, totalTokens int, latencyMs int64) {
+			if traceCtx == nil || traceCtx.UserID == nil || *traceCtx.UserID == "" {
+				return
+			}
+			ctx := context.Background()
+			// 计算积分（对齐AOCI: CalculateCreditsFromCost/CalculateCreditsForCall）
+			calc := creditPolicyService.CalculateCredits(ctx, modelUsed, inputTokens, outputTokens, totalTokens, traceCtx.SchoolID, latencyMs)
+			if calc == nil || calc.CreditsConsumed <= 0 {
+				return
+			}
+			// 扣减积分
+			req := &models.TokenConsumeRequest{
+				UserID:       *traceCtx.UserID,
+				SceneCode:    traceCtx.SceneCode,
+				TokensUsed:   totalTokens,
+				ModelUsed:    modelUsed,
+				LessonPlanID: traceCtx.LessonPlanID,
+				PipelineID:   traceCtx.PipelineID,
+				Calculation:  calc,
+			}
+			_ = tokenService.ConsumeTokens(ctx, req)
+		},
+		// 前置检查回调：AI调用前检查余额
+		func(traceCtx *ai.TraceContext) (bool, string) {
+			if traceCtx == nil || traceCtx.UserID == nil || *traceCtx.UserID == "" {
+				return true, "" // 无用户信息时放行
+			}
+			ctx := context.Background()
+			result := tokenGuard.CheckBalance(ctx, *traceCtx.UserID)
+			if result.HasBalance {
+				return true, ""
+			}
+			return false, result.Message
+		},
+	)
+	inspectionService := services.NewInspectionService()
+        interactionHandler := handlers.NewLessonPlanInteractionHandler(interactionService)
 	aiTraceHandler := handlers.NewAITraceHandler()
+
+	// v127新增：多级审核 + 抽查处理器
+	reviewV2Handler := handlers.NewReviewV2Handler(reviewV2Service)
+	inspectionHandler := handlers.NewInspectionHandler(inspectionService)
+
+	// v128新增：Token处理器
+	tokenHandler := handlers.NewTokenHandler(tokenService)
+	// v129新增：积分策略处理器
+	creditPolicyHandler := handlers.NewCreditPolicyHandler(creditPolicyService)
 
 	// v110:学校管理员处理器
 	schoolAdminHandler := handlers.NewSchoolAdminHandler(userService, orgService)
+
+	// v130(课件工坊 Phase 1)新增:课件工坊服务+处理器
+	cwService := services.NewCoursewareService()
+	cwHandler := handlers.NewCoursewareHandler(cwService)
+	cwCompHandler := handlers.NewCWComponentHandler()
+
+	// v130(课件工坊 Phase 2)新增:种子数据+模板管理处理器
+	cwSeedService := services.NewCoursewareSeedService()
+	cwSeedHandler := handlers.NewCWSeedHandler(cwSeedService)
+
+	// v131(课件工坊 Phase 3)新增:课件索引AI生成服务+处理器
+	cwIndexService := services.NewCoursewareIndexService(cfg)
+	cwIndexHandler := handlers.NewCoursewareIndexHandler(cwIndexService, cwService, authService)
 
 	// v110(TE-DNA 3.0 P0)新增:AI 助手处理器
 	aiAssistantHandler := handlers.NewAIAssistantHandler(aiAssistantService)
@@ -123,9 +203,17 @@ func Setup(cfg *config.Config) http.Handler {
 	authMW := middleware.AuthMiddleware(authService)
 	adminOnly := middleware.RequireRole(roleAdmin)
 	seniorOperatorOnly := middleware.RequireRole(roleSeniorOperator)
+	// v122(AdminPage 权限统一):admin 和 senior_operator 都能进入用户管理中心
+	// admin 看全系统,senior_operator 在 handler 层强制过滤为本校数据
+	adminOrSchoolAdmin := middleware.RequireRole(roleAdmin, roleSeniorOperator)
+	// v127新增：admin + district_inspector 可访问抽查功能
+	adminOrInspector := middleware.RequireRole(roleAdmin, roleDistrictInspector)
 
 	mux.HandleFunc("/api/v1/health", makeHealthHandler(engine))
 	pipelineService.StartNightlyVerifyScheduler()
+	tokenService.StartMonthlyQuotaScheduler()
+	tokenService.StartAlertCheckScheduler()
+	courseService.StartNightlyIndexSyncScheduler()
 
 	mux.Handle("/api/v1/engine/stats", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -170,9 +258,17 @@ func Setup(cfg *config.Config) http.Handler {
 
 	mux.Handle("/api/v1/dashboard/stats", middleware.Chain(http.HandlerFunc(pipelineHandler.GetDashboardStats), authMW))
 
-	registerAdminRoutes(mux, authMW, adminOnly, adminHandler, roleHandler, userHandler, aiConfigHandler, promptHandler, edHandler, courseHandler, wsStageHandler, aiTraceHandler)
+	registerAdminRoutes(mux, authMW, adminOnly, adminOrSchoolAdmin, adminHandler, roleHandler, userHandler, aiConfigHandler, promptHandler, edHandler, courseHandler, wsStageHandler, aiTraceHandler)
 	registerPipelineRoutes(mux, authMW, pipelineHandler, sseHandler)
-	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler, annotationHandler, reviewAIHandler)
+	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler, annotationHandler, reviewAIHandler, assetHandler, interactionHandler)
+
+	// v127新增：注册多级审核 + 抽查路由
+	registerReviewV2Routes(mux, authMW, adminOnly, adminOrInspector, adminOrSchoolAdmin, reviewV2Handler, inspectionHandler)
+
+	// v128新增：注册Token积分系统路由
+	registerTokenRoutes(mux, authMW, adminOnly, adminOrSchoolAdmin, tokenHandler)
+	// v129新增：注册积分策略路由
+	registerCreditPolicyRoutes(mux, authMW, adminOnly, creditPolicyHandler)
 
 	// v110:注册学校管理员路由
 	registerSchoolAdminRoutes(mux, authMW, seniorOperatorOnly, schoolAdminHandler)
@@ -186,6 +282,9 @@ func Setup(cfg *config.Config) http.Handler {
 	// - GET    /api/v1/assistant-feedback                列表(admin only)
 	// - GET    /api/v1/assistants/{id}/feedback-stats    某助手的反馈统计
 	registerAssistantFeedbackRoutes(mux, authMW, adminOnly, assistantFeedbackHandler)
+
+	// v130(课件工坊 Phase 1)新增:注册课件工坊路由
+	registerCoursewareRoutes(mux, authMW, adminOnly, cwHandler, cwCompHandler, cwSeedHandler, cwIndexHandler)
 
 	mux.Handle("/api/v1/admin/component-index/batch-compress", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

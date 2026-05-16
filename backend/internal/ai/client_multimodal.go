@@ -80,6 +80,11 @@ func CallAIMultimodal(cfg *EffectiveConfig, systemPrompt string, userText string
 	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
 	startTime := time.Now()
 
+	// v129新增：积分前置检查（对齐AOCI的checkCreditsGate）
+	if allowed, errMsg := invokeCreditCheck(traceCtx); !allowed {
+		return nil, fmt.Errorf(errMsg)
+	}
+
 	// -------- 构建模型尝试列表：主模型 + fallback模型 --------
 	type modelAttempt struct {
 		model      string
@@ -133,9 +138,12 @@ func CallAIMultimodal(cfg *EffectiveConfig, systemPrompt string, userText string
 				if modelEntry.isFallback {
 					log.Printf("[AI Fallback] 多模态降级模型 %s 调用成功（原始: %s）", modelEntry.model, primaryModel)
 				}
+				mmLatMs := time.Since(startTime).Milliseconds()
 				emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
-					time.Since(startTime).Milliseconds(), "success", "", len(result.Content), false,
+					mmLatMs, "success", "", len(result.Content), false,
 					modelEntry.isFallback, primaryModel)
+				// v129新增：多模态成功后积分消费
+				invokeCreditConsume(traceCtx, result.ModelUsed, 0, 0, result.TokensUsed, mmLatMs)
 				return result, nil
 			}
 			lastErr = err

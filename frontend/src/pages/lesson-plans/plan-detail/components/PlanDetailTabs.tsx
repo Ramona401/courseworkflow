@@ -5,6 +5,12 @@
  *   P2-8：批注汇总提示条新增「展开全部批注」/「收起全部」快捷按钮
  *   P2-10：新增「批量AI修改」入口，弹出 BatchAIFixPanel 逐条处理
  *   P3-11：AIFixPanel / ManualEditBox / AnnotationBubble 拆分为独立文件
+ *
+ * v121改动（AI辅助修改 Bug 修复 · 方案C）：
+ *   把"待处理"的判定从 status==='pending' 放宽到 status!=='resolved',
+ *   让 archived 状态的批注也被算作待处理,显示批量修改按钮并计入批量任务。
+ *   这样教研员退回后,上一轮 archived 批注能正确进入"本轮待处理"统计。
+ *   涉及字段:pendingTotal(头部计数)、batchItems(批量任务项)、段落 💬 小红点。
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useState, useEffect, useRef } from 'react'
@@ -20,6 +26,13 @@ import { BatchAIFixPanel } from './BatchAIFixPanel'
 
 type PipelineDetail = Awaited<ReturnType<typeof getPipelineDetail>>
 
+// v121:统一的"待处理"判定 — pending 和 archived 都算待处理
+// (archived 是教研员退回场景下上一轮未彻底解决的批注,作者应该继续处理)
+// 只有 resolved 才是真的"已处理完",不计入待处理
+function isActionable(a: Annotation): boolean {
+  return a.status !== 'resolved'
+}
+
 function splitIntoParagraphs(md: string): string[] {
   if (!md) return []
   return md.split(/\n\s*\n/).map(p => p.trim()).filter(p => p.length > 0)
@@ -33,14 +46,18 @@ function joinParagraphs(paragraphs: string[]): string {
 
 function ParagraphWithAnnotation({
   paragraph, index, annotations, currentRound, isOwner,
-  planContext, forceExpand, onResolve, onParagraphChange,
+  canEdit, planContext, planID, forceExpand, onResolve, onParagraphChange,
 }: {
   paragraph: string
   index: number
   annotations: Annotation[]
   currentRound: number
   isOwner: boolean
+  /** v125新增：是否可编辑（排除 submitted/developing/completed） */
+  canEdit: boolean
   planContext: string
+  /** v123: 教案 ID(传给 ManualEditBox 用于图片上传) */
+  planID: string
   forceExpand: boolean
   onResolve: (id: string, status: 'pending' | 'resolved') => void
   onParagraphChange: (index: number, newContent: string, annotationId?: string) => void
@@ -55,7 +72,8 @@ function ParagraphWithAnnotation({
   const myAnnotations           = annotations.filter(a => a.paragraph_index === index)
   const currentRoundAnnotations = myAnnotations.filter(a => a.review_round === currentRound)
   const historicalAnnotations   = myAnnotations.filter(a => a.review_round < currentRound)
-  const pendingCount            = currentRoundAnnotations.filter(a => a.status === 'pending').length
+  // v121:待处理计数包含 pending + archived(见顶部 isActionable)
+  const pendingCount            = currentRoundAnnotations.filter(isActionable).length
   const hasAnnotations          = myAnnotations.length > 0
   const hasCurrentAnnotations   = currentRoundAnnotations.length > 0
 
@@ -86,7 +104,7 @@ function ParagraphWithAnnotation({
               )}
             </button>
           )}
-          {isOwner && (
+          {canEdit && (
             <button
               onClick={() => setActivePanel(activePanel === 'manual' ? null : 'manual')}
               style={{ padding: '4px 8px', borderRadius: '20px', border: 'none', background: activePanel === 'manual' ? '#D1FAE5' : '#F3F4F6', color: '#374151', fontSize: '12px', cursor: 'pointer', whiteSpace: 'nowrap', boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }}
@@ -138,6 +156,7 @@ function ParagraphWithAnnotation({
       {activePanel === 'manual' && (
         <ManualEditBox
           initialContent={paragraph}
+          planID={planID}
           onSave={(newContent) => { onParagraphChange(index, newContent); setActivePanel(null) }}
           onClose={() => setActivePanel(null)}
         />
@@ -161,6 +180,11 @@ export function ContentTab({ plan, isOwner, annotations, annotationsLoading, onA
   const [saveToast, setSaveToast]           = useState<string | null>(null)
   const [allExpanded, setAllExpanded]       = useState(false)
   const [showBatchPanel, setShowBatchPanel] = useState(false)
+
+  // v124: 图片上传引导条 — localStorage 记忆关闭状态
+  const [imageTipDismissed, setImageTipDismissed] = useState(() => {
+    try { return localStorage.getItem('plan_detail_image_tip_dismissed') === '1' } catch { return false }
+  })
   const isSavingRef  = useRef(false)
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -171,6 +195,10 @@ export function ContentTab({ plan, isOwner, annotations, annotationsLoading, onA
   }, [plan.content_markdown, hasContent])
 
   const currentRound = annotations.reduce((max, a) => Math.max(max, a.review_round ?? 1), 1)
+
+  // v125新增：不可编辑的状态（评审中锁定 / 课件关联锁定）
+  const nonEditableStatuses = ['submitted', 'developing', 'completed']
+  const canEdit = !!(isOwner && !nonEditableStatuses.includes(plan.status))
 
   const planContext = [
     `学科：${plan.subject}  年级：${plan.grade}  课题：${plan.topic}  课时：${plan.duration_minutes}分钟`,
@@ -209,10 +237,12 @@ export function ContentTab({ plan, isOwner, annotations, annotationsLoading, onA
   const showSaveToast = (msg: string) => { setSaveToast(msg); setTimeout(() => setSaveToast(null), 3000) }
 
   const currentRoundAnnotations = annotations.filter(a => (a.review_round ?? 1) === currentRound)
-  const pendingTotal             = currentRoundAnnotations.filter(a => a.status === 'pending').length
+  // v121:待处理计数 = pending + archived(见顶部 isActionable)
+  const pendingTotal             = currentRoundAnnotations.filter(isActionable).length
 
+  // v121:批量任务项也用 isActionable 统一口径
   const batchItems = currentRoundAnnotations
-    .filter(a => a.status === 'pending')
+    .filter(isActionable)
     .map(a => ({ annotation: a, paragraphContent: paragraphs[a.paragraph_index] ?? '', paragraphIndex: a.paragraph_index }))
     .filter(item => item.paragraphContent.length > 0)
 
@@ -228,6 +258,21 @@ export function ContentTab({ plan, isOwner, annotations, annotationsLoading, onA
 
   return (
     <div style={{ padding: '28px', position: 'relative' }}>
+
+
+            {/* v124: 图片上传引导条 */}
+      {!imageTipDismissed && canEdit && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 16px', marginBottom: '16px', background: 'linear-gradient(135deg, rgba(16,185,129,0.06), rgba(79,123,232,0.04))', borderRadius: '10px', border: '1px solid rgba(16,185,129,0.18)', fontSize: '13px', color: '#374151' }}>
+          <span style={{ fontSize: '16px', flexShrink: 0 }}>✨</span>
+          <span style={{ flex: 1, lineHeight: 1.6 }}>
+            点击段落右侧 <span style={{ fontWeight: 600 }}>✏️</span> 可编辑内容，支持<span style={{ fontWeight: 600, color: '#059669' }}>拖拽、粘贴或点击 📷 上传图片</span>
+          </span>
+          <button
+            onClick={() => { setImageTipDismissed(true); try { localStorage.setItem('plan_detail_image_tip_dismissed', '1') } catch {} }}
+            style={{ padding: '4px 12px', borderRadius: '8px', border: '1px solid rgba(16,185,129,0.2)', background: 'transparent', fontSize: '12px', color: '#6B7280', cursor: 'pointer', flexShrink: 0, whiteSpace: 'nowrap' }}
+          >我知道了</button>
+        </div>
+      )}
 
       {!annotationsLoading && annotations.length > 0 && (
         <div style={{
@@ -273,7 +318,9 @@ export function ContentTab({ plan, isOwner, annotations, annotationsLoading, onA
           annotations={annotations}
           currentRound={currentRound}
           isOwner={isOwner ?? false}
+          canEdit={canEdit}
           planContext={planContext}
+          planID={plan.id}
           forceExpand={allExpanded}
           onResolve={handleResolve}
           onParagraphChange={handleParagraphChange}
@@ -289,6 +336,7 @@ export function ContentTab({ plan, isOwner, annotations, annotationsLoading, onA
           items={batchItems}
           planContext={planContext}
           onAdopt={(paragraphIndex, newContent, annotationId) => { handleParagraphChange(paragraphIndex, newContent, annotationId) }}
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
           onSkip={(_annotationId) => { /* 跳过，用户可手动处理 */ }}
           onClose={() => setShowBatchPanel(false)}
         />

@@ -1,6 +1,7 @@
 /**
- * 教案系统布局组件 — LPLayout v5.3
+ * 教案系统布局组件 — LPLayout v5.4
  *
+ * v5.4变更：修复 header JSX 结构损坏（去掉多余的 logo img）
  * v5.3变更：pageTitles 增加备课配方相关路径
  * v5.2变更：下拉菜单新增"用户管理"入口（admin专属）
  * v110新增：下拉菜单新增"学校管理"入口（senior_operator专属）
@@ -9,6 +10,7 @@ import { useState, useRef, useEffect } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import LPSidebar from './LPSidebar'
+import { getMyTokenAccount } from '@/api/tokens'
 
 const pageTitles: Record<string, string> = {
   '/lesson-plans':              '备课工坊',
@@ -17,6 +19,8 @@ const pageTitles: Record<string, string> = {
   '/lesson-plans/my-plans':     '我的教案',
   '/lesson-plans/library':      '教案库',
   '/lesson-plans/review':       '评审中心',
+  '/lesson-plans/review-v2':    '多级审核工作台',
+  '/lesson-plans/tokens':        '积分管理',
   '/lesson-plans/components':   '组件管理',
   '/lesson-plans/templates':    '提示词模板',
 }
@@ -56,6 +60,16 @@ function UserMenu() {
   const navigate = useNavigate()
   const [open, setOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  const [tokenBalance, setTokenBalance] = useState<number | null>(null)
+
+  // v128.1：加载个人积分余额
+  useEffect(() => {
+    getMyTokenAccount().then(data => {
+      if (data?.has_account && data?.available_balance != null) {
+        setTokenBalance(data.available_balance)
+      }
+    }).catch(() => {})
+  }, [])
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -77,7 +91,20 @@ function UserMenu() {
   }
 
   return (
-    <div ref={menuRef} style={{ position: 'relative' }}>
+    <div ref={menuRef} style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: '8px' }}>
+      {/* v128.1：积分余额徽章（v129.1修复：和按钮放在同一个flex行内） */}
+      {tokenBalance !== null && (
+        <div
+          onClick={() => navigate('/lesson-plans/tokens')}
+          style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '5px 12px', borderRadius: '16px', background: 'rgba(79,123,232,0.08)', cursor: 'pointer', transition: 'all 150ms ease' }}
+          onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(79,123,232,0.15)' }}
+          onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(79,123,232,0.08)' }}
+          title="点击查看积分详情"
+        >
+          <span style={{ fontSize: '14px' }}>🪙</span>
+          <span style={{ fontSize: '13px', fontWeight: 600, color: '#4F7BE8' }}>{tokenBalance < 10 && tokenBalance > 0 ? tokenBalance.toFixed(2) : tokenBalance.toLocaleString()}</span>
+        </div>
+      )}
       <button
         onClick={() => setOpen(p => !p)}
         style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '5px 10px 5px 5px', borderRadius: '20px', border: '1px solid #E5E7EB', background: open ? '#F3F4F6' : 'transparent', cursor: 'pointer', transition: 'all 150ms ease' }}
@@ -110,7 +137,10 @@ function UserMenu() {
             )}
             {/* senior_operator 专属：学校管理 */}
             {user?.role === 'senior_operator' && (
-              <LPMenuItem icon="🏫" label="学校管理" onClick={() => go('/school-admin', '/lesson-plans')} highlight />
+              <>
+                <LPMenuItem icon="👥" label="用户管理" onClick={() => go('/admin', '/lesson-plans')} highlight />
+                <LPMenuItem icon="🏫" label="学校管理" onClick={() => go('/school-admin', '/lesson-plans')} highlight />
+              </>
             )}
           </div>
 

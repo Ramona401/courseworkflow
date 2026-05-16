@@ -2,16 +2,20 @@ package handlers
 
 // school_admin_handler.go — 学校管理员专属处理器
 //
-// v110设计：
+// v122 方案B 改动(修复: 学校管理员新建老师看不见):
+//   - CreateSchoolUser: 创建成功后自动 AddSchoolMember,写入 school_members
+//   - 所有 IsUserInSchoolByGroup 换为 IsUserInSchool
+//     (school_members 主判 + teaching_group_members 兜底)
+//
+// v110 原设计:
 //   - senior_operator 作为学校管理员
 //   - 仅当 organizations.admin_user_id = 当前用户 时才可使用
-//   - 不依赖 users.school_id 字段，完全基于现有组织体系
-//   - 用户列表：通过 teaching_group_members → teaching_groups.school_id 查询本校用户
-//   - 教研组：直接按 teaching_groups.school_id 筛选
+//   - 不依赖 users.school_id 字段,完全基于现有组织体系
 
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -28,7 +32,6 @@ type SchoolAdminHandler struct {
 	orgService  *services.OrganizationService
 }
 
-// NewSchoolAdminHandler 构造函数
 func NewSchoolAdminHandler(userService *services.UserService, orgService *services.OrganizationService) *SchoolAdminHandler {
 	return &SchoolAdminHandler{
 		userService: userService,
@@ -37,7 +40,6 @@ func NewSchoolAdminHandler(userService *services.UserService, orgService *servic
 }
 
 // getCurrentSchoolAdminContext 获取当前学校管理员的用户ID和所管理的学校
-// 通过 organizations.admin_user_id 反查，不依赖 school_id 字段
 func getCurrentSchoolAdminContext(r *http.Request) (string, *models.Organization, error) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
@@ -55,8 +57,6 @@ func getCurrentSchoolAdminContext(r *http.Request) (string, *models.Organization
 
 // ==================== 学校信息 ====================
 
-// GetMySchool GET /api/v1/school-admin/my-school
-// 获取当前学校管理员管理的学校信息
 func (h *SchoolAdminHandler) GetMySchool(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
@@ -79,8 +79,7 @@ func (h *SchoolAdminHandler) GetMySchool(w http.ResponseWriter, r *http.Request)
 // ==================== 学校用户管理 ====================
 
 // ListSchoolUsers GET /api/v1/school-admin/users
-// 获取本校所有用户：通过 teaching_group_members → teaching_groups.school_id 查询
-// 不依赖 users.school_id，完全基于现有组织体系
+// v122 方案B: 通过 school_members (∪ teaching_group_members 兜底) 查本校用户
 func (h *SchoolAdminHandler) ListSchoolUsers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
@@ -92,10 +91,9 @@ func (h *SchoolAdminHandler) ListSchoolUsers(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// 通过教研组关联查询本校用户（复用已有的 ListAdminUsers 接口，传 school_id 参数）
 	result, err := repository.ListAdminUsers(r.Context(), repository.AdminUserListParams{
 		Page:     1,
-		PageSize: 500, // 学校用户量一般不大，一次性全部返回
+		PageSize: 500,
 		SchoolID: school.ID,
 	})
 	if err != nil {
@@ -107,13 +105,13 @@ func (h *SchoolAdminHandler) ListSchoolUsers(w http.ResponseWriter, r *http.Requ
 }
 
 // CreateSchoolUser POST /api/v1/school-admin/users
-// 学校管理员新建教师账号（只允许 operator/viewer 角色）
+// v122 方案B: 创建成功后自动写入 school_members
 func (h *SchoolAdminHandler) CreateSchoolUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
-	adminUserID, _, err := getCurrentSchoolAdminContext(r)
+	adminUserID, school, err := getCurrentSchoolAdminContext(r)
 	if err != nil {
 		utils.Forbidden(w, err.Error())
 		return
@@ -125,7 +123,6 @@ func (h *SchoolAdminHandler) CreateSchoolUser(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// 学校管理员只能创建低级别账号
 	if !models.IsSchoolAdminCreatableRole(req.Role) {
 		utils.BadRequest(w, "学校管理员仅可创建骨干教师(operator)或普通教师(viewer)账号")
 		return
@@ -137,12 +134,19 @@ func (h *SchoolAdminHandler) CreateSchoolUser(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// 写入审计日志
+	// v122 方案B: 创建成功后自动写入 school_members
+	// 失败时不阻断响应(用户已创建),但写 warning 日志
+	if addErr := repository.AddSchoolMember(r.Context(), school.ID, userInfo.ID, "school_admin_create"); addErr != nil {
+		fmt.Printf("[WARN] school_admin_handler.CreateSchoolUser: 写入 school_members 失败 user_id=%s school_id=%s err=%v\n",
+			userInfo.ID, school.ID, addErr)
+	}
+
 	repository.WriteAuditLog(adminUserID, "school_admin.user_create",
 		map[string]interface{}{
 			"target_user_id": userInfo.ID,
 			"username":       userInfo.Username,
 			"role":           userInfo.Role,
+			"school_id":      school.ID,
 		},
 		repository.GetClientIP(r.RemoteAddr),
 	)
@@ -151,7 +155,6 @@ func (h *SchoolAdminHandler) CreateSchoolUser(w http.ResponseWriter, r *http.Req
 }
 
 // GetSchoolUserDetail GET /api/v1/school-admin/users/{id}
-// 获取本校用户详情
 func (h *SchoolAdminHandler) GetSchoolUserDetail(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
@@ -169,8 +172,8 @@ func (h *SchoolAdminHandler) GetSchoolUserDetail(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// 验证用户是否属于本校教研组
-	inSchool, err := repository.IsUserInSchoolByGroup(r.Context(), userID, school.ID)
+	// v122 方案B: 换用 IsUserInSchool
+	inSchool, err := repository.IsUserInSchool(r.Context(), userID, school.ID)
 	if err != nil {
 		utils.InternalError(w, "校验用户归属失败: "+err.Error())
 		return
@@ -189,7 +192,6 @@ func (h *SchoolAdminHandler) GetSchoolUserDetail(w http.ResponseWriter, r *http.
 }
 
 // UpdateSchoolUser PUT /api/v1/school-admin/users/{id}
-// 编辑本校用户信息
 func (h *SchoolAdminHandler) UpdateSchoolUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
@@ -207,7 +209,8 @@ func (h *SchoolAdminHandler) UpdateSchoolUser(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	inSchool, err := repository.IsUserInSchoolByGroup(r.Context(), userID, school.ID)
+	// v122 方案B
+	inSchool, err := repository.IsUserInSchool(r.Context(), userID, school.ID)
 	if err != nil {
 		utils.InternalError(w, "校验用户归属失败: "+err.Error())
 		return
@@ -236,7 +239,6 @@ func (h *SchoolAdminHandler) UpdateSchoolUser(w http.ResponseWriter, r *http.Req
 }
 
 // UpdateSchoolUserStatus PUT /api/v1/school-admin/users/{id}/status
-// 启用/禁用本校用户
 func (h *SchoolAdminHandler) UpdateSchoolUserStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
@@ -254,7 +256,8 @@ func (h *SchoolAdminHandler) UpdateSchoolUserStatus(w http.ResponseWriter, r *ht
 		return
 	}
 
-	inSchool, err := repository.IsUserInSchoolByGroup(r.Context(), userID, school.ID)
+	// v122 方案B
+	inSchool, err := repository.IsUserInSchool(r.Context(), userID, school.ID)
 	if err != nil {
 		utils.InternalError(w, "校验用户归属失败: "+err.Error())
 		return
@@ -277,7 +280,6 @@ func (h *SchoolAdminHandler) UpdateSchoolUserStatus(w http.ResponseWriter, r *ht
 }
 
 // ResetSchoolUserPassword PUT /api/v1/school-admin/users/{id}/password
-// 重置本校用户密码
 func (h *SchoolAdminHandler) ResetSchoolUserPassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
@@ -295,7 +297,8 @@ func (h *SchoolAdminHandler) ResetSchoolUserPassword(w http.ResponseWriter, r *h
 		return
 	}
 
-	inSchool, err := repository.IsUserInSchoolByGroup(r.Context(), userID, school.ID)
+	// v122 方案B
+	inSchool, err := repository.IsUserInSchool(r.Context(), userID, school.ID)
 	if err != nil {
 		utils.InternalError(w, "校验用户归属失败: "+err.Error())
 		return
@@ -319,8 +322,6 @@ func (h *SchoolAdminHandler) ResetSchoolUserPassword(w http.ResponseWriter, r *h
 
 // ==================== 学校教研组管理 ====================
 
-// ListSchoolGroups GET /api/v1/school-admin/groups
-// 获取本校教研组列表
 func (h *SchoolAdminHandler) ListSchoolGroups(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
@@ -340,8 +341,6 @@ func (h *SchoolAdminHandler) ListSchoolGroups(w http.ResponseWriter, r *http.Req
 	utils.Success(w, result)
 }
 
-// CreateSchoolGroup POST /api/v1/school-admin/groups
-// 创建本校教研组
 func (h *SchoolAdminHandler) CreateSchoolGroup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
@@ -368,8 +367,6 @@ func (h *SchoolAdminHandler) CreateSchoolGroup(w http.ResponseWriter, r *http.Re
 	utils.Success(w, group)
 }
 
-// UpdateSchoolGroup PUT /api/v1/school-admin/groups/{id}
-// 编辑本校教研组
 func (h *SchoolAdminHandler) UpdateSchoolGroup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
@@ -409,8 +406,6 @@ func (h *SchoolAdminHandler) UpdateSchoolGroup(w http.ResponseWriter, r *http.Re
 	utils.Success(w, map[string]string{"message": "更新成功"})
 }
 
-// DeleteSchoolGroup DELETE /api/v1/school-admin/groups/{id}
-// 删除本校教研组
 func (h *SchoolAdminHandler) DeleteSchoolGroup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodDeleteOnly)
@@ -444,8 +439,6 @@ func (h *SchoolAdminHandler) DeleteSchoolGroup(w http.ResponseWriter, r *http.Re
 	utils.Success(w, map[string]string{"message": "删除成功"})
 }
 
-// ListSchoolGroupMembers GET /api/v1/school-admin/groups/{id}/members
-// 获取本校教研组成员
 func (h *SchoolAdminHandler) ListSchoolGroupMembers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
@@ -481,8 +474,6 @@ func (h *SchoolAdminHandler) ListSchoolGroupMembers(w http.ResponseWriter, r *ht
 	utils.Success(w, members)
 }
 
-// AddSchoolGroupMember POST /api/v1/school-admin/groups/{id}/members
-// 向本校教研组添加成员
 func (h *SchoolAdminHandler) AddSchoolGroupMember(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
@@ -523,8 +514,6 @@ func (h *SchoolAdminHandler) AddSchoolGroupMember(w http.ResponseWriter, r *http
 	utils.Success(w, map[string]string{"message": "添加成功"})
 }
 
-// UpdateSchoolGroupMemberRole PUT /api/v1/school-admin/groups/{id}/members/{uid}
-// 修改本校教研组成员角色
 func (h *SchoolAdminHandler) UpdateSchoolGroupMemberRole(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
@@ -566,8 +555,6 @@ func (h *SchoolAdminHandler) UpdateSchoolGroupMemberRole(w http.ResponseWriter, 
 	utils.Success(w, map[string]string{"message": "角色更新成功"})
 }
 
-// RemoveSchoolGroupMember DELETE /api/v1/school-admin/groups/{id}/members/{uid}
-// 移除本校教研组成员
 func (h *SchoolAdminHandler) RemoveSchoolGroupMember(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodDeleteOnly)

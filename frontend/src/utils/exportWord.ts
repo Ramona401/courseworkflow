@@ -1,10 +1,8 @@
 /**
- * exportWord.ts — 教案导出Word文档工具 v3
+ * exportWord.ts — 教案导出 Word 文档工具 v5
  *
- * v3改动：
- *   - 支持 > blockquote 语法（去掉>符号，正常段落输出）
- *   - 连续空行合并，只保留一个小间距
- *   - 整体紧凑排版，8000字约10-12页
+ * 职责: Markdown解析 + 元信息表格 + Document构建 + 打包下载
+ * 图片处理已拆分到 exportWordImages.ts
  */
 
 import {
@@ -22,6 +20,14 @@ import {
   ShadingType,
 } from 'docx'
 import { saveAs } from 'file-saver'
+import {
+  IMG_LINE_RE,
+  type ImageData,
+  preloadAllImages,
+  buildImageParagraphs,
+} from './exportWordImages'
+
+// ==================== 导出数据类型 ====================
 
 export interface LessonPlanExportData {
   title: string
@@ -35,7 +41,9 @@ export interface LessonPlanExportData {
   created_at?: string
 }
 
-/** 解析行内粗体 **text** → TextRun数组 */
+// ==================== 行内格式解析 ====================
+
+/** 解析行内粗体 **text** → TextRun 数组 */
 function parseInlineRuns(text: string, fontSize = 22): TextRun[] {
   const parts = text.split(/(\*\*[^*]+\*\*)/)
   return parts.map(part => {
@@ -46,10 +54,12 @@ function parseInlineRuns(text: string, fontSize = 22): TextRun[] {
   })
 }
 
+// ==================== Markdown 预处理 ====================
+
 /**
- * 预处理Markdown：
+ * 预处理 Markdown:
  * 1. 合并连续空行为单个空行
- * 2. 去掉 > blockquote 前缀，保留内容
+ * 2. 去掉 > blockquote 前缀,保留内容
  */
 function preprocessMarkdown(markdown: string): string[] {
   const raw = markdown.split('\n')
@@ -57,34 +67,32 @@ function preprocessMarkdown(markdown: string): string[] {
   let lastWasEmpty = false
 
   for (const line of raw) {
-    // 处理blockquote：去掉开头的 > 和空格
     let processed = line
     if (/^>\s*/.test(processed)) {
       processed = processed.replace(/^>\s*/, '')
     }
-
     const isEmpty = processed.trim() === ''
-
-    // 合并连续空行
     if (isEmpty) {
-      if (!lastWasEmpty) {
-        result.push('')
-      }
+      if (!lastWasEmpty) result.push('')
       lastWasEmpty = true
     } else {
       result.push(processed)
       lastWasEmpty = false
     }
   }
-
   return result
 }
 
-/** Markdown → docx Paragraph数组（紧凑版） */
-function parseMarkdownToParagraphs(markdown: string): Paragraph[] {
+// ==================== Markdown → docx Paragraph 数组 ====================
+
+/** Markdown → docx Paragraph 数组(图片走 buildImageParagraphs) */
+function parseMarkdownToParagraphs(
+  markdown: string,
+  imageMap: Map<string, ImageData>
+): Paragraph[] {
   if (!markdown || !markdown.trim()) {
     return [new Paragraph({
-      children: [new TextRun({ text: '（暂无教案内容）', color: '9CA3AF', size: 22 })],
+      children: [new TextRun({ text: '(暂无教案内容)', color: '9CA3AF', size: 22 })],
     })]
   }
 
@@ -94,7 +102,28 @@ function parseMarkdownToParagraphs(markdown: string): Paragraph[] {
   for (const line of lines) {
     const t = line.trim()
 
-    // 空行：只加一个小间距（环节分隔用）
+    // 图片行
+    const imgMatch = t.match(IMG_LINE_RE)
+    if (imgMatch) {
+      const url = imgMatch[2]
+      const img = imageMap.get(url)
+      if (img) {
+        paragraphs.push(...buildImageParagraphs(img))
+      } else {
+        console.warn(`[exportWord] imageMap 中未找到: ${url}`)
+        paragraphs.push(new Paragraph({
+          alignment: AlignmentType.CENTER,
+          children: [new TextRun({
+            text: `[图片未加载:${imgMatch[1] || url}]`,
+            size: 20, color: 'DC2626', italics: true,
+          })],
+          spacing: { before: 60, after: 60 },
+        }))
+      }
+      continue
+    }
+
+    // 空行
     if (!t) {
       paragraphs.push(new Paragraph({
         children: [],
@@ -168,7 +197,7 @@ function parseMarkdownToParagraphs(markdown: string): Paragraph[] {
       continue
     }
 
-    // 普通段落（含原blockquote内容）
+    // 普通段落
     paragraphs.push(new Paragraph({
       children: parseInlineRuns(t, 22),
       spacing: { before: 10, after: 10, line: 260 },
@@ -177,6 +206,8 @@ function parseMarkdownToParagraphs(markdown: string): Paragraph[] {
 
   return paragraphs
 }
+
+// ==================== 元信息表格 ====================
 
 /** 构建元信息表格 */
 function buildMetaTable(plan: LessonPlanExportData): Table {
@@ -214,8 +245,10 @@ function buildMetaTable(plan: LessonPlanExportData): Table {
   if (plan.created_at) {
     try {
       const d = new Date(plan.created_at)
-      rows.push(makeRow('日期', `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`))
-    } catch { /* 忽略 */ }
+      rows.push(makeRow('日期',
+        `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+      ))
+    } catch { /* 忽略日期解析失败 */ }
   }
 
   return new Table({
@@ -227,7 +260,7 @@ function buildMetaTable(plan: LessonPlanExportData): Table {
       left:    { style: BorderStyle.SINGLE, size: 4, color: 'E5E7EB' },
       right:   { style: BorderStyle.SINGLE, size: 4, color: 'E5E7EB' },
       insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: 'E5E7EB' },
-      insideVertical: { style: BorderStyle.SINGLE, size: 4, color: 'E5E7EB' },
+      insideVertical:   { style: BorderStyle.SINGLE, size: 4, color: 'E5E7EB' },
     },
   })
 }
@@ -235,8 +268,20 @@ function buildMetaTable(plan: LessonPlanExportData): Table {
 // ==================== 主导出函数 ====================
 
 export async function exportLessonPlanToWord(plan: LessonPlanExportData): Promise<void> {
-  const contentParagraphs = parseMarkdownToParagraphs(plan.content_markdown || '')
+  console.log('[exportWord] ========== 开始导出 Word ==========')
+  console.log(`[exportWord] 教案: ${plan.title}, 学科: ${plan.subject}, 年级: ${plan.grade}`)
 
+  // 1. 预处理 Markdown 并下载图片
+  const markdownText = plan.content_markdown || ''
+  const lines = preprocessMarkdown(markdownText)
+  const imageMap = await preloadAllImages(lines)
+  console.log(`[exportWord] imageMap 大小: ${imageMap.size}`)
+
+  // 2. 解析为 docx 段落
+  const contentParagraphs = parseMarkdownToParagraphs(markdownText, imageMap)
+  console.log(`[exportWord] 生成段落数: ${contentParagraphs.length}`)
+
+  // 3. 构建 Document
   const doc = new Document({
     numbering: {
       config: [{
@@ -262,26 +307,17 @@ export async function exportLessonPlanToWord(plan: LessonPlanExportData): Promis
       },
       paragraphStyles: [
         {
-          id: 'Heading1',
-          name: 'Heading 1',
-          basedOn: 'Normal',
-          next: 'Normal',
+          id: 'Heading1', name: 'Heading 1', basedOn: 'Normal', next: 'Normal',
           run: { bold: true, size: 28, color: '1F2937', font: 'Microsoft YaHei' },
           paragraph: { spacing: { before: 180, after: 60, line: 276 } },
         },
         {
-          id: 'Heading2',
-          name: 'Heading 2',
-          basedOn: 'Normal',
-          next: 'Normal',
+          id: 'Heading2', name: 'Heading 2', basedOn: 'Normal', next: 'Normal',
           run: { bold: true, size: 26, color: '1F2937', font: 'Microsoft YaHei' },
           paragraph: { spacing: { before: 140, after: 40, line: 276 } },
         },
         {
-          id: 'Heading3',
-          name: 'Heading 3',
-          basedOn: 'Normal',
-          next: 'Normal',
+          id: 'Heading3', name: 'Heading 3', basedOn: 'Normal', next: 'Normal',
           run: { bold: true, size: 24, color: '374151', font: 'Microsoft YaHei' },
           paragraph: { spacing: { before: 100, after: 30, line: 276 } },
         },
@@ -289,51 +325,29 @@ export async function exportLessonPlanToWord(plan: LessonPlanExportData): Promis
     },
     sections: [{
       properties: {
-        page: {
-          // A4，页边距2cm
-          margin: { top: 1134, bottom: 1134, left: 1134, right: 1134 },
-        },
+        page: { margin: { top: 1134, bottom: 1134, left: 1134, right: 1134 } },
       },
       children: [
-        // 教案标题
         new Paragraph({
           alignment: AlignmentType.CENTER,
           children: [new TextRun({
-            text: plan.title,
-            bold: true,
-            size: 36,
-            color: '1F2937',
-            font: 'Microsoft YaHei',
+            text: plan.title, bold: true, size: 36, color: '1F2937', font: 'Microsoft YaHei',
           })],
           spacing: { before: 0, after: 120, line: 276 },
         }),
-
-        // 元信息表格
         buildMetaTable(plan),
-
-        // 分割线
         new Paragraph({
           children: [],
           border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: 'E5E7EB' } },
           spacing: { before: 100, after: 100 },
         }),
-
-        // 教案内容标题
         new Paragraph({
           children: [new TextRun({
-            text: '教案内容',
-            bold: true,
-            size: 26,
-            color: '1F2937',
-            font: 'Microsoft YaHei',
+            text: '教案内容', bold: true, size: 26, color: '1F2937', font: 'Microsoft YaHei',
           })],
           spacing: { before: 0, after: 60, line: 276 },
         }),
-
-        // 正文
         ...contentParagraphs,
-
-        // 底部
         new Paragraph({
           alignment: AlignmentType.CENTER,
           children: [],
@@ -344,19 +358,19 @@ export async function exportLessonPlanToWord(plan: LessonPlanExportData): Promis
           alignment: AlignmentType.CENTER,
           children: [new TextRun({
             text: '由 TE-DNA 2.0 · 备课工坊 生成',
-            size: 18,
-            color: '9CA3AF',
-            font: 'Microsoft YaHei',
+            size: 18, color: '9CA3AF', font: 'Microsoft YaHei',
           })],
         }),
       ],
     }],
   })
 
+  // 4. 打包下载
+  console.log('[exportWord] 开始 Packer.toBlob...')
   const blob = await Packer.toBlob(doc)
-  const safeName = plan.title
-    .replace(/[\\/:*?"<>|]/g, '')
-    .replace(/\s+/g, '_')
-    .slice(0, 50)
+  console.log(`[exportWord] Blob 生成完成, 大小=${blob.size} bytes`)
+
+  const safeName = plan.title.replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, '_').slice(0, 50)
   saveAs(blob, `${safeName}.docx`)
+  console.log(`[exportWord] ========== 导出完成: ${safeName}.docx ==========`)
 }

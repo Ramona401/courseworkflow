@@ -92,6 +92,11 @@ func CallAIStream(
 	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
 	startTime := time.Now()
 
+	// v129新增：积分前置检查（对齐AOCI的checkCreditsGate）
+	if allowed, errMsg := invokeCreditCheck(traceCtx); !allowed {
+		return nil, fmt.Errorf(errMsg)
+	}
+
 	// -------- 构建模型尝试列表：主模型 + fallback模型 --------
 	type modelAttempt struct {
 		model      string
@@ -296,6 +301,24 @@ func CallAIStream(
 	// 记录成功trace
 	emitTrace(traceCtx, coalesce(modelUsed, actualModel), totalTokens, promptTokens, completionTokens,
 		latencyMs, "success", "", len(content), true, isFallback, cfg.Model)
+
+	// v129新增：积分消费回调（对齐AOCI的ConsumeCreditsForStream）
+	// v129.1修复：部分模型（Gemini等）流式不返回usage统计
+	// 当tokens全为0时，用content长度粗估（中文约0.7token/字符，英文约0.25token/字符）
+	creditPromptTokens := promptTokens
+	creditCompletionTokens := completionTokens
+	creditTotalTokens := totalTokens
+	if creditTotalTokens == 0 && creditPromptTokens == 0 && creditCompletionTokens == 0 && len(content) > 0 {
+		// 粗估：输出约 content长度×0.7 tokens，输入约输出的2倍（系统提示词+对话历史）
+		estimatedOutput := int(float64(len(content)) * 0.7)
+		estimatedInput := estimatedOutput * 2
+		creditPromptTokens = estimatedInput
+		creditCompletionTokens = estimatedOutput
+		creditTotalTokens = estimatedInput + estimatedOutput
+		log.Printf("[AI积分] 流式tokens为0，用content长度(%d字符)估算: in=%d out=%d total=%d",
+			len(content), estimatedInput, estimatedOutput, creditTotalTokens)
+	}
+	invokeCreditConsume(traceCtx, coalesce(modelUsed, actualModel), creditPromptTokens, creditCompletionTokens, creditTotalTokens, latencyMs)
 
 	return &CallResult{
 		Content:    content,

@@ -7,6 +7,10 @@ package repository
 //   - CreateAnnotation / ListAnnotationsByPlanID / GetAnnotationByID 支持 review_round 字段
 //   - 新增 ArchiveAnnotationsByPlanID — 提交新一轮评审时将所有 pending 批注归档
 //   - 新增 GetCurrentAnnotationRound — 获取教案当前最大评审轮次
+// v121改动（AI辅助修改 Bug 修复 · 方案C）：
+//   - 新增 RestoreArchivedAnnotationsForLatestRound — 教研员退回教案时,把
+//     最新一轮已归档(archived)批注恢复为 pending,让作者可以继续用 AI 辅助修改
+//     处理上一轮未彻底解决的批注(符合"退回即继续工作"的业务直觉)
 
 import (
 	"context"
@@ -168,6 +172,30 @@ func ArchiveAnnotationsByPlanID(ctx context.Context, planID string) error {
 		 WHERE lesson_plan_id = $3 AND status = $4`,
 		models.AnnotationStatusArchived, time.Now(), planID, models.AnnotationStatusPending,
 	)
+	return err
+}
+
+// RestoreArchivedAnnotationsForLatestRound 把教案最新一轮的 archived 批注恢复为 pending
+// v121新增：教研员退回教案时调用，配合"退回=继续工作"的业务场景
+// 业务含义：
+//   - 教研员退回意味着作者需要继续修改
+//   - 上一轮提交时被归档的批注(但作者实际还没处理)应该重新激活
+//   - 这样作者能继续用"AI辅助修改"按钮处理这些批注
+// 实现要点：
+//   - 只影响"最新一轮"的 archived 批注(保留更早轮次的归档历史)
+//   - 已 resolved 的批注不动(它们是真的处理完了的历史记录)
+func RestoreArchivedAnnotationsForLatestRound(ctx context.Context, planID string) error {
+	_, err := database.DB.Exec(ctx, `
+		UPDATE lesson_plan_annotations
+		SET status = $1, updated_at = $2
+		WHERE lesson_plan_id = $3
+		  AND status = $4
+		  AND review_round = (
+		    SELECT COALESCE(MAX(review_round), 1)
+		    FROM lesson_plan_annotations
+		    WHERE lesson_plan_id = $3
+		  )
+	`, models.AnnotationStatusPending, time.Now(), planID, models.AnnotationStatusArchived)
 	return err
 }
 

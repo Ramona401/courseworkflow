@@ -15,12 +15,12 @@ import (
 // ==================== 错误常量 ====================
 
 var (
-	ErrOrgNotFound    = errors.New("组织不存在")
-	ErrOrgNameExists  = errors.New("同类型下组织名称已存在")
-	ErrGroupNotFound  = errors.New("教研组不存在")
+	ErrOrgNotFound     = errors.New("组织不存在")
+	ErrOrgNameExists   = errors.New("同类型下组织名称已存在")
+	ErrGroupNotFound   = errors.New("教研组不存在")
 	ErrGroupNameExists = errors.New("该学校下教研组名称已存在")
-	ErrMemberExists   = errors.New("该用户已是教研组成员")
-	ErrMemberNotFound = errors.New("教研组成员不存在")
+	ErrMemberExists    = errors.New("该用户已是教研组成员")
+	ErrMemberNotFound  = errors.New("教研组成员不存在")
 )
 
 // ==================== 组织 CRUD ====================
@@ -63,28 +63,27 @@ func GetOrganizationByID(ctx context.Context, id string) (*models.Organization, 
 	return org, nil
 }
 
-
 // GetSchoolByAdminUserID 根据学校管理员用户ID获取其管理的学校
 // 规则：仅返回 type='school' 的组织；若无则返回 ErrOrgNotFound
 func GetSchoolByAdminUserID(ctx context.Context, adminUserID string) (*models.Organization, error) {
-        org := &models.Organization{}
-        query := `
-                SELECT id, name, type, parent_id, admin_user_id, settings, status, created_at, updated_at
-                FROM organizations
-                WHERE admin_user_id = $1 AND type = 'school'
-                LIMIT 1
-        `
-        err := database.DB.QueryRow(ctx, query, adminUserID).Scan(
-                &org.ID, &org.Name, &org.Type, &org.ParentID, &org.AdminUserID,
-                &org.Settings, &org.Status, &org.CreatedAt, &org.UpdatedAt,
-        )
-        if err != nil {
-                if errors.Is(err, pgx.ErrNoRows) {
-                        return nil, ErrOrgNotFound
-                }
-                return nil, fmt.Errorf("查询学校管理员所属学校失败: %w", err)
-        }
-        return org, nil
+	org := &models.Organization{}
+	query := `
+		SELECT id, name, type, parent_id, admin_user_id, settings, status, created_at, updated_at
+		FROM organizations
+		WHERE admin_user_id = $1 AND type = 'school'
+		LIMIT 1
+	`
+	err := database.DB.QueryRow(ctx, query, adminUserID).Scan(
+		&org.ID, &org.Name, &org.Type, &org.ParentID, &org.AdminUserID,
+		&org.Settings, &org.Status, &org.CreatedAt, &org.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrOrgNotFound
+		}
+		return nil, fmt.Errorf("查询学校管理员所属学校失败: %w", err)
+	}
+	return org, nil
 }
 
 func ListOrganizations(ctx context.Context, orgType string, parentID string) ([]*models.OrganizationListItem, error) {
@@ -573,9 +572,98 @@ func GetGroupLeadNames(ctx context.Context, groupID string) (string, error) {
 	return strings.Join(names, "、"), nil
 }
 
-// IsUserInSchoolByGroup 检查用户是否通过教研组归属于某学校
-// 不依赖 users.school_id，基于现有 teaching_group_members 组织体系
-// v110新增：用于学校管理员权限校验
+// ==================== v122 方案B 新增：school_members 直接归属 ====================
+//
+// school_members 是"学校直接成员名单"的权威来源（v122 新增）。
+// 与 teaching_group_members 正交：教研组成员自动算本校成员，但本校成员不一定要在教研组。
+// 新建用户入校、加入本校教研组 都会自动写入 school_members。
+
+// AddSchoolMember 将用户加入学校的直接成员名单
+// - 幂等：ON CONFLICT 不报错
+// - source 记录来源('school_admin_create'/'admin_create'/'group_member'/'migration'/'manual')
+func AddSchoolMember(ctx context.Context, schoolID string, userID string, source string) error {
+	if schoolID == "" || userID == "" {
+		return fmt.Errorf("schoolID 或 userID 为空")
+	}
+	if source == "" {
+		source = "manual"
+	}
+	_, err := database.DB.Exec(ctx, `
+		INSERT INTO school_members (school_id, user_id, joined_at, source)
+		VALUES ($1, $2, now(), $3)
+		ON CONFLICT (school_id, user_id) DO NOTHING
+	`, schoolID, userID, source)
+	if err != nil {
+		return fmt.Errorf("加入学校成员失败: %w", err)
+	}
+	return nil
+}
+
+// RemoveSchoolMember 从学校直接成员名单移除用户
+// - 仅当学校管理员显式移除用户时调用
+// - 禁用用户不调此函数（禁用只改 users.status）
+func RemoveSchoolMember(ctx context.Context, schoolID string, userID string) error {
+	_, err := database.DB.Exec(ctx,
+		`DELETE FROM school_members WHERE school_id = $1 AND user_id = $2`,
+		schoolID, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("移除学校成员失败: %w", err)
+	}
+	return nil
+}
+
+// IsUserInSchool 检查用户是否属于指定学校（v122 方案B 权威判定）
+// 同时兜底查 teaching_group_members，防止回填遗漏或新加入教研组但 school_members 漏写
+func IsUserInSchool(ctx context.Context, userID string, schoolID string) (bool, error) {
+	var count int
+	// 主判：school_members
+	err := database.DB.QueryRow(ctx,
+		`SELECT COUNT(*) FROM school_members WHERE user_id = $1 AND school_id = $2`,
+		userID, schoolID,
+	).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("检查学校直接成员失败: %w", err)
+	}
+	if count > 0 {
+		return true, nil
+	}
+	// 兜底：通过教研组反查（历史兼容 + 防漏）
+	err = database.DB.QueryRow(ctx, `
+		SELECT COUNT(*) FROM teaching_group_members tgm
+		JOIN teaching_groups tg ON tg.id = tgm.group_id
+		WHERE tgm.user_id = $1 AND tg.school_id = $2
+	`, userID, schoolID).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("检查用户学校归属(教研组兜底)失败: %w", err)
+	}
+	return count > 0, nil
+}
+
+// ListSchoolMemberIDs 返回某学校所有成员的 user_id
+// 用于 ListAdminUsers 按学校筛选的 IN 子查询构建
+func ListSchoolMemberIDs(ctx context.Context, schoolID string) ([]string, error) {
+	rows, err := database.DB.Query(ctx,
+		`SELECT user_id FROM school_members WHERE school_id = $1`,
+		schoolID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("查询学校成员ID列表失败: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// IsUserInSchoolByGroup 检查用户是否通过教研组归属于某学校（v110 老接口，保留向后兼容）
+// Deprecated: v122 改用 IsUserInSchool（school_members 主判 + 教研组兜底）
+// 保留此函数避免未发现的调用点编译失败
 func IsUserInSchoolByGroup(ctx context.Context, userID string, schoolID string) (bool, error) {
 	var count int
 	err := database.DB.QueryRow(ctx, `

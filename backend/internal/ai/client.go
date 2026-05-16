@@ -98,6 +98,7 @@ type TraceContext struct {
 	PipelineID   *string // 关联Pipeline ID（Pipeline步骤时设置）
 	LessonPlanID *string // 关联教案 ID（备课对话时设置）
 	UserID       *string // 关联用户 ID
+	SchoolID     *string // v129新增：用户所属学校ID，用于积分策略查询
 }
 
 // ChatMessage OpenAI兼容的消息格式
@@ -298,13 +299,21 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
 	startTime := time.Now()
 
+	// v129新增：积分前置检查（对齐AOCI的checkCreditsGate）
+	if allowed, errMsg := invokeCreditCheck(traceCtx); !allowed {
+		return nil, fmt.Errorf(errMsg)
+	}
+
 	// -------- 第1阶段：主模型调用（带完整重试）--------
 	primaryModel := cfg.Model
 	result, err := callAIWithRetries(cfg, primaryModel, messages, endpoint, MaxRetries)
 	if err == nil {
 		// 主模型调用成功
+		latMs := time.Since(startTime).Milliseconds()
 		emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
-			time.Since(startTime).Milliseconds(), "success", "", len(result.Content), false, false, "")
+			latMs, "success", "", len(result.Content), false, false, "")
+		// v129新增：积分消费回调（对齐AOCI的ConsumeCredits）
+		invokeCreditConsume(traceCtx, result.ModelUsed, 0, 0, result.TokensUsed, latMs)
 		return result, nil
 	}
 
@@ -324,10 +333,13 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 		result, err = callAIWithRetries(cfg, fbModel, messages, endpoint, MaxFallbackRetries)
 		if err == nil {
 			// fallback模型调用成功
+			fbLatMs := time.Since(startTime).Milliseconds()
 			log.Printf("[AI Fallback] 降级模型 %s 调用成功（原始模型: %s）", fbModel, primaryModel)
 			emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
-				time.Since(startTime).Milliseconds(), "success", "", len(result.Content), false,
+				fbLatMs, "success", "", len(result.Content), false,
 				true, primaryModel)
+			// v129新增：降级模型成功也扣减积分
+			invokeCreditConsume(traceCtx, result.ModelUsed, 0, 0, result.TokensUsed, fbLatMs)
 			return result, nil
 		}
 

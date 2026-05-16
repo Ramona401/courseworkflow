@@ -1,6 +1,7 @@
 /**
- * 主布局组件 — 课件审核系统 v6.0
+ * 主布局组件 — 课件审核系统 v6.1
  *
+ * v6.1变更：修复 header 缩进（去掉多余的 logo img）
  * v6.0 改版：与备课工坊 LPLayout 视觉风格统一
  * v110新增：学校管理员下拉菜单入口（senior_operator专属）
  */
@@ -117,7 +118,10 @@ function UserMenu() {
             )}
             {/* senior_operator 专属：学校管理 */}
             {user?.role === 'senior_operator' && (
-              <DropdownItem icon="🏫" label="学校管理" onClick={() => go('/school-admin', '/workflow')} highlight />
+              <>
+                <DropdownItem icon="👥" label="用户管理" onClick={() => go('/admin', '/workflow')} highlight />
+                <DropdownItem icon="🏫" label="学校管理" onClick={() => go('/school-admin', '/workflow')} highlight />
+              </>
             )}
           </div>
 

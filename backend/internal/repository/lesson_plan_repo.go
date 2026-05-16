@@ -105,6 +105,7 @@ func CreateLessonPlan(ctx context.Context, lp *models.LessonPlan) error {
 // 迭代7B：新增textbook_page_ids字段
 func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, error) {
 	lp := &models.LessonPlan{}
+	var reviewSchoolIDStr string
 	query := `
 		SELECT id, title, subject, grade, topic, duration_minutes,
 		       content_markdown, content_structured, generation_config,
@@ -117,6 +118,7 @@ func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, erro
 		       COALESCE(textbook_page_ids::text, '[]'),
                        COALESCE(lesson_index, ''), idx_cognitive_level, idx_pedagogy_intensity,
                        idx_structure_type, idx_quality_level,
+		       review_level, COALESCE(review_school_id::text, ''),
 		       created_at, updated_at
 		FROM lesson_plans WHERE id = $1
 	`
@@ -132,6 +134,7 @@ func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, erro
 		&lp.TextbookPageIDs,
                 &lp.LessonIndex, &lp.IdxCognitiveLevel, &lp.IdxPedagogyIntensity,
                 &lp.IdxStructureType, &lp.IdxQualityLevel,
+		&lp.ReviewLevel, &reviewSchoolIDStr,
 		&lp.CreatedAt, &lp.UpdatedAt,
 	)
 	if err != nil {
@@ -139,6 +142,9 @@ func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, erro
 			return nil, ErrLessonPlanNotFound
 		}
 		return nil, fmt.Errorf("查询教案失败: %w", err)
+	}
+	if reviewSchoolIDStr != "" {
+		lp.ReviewSchoolID = &reviewSchoolIDStr
 	}
 	return lp, nil
 }
@@ -214,6 +220,7 @@ func ListLessonPlans(ctx context.Context, authorID string, groupID string, statu
 		       COALESCE(tr.name, '') AS recipe_name,
                        COALESCE(lp.lesson_index, '') AS lesson_index,
                        lp.idx_quality_level,
+		       lp.review_level,
 		       lp.created_at, lp.updated_at
 		FROM lesson_plans lp
 		LEFT JOIN users u ON u.id = lp.author_id
@@ -238,6 +245,7 @@ func ListLessonPlans(ctx context.Context, authorID string, groupID string, statu
 			&item.Status, &item.Visibility, &item.AuthorID, &item.AuthorName,
 			&item.AIReviewScore, &item.ForkCount, &item.ViewCount,
 			&item.ForkedFrom, &item.RecipeID, &item.RecipeName, &item.LessonIndex, &item.IdxQualityLevel,
+			&item.ReviewLevel,
 			&item.CreatedAt, &item.UpdatedAt,
 		)
 		if err != nil {

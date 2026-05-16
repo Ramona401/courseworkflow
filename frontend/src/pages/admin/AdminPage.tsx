@@ -21,6 +21,7 @@
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
+import { useAuth } from '@/store/auth'
 import {
   getAdminStats, getAdminUsers, getAdminAuditLogs,
   getAdminOrgs, updateAdminOrg, deleteAdminOrg,
@@ -81,12 +82,27 @@ function ColCard({ title, count, onAdd, addLabel, loading, empty, children }: {
 
 // ==================== 主组件 ====================
 export default function AdminPage() {
+  const { user } = useAuth()
   const navigate  = useNavigate()
   const location  = useLocation()
+  // v122:按角色决定可见 Tab
+  //   admin:全部 5 个 Tab
+  //   senior_operator:只看"用户"和"组织架构",不看概览/日志/角色权限
+  const isSchoolAdmin = user?.role === 'senior_operator'
+  const availableTabs = isSchoolAdmin
+    ? (['users', 'orgs'] as const)
+    : (['overview', 'users', 'orgs', 'logs', 'roles'] as const)
+  const availableTabLabels: Record<string, string> = {
+    overview: '📊 概览',
+    users:    '👥 用户管理',
+    orgs:     '🏫 组织架构',
+    logs:     '📋 操作日志',
+    roles:    '🎭 角色权限',
+  }
   const fromPath: string = (location.state as { from?: string })?.from || '/'
 
   // ---- Tab状态 ----
-  const [activeTab, setActiveTab] = useState<'overview' | 'users' | 'orgs' | 'logs' | 'roles'>('overview')
+  const [activeTab, setActiveTab] = useState<'overview' | 'users' | 'orgs' | 'logs' | 'roles'>(user?.role === 'senior_operator' ? 'users' : 'overview')
 
   // ---- 概览Tab ----
   const [stats, setStats]                         = useState<AdminStats | null>(null)
@@ -389,8 +405,10 @@ export default function AdminPage() {
           {'<- 返回'}
         </button>
         <div style={{ flex: 1, textAlign: 'center' }}>
-          <h1 style={{ fontSize: '18px', fontWeight: 700, color: C.text, margin: 0 }}>👥 用户管理中心</h1>
-          <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '2px' }}>统一管理用户、组织架构与操作日志</div>
+          <h1 style={{ fontSize: '18px', fontWeight: 700, color: C.text, margin: 0 }}>{isSchoolAdmin ? '🏫 本校用户管理' : '👥 用户管理中心'}</h1>
+          <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '2px' }}>
+            {isSchoolAdmin ? '管理本校用户与教研组架构' : '统一管理用户、组织架构与操作日志'}
+          </div>
         </div>
         <button onClick={() => setShowCreateModal(true)}
           style={{ padding: '8px 18px', borderRadius: '8px', border: 'none', background: `linear-gradient(135deg,${C.primary},#7C3AED)`, color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>
@@ -402,15 +420,12 @@ export default function AdminPage() {
 
         {/* Tab切换（5个Tab）*/}
         <div style={{ display: 'flex', gap: '4px', marginBottom: '20px', background: C.bg, borderRadius: '12px', padding: '4px', border: `1px solid ${C.border}`, width: 'fit-content' }}>
-          {(['overview', 'users', 'orgs', 'logs', 'roles'] as const).map((tab, i) => {
-            const labels = ['📊 概览', '👥 用户管理', '🏫 组织架构', '📋 操作日志', '🎭 角色权限']
-            return (
-              <button key={tab} onClick={() => setActiveTab(tab)}
-                style={{ padding: '9px 22px', borderRadius: '9px', border: 'none', cursor: 'pointer', fontSize: '14px', fontWeight: activeTab === tab ? 600 : 400, color: activeTab === tab ? C.primary : C.textSec, background: activeTab === tab ? C.white : 'transparent', boxShadow: activeTab === tab ? '0 1px 4px rgba(0,0,0,0.08)' : 'none', transition: 'all 150ms ease' }}>
-                {labels[i]}
-              </button>
-            )
-          })}
+          {availableTabs.map(tab => (
+            <button key={tab} onClick={() => setActiveTab(tab)}
+              style={{ padding: '9px 22px', borderRadius: '9px', border: 'none', cursor: 'pointer', fontSize: '14px', fontWeight: activeTab === tab ? 600 : 400, color: activeTab === tab ? C.primary : C.textSec, background: activeTab === tab ? C.white : 'transparent', boxShadow: activeTab === tab ? '0 1px 4px rgba(0,0,0,0.08)' : 'none', transition: 'all 150ms ease' }}>
+              {availableTabLabels[tab]}
+            </button>
+          ))}
         </div>
 
         {/* ===== Tab: 概览 ===== */}

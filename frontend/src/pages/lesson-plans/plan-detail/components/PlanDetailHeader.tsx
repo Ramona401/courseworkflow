@@ -10,6 +10,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { LessonPlan, LessonPlanStatus } from '@/api/lesson-plans'
+import type { InteractionCounts } from '@/api/lesson-plan-interactions'
 import { C, STATUS_CONFIG } from './planDetailConstants'
 import { exportLessonPlanToWord } from '@/utils/exportWord'
 
@@ -79,9 +80,13 @@ interface ActionBarProps {
   isOwner: boolean
   actionLoading: string | null
   onAction: (action: string) => void
+  /** v125新增：互动数据（点赞/收藏计数+用户状态） */
+  interactions?: InteractionCounts
+  /** v125新增：切换互动回调 */
+  onToggleInteraction?: (type: 'like' | 'favorite') => void
 }
 
-export function ActionBar({ plan, isOwner, actionLoading, onAction }: ActionBarProps) {
+export function ActionBar({ plan, isOwner, actionLoading, onAction, interactions, onToggleInteraction }: ActionBarProps) {
   const navigate = useNavigate()
   const isLoading = !!actionLoading
 
@@ -157,7 +162,7 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction }: ActionBarP
         buttons.push({ label: '提交评审',   style: secondaryBtn, action: 'submit'  })
         break
       case 'published_personal':
-        buttons.push({ label: '进入课件开发', style: primaryBtn,   action: 'develop' })
+        buttons.push({ label: '🎨 生成课件', style: primaryBtn,   action: 'courseware' })
         buttons.push({ label: '提交评审',    style: secondaryBtn, action: 'submit'  })
         break
       case 'revision':
@@ -167,10 +172,10 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction }: ActionBarP
         break
       case 'approved':
       case 'published_shared':
-        buttons.push({ label: '进入课件开发', style: primaryBtn, action: 'develop' })
+        buttons.push({ label: '🎨 生成课件', style: primaryBtn, action: 'courseware' })
         break
       case 'developing':
-        buttons.push({ label: '查看课件进度', style: primaryBtn, action: 'view_pipeline' })
+        buttons.push({ label: '🎨 生成课件', style: primaryBtn, action: 'courseware' })
         break
     }
     if (['draft', 'published_personal', 'revision'].includes(plan.status)) {
@@ -225,6 +230,45 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction }: ActionBarP
         title="将教案导出为Word文档（.docx）">
         {exporting ? '⏳ 导出中...' : '📄 导出 Word'}
       </button>
+
+      {/* v125新增：点赞 + 收藏按钮（与导出Word按钮统一风格） */}
+      {interactions && onToggleInteraction && (
+        <>
+          <div style={{ width: '1px', height: '24px', background: '#E5E7EB', margin: '0 4px', flexShrink: 0 }} />
+          <button
+            onClick={() => onToggleInteraction('like')}
+            title={interactions.is_liked ? '取消点赞' : '点赞'}
+            style={{
+              padding: '9px 20px', borderRadius: '8px',
+              border: `1px solid ${interactions.is_liked ? 'rgba(239,68,68,0.3)' : C.border}`,
+              background: interactions.is_liked ? 'rgba(239,68,68,0.06)' : 'transparent',
+              fontSize: '14px', fontWeight: 500,
+              color: interactions.is_liked ? '#DC2626' : C.textSec,
+              cursor: 'pointer', transition: 'all 150ms ease', whiteSpace: 'nowrap',
+              display: 'inline-flex', alignItems: 'center', gap: '5px',
+            }}
+          >
+            <span style={{ fontSize: '15px' }}>{interactions.is_liked ? '👍' : '👍'}</span>
+            {interactions.like_count > 0 ? `${interactions.like_count}` : '点赞'}
+          </button>
+          <button
+            onClick={() => onToggleInteraction('favorite')}
+            title={interactions.is_favorited ? '取消收藏' : '收藏'}
+            style={{
+              padding: '9px 20px', borderRadius: '8px',
+              border: `1px solid ${interactions.is_favorited ? 'rgba(245,158,11,0.3)' : C.border}`,
+              background: interactions.is_favorited ? 'rgba(245,158,11,0.06)' : 'transparent',
+              fontSize: '14px', fontWeight: 500,
+              color: interactions.is_favorited ? '#D97706' : C.textSec,
+              cursor: 'pointer', transition: 'all 150ms ease', whiteSpace: 'nowrap',
+              display: 'inline-flex', alignItems: 'center', gap: '5px',
+            }}
+          >
+            <span style={{ fontSize: '15px' }}>📌</span>
+            {interactions.favorite_count > 0 ? `${interactions.favorite_count}` : '收藏'}
+          </button>
+        </>
+      )}
 
       <style>{`@keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }`}</style>
     </div>

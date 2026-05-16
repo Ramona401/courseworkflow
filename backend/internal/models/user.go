@@ -14,7 +14,7 @@ type User struct {
 	Username     string     `json:"username"`
 	DisplayName  string     `json:"display_name"`
 	PasswordHash string     `json:"-"`
-	// Role：admin / senior_operator / operator / viewer
+	// Role：admin / district_inspector / senior_operator / operator / viewer
 	Role        string     `json:"role"`
 	Status      string     `json:"status"`
 	LastLoginAt *time.Time `json:"last_login_at"`
@@ -123,10 +123,11 @@ type UserListResponse struct {
 // ==================== 角色与状态常量 ====================
 
 const (
-	RoleAdmin          = "admin"
-	RoleSeniorOperator = "senior_operator" // 学校管理员
-	RoleOperator       = "operator"        // 骨干教师
-	RoleViewer         = "viewer"          // 普通教师
+	RoleAdmin             = "admin"
+	RoleDistrictInspector = "district_inspector" // v127新增：区域教研员
+	RoleSeniorOperator    = "senior_operator"    // 学校管理员
+	RoleOperator          = "operator"           // 骨干教师
+	RoleViewer            = "viewer"             // 普通教师
 )
 
 const (
@@ -134,7 +135,8 @@ const (
 	StatusDisabled = "disabled"
 )
 
-var ValidRoles    = []string{RoleAdmin, RoleSeniorOperator, RoleOperator, RoleViewer}
+// ValidRoles 有效角色列表（v127新增 district_inspector）
+var ValidRoles = []string{RoleAdmin, RoleDistrictInspector, RoleSeniorOperator, RoleOperator, RoleViewer}
 var ValidStatuses = []string{StatusActive, StatusDisabled}
 
 func IsValidRole(role string) bool {

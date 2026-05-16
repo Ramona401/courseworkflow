@@ -1,0 +1,149 @@
+/**
+ * 课件风格模板页面 — CWTemplatesPage v2.0（Phase 2）
+ *
+ * 模板浏览 + 风格筛选 + 预览弹窗（配色+CSS变量）+ admin删除
+ */
+import { useState, useEffect } from 'react'
+import { getCWTemplates, deleteCWTemplate, CW_STYLE_CONFIG } from '@/api/coursewares'
+import type { CoursewareTemplate } from '@/api/coursewares'
+import { useAuth } from '@/store/auth'
+
+const C = {
+  primary: '#F59E0B', textPrimary: '#1F2937', textSecondary: '#6B7280',
+  textMuted: '#9CA3AF', border: '#E5E7EB', bgCard: '#FFFFFF', danger: '#EF4444',
+}
+
+const safeParse = (s: string): Record<string, string> => {
+  try { return JSON.parse(s) || {} } catch { return {} }
+}
+
+export default function CWTemplatesPage() {
+  const { user } = useAuth()
+  const isAdmin = user?.role === 'admin'
+  const [templates, setTemplates] = useState<CoursewareTemplate[]>([])
+  const [loading, setLoading] = useState(true)
+  const [styleFilter, setStyleFilter] = useState('')
+  const [previewT, setPreviewT] = useState<CoursewareTemplate | null>(null)
+
+  useEffect(() => { loadData() }, [])
+
+  const loadData = async () => {
+    setLoading(true)
+    try { setTemplates((await getCWTemplates()) || []) } catch { /* */ } finally { setLoading(false) }
+  }
+
+  const handleDelete = async (id: string, name: string) => {
+    if (!window.confirm(`确定删除模板「${name}」？`)) return
+    try { await deleteCWTemplate(id); loadData() } catch { alert('删除失败') }
+  }
+
+  const filtered = styleFilter ? templates.filter(t => t.style_category === styleFilter) : templates
+  const styleFilters = [{ value: '', label: '全部' }, ...Object.entries(CW_STYLE_CONFIG).map(([k, v]) => ({ value: k, label: `${v.emoji} ${v.label}` }))]
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '20px' }}>
+        {styleFilters.map(f => (
+          <button key={f.value} onClick={() => setStyleFilter(f.value)} style={{
+            padding: '6px 14px', borderRadius: '20px',
+            border: `1px solid ${styleFilter === f.value ? C.primary : C.border}`,
+            background: styleFilter === f.value ? 'rgba(245,158,11,0.08)' : 'transparent',
+            color: styleFilter === f.value ? C.primary : C.textSecondary,
+            fontSize: '13px', fontWeight: styleFilter === f.value ? 600 : 400, cursor: 'pointer',
+          }}>{f.label}</button>
+        ))}
+      </div>
+
+      <div style={{ fontSize: '13px', color: C.textMuted, marginBottom: '20px' }}>共 {filtered.length} 套风格模板</div>
+
+      {loading ? (
+        <div style={{ textAlign: 'center', padding: '60px 0', color: C.textMuted }}>加载中...</div>
+      ) : filtered.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: '80px 0' }}>
+          <div style={{ fontSize: '48px', marginBottom: '16px' }}>🎨</div>
+          <div style={{ fontSize: '16px', color: C.textSecondary, marginBottom: '8px' }}>暂无风格模板</div>
+          <div style={{ fontSize: '13px', color: C.textMuted }}>{isAdmin ? '前往组件库页面点击「填充种子数据」一键入库' : '等待管理员填充数据'}</div>
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '20px' }}>
+          {filtered.map(t => {
+            const sc = CW_STYLE_CONFIG[t.style_category] || { label: t.style_category, color: '#6B7280', bg: '#F3F4F6', emoji: '🎨' }
+            const colors = safeParse(t.color_scheme)
+            return (
+              <div key={t.id} onClick={() => setPreviewT(t)} style={{
+                background: C.bgCard, borderRadius: '16px', overflow: 'hidden', border: `1px solid ${C.border}`, cursor: 'pointer', transition: 'all 200ms ease',
+              }} onMouseEnter={e => { (e.currentTarget as HTMLDivElement).style.borderColor = 'rgba(245,158,11,0.3)'; (e.currentTarget as HTMLDivElement).style.transform = 'translateY(-2px)' }}
+                 onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.borderColor = C.border; (e.currentTarget as HTMLDivElement).style.transform = 'none' }}>
+                <div style={{
+                  height: '120px', display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative',
+                  background: colors.primary && colors.secondary ? `linear-gradient(135deg, ${colors.primary}, ${colors.secondary})` : `linear-gradient(135deg, ${sc.color}20, ${sc.color}40)`,
+                }}>
+                  <span style={{ fontSize: '40px' }}>{sc.emoji}</span>
+                  {colors.primary && (
+                    <div style={{ position: 'absolute', bottom: '10px', right: '12px', display: 'flex', gap: '4px' }}>
+                      {['primary', 'secondary', 'accent', 'background', 'text'].map(k => colors[k] ? (
+                        <div key={k} style={{ width: '16px', height: '16px', borderRadius: '50%', background: colors[k], border: '2px solid rgba(255,255,255,0.6)' }} title={`${k}: ${colors[k]}`} />
+                      ) : null)}
+                    </div>
+                  )}
+                </div>
+                <div style={{ padding: '16px 20px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                    <div style={{ fontSize: '16px', fontWeight: 600, color: C.textPrimary }}>{t.name}</div>
+                    <span style={{ padding: '2px 10px', borderRadius: '12px', fontSize: '11px', fontWeight: 500, color: sc.color, background: sc.bg }}>{sc.label}</span>
+                  </div>
+                  {t.description && <div style={{ fontSize: '13px', color: C.textSecondary, lineHeight: 1.5 }}>{t.description.length > 60 ? t.description.slice(0, 60) + '...' : t.description}</div>}
+                  {isAdmin && (
+                    <div style={{ marginTop: '10px', display: 'flex', justifyContent: 'flex-end' }}>
+                      <button onClick={e => { e.stopPropagation(); handleDelete(t.id, t.name) }} style={{ padding: '2px 10px', borderRadius: '6px', border: `1px solid ${C.border}`, background: 'transparent', color: C.danger, fontSize: '11px', cursor: 'pointer' }}>删除</button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {previewT && (
+        <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.5)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setPreviewT(null)}>
+          <div style={{ background: '#fff', borderRadius: '16px', width: '90%', maxWidth: '680px', maxHeight: '85vh', overflow: 'auto' }} onClick={e => e.stopPropagation()}>
+            <div style={{ padding: '24px 28px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+              <div>
+                <div style={{ fontSize: '20px', fontWeight: 700, color: C.textPrimary, marginBottom: '4px' }}>{previewT.name}</div>
+                {previewT.description && <div style={{ fontSize: '13px', color: C.textSecondary }}>{previewT.description}</div>}
+              </div>
+              <button onClick={() => setPreviewT(null)} style={{ background: 'none', border: 'none', fontSize: '24px', cursor: 'pointer', color: C.textMuted }}>x</button>
+            </div>
+            <div style={{ padding: '0 28px 20px' }}>
+              <div style={{ fontSize: '14px', fontWeight: 600, color: C.textPrimary, marginBottom: '12px' }}>配色方案</div>
+              <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+                {Object.entries(safeParse(previewT.color_scheme)).map(([key, val]) => (
+                  <div key={key} style={{ textAlign: 'center' }}>
+                    <div style={{ width: '48px', height: '48px', borderRadius: '12px', background: val, border: '2px solid rgba(0,0,0,0.08)', marginBottom: '4px' }} />
+                    <div style={{ fontSize: '10px', color: C.textMuted }}>{key}</div>
+                    <div style={{ fontSize: '10px', color: C.textSecondary, fontFamily: 'monospace' }}>{val}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{ padding: '0 28px 24px' }}>
+              <div style={{ fontSize: '14px', fontWeight: 600, color: C.textPrimary, marginBottom: '12px' }}>CSS变量</div>
+              <div style={{ background: '#F8FAFC', borderRadius: '8px', padding: '12px 16px' }}>
+                {Object.entries(safeParse(previewT.css_variables)).map(([key, val]) => (
+                  <div key={key} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: '12px', borderBottom: '1px solid #F1F5F9' }}>
+                    <span style={{ color: '#7C3AED', fontFamily: 'monospace' }}>{key}</span>
+                    <span style={{ color: C.textSecondary, fontFamily: 'monospace', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      {typeof val === 'string' && val.startsWith('#') && <span style={{ width: '12px', height: '12px', borderRadius: '3px', background: val, border: '1px solid #E2E8F0', flexShrink: 0 }} />}
+                      {val}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}

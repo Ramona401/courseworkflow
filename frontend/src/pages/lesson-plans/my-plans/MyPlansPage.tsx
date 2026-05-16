@@ -15,6 +15,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
+import { createCourseware } from '@/api/coursewares'
 import {
   getLessonPlans, deleteLessonPlan,
   publishLessonPlanPersonal, submitLessonPlanForReview, startDevelopment,
@@ -279,6 +280,17 @@ export default function MyPlansPage() {
           setLoadingId(null)
           return
         case 'publish':  await publishLessonPlanPersonal(planId); showToast('教案已个人发布 ✓'); break
+        case 'courseware': {
+          // Phase 3: 创建课件并跳转到课件工坊
+          try {
+            const cw = await createCourseware({ lesson_plan_id: planId })
+            showToast('课件创建成功，正在跳转课件工坊... ✓')
+            setTimeout(() => navigate('/courseware/' + (cw as { id: string }).id), 500)
+          } catch {
+            showToast('创建课件失败，请稍后重试', 'error')
+          }
+          break
+        }
         case 'develop':  await startDevelopment(planId);           showToast('已进入课件开发流程 ✓'); break
         case 'delete':   await deleteLessonPlan(planId);           showToast('教案已删除'); break
         default: console.warn('未知操作:', action)
