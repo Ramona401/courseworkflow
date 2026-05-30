@@ -1,5 +1,14 @@
 /**
- * 课件工坊主页面 — CoursewareWorkshopPage.tsx v5.3 (v0.41: 预览降级注入)
+ * 课件工坊主页面 — CoursewareWorkshopPage.tsx v5.4 (左侧空隙修复)
+ *
+ * v5.4 修复（左侧白边/空隙）：
+ *   - CWFullscreenPreview 与 SlideshowPlayer 的缩放容器，从
+ *     「绝对定位 + 手动 left:ox/top:oy 偏移 + transformOrigin:'top left'」
+ *     改为「外层 flex 居中 + 缩放层 transformOrigin:'center'」。
+ *   - 原写法在画面宽于缩放后内容时，ox 为带小数的正值，缩放从左上角展开，
+ *     导致左侧露出一条画布底色（白边）。改用浏览器 flex 精确居中后白缝消除。
+ *   - renderPagePreview 的小预览框是「贴左上填满固定高度」逻辑（非居中），
+ *     无此问题，保持不变。
  *
  * v5.3 (v0.41) 新增：
  *   - injectPreviewMode()：统一为所有iframe的srcDoc注入预览环境降级脚本
@@ -79,6 +88,12 @@ function statusToStep(s: string, hasNavTemplate: boolean, hasPreviewPages: boole
 // 此函数为srcDoc注入一段脚本，拦截fetch请求并返回降级响应
 // 课件内的降级代码检测到 _preview_mode: true 时显示蓝色信息条而非红色错误
 const PREVIEW_INJECT_SCRIPT = `
+<style>
+/* v5.5: 强制归零 iframe 内 html/body 默认 margin（浏览器默认 body margin:8px，
+   经 scale 缩小后会在课件左/上侧露出约 1-2px 画布底色缝隙）。
+   课件内容本就按 1920x1080 从 (0,0) 铺满，归零后缝隙消除。 */
+html, body { margin: 0 !important; padding: 0 !important; }
+</style>
 <script>
 // TE-DNA 预览模式标记
 window.__TEDNA_PREVIEW_MODE__ = true;
@@ -171,13 +186,10 @@ function CWFullscreenPreview({ pages, initialPageNum, codeView, onToggleCode, on
   }, [idx, hasPrev, hasNext, pages, onClose])
 
   // 缩放计算：工具栏高度60px，内容区占满剩余空间
+  // v5.4: 只算 scale，居中交给外层 flex（不再手动算 ox/oy 偏移，避免亚像素白边）
   const toolbarH = 60
   const contentH = viewSize.h - toolbarH
   const scale = Math.min(viewSize.w / CW_WIDTH, contentH / CW_HEIGHT)
-  const scaledW = CW_WIDTH * scale
-  const scaledH = CW_HEIGHT * scale
-  const ox = (viewSize.w - scaledW) / 2
-  const oy = (contentH - scaledH) / 2
 
   const tbtn: React.CSSProperties = { padding: '6px 14px', borderRadius: 8, border: '1px solid #E5E7EB', background: '#fff', color: '#6B7280', fontSize: 13, cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4 }
 
@@ -195,8 +207,8 @@ function CWFullscreenPreview({ pages, initialPageNum, codeView, onToggleCode, on
         <button onClick={() => onSlideshow(page?.page_number || 1)} style={{ ...tbtn, border: '1px solid #F59E0B', background: 'rgba(245,158,11,0.06)', color: '#F59E0B' }}>🖥️ 放映</button>
         <button onClick={onClose} style={tbtn}>✕ 退出</button>
       </div>
-      {/* 内容区 */}
-      <div style={{ flex: 1, overflow: 'hidden', position: 'relative', background: codeView ? '#1e1e1e' : '#fff' }}>
+      {/* 内容区：v5.4 改为 flex 居中，缩放层 transformOrigin:center，消除左侧白边 */}
+      <div style={{ flex: 1, overflow: 'hidden', position: 'relative', background: codeView ? '#1e1e1e' : '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         {codeView ? (
           <div style={{ width: '100%', height: '100%', overflow: 'auto', fontFamily: 'Monaco, Consolas, "Courier New", monospace', fontSize: 13, lineHeight: 1.7 }}>
             <table style={{ borderCollapse: 'collapse', width: '100%' }}><tbody>
@@ -206,7 +218,7 @@ function CWFullscreenPreview({ pages, initialPageNum, codeView, onToggleCode, on
             </tbody></table>
           </div>
         ) : (
-          <div style={{ position: 'absolute', left: ox, top: oy, width: CW_WIDTH, height: CW_HEIGHT, transform: `scale(${scale})`, transformOrigin: 'top left' }}>
+          <div style={{ width: CW_WIDTH, height: CW_HEIGHT, flexShrink: 0, transform: `scale(${scale})`, transformOrigin: 'center center' }}>
             <iframe srcDoc={previewHtml} scrolling="no" style={{ width: CW_WIDTH, height: CW_HEIGHT, border: 'none', display: 'block', overflow: 'hidden' }} sandbox="allow-scripts" title={`全屏预览-P${page?.page_number}`} />
           </div>
         )}
@@ -298,12 +310,8 @@ function SlideshowPlayer({ pages, initialPage, onClose }: {
   if (!data) return null
 
   // v5.2: 缩放计算 — 以宽度为基准，确保内容完全可见无黑框
+  // v5.4: 只算 scale，居中交给外层 flex（不再手动算 ox/oy 偏移，避免亚像素白边）
   const scale = Math.min(containerSize.w / CW_WIDTH, containerSize.h / CW_HEIGHT)
-  const scaledW = CW_WIDTH * scale
-  const scaledH = CW_HEIGHT * scale
-  // 居中偏移（水平和垂直）
-  const ox = (containerSize.w - scaledW) / 2
-  const oy = (containerSize.h - scaledH) / 2
 
   return (
     <div ref={boxRef} data-slideshow="1" onMouseMove={flashUI}
@@ -320,14 +328,14 @@ function SlideshowPlayer({ pages, initialPage, onClose }: {
         background: '#fff',              /* v5.2: 白色背景替代黑色 */
         cursor: showUI ? 'default' : 'none',
         overflow: 'hidden',              /* v5.2: 消除外层滚动条 */
+        /* v5.4: flex 居中课件，消除左侧亚像素白边 */
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
       }}>
-      {/* 课件内容区域：绝对定位+缩放居中 */}
+      {/* 课件内容区域：v5.4 flex 居中 + 缩放层 transformOrigin:center（不再绝对定位偏移） */}
       <div style={{
-        position: 'absolute',
-        left: ox, top: oy,
-        width: CW_WIDTH, height: CW_HEIGHT,
+        width: CW_WIDTH, height: CW_HEIGHT, flexShrink: 0,
         transform: `scale(${scale})`,
-        transformOrigin: 'top left',
+        transformOrigin: 'center center',
       }}>
         <iframe
           srcDoc={previewHtml}
