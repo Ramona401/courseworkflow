@@ -52,3 +52,7 @@ sql-migrations/**/*.failed_*
 # 误创建的空文件
 frontend/=
 旧文件
+*.backup
+*.backup.*
+backend/internal/**/*.backup.*
+backend/internal/**/*.backup2.*
