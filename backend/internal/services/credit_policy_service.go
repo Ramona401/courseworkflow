@@ -9,6 +9,8 @@ package services
 //   - 模拟计算：Simulate
 //   - 模型积分预览：GetModelPreviews
 //
+// v141 改进：log.Printf → logger.WithModule 结构化日志
+//
 // 积分计算公式（对齐AOCI的credit_policy.go）：
 //   cost_usd = (input_tokens/1000 × cost_per_1k_input) + (output_tokens/1000 × cost_per_1k_output)
 //   credits  = cost_usd × exchange_rate × multiplier
@@ -20,12 +22,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 
+	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 )
+
+// 模块日志
+var cpLog = logger.WithModule("credit_policy")
 
 // ==================== CreditPolicyService 结构体 ====================
 
@@ -74,8 +79,8 @@ func (s *CreditPolicyService) CalculateCredits(
 	// token数全部为0，返回零消费
 	if inputTokens == 0 && outputTokens == 0 {
 		return &models.CreditCalculation{
-			ModelName:   modelUsed,
-			LatencyMs:   latencyMs,
+			ModelName: modelUsed,
+			LatencyMs: latencyMs,
 		}
 	}
 
@@ -85,7 +90,7 @@ func (s *CreditPolicyService) CalculateCredits(
 		// 模型单价未配置，尝试模糊匹配
 		price = s.estimateModelPrice(modelUsed)
 		if price == nil {
-			log.Printf("[CreditPolicy] 模型 %s 未配置单价且无法估算，积分为0", modelUsed)
+			cpLog.Warn("模型未配置单价且无法估算，积分为0", "model", modelUsed)
 			return &models.CreditCalculation{
 				InputTokens:  inputTokens,
 				OutputTokens: outputTokens,

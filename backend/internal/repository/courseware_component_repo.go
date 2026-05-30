@@ -1,5 +1,18 @@
 package repository
 
+// courseware_component_repo.go — 课件组件库数据访问层（v139 拆分版）
+//
+// v139 变更：
+//   - 模板相关函数（ListCWTemplates / GetCWTemplateByID / CreateCWTemplate / UpdateCWTemplate /
+//     DeleteCWTemplate / ListCWTemplatesWithUser / CreatePersonalTemplate / DeletePersonalTemplate）
+//     全部拆出到 courseware_template_repo.go,职责分离更清晰
+//   - 本文件只保留组件库（courseware_components 表）CRUD 和匹配引擎
+//
+// 保留的全部函数（向后兼容,签名不变）：
+//   - CreateCWComponent / GetCWComponentByID / ListCWComponents
+//   - UpdateCWComponent / UpdateCWComponentIndex / DeleteCWComponent
+//   - MatchCWComponents（AOCI 匹配引擎,逻辑保持原样）
+
 import (
 	"context"
 	"fmt"
@@ -59,7 +72,6 @@ func GetCWComponentByID(ctx context.Context, id string) (*models.CoursewareCompo
 
 // ListCWComponents 查询课件组件列表（支持类型+学科+学段+状态筛选+分页）
 func ListCWComponents(ctx context.Context, componentType string, subjectScope string, gradeScope string, isActive *bool, limit int, offset int) ([]*models.CWComponentListItem, int, error) {
-	// 构建WHERE条件
 	conditions := []string{"1=1"}
 	args := []interface{}{}
 	argIdx := 1
@@ -87,14 +99,12 @@ func ListCWComponents(ctx context.Context, componentType string, subjectScope st
 
 	whereClause := strings.Join(conditions, " AND ")
 
-	// 查询总数
 	countSQL := fmt.Sprintf("SELECT COUNT(*) FROM courseware_components WHERE %s", whereClause)
 	var total int
 	if err := database.DB.QueryRow(ctx, countSQL, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("查询课件组件总数失败: %w", err)
 	}
 
-	// 查询列表
 	listSQL := fmt.Sprintf(`SELECT id, name, COALESCE(description,''), component_type,
 		COALESCE(preview_image_url,''), COALESCE(subject_scope,'ALL'), COALESCE(grade_scope,'ALL'),
 		COALESCE(component_index,''), idx_interaction_level, is_active, review_status, created_at
@@ -121,7 +131,6 @@ func ListCWComponents(ctx context.Context, componentType string, subjectScope st
 		); err != nil {
 			return nil, 0, fmt.Errorf("扫描课件组件列表行失败: %w", err)
 		}
-		// 填充类型中文名
 		item.ComponentTypeName = models.CWComponentTypeNameMap[item.ComponentType]
 		items = append(items, item)
 	}
@@ -149,7 +158,6 @@ func UpdateCWComponent(ctx context.Context, id string, req *models.UpdateCWCompo
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("课件组件不存在: %s", id)
 	}
-	// 单独更新可选字段
 	if req.IsActive != nil {
 		_, _ = database.DB.Exec(ctx, `UPDATE courseware_components SET is_active = $1 WHERE id = $2`, *req.IsActive, id)
 	}
@@ -184,55 +192,43 @@ func DeleteCWComponent(ctx context.Context, id string) error {
 // ==================== 课件组件匹配引擎 ====================
 
 // MatchCWComponents 根据交互类型+视觉形式+学科+学段匹配课件组件
-// 匹配优先级：精确匹配 > 通用(ALL)匹配 > 无条件返回
-// 返回 Top-N 最匹配的组件代码供AI参考
+// 按交互复杂度 ±1 浮动匹配,视觉形式精确匹配或通配('')
+// 按学科+学段精度排序(精确匹配优先于 ALL 通配)
 func MatchCWComponents(ctx context.Context, req *models.MatchCWComponentsRequest) ([]*models.MatchedCWComponent, error) {
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 3
 	}
 
-	// 构建WHERE条件
 	conditions := []string{"is_active = true", "review_status = 'approved'"}
 	args := []interface{}{}
 	argIdx := 1
 
-	// 组件类型筛选
 	if req.ComponentType != "" {
 		conditions = append(conditions, fmt.Sprintf("component_type = $%d", argIdx))
 		args = append(args, req.ComponentType)
 		argIdx++
 	}
-
-	// 学科筛选（精确匹配或通用）
 	if req.SubjectScope != "" {
 		conditions = append(conditions, fmt.Sprintf("(subject_scope = $%d OR subject_scope = 'ALL')", argIdx))
 		args = append(args, req.SubjectScope)
 		argIdx++
 	}
-
-	// 学段筛选（精确匹配或通用）
 	if req.GradeScope != "" {
 		conditions = append(conditions, fmt.Sprintf("(grade_scope = $%d OR grade_scope = 'ALL')", argIdx))
 		args = append(args, req.GradeScope)
 		argIdx++
 	}
-
-	// 交互复杂度筛选（允许±1级浮动匹配）
 	if req.InteractionLevel > 0 {
 		conditions = append(conditions, fmt.Sprintf("(idx_interaction_level IS NULL OR ABS(idx_interaction_level - $%d) <= 1)", argIdx))
 		args = append(args, req.InteractionLevel)
 		argIdx++
 	}
-
-	// 视觉形式精确匹配
 	if req.VisualFormat != "" {
 		conditions = append(conditions, fmt.Sprintf("(idx_visual_format = '' OR idx_visual_format = $%d)", argIdx))
 		args = append(args, req.VisualFormat)
 		argIdx++
 	}
-
-	// 技术标签精确匹配
 	if req.TechTag != "" {
 		conditions = append(conditions, fmt.Sprintf("(idx_tech_tag = '' OR idx_tech_tag = $%d)", argIdx))
 		args = append(args, req.TechTag)
@@ -240,8 +236,6 @@ func MatchCWComponents(ctx context.Context, req *models.MatchCWComponentsRequest
 	}
 
 	whereClause := strings.Join(conditions, " AND ")
-
-	// 排序：精确匹配的排在前面（通用ALL排后面）
 	orderClause := `ORDER BY
 		CASE WHEN subject_scope != 'ALL' AND grade_scope != 'ALL' THEN 0
 		     WHEN subject_scope != 'ALL' OR grade_scope != 'ALL' THEN 1
@@ -272,112 +266,4 @@ func MatchCWComponents(ctx context.Context, req *models.MatchCWComponentsRequest
 		matched = append(matched, m)
 	}
 	return matched, nil
-}
-
-// ==================== 风格模板 CRUD ====================
-
-// ListCWTemplates 获取所有激活的风格模板（按排序）
-func ListCWTemplates(ctx context.Context, activeOnly bool) ([]*models.CoursewareTemplate, error) {
-	conditions := "1=1"
-	if activeOnly {
-		conditions = "is_active = true"
-	}
-	sql := fmt.Sprintf(`SELECT id, name, COALESCE(description,''), style_category,
-		COALESCE(preview_image_url,''), COALESCE(color_scheme::text,''),
-		COALESCE(css_variables::text,''), COALESCE(sample_pages::text,''),
-		is_active, sort_order, created_at, updated_at
-		FROM courseware_templates WHERE %s
-		ORDER BY sort_order ASC, created_at ASC`, conditions)
-
-	rows, err := database.DB.Query(ctx, sql)
-	if err != nil {
-		return nil, fmt.Errorf("查询风格模板列表失败: %w", err)
-	}
-	defer rows.Close()
-
-	var templates []*models.CoursewareTemplate
-	for rows.Next() {
-		t := &models.CoursewareTemplate{}
-		if err := rows.Scan(
-			&t.ID, &t.Name, &t.Description, &t.StyleCategory,
-			&t.PreviewImageURL, &t.ColorScheme, &t.CSSVariables, &t.SamplePages,
-			&t.IsActive, &t.SortOrder, &t.CreatedAt, &t.UpdatedAt,
-		); err != nil {
-			return nil, fmt.Errorf("扫描风格模板行失败: %w", err)
-		}
-		templates = append(templates, t)
-	}
-	return templates, nil
-}
-
-// GetCWTemplateByID 获取风格模板详情
-func GetCWTemplateByID(ctx context.Context, id string) (*models.CoursewareTemplate, error) {
-	sql := `SELECT id, name, COALESCE(description,''), style_category,
-		COALESCE(preview_image_url,''), COALESCE(color_scheme::text,''),
-		COALESCE(css_variables::text,''), COALESCE(sample_pages::text,''),
-		is_active, sort_order, created_at, updated_at
-		FROM courseware_templates WHERE id = $1`
-	t := &models.CoursewareTemplate{}
-	err := database.DB.QueryRow(ctx, sql, id).Scan(
-		&t.ID, &t.Name, &t.Description, &t.StyleCategory,
-		&t.PreviewImageURL, &t.ColorScheme, &t.CSSVariables, &t.SamplePages,
-		&t.IsActive, &t.SortOrder, &t.CreatedAt, &t.UpdatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return t, nil
-}
-
-// CreateCWTemplate 创建风格模板
-func CreateCWTemplate(ctx context.Context, t *models.CoursewareTemplate) error {
-	sql := `INSERT INTO courseware_templates (id, name, description, style_category,
-		preview_image_url, color_scheme, css_variables, sample_pages, is_active, sort_order)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8, $9)
-		RETURNING id, created_at, updated_at`
-	return database.DB.QueryRow(ctx, sql,
-		t.Name, t.Description, t.StyleCategory,
-		t.PreviewImageURL, nullIfEmpty(t.ColorScheme), nullIfEmpty(t.CSSVariables),
-		nullIfEmpty(t.SamplePages), t.IsActive, t.SortOrder,
-	).Scan(&t.ID, &t.CreatedAt, &t.UpdatedAt)
-}
-
-// UpdateCWTemplate 更新风格模板
-func UpdateCWTemplate(ctx context.Context, id string, req *models.UpdateCWTemplateRequest) error {
-	sql := `UPDATE courseware_templates SET name = $1, description = $2, style_category = $3,
-		preview_image_url = $4, color_scheme = $5::jsonb, css_variables = $6::jsonb,
-		sample_pages = $7::jsonb, updated_at = $8
-		WHERE id = $9`
-	tag, err := database.DB.Exec(ctx, sql,
-		req.Name, req.Description, req.StyleCategory,
-		req.PreviewImageURL, nullIfEmpty(req.ColorScheme), nullIfEmpty(req.CSSVariables),
-		nullIfEmpty(req.SamplePages), time.Now(), id,
-	)
-	if err != nil {
-		return fmt.Errorf("更新风格模板失败: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("风格模板不存在: %s", id)
-	}
-	// 单独更新可选字段
-	if req.IsActive != nil {
-		_, _ = database.DB.Exec(ctx, `UPDATE courseware_templates SET is_active = $1 WHERE id = $2`, *req.IsActive, id)
-	}
-	if req.SortOrder != nil {
-		_, _ = database.DB.Exec(ctx, `UPDATE courseware_templates SET sort_order = $1 WHERE id = $2`, *req.SortOrder, id)
-	}
-	return nil
-}
-
-// DeleteCWTemplate 删除风格模板
-func DeleteCWTemplate(ctx context.Context, id string) error {
-	sql := `DELETE FROM courseware_templates WHERE id = $1`
-	tag, err := database.DB.Exec(ctx, sql, id)
-	if err != nil {
-		return fmt.Errorf("删除风格模板失败: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("风格模板不存在: %s", id)
-	}
-	return nil
 }

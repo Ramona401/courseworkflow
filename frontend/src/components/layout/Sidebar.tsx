@@ -152,11 +152,11 @@ export default function Sidebar() {
           onClick={() => navigate('/')}
           title="返回首页"
         >
-          <img
-            src="/pkuailab.png"
-            alt="北京大学人工智能应用与创新实验室"
-            style={{ height: '26px', objectFit: 'contain', display: 'block' }}
-          />
+          {user?.org_logo_url ? (
+            <img src={user.org_logo_url} alt={user.org_name || 'Logo'} style={{ height: '26px', objectFit: 'contain', display: 'block' }} />
+          ) : (
+            <div style={{ fontSize: '14px', fontWeight: 700, color: '#4F7BE8', letterSpacing: '1px' }}>TE-DNA 2.0</div>
+          )}
         </div>
         {/* 系统名称 */}
         <div style={{ padding: '6px 18px 12px', display: 'flex', alignItems: 'center', gap: '10px' }}>

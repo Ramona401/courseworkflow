@@ -1,9 +1,12 @@
 package routes
 
+// routes.go — 主路由注册
+//
+// v0.42 多媒体: 新增 CoursewareAssetService + CoursewareAssetHandler
+
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"time"
 
@@ -11,11 +14,15 @@ import (
 	"tedna/internal/config"
 	"tedna/internal/database"
 	"tedna/internal/handlers"
+	"tedna/internal/logger"
 	"tedna/internal/middleware"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 	"tedna/internal/services"
 )
+
+// 模块日志
+var routeLog = logger.WithModule("routes")
 
 const roleAdmin = "admin"
 const roleSeniorOperator = "senior_operator"
@@ -64,19 +71,19 @@ func Setup(cfg *config.Config) http.Handler {
 	wsStageService := services.NewWorkshopStageService()
 	assessService := services.NewAssessmentService(recipeService, cfg)
 	tbService := services.NewTextbookService(cfg)
-        assetService := services.NewLessonPlanAssetService()
+	assetService := services.NewLessonPlanAssetService()
 	ciService := services.NewComponentIndexService(cfg)
 	liService := services.NewLessonIndexService(cfg)
 
 	// v110(TE-DNA 3.0 P0)新增:AI 助手服务
 	aiAssistantService := services.NewAIAssistantService()
 
-	// v113(TE-DNA 3.0 P0.5)新增:AI 助手对话式创作服务(Meta-Prompt + AOCI 组件库检索)
+	// v113(TE-DNA 3.0 P0.5)新增:AI 助手对话式创作服务
 	assistantDesignerService := services.NewAssistantDesignerService(
 		cfg.AESKey, cfg.AIAPIBaseURL, cfg.AIAPIKey, cfg.AIDefaultModel,
 	)
 
-	// v110(TE-DNA 3.0 P0 STEP 3):将 AI 助手服务注入教案生成服务,使 Chat 支持 assistant_id
+	// v110:将 AI 助手服务注入教案生成服务
 	lpGenService.SetAssistantService(aiAssistantService)
 
 	wsStageService.SetGenService(lpGenService)
@@ -101,7 +108,7 @@ func Setup(cfg *config.Config) http.Handler {
 	lpHandler := handlers.NewLessonPlanHandler(lpService)
 	annotationHandler := handlers.NewAnnotationHandler(cfg)
 
-	// v110(TE-DNA 3.0 P0)改动:NewReviewAIHandler 签名增加 aiAssistantService
+	// v110:NewReviewAIHandler 签名增加 aiAssistantService
 	reviewAIHandler := handlers.NewReviewAIHandler(cfg, aiAssistantService)
 
 	lpGenHandler := handlers.NewLessonPlanGenHandler(lpGenService, authService)
@@ -109,9 +116,9 @@ func Setup(cfg *config.Config) http.Handler {
 	wsStageHandler := handlers.NewWorkshopStageHandler(wsStageService)
 	assessHandler := handlers.NewAssessmentHandler(assessService)
 	tbHandler := handlers.NewTextbookHandler(tbService)
-        assetHandler := handlers.NewLessonPlanAssetHandler(assetService)
-        // v125新增：教案互动服务（点赞/收藏）
-        interactionService := services.NewLessonPlanInteractionService()
+	assetHandler := handlers.NewLessonPlanAssetHandler(assetService)
+	// v125新增：教案互动服务（点赞/收藏）
+	interactionService := services.NewLessonPlanInteractionService()
 
 	// v127新增：多级审核 + 抽查服务
 	reviewV2Service := services.NewReviewV2Service(compService)
@@ -120,23 +127,20 @@ func Setup(cfg *config.Config) http.Handler {
 	// v129改造：启用积分检查 + 注入精确积分计算钩子
 	tokenService := services.NewTokenService()
 	creditPolicyService := services.NewCreditPolicyService()
-	tokenGuard := services.NewTokenGuard(true) // v129: 启用积分前置检查
+	tokenGuard := services.NewTokenGuard(true)
 
-	// v129新增：注入AI调用积分回调钩子（对齐AOCI的ai_proxy.go积分扣减链路）
-	// 所有 CallAI/CallAIStream/CallAIMultimodal 成功后自动触发积分计算和扣减
+	// v129新增：注入AI调用积分回调钩子
 	ai.SetCreditHook(
-		// 消费回调：AI调用成功后计算积分并扣减
+		// 消费回调
 		func(traceCtx *ai.TraceContext, modelUsed string, inputTokens int, outputTokens int, totalTokens int, latencyMs int64) {
 			if traceCtx == nil || traceCtx.UserID == nil || *traceCtx.UserID == "" {
 				return
 			}
 			ctx := context.Background()
-			// 计算积分（对齐AOCI: CalculateCreditsFromCost/CalculateCreditsForCall）
 			calc := creditPolicyService.CalculateCredits(ctx, modelUsed, inputTokens, outputTokens, totalTokens, traceCtx.SchoolID, latencyMs)
 			if calc == nil || calc.CreditsConsumed <= 0 {
 				return
 			}
-			// 扣减积分
 			req := &models.TokenConsumeRequest{
 				UserID:       *traceCtx.UserID,
 				SceneCode:    traceCtx.SceneCode,
@@ -148,10 +152,10 @@ func Setup(cfg *config.Config) http.Handler {
 			}
 			_ = tokenService.ConsumeTokens(ctx, req)
 		},
-		// 前置检查回调：AI调用前检查余额
+		// 前置检查回调
 		func(traceCtx *ai.TraceContext) (bool, string) {
 			if traceCtx == nil || traceCtx.UserID == nil || *traceCtx.UserID == "" {
-				return true, "" // 无用户信息时放行
+				return true, ""
 			}
 			ctx := context.Background()
 			result := tokenGuard.CheckBalance(ctx, *traceCtx.UserID)
@@ -162,7 +166,7 @@ func Setup(cfg *config.Config) http.Handler {
 		},
 	)
 	inspectionService := services.NewInspectionService()
-        interactionHandler := handlers.NewLessonPlanInteractionHandler(interactionService)
+	interactionHandler := handlers.NewLessonPlanInteractionHandler(interactionService)
 	aiTraceHandler := handlers.NewAITraceHandler()
 
 	// v127新增：多级审核 + 抽查处理器
@@ -190,30 +194,51 @@ func Setup(cfg *config.Config) http.Handler {
 	cwIndexService := services.NewCoursewareIndexService(cfg)
 	cwIndexHandler := handlers.NewCoursewareIndexHandler(cwIndexService, cwService, authService)
 
+	// v0.42(入口B)新增:PPT上传解析服务
+	cwPPTService := services.NewCoursewarePPTService(cfg, cwIndexService)
+	cwIndexHandler.SetPPTService(cwPPTService)
+
+	// v134(课件工坊 Phase 4B)新增:课件HTML逐页AI生成服务+处理器
+	cwGenService := services.NewCoursewareGenService(cfg)
+	cwGenHandler := handlers.NewCoursewareGenHandler(cwGenService, cwService)
+
+	// v0.42 多媒体:课件多媒体资产服务+处理器
+	cwAssetService := services.NewCoursewareAssetService(cfg)
+	// v0.42.10: 创建OSS上传服务实例（复用已有配置体系）
+        ossService := services.NewOSSService(cfg)
+        cwAssetHandler := handlers.NewCoursewareAssetHandler(cwAssetService, ossService)
+
+	// v0.42.1 视频编辑:服务+处理器
+	videoEditService := services.NewVideoEditService(cfg)
+	videoEditHandler := handlers.NewVideoEditHandler(videoEditService)
+
+	// v0.42.8 字幕轨:服务+处理器
+	subtitleService := services.NewCoursewareSubtitleService(cfg)
+	subtitleHandler := handlers.NewCoursewareSubtitleHandler(subtitleService)
+
 	// v110(TE-DNA 3.0 P0)新增:AI 助手处理器
 	aiAssistantHandler := handlers.NewAIAssistantHandler(aiAssistantService)
 
-	// v113(TE-DNA 3.0 P0.5)新增:AI 助手对话式创作处理器(SSE 流式接口)
+	// v113(TE-DNA 3.0 P0.5)新增:AI 助手对话式创作处理器
 	assistantDesignerHandler := handlers.NewAssistantDesignerHandler(assistantDesignerService)
 
-	// v121(P1 收尾 · 2026-04-20)新增:AI 助手反馈处理器
-	// 无依赖 service(反馈逻辑简单,直接调 repository)
+	// v121新增:AI 助手反馈处理器
 	assistantFeedbackHandler := handlers.NewAssistantFeedbackHandler()
 
 	authMW := middleware.AuthMiddleware(authService)
 	adminOnly := middleware.RequireRole(roleAdmin)
 	seniorOperatorOnly := middleware.RequireRole(roleSeniorOperator)
-	// v122(AdminPage 权限统一):admin 和 senior_operator 都能进入用户管理中心
-	// admin 看全系统,senior_operator 在 handler 层强制过滤为本校数据
 	adminOrSchoolAdmin := middleware.RequireRole(roleAdmin, roleSeniorOperator)
-	// v127新增：admin + district_inspector 可访问抽查功能
 	adminOrInspector := middleware.RequireRole(roleAdmin, roleDistrictInspector)
 
 	mux.HandleFunc("/api/v1/health", makeHealthHandler(engine))
-	pipelineService.StartNightlyVerifyScheduler()
-	tokenService.StartMonthlyQuotaScheduler()
-	tokenService.StartAlertCheckScheduler()
-	courseService.StartNightlyIndexSyncScheduler()
+	// v142优化：测试环境跳过调度器启动
+	if !cfg.DisableSchedulers {
+		pipelineService.StartNightlyVerifyScheduler()
+		tokenService.StartMonthlyQuotaScheduler()
+		tokenService.StartAlertCheckScheduler()
+		courseService.StartNightlyIndexSyncScheduler()
+	}
 
 	mux.Handle("/api/v1/engine/stats", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -258,7 +283,7 @@ func Setup(cfg *config.Config) http.Handler {
 
 	mux.Handle("/api/v1/dashboard/stats", middleware.Chain(http.HandlerFunc(pipelineHandler.GetDashboardStats), authMW))
 
-	registerAdminRoutes(mux, authMW, adminOnly, adminOrSchoolAdmin, adminHandler, roleHandler, userHandler, aiConfigHandler, promptHandler, edHandler, courseHandler, wsStageHandler, aiTraceHandler)
+	registerAdminRoutes(mux, authMW, adminOnly, adminOrSchoolAdmin, adminHandler, orgHandler, roleHandler, userHandler, aiConfigHandler, promptHandler, edHandler, courseHandler, wsStageHandler, aiTraceHandler)
 	registerPipelineRoutes(mux, authMW, pipelineHandler, sseHandler)
 	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler, annotationHandler, reviewAIHandler, assetHandler, interactionHandler)
 
@@ -276,15 +301,25 @@ func Setup(cfg *config.Config) http.Handler {
 	// v110(TE-DNA 3.0 P0)新增:注册 AI 助手路由
 	registerAIAssistantRoutes(mux, authMW, aiAssistantHandler, assistantDesignerHandler)
 
-	// v121(P1 收尾 · 2026-04-20)新增:注册 AI 助手反馈路由
-	// - POST   /api/v1/assistant-feedback                创建反馈(登录即可)
-	// - DELETE /api/v1/assistant-feedback/{id}           删除自己的反馈
-	// - GET    /api/v1/assistant-feedback                列表(admin only)
-	// - GET    /api/v1/assistants/{id}/feedback-stats    某助手的反馈统计
+	// v121:注册 AI 助手反馈路由
 	registerAssistantFeedbackRoutes(mux, authMW, adminOnly, assistantFeedbackHandler)
 
 	// v130(课件工坊 Phase 1)新增:注册课件工坊路由
-	registerCoursewareRoutes(mux, authMW, adminOnly, cwHandler, cwCompHandler, cwSeedHandler, cwIndexHandler)
+	// v139(模板 AI 提取+微调)新增:模板提取和微调服务
+	templateExtractService := services.NewTemplateExtractService(cfg)
+	templateRefineService := services.NewTemplateRefineService(cfg)
+
+	// v139:使用 V139 完整构造函数注入提取/微调/认证 3 个服务
+	cwTplHandler := handlers.NewCoursewareTemplateHandlerV139(
+		templateExtractService,
+		templateRefineService,
+		authService,
+	)
+	// v0.42 多媒体: registerCoursewareRoutes 新增 cwAssetHandler 参数
+	registerCoursewareRoutes(mux, authMW, adminOnly, cwHandler, cwCompHandler, cwSeedHandler, cwIndexHandler, cwGenHandler, cwTplHandler, cwAssetHandler, videoEditHandler, subtitleHandler)
+
+	// v0.42.9新增：TTS音色列表（登录即可）
+	mux.Handle("/api/v1/tts-voices", middleware.Chain(http.HandlerFunc(subtitleHandler.ListTTSVoices), authMW))
 
 	mux.Handle("/api/v1/admin/component-index/batch-compress", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -295,9 +330,9 @@ func Setup(cfg *config.Config) http.Handler {
 			importCtx := context.Background()
 			success, failed, err := ciService.BatchCompressAllComponents(importCtx, 20, 800)
 			if err != nil {
-				log.Printf("批量压缩组件索引错误: %v", err)
+				routeLog.Error("批量压缩组件索引错误", "error", err)
 			} else {
-				log.Printf("批量压缩组件索引完成: 成功=%d 失败=%d", success, failed)
+				routeLog.Info("批量压缩组件索引完成", "success", success, "failed", failed)
 			}
 		}()
 		w.Header().Set("Content-Type", "application/json")

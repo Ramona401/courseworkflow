@@ -1,10 +1,15 @@
 package services
 
-// courseware_sse_hub.go — 课件工坊SSE广播中心
+// courseware_sse_hub.go — 课件工坊SSE广播中心 (v142 P3-3 竞态修复)
 //
 // 复用教案SSE Hub模式（lp_sse_hub.go）
-// 用于课件索引生成、课件AI生成等流式推送场景
+// 用于课件索引生成、课件AI生成、模板微调等流式推送场景
 // 独占模式：同一coursewareID同一时间只允许一个活跃SSE连接
+//
+// v142 P3-3 修复:
+//   - safeCloseCWChan: 防止double-close panic(recover保护)
+//   - Broadcast: send操作加recover防御,防止send-on-closed panic
+//   - Subscribe/Unsubscribe: close(ch)统一替换为safeCloseCWChan(ch)
 
 import (
 	"sync"
@@ -14,13 +19,22 @@ import (
 // ==================== 课件SSE事件类型常量 ====================
 
 const (
+	// ---- 索引生成阶段事件（Phase 3） ----
 	CWSSEConnected     = "connected"      // SSE连接建立
 	CWSSEIndexStart    = "index_start"    // 开始生成索引
 	CWSSEIndexPage     = "index_page"     // 单页索引生成完成
 	CWSSEIndexProgress = "index_progress" // 索引生成进度
 	CWSSEIndexDone     = "index_done"     // 索引生成全部完成
-	CWSSEChunk         = "chunk"          // AI流式输出片段
-	CWSSEError         = "error"          // 错误
+
+	// ---- 课件HTML生成阶段事件（Phase 4B） ----
+	CWSSEGenStart    = "gen_start"    // 开始生成课件HTML
+	CWSSEGenPage     = "gen_page"     // 单页HTML生成完成
+	CWSSEGenProgress = "gen_progress" // 生成进度更新
+	CWSSEGenDone     = "gen_done"     // 全部页面HTML生成完成
+
+	// ---- 通用事件 ----
+	CWSSEChunk = "chunk" // AI流式输出片段
+	CWSSEError = "error" // 错误
 )
 
 // ==================== 课件SSE事件结构 ====================
@@ -31,9 +45,40 @@ type CWSSEEvent struct {
 	Data      interface{} `json:"data"`       // 事件数据（根据类型不同而不同）
 }
 
-// ==================== 课件SSE广播中心 ====================
+// ==================== 防御性辅助函数 ====================
 
 var cwSseLog = logger.WithModule("cw_sse")
+
+// safeCloseCWChan 安全关闭课件SSE channel
+// 使用 recover 防止 double-close panic（防御性编程，正常路径不应触发）
+func safeCloseCWChan(ch chan CWSSEEvent) {
+	defer func() {
+		if r := recover(); r != nil {
+			cwSseLog.Warn("课件SSE channel double-close被捕获(已安全忽略)", "recover", r)
+		}
+	}()
+	close(ch)
+}
+
+// safeSendCWEvent 安全发送事件到课件SSE channel
+// 非阻塞发送，满则丢弃；使用 recover 防止 send-on-closed panic
+// 返回值: true=发送成功, false=丢弃或channel已关闭
+func safeSendCWEvent(ch chan CWSSEEvent, event CWSSEEvent) bool {
+	defer func() {
+		if r := recover(); r != nil {
+			cwSseLog.Warn("课件SSE send-on-closed被捕获(已安全忽略)",
+				"event_type", event.EventType, "recover", r)
+		}
+	}()
+	select {
+	case ch <- event:
+		return true
+	default:
+		return false
+	}
+}
+
+// ==================== 课件SSE广播中心 ====================
 
 // CWSSEHub 课件工坊SSE广播中心（全局单例）
 type CWSSEHub struct {
@@ -67,7 +112,7 @@ func (h *CWSSEHub) Subscribe(coursewareID string) chan CWSSEEvent {
 		for ch, active := range oldSubs {
 			if active {
 				oldSubs[ch] = false
-				close(ch)
+				safeCloseCWChan(ch) // v142: 安全关闭防止double-close
 			}
 		}
 		delete(h.subscribers, coursewareID)
@@ -95,7 +140,7 @@ func (h *CWSSEHub) Unsubscribe(coursewareID string, ch chan CWSSEEvent) {
 	}
 	if active, exists := subs[ch]; exists && active {
 		subs[ch] = false
-		close(ch)
+		safeCloseCWChan(ch) // v142: 安全关闭防止double-close
 		delete(subs, ch)
 	}
 	if len(subs) == 0 {
@@ -119,16 +164,14 @@ func (h *CWSSEHub) Broadcast(coursewareID string, event CWSSEEvent) {
 		if !active {
 			continue
 		}
-		select {
-		case ch <- event:
+		// v142: 使用safeSend防御send-on-closed
+		if safeSendCWEvent(ch, event) {
 			sent++
-		default:
+		} else {
 			dropped++
-			cwSseLog.Warn("课件SSE channel已满，事件被丢弃",
+			cwSseLog.Warn("课件SSE channel已满或已关闭，事件被丢弃",
 				"courseware_id", coursewareID,
 				"event_type", event.EventType,
-				"channel_cap", cap(ch),
-				"channel_len", len(ch),
 			)
 		}
 	}

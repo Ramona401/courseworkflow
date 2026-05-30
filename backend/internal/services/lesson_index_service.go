@@ -12,11 +12,11 @@ package services
 // 使用scanner场景（Haiku模型）低成本压缩
 //
 // v89-2变更：CompressLessonIndex增加planID参数，传入真实TraceContext
+// v141 改进：log.Printf → liLog 结构化日志
 
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -232,12 +232,15 @@ func (s *LessonIndexService) BatchIndexAllLessonPlans() {
 		}
 
 		successCount++
-		log.Printf("[教案索引] 进度 %d/%d 成功（ID: %s, 标题: %s）",
-			i+1, total, p.id, truncateStr(p.title, 30))
+		liLog.Info("教案索引进度",
+			"progress", fmt.Sprintf("%d/%d", i+1, total),
+			"plan_id", p.id,
+			"title", truncateStr(p.title, 30),
+		)
 
 		// 每批20个后暂停1秒防限流
 		if (i+1)%20 == 0 && i+1 < total {
-			log.Printf("[教案索引] 已处理%d个，暂停1秒...", i+1)
+			liLog.Info("批量处理暂停防限流", "processed", i+1)
 			time.Sleep(1 * time.Second)
 		}
 	}

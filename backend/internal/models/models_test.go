@@ -89,8 +89,8 @@ func TestSceneGroupMap_Completeness(t *testing.T) {
 		if !ok || group == "" {
 			t.Errorf("场景 %q 在SceneGroupMap中无分组", code)
 		}
-		if group != "pipeline" && group != "lesson_plan" {
-			t.Errorf("场景 %q 分组 %q 不在合法范围(pipeline/lesson_plan)", code, group)
+		if group != "pipeline" && group != "lesson_plan" && group != "courseware" {
+			t.Errorf("场景 %q 分组 %q 不在合法范围(pipeline/lesson_plan/courseware)", code, group)
 		}
 	}
 }
@@ -229,8 +229,8 @@ func TestIsValidStatus(t *testing.T) {
 
 // TestValidRoles_Count 测试角色常量数量=4
 func TestValidRoles_Count(t *testing.T) {
-	if len(ValidRoles) != 4 {
-		t.Errorf("ValidRoles应有4个角色, 实际%d", len(ValidRoles))
+	if len(ValidRoles) != 5 {
+		t.Errorf("ValidRoles应有5个角色, 实际%d", len(ValidRoles))
 	}
 }
 

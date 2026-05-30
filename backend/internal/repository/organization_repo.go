@@ -47,12 +47,12 @@ func CreateOrganization(ctx context.Context, org *models.Organization) error {
 func GetOrganizationByID(ctx context.Context, id string) (*models.Organization, error) {
 	org := &models.Organization{}
 	query := `
-		SELECT id, name, type, parent_id, admin_user_id, settings, status, created_at, updated_at
+		SELECT id, name, type, parent_id, admin_user_id, settings, COALESCE(logo_url,''), status, created_at, updated_at
 		FROM organizations WHERE id = $1
 	`
 	err := database.DB.QueryRow(ctx, query, id).Scan(
 		&org.ID, &org.Name, &org.Type, &org.ParentID, &org.AdminUserID,
-		&org.Settings, &org.Status, &org.CreatedAt, &org.UpdatedAt,
+		&org.Settings, &org.LogoURL, &org.Status, &org.CreatedAt, &org.UpdatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -68,14 +68,14 @@ func GetOrganizationByID(ctx context.Context, id string) (*models.Organization, 
 func GetSchoolByAdminUserID(ctx context.Context, adminUserID string) (*models.Organization, error) {
 	org := &models.Organization{}
 	query := `
-		SELECT id, name, type, parent_id, admin_user_id, settings, status, created_at, updated_at
+		SELECT id, name, type, parent_id, admin_user_id, settings, COALESCE(logo_url,''), status, created_at, updated_at
 		FROM organizations
 		WHERE admin_user_id = $1 AND type = 'school'
 		LIMIT 1
 	`
 	err := database.DB.QueryRow(ctx, query, adminUserID).Scan(
 		&org.ID, &org.Name, &org.Type, &org.ParentID, &org.AdminUserID,
-		&org.Settings, &org.Status, &org.CreatedAt, &org.UpdatedAt,
+		&org.Settings, &org.LogoURL, &org.Status, &org.CreatedAt, &org.UpdatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -88,7 +88,7 @@ func GetSchoolByAdminUserID(ctx context.Context, adminUserID string) (*models.Or
 
 func ListOrganizations(ctx context.Context, orgType string, parentID string) ([]*models.OrganizationListItem, error) {
 	query := `
-		SELECT o.id, o.name, o.type, o.parent_id, o.admin_user_id, o.status, o.created_at,
+		SELECT o.id, o.name, o.type, o.parent_id, o.admin_user_id, COALESCE(o.logo_url,''), o.status, o.created_at,
 		       COALESCE(p.name, '') AS parent_name,
 		       COALESCE(u.display_name, '') AS admin_user_name,
 		       (SELECT COUNT(*) FROM teaching_groups tg WHERE tg.school_id = o.id AND tg.status = 'active') AS group_count,
@@ -124,7 +124,7 @@ func ListOrganizations(ctx context.Context, orgType string, parentID string) ([]
 		item := &models.OrganizationListItem{}
 		err := rows.Scan(
 			&item.ID, &item.Name, &item.Type, &item.ParentID, &item.AdminUserID,
-			&item.Status, &item.CreatedAt,
+			&item.LogoURL, &item.Status, &item.CreatedAt,
 			&item.ParentName, &item.AdminUserName,
 			&item.GroupCount, &item.MemberCount,
 		)
@@ -191,7 +191,7 @@ func CheckOrgNameExists(ctx context.Context, name string, orgType string, exclud
 
 func GetSchoolsByRegion(ctx context.Context, regionID string) ([]*models.Organization, error) {
 	query := `
-		SELECT id, name, type, parent_id, admin_user_id, settings, status, created_at, updated_at
+		SELECT id, name, type, parent_id, admin_user_id, settings, COALESCE(logo_url,''), status, created_at, updated_at
 		FROM organizations WHERE parent_id = $1 AND type = 'school' AND status = 'active'
 		ORDER BY name ASC
 	`
@@ -206,7 +206,7 @@ func GetSchoolsByRegion(ctx context.Context, regionID string) ([]*models.Organiz
 		org := &models.Organization{}
 		err := rows.Scan(
 			&org.ID, &org.Name, &org.Type, &org.ParentID, &org.AdminUserID,
-			&org.Settings, &org.Status, &org.CreatedAt, &org.UpdatedAt,
+			&org.Settings, &org.LogoURL, &org.Status, &org.CreatedAt, &org.UpdatedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("扫描学校行失败: %w", err)
@@ -675,4 +675,111 @@ func IsUserInSchoolByGroup(ctx context.Context, userID string, schoolID string) 
 		return false, fmt.Errorf("检查用户学校归属失败: %w", err)
 	}
 	return count > 0, nil
+}
+
+
+// UpdateOrganizationLogo 更新组织Logo URL
+func UpdateOrganizationLogo(ctx context.Context, id string, logoURL string) error {
+	sql := `UPDATE organizations SET logo_url = $1, updated_at = $2 WHERE id = $3`
+	result, err := database.DB.Exec(ctx, sql, logoURL, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("更新组织Logo失败: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrOrgNotFound
+	}
+	return nil
+}
+
+
+// GetUserOrgLogo 获取用户所属组织的Logo和名称
+// 查找链路：school_members → 学校 → 学校Logo → 如果没有则取区域Logo
+// 返回 (logoURL, orgName)，全部为空表示用户未绑定任何组织
+func GetUserOrgLogo(ctx context.Context, userID string) (string, string) {
+	// 1. 通过school_members查用户所属学校
+	var schoolID, schoolName, schoolLogoURL string
+	var parentID *string
+	err := database.DB.QueryRow(ctx, `
+		SELECT o.id, o.name, COALESCE(o.logo_url, ''), o.parent_id
+		FROM school_members sm
+		JOIN organizations o ON o.id = sm.school_id
+		WHERE sm.user_id = $1 AND o.status = 'active'
+		LIMIT 1
+	`, userID).Scan(&schoolID, &schoolName, &schoolLogoURL, &parentID)
+	if err != nil {
+		// 兜底：通过教研组反查学校
+		err = database.DB.QueryRow(ctx, `
+			SELECT o.id, o.name, COALESCE(o.logo_url, ''), o.parent_id
+			FROM teaching_group_members tgm
+			JOIN teaching_groups tg ON tg.id = tgm.group_id
+			JOIN organizations o ON o.id = tg.school_id
+			WHERE tgm.user_id = $1 AND o.status = 'active'
+			LIMIT 1
+		`, userID).Scan(&schoolID, &schoolName, &schoolLogoURL, &parentID)
+		if err != nil {
+			return "", ""
+		}
+	}
+
+	// 2. 如果学校有Logo，直接返回
+	if schoolLogoURL != "" {
+		return schoolLogoURL, schoolName
+	}
+
+	// 3. 学校没有Logo，尝试从所属区域获取
+	if parentID != nil && *parentID != "" {
+		var regionLogoURL, regionName string
+		err = database.DB.QueryRow(ctx, `
+			SELECT COALESCE(logo_url, ''), name
+			FROM organizations WHERE id = $1 AND status = 'active'
+		`, *parentID).Scan(&regionLogoURL, &regionName)
+		if err == nil && regionLogoURL != "" {
+			return regionLogoURL, schoolName
+		}
+	}
+
+	// 4. 都没有Logo，返回学校名称但空Logo
+	return "", schoolName
+}
+
+// ==================== v139.1 新增:查询用户管理的教研组 ====================
+
+// ListMyLeadOrBackboneGroups 查询当前用户在其中担任 lead 或 backbone 的所有教研组
+//
+// 用途:发布模板时,让用户从"自己管理的教研组"下拉中选择,而不是手填 UUID
+// 返回:每个教研组的 ID/名称/所属学校名/当前用户在此组的角色
+// 排序:lead 排前,然后按 joined_at 升序
+//
+// 复用 organizations + teaching_groups + teaching_group_members 三表 JOIN
+func ListMyLeadOrBackboneGroups(ctx context.Context, userID string) ([]models.PublishTargetGroup, error) {
+        query := `
+                SELECT tg.id, tg.name, COALESCE(o.name, ''), tgm.role
+                FROM teaching_group_members tgm
+                JOIN teaching_groups tg ON tg.id = tgm.group_id
+                LEFT JOIN organizations o ON o.id = tg.school_id
+                WHERE tgm.user_id = $1
+                  AND tgm.role IN ('lead', 'backbone')
+                  AND tg.status = 'active'
+                ORDER BY
+                  CASE tgm.role WHEN 'lead' THEN 0 ELSE 1 END,
+                  tgm.joined_at ASC
+        `
+        rows, err := database.DB.Query(ctx, query, userID)
+        if err != nil {
+                return nil, fmt.Errorf("查询用户管理的教研组失败: %w", err)
+        }
+        defer rows.Close()
+
+        var groups []models.PublishTargetGroup
+        for rows.Next() {
+                g := models.PublishTargetGroup{}
+                if err := rows.Scan(&g.ID, &g.Name, &g.SchoolName, &g.Role); err != nil {
+                        return nil, fmt.Errorf("扫描教研组行失败: %w", err)
+                }
+                groups = append(groups, g)
+        }
+        if groups == nil {
+                groups = []models.PublishTargetGroup{}
+        }
+        return groups, nil
 }

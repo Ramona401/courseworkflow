@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	"tedna/internal/config"
+	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 	"tedna/internal/utils"
@@ -38,6 +41,17 @@ type ossConfig struct {
 	IndexPrefix  string
 	HTMLPrefix   string
 }
+
+// ossUploadConfig OSS上传专用配置（使用单独的Bucket和内网Endpoint）
+type ossUploadConfig struct {
+	Endpoint     string // 内网Endpoint（oss-cn-beijing-internal.aliyuncs.com）
+	Bucket       string // 上传专用Bucket（20260525zuo）
+	AccessKeyID  string // 复用主配置的AccessKey ID
+	AccessKeySec string // 复用主配置的AccessKey Secret（已解密）
+	PublicHost   string // 公网访问域名（20260525zuo.oss-cn-beijing.aliyuncs.com）
+}
+
+var ossLog = logger.WithModule("oss_service")
 
 // getOSSConfig 从数据库读取并解密OSS配置
 func (s *OSSService) getOSSConfig() (*ossConfig, error) {
@@ -82,6 +96,194 @@ func (s *OSSService) getOSSConfig() (*ossConfig, error) {
 		AccessKeyID: accessKeyID, AccessKeySec: accessKeySec,
 		IndexPrefix: indexPrefix, HTMLPrefix: htmlPrefix,
 	}, nil
+}
+
+// getUploadConfig 获取OSS上传专用配置
+// 复用主配置的AccessKey，但使用独立的上传Bucket和内网Endpoint
+func (s *OSSService) getUploadConfig() (*ossUploadConfig, error) {
+	configs, err := repository.GetAllEDConfigs()
+	if err != nil {
+		return nil, fmt.Errorf("读取外部数据配置失败: %w", err)
+	}
+	cfgMap := make(map[string]string)
+	for _, c := range configs {
+		cfgMap[c.ConfigKey] = c.ConfigValue
+	}
+	// 复用主配置的AccessKey
+	accessKeyID := cfgMap["oss_access_key_id"]
+	accessKeyEnc := cfgMap["oss_access_key_enc"]
+	if accessKeyID == "" || accessKeyID == "PLACEHOLDER_SET_IN_ADMIN" {
+		return nil, fmt.Errorf("OSS AccessKey ID未配置")
+	}
+	if accessKeyEnc == "" || accessKeyEnc == "PLACEHOLDER_SET_IN_ADMIN" {
+		return nil, fmt.Errorf("OSS AccessKey Secret未配置")
+	}
+	accessKeySec, err := utils.DecryptAES(accessKeyEnc, s.aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("解密OSS AccessKey Secret失败: %w", err)
+	}
+	// 上传专用Bucket和Endpoint
+	uploadBucket := cfgMap["oss_upload_bucket"]
+	uploadEndpoint := cfgMap["oss_upload_endpoint"]
+	if uploadBucket == "" || uploadBucket == "PLACEHOLDER_SET_IN_ADMIN" {
+		return nil, fmt.Errorf("OSS上传Bucket未配置(oss_upload_bucket)")
+	}
+	if uploadEndpoint == "" || uploadEndpoint == "PLACEHOLDER_SET_IN_ADMIN" {
+		return nil, fmt.Errorf("OSS上传Endpoint未配置(oss_upload_endpoint)")
+	}
+	// 公网访问域名：将内网endpoint替换为外网
+	// oss-cn-beijing-internal.aliyuncs.com → oss-cn-beijing.aliyuncs.com
+	publicEndpoint := strings.Replace(uploadEndpoint, "-internal", "", 1)
+	publicHost := uploadBucket + "." + publicEndpoint
+	return &ossUploadConfig{
+		Endpoint:     uploadEndpoint,
+		Bucket:       uploadBucket,
+		AccessKeyID:  accessKeyID,
+		AccessKeySec: accessKeySec,
+		PublicHost:   publicHost,
+	}, nil
+}
+
+// ==================== OSS上传（课件资产上传到云盘） ====================
+
+// UploadFileToOSS 将本地文件上传到OSS，返回公网可访问的URL
+//
+// 参数:
+//   - localPath: 本地文件路径（如 /www/wwwroot/tedna/uploads/courseware-assets/xxx/p1/xxx.jpg）
+//   - ossKey: OSS对象Key（如 courseware-assets/xxx/p1/xxx.jpg）
+//   - contentType: MIME类型（如 image/png, video/mp4）
+//
+// 返回:
+//   - publicURL: 公网可访问的URL（如 https://20260525zuo.oss-cn-beijing.aliyuncs.com/courseware-assets/xxx/p1/xxx.jpg）
+//   - error: 错误信息
+func (s *OSSService) UploadFileToOSS(localPath string, ossKey string, contentType string) (string, error) {
+	// 1. 获取上传配置
+	cfg, err := s.getUploadConfig()
+	if err != nil {
+		return "", fmt.Errorf("获取OSS上传配置失败: %w", err)
+	}
+
+	// 2. 读取本地文件
+	file, err := os.Open(localPath)
+	if err != nil {
+		return "", fmt.Errorf("打开本地文件失败: %w", err)
+	}
+	defer file.Close()
+
+	// 获取文件大小（用于Content-Length头）
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return "", fmt.Errorf("获取文件信息失败: %w", err)
+	}
+
+	// 3. 构建PUT请求URL（走内网Endpoint上传）
+	putURL := fmt.Sprintf("https://%s.%s/%s", cfg.Bucket, cfg.Endpoint, ossKey)
+	req, err := http.NewRequest("PUT", putURL, file)
+	if err != nil {
+		return "", fmt.Errorf("创建上传请求失败: %w", err)
+	}
+
+	// 4. 设置请求头
+	date := time.Now().UTC().Format(http.TimeFormat)
+	req.Header.Set("Date", date)
+	req.Header.Set("Content-Type", contentType)
+	req.ContentLength = fileInfo.Size()
+
+	// 5. 计算V1签名（PUT请求需要包含Content-Type）
+	resource := fmt.Sprintf("/%s/%s", cfg.Bucket, ossKey)
+	signStr := "PUT" + "\n" + "\n" + contentType + "\n" + date + "\n" + resource
+	mac := hmac.New(sha1.New, []byte(cfg.AccessKeySec))
+	mac.Write([]byte(signStr))
+	signature := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	req.Header.Set("Authorization", fmt.Sprintf("OSS %s:%s", cfg.AccessKeyID, signature))
+
+	// 6. 执行上传
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("OSS上传请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 7. 检查响应
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		bodyStr := string(body)
+		if len(bodyStr) > 300 {
+			bodyStr = bodyStr[:300]
+		}
+		return "", fmt.Errorf("OSS上传失败(HTTP %d): %s", resp.StatusCode, bodyStr)
+	}
+
+	// 8. 构建公网访问URL
+	publicURL := fmt.Sprintf("https://%s/%s", cfg.PublicHost, ossKey)
+
+	ossLog.Info("文件上传OSS成功",
+		"local_path", localPath,
+		"oss_key", ossKey,
+		"size", fileInfo.Size(),
+		"public_url", publicURL,
+	)
+
+	return publicURL, nil
+}
+
+// UploadAssetToOSS 将课件资产（图片/视频/音频）上传到OSS
+// 根据资产的本地URL路径，自动推导OSS Key和Content-Type
+//
+// 参数:
+//   - localURL: 资产的本地访问URL（如 /uploads/courseware-assets/xxx/p1/xxx.jpg）
+//
+// 返回:
+//   - publicURL: 公网可访问的OSS URL
+//   - error: 错误信息
+func (s *OSSService) UploadAssetToOSS(localURL string) (string, error) {
+	// 1. 从URL路径推导本地磁盘路径
+	// /uploads/courseware-assets/xxx/p1/xxx.jpg → /www/wwwroot/tedna/uploads/courseware-assets/xxx/p1/xxx.jpg
+	if !strings.HasPrefix(localURL, "/uploads/") {
+		return "", fmt.Errorf("不支持的资源路径格式: %s", localURL)
+	}
+	localPath := "/www/wwwroot/tedna" + localURL
+
+	// 检查文件是否存在
+	if _, err := os.Stat(localPath); os.IsNotExist(err) {
+		return "", fmt.Errorf("本地文件不存在: %s", localPath)
+	}
+
+	// 2. 推导OSS Key（去掉 /uploads/ 前缀）
+	// /uploads/courseware-assets/xxx/p1/xxx.jpg → courseware-assets/xxx/p1/xxx.jpg
+	ossKey := strings.TrimPrefix(localURL, "/uploads/")
+
+	// 3. 推导Content-Type
+	ext := strings.ToLower(filepath.Ext(localPath))
+	contentType := "application/octet-stream"
+	switch ext {
+	case ".jpg", ".jpeg":
+		contentType = "image/jpeg"
+	case ".png":
+		contentType = "image/png"
+	case ".webp":
+		contentType = "image/webp"
+	case ".gif":
+		contentType = "image/gif"
+	case ".svg":
+		contentType = "image/svg+xml"
+	case ".mp4":
+		contentType = "video/mp4"
+	case ".webm":
+		contentType = "video/webm"
+	case ".mov":
+		contentType = "video/quicktime"
+	case ".avi":
+		contentType = "video/x-msvideo"
+	case ".mp3":
+		contentType = "audio/mpeg"
+	case ".wav":
+		contentType = "audio/wav"
+	}
+
+	// 4. 执行上传
+	return s.UploadFileToOSS(localPath, ossKey, contentType)
 }
 
 // signAndGet 签名并执行OSS GET对象请求

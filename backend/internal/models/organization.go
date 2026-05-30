@@ -14,6 +14,7 @@ type Organization struct {
 	ParentID    *string    `json:"parent_id"`
 	AdminUserID *string    `json:"admin_user_id"`
 	Settings    string     `json:"settings"`
+	LogoURL     string     `json:"logo_url"`      // 组织Logo URL
 	Status      string     `json:"status"`
 	CreatedAt   *time.Time `json:"created_at"`
 	UpdatedAt   *time.Time `json:"updated_at"`
@@ -33,6 +34,7 @@ type TeachingGroup struct {
 	LeadUserID  *string    `json:"lead_user_id"`  // 兼容保留，实际组长通过成员角色管理
 	Description string     `json:"description"`
 	Settings    string     `json:"settings"`
+	LogoURL     string     `json:"logo_url"`      // 组织Logo URL
 	Status      string     `json:"status"`
 	CreatedAt   *time.Time `json:"created_at"`
 	UpdatedAt   *time.Time `json:"updated_at"`
@@ -149,6 +151,7 @@ type OrganizationListItem struct {
 	AdminUserID   *string    `json:"admin_user_id"`
 	AdminUserName string     `json:"admin_user_name"`
 	Status        string     `json:"status"`
+	LogoURL       string     `json:"logo_url"`
 	GroupCount    int        `json:"group_count"`
 	MemberCount   int        `json:"member_count"`
 	CreatedAt     *time.Time `json:"created_at"`

@@ -19,10 +19,14 @@ package ai
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"time"
+
+	"tedna/internal/logger"
 )
+
+// mmLog 模块级结构化日志器
+var mmLog = logger.WithModule("ai.multimodal")
 
 // ==================== 多模态类型定义 ====================
 
@@ -126,17 +130,24 @@ func CallAIMultimodal(cfg *EffectiveConfig, systemPrompt string, userText string
 		for attempt := 0; attempt <= maxRetries; attempt++ {
 			if attempt > 0 {
 				delay := getRetryDelay(attempt - 1)
-				log.Printf("[AI多模态重试] 模型 %s 第%d次重试，等待%s", modelEntry.model, attempt, delay)
+				mmLog.Info("多模态重试等待",
+					"model", modelEntry.model,
+					"attempt", attempt,
+					"delay", delay)
 				time.Sleep(delay)
 			}
 
 			result, err := callAIOnce(cfg, endpoint, jsonBody)
 			if err == nil {
 				if attempt > 0 {
-					log.Printf("[AI多模态重试] 模型 %s 第%d次重试成功", modelEntry.model, attempt)
+					mmLog.Info("多模态重试成功",
+						"model", modelEntry.model,
+						"attempt", attempt)
 				}
 				if modelEntry.isFallback {
-					log.Printf("[AI Fallback] 多模态降级模型 %s 调用成功（原始: %s）", modelEntry.model, primaryModel)
+					mmLog.Info("多模态降级模型调用成功",
+						"fallback_model", modelEntry.model,
+						"original_model", primaryModel)
 				}
 				mmLatMs := time.Since(startTime).Milliseconds()
 				emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
@@ -154,15 +165,20 @@ func CallAIMultimodal(cfg *EffectiveConfig, systemPrompt string, userText string
 					modelEntry.isFallback, primaryModel)
 				return nil, err
 			}
-			log.Printf("[AI多模态重试] 模型 %s 失败（第%d/%d次）: %s",
-				modelEntry.model, attempt+1, maxRetries+1, err.Error())
+			mmLog.Warn("多模态调用失败",
+				"model", modelEntry.model,
+				"attempt", attempt+1,
+				"max_attempts", maxRetries+1,
+				"error", err.Error())
 		}
 
 		// 当前模型所有重试失败
 		if modelEntry.isFallback {
-			log.Printf("[AI Fallback] 多模态降级模型 %s 所有重试失败", modelEntry.model)
+			mmLog.Warn("多模态降级模型所有重试失败",
+				"model", modelEntry.model)
 		} else {
-			log.Printf("[AI Fallback] 多模态主模型 %s 所有重试失败，开始尝试降级", modelEntry.model)
+			mmLog.Warn("多模态主模型所有重试失败，开始尝试降级",
+				"model", modelEntry.model)
 		}
 	}
 

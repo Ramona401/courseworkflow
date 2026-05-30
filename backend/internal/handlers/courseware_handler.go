@@ -13,7 +13,8 @@ import (
 )
 
 // ==================== 课件工坊HTTP处理器 ====================
-// 课件CRUD + 页面操作 + 状态流转 + 风格模板
+// 课件CRUD + 页面操作 + 状态流转 + 风格模板 + Logo上传
+// Phase 4A: 新增UploadLogo/SaveStyleFull/ConfirmStyle
 
 // CoursewareHandler 课件工坊处理器
 type CoursewareHandler struct {
@@ -295,7 +296,7 @@ func (h *CoursewareHandler) ConfirmIndex(w http.ResponseWriter, r *http.Request)
 	utils.Success(w, map[string]string{"message": "索引确认成功，请选择风格"})
 }
 
-// SaveStyle PUT /api/v1/coursewares/{id}/style — 保存风格
+// SaveStyle PUT /api/v1/coursewares/{id}/style — 保存风格（兼容旧接口）
 func (h *CoursewareHandler) SaveStyle(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
@@ -323,6 +324,98 @@ func (h *CoursewareHandler) SaveStyle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	utils.Success(w, map[string]string{"message": "风格保存成功"})
+}
+
+// SaveStyleFull POST /api/v1/coursewares/{id}/save-style — Phase 4A: 保存完整风格配置
+func (h *CoursewareHandler) SaveStyleFull(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+	id := extractCoursewareMiddleID(r.URL.Path, "/save-style")
+	if id == "" {
+		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	var req models.SaveStyleFullRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+
+	if err := h.cwService.SaveStyleFull(r.Context(), id, claims.UserID, &req); err != nil {
+		utils.InternalError(w, err.Error())
+		return
+	}
+	utils.Success(w, map[string]string{"message": "风格配置保存成功"})
+}
+
+// ConfirmStyle POST /api/v1/coursewares/{id}/confirm-style — Phase 4A: 确认风格
+func (h *CoursewareHandler) ConfirmStyle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+	id := extractCoursewareMiddleID(r.URL.Path, "/confirm-style")
+	if id == "" {
+		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	if err := h.cwService.ConfirmStyle(r.Context(), id, claims.UserID); err != nil {
+		utils.InternalError(w, err.Error())
+		return
+	}
+	utils.Success(w, map[string]string{"message": "风格确认成功，准备生成课件"})
+}
+
+// UploadLogo POST /api/v1/coursewares/{id}/upload-logo — Phase 4A: 上传Logo
+func (h *CoursewareHandler) UploadLogo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+	id := extractCoursewareMiddleID(r.URL.Path, "/upload-logo")
+	if id == "" {
+		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	// 解析multipart表单（最大4MB缓冲）
+	if err := r.ParseMultipartForm(4 << 20); err != nil {
+		utils.BadRequest(w, "文件解析失败: "+err.Error())
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		utils.BadRequest(w, "缺少文件字段 file")
+		return
+	}
+	defer file.Close()
+
+	resp, err := h.cwService.UploadLogo(r.Context(), id, file, header, claims.UserID)
+	if err != nil {
+		utils.InternalError(w, err.Error())
+		return
+	}
+	utils.Success(w, resp)
 }
 
 // ConfirmCourseware POST /api/v1/coursewares/{id}/confirm — 确认课件
@@ -450,4 +543,73 @@ func extractCWTemplateID(path string) string {
 		return rest[:idx]
 	}
 	return strings.TrimRight(rest, "/")
+}
+
+
+// ==================== v0.42新增：从主题创建课件 ====================
+
+// CreateFromTopic POST /api/v1/coursewares/from-topic — 从主题直接创建课件
+func (h *CoursewareHandler) CreateFromTopic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	var req models.CreateCoursewareFromTopicRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+
+	cw, err := h.cwService.CreateCoursewareFromTopic(r.Context(), claims.UserID, &req)
+	if err != nil {
+		utils.InternalError(w, "创建课件失败: "+err.Error())
+		return
+	}
+	utils.Success(w, cw)
+}
+
+// ==================== v0.42.11新增：创建3D互动单页课件 ====================
+
+// CreateFrom3D POST /api/v1/coursewares/from-3d — 创建3D互动单页课件
+// 创建后 source_type='3d_single'，状态直接为 generating，自动创建1个页面记录
+func (h *CoursewareHandler) CreateFrom3D(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	var req struct {
+		Subject     string `json:"subject"`
+		Grade       string `json:"grade"`
+		Topic       string `json:"topic"`
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+
+	cw, err := h.cwService.CreateCoursewareFrom3D(r.Context(), claims.UserID, req.Subject, req.Grade, req.Topic, req.Description)
+	if err != nil {
+		utils.InternalError(w, "创建3D课件失败: "+err.Error())
+		return
+	}
+	utils.Success(w, map[string]interface{}{
+		"id":          cw.ID,
+		"title":       cw.Title,
+		"source_type": cw.SourceType,
+		"status":      cw.Status,
+		"message":     "3D互动单页课件创建成功，请触发生成",
+	})
 }

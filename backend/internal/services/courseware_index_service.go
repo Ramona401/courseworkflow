@@ -59,7 +59,7 @@ type cwSchemeItem struct {
 // ==================== 核心方法：生成课件索引（两层AI） ====================
 
 // GenerateIndex 生成课件索引（异步执行，通过SSE推送进度）
-func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID string, userID string) error {
+func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID string, userID string, preset string) error {
 	// ---- 1. 获取课件信息 ----
 	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
 	if err != nil {
@@ -76,7 +76,11 @@ func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID
 	}
 
 	// ---- 2. 获取关联教案全部内容 ----
-	lp, err := repository.GetLessonPlanByID(ctx, cw.LessonPlanID)
+	if cw.LessonPlanID == nil || *cw.LessonPlanID == "" {
+		s.broadcastError(coursewareID, "课件未关联教案，无法生成方案")
+		return fmt.Errorf("课件未关联教案")
+	}
+	lp, err := repository.GetLessonPlanByID(ctx, *cw.LessonPlanID)
 	if err != nil {
 		s.broadcastError(coursewareID, "关联教案不存在: "+err.Error())
 		return fmt.Errorf("关联教案不存在: %w", err)
@@ -120,7 +124,7 @@ func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID
 		return fmt.Errorf("获取AI配置失败: %w", err)
 	}
 
-	userPrompt1 := s.buildLayer1UserPrompt(lp, lessonContent)
+	userPrompt1 := s.buildLayer1UserPrompt(lp, lessonContent, preset)
 	traceCtx1 := &ai.TraceContext{SceneCode: "courseware_index", UserID: &userID}
 	callResult1, err := ai.CallAI(aiCfg1, dictPrompt.Content, userPrompt1, traceCtx1)
 	if err != nil {
@@ -248,7 +252,7 @@ func (s *CoursewareIndexService) saveAndBroadcast(ctx context.Context, coursewar
 
 // ==================== 层1 提示词构建 ====================
 
-func (s *CoursewareIndexService) buildLayer1UserPrompt(lp *models.LessonPlan, content string) string {
+func (s *CoursewareIndexService) buildLayer1UserPrompt(lp *models.LessonPlan, content string, preset string) string {
 	var sb strings.Builder
 	sb.WriteString("请根据以下教案内容，先输出课件脉络概述（OVERVIEW:），再为每一页生成AOCI压缩索引。\n\n")
 	sb.WriteString("## 教案基本信息\n")
@@ -257,6 +261,15 @@ func (s *CoursewareIndexService) buildLayer1UserPrompt(lp *models.LessonPlan, co
 	sb.WriteString(fmt.Sprintf("- 年级：%s\n", lp.Grade))
 	sb.WriteString("\n## 教案完整内容\n\n")
 	sb.WriteString(content)
+	// v136: 注入方案结构预设提示
+	if preset != "" {
+		presetObj := models.GetSchemePresetByKey(preset)
+		if presetObj != nil && presetObj.PromptHint != "" {
+			sb.WriteString("\n\n")
+			sb.WriteString(presetObj.PromptHint)
+			sb.WriteString("\n")
+		}
+	}
 	sb.WriteString("\n\n请严格按照字典格式输出（先OVERVIEW:概述，再PAGE:页面索引，不要任何格式之外的说明文字）：")
 	return sb.String()
 }
@@ -493,7 +506,14 @@ func (s *CoursewareIndexService) fallbackTranslateToPages(rawPages []*cwRawPageI
 
 func (s *CoursewareIndexService) extractLessonPlanContent(lp *models.LessonPlan) string {
 	var parts []string
-	if lp.ConversationLog != "" {
+
+	// 优先级1: content_markdown — 教案正文（Fork/导入/手动编辑的教案内容存储在此字段）
+	if lp.ContentMarkdown != "" && len(strings.TrimSpace(lp.ContentMarkdown)) > 50 {
+		parts = append(parts, lp.ContentMarkdown)
+	}
+
+	// 优先级2: conversation_log — 对话记录中最长的assistant消息（AI备课工坊生成的教案）
+	if len(parts) == 0 && lp.ConversationLog != "" {
 		messages := s.parseConversationLog(lp.ConversationLog)
 		var longestMsg string
 		for i := len(messages) - 1; i >= 0; i-- {
@@ -505,12 +525,17 @@ func (s *CoursewareIndexService) extractLessonPlanContent(lp *models.LessonPlan)
 			parts = append(parts, longestMsg)
 		}
 	}
-	if lp.AIReviewResult != "" && len(parts) == 0 {
+
+	// 优先级3: ai_review_result — AI评审结果
+	if len(parts) == 0 && lp.AIReviewResult != "" {
 		parts = append(parts, "【AI评审结果】\n"+lp.AIReviewResult)
 	}
+
+	// 优先级4: ai_review_history — 评审历史（最后兜底）
 	if len(parts) == 0 && lp.AIReviewHistory != "" {
 		parts = append(parts, "【教案历史】\n"+lp.AIReviewHistory)
 	}
+
 	return strings.Join(parts, "\n\n---\n\n")
 }
 
@@ -769,4 +794,339 @@ func cwCleanChinesePunctuation(s string) string {
 		"\uff01", "!", "\uff1f", "?",       // 全角感叹号、问号
 	)
 	return replacer.Replace(s)
+}
+
+// ==================== v136新增：AI修改方案 ====================
+
+// RefineIndex 根据用户反馈修改课件方案（异步执行，通过SSE推送进度）
+// 流程：
+//   1. 获取当前全部页面方案
+//   2. 拼接用户反馈+当前方案+教案内容
+//   3. 调用层2 AI（scheme场景）重新生成修改后的方案JSON
+//   4. 解析JSON,保留层1索引,仅更新层2用户字段
+//   5. 写入数据库并SSE广播
+func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID string, userID string, feedback string) error {
+	// ---- 1. 获取课件和教案信息 ----
+	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+	if err != nil {
+		s.broadcastError(coursewareID, "课件不存在: "+err.Error())
+		return fmt.Errorf("课件不存在: %w", err)
+	}
+	if cw.UserID != userID {
+		s.broadcastError(coursewareID, "无权操作此课件")
+		return fmt.Errorf("无权操作此课件")
+	}
+
+	// 获取当前全部页面
+	pages, err := repository.ListCoursewarePages(ctx, coursewareID)
+	if err != nil || len(pages) == 0 {
+		s.broadcastError(coursewareID, "当前没有可修改的方案页面")
+		return fmt.Errorf("当前没有可修改的方案页面")
+	}
+
+	// 获取关联教案
+	if cw.LessonPlanID == nil || *cw.LessonPlanID == "" {
+		s.broadcastError(coursewareID, "课件未关联教案，无法生成方案")
+		return fmt.Errorf("课件未关联教案")
+	}
+	lp, err := repository.GetLessonPlanByID(ctx, *cw.LessonPlanID)
+	if err != nil {
+		s.broadcastError(coursewareID, "关联教案不存在")
+		return fmt.Errorf("关联教案不存在: %w", err)
+	}
+
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEIndexStart,
+		Data: map[string]interface{}{
+			"courseware_id": coursewareID,
+			"message":      "正在根据您的意见修改方案...",
+		},
+	})
+
+	// ---- 2. 构建修改提示词 ----
+	var promptBuf strings.Builder
+	promptBuf.WriteString("你是课件方案修改专家。用户对当前课件方案提出了修改意见，请根据意见调整方案。\n\n")
+	promptBuf.WriteString(fmt.Sprintf("## 课件基本信息\n- 标题：%s\n- 学科：%s\n- 年级：%s\n\n", lp.Title, lp.Subject, lp.Grade))
+	promptBuf.WriteString("## 当前方案（需要修改）\n")
+	for _, p := range pages {
+		promptBuf.WriteString(fmt.Sprintf("第%d页 | 标题：%s | 目的：%s | 概要：%s | 交互：%s | 视觉：%s | 复杂度：%d\n",
+			p.PageNumber, p.Title, p.Purpose, p.ContentSummary, p.InteractionType, p.VisualFormat, p.EstimatedComplexity))
+	}
+	promptBuf.WriteString(fmt.Sprintf("\n## 用户修改意见\n%s\n\n", feedback))
+	promptBuf.WriteString("## 输出要求\n")
+	promptBuf.WriteString("请输出修改后的完整方案，格式为JSON数组。每个元素包含以下字段：\n")
+	promptBuf.WriteString("page_number(int), title(string), purpose(string), content_summary(string), interaction_type(string), visual_format(string), media_requirements(string), estimated_complexity(int 1-5)\n")
+	promptBuf.WriteString("\n可以增加、删除或修改页面。page_number从1开始连续编号。\n")
+	promptBuf.WriteString("交互类型可选：static/click/drag/input/animation/video/game/quiz\n")
+	promptBuf.WriteString("视觉形式可选：text_heavy/image_text/diagram/chart/timeline/comparison/gallery/fullscreen_media\n")
+	promptBuf.WriteString("\n请只输出JSON数组，不要有任何额外说明文字。")
+
+	// ---- 3. 调用AI ----
+	schemePromptObj, sErr := repository.GetCurrentPromptByKey("prompt_courseware_scheme")
+	systemPrompt := ""
+	if sErr == nil {
+		systemPrompt = schemePromptObj.Content
+	} else {
+		systemPrompt = "你是课件方案设计专家，请按要求输出JSON格式的课件方案。"
+	}
+
+	aiCfg, err := ai.GetEffectiveConfig(
+		s.cfg.GetAESKey(), "courseware_scheme",
+		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		// courseware_scheme场景不存在时降级到scanner
+		aiCfg, err = ai.GetEffectiveConfig(
+			s.cfg.GetAESKey(), "scanner",
+			s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+		)
+		if err != nil {
+			s.broadcastError(coursewareID, "获取AI配置失败")
+			return fmt.Errorf("获取AI配置失败: %w", err)
+		}
+	}
+
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEIndexProgress,
+		Data:      map[string]interface{}{"message": "AI正在修改方案..."},
+	})
+
+	traceCtx := &ai.TraceContext{SceneCode: "courseware_scheme", UserID: &userID}
+	callResult, err := ai.CallAI(aiCfg, systemPrompt, promptBuf.String(), traceCtx)
+	if err != nil {
+		s.broadcastError(coursewareID, "AI修改方案失败: "+err.Error())
+		return fmt.Errorf("AI调用失败: %w", err)
+	}
+
+	// ---- 4. 解析AI输出的JSON ----
+	schemes, err := s.parseSchemeJSON(callResult.Content)
+	if err != nil {
+		s.broadcastError(coursewareID, "解析修改后的方案失败: "+err.Error())
+		return fmt.Errorf("解析方案失败: %w", err)
+	}
+	if len(schemes) == 0 {
+		s.broadcastError(coursewareID, "AI未返回有效方案")
+		return fmt.Errorf("AI未返回有效方案")
+	}
+
+	// ---- 5. 构建新的CoursewarePage列表 ----
+	// 尽量保留原有页面的层1索引信息
+	oldPageMap := make(map[int]*models.CoursewarePage)
+	for _, p := range pages {
+		oldPageMap[p.PageNumber] = p
+	}
+
+	var newPages []*models.CoursewarePage
+	for _, sc := range schemes {
+		pn := sc.PageNumber
+		if pn <= 0 {
+			pn = len(newPages) + 1
+		}
+		page := &models.CoursewarePage{
+			CoursewareID:        coursewareID,
+			PageNumber:          pn,
+			Title:               strings.TrimSpace(sc.Title),
+			Purpose:             strings.TrimSpace(sc.Purpose),
+			ContentSummary:      strings.TrimSpace(sc.ContentSummary),
+			InteractionType:     strings.TrimSpace(sc.InteractionType),
+			VisualFormat:        strings.TrimSpace(sc.VisualFormat),
+			MediaRequirements:   strings.TrimSpace(sc.MediaRequirements),
+			EstimatedComplexity: cwClamp(sc.EstimatedComplexity, 1, 5),
+			Status:              models.CWPageStatusPending,
+		}
+		// 如果原有相同页码的页面有层1索引，保留
+		if oldPage, ok := oldPageMap[pn]; ok {
+			page.PageIndex = oldPage.PageIndex
+			page.IdxCognitiveLevel = oldPage.IdxCognitiveLevel
+			page.IdxInteractionLevel = oldPage.IdxInteractionLevel
+			page.IdxVisualFormat = oldPage.IdxVisualFormat
+		}
+		if page.InteractionType == "" {
+			page.InteractionType = "static"
+		}
+		if page.VisualFormat == "" {
+			page.VisualFormat = "text_heavy"
+		}
+		newPages = append(newPages, page)
+	}
+
+	// 重新编号（确保连续）
+	for i, p := range newPages {
+		p.PageNumber = i + 1
+	}
+
+	log.Printf("[courseware_index] RefineIndex完成: cw=%s oldPages=%d newPages=%d model=%s tokens=%d feedback=%s",
+		coursewareID, len(pages), len(newPages), callResult.ModelUsed, callResult.TokensUsed, cwTruncate(feedback, 50))
+
+	// ---- 6. 保存并广播 ----
+	// 保留原有概述不变
+	return s.saveAndBroadcast(ctx, coursewareID, cw.IndexOverview, newPages)
+}
+
+
+// ==================== v0.42新增：从主题直接生成课件索引 ====================
+
+// GenerateIndexFromTopic 从主题直接生成课件索引（无教案，纯AI规划）
+// 流程：
+//   1. 校验课件状态和权限
+//   2. 用主题信息构建提示词，跳过层1（无教案内容可压缩）
+//   3. 直接调层2 AI生成方案JSON
+//   4. 写入数据库并SSE广播
+func (s *CoursewareIndexService) GenerateIndexFromTopic(ctx context.Context, coursewareID string, userID string, req *models.CreateCoursewareFromTopicRequest, preset string) error {
+	// ---- 1. 获取课件信息 ----
+	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+	if err != nil {
+		s.broadcastError(coursewareID, "课件不存在: "+err.Error())
+		return fmt.Errorf("课件不存在: %w", err)
+	}
+	if cw.UserID != userID {
+		s.broadcastError(coursewareID, "无权操作此课件")
+		return fmt.Errorf("无权操作此课件")
+	}
+	if cw.Status != models.CoursewareStatusDraft && cw.Status != models.CoursewareStatusIndexing {
+		s.broadcastError(coursewareID, "当前状态不允许生成方案: "+cw.Status)
+		return fmt.Errorf("当前状态不允许生成方案: %s", cw.Status)
+	}
+
+	// ---- 2. 更新课件状态为 indexing ----
+	if cw.Status == models.CoursewareStatusDraft {
+		_ = repository.UpdateCoursewareStatus(ctx, coursewareID, models.CoursewareStatusIndexing)
+	}
+
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEIndexStart,
+		Data: map[string]interface{}{
+			"courseware_id": coursewareID,
+			"message":      "正在根据主题规划课件方案...",
+		},
+	})
+
+	// ---- 3. 构建主题直接生成的提示词 ----
+	userPrompt := s.buildTopicDirectPrompt(req, preset)
+
+	// ---- 4. 加载提示词模板（复用 courseware_scheme 场景） ----
+	schemePrompt, sErr := repository.GetCurrentPromptByKey("prompt_courseware_scheme")
+	systemPrompt := ""
+	if sErr == nil {
+		systemPrompt = schemePrompt.Content
+	} else {
+		systemPrompt = "你是K12课件规划专家，请按要求输出JSON格式的课件方案。"
+	}
+
+	// ---- 5. 调用AI（courseware_scheme场景，降级到scanner） ----
+	aiCfg, err := ai.GetEffectiveConfig(
+		s.cfg.GetAESKey(), "courseware_scheme",
+		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		aiCfg, err = ai.GetEffectiveConfig(
+			s.cfg.GetAESKey(), "scanner",
+			s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+		)
+		if err != nil {
+			s.broadcastError(coursewareID, "获取AI配置失败")
+			return fmt.Errorf("获取AI配置失败: %w", err)
+		}
+	}
+
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEIndexProgress,
+		Data:      map[string]interface{}{"message": "AI正在规划课件结构..."},
+	})
+
+	traceCtx := &ai.TraceContext{SceneCode: "courseware_scheme", UserID: &userID}
+	callResult, err := ai.CallAI(aiCfg, systemPrompt, userPrompt, traceCtx)
+	if err != nil {
+		s.broadcastError(coursewareID, "AI规划失败: "+err.Error())
+		return fmt.Errorf("AI调用失败: %w", err)
+	}
+
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEIndexProgress,
+		Data:      map[string]interface{}{"message": "方案生成完成，正在整理..."},
+	})
+
+	// ---- 6. 解析JSON输出 ----
+	schemes, err := s.parseSchemeJSON(callResult.Content)
+	if err != nil {
+		s.broadcastError(coursewareID, "解析方案失败: "+err.Error())
+		return fmt.Errorf("解析方案失败: %w", err)
+	}
+	if len(schemes) == 0 {
+		s.broadcastError(coursewareID, "AI未返回有效方案")
+		return fmt.Errorf("AI未返回有效方案")
+	}
+
+	// ---- 7. 构建CoursewarePage列表（无层1索引，全部来自层2方案） ----
+	var pages []*models.CoursewarePage
+	for i, sc := range schemes {
+		page := &models.CoursewarePage{
+			CoursewareID:        coursewareID,
+			PageNumber:          i + 1,
+			Title:               strings.TrimSpace(sc.Title),
+			Purpose:             strings.TrimSpace(sc.Purpose),
+			ContentSummary:      strings.TrimSpace(sc.ContentSummary),
+			InteractionType:     strings.TrimSpace(sc.InteractionType),
+			VisualFormat:        strings.TrimSpace(sc.VisualFormat),
+			MediaRequirements:   strings.TrimSpace(sc.MediaRequirements),
+			EstimatedComplexity: cwClamp(sc.EstimatedComplexity, 1, 5),
+			Status:              models.CWPageStatusPending,
+		}
+		if page.InteractionType == "" {
+			page.InteractionType = "static"
+		}
+		if page.VisualFormat == "" {
+			page.VisualFormat = "text_heavy"
+		}
+		pages = append(pages, page)
+	}
+
+	// 生成简要概述
+	overview := fmt.Sprintf("主题：%s（%s·%s），共%d页课件方案，由AI根据主题直接规划。",
+		req.Topic, req.Subject, req.Grade, len(pages))
+
+	log.Printf("[courseware_index] TopicDirect完成: cw=%s pages=%d model=%s tokens=%d topic=%s",
+		coursewareID, len(pages), callResult.ModelUsed, callResult.TokensUsed, req.Topic)
+
+	return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
+}
+
+// buildTopicDirectPrompt 构建主题直接生成的用户提示词
+func (s *CoursewareIndexService) buildTopicDirectPrompt(req *models.CreateCoursewareFromTopicRequest, preset string) string {
+	var sb strings.Builder
+	sb.WriteString("你是K12课件规划专家。\n根据以下信息，设计一份完整的课件大纲（每页详细说明）。\n\n")
+	sb.WriteString(fmt.Sprintf("学科: %s\n", req.Subject))
+	sb.WriteString(fmt.Sprintf("年级: %s\n", req.Grade))
+	sb.WriteString(fmt.Sprintf("主题: %s\n", req.Topic))
+	if req.PageRange != "" {
+		sb.WriteString(fmt.Sprintf("期望页数: %s\n", req.PageRange))
+	} else {
+		sb.WriteString("期望页数: 按学段默认（小学15-25页，初中20-30页，高中22-35页）\n")
+	}
+	if req.ExtraNotes != "" {
+		sb.WriteString(fmt.Sprintf("额外说明: %s\n", req.ExtraNotes))
+	}
+
+	// 注入方案结构预设
+	if preset != "" {
+		presetObj := models.GetSchemePresetByKey(preset)
+		if presetObj != nil && presetObj.PromptHint != "" {
+			sb.WriteString("\n")
+			sb.WriteString(presetObj.PromptHint)
+			sb.WriteString("\n")
+		}
+	}
+
+	sb.WriteString("\n请输出JSON数组格式。每个元素包含以下字段：\n")
+	sb.WriteString("page_number(int), title(string), purpose(string), content_summary(string), ")
+	sb.WriteString("interaction_type(string), visual_format(string), media_requirements(string), estimated_complexity(int 1-5)\n\n")
+	sb.WriteString("设计原则：\n")
+	sb.WriteString("1. 遵循课程标准，知识点覆盖完整\n")
+	sb.WriteString("2. 结构：封面(1页) → 学习目标(1页) → 知识讲授(主体) → 练习(2-3页) → 总结(1页)\n")
+	sb.WriteString("3. 交互类型分布：纯展示≤40%，简单交互30-40%，复杂交互≤20%\n")
+	sb.WriteString("4. 难度递进：前1/3基础 → 中1/3进阶 → 后1/3综合\n\n")
+	sb.WriteString("交互类型可选：static/click/drag/input/animation/video/game/quiz\n")
+	sb.WriteString("视觉形式可选：text_heavy/image_text/diagram/chart/timeline/comparison/gallery/fullscreen_media\n\n")
+	sb.WriteString("请只输出JSON数组，不要有任何额外说明文字。")
+	return sb.String()
 }

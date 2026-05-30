@@ -116,9 +116,14 @@ func (s *AuthService) Login(ctx context.Context, req *models.LoginRequest) (*mod
 	)
 
 	// 7. 返回 token 和用户信息
+	info := user.ToUserInfo()
+	orgLogo, orgName := repository.GetUserOrgLogo(ctx, user.ID)
+	info.OrgLogoURL = orgLogo
+	info.OrgName = orgName
+
 	return &models.LoginResponse{
 		Token: token,
-		User:  user.ToUserInfo(),
+		User:  info,
 	}, nil
 }
 
@@ -184,5 +189,12 @@ func (s *AuthService) GetCurrentUser(ctx context.Context, claims *JWTClaims) (*m
 		return nil, ErrUserDisabled
 	}
 
-	return user.ToUserInfo(), nil
+	info := user.ToUserInfo()
+
+	// 查询用户所属组织的Logo和名称（学校>区域>空）
+	orgLogo, orgName := repository.GetUserOrgLogo(ctx, user.ID)
+	info.OrgLogoURL = orgLogo
+	info.OrgName = orgName
+
+	return info, nil
 }

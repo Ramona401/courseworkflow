@@ -1,6 +1,6 @@
 package services
 
-// lp_sse_hub.go — 教案系统SSE广播中心
+// lp_sse_hub.go — 教案系统SSE广播中心 (v142 P3-3 竞态修复)
 //
 // v73 BugFix1：channel缓冲从20扩大到2000，避免write阶段chunk丢失
 //
@@ -12,6 +12,11 @@ package services
 //         Subscribe时先关闭该planID的所有旧channel，再建新channel。
 //   注意：关闭旧channel会让旧goroutine的 for-select 收到channel关闭信号，
 //         自然退出，不会有资源泄漏。
+//
+// v142 P3-3 修复:
+//   - safeCloseLPChan: 防止double-close panic(recover保护)
+//   - Broadcast: send操作加recover防御,防止send-on-closed panic
+//   - Subscribe/Unsubscribe: close(ch)统一替换为safeCloseLPChan(ch)
 
 import (
 	"sync"
@@ -19,13 +24,46 @@ import (
 	"tedna/internal/models"
 )
 
+// ==================== 防御性辅助函数 ====================
+
+var lpSseLog = logger.WithModule("lp_sse")
+
+// safeCloseLPChan 安全关闭教案SSE channel
+// 使用 recover 防止 double-close panic（防御性编程，正常路径不应触发）
+func safeCloseLPChan(ch chan models.LPSSEEvent) {
+	defer func() {
+		if r := recover(); r != nil {
+			lpSseLog.Warn("教案SSE channel double-close被捕获(已安全忽略)", "recover", r)
+		}
+	}()
+	close(ch)
+}
+
+// safeSendLPEvent 安全发送事件到教案SSE channel
+// 非阻塞发送，满则丢弃；使用 recover 防止 send-on-closed panic
+// 返回值: true=发送成功, false=丢弃或channel已关闭
+func safeSendLPEvent(ch chan models.LPSSEEvent, event models.LPSSEEvent) bool {
+	defer func() {
+		if r := recover(); r != nil {
+			lpSseLog.Warn("教案SSE send-on-closed被捕获(已安全忽略)",
+				"event_type", event.EventType, "recover", r)
+		}
+	}()
+	select {
+	case ch <- event:
+		return true
+	default:
+		return false
+	}
+}
+
+// ==================== 教案SSE广播中心 ====================
+
 // LPSSEHub 教案生成SSE广播中心（全局单例）
 type LPSSEHub struct {
 	mu          sync.Mutex
 	subscribers map[string]map[chan models.LPSSEEvent]bool
 }
-
-var lpSseLog = logger.WithModule("lp_sse")
 
 // GlobalLPSSEHub 全局教案SSE广播中心
 var GlobalLPSSEHub = NewLPSSEHub()
@@ -60,7 +98,7 @@ func (h *LPSSEHub) Subscribe(planID string) chan models.LPSSEEvent {
 		for ch, active := range oldSubs {
 			if active {
 				oldSubs[ch] = false
-				close(ch) // 关闭旧channel，让旧goroutine自然退出
+				safeCloseLPChan(ch) // v142: 安全关闭防止double-close
 			}
 		}
 		delete(h.subscribers, planID)
@@ -88,7 +126,7 @@ func (h *LPSSEHub) Unsubscribe(planID string, ch chan models.LPSSEEvent) {
 	}
 	if active, exists := subs[ch]; exists && active {
 		subs[ch] = false
-		close(ch)
+		safeCloseLPChan(ch) // v142: 安全关闭防止double-close
 		delete(subs, ch)
 	}
 	if len(subs) == 0 {
@@ -114,16 +152,14 @@ func (h *LPSSEHub) Broadcast(planID string, event models.LPSSEEvent) {
 		if !active {
 			continue
 		}
-		select {
-		case ch <- event:
+		// v142: 使用safeSend防御send-on-closed
+		if safeSendLPEvent(ch, event) {
 			sent++
-		default:
+		} else {
 			dropped++
-			lpSseLog.Warn("教案SSE channel已满，事件被丢弃",
+			lpSseLog.Warn("教案SSE channel已满或已关闭，事件被丢弃",
 				"plan_id", planID,
 				"event_type", event.EventType,
-				"channel_cap", cap(ch),
-				"channel_len", len(ch),
 			)
 		}
 	}

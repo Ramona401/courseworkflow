@@ -58,7 +58,11 @@ export default function CWSidebar() {
       <div style={{ display: 'flex', flexDirection: 'column', borderBottom: `1px solid ${COLORS.border}` }}>
         {/* 北大实验室 logo */}
         <div style={{ padding: '12px 18px 6px', cursor: 'pointer' }} onClick={() => navigate('/')} title="返回首页">
-          <img src="/pkuailab.png" alt="北京大学人工智能应用与创新实验室" style={{ height: '26px', objectFit: 'contain', display: 'block' }} />
+          {user?.org_logo_url ? (
+            <img src={user.org_logo_url} alt={user.org_name || 'Logo'} style={{ height: '26px', objectFit: 'contain', display: 'block' }} />
+          ) : (
+            <div style={{ fontSize: '14px', fontWeight: 700, color: '#F59E0B', letterSpacing: '1px' }}>TE-DNA 2.0</div>
+          )}
         </div>
         {/* 系统名称 */}
         <div style={{ padding: '6px 18px 12px', display: 'flex', alignItems: 'center', gap: '10px' }}>

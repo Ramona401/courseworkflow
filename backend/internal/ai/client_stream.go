@@ -24,11 +24,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
+
+	"tedna/internal/logger"
 )
+
+// streamLog 模块级结构化日志器
+var streamLog = logger.WithModule("ai.stream")
 
 // ==================== 流式请求/响应类型 ====================
 
@@ -139,7 +143,10 @@ func CallAIStream(
 		for attempt := 0; attempt <= modelEntry.maxRetries; attempt++ {
 			if attempt > 0 {
 				delay := getRetryDelay(attempt - 1)
-				log.Printf("[AI流式重试] 模型 %s 第%d次重试，等待%s", modelEntry.model, attempt, delay)
+				streamLog.Info("流式重试等待",
+					"model", modelEntry.model,
+					"attempt", attempt,
+					"delay", delay)
 				time.Sleep(delay)
 			}
 
@@ -155,8 +162,11 @@ func CallAIStream(
 			resp, err = httpClient.Do(httpReq)
 			if err != nil {
 				lastErr = fmt.Errorf("AI流式API调用失败（模型 %s）: %w", modelEntry.model, err)
-				log.Printf("[AI流式重试] 模型 %s 网络错误（第%d/%d次）: %s",
-					modelEntry.model, attempt+1, modelEntry.maxRetries+1, err.Error())
+				streamLog.Warn("流式网络错误",
+					"model", modelEntry.model,
+					"attempt", attempt+1,
+					"max_attempts", modelEntry.maxRetries+1,
+					"error", err.Error())
 				continue
 			}
 
@@ -168,8 +178,12 @@ func CallAIStream(
 				if isRetryableError(resp.StatusCode, body) {
 					lastErr = fmt.Errorf("AI流式API返回错误（模型 %s, HTTP %d）: %s",
 						modelEntry.model, resp.StatusCode, errMsg)
-					log.Printf("[AI流式重试] 模型 %s HTTP %d（第%d/%d次）: %s",
-						modelEntry.model, resp.StatusCode, attempt+1, modelEntry.maxRetries+1, errMsg)
+					streamLog.Warn("流式HTTP错误可重试",
+						"model", modelEntry.model,
+						"status", resp.StatusCode,
+						"attempt", attempt+1,
+						"max_attempts", modelEntry.maxRetries+1,
+						"error", errMsg)
 					continue
 				}
 				// 不可重试的错误（如401认证失败），不继续fallback，直接返回
@@ -185,23 +199,29 @@ func CallAIStream(
 			actualModel = modelEntry.model
 			isFallback = modelEntry.isFallback
 			if attempt > 0 {
-				log.Printf("[AI流式重试] 模型 %s 第%d次重试成功", modelEntry.model, attempt)
+				streamLog.Info("流式重试成功",
+					"model", modelEntry.model,
+					"attempt", attempt)
 			}
 			break
 		}
 
 		if connected {
 			if isFallback {
-				log.Printf("[AI Fallback] 流式降级模型 %s 连接成功（原始模型: %s）", actualModel, cfg.Model)
+				streamLog.Info("流式降级模型连接成功",
+					"fallback_model", actualModel,
+					"original_model", cfg.Model)
 			}
 			break
 		}
 
 		// 当前模型所有重试失败，尝试下一个
 		if modelEntry.isFallback {
-			log.Printf("[AI Fallback] 流式降级模型 %s 所有重试失败", modelEntry.model)
+			streamLog.Warn("流式降级模型所有重试失败",
+				"model", modelEntry.model)
 		} else {
-			log.Printf("[AI Fallback] 流式主模型 %s 所有重试失败，开始尝试降级", modelEntry.model)
+			streamLog.Warn("流式主模型所有重试失败，开始尝试降级",
+				"model", modelEntry.model)
 		}
 	}
 
@@ -315,8 +335,11 @@ func CallAIStream(
 		creditPromptTokens = estimatedInput
 		creditCompletionTokens = estimatedOutput
 		creditTotalTokens = estimatedInput + estimatedOutput
-		log.Printf("[AI积分] 流式tokens为0，用content长度(%d字符)估算: in=%d out=%d total=%d",
-			len(content), estimatedInput, estimatedOutput, creditTotalTokens)
+		streamLog.Info("流式tokens为0，用content长度估算",
+			"content_len", len(content),
+			"estimated_input", estimatedInput,
+			"estimated_output", estimatedOutput,
+			"estimated_total", creditTotalTokens)
 	}
 	invokeCreditConsume(traceCtx, coalesce(modelUsed, actualModel), creditPromptTokens, creditCompletionTokens, creditTotalTokens, latencyMs)
 

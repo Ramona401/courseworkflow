@@ -1,0 +1,318 @@
+package services
+
+import (
+	"context"
+
+	"tedna/internal/logger"
+	"tedna/internal/models"
+	"tedna/internal/repository"
+)
+
+// seedLog 模块级结构化日志器
+var seedLog = logger.WithModule("services.courseware_seed")
+
+// ==================== 课件工坊种子数据服务 ====================
+// Phase 2: 批量填充课件组件（~24个）
+// Phase 4A: 模板数据已通过SQL手动管理（15套高质量模板），种子服务不再管理模板
+// admin通过接口一键调用，幂等执行（先检查数量，已有则跳过，force=true先清空再写入）
+
+// CoursewareSeedService 种子数据服务
+type CoursewareSeedService struct{}
+
+// NewCoursewareSeedService 创建种子数据服务
+func NewCoursewareSeedService() *CoursewareSeedService {
+	return &CoursewareSeedService{}
+}
+
+// ==================== 种子数据填充入口 ====================
+
+// SeedResult 种子数据填充结果
+type SeedResult struct {
+	ComponentsCreated int      `json:"components_created"`
+	TemplatesCreated  int      `json:"templates_created"`
+	TemplatesSkipped  string   `json:"templates_skipped,omitempty"`
+	Errors            []string `json:"errors,omitempty"`
+}
+
+// SeedAll 一键填充全部种子数据
+// Phase 4A: 只填充组件，模板数据已通过SQL手动管理，不再自动覆盖
+func (s *CoursewareSeedService) SeedAll(ctx context.Context, force bool) (*SeedResult, error) {
+	result := &SeedResult{}
+
+	// 组件种子
+	compCount, err := s.seedComponents(ctx, force)
+	if err != nil {
+		result.Errors = append(result.Errors, "组件种子失败: "+err.Error())
+	}
+	result.ComponentsCreated = compCount
+
+	// 模板种子：跳过，保护现有高质量模板数据
+	existing, _ := repository.ListCWTemplates(ctx, false)
+	if len(existing) > 0 {
+		seedLog.Info("已有模板，跳过模板种子（Phase 4A手动管理）",
+			"count", len(existing))
+		result.TemplatesSkipped = "模板已通过SQL手动管理，种子服务不再覆盖"
+	} else {
+		// 只有当模板表完全为空时，才用基础种子填充（防止全新部署时没有模板）
+		tmplCount, tmplErr := s.seedTemplates(ctx, false)
+		if tmplErr != nil {
+			result.Errors = append(result.Errors, "模板种子失败: "+tmplErr.Error())
+		}
+		result.TemplatesCreated = tmplCount
+	}
+
+	return result, nil
+}
+
+// ==================== 组件种子数据 ====================
+
+func (s *CoursewareSeedService) seedComponents(ctx context.Context, force bool) (int, error) {
+	existing, total, err := repository.ListCWComponents(ctx, "", "", "", nil, 1, 0)
+	_ = existing
+	if err == nil && total > 0 && !force {
+		seedLog.Info("已有组件，跳过（可传 force=true 强制重建）",
+			"count", total)
+		return 0, nil
+	}
+
+	if force && total > 0 {
+		seedLog.Info("force模式，清空现有组件",
+			"count", total)
+		allComps, _, _ := repository.ListCWComponents(ctx, "", "", "", nil, 500, 0)
+		for _, c := range allComps {
+			_ = repository.DeleteCWComponent(ctx, c.ID)
+		}
+	}
+
+	components := buildSeedComponents()
+	created := 0
+	for _, comp := range components {
+		if err := repository.CreateCWComponent(ctx, comp); err != nil {
+			seedLog.Error("创建组件失败",
+				"name", comp.Name,
+				"error", err)
+			continue
+		}
+		created++
+	}
+	seedLog.Info("组件创建完成",
+		"created", created,
+		"total", len(components))
+	return created, nil
+}
+
+// ==================== 模板种子数据（仅全新部署时使用） ====================
+// Phase 4A: 此函数仅在模板表完全为空时调用（全新部署兜底）
+// 正常情况下模板通过SQL手动管理，不走此函数
+
+func (s *CoursewareSeedService) seedTemplates(ctx context.Context, force bool) (int, error) {
+	existing, err := repository.ListCWTemplates(ctx, false)
+	if err == nil && len(existing) > 0 {
+		seedLog.Info("已有模板，跳过（模板由SQL手动管理）",
+			"count", len(existing))
+		return 0, nil
+	}
+
+	// 全新部署时插入基础模板（简化版，正式数据需通过SQL补充）
+	seedLog.Info("模板表为空，插入基础兜底模板")
+	templates := buildFallbackTemplates()
+	created := 0
+	for _, t := range templates {
+		if err := repository.CreateCWTemplate(ctx, t); err != nil {
+			seedLog.Error("创建模板失败",
+				"name", t.Name,
+				"error", err)
+			continue
+		}
+		created++
+	}
+	seedLog.Info("兜底模板创建完成",
+		"created", created,
+		"total", len(templates))
+	return created, nil
+}
+
+// buildFallbackTemplates 全新部署时的基础兜底模板（3套最简模板）
+// 正式的高质量模板通过SQL手动管理
+func buildFallbackTemplates() []*models.CoursewareTemplate {
+	var templates []*models.CoursewareTemplate
+	templates = append(templates, &models.CoursewareTemplate{
+		Name: "默认-简约蓝", Description: "基础简约蓝色模板（兜底）",
+		StyleCategory: "minimalist", IsActive: true, SortOrder: 10,
+		ColorScheme: `{"primary":"#0EA5E9","secondary":"#38BDF8","background":"#F0F9FF","accent":"#F97316","text":"#0C4A6E"}`,
+		CSSVariables: `{"--cw-primary":"#0EA5E9","--cw-bg":"#F0F9FF","--cw-text":"#0C4A6E"}`,
+		SamplePages: `["<div style=\"width:960px;height:540px;background:#F0F9FF;display:flex;align-items:center;justify-content:center;font-family:system-ui\"><h1 style=\"font-size:48px;color:#0EA5E9\">默认模板</h1></div>"]`,
+	})
+	templates = append(templates, &models.CoursewareTemplate{
+		Name: "默认-科技蓝", Description: "基础科技蓝模板（兜底）",
+		StyleCategory: "tech", IsActive: true, SortOrder: 20,
+		ColorScheme: `{"primary":"#3B82F6","background":"#030712","text":"#E2E8F0"}`,
+		CSSVariables: `{"--cw-primary":"#3B82F6","--cw-bg":"#030712","--cw-text":"#E2E8F0"}`,
+		SamplePages: `["<div style=\"width:960px;height:540px;background:#030712;display:flex;align-items:center;justify-content:center;font-family:system-ui\"><h1 style=\"font-size:48px;color:#3B82F6\">科技模板</h1></div>"]`,
+	})
+	templates = append(templates, &models.CoursewareTemplate{
+		Name: "默认-活泼粉", Description: "基础活泼粉模板（兜底）",
+		StyleCategory: "playful", IsActive: true, SortOrder: 30,
+		ColorScheme: `{"primary":"#F472B6","background":"#FDF2F8","text":"#1F2937"}`,
+		CSSVariables: `{"--cw-primary":"#F472B6","--cw-bg":"#FDF2F8","--cw-text":"#1F2937"}`,
+		SamplePages: `["<div style=\"width:960px;height:540px;background:#FDF2F8;display:flex;align-items:center;justify-content:center;font-family:system-ui\"><h1 style=\"font-size:48px;color:#F472B6\">活泼模板</h1></div>"]`,
+	})
+	return templates
+}
+
+// buildSeedComponents 构建全部种子组件（6大类 × 每类3-5个 = 约24个核心组件）
+// 此函数代码量大（~400行），保持不变
+func buildSeedComponents() []*models.CoursewareComponent {
+	il := func(v int) *int { return &v }
+	var comps []*models.CoursewareComponent
+
+	// ============ 1. 布局模板 (layout) — 4个 ============
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "标题+正文布局", Description: "经典的大标题+居中正文布局，适用于课程导入和知识讲解页面",
+		ComponentType: "layout", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(1), IdxVisualFormat: "FR", IdxTechTag: "CSS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><h1 class="title">{{PAGE_TITLE}}</h1><div class="content">{{CONTENT}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:20px;background:#F8FAFC"><h1 style="font-size:18px;color:#2563EB;margin-bottom:12px">标题区域</h1><p style="font-size:12px;color:#1E293B;text-align:center">正文内容区域</p></div>`,
+	})
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "左图右文布局", Description: "左侧展示图片/插图，右侧展示文字说明，适用于概念讲解",
+		ComponentType: "layout", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(1), IdxVisualFormat: "CP", IdxTechTag: "CSS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><div class="img-area">{{IMG}}</div><div class="text-area"><h2>{{TITLE}}</h2><p>{{CONTENT}}</p></div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;display:flex;align-items:center;padding:12px;gap:12px;background:#F8FAFC"><div style="flex:1;height:80%;border-radius:8px;background:#60A5FA;display:flex;align-items:center;justify-content:center;color:#fff;font-size:11px">图片区</div><div style="flex:1"><div style="font-size:14px;font-weight:600;color:#2563EB;margin-bottom:6px">标题</div><div style="font-size:10px;color:#64748B">文字说明</div></div></div>`,
+	})
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "双栏对比布局", Description: "左右两栏对比展示，适用于概念对比、优劣分析等",
+		ComponentType: "layout", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(1), IdxVisualFormat: "CP", IdxTechTag: "CSS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><h1>{{TITLE}}</h1><div class="compare"><div class="col">{{LEFT}}</div><div class="col right">{{RIGHT}}</div></div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:12px;background:#F8FAFC;display:flex;flex-direction:column"><div style="font-size:14px;font-weight:600;color:#2563EB;text-align:center;margin-bottom:10px">对比标题</div><div style="display:flex;gap:8px;flex:1"><div style="flex:1;background:#fff;border-radius:8px;padding:8px"><div style="font-size:11px;font-weight:600;color:#2563EB">左栏</div></div><div style="flex:1;background:#fff;border-radius:8px;padding:8px"><div style="font-size:11px;font-weight:600;color:#F59E0B">右栏</div></div></div></div>`,
+	})
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "卡片网格布局", Description: "多个卡片网格排列，适用于知识点罗列、分类展示",
+		ComponentType: "layout", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(1), IdxVisualFormat: "GD", IdxTechTag: "CSS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><h1>{{TITLE}}</h1><div class="grid">{{CARDS}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:10px;background:#F8FAFC"><div style="font-size:13px;font-weight:600;color:#2563EB;text-align:center;margin-bottom:8px">网格标题</div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px"><div style="background:#fff;border-radius:6px;padding:8px;text-align:center;font-size:9px;font-weight:600;color:#2563EB">📌 要点一</div><div style="background:#fff;border-radius:6px;padding:8px;text-align:center;font-size:9px;font-weight:600;color:#2563EB">💡 要点二</div><div style="background:#fff;border-radius:6px;padding:8px;text-align:center;font-size:9px;font-weight:600;color:#2563EB">🔍 要点三</div></div></div>`,
+	})
+
+	// ============ 2. 交互功能 (interaction) — 4个 ============
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "单选题交互", Description: "4选1单选题，点击选项即时反馈对错",
+		ComponentType: "interaction", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(3), IdxVisualFormat: "CG", IdxTechTag: "JS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><div class="question">{{QUESTION}}</div><div class="options">{{OPTIONS}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:12px;background:#F8FAFC"><div style="font-size:12px;font-weight:600;margin-bottom:10px">❓ 题目区域</div><div style="display:flex;flex-direction:column;gap:5px"><div style="padding:6px 10px;border-radius:6px;border:1.5px solid #E2E8F0;font-size:10px">A 选项</div><div style="padding:6px 10px;border-radius:6px;border:1.5px solid #E2E8F0;font-size:10px">B 选项</div></div></div>`,
+	})
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "拖拽排序练习", Description: "将打乱的选项拖拽到正确顺序",
+		ComponentType: "interaction", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(3), IdxVisualFormat: "TL", IdxTechTag: "JS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><div class="title">{{TITLE}}</div><div class="items">{{ITEMS}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:10px;background:#F8FAFC"><div style="font-size:12px;font-weight:600;color:#2563EB;margin-bottom:8px">拖拽排序</div><div style="display:flex;flex-direction:column;gap:4px"><div style="padding:5px 8px;background:#fff;border-radius:4px;border:1px solid #E2E8F0;font-size:9px">1 项目一</div><div style="padding:5px 8px;background:#fff;border-radius:4px;border:1px solid #E2E8F0;font-size:9px">2 项目二</div></div></div>`,
+	})
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "翻卡片记忆", Description: "点击卡片翻转显示答案，适用于词汇记忆",
+		ComponentType: "interaction", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(2), IdxVisualFormat: "CG", IdxTechTag: "JS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><h1>{{TITLE}}</h1><div class="cards">{{FLIP_CARDS}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:10px;background:#F8FAFC"><div style="font-size:12px;font-weight:600;color:#2563EB;text-align:center;margin-bottom:8px">翻卡片</div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px"><div style="height:45px;background:#2563EB;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:9px">正面</div><div style="height:45px;background:#2563EB;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:9px">正面</div><div style="height:45px;background:#2563EB;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:9px">正面</div></div></div>`,
+	})
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "步骤引导交互", Description: "分步展示内容，点击按钮逐步推进",
+		ComponentType: "interaction", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(2), IdxVisualFormat: "TL", IdxTechTag: "JS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><h1>{{TITLE}}</h1><div class="steps">{{STEPS}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:10px;background:#F8FAFC"><div style="font-size:12px;font-weight:600;color:#2563EB;text-align:center;margin-bottom:6px">步骤引导</div><div style="display:flex;gap:4px;justify-content:center;margin-bottom:8px"><div style="width:8px;height:8px;border-radius:50%;background:#2563EB"></div><div style="width:8px;height:8px;border-radius:50%;background:#E2E8F0"></div></div><div style="flex:1;background:#fff;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:10px;color:#64748B">步骤内容区</div></div>`,
+	})
+
+	// ============ 3. 数据可视化 (data_viz) — 3个 ============
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "时间线展示", Description: "水平时间线，展示历史事件或发展阶段",
+		ComponentType: "data_viz", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(1), IdxVisualFormat: "TL", IdxTechTag: "CSS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><h1>{{TITLE}}</h1><div class="timeline">{{EVENTS}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:10px;background:#F8FAFC"><div style="font-size:12px;font-weight:600;color:#2563EB;text-align:center;margin-bottom:12px">时间线</div><div style="display:flex;justify-content:space-around;position:relative;padding-top:10px"><div style="position:absolute;top:14px;left:15%;right:15%;height:2px;background:#2563EB"></div><div style="text-align:center;z-index:1"><div style="width:8px;height:8px;border-radius:50%;background:#2563EB;margin:0 auto 4px"></div><div style="font-size:8px;color:#2563EB">2020</div></div><div style="text-align:center;z-index:1"><div style="width:8px;height:8px;border-radius:50%;background:#2563EB;margin:0 auto 4px"></div><div style="font-size:8px;color:#2563EB">2024</div></div></div></div>`,
+	})
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "进度/比例展示", Description: "SVG圆环进度指示器，展示完成度",
+		ComponentType: "data_viz", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(1), IdxVisualFormat: "CH", IdxTechTag: "SVG",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><h1>{{TITLE}}</h1><div class="charts">{{RINGS}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:10px;background:#F8FAFC;display:flex;flex-direction:column;align-items:center"><div style="font-size:12px;font-weight:600;color:#2563EB;margin-bottom:8px">进度展示</div><div style="font-size:24px;font-weight:800;color:#2563EB">70%</div></div>`,
+	})
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "柱状图对比", Description: "CSS纯实现柱状图，展示数据对比",
+		ComponentType: "data_viz", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(1), IdxVisualFormat: "CH", IdxTechTag: "CSS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><h1>{{TITLE}}</h1><div class="chart">{{BARS}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:10px;background:#F8FAFC"><div style="font-size:12px;font-weight:600;color:#2563EB;text-align:center;margin-bottom:8px">柱状图</div><div style="display:flex;align-items:flex-end;justify-content:center;gap:12px;height:60%;border-bottom:2px solid #E2E8F0"><div style="width:20px;height:70%;background:#2563EB;border-radius:3px 3px 0 0"></div><div style="width:20px;height:50%;background:#F59E0B;border-radius:3px 3px 0 0"></div><div style="width:20px;height:85%;background:#22C55E;border-radius:3px 3px 0 0"></div></div></div>`,
+	})
+
+	// ============ 4. 动画效果 (animation) — 2个 ============
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "淡入逐条展示", Description: "内容列表逐条淡入动画展示",
+		ComponentType: "animation", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(2), IdxVisualFormat: "FR", IdxTechTag: "AN",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><h1>{{TITLE}}</h1><div class="items">{{ANIM_ITEMS}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:10px;background:#F8FAFC"><div style="font-size:12px;font-weight:600;color:#2563EB;text-align:center;margin-bottom:8px">逐条展示</div><div style="display:flex;flex-direction:column;gap:4px"><div style="padding:6px 8px;background:#fff;border-radius:4px;border-left:3px solid #2563EB;font-size:9px">要点一</div><div style="padding:6px 8px;background:#fff;border-radius:4px;border-left:3px solid #2563EB;font-size:9px;opacity:0.3">要点二</div></div></div>`,
+	})
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "计数动画展示", Description: "数字从0滚动到目标值的动画效果",
+		ComponentType: "animation", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(1), IdxVisualFormat: "CH", IdxTechTag: "JS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><h1>{{TITLE}}</h1><div class="stats">{{NUMBERS}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:12px;background:#F8FAFC;display:flex;flex-direction:column;align-items:center;justify-content:center"><div style="font-size:24px;font-weight:800;color:#2563EB">98</div><div style="font-size:8px;color:#64748B">数据亮点</div></div>`,
+	})
+
+	// ============ 5. 多媒体容器 (multimedia) — 2个 ============
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "图片画廊展示", Description: "多图网格画廊，点击可放大查看",
+		ComponentType: "multimedia", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(2), IdxVisualFormat: "GD", IdxTechTag: "JS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><h1>{{TITLE}}</h1><div class="gallery">{{IMAGES}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:10px;background:#F8FAFC"><div style="font-size:12px;font-weight:600;color:#2563EB;text-align:center;margin-bottom:8px">图片画廊</div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px"><div style="background:#60A5FA;border-radius:4px;min-height:30px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px">📷</div><div style="background:#60A5FA;border-radius:4px;min-height:30px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px">📷</div><div style="background:#60A5FA;border-radius:4px;min-height:30px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px">📷</div></div></div>`,
+	})
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "视频播放器容器", Description: "带样式的视频播放器占位容器",
+		ComponentType: "multimedia", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(1), IdxVisualFormat: "FS", IdxTechTag: "CSS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><h1>{{TITLE}}</h1><div class="video-wrap">{{VIDEO}}</div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;padding:8px;background:#F8FAFC"><div style="font-size:11px;font-weight:600;color:#2563EB;margin-bottom:6px">视频播放</div><div style="flex:1;background:#000;border-radius:6px;height:60%;display:flex;align-items:center;justify-content:center"><div style="width:30px;height:30px;border-radius:50%;background:rgba(255,255,255,0.9);display:flex;align-items:center;justify-content:center"><div style="width:0;height:0;border-left:10px solid #2563EB;border-top:6px solid transparent;border-bottom:6px solid transparent"></div></div></div></div>`,
+	})
+
+	// ============ 6. 样式主题 (style) — 2个 ============
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "渐变标题装饰", Description: "带渐变背景和装饰元素的标题区域",
+		ComponentType: "style", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(1), IdxVisualFormat: "FS", IdxTechTag: "CSS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><div class="center"><h1>{{TITLE}}</h1><p>{{SUBTITLE}}</p></div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;background:linear-gradient(135deg,#2563EB,#F59E0B);display:flex;align-items:center;justify-content:center;border-radius:6px"><div style="text-align:center;color:#fff"><div style="font-size:16px;font-weight:800">章节标题</div><div style="font-size:9px;opacity:0.8">副标题</div></div></div>`,
+	})
+	comps = append(comps, &models.CoursewareComponent{
+		Name: "背景图案网格纹", Description: "CSS背景图案装饰，丰富页面层次",
+		ComponentType: "style", SubjectScope: "ALL", GradeScope: "ALL",
+		IdxInteractionLevel: il(1), IdxVisualFormat: "FS", IdxTechTag: "CSS",
+		ReviewStatus: "approved", IsActive: true,
+		CodeContent: `<div class="page"><div class="content-box"><h1>{{TITLE}}</h1><p>{{CONTENT}}</p></div></div>`,
+		PreviewHTML: `<div style="width:100%;height:100%;background-color:#F8FAFC;background-image:radial-gradient(circle,rgba(37,99,235,0.1) 1px,transparent 1px);background-size:10px 10px;display:flex;align-items:center;justify-content:center"><div style="background:rgba(255,255,255,0.9);border-radius:8px;padding:10px;text-align:center"><div style="font-size:12px;font-weight:700;color:#2563EB">标题</div></div></div>`,
+	})
+
+	return comps
+}

@@ -140,14 +140,13 @@ export default function PortalPage() {
 
   return (
     <div style={styles.container}>
-      {/* 北大实验室 Logo */}
-      <div style={{ marginBottom: '32px' }}>
-        <img
-          src="/pkuailab.png"
-          alt="北京大学人工智能应用与创新实验室"
-          style={{ height: '44px', objectFit: 'contain' }}
-        />
-      </div>
+      {/* 组织Logo（动态：用户所属组织Logo，无则不显示图片） */}
+      {user.org_logo_url && (
+        <div style={{ marginBottom: '32px' }}>
+          <img src={user.org_logo_url} alt={user.org_name || 'Logo'} style={{ height: '48px', objectFit: 'contain' }} />
+          {user.org_name && <div style={{ fontSize: '13px', color: '#6B7280', marginTop: '8px', textAlign: 'center' }}>{user.org_name}</div>}
+        </div>
+      )}
 
       {/* 欢迎语 */}
       <div style={styles.greeting}>欢迎回来，{user.display_name}</div>
@@ -165,7 +164,7 @@ export default function PortalPage() {
       </div>
 
       {/* 页脚 */}
-      <div style={styles.footer}>TE-DNA 2.0 · 北京大学人工智能应用与创新实验室</div>
+      <div style={styles.footer}>TE-DNA 2.0{user.org_name ? ` · ${user.org_name}` : ''}</div>
     </div>
   )
 }

@@ -51,14 +51,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 
 	"tedna/internal/ai"
+	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 	"tedna/internal/utils"
 )
+
+// designerLog 模块级结构化日志器
+var designerLog = logger.WithModule("services.designer")
 
 // ============================================================================
 // Meta-Prompt:Designer 的核心 system prompt
@@ -312,8 +315,9 @@ func (s *AssistantDesignerService) DesignChat(
 
 	decision, parseErr := parseAIDecision(decisionResult.Content)
 	if parseErr != nil {
-		log.Printf("[designer] 决策 JSON 解析失败,降级为直接回复: err=%v raw=%s",
-			parseErr, utils.SafeTruncate(decisionResult.Content, 300))
+		designerLog.Warn("决策JSON解析失败，降级为直接回复",
+			"error", parseErr,
+			"raw", utils.SafeTruncate(decisionResult.Content, 300))
 		decision = &AIDesignerDecision{
 			Action:    "clarify",
 			ReplyText: "我暂时没能理解这轮对话,麻烦您换种说法?",
@@ -327,7 +331,8 @@ func (s *AssistantDesignerService) DesignChat(
 	case "draft_directly", "clarify":
 		return s.handleDirectReply(decision, callbacks)
 	default:
-		log.Printf("[designer] 未知 action=%s,降级为 clarify", decision.Action)
+		designerLog.Warn("未知action，降级为clarify",
+			"action", decision.Action)
 		return s.handleDirectReply(&AIDesignerDecision{
 			Action:    "clarify",
 			ReplyText: decision.ReplyText,
@@ -357,7 +362,8 @@ func (s *AssistantDesignerService) handleSearchAndDraft(
 	matchReq := buildMatchRequestFromParams(decision.QueryParams, dCtx)
 	groups, err := repository.MatchComponents(ctx, matchReq)
 	if err != nil {
-		log.Printf("[designer] 查库失败: %v,降级为直接起草", err)
+		designerLog.Warn("查库失败，降级为直接起草",
+			"error", err)
 		return s.handleDirectReply(&AIDesignerDecision{
 			Action:       "draft_directly",
 			ReplyText:    decision.ReplyText + "\n\n(组件库查询失败,我先基于常识起草一版。)",
@@ -404,7 +410,8 @@ func (s *AssistantDesignerService) handleDirectReply(
 	if strings.HasPrefix(innerText, "{") && strings.Contains(innerText, "\"reply_text\"") {
 		var inner AIDesignerDecision
 		if err := json.Unmarshal([]byte(innerText), &inner); err == nil && strings.TrimSpace(inner.ReplyText) != "" {
-			log.Printf("[designer] 检测到双层 JSON 嵌套,已提取内层字段(原外层 reply_text 长度=%d)", len(innerText))
+			designerLog.Info("检测到双层JSON嵌套，已提取内层字段",
+				"outer_len", len(innerText))
 			decision.ReplyText = inner.ReplyText
 			if strings.TrimSpace(decision.UpdatedDraft) == "" && strings.TrimSpace(inner.UpdatedDraft) != "" {
 				decision.UpdatedDraft = inner.UpdatedDraft
@@ -451,7 +458,8 @@ func (s *AssistantDesignerService) callAIStreamAndEmit(
 	fullText := accumulated.String()
 	finalDecision, parseErr := parseAIDecision(fullText)
 	if parseErr != nil {
-		log.Printf("[designer] 阶段 2 JSON 解析失败,原文作为回复: err=%v", parseErr)
+		designerLog.Warn("阶段2 JSON解析失败，原文作为回复",
+			"error", parseErr)
 		callbacks.OnDone(fullText, "", nil)
 		return nil
 	}
@@ -461,7 +469,7 @@ func (s *AssistantDesignerService) callAIStreamAndEmit(
 	if strings.HasPrefix(innerText, "{") && strings.Contains(innerText, "\"reply_text\"") {
 		var inner AIDesignerDecision
 		if err := json.Unmarshal([]byte(innerText), &inner); err == nil && strings.TrimSpace(inner.ReplyText) != "" {
-			log.Printf("[designer] 阶段 2 检测到双层 JSON,已提取内层")
+			designerLog.Info("阶段2检测到双层JSON，已提取内层")
 			finalDecision.ReplyText = inner.ReplyText
 			if strings.TrimSpace(finalDecision.UpdatedDraft) == "" && strings.TrimSpace(inner.UpdatedDraft) != "" {
 				finalDecision.UpdatedDraft = inner.UpdatedDraft
@@ -551,3 +559,5 @@ func (s *AssistantDesignerService) buildUserPrompt(
 
 // ============================================================================
 // parseAIDecision - 四重鲁棒性兜底
+// 已拆分到 assistant_designer_parse.go
+// ============================================================================

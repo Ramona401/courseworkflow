@@ -5,14 +5,17 @@
  *   MetaTag         — 元信息标签（学科/年级/课时等）
  *   ActionBar       — 操作按钮组（按状态动态渲染 + 导出Word按钮）
  *
- * 新增：导出Word按钮，调用 exportLessonPlanToWord 工具，纯前端生成 .docx 下载
+ * v142优化：exportWord 改为动态导入（按需加载 docx 库 ~300KB），
+ *   用户点击「导出Word」按钮时才加载 docx + file-saver，
+ *   PlanDetailPage chunk 从 418KB 降至 ~120KB
  */
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { LessonPlan, LessonPlanStatus } from '@/api/lesson-plans'
 import type { InteractionCounts } from '@/api/lesson-plan-interactions'
 import { C, STATUS_CONFIG } from './planDetailConstants'
-import { exportLessonPlanToWord } from '@/utils/exportWord'
+// v142: 删除静态导入 exportLessonPlanToWord
+// 改为 handleExportWord 内部 await import() 动态加载
 
 // ==================== 骨架屏 ====================
 
@@ -94,12 +97,15 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction, interactions
   const [exporting, setExporting] = useState(false)
 
   /**
-   * 点击"导出Word"：异步生成并下载 .docx
+   * v142优化：点击"导出Word"时动态加载 docx 库
+   * 首次点击会多等约 0.5-1 秒加载 chunk，后续浏览器缓存秒开
    */
   const handleExportWord = async () => {
     if (exporting) return
     setExporting(true)
     try {
+      // 动态导入：docx + file-saver 只在用户点击时才加载（~300KB独立chunk）
+      const { exportLessonPlanToWord } = await import('@/utils/exportWord')
       await exportLessonPlanToWord({
         title:            plan.title,
         subject:          plan.subject,

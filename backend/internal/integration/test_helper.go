@@ -85,7 +85,8 @@ func testConfig() *config.Config {
 		Port:       "0",          // httptest 自动分配端口
 		JWTSecret:  "test-jwt-secret-for-integration-tests-only",
 		AESKey:     "c94985251907d9a973ee517d048d8430",
-		GinMode:    "test",
+		GinMode:           "test",
+		DisableSchedulers: true, // v142: 测试环境禁用调度器防goroutine泄漏
 	}
 }
 

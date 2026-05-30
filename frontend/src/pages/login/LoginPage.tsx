@@ -88,7 +88,7 @@ export default function LoginPage() {
         <div style={{ textAlign: 'center', marginBottom: '36px' }}>
           <div style={{
             display: 'inline-block',
-            padding: '12px 20px',
+            padding: '14px 28px',
             background: 'rgba(255,255,255,0.15)',
             backdropFilter: 'blur(20px)',
             WebkitBackdropFilter: 'blur(20px)',
@@ -97,14 +97,9 @@ export default function LoginPage() {
             marginBottom: '16px',
             boxShadow: '0 8px 32px rgba(0,0,0,0.1)',
           }}>
-            <img
-              src="/pkuailab.png"
-              alt="北京大学人工智能应用与创新实验室"
-              style={{ height: '40px', display: 'block' }}
-            />
+            <span style={{ fontSize: '28px', fontWeight: 700, color: '#fff', letterSpacing: '2px' }}>TE-DNA</span>
           </div>
-          <h1 style={{ color: '#fff', fontSize: '28px', fontWeight: 600, letterSpacing: '-0.5px', margin: '0 0 4px 0' }}>TE-DNA 2.0</h1>
-          <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: '15px', margin: 0 }}>K12 AI课程质量评估与教案开发平台</p>
+          <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: '15px', margin: 0, marginTop: '8px' }}>K12 AI课程质量评估与教案开发平台</p>
         </div>
 
         {/* 表单卡片 */}

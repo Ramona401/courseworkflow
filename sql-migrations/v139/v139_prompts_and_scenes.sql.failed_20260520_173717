@@ -1,0 +1,123 @@
+-- ============================================================
+-- v139 迁移脚本: 课件模板 AI 提取 + AI 微调
+-- 新增 2 个提示词 + 2 个 AI 场景
+-- 提示词内容从外部文件读取（pg_read_file），规避 heredoc 嵌套问题
+-- ============================================================
+
+\set extract_prompt_path '/www/wwwroot/tedna/sql-migrations/v139/prompt_template_extract.txt'
+\set refine_prompt_path '/www/wwwroot/tedna/sql-migrations/v139/prompt_template_refine.txt'
+
+-- ------------------------------------------------------------
+-- 提示词 1: prompt_courseware_template_extract
+-- 用途: AI 分析用户粘贴的多页 HTML, 提取统一风格
+--      （配色 / CSS变量 / 字体 / 圆角 / 阴影 / 风格分类）
+-- 创建模式: 如已存在则跳过，幂等执行
+-- ------------------------------------------------------------
+DO $insert_extract$
+DECLARE
+    prompt_content TEXT;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM prompts WHERE prompt_key = 'prompt_courseware_template_extract') THEN
+        -- 通过 pg_read_file 读取文件内容（路径必须是 PostgreSQL data 目录的相对路径或绝对路径权限内）
+        -- 这里用 COPY ... FROM 间接方式：直接定义内容（精简版兜底，完整版走 \i include）
+        prompt_content := pg_read_server_file(:'extract_prompt_path', 0, 100000, true);
+        INSERT INTO prompts (prompt_key, content, version, is_current, created_at)
+        VALUES ('prompt_courseware_template_extract', prompt_content, 1, true, now());
+        RAISE NOTICE '✅ 已插入提示词 prompt_courseware_template_extract (长度: %)', LENGTH(prompt_content);
+    ELSE
+        RAISE NOTICE '⏭️ prompt_courseware_template_extract 已存在，跳过';
+    END IF;
+END
+$insert_extract$;
+
+-- ------------------------------------------------------------
+-- 提示词 2: prompt_courseware_template_refine
+-- 用途: AI SSE 流式微调现有模板, 根据用户指令调整配色/字体/圆角/样例页面
+-- ------------------------------------------------------------
+DO $insert_refine$
+DECLARE
+    prompt_content TEXT;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM prompts WHERE prompt_key = 'prompt_courseware_template_refine') THEN
+        prompt_content := pg_read_server_file(:'refine_prompt_path', 0, 100000, true);
+        INSERT INTO prompts (prompt_key, content, version, is_current, created_at)
+        VALUES ('prompt_courseware_template_refine', prompt_content, 1, true, now());
+        RAISE NOTICE '✅ 已插入提示词 prompt_courseware_template_refine (长度: %)', LENGTH(prompt_content);
+    ELSE
+        RAISE NOTICE '⏭️ prompt_courseware_template_refine 已存在，跳过';
+    END IF;
+END
+$insert_refine$;
+
+-- ------------------------------------------------------------
+-- AI 场景 1: courseware_template_extract
+-- 用途: 模板 AI 提取, 需要 Sonnet 级别的代码分析能力
+-- 温度 0.30 偏稳定（要求结构化 JSON 输出）
+-- max_tokens 16000 容纳多页 HTML 输入和完整 JSON 输出
+-- Fallback: Haiku(快速) → Gemini Pro(兜底)
+-- ------------------------------------------------------------
+INSERT INTO ai_scene_configs (scene_code, model, temperature, max_tokens, is_active, fallback_models, updated_at)
+VALUES (
+    'courseware_template_extract',
+    'anthropic/claude-sonnet-4-5',
+    0.30,
+    16000,
+    true,
+    '["anthropic/claude-haiku-4-5", "google/gemini-2.5-pro"]'::jsonb,
+    now()
+)
+ON CONFLICT (scene_code) DO UPDATE
+    SET model = EXCLUDED.model,
+        temperature = EXCLUDED.temperature,
+        max_tokens = EXCLUDED.max_tokens,
+        is_active = EXCLUDED.is_active,
+        fallback_models = EXCLUDED.fallback_models,
+        updated_at = now();
+
+-- ------------------------------------------------------------
+-- AI 场景 2: courseware_template_refine
+-- 用途: 模板 AI 微调（SSE 流式）, 保留完整 HTML 输出能力
+-- 温度 0.40 略灵活（允许设计创意）
+-- ------------------------------------------------------------
+INSERT INTO ai_scene_configs (scene_code, model, temperature, max_tokens, is_active, fallback_models, updated_at)
+VALUES (
+    'courseware_template_refine',
+    'anthropic/claude-sonnet-4-5',
+    0.40,
+    16000,
+    true,
+    '["anthropic/claude-haiku-4-5", "google/gemini-2.5-pro"]'::jsonb,
+    now()
+)
+ON CONFLICT (scene_code) DO UPDATE
+    SET model = EXCLUDED.model,
+        temperature = EXCLUDED.temperature,
+        max_tokens = EXCLUDED.max_tokens,
+        is_active = EXCLUDED.is_active,
+        fallback_models = EXCLUDED.fallback_models,
+        updated_at = now();
+
+-- ------------------------------------------------------------
+-- 验证查询
+-- ------------------------------------------------------------
+\echo ''
+\echo '=========== 验证 1: 新插入的 2 个提示词 ==========='
+SELECT prompt_key, version, is_current, LENGTH(content) AS content_len, created_at
+  FROM prompts
+ WHERE prompt_key IN ('prompt_courseware_template_extract', 'prompt_courseware_template_refine')
+ ORDER BY prompt_key;
+
+\echo ''
+\echo '=========== 验证 2: 新插入的 2 个 AI 场景 ==========='
+SELECT scene_code, model, temperature, max_tokens, is_active, fallback_models
+  FROM ai_scene_configs
+ WHERE scene_code IN ('courseware_template_extract', 'courseware_template_refine')
+ ORDER BY scene_code;
+
+\echo ''
+\echo '=========== 验证 3: 当前所有课件相关场景 ==========='
+SELECT scene_code, model FROM ai_scene_configs WHERE scene_code LIKE 'courseware_%' ORDER BY scene_code;
+
+\echo ''
+\echo '=========== 验证 4: 当前所有课件相关提示词 ==========='
+SELECT prompt_key, version, LENGTH(content) AS content_len FROM prompts WHERE prompt_key LIKE 'prompt_courseware_%' ORDER BY prompt_key;

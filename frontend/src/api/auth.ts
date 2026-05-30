@@ -14,6 +14,8 @@ export interface UserInfo {
   status: string
   last_login_at: string | null
   login_count: number
+  org_logo_url: string
+  org_name: string
 }
 
 // 登录响应类型

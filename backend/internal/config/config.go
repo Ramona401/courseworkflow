@@ -12,7 +12,8 @@ import (
 // 修复R-03：从硬编码迁移到配置，healthHandler和其他需要版本号的地方统一读取此常量
 // 发版时只需修改此处一个位置，避免多处硬编码漏改
 // 审查修复C-01：版本号必须与实际发布版本保持一致
-const AppVersion = "0.37.0"
+// v0.41.0: 生成质量对齐edu平台（提示词v5+预览降级+响应式+场景预留）
+const AppVersion = "0.42.0"
 
 // Config 全局配置结构体
 type Config struct {
@@ -26,6 +27,9 @@ type Config struct {
 	// 服务器配置
 	Port    string
 	GinMode string
+
+	// v142新增：禁用定时任务调度器（测试环境设true避免goroutine泄漏）
+	DisableSchedulers bool
 
 	// JWT 配置
 	JWTSecret string

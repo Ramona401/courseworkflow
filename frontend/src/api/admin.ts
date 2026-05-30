@@ -119,6 +119,7 @@ export interface OrgListItem {
   parent_name: string
   admin_user_id: string | null
   admin_user_name: string
+  logo_url: string
   status: string
   group_count: number
   member_count: number
@@ -315,6 +316,16 @@ export async function updateAdminOrg(id: string, data: UpdateOrgRequest): Promis
 
 export async function deleteAdminOrg(id: string): Promise<void> {
   await client.delete(`/lesson-plans/organizations/${id}`)
+}
+
+/** 上传组织Logo */
+export async function uploadOrgLogo(orgId: string, file: File): Promise<{ url: string }> {
+  const formData = new FormData()
+  formData.append('file', file)
+  const res = await client.post<{ code: number; data: { url: string } }>(`/admin/orgs/${orgId}/upload-logo`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  })
+  return res.data.data!
 }
 
 // ==================== 教研组管理 API ====================

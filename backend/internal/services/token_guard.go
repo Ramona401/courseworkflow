@@ -10,16 +10,21 @@ package services
 //   - 查询失败降级放行
 //   - 账户已冻结时拒绝
 //
+// v141 改进：log.Printf → logger.WithModule 结构化日志
+//
 // 对齐AOCI: ai_proxy.go 的 checkCreditsGate + credits.go 的 HasAvailableCredits
 
 import (
 	"context"
 	"errors"
-	"log"
 
+	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 )
+
+// 模块日志
+var tgLog = logger.WithModule("token_guard")
 
 // ==================== TokenGuard 结构体 ====================
 
@@ -70,7 +75,7 @@ func (g *TokenGuard) CheckBalance(ctx context.Context, userID string) *models.To
 			return result
 		}
 		// 查询失败降级放行（对齐AOCI：查询失败不阻断）
-		log.Printf("[TokenGuard] 查询用户账户失败(放行): user=%s err=%v", userID, err)
+		tgLog.Warn("查询用户账户失败(降级放行)", "user_id", userID, "error", err)
 		result.Message = "查询失败，默认放行"
 		return result
 	}

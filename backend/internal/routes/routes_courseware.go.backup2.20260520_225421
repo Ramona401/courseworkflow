@@ -1,0 +1,364 @@
+package routes
+
+// routes_courseware.go — 课件工坊路由注册(v139 大改造)
+//
+// v138 原有路由(全部保留):
+//   - 课件 CRUD: /api/v1/coursewares + /api/v1/coursewares/{id}/*
+//   - 课件子操作: confirm-index/save-style/confirm-style/generate-*/refine-*/cancel-generate 等
+//   - SSE 索引生成: /api/v1/sse/courseware/{id}
+//   - 风格模板查询: /api/v1/courseware-templates 系列
+//   - 课件组件库: /api/v1/courseware-components 系列
+//   - Admin 模板管理: /api/v1/admin/courseware-templates
+//   - 种子数据: /api/v1/admin/courseware-seed
+//   - 方案预设: /api/v1/courseware-presets
+//
+// v139 新增 8 个 API(模板 AI 提取+微调+历史+发布):
+//   - POST   /api/v1/coursewares/templates/extract              — AI 提取草稿(同步)
+//   - GET    /api/v1/coursewares/templates/my-drafts            — 我的草稿列表
+//   - DELETE /api/v1/coursewares/templates/drafts/{id}          — 删除我的草稿
+//   - POST   /api/v1/coursewares/templates/{id}/refine          — 触发 AI 微调(异步)
+//   - GET    /api/v1/sse/template-refine/{id}                   — SSE 订阅微调进度(内部 Token 验证)
+//   - GET    /api/v1/coursewares/templates/{id}/history         — 查询微调历史
+//   - POST   /api/v1/coursewares/templates/{id}/rollback        — 回退到历史快照
+//   - POST   /api/v1/coursewares/templates/{id}/publish         — 草稿发布为正式
+
+import (
+	"net/http"
+	"strings"
+
+	"tedna/internal/handlers"
+	"tedna/internal/middleware"
+)
+
+// registerCoursewareRoutes 注册课件工坊全部路由
+// v139 签名扩展:第一个 6 参数保持不变,末尾参数 cwTplHandler 已升级为 V139 版本(支持全部 11 个模板 API)
+func registerCoursewareRoutes(
+	mux *http.ServeMux,
+	authMW func(http.Handler) http.Handler,
+	adminOnly func(http.Handler) http.Handler,
+	cwHandler *handlers.CoursewareHandler,
+	cwCompHandler *handlers.CWComponentHandler,
+	cwSeedHandler *handlers.CWSeedHandler,
+	cwIndexHandler *handlers.CoursewareIndexHandler,
+	cwGenHandler *handlers.CoursewareGenHandler,
+	cwTplHandler *handlers.CoursewareTemplateHandler,
+) {
+	// ==================== 课件索引 SSE(内部 Token 验证,不走 authMW) ====================
+	mux.HandleFunc("/api/v1/sse/courseware/", cwIndexHandler.IndexStream)
+
+	// ==================== v139 新增:模板微调 SSE(内部 Token 验证) ====================
+	mux.HandleFunc("/api/v1/sse/template-refine/", cwTplHandler.RefineStream)
+
+	// ==================== 课件 CRUD(登录即可) ====================
+	cwMux := middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/api/v1/coursewares" || path == "/api/v1/coursewares/" {
+			switch r.Method {
+			case http.MethodGet:
+				cwHandler.ListCoursewares(w, r)
+			case http.MethodPost:
+				cwHandler.CreateCourseware(w, r)
+			default:
+				http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+			}
+			return
+		}
+		dispatchCoursewareSubRoutes(w, r, cwHandler, cwIndexHandler, cwGenHandler, cwTplHandler)
+	}), authMW)
+	mux.Handle("/api/v1/coursewares", cwMux)
+	mux.Handle("/api/v1/coursewares/", cwMux)
+
+	// ==================== v136: 方案结构预设(登录即可) ====================
+	mux.Handle("/api/v1/courseware-presets", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cwHandler.GetSchemePresets(w, r)
+	}), authMW))
+
+	// ==================== 风格模板查询(登录即可) ====================
+	mux.Handle("/api/v1/courseware-templates", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cwHandler.ListTemplates(w, r)
+	}), authMW))
+
+	mux.Handle("/api/v1/courseware-templates/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		// v137: GET /api/v1/courseware-templates/with-user — 系统模板+我的个人模板
+		if strings.HasSuffix(path, "/with-user") {
+			cwTplHandler.ListTemplatesWithUser(w, r)
+			return
+		}
+		// v137: DELETE /api/v1/courseware-templates/personal/{id} — 删除我的个人模板
+		if strings.Contains(path, "/personal/") && r.Method == http.MethodDelete {
+			cwTplHandler.DeleteMyTemplate(w, r)
+			return
+		}
+		if strings.HasSuffix(path, "/preview") {
+			cwHandler.GetTemplatePreview(w, r)
+			return
+		}
+		http.Error(w, `{"code":-1,"message":"未找到路由"}`, http.StatusNotFound)
+	}), authMW))
+
+	// ==================== 课件组件库(admin 管理,登录可查询) ====================
+	compMux := middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/api/v1/courseware-components" || path == "/api/v1/courseware-components/" {
+			switch r.Method {
+			case http.MethodGet:
+				cwCompHandler.ListComponents(w, r)
+			case http.MethodPost:
+				cwCompHandler.CreateComponent(w, r)
+			default:
+				http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+			}
+			return
+		}
+		dispatchCWComponentSubRoutes(w, r, cwCompHandler)
+	}), authMW)
+	mux.Handle("/api/v1/courseware-components", compMux)
+	mux.Handle("/api/v1/courseware-components/", compMux)
+
+	mux.Handle("/api/v1/courseware-components/match", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cwCompHandler.MatchComponents(w, r)
+	}), authMW))
+
+	// ==================== 种子数据填充(admin) ====================
+	mux.Handle("/api/v1/admin/courseware-seed", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cwSeedHandler.SeedAll(w, r)
+	}), authMW, adminOnly))
+
+	// ==================== Admin 模板管理 ====================
+	mux.Handle("/api/v1/admin/courseware-templates", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/api/v1/admin/courseware-templates" || path == "/api/v1/admin/courseware-templates/" {
+			switch r.Method {
+			case http.MethodPost:
+				cwSeedHandler.CreateTemplate(w, r)
+			default:
+				http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+			}
+			return
+		}
+	}), authMW, adminOnly))
+
+	mux.Handle("/api/v1/admin/courseware-templates/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			cwSeedHandler.UpdateTemplate(w, r)
+		case http.MethodDelete:
+			cwSeedHandler.DeleteTemplate(w, r)
+		default:
+			http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		}
+	}), authMW, adminOnly))
+
+	// ==================== v139 新增:模板 AI 操作路由(登录即可,handler 层做细粒度权限校验)====================
+	//
+	// 全部使用 /api/v1/coursewares/templates/ 前缀(不与课件 ID 路径冲突)
+	// 通配匹配模式:用一个统一的 ServeMux 模式 + handler 内部根据 path 后缀分发
+	mux.Handle("/api/v1/coursewares/templates/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dispatchTemplateAIRoutes(w, r, cwTplHandler)
+	}), authMW))
+}
+
+// dispatchCoursewareSubRoutes 课件子路由分发
+// v138 原有逻辑保持不变(已经在原版本里实现)
+func dispatchCoursewareSubRoutes(w http.ResponseWriter, r *http.Request, h *handlers.CoursewareHandler, idxH *handlers.CoursewareIndexHandler, genH *handlers.CoursewareGenHandler, cwTplHandler *handlers.CoursewareTemplateHandler) {
+	path := r.URL.Path
+
+	// v137: POST /api/v1/coursewares/{id}/save-as-template(保存为我的模板)
+	if strings.HasSuffix(path, "/save-as-template") {
+		cwTplHandler.SaveAsMyTemplate(w, r)
+		return
+	}
+	// Phase 3: POST /api/v1/coursewares/{id}/generate-index
+	if strings.HasSuffix(path, "/generate-index") {
+		idxH.GenerateIndexWithPreset(w, r)
+		return
+	}
+	// v136: POST /api/v1/coursewares/{id}/refine-index(AI 修改方案)
+	if strings.HasSuffix(path, "/refine-index") {
+		idxH.RefineIndex(w, r)
+		return
+	}
+	// v136: POST /api/v1/coursewares/{id}/rollback-status(步骤回退)
+	if strings.HasSuffix(path, "/rollback-status") {
+		h.RollbackStatus(w, r)
+		return
+	}
+	// Phase 4C: POST /api/v1/coursewares/{id}/generate-preview
+	if strings.HasSuffix(path, "/generate-preview") {
+		genH.GeneratePreview(w, r)
+		return
+	}
+	// Phase 4C: POST /api/v1/coursewares/{id}/save-nav-template
+	if strings.HasSuffix(path, "/save-nav-template") {
+		genH.SaveNavTemplate(w, r)
+		return
+	}
+	// Phase 4B/4C: POST /api/v1/coursewares/{id}/generate-pages
+	if strings.HasSuffix(path, "/generate-pages") {
+		genH.GeneratePages(w, r)
+		return
+	}
+	// P0-2: POST /api/v1/coursewares/{id}/refine-nav(导航栏 AI 微调)
+	if strings.HasSuffix(path, "/refine-nav") {
+		genH.RefineNav(w, r)
+		return
+	}
+	// P0-5: POST /api/v1/coursewares/{id}/cancel-generate
+	if strings.HasSuffix(path, "/cancel-generate") {
+		genH.CancelGenerate(w, r)
+		return
+	}
+	// Phase 3: GET /api/v1/coursewares/{id}/index-stream
+	if strings.HasSuffix(path, "/index-stream") {
+		idxH.IndexStream(w, r)
+		return
+	}
+	// POST /api/v1/coursewares/{id}/confirm-index
+	if strings.HasSuffix(path, "/confirm-index") {
+		h.ConfirmIndex(w, r)
+		return
+	}
+	// Phase 4A: POST /api/v1/coursewares/{id}/upload-logo
+	if strings.HasSuffix(path, "/upload-logo") {
+		h.UploadLogo(w, r)
+		return
+	}
+	// Phase 4A: POST /api/v1/coursewares/{id}/save-style
+	if strings.HasSuffix(path, "/save-style") {
+		h.SaveStyleFull(w, r)
+		return
+	}
+	// Phase 4A: POST /api/v1/coursewares/{id}/confirm-style
+	if strings.HasSuffix(path, "/confirm-style") {
+		h.ConfirmStyle(w, r)
+		return
+	}
+	// PUT /api/v1/coursewares/{id}/style
+	if strings.HasSuffix(path, "/style") {
+		h.SaveStyle(w, r)
+		return
+	}
+	// POST /api/v1/coursewares/{id}/confirm
+	if strings.HasSuffix(path, "/confirm") && !strings.HasSuffix(path, "/confirm-index") && !strings.HasSuffix(path, "/confirm-style") {
+		h.ConfirmCourseware(w, r)
+		return
+	}
+	// PUT /api/v1/coursewares/{id}/pages/reorder
+	if strings.HasSuffix(path, "/pages/reorder") {
+		h.ReorderPages(w, r)
+		return
+	}
+	// GET/POST /api/v1/coursewares/{id}/pages
+	if strings.HasSuffix(path, "/pages") || strings.HasSuffix(path, "/pages/") {
+		switch r.Method {
+		case http.MethodGet:
+			h.GetCoursewarePages(w, r)
+		case http.MethodPost:
+			h.AddPage(w, r)
+		default:
+			http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		}
+		return
+	}
+	// P0-4: POST /api/v1/coursewares/{id}/pages/{num}/refine(单页 AI 微调)
+	if strings.Contains(path, "/pages/") && strings.HasSuffix(path, "/refine") {
+		genH.RefinePage(w, r)
+		return
+	}
+	// PUT/DELETE /api/v1/coursewares/{id}/pages/{num}
+	if strings.Contains(path, "/pages/") {
+		switch r.Method {
+		case http.MethodPut:
+			h.UpdatePageIndex(w, r)
+		case http.MethodDelete:
+			idxH.DeletePage(w, r)
+		default:
+			http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		}
+		return
+	}
+	// GET/PUT/DELETE /api/v1/coursewares/{id}
+	switch r.Method {
+	case http.MethodGet:
+		h.GetCourseware(w, r)
+	case http.MethodPut:
+		h.UpdateCourseware(w, r)
+	case http.MethodDelete:
+		h.DeleteCourseware(w, r)
+	default:
+		http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+	}
+}
+
+// dispatchCWComponentSubRoutes 课件组件子路由分发
+func dispatchCWComponentSubRoutes(w http.ResponseWriter, r *http.Request, h *handlers.CWComponentHandler) {
+	path := r.URL.Path
+
+	if strings.HasSuffix(path, "/index") {
+		h.CompressIndex(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		h.GetComponent(w, r)
+	case http.MethodPut:
+		h.UpdateComponent(w, r)
+	case http.MethodDelete:
+		h.DeleteComponent(w, r)
+	default:
+		http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+	}
+}
+
+// dispatchTemplateAIRoutes v139 新增:模板 AI 操作路由分发
+//
+// 处理以下路径(全部以 /api/v1/coursewares/templates/ 开头):
+//   POST   /api/v1/coursewares/templates/extract              → ExtractFromHTML
+//   GET    /api/v1/coursewares/templates/my-drafts            → ListMyDrafts
+//   DELETE /api/v1/coursewares/templates/drafts/{id}          → DeleteDraft
+//   POST   /api/v1/coursewares/templates/{id}/refine          → RefineTemplate
+//   GET    /api/v1/coursewares/templates/{id}/history         → GetHistory
+//   POST   /api/v1/coursewares/templates/{id}/rollback        → RollbackToHistory
+//   POST   /api/v1/coursewares/templates/{id}/publish         → PublishDraft
+//
+// 注意分发顺序:特殊路径先匹配,通配路径后匹配,避免误判
+func dispatchTemplateAIRoutes(w http.ResponseWriter, r *http.Request, h *handlers.CoursewareTemplateHandler) {
+	path := r.URL.Path
+
+	// ---- 特殊路径(固定后缀,优先匹配)----
+	if strings.HasSuffix(path, "/extract") {
+		h.ExtractFromHTML(w, r)
+		return
+	}
+	if strings.HasSuffix(path, "/my-drafts") {
+		h.ListMyDrafts(w, r)
+		return
+	}
+	// /drafts/{id}(DELETE)
+	if strings.Contains(path, "/drafts/") && r.Method == http.MethodDelete {
+		h.DeleteDraft(w, r)
+		return
+	}
+
+	// ---- 通配路径 /api/v1/coursewares/templates/{id}/<suffix> ----
+	if strings.HasSuffix(path, "/refine") {
+		h.RefineTemplate(w, r)
+		return
+	}
+	if strings.HasSuffix(path, "/history") {
+		h.GetHistory(w, r)
+		return
+	}
+	if strings.HasSuffix(path, "/rollback") {
+		h.RollbackToHistory(w, r)
+		return
+	}
+	if strings.HasSuffix(path, "/publish") {
+		h.PublishDraft(w, r)
+		return
+	}
+
+	// 没有匹配的路径
+	http.Error(w, `{"code":-1,"message":"未找到路由"}`, http.StatusNotFound)
+}

@@ -24,12 +24,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"time"
 
+	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 )
+
+// tokenLog 模块级结构化日志器
+var tokenLog = logger.WithModule("services.token")
 
 // ==================== 错误常量 ====================
 
@@ -88,7 +91,10 @@ func (s *TokenService) CreateAccount(ctx context.Context, req *models.CreateToke
 		return nil, fmt.Errorf("创建账户失败: %w", err)
 	}
 
-	log.Printf("[Token] 创建账户成功: type=%s owner=%s name=%s", acc.AccountType, acc.OwnerID, acc.DisplayName)
+	tokenLog.Info("创建账户成功",
+		"type", acc.AccountType,
+		"owner", acc.OwnerID,
+		"name", acc.DisplayName)
 	return acc, nil
 }
 
@@ -221,12 +227,18 @@ func (s *TokenService) AllocateTokens(ctx context.Context, fromAccountID string,
 		OperatorID:     operatorID,
 	}
 	if err := repository.CreateTokenAllocation(ctx, alloc); err != nil {
-		log.Printf("[Token] 分配成功但记录流水失败: from=%s to=%s amount=%d err=%v",
-			fromAccountID, req.ToAccountID, req.Amount, err)
+		tokenLog.Warn("分配成功但记录流水失败",
+			"from", fromAccountID,
+			"to", req.ToAccountID,
+			"amount", req.Amount,
+			"error", err)
 	}
 
-	log.Printf("[Token] 分配成功: from=%s to=%s amount=%d operator=%s",
-		fromAccountID, req.ToAccountID, req.Amount, operatorID)
+	tokenLog.Info("分配成功",
+		"from", fromAccountID,
+		"to", req.ToAccountID,
+		"amount", req.Amount,
+		"operator", operatorID)
 	return nil
 }
 
@@ -278,12 +290,17 @@ func (s *TokenService) PurchaseTokens(ctx context.Context, req *models.PurchaseT
 		ValidUntil:   validUntil,
 	}
 	if err := repository.CreateTokenPurchase(ctx, purchase); err != nil {
-		log.Printf("[Token] 充值成功但记录采购流水失败: account=%s amount=%d err=%v",
-			req.AccountID, req.Amount, err)
+		tokenLog.Warn("充值成功但记录采购流水失败",
+			"account", req.AccountID,
+			"amount", req.Amount,
+			"error", err)
 	}
 
-	log.Printf("[Token] 充值成功: account=%s amount=%d type=%s operator=%s",
-		req.AccountID, req.Amount, req.PurchaseType, operatorID)
+	tokenLog.Info("充值成功",
+		"account", req.AccountID,
+		"amount", req.Amount,
+		"type", req.PurchaseType,
+		"operator", operatorID)
 	return nil
 }
 
@@ -343,7 +360,10 @@ func (s *TokenService) ConsumeTokens(ctx context.Context, req *models.TokenConsu
 
 	// 扣减余额（允许透支，对齐AOCI：不做余额预检查，闸门已前置检查过）
 	if err := repository.DirectDeductBalance(ctx, acc.ID, creditCost); err != nil {
-		log.Printf("[Token] 消费扣减失败(不阻断AI): account=%s amount=%.4f err=%v", acc.ID, creditCost, err)
+		tokenLog.Warn("消费扣减失败(不阻断AI)",
+			"account", acc.ID,
+			"amount", creditCost,
+			"error", err)
 		return nil // 不阻断AI调用
 	}
 
@@ -373,7 +393,10 @@ func (s *TokenService) ConsumeTokens(ctx context.Context, req *models.TokenConsu
 		consumeLog.LatencyMs = int(calc.LatencyMs)
 	}
 	if err := repository.CreateTokenConsumptionLog(ctx, consumeLog); err != nil {
-		log.Printf("[Token] 记录消费流水失败: account=%s amount=%.4f err=%v", acc.ID, creditCost, err)
+		tokenLog.Warn("记录消费流水失败",
+			"account", acc.ID,
+			"amount", creditCost,
+			"error", err)
 	}
 
 	return nil

@@ -15,18 +15,23 @@ package ai
 // 新增 SchoolID 字段到 TraceContext 中
 
 import (
-	"log"
 	"sync"
+
+	"tedna/internal/logger"
 )
+
+// hookLog 模块级结构化日志器
+var hookLog = logger.WithModule("ai.credit_hook")
 
 // CreditConsumeFunc 积分消费回调函数类型
 // 参数说明：
-//   traceCtx     — 追踪上下文（含UserID/SceneCode等，来自调用方）
-//   modelUsed    — AI实际使用的模型名称
-//   inputTokens  — 输入token数（prompt_tokens）
-//   outputTokens — 输出token数（completion_tokens）
-//   totalTokens  — 总token数
-//   latencyMs    — 调用耗时（毫秒）
+//
+//	traceCtx     — 追踪上下文（含UserID/SceneCode等，来自调用方）
+//	modelUsed    — AI实际使用的模型名称
+//	inputTokens  — 输入token数（prompt_tokens）
+//	outputTokens — 输出token数（completion_tokens）
+//	totalTokens  — 总token数
+//	latencyMs    — 调用耗时（毫秒）
 type CreditConsumeFunc func(
 	traceCtx *TraceContext,
 	modelUsed string,
@@ -58,8 +63,9 @@ func SetCreditHook(consumeHook CreditConsumeFunc, checkHook CreditCheckFunc) {
 	defer hookMu.Unlock()
 	creditConsumeHook = consumeHook
 	creditCheckHook = checkHook
-	log.Printf("[AI积分] 积分回调钩子已设置 (消费回调=%v, 检查回调=%v)",
-		consumeHook != nil, checkHook != nil)
+	hookLog.Info("积分回调钩子已设置",
+		"consume_hook_set", consumeHook != nil,
+		"check_hook_set", checkHook != nil)
 }
 
 // invokeCreditConsume 调用积分消费回调（内部函数，AI调用成功后调用）
@@ -80,7 +86,9 @@ func invokeCreditConsume(traceCtx *TraceContext, modelUsed string, inputTokens i
 	// 当所有token数都为0时，不触发积分消费（由emitTrace中的output_length间接估算不可靠）
 	// 当totalTokens>0但input/output为0时，用总数按6:4估算
 	if inputTokens == 0 && outputTokens == 0 && totalTokens == 0 {
-		log.Printf("[AI积分] tokens全部为0，跳过积分消费 scene=%s model=%s", traceCtx.SceneCode, modelUsed)
+		hookLog.Info("tokens全部为0，跳过积分消费",
+			"scene", traceCtx.SceneCode,
+			"model", modelUsed)
 		return
 	}
 
@@ -88,7 +96,8 @@ func invokeCreditConsume(traceCtx *TraceContext, modelUsed string, inputTokens i
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("[AI积分] 积分消费回调panic: %v", r)
+				hookLog.Error("积分消费回调panic",
+					"error", r)
 			}
 		}()
 		hook(traceCtx, modelUsed, inputTokens, outputTokens, totalTokens, latencyMs)

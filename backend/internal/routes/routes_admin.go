@@ -35,6 +35,7 @@ func registerAdminRoutes(
         adminOnly func(http.Handler) http.Handler,
         adminOrSchoolAdmin func(http.Handler) http.Handler,
         adminHandler *handlers.AdminHandler,
+        orgHandler *handlers.OrganizationHandler,
         roleHandler *handlers.RoleHandler,
         userHandler *handlers.UserHandler,
         aiConfigHandler *handlers.AIConfigHandler,
@@ -62,6 +63,15 @@ func registerAdminRoutes(
         // 组织列表 — 学校管理员可看(用于组织架构 Tab 筛选)
         mux.Handle("/api/v1/admin/orgs",
                 middleware.Chain(http.HandlerFunc(adminHandler.ListAdminOrgs), authMW, adminOrSchoolAdmin))
+
+        // 组织Logo上传 — admin和senior_operator都可操作
+        mux.Handle("/api/v1/admin/orgs/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                if hasSuffix(r.URL.Path, "/upload-logo") {
+                        orgHandler.UploadOrgLogo(w, r)
+                        return
+                }
+                http.Error(w, `{"code":-1,"message":"未知路径"}`, http.StatusNotFound)
+        }), authMW, adminOrSchoolAdmin))
 
         // 教研组列表 — 学校管理员可看
         mux.Handle("/api/v1/admin/groups",

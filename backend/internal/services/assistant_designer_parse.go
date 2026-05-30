@@ -6,20 +6,23 @@ package services
 //   - parseAIDecision: AI决策JSON解析(四重兜底)
 //   - extractFieldsLenient: 字段级宽容提取
 //   - extractLongFieldValue: 长字段值提取
+//
+// v141 改进：log.Printf → adpLog 结构化日志
 
 import (
 	"encoding/json"
-	"log"
 	"fmt"
 	"regexp"
 	"strings"
 
 	"tedna/internal/ai"
+	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/utils"
 )
 
-
+// 模块日志
+var adpLog = logger.WithModule("designer_parse")
 
 // ============================================================================
 //
@@ -66,7 +69,7 @@ func parseAIDecision(raw string) (*AIDesignerDecision, error) {
 		fixed = openBrace + "\n" + fixed
 		var decision AIDesignerDecision
 		if err := json.Unmarshal([]byte(fixed), &decision); err == nil {
-			log.Printf("[designer] 手动补大括号后解析成功")
+			adpLog.Info("手动补大括号后解析成功")
 			if decision.Action == "" {
 				decision.Action = "draft_directly"
 			}
@@ -88,8 +91,11 @@ func parseAIDecision(raw string) (*AIDesignerDecision, error) {
 	if strings.HasPrefix(text, "{") && (strings.Contains(text, "\"action\"") || strings.Contains(text, "\"reply_text\"")) {
 		d := extractFieldsLenient(text)
 		if d != nil && strings.TrimSpace(d.ReplyText) != "" {
-			log.Printf("[designer] 策略 4 字段级宽容提取成功:action=%s reply_len=%d draft_len=%d",
-				d.Action, len(d.ReplyText), len(d.UpdatedDraft))
+			adpLog.Info("策略4字段级宽容提取成功",
+				"action", d.Action,
+				"reply_len", len(d.ReplyText),
+				"draft_len", len(d.UpdatedDraft),
+			)
 			return d, nil
 		}
 	}

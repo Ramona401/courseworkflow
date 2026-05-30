@@ -1,0 +1,1369 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>水循环实验场 · 3D 分步骤学习</title>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.171.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.171.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700;800;900&display=swap');
+
+    :root {
+      --bg: #050713;
+      --panel: rgba(8, 13, 28, 0.62);
+      --panel-strong: rgba(10, 18, 40, 0.78);
+      --line: rgba(145, 190, 255, 0.18);
+      --line-strong: rgba(120, 210, 255, 0.36);
+      --text: #e9f3ff;
+      --muted: #8aa1bd;
+      --muted-2: #5f789a;
+      --cyan: #57d8ff;
+      --blue: #4a8bff;
+      --mint: #55f0be;
+      --gold: #ffd18a;
+      --rose: #ff7db7;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+    body {
+      font-family: "Noto Sans SC", "Microsoft YaHei", "PingFang SC", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 16% 12%, rgba(88, 136, 255, 0.25), transparent 31%),
+        radial-gradient(circle at 78% 10%, rgba(80, 235, 194, 0.16), transparent 33%),
+        radial-gradient(circle at 50% 104%, rgba(30, 70, 140, 0.42), transparent 50%),
+        #050713;
+    }
+
+    body::before {
+      content: "";
+      position: fixed; inset: -40%; pointer-events: none; z-index: 0;
+      background:
+        conic-gradient(from 180deg at 50% 50%, transparent, rgba(87,216,255,0.10), transparent, rgba(255,209,138,0.08), transparent),
+        radial-gradient(circle, rgba(255,255,255,0.08) 1px, transparent 1.2px);
+      background-size: auto, 34px 34px;
+      animation: atmosphere 26s linear infinite;
+      opacity: 0.55;
+    }
+    @keyframes atmosphere { to { transform: rotate(1turn); } }
+
+    button { font: inherit; color: inherit; border: 0; background: none; cursor: pointer; }
+
+    .glass {
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(12, 20, 45, 0.76), rgba(8, 12, 26, 0.58));
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(22px) saturate(1.18);
+    }
+
+    .app { position: relative; height: 100vh; z-index: 1; }
+    .stage { position: absolute; inset: 0; overflow: hidden; }
+    #scene {
+      position: absolute; inset: 0; width: 100%; height: 100%; display: block;
+      cursor: grab;
+    }
+    #scene:active { cursor: grabbing; }
+
+    .topbar {
+      position: absolute; top: 18px; left: 22px; right: 22px; height: 66px; z-index: 10;
+      display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 16px;
+      padding: 0 18px; border-radius: 999px;
+    }
+    .brand { display: flex; align-items: center; gap: 13px; min-width: 0; }
+    .mark {
+      width: 46px; height: 46px; border-radius: 50%; position: relative; flex: 0 0 auto;
+      display: grid; place-items: center;
+      background:
+        radial-gradient(circle at 34% 24%, rgba(255,255,255,0.95), rgba(255,255,255,0.2) 16%, transparent 18%),
+        conic-gradient(from 220deg, #57d8ff, #55f0be, #ffd18a, #4a8bff, #57d8ff);
+      box-shadow: 0 0 38px rgba(87, 216, 255, 0.34), inset 0 0 18px rgba(255,255,255,0.22);
+    }
+    .mark::after {
+      content: ""; width: 25px; height: 25px; border-radius: 50%;
+      border: 2px solid rgba(5, 7, 19, 0.72); border-top-color: rgba(5, 7, 19, 0.1);
+      transform: rotate(-28deg);
+    }
+    .brand h1 { margin: 0; font-size: 18px; letter-spacing: 0.06em; font-weight: 900; }
+    .brand p { margin: 2px 0 0; color: var(--muted-2); font-size: 12px; white-space: nowrap; }
+    .top-status {
+      justify-self: center; display: flex; align-items: center; gap: 8px;
+      padding: 8px 12px; border-radius: 999px;
+      background: rgba(87, 216, 255, 0.08); border: 1px solid rgba(87, 216, 255, 0.20);
+      color: #b9ebff; font-size: 12px; font-weight: 700; letter-spacing: 0.02em;
+    }
+    .pulse-dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--mint);
+      box-shadow: 0 0 0 0 rgba(85, 240, 190, 0.7);
+      animation: pulse 1.8s infinite;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(85, 240, 190, 0.55); }
+      70% { box-shadow: 0 0 0 10px rgba(85, 240, 190, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(85, 240, 190, 0); }
+    }
+    .top-actions { justify-self: end; display: flex; gap: 9px; align-items: center; }
+    .pill-btn {
+      height: 38px; min-width: 38px; padding: 0 15px; border-radius: 999px;
+      border: 1px solid rgba(145, 190, 255, 0.20);
+      color: #cfe8ff; background: rgba(255,255,255,0.035);
+      transition: 0.18s ease;
+    }
+    .pill-btn:hover { transform: translateY(-1px); border-color: rgba(87,216,255,0.48); background: rgba(87,216,255,0.10); }
+    .pill-btn.active { background: linear-gradient(135deg, rgba(87,216,255,0.22), rgba(85,240,190,0.14)); border-color: rgba(87,216,255,0.52); }
+
+    .story-card {
+      position: absolute; left: 28px; top: 110px; width: 390px; max-width: calc(100vw - 56px); z-index: 8;
+      border-radius: 30px; padding: 24px;
+      overflow: hidden;
+    }
+    .story-card::before {
+      content: ""; position: absolute; inset: 0; pointer-events: none;
+      background:
+        linear-gradient(135deg, rgba(87,216,255,0.18), transparent 34%),
+        radial-gradient(circle at 94% 10%, rgba(255,209,138,0.18), transparent 24%);
+      opacity: 0.9;
+    }
+    .story-inner { position: relative; z-index: 1; }
+    .chapter-kicker { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+    .chapter-number {
+      font-size: 54px; line-height: 0.88; font-weight: 900; letter-spacing: -0.06em;
+      color: transparent; background: linear-gradient(135deg, #ffffff, #57d8ff 48%, #55f0be); -webkit-background-clip: text; background-clip: text;
+      filter: drop-shadow(0 0 18px rgba(87,216,255,0.28));
+    }
+    .chapter-tag {
+      padding: 7px 10px; border-radius: 999px; font-size: 12px; color: #b9ebff; font-weight: 800;
+      border: 1px solid rgba(87,216,255,0.28); background: rgba(87,216,255,0.08);
+      white-space: nowrap;
+    }
+    .story-card h2 { margin: 0; font-size: 32px; line-height: 1.15; letter-spacing: -0.02em; }
+    .story-card .subtitle { margin: 9px 0 0; color: var(--muted); font-size: 14px; font-weight: 600; }
+    .story-card .desc { margin: 18px 0 0; color: #bed4ec; font-size: 14px; line-height: 1.78; }
+
+    .keyword-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+    .keyword {
+      padding: 7px 9px; border-radius: 12px; font-size: 12px; color: #d7f4ff;
+      background: rgba(255,255,255,0.055); border: 1px solid rgba(145,190,255,0.14);
+    }
+    .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 20px; }
+    .stat {
+      min-height: 76px; border-radius: 18px; padding: 12px;
+      background: rgba(255,255,255,0.045); border: 1px solid rgba(145,190,255,0.13);
+    }
+    .stat span { display: block; color: var(--muted-2); font-size: 11px; font-weight: 700; margin-bottom: 6px; }
+    .stat b { display: block; color: #eaf7ff; font-size: 14px; line-height: 1.35; }
+    .story-controls { display: grid; grid-template-columns: 44px 1fr 44px; gap: 10px; margin-top: 20px; }
+    .round-control, .primary-control {
+      height: 44px; border-radius: 15px; border: 1px solid rgba(145,190,255,0.18);
+      background: rgba(255,255,255,0.06); transition: 0.18s ease;
+    }
+    .primary-control {
+      color: #06111f; font-weight: 900;
+      background: linear-gradient(135deg, #57d8ff, #55f0be 72%, #ffd18a);
+      border-color: rgba(255,255,255,0.38);
+      box-shadow: 0 12px 30px rgba(87,216,255,0.25);
+    }
+    .round-control:hover, .primary-control:hover { transform: translateY(-1px); filter: brightness(1.05); }
+
+    .cycle-panel {
+      position: absolute; right: 28px; top: 110px; width: 315px; z-index: 8;
+      border-radius: 30px; padding: 18px;
+    }
+    .panel-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .panel-head h3 { margin: 0; font-size: 15px; letter-spacing: 0.04em; }
+    .panel-head span { color: var(--muted-2); font-size: 12px; }
+    .phase-orb {
+      height: 164px; position: relative; display: grid; place-items: center; margin-bottom: 15px;
+    }
+    .phase-ring {
+      width: 150px; height: 150px; border-radius: 50%; position: relative;
+      background:
+        radial-gradient(circle at 50% 50%, rgba(8,13,28,0.94) 0 50%, transparent 51%),
+        conic-gradient(from var(--phase-angle, 0deg), #57d8ff, #55f0be, #ffd18a, #ff7db7, #4a8bff, #57d8ff);
+      filter: drop-shadow(0 0 28px rgba(87,216,255,0.18));
+      transition: 0.55s ease;
+    }
+    .phase-ring::before, .phase-ring::after {
+      content: ""; position: absolute; inset: 12px; border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.12);
+    }
+    .phase-ring::after { inset: 34px; border-style: dashed; opacity: 0.65; animation: spin 12s linear infinite; }
+    @keyframes spin { to { transform: rotate(1turn); } }
+    .orb-label { position: absolute; text-align: center; }
+    .orb-label b { display: block; font-size: 18px; }
+    .orb-label span { display: block; margin-top: 4px; color: var(--muted-2); font-size: 11px; }
+
+    .process-list { display: grid; gap: 8px; }
+    .process-item {
+      display: grid; grid-template-columns: 22px 1fr auto; gap: 9px; align-items: center;
+      min-height: 42px; padding: 8px; border-radius: 15px;
+      background: rgba(255,255,255,0.035); border: 1px solid transparent;
+      color: #93abc8; transition: 0.22s ease;
+    }
+    .process-item .dot {
+      width: 10px; height: 10px; border-radius: 50%; background: rgba(145,190,255,0.35);
+      box-shadow: inset 0 0 0 2px rgba(255,255,255,0.08);
+      justify-self: center;
+    }
+    .process-item strong { color: #cfe0f4; font-size: 13px; }
+    .process-item small { color: var(--muted-2); font-size: 11px; }
+    .process-item.active {
+      border-color: rgba(87,216,255,0.35); background: rgba(87,216,255,0.10); color: #d9f5ff;
+      transform: translateX(-3px);
+    }
+    .process-item.active .dot { background: var(--cyan); box-shadow: 0 0 18px rgba(87,216,255,0.55); }
+
+    .bottom-deck {
+      position: absolute; left: 28px; right: 28px; bottom: 22px; z-index: 9;
+      display: grid; grid-template-columns: minmax(0, 1fr) 275px; gap: 14px;
+      align-items: end;
+    }
+    .timeline {
+      height: 122px; border-radius: 28px; padding: 15px;
+      overflow: hidden;
+    }
+    .timeline-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 11px; }
+    .timeline-head b { font-size: 13px; letter-spacing: 0.04em; }
+    .timeline-head span { color: var(--muted-2); font-size: 12px; }
+    .chapters {
+      display: grid; grid-template-columns: repeat(9, minmax(102px, 1fr)); gap: 8px;
+      height: 70px; overflow-x: auto; padding-bottom: 4px;
+    }
+    .chapters::-webkit-scrollbar { height: 4px; }
+    .chapters::-webkit-scrollbar-thumb { background: rgba(87,216,255,0.25); border-radius: 99px; }
+    .chapter-btn {
+      position: relative; text-align: left; padding: 10px 10px 9px; min-width: 102px;
+      border-radius: 18px; background: rgba(255,255,255,0.045); border: 1px solid rgba(145,190,255,0.11);
+      color: #91a8c5; overflow: hidden; transition: 0.18s ease;
+    }
+    .chapter-btn::before {
+      content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px;
+      background: linear-gradient(90deg, transparent, var(--accent, #57d8ff), transparent);
+      opacity: 0;
+    }
+    .chapter-btn:hover { transform: translateY(-2px); border-color: rgba(87,216,255,0.28); }
+    .chapter-btn.active {
+      color: #effaff; background: rgba(87,216,255,0.12); border-color: rgba(87,216,255,0.42);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.035), 0 10px 28px rgba(0,0,0,0.22);
+    }
+    .chapter-btn.active::before { opacity: 1; }
+    .chapter-btn .n { display: block; color: var(--accent, #57d8ff); font-size: 11px; font-weight: 900; margin-bottom: 5px; }
+    .chapter-btn .t { display: block; font-size: 13px; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .chapter-btn .s { display: block; margin-top: 3px; font-size: 11px; color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .legend-card {
+      border-radius: 28px; padding: 15px; min-height: 122px;
+    }
+    .legend-card h3 { margin: 0 0 12px; font-size: 13px; letter-spacing: 0.04em; }
+    .legend-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .legend {
+      display: flex; align-items: center; gap: 8px; color: #a9bdd4; font-size: 12px;
+      padding: 8px; border-radius: 14px; background: rgba(255,255,255,0.035);
+      border: 1px solid rgba(145,190,255,0.10);
+    }
+    .swatch { width: 10px; height: 10px; border-radius: 50%; box-shadow: 0 0 14px currentColor; }
+
+    .hud-tip {
+      position: absolute; left: 50%; top: 108px; transform: translateX(-50%); z-index: 7;
+      padding: 8px 13px; border-radius: 999px;
+      color: rgba(221,242,255,0.72); font-size: 12px; letter-spacing: 0.02em;
+      border: 1px solid rgba(145,190,255,0.12); background: rgba(5,7,19,0.35); backdrop-filter: blur(12px);
+      pointer-events: none;
+    }
+
+    .corner-readout {
+      position: absolute; right: 34px; bottom: 160px; z-index: 7;
+      display: flex; gap: 8px; align-items: center;
+      color: rgba(221,242,255,0.58); font-size: 12px;
+      pointer-events: none;
+    }
+    .read-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 14px var(--mint); }
+
+    @media (max-width: 1180px) {
+      body { overflow: auto; }
+      .app { height: 1180px; min-height: 100vh; }
+      .topbar { grid-template-columns: 1fr auto; height: auto; padding: 12px; border-radius: 26px; }
+      .top-status { display: none; }
+      .story-card { top: 96px; width: 360px; }
+      .cycle-panel { top: 96px; width: 290px; }
+      .bottom-deck { grid-template-columns: 1fr; }
+      .chapters { grid-template-columns: repeat(9, 128px); }
+    }
+    @media (max-width: 820px) {
+      .app { height: 1460px; }
+      .topbar { left: 12px; right: 12px; top: 12px; }
+      .brand p, .top-actions .pill-btn span { display: none; }
+      .story-card, .cycle-panel { position: relative; left: auto; right: auto; top: auto; width: auto; margin: 96px 12px 0; }
+      .cycle-panel { margin-top: 14px; }
+      .bottom-deck { left: 12px; right: 12px; bottom: 12px; }
+      .story-card h2 { font-size: 27px; }
+      .hud-tip, .corner-readout { display: none; }
+    }
+  </style>
+</head>
+
+<body>
+<div class="app">
+  <main class="stage">
+    <canvas id="scene"></canvas>
+
+    <header class="topbar glass">
+      <div class="brand">
+        <div class="mark" aria-hidden="true"></div>
+        <div>
+          <h1>水循环实验场</h1>
+          <p>Hydrosphere Loop · 3D step-by-step simulation</p>
+        </div>
+      </div>
+      <div class="top-status"><span class="pulse-dot"></span><span id="modeText">步骤演示：总览</span></div>
+      <div class="top-actions">
+        <button class="pill-btn active" id="labelsBtn" title="显示或隐藏 3D 标签">标签</button>
+        <button class="pill-btn" id="resetCameraBtn" title="恢复当前步骤镜头">重置镜头</button>
+      </div>
+    </header>
+
+    <div class="hud-tip">拖动旋转 · 滚轮缩放 · 点击底部步骤卡切换过程</div>
+
+    <section class="story-card glass" aria-label="当前步骤说明">
+      <div class="story-inner">
+        <div class="chapter-kicker">
+          <div class="chapter-number" id="chapterNumber">00</div>
+          <div class="chapter-tag" id="chapterTag">完整循环</div>
+        </div>
+        <h2 id="stepTitle">水循环总览</h2>
+        <p class="subtitle" id="stepSubtitle">太阳能驱动的全球水分循环系统</p>
+        <p class="desc" id="stepDesc"></p>
+        <div class="keyword-row" id="keywordRow"></div>
+        <div class="stat-grid" id="statGrid"></div>
+        <div class="story-controls">
+          <button class="round-control" id="prevBtn" title="上一步">‹</button>
+          <button class="primary-control" id="playBtn">自动播放</button>
+          <button class="round-control" id="nextBtn" title="下一步">›</button>
+        </div>
+      </div>
+    </section>
+
+    <aside class="cycle-panel glass" aria-label="过程剖面">
+      <div class="panel-head">
+        <h3>循环剖面</h3>
+        <span id="phaseLabel">Liquid · Vapor · Ice</span>
+      </div>
+      <div class="phase-orb">
+        <div class="phase-ring" id="phaseRing"></div>
+        <div class="orb-label"><b id="phaseName">水体</b><span id="phaseSub">状态切换</span></div>
+      </div>
+      <div class="process-list" id="processList"></div>
+    </aside>
+
+    <div class="corner-readout"><span class="read-dot"></span><span>Procedural terrain · volumetric particles · real-time Three.js</span></div>
+
+    <section class="bottom-deck">
+      <nav class="timeline glass" aria-label="水循环步骤时间轴">
+        <div class="timeline-head"><b>分步骤演示</b><span id="timelineHint">点击任意步骤聚焦对应过程</span></div>
+        <div class="chapters" id="stepRail"></div>
+      </nav>
+      <section class="legend-card glass">
+        <h3>视觉图例</h3>
+        <div class="legend-grid">
+          <div class="legend"><span class="swatch" style="color:#57d8ff;background:#57d8ff"></span>水汽 / 云</div>
+          <div class="legend"><span class="swatch" style="color:#55f0be;background:#55f0be"></span>蒸腾 / 下渗</div>
+          <div class="legend"><span class="swatch" style="color:#ffd18a;background:#ffd18a"></span>太阳能</div>
+          <div class="legend"><span class="swatch" style="color:#4a8bff;background:#4a8bff"></span>径流 / 汇流</div>
+        </div>
+      </section>
+    </section>
+  </main>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ═══════════════════════════════════════════════════════════════
+// 课程数据：每一步会同时驱动 UI、镜头和 3D 特效强度
+// ═══════════════════════════════════════════════════════════════
+const steps = [
+  {
+    id: 'overview', no: '00', title: '水循环总览', tag: '完整循环', phase: '多相共存', phaseSub: '液态 · 气态 · 固态', accent: '#57d8ff', angle: 0,
+    subtitle: '太阳能驱动的全球水分循环系统',
+    desc: '水在海洋、陆地、大气和地下之间不断移动。它会经历蒸发、蒸腾、凝结、输送、降水、径流、下渗与汇流，形成近似闭合的循环。',
+    keywords: ['太阳能驱动', '相变', '大气输送', '陆海连接'],
+    stats: [['核心能量', '太阳辐射 + 重力'], ['主要水库', '海洋、冰川、地下水'], ['观察重点', '水分如何返回海洋'], ['学习方式', '逐步聚焦每个过程']],
+    cam: { pos: [8.6, 5.2, 9.2], target: [0.2, 1.45, 0.1] }
+  },
+  {
+    id: 'evaporation', no: '01', title: '蒸发', tag: '海面升空', phase: '液态 → 气态', phaseSub: '吸收热量', accent: '#ffd18a', angle: 42,
+    subtitle: '太阳加热海洋、湖泊和湿润地表',
+    desc: '水分子获得足够能量后脱离液面，变成水蒸气进入大气。海洋面积巨大，因此是全球蒸发最重要的来源。',
+    keywords: ['吸热', '海洋', '水汽', '潜热'],
+    stats: [['能量来源', '太阳辐射'], ['相态变化', '液态水 → 水蒸气'], ['主要位置', '海洋 / 湖泊 / 土壤表面'], ['3D 观察', '金色热量与上升水汽粒子']],
+    cam: { pos: [-6.4, 3.3, 5.0], target: [-3.9, 1.35, 0.2] }
+  },
+  {
+    id: 'transpiration', no: '02', title: '植物蒸腾', tag: '森林呼吸', phase: '液态 → 气态', phaseSub: '生物参与', accent: '#55f0be', angle: 84,
+    subtitle: '植物把根系吸收的水通过叶片释放到空气中',
+    desc: '植物根系吸水后，水沿茎叶运输，在叶片气孔中以水汽形式释放。蒸腾把生物圈和大气水分循环连接起来。',
+    keywords: ['根系吸水', '气孔释放', '森林', '生物圈'],
+    stats: [['参与主体', '植物叶片和根系'], ['释放形式', '水蒸气'], ['生态意义', '调节局地湿度与温度'], ['3D 观察', '森林上方的绿色上升粒子']],
+    cam: { pos: [4.8, 3.2, 6.0], target: [1.8, 1.25, 2.55] }
+  },
+  {
+    id: 'condensation', no: '03', title: '凝结成云', tag: '云滴生成', phase: '气态 → 液态/冰晶', phaseSub: '冷却释放热量', accent: '#b9ecff', angle: 128,
+    subtitle: '水汽上升冷却，附着在凝结核上形成云滴',
+    desc: '空气升高后温度降低，水汽达到饱和，会凝结为微小水滴或冰晶。大量云滴聚集后，我们就能看到云。',
+    keywords: ['饱和', '冷却', '凝结核', '云滴'],
+    stats: [['关键条件', '空气冷却到露点附近'], ['相态变化', '水蒸气 → 云滴/冰晶'], ['结果', '形成云层'], ['3D 观察', '云团变亮并聚合']],
+    cam: { pos: [1.3, 6.0, 8.8], target: [0.5, 3.1, 0.5] }
+  },
+  {
+    id: 'advection', no: '04', title: '水汽输送', tag: '风场迁移', phase: '大气搬运', phaseSub: '水平运动', accent: '#57d8ff', angle: 176,
+    subtitle: '风把云和水汽从海洋带向陆地',
+    desc: '大气环流与局地风会推动水汽水平移动。海面产生的水汽可以被带到山地和内陆，为后续降水提供来源。',
+    keywords: ['风', '大气环流', '水汽通量', '海陆输送'],
+    stats: [['驱动力', '气压差与风场'], ['运动方向', '海洋 → 陆地 / 山地'], ['影响', '决定降水分布'], ['3D 观察', '蓝色风向箭头推动云层']],
+    cam: { pos: [2.3, 4.7, 9.7], target: [0.9, 2.7, 0.2] }
+  },
+  {
+    id: 'precipitation', no: '05', title: '降水', tag: '回到地表', phase: '云滴 → 雨雪', phaseSub: '重力下落', accent: '#8bbdff', angle: 220,
+    subtitle: '云滴变大后以雨、雪或冰雹形式落下',
+    desc: '当云滴或冰晶增长到空气无法继续托举时，就会在重力作用下落回地表。山地抬升常会增强迎风坡降水。',
+    keywords: ['雨', '雪', '重力', '地形抬升'],
+    stats: [['触发条件', '云滴增长到足够大'], ['常见形式', '雨 / 雪 / 冰雹'], ['落点', '海洋、陆地、山地'], ['3D 观察', '降水线从云层落向山坡']],
+    cam: { pos: [5.5, 4.5, 6.0], target: [3.0, 2.1, 0.0] }
+  },
+  {
+    id: 'runoff', no: '06', title: '地表径流', tag: '河流汇集', phase: '地表流动', phaseSub: '重力驱动', accent: '#4a8bff', angle: 262,
+    subtitle: '降到陆地上的水沿地形流向低处',
+    desc: '没有被立即吸收或蒸发的雨水会沿坡面流动，汇入沟谷、溪流、河流和湖泊，最终可能进入海洋。',
+    keywords: ['坡面流', '河流', '重力', '流域'],
+    stats: [['主要动力', '重力 + 地形坡度'], ['路径', '坡面 → 河道 → 湖海'], ['作用', '搬运泥沙和溶解物'], ['3D 观察', '亮蓝色水流沿河谷移动']],
+    cam: { pos: [3.7, 3.0, 6.2], target: [0.5, 0.8, -0.7] }
+  },
+  {
+    id: 'infiltration', no: '07', title: '下渗与地下水', tag: '进入地下', phase: '地下储存', phaseSub: '孔隙流动', accent: '#55f0be', angle: 304,
+    subtitle: '一部分水渗入土壤和岩层，补给地下水',
+    desc: '降水可穿过土壤孔隙进入地下，形成土壤水与地下水。地下水会缓慢流动，也能补给河流或最终流向海洋。',
+    keywords: ['土壤孔隙', '含水层', '补给', '地下径流'],
+    stats: [['进入方式', '沿孔隙和裂隙下渗'], ['储存位置', '土壤层 / 含水层'], ['速度', '通常比地表径流更慢'], ['3D 观察', '绿色粒子向地下含水层移动']],
+    cam: { pos: [4.5, 2.2, 4.8], target: [1.9, 0.15, 0.9] }
+  },
+  {
+    id: 'collection', no: '08', title: '汇流回海', tag: '循环闭合', phase: '重新汇入水体', phaseSub: '下一轮开始', accent: '#57d8ff', angle: 352,
+    subtitle: '河流和地下水把水重新送回海洋',
+    desc: '地表径流、河流和地下水最终把大量水分带回海洋。太阳继续加热，新的蒸发开始，水循环因此不断重复。',
+    keywords: ['河口', '海洋', '闭合循环', '持续更新'],
+    stats: [['最终去向', '湖泊、湿地和海洋'], ['循环特点', '连续、动态、全球尺度'], ['重新开始', '蒸发再次发生'], ['3D 观察', '河流、地下水与海洋连成闭环']],
+    cam: { pos: [-3.8, 4.2, 8.6], target: [-1.9, 0.8, -0.2] }
+  }
+];
+
+const processItems = [
+  ['evaporation', '蒸发', '海面水汽上升'],
+  ['transpiration', '蒸腾', '植物释放水汽'],
+  ['condensation', '凝结', '水汽形成云滴'],
+  ['advection', '输送', '风把云推向陆地'],
+  ['precipitation', '降水', '雨雪回到地表'],
+  ['runoff', '径流', '河流汇集'],
+  ['infiltration', '下渗', '补给地下水'],
+  ['collection', '汇流', '返回海洋']
+];
+
+const state = {
+  step: 0,
+  labels: true,
+  autoplay: false,
+  cameraStart: null,
+  targetStart: null,
+  cameraEnd: null,
+  targetEnd: null,
+  cameraT0: 0,
+  cameraDuration: 980,
+  targets: {
+    vapor: 0, transp: 0, cloud: 1, wind: 0, rain: 0,
+    runoff: 0, infiltrate: 0, aquifer: 0, sun: 0.55
+  },
+  current: {
+    vapor: 0, transp: 0, cloud: 1, wind: 0, rain: 0,
+    runoff: 0, infiltrate: 0, aquifer: 0, sun: 0.55
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
+// Three.js 基础场景
+// ═══════════════════════════════════════════════════════════════
+const canvas = document.getElementById('scene');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.9));
+renderer.setClearColor(0x000000, 0);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.18;
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x07101f, 0.025);
+
+const camera = new THREE.PerspectiveCamera(43, 1, 0.1, 120);
+camera.position.set(...steps[0].cam.pos);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.055;
+controls.minDistance = 4.2;
+controls.maxDistance = 20;
+controls.maxPolarAngle = Math.PI * 0.49;
+controls.target.set(...steps[0].cam.target);
+controls.update();
+
+const root = new THREE.Group();
+root.rotation.y = -0.18;
+scene.add(root);
+
+// Lighting
+scene.add(new THREE.HemisphereLight(0xbfe8ff, 0x0a1428, 1.7));
+const sunLight = new THREE.DirectionalLight(0xffe0ad, 3.2);
+sunLight.position.set(-7, 8, -5);
+scene.add(sunLight);
+const coolLight = new THREE.DirectionalLight(0x65cfff, 1.25);
+coolLight.position.set(6, 6, 8);
+scene.add(coolLight);
+const fillLight = new THREE.PointLight(0x57d8ff, 1.4, 16);
+fillLight.position.set(-3, 3.2, 4);
+scene.add(fillLight);
+
+const clock = new THREE.Clock();
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+
+// ═══════════════════════════════════════════════════════════════
+// 实用函数
+// ═══════════════════════════════════════════════════════════════
+let seed = 14789;
+function rand() {
+  seed = (seed * 1664525 + 1013904223) >>> 0;
+  return seed / 4294967296;
+}
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+function easeInOut(t) { return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; }
+function smoothstep(edge0, edge1, x) {
+  const t = clamp01((x - edge0) / (edge1 - edge0));
+  return t * t * (3 - 2 * t);
+}
+function gaussian(x, z, cx, cz, sx, sz, amp) {
+  const dx = (x - cx) / sx;
+  const dz = (z - cz) / sz;
+  return amp * Math.exp(-(dx * dx + dz * dz));
+}
+function terrainHeight(x, z) {
+  const land = smoothstep(-4.2, -1.25, x);
+  const mountains = gaussian(x, z, 3.2, -0.4, 2.0, 2.5, 2.45)
+    + gaussian(x, z, 4.55, 2.0, 1.2, 1.35, 1.15)
+    + gaussian(x, z, 1.0, -2.4, 2.2, 1.2, 0.65)
+    + gaussian(x, z, 0.6, 2.35, 1.8, 1.6, 0.52);
+  const ridge = 0.12 * Math.sin(x * 1.9 + z * 0.7) + 0.08 * Math.sin(x * 3.1 - z * 1.2);
+  const shoreDip = -0.20 * (1 - land);
+  return land * (0.12 + mountains + ridge) + shoreDip;
+}
+function setOpacity(object, opacity, visibleThreshold = 0.015) {
+  object.visible = opacity > visibleThreshold;
+  object.traverse(child => {
+    if (!child.material) return;
+    const mats = Array.isArray(child.material) ? child.material : [child.material];
+    mats.forEach(m => {
+      if (m.userData.baseOpacity === undefined) m.userData.baseOpacity = m.opacity ?? 1;
+      m.transparent = true;
+      m.opacity = (m.userData.baseOpacity ?? 1) * opacity;
+      m.depthWrite = opacity > 0.55 && (m.userData.baseOpacity ?? 1) > 0.85;
+      m.needsUpdate = true;
+    });
+  });
+}
+function makeGlowTexture(inner = 'rgba(255,255,255,1)', outer = 'rgba(87,216,255,0)') {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(128, 128, 0, 128, 128, 128);
+  g.addColorStop(0.0, inner);
+  g.addColorStop(0.22, inner.replace('1)', '0.86)'));
+  g.addColorStop(0.58, inner.replace('1)', '0.23)'));
+  g.addColorStop(1.0, outer);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 256, 256);
+  return new THREE.CanvasTexture(c);
+}
+function makeLabel(text, accent = '#57d8ff') {
+  const c = document.createElement('canvas'); c.width = 384; c.height = 96;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.fillStyle = 'rgba(5, 10, 22, 0.78)';
+  roundRect(ctx, 8, 16, 368, 64, 20); ctx.fill();
+  ctx.strokeStyle = 'rgba(145,190,255,0.24)'; ctx.lineWidth = 2; roundRect(ctx, 8, 16, 368, 64, 20); ctx.stroke();
+  ctx.fillStyle = accent; ctx.beginPath(); ctx.arc(38, 48, 7, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#eaf6ff'; ctx.font = '800 27px "Noto Sans SC", sans-serif';
+  ctx.fillText(text, 56, 58);
+  const texture = new THREE.CanvasTexture(c);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false, depthWrite: false });
+  const sp = new THREE.Sprite(mat);
+  sp.scale.set(1.45, 0.36, 1);
+  sp.renderOrder = 1000;
+  return sp;
+}
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function materialAccent(color, opacity = 1) {
+  const m = new THREE.MeshPhysicalMaterial({
+    color, roughness: 0.33, metalness: 0.02, clearcoat: 0.6,
+    emissive: new THREE.Color(color), emissiveIntensity: 0.08,
+    transparent: opacity < 1, opacity
+  });
+  m.userData.baseOpacity = opacity;
+  return m;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 天空、太阳、星尘
+// ═══════════════════════════════════════════════════════════════
+const skyGeo = new THREE.SphereGeometry(58, 64, 32);
+const skyMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide,
+  uniforms: {
+    topColor: { value: new THREE.Color(0x10284c) },
+    bottomColor: { value: new THREE.Color(0x050713) },
+    offset: { value: 0.22 },
+    exponent: { value: 1.35 }
+  },
+  vertexShader: `varying vec3 vWorldPosition;
+    void main(){ vec4 worldPosition = modelMatrix * vec4(position,1.0); vWorldPosition = worldPosition.xyz; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+  fragmentShader: `uniform vec3 topColor; uniform vec3 bottomColor; uniform float offset; uniform float exponent; varying vec3 vWorldPosition;
+    void main(){ float h = normalize(vWorldPosition + offset).y; gl_FragColor = vec4(mix(bottomColor, topColor, max(pow(max(h,0.0), exponent),0.0)), 1.0); }`
+});
+scene.add(new THREE.Mesh(skyGeo, skyMat));
+
+const sunGroup = new THREE.Group();
+sunGroup.position.set(-6.4, 6.8, -4.5);
+const sunCore = new THREE.Mesh(
+  new THREE.SphereGeometry(0.34, 48, 24),
+  new THREE.MeshBasicMaterial({ color: 0xffd18a })
+);
+const sunGlow = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: makeGlowTexture('rgba(255,209,138,1)', 'rgba(255,209,138,0)'),
+  transparent: true, blending: THREE.AdditiveBlending, depthWrite: false
+}));
+sunGlow.scale.set(3.8, 3.8, 1);
+sunGroup.add(sunGlow, sunCore);
+scene.add(sunGroup);
+
+const starGeo = new THREE.BufferGeometry();
+const starPositions = [];
+for (let i = 0; i < 720; i++) {
+  const r = 24 + rand() * 34;
+  const theta = rand() * Math.PI * 2;
+  const phi = Math.acos(2 * rand() - 1);
+  starPositions.push(r * Math.sin(phi) * Math.cos(theta), r * Math.sin(phi) * Math.sin(theta), r * Math.cos(phi));
+}
+starGeo.setAttribute('position', new THREE.Float32BufferAttribute(starPositions, 3));
+scene.add(new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0x86bfff, size: 0.045, transparent: true, opacity: 0.62 })));
+
+// ═══════════════════════════════════════════════════════════════
+// 地形与海洋
+// ═══════════════════════════════════════════════════════════════
+const terrainGroup = new THREE.Group();
+root.add(terrainGroup);
+
+function buildTerrain() {
+  const width = 18, depth = 13, nx = 176, nz = 128;
+  const verts = [], colors = [], indices = [];
+  const color = new THREE.Color();
+  for (let iz = 0; iz <= nz; iz++) {
+    const z = (iz / nz - 0.5) * depth;
+    for (let ix = 0; ix <= nx; ix++) {
+      const x = (ix / nx - 0.5) * width;
+      const h = terrainHeight(x, z);
+      verts.push(x, h, z);
+      if (h < -0.05) color.setRGB(0.08, 0.18, 0.23);
+      else if (h < 0.16) color.setRGB(0.48, 0.40, 0.25);
+      else if (h < 0.58) color.setRGB(0.20, 0.42, 0.24);
+      else if (h < 1.35) color.setRGB(0.16, 0.34, 0.25);
+      else if (h < 2.15) color.setRGB(0.45, 0.47, 0.43);
+      else color.setRGB(0.78, 0.82, 0.86);
+      const shade = 0.88 + 0.16 * Math.sin(x * 2.1 + z * 1.3);
+      colors.push(color.r * shade, color.g * shade, color.b * shade);
+    }
+  }
+  for (let iz = 0; iz < nz; iz++) {
+    for (let ix = 0; ix < nx; ix++) {
+      const a = iz * (nx + 1) + ix;
+      const b = a + 1;
+      const c = a + (nx + 1);
+      const d = c + 1;
+      indices.push(a, c, b, b, c, d);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  const mat = new THREE.MeshStandardMaterial({
+    vertexColors: true, roughness: 0.86, metalness: 0.02,
+    envMapIntensity: 0.25
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.receiveShadow = true;
+  terrainGroup.add(mesh);
+
+  // 海岸线薄光
+  const coastPts = [];
+  for (let z = -5.6; z <= 5.6; z += 0.25) coastPts.push(new THREE.Vector3(-1.45 + 0.18 * Math.sin(z * 1.4), 0.08, z));
+  const coast = new THREE.Mesh(
+    new THREE.TubeGeometry(new THREE.CatmullRomCurve3(coastPts), 120, 0.018, 8, false),
+    new THREE.MeshBasicMaterial({ color: 0x57d8ff, transparent: true, opacity: 0.38 })
+  );
+  terrainGroup.add(coast);
+}
+buildTerrain();
+
+function buildOcean() {
+  const width = 23, depth = 16, nx = 140, nz = 96;
+  const verts = [], indices = [];
+  for (let iz = 0; iz <= nz; iz++) {
+    const z = (iz / nz - 0.5) * depth;
+    for (let ix = 0; ix <= nx; ix++) {
+      const x = (ix / nx - 0.5) * width - 1.7;
+      verts.push(x, 0.03, z);
+    }
+  }
+  for (let iz = 0; iz < nz; iz++) {
+    for (let ix = 0; ix < nx; ix++) {
+      const a = iz * (nx + 1) + ix;
+      indices.push(a, a + nx + 1, a + 1, a + 1, a + nx + 1, a + nx + 2);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  geo.userData.nx = nx;
+  geo.userData.nz = nz;
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: 0x0e6fa9, roughness: 0.16, metalness: 0.0, clearcoat: 1,
+    transparent: true, opacity: 0.62, transmission: 0.08, thickness: 0.35,
+    emissive: 0x06233b, emissiveIntensity: 0.18
+  });
+  mat.userData.baseOpacity = 0.62;
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.renderOrder = 2;
+  terrainGroup.add(mesh);
+  return mesh;
+}
+const oceanMesh = buildOcean();
+const oceanPositions = oceanMesh.geometry.attributes.position;
+
+// 河流曲线
+function makeRiverCurve(points) { return new THREE.CatmullRomCurve3(points.map(p => new THREE.Vector3(...p))); }
+const mainRiver = makeRiverCurve([
+  [3.95, terrainHeight(3.95, -1.0) + 0.08, -1.0],
+  [2.35, terrainHeight(2.35, -1.15) + 0.08, -1.15],
+  [1.25, terrainHeight(1.25, -0.55) + 0.06, -0.55],
+  [-0.45, terrainHeight(-0.45, -0.28) + 0.06, -0.28],
+  [-1.75, 0.08, -0.05],
+  [-3.65, 0.05, 0.05]
+]);
+const tributary = makeRiverCurve([
+  [3.35, terrainHeight(3.35, 2.0) + 0.08, 2.0],
+  [2.4, terrainHeight(2.4, 1.4) + 0.07, 1.4],
+  [1.35, terrainHeight(1.35, 0.55) + 0.07, 0.55],
+  [0.05, terrainHeight(0.05, -0.10) + 0.06, -0.10]
+]);
+const riverMat = new THREE.MeshPhysicalMaterial({ color: 0x2bb8ff, roughness: 0.18, clearcoat: 0.9, transparent: true, opacity: 0.72, emissive: 0x076dba, emissiveIntensity: 0.22 });
+riverMat.userData.baseOpacity = 0.72;
+const riverGroup = new THREE.Group();
+riverGroup.add(new THREE.Mesh(new THREE.TubeGeometry(mainRiver, 180, 0.052, 12, false), riverMat));
+riverGroup.add(new THREE.Mesh(new THREE.TubeGeometry(tributary, 120, 0.035, 10, false), riverMat.clone()));
+terrainGroup.add(riverGroup);
+
+// 地下含水层剖面
+const aquiferGroup = new THREE.Group();
+const aquiferCurve = makeRiverCurve([
+  [2.9, -0.34, 1.7], [1.7, -0.42, 1.0], [0.2, -0.46, 0.3], [-1.4, -0.38, 0.1], [-3.0, -0.28, 0.05]
+]);
+const aquiferMat = new THREE.MeshPhysicalMaterial({ color: 0x55f0be, transparent: true, opacity: 0.52, roughness: 0.25, clearcoat: 0.8, emissive: 0x15b68d, emissiveIntensity: 0.25 });
+aquiferMat.userData.baseOpacity = 0.52;
+aquiferGroup.add(new THREE.Mesh(new THREE.TubeGeometry(aquiferCurve, 140, 0.07, 14, false), aquiferMat));
+const aquiferGlow = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: makeGlowTexture('rgba(85,240,190,1)', 'rgba(85,240,190,0)'),
+  transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.45
+}));
+aquiferGlow.position.set(0.0, -0.42, 0.4);
+aquiferGlow.scale.set(5.2, 1.05, 1);
+aquiferGlow.material.userData.baseOpacity = 0.45;
+aquiferGroup.add(aquiferGlow);
+terrainGroup.add(aquiferGroup);
+
+// ═══════════════════════════════════════════════════════════════
+// 植被
+// ═══════════════════════════════════════════════════════════════
+const forestGroup = new THREE.Group();
+const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5b3422, roughness: 0.8 });
+const leafMat = new THREE.MeshStandardMaterial({ color: 0x1f8f61, roughness: 0.7, emissive: 0x06341f, emissiveIntensity: 0.08 });
+const leafMat2 = new THREE.MeshStandardMaterial({ color: 0x2bbb72, roughness: 0.72, emissive: 0x06341f, emissiveIntensity: 0.06 });
+function addTree(x, z, s) {
+  const y = terrainHeight(x, z);
+  if (y < 0.1) return;
+  const g = new THREE.Group();
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.035 * s, 0.05 * s, 0.34 * s, 8), trunkMat);
+  trunk.position.y = 0.17 * s;
+  const leaves = new THREE.Mesh(new THREE.ConeGeometry(0.22 * s, 0.62 * s, 10), rand() > 0.45 ? leafMat : leafMat2);
+  leaves.position.y = 0.55 * s;
+  const leaves2 = new THREE.Mesh(new THREE.ConeGeometry(0.18 * s, 0.46 * s, 10), leaves.material);
+  leaves2.position.y = 0.82 * s;
+  g.add(trunk, leaves, leaves2);
+  g.position.set(x, y + 0.02, z);
+  g.rotation.y = rand() * Math.PI * 2;
+  forestGroup.add(g);
+}
+for (let i = 0; i < 90; i++) {
+  const x = 0.35 + rand() * 2.45;
+  const z = 1.35 + rand() * 2.8;
+  addTree(x, z, 0.62 + rand() * 0.55);
+}
+for (let i = 0; i < 36; i++) {
+  const x = 1.1 + rand() * 2.6;
+  const z = -3.1 + rand() * 1.4;
+  addTree(x, z, 0.45 + rand() * 0.45);
+}
+terrainGroup.add(forestGroup);
+
+// ═══════════════════════════════════════════════════════════════
+// 云、粒子、雨、径流、下渗
+// ═══════════════════════════════════════════════════════════════
+const cloudGroup = new THREE.Group();
+root.add(cloudGroup);
+const cloudMaterials = [];
+function createCloudCluster(x, y, z, scale, count, tint = 0xffffff) {
+  const group = new THREE.Group();
+  for (let i = 0; i < count; i++) {
+    const r = (0.22 + rand() * 0.34) * scale;
+    const mat = new THREE.MeshStandardMaterial({
+      color: tint, transparent: true, opacity: 0.62 + rand() * 0.18,
+      roughness: 0.92, metalness: 0, emissive: 0x9bdfff, emissiveIntensity: 0.03
+    });
+    mat.userData.baseOpacity = mat.opacity;
+    cloudMaterials.push(mat);
+    const puff = new THREE.Mesh(new THREE.SphereGeometry(r, 24, 14), mat);
+    puff.position.set((rand() - 0.5) * 2.2 * scale, (rand() - 0.5) * 0.45 * scale, (rand() - 0.5) * 1.1 * scale);
+    puff.scale.x *= 1.15 + rand() * 0.9;
+    puff.scale.z *= 0.85 + rand() * 0.6;
+    group.add(puff);
+  }
+  group.position.set(x, y, z);
+  cloudGroup.add(group);
+  return group;
+}
+const oceanCloud = createCloudCluster(-1.6, 4.0, 0.2, 1.0, 18, 0xeaf9ff);
+const mountainCloud = createCloudCluster(2.9, 4.25, 0.05, 1.18, 24, 0xeaf9ff);
+const cloudHalo = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: makeGlowTexture('rgba(185,236,255,0.85)', 'rgba(185,236,255,0)'),
+  transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.25
+}));
+cloudHalo.position.set(1.1, 4.15, 0.05);
+cloudHalo.scale.set(5.2, 2.1, 1);
+cloudHalo.material.userData.baseOpacity = 0.25;
+cloudGroup.add(cloudHalo);
+
+function createRisingParticles(name, count, color, sourceFn, topY, size = 0.065) {
+  const pos = new Float32Array(count * 3);
+  const data = [];
+  for (let i = 0; i < count; i++) {
+    const p = sourceFn();
+    data.push({ x: p.x, y: p.y, z: p.z, phase: rand(), speed: 0.035 + rand() * 0.085, drift: rand() * Math.PI * 2, topY });
+    pos[i * 3] = p.x; pos[i * 3 + 1] = p.y; pos[i * 3 + 2] = p.z;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({
+    color, size, transparent: true, opacity: 0, depthWrite: false,
+    blending: THREE.AdditiveBlending, sizeAttenuation: true
+  });
+  mat.userData.baseOpacity = 0.72;
+  const pts = new THREE.Points(geo, mat);
+  pts.userData.data = data;
+  pts.userData.name = name;
+  root.add(pts);
+  return pts;
+}
+const vaporParticles = createRisingParticles('vapor', 520, 0xffd18a, () => ({
+  x: -6.7 + rand() * 4.7,
+  y: 0.08 + rand() * 0.08,
+  z: -4.6 + rand() * 9.0
+}), 4.15, 0.06);
+const transpParticles = createRisingParticles('transp', 260, 0x55f0be, () => {
+  const x = 0.45 + rand() * 2.4;
+  const z = 1.4 + rand() * 2.7;
+  return { x, y: terrainHeight(x, z) + 0.38 + rand() * 0.2, z };
+}, 4.05, 0.055);
+
+function createMistParticles() {
+  const count = 260;
+  const pos = new Float32Array(count * 3);
+  const data = [];
+  for (let i = 0; i < count; i++) {
+    const a = rand() * Math.PI * 2;
+    const r = 0.35 + rand() * 1.9;
+    const y = 3.7 + (rand() - 0.5) * 0.8;
+    data.push({ a, r, y, speed: 0.3 + rand() * 0.8, phase: rand() * 6.28 });
+    pos[i * 3] = Math.cos(a) * r + 0.8;
+    pos[i * 3 + 1] = y;
+    pos[i * 3 + 2] = Math.sin(a) * r * 0.55 + 0.05;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({ color: 0xb9ecff, size: 0.055, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending });
+  mat.userData.baseOpacity = 0.62;
+  const pts = new THREE.Points(geo, mat);
+  pts.userData.data = data;
+  root.add(pts);
+  return pts;
+}
+const mistParticles = createMistParticles();
+
+function createRain() {
+  const count = 430;
+  const pos = new Float32Array(count * 2 * 3);
+  const data = [];
+  for (let i = 0; i < count; i++) {
+    const x = 1.2 + rand() * 4.5;
+    const z = -1.6 + rand() * 3.8;
+    data.push({ x, z, phase: rand(), speed: 0.42 + rand() * 0.48, len: 0.18 + rand() * 0.22 });
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.LineBasicMaterial({ color: 0x8bbdff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending });
+  mat.userData.baseOpacity = 0.72;
+  const lines = new THREE.LineSegments(geo, mat);
+  lines.userData.data = data;
+  root.add(lines);
+  return lines;
+}
+const rainLines = createRain();
+
+function createFlowParticles(curves, count, color, radius = 0.055) {
+  const geo = new THREE.SphereGeometry(radius, 12, 8);
+  const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0, blending: THREE.AdditiveBlending });
+  mat.userData.baseOpacity = 0.9;
+  const mesh = new THREE.InstancedMesh(geo, mat, count);
+  const data = [];
+  for (let i = 0; i < count; i++) data.push({ curve: curves[Math.floor(rand() * curves.length)], phase: rand(), speed: 0.08 + rand() * 0.11, scale: 0.55 + rand() * 0.85 });
+  mesh.userData.data = data;
+  root.add(mesh);
+  return mesh;
+}
+const runoffDrops = createFlowParticles([mainRiver, tributary], 160, 0x4a8bff, 0.055);
+const aquiferDrops = createFlowParticles([aquiferCurve], 85, 0x55f0be, 0.052);
+
+function createInfiltration() {
+  const count = 120;
+  const geo = new THREE.SphereGeometry(0.045, 12, 8);
+  const mat = new THREE.MeshBasicMaterial({ color: 0x55f0be, transparent: true, opacity: 0, blending: THREE.AdditiveBlending });
+  mat.userData.baseOpacity = 0.85;
+  const mesh = new THREE.InstancedMesh(geo, mat, count);
+  const data = [];
+  for (let i = 0; i < count; i++) {
+    const x = 0.3 + rand() * 3.4;
+    const z = -1.0 + rand() * 3.4;
+    const ground = terrainHeight(x, z) + 0.04;
+    data.push({ x, z, ground, phase: rand(), depth: 0.46 + rand() * 0.85, speed: 0.12 + rand() * 0.24 });
+  }
+  mesh.userData.data = data;
+  root.add(mesh);
+  return mesh;
+}
+const infiltrationDrops = createInfiltration();
+
+// ═══════════════════════════════════════════════════════════════
+// 3D 流程箭头
+// ═══════════════════════════════════════════════════════════════
+const arrowGroup = new THREE.Group();
+const arrows = [];
+root.add(arrowGroup);
+function makeArrow(name, pts, color, stepsForArrow, radius = 0.035) {
+  const curve = new THREE.CatmullRomCurve3(pts.map(p => new THREE.Vector3(...p)));
+  const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.82, blending: THREE.AdditiveBlending, depthWrite: false });
+  mat.userData.baseOpacity = 0.82;
+  const tube = new THREE.Mesh(new THREE.TubeGeometry(curve, 96, radius, 10, false), mat);
+  const coneMat = mat.clone(); coneMat.userData.baseOpacity = 0.95;
+  const cone = new THREE.Mesh(new THREE.ConeGeometry(radius * 5.3, radius * 15, 18), coneMat);
+  const end = curve.getPoint(1);
+  const tangent = curve.getTangent(1).normalize();
+  cone.position.copy(end);
+  cone.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), tangent);
+  const g = new THREE.Group();
+  g.add(tube, cone);
+  g.userData.steps = stepsForArrow;
+  g.userData.basePulse = 0.6 + rand() * 0.4;
+  g.userData.name = name;
+  arrows.push(g);
+  arrowGroup.add(g);
+  return g;
+}
+makeArrow('evap-1', [[-5.6,0.3,-2.6],[-5.1,1.4,-2.0],[-4.2,2.6,-1.0],[-2.4,3.75,-0.2]], 0xffd18a, ['evaporation'], 0.026);
+makeArrow('evap-2', [[-4.0,0.3,1.8],[-3.8,1.7,1.0],[-2.8,2.9,0.55],[-1.5,3.9,0.2]], 0xffd18a, ['evaporation'], 0.026);
+makeArrow('transp-1', [[1.1,1.0,2.4],[1.0,2.0,2.2],[0.8,3.1,1.6],[0.2,3.85,0.8]], 0x55f0be, ['transpiration'], 0.024);
+makeArrow('transp-2', [[2.2,0.9,3.2],[2.0,1.9,2.55],[1.8,3.2,1.25],[1.3,4.0,0.45]], 0x55f0be, ['transpiration'], 0.024);
+makeArrow('condense-loop', [[-1.0,3.8,0.8],[0.4,4.45,1.0],[1.8,4.2,0.3],[0.7,3.65,-0.4],[-0.8,3.8,0.2]], 0xb9ecff, ['condensation'], 0.022);
+makeArrow('wind-1', [[-2.2,4.0,0.5],[-0.6,4.25,0.55],[1.2,4.25,0.35],[3.1,4.18,0.1]], 0x57d8ff, ['advection'], 0.03);
+makeArrow('wind-2', [[-2.6,3.55,-0.8],[-0.8,3.85,-0.55],[1.0,3.9,-0.25],[2.7,3.82,-0.45]], 0x57d8ff, ['advection'], 0.022);
+makeArrow('precip-1', [[3.0,3.55,-0.2],[3.0,2.6,-0.25],[2.8,1.7,-0.35],[2.65,terrainHeight(2.65,-0.35)+0.15,-0.35]], 0x8bbdff, ['precipitation'], 0.028);
+makeArrow('precip-2', [[3.9,3.65,1.0],[3.6,2.7,0.75],[3.25,1.8,0.5],[3.0,terrainHeight(3.0,0.5)+0.16,0.5]], 0x8bbdff, ['precipitation'], 0.024);
+makeArrow('runoff-1', [[3.9,terrainHeight(3.9,-1.0)+0.28,-1.0],[2.3,terrainHeight(2.3,-1.1)+0.28,-1.1],[0.4,terrainHeight(0.4,-0.25)+0.22,-0.25],[-2.5,0.22,0.0]], 0x4a8bff, ['runoff', 'collection'], 0.026);
+makeArrow('infiltrate-1', [[1.5,terrainHeight(1.5,1.1)+0.32,1.1],[1.5,0.35,1.0],[1.2,-0.15,0.78],[0.8,-0.42,0.55]], 0x55f0be, ['infiltration'], 0.026);
+makeArrow('groundwater-1', [[0.9,-0.42,0.55],[-0.5,-0.45,0.3],[-1.8,-0.36,0.12],[-3.15,-0.18,0.04]], 0x55f0be, ['infiltration', 'collection'], 0.026);
+makeArrow('collection-1', [[-1.9,0.18,0.0],[-3.3,0.14,0.05],[-5.0,0.18,0.2],[-6.4,0.22,0.35]], 0x57d8ff, ['collection'], 0.03);
+
+// ═══════════════════════════════════════════════════════════════
+// 标签
+// ═══════════════════════════════════════════════════════════════
+const labels = [];
+function addLabel(text, pos, color, stepsVisible = []) {
+  const sp = makeLabel(text, color);
+  sp.position.set(...pos);
+  sp.userData.steps = stepsVisible;
+  labels.push(sp);
+  root.add(sp);
+}
+addLabel('海洋：蒸发源', [-5.6, 0.62, -2.8], '#ffd18a', ['overview', 'evaporation', 'collection']);
+addLabel('云：凝结与输送', [0.0, 4.75, 0.9], '#b9ecff', ['overview', 'condensation', 'advection']);
+addLabel('山地降水', [3.4, 3.05, -1.35], '#8bbdff', ['overview', 'precipitation']);
+addLabel('森林蒸腾', [1.7, 1.55, 3.55], '#55f0be', ['overview', 'transpiration']);
+addLabel('河流径流', [-0.7, 0.62, -0.86], '#4a8bff', ['overview', 'runoff', 'collection']);
+addLabel('地下水', [0.3, -0.28, 1.25], '#55f0be', ['overview', 'infiltration', 'collection']);
+
+// ═══════════════════════════════════════════════════════════════
+// UI 渲染与交互
+// ═══════════════════════════════════════════════════════════════
+const els = {
+  number: document.getElementById('chapterNumber'), tag: document.getElementById('chapterTag'),
+  title: document.getElementById('stepTitle'), subtitle: document.getElementById('stepSubtitle'), desc: document.getElementById('stepDesc'),
+  keywordRow: document.getElementById('keywordRow'), statGrid: document.getElementById('statGrid'),
+  rail: document.getElementById('stepRail'), processList: document.getElementById('processList'),
+  modeText: document.getElementById('modeText'), phaseRing: document.getElementById('phaseRing'),
+  phaseName: document.getElementById('phaseName'), phaseSub: document.getElementById('phaseSub'), phaseLabel: document.getElementById('phaseLabel'),
+  playBtn: document.getElementById('playBtn'), labelsBtn: document.getElementById('labelsBtn')
+};
+
+function renderStaticUI() {
+  els.rail.innerHTML = steps.map((s, i) => `
+    <button class="chapter-btn" data-step="${i}" style="--accent:${s.accent}">
+      <span class="n">${s.no}</span><span class="t">${s.title}</span><span class="s">${s.tag}</span>
+    </button>
+  `).join('');
+  els.processList.innerHTML = processItems.map(([id, name, sub]) => `
+    <div class="process-item" data-process="${id}"><span class="dot"></span><strong>${name}</strong><small>${sub}</small></div>
+  `).join('');
+}
+function renderStepUI() {
+  const s = steps[state.step];
+  els.number.textContent = s.no;
+  els.tag.textContent = s.tag;
+  els.title.textContent = s.title;
+  els.subtitle.textContent = s.subtitle;
+  els.desc.textContent = s.desc;
+  els.keywordRow.innerHTML = s.keywords.map(k => `<span class="keyword">${k}</span>`).join('');
+  els.statGrid.innerHTML = s.stats.map(([k, v]) => `<div class="stat"><span>${k}</span><b>${v}</b></div>`).join('');
+  els.modeText.textContent = `步骤演示：${s.title}`;
+  els.phaseRing.style.setProperty('--phase-angle', `${s.angle}deg`);
+  els.phaseName.textContent = s.phase;
+  els.phaseSub.textContent = s.phaseSub;
+  els.phaseLabel.textContent = s.id === 'overview' ? 'Liquid · Vapor · Ice' : s.tag;
+  document.querySelectorAll('.chapter-btn').forEach((b, i) => b.classList.toggle('active', i === state.step));
+  document.querySelectorAll('.process-item').forEach(item => {
+    const id = item.dataset.process;
+    item.classList.toggle('active', s.id === id || (s.id === 'overview' && ['evaporation','condensation','precipitation','runoff'].includes(id)));
+  });
+  els.playBtn.textContent = state.autoplay ? '停止播放' : '自动播放';
+  els.labelsBtn.classList.toggle('active', state.labels);
+}
+
+function updateTargets() {
+  const id = steps[state.step].id;
+  const all = id === 'overview';
+  state.targets.vapor = all ? 0.36 : id === 'evaporation' ? 1 : id === 'condensation' ? 0.35 : 0.06;
+  state.targets.transp = all ? 0.25 : id === 'transpiration' ? 1 : 0.04;
+  state.targets.cloud = all ? 0.86 : ['condensation', 'advection', 'precipitation'].includes(id) ? 1 : 0.68;
+  state.targets.wind = all ? 0.18 : id === 'advection' ? 1 : 0.03;
+  state.targets.rain = all ? 0.18 : id === 'precipitation' ? 1 : 0.02;
+  state.targets.runoff = all ? 0.30 : ['runoff', 'collection'].includes(id) ? 1 : 0.06;
+  state.targets.infiltrate = all ? 0.17 : id === 'infiltration' ? 1 : 0.02;
+  state.targets.aquifer = all ? 0.32 : ['infiltration', 'collection'].includes(id) ? 1 : 0.05;
+  state.targets.sun = id === 'evaporation' ? 1 : all ? 0.62 : 0.46;
+}
+
+function applyStep(index, instant = false) {
+  state.step = (index + steps.length) % steps.length;
+  const s = steps[state.step];
+  renderStepUI();
+  updateTargets();
+  state.cameraStart = camera.position.clone();
+  state.targetStart = controls.target.clone();
+  state.cameraEnd = new THREE.Vector3(...s.cam.pos);
+  state.targetEnd = new THREE.Vector3(...s.cam.target);
+  state.cameraT0 = performance.now();
+  if (instant) {
+    camera.position.copy(state.cameraEnd);
+    controls.target.copy(state.targetEnd);
+    controls.update();
+  }
+}
+
+renderStaticUI();
+applyStep(0, true);
+
+let autoplayTimer = null;
+function setAutoplay(on) {
+  state.autoplay = on;
+  if (autoplayTimer) { clearInterval(autoplayTimer); autoplayTimer = null; }
+  if (on) autoplayTimer = setInterval(() => applyStep(state.step + 1), 5600);
+  renderStepUI();
+}
+
+document.body.addEventListener('click', (e) => {
+  const stepBtn = e.target.closest('[data-step]');
+  if (stepBtn) { setAutoplay(false); applyStep(Number(stepBtn.dataset.step)); return; }
+  if (e.target.id === 'prevBtn') { setAutoplay(false); applyStep(state.step - 1); return; }
+  if (e.target.id === 'nextBtn') { setAutoplay(false); applyStep(state.step + 1); return; }
+  if (e.target.id === 'playBtn') { setAutoplay(!state.autoplay); return; }
+  if (e.target.id === 'labelsBtn') { state.labels = !state.labels; renderStepUI(); return; }
+  if (e.target.id === 'resetCameraBtn') { applyStep(state.step); return; }
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight') { setAutoplay(false); applyStep(state.step + 1); }
+  if (e.key === 'ArrowLeft') { setAutoplay(false); applyStep(state.step - 1); }
+  if (e.key === ' ') { e.preventDefault(); setAutoplay(!state.autoplay); }
+});
+
+// 点击 3D 箭头也可切换到对应步骤
+canvas.addEventListener('pointerdown', e => {
+  const rect = canvas.getBoundingClientRect();
+  pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObjects(arrows.flatMap(g => g.children), false);
+  if (!hits.length) return;
+  const parent = hits[0].object.parent;
+  const stepId = parent?.userData?.steps?.[0];
+  if (!stepId) return;
+  const idx = steps.findIndex(s => s.id === stepId);
+  if (idx >= 0) { setAutoplay(false); applyStep(idx); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// 动画循环
+// ═══════════════════════════════════════════════════════════════
+const tmpMatrix = new THREE.Matrix4();
+const tmpPos = new THREE.Vector3();
+const tmpScale = new THREE.Vector3();
+const tmpQuat = new THREE.Quaternion();
+
+function updateOcean(time) {
+  const pos = oceanPositions.array;
+  for (let i = 0; i < pos.length; i += 3) {
+    const x = pos[i], z = pos[i + 2];
+    pos[i + 1] = 0.03
+      + Math.sin(x * 1.6 + time * 0.92) * 0.035
+      + Math.sin(z * 2.2 + time * 0.72) * 0.025
+      + Math.sin((x + z) * 0.75 + time * 0.42) * 0.018;
+  }
+  oceanPositions.needsUpdate = true;
+  oceanMesh.geometry.computeVertexNormals();
+}
+function updateRisingParticles(points, intensity, time, extraDrift = 1) {
+  const pos = points.geometry.attributes.position.array;
+  const data = points.userData.data;
+  for (let i = 0; i < data.length; i++) {
+    const d = data[i];
+    const p = (d.phase + time * d.speed) % 1;
+    const y = lerp(d.y, d.topY, p);
+    pos[i * 3] = d.x + Math.sin(time * 1.4 + d.drift + p * 5.0) * 0.12 * extraDrift + p * 0.4;
+    pos[i * 3 + 1] = y;
+    pos[i * 3 + 2] = d.z + Math.cos(time * 1.1 + d.drift) * 0.12 * extraDrift;
+  }
+  points.geometry.attributes.position.needsUpdate = true;
+  points.material.opacity = points.material.userData.baseOpacity * intensity;
+  points.visible = intensity > 0.015;
+}
+function updateMist(time, intensity) {
+  const pos = mistParticles.geometry.attributes.position.array;
+  const data = mistParticles.userData.data;
+  for (let i = 0; i < data.length; i++) {
+    const d = data[i];
+    const a = d.a + time * 0.25 * d.speed;
+    const wob = Math.sin(time * 1.3 + d.phase) * 0.09;
+    pos[i * 3] = 0.9 + Math.cos(a) * (d.r + wob);
+    pos[i * 3 + 1] = d.y + Math.sin(time * 0.9 + d.phase) * 0.08;
+    pos[i * 3 + 2] = 0.05 + Math.sin(a) * (d.r * 0.52 + wob);
+  }
+  mistParticles.geometry.attributes.position.needsUpdate = true;
+  mistParticles.material.opacity = mistParticles.material.userData.baseOpacity * intensity;
+  mistParticles.visible = intensity > 0.015;
+}
+function updateRain(time, intensity) {
+  const pos = rainLines.geometry.attributes.position.array;
+  const data = rainLines.userData.data;
+  for (let i = 0; i < data.length; i++) {
+    const d = data[i];
+    const ground = Math.max(0.08, terrainHeight(d.x, d.z) + 0.07);
+    const travel = 3.95 - ground;
+    const p = (d.phase + time * d.speed * 0.34) % 1;
+    const y = 3.95 - p * travel;
+    const x = d.x + Math.sin(time * 0.8 + d.phase * 6.28) * 0.04;
+    const z = d.z + Math.cos(time * 0.55 + d.phase * 6.28) * 0.03;
+    const idx = i * 6;
+    pos[idx] = x; pos[idx + 1] = y; pos[idx + 2] = z;
+    pos[idx + 3] = x + 0.02; pos[idx + 4] = Math.max(ground, y - d.len); pos[idx + 5] = z - 0.03;
+  }
+  rainLines.geometry.attributes.position.needsUpdate = true;
+  rainLines.material.opacity = rainLines.material.userData.baseOpacity * intensity;
+  rainLines.visible = intensity > 0.015;
+}
+function updateFlow(mesh, intensity, time) {
+  const data = mesh.userData.data;
+  const mat = mesh.material;
+  mat.opacity = mat.userData.baseOpacity * intensity;
+  mesh.visible = intensity > 0.015;
+  if (!mesh.visible) return;
+  for (let i = 0; i < data.length; i++) {
+    const d = data[i];
+    const t = (d.phase + time * d.speed) % 1;
+    tmpPos.copy(d.curve.getPointAt(t));
+    tmpPos.y += 0.05 + Math.sin((t + time) * 20) * 0.012;
+    tmpScale.setScalar(d.scale * (0.7 + 0.3 * Math.sin(t * Math.PI)));
+    tmpQuat.identity();
+    tmpMatrix.compose(tmpPos, tmpQuat, tmpScale);
+    mesh.setMatrixAt(i, tmpMatrix);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+}
+function updateInfiltration(time, intensity) {
+  const data = infiltrationDrops.userData.data;
+  const mat = infiltrationDrops.material;
+  mat.opacity = mat.userData.baseOpacity * intensity;
+  infiltrationDrops.visible = intensity > 0.015;
+  if (!infiltrationDrops.visible) return;
+  for (let i = 0; i < data.length; i++) {
+    const d = data[i];
+    const p = (d.phase + time * d.speed) % 1;
+    tmpPos.set(d.x + Math.sin(time + d.phase * 6.28) * 0.025, d.ground - p * d.depth, d.z);
+    tmpScale.setScalar(0.55 + 0.45 * (1 - p));
+    tmpQuat.identity();
+    tmpMatrix.compose(tmpPos, tmpQuat, tmpScale);
+    infiltrationDrops.setMatrixAt(i, tmpMatrix);
+  }
+  infiltrationDrops.instanceMatrix.needsUpdate = true;
+}
+function updateArrows(time) {
+  const activeId = steps[state.step].id;
+  arrows.forEach(g => {
+    const active = activeId === 'overview' || g.userData.steps.includes(activeId);
+    const dim = activeId === 'collection' && g.userData.steps.includes('collection');
+    const pulse = active ? (0.85 + Math.sin(time * 2.8 + g.userData.basePulse * 4.0) * 0.15) : 0.09;
+    setOpacity(g, dim ? Math.max(pulse, 0.75) : pulse);
+  });
+}
+function updateClouds(time) {
+  const cloudIntensity = state.current.cloud;
+  cloudGroup.visible = cloudIntensity > 0.05;
+  cloudMaterials.forEach((m, i) => {
+    const isPrecip = steps[state.step].id === 'precipitation';
+    const base = m.userData.baseOpacity ?? 0.7;
+    m.color.lerp(new THREE.Color(isPrecip ? 0xc8d6eb : 0xffffff), 0.045);
+    m.opacity = base * (0.58 + 0.42 * cloudIntensity);
+  });
+  oceanCloud.position.x = -1.65 + Math.sin(time * 0.19) * 0.08;
+  mountainCloud.position.x = 2.9 + Math.sin(time * 0.16 + 1.2) * 0.06;
+  cloudGroup.position.x = state.current.wind * 0.16 * Math.sin(time * 0.8);
+  cloudHalo.material.opacity = cloudHalo.material.userData.baseOpacity * cloudIntensity;
+}
+function updateLabels() {
+  const activeId = steps[state.step].id;
+  labels.forEach(sp => {
+    const allowed = sp.userData.steps.length === 0 || sp.userData.steps.includes(activeId);
+    sp.visible = state.labels && allowed;
+    sp.material.opacity = activeId === 'overview' ? 0.82 : 1;
+  });
+}
+function updateCamera() {
+  if (!state.cameraEnd || !state.cameraStart) return;
+  const t = clamp01((performance.now() - state.cameraT0) / state.cameraDuration);
+  const e = easeInOut(t);
+  camera.position.lerpVectors(state.cameraStart, state.cameraEnd, e);
+  controls.target.lerpVectors(state.targetStart, state.targetEnd, e);
+}
+function updateEffectIntensities(dt) {
+  Object.keys(state.current).forEach(k => {
+    state.current[k] = lerp(state.current[k], state.targets[k], 1 - Math.pow(0.001, dt));
+  });
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(0.05, clock.getDelta());
+  const t = clock.elapsedTime;
+  updateEffectIntensities(dt);
+  updateCamera();
+  controls.update();
+
+  updateOcean(t);
+  updateRisingParticles(vaporParticles, state.current.vapor, t, 1.3);
+  updateRisingParticles(transpParticles, state.current.transp, t, 0.75);
+  updateMist(t, steps[state.step].id === 'condensation' ? 1 : steps[state.step].id === 'overview' ? 0.35 : 0.04);
+  updateRain(t, state.current.rain);
+  updateFlow(runoffDrops, state.current.runoff, t);
+  updateFlow(aquiferDrops, state.current.aquifer, t * 0.45);
+  updateInfiltration(t, state.current.infiltrate);
+  updateClouds(t);
+  updateArrows(t);
+  updateLabels();
+
+  const aquiferOpacity = state.current.aquifer;
+  setOpacity(aquiferGroup, aquiferOpacity);
+  sunGlow.material.opacity = 0.55 + state.current.sun * 0.55;
+  sunGlow.scale.setScalar(3.5 + state.current.sun * 1.8 + Math.sin(t * 1.2) * 0.08);
+  sunCore.scale.setScalar(1 + state.current.sun * 0.08);
+  sunLight.intensity = 2.4 + state.current.sun * 1.8;
+
+  riverMat.opacity = riverMat.userData.baseOpacity * (0.55 + state.current.runoff * 0.45);
+  root.rotation.y += dt * 0.018;
+
+  renderer.render(scene, camera);
+}
+
+function resize() {
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  camera.aspect = rect.width / rect.height;
+  camera.updateProjectionMatrix();
+  renderer.setSize(rect.width, rect.height, false);
+}
+window.addEventListener('resize', resize);
+resize();
+animate();
+</script>
+</body>
+</html>

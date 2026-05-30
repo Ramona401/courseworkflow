@@ -1,0 +1,235 @@
+package handlers
+
+// courseware_template_handler.go — v137新增：课件个人模板HTTP处理器
+//
+// 提供三个接口：
+//   1. GET  /api/v1/courseware-templates/with-user — 获取系统模板+我的个人模板
+//   2. POST /api/v1/coursewares/{id}/save-as-template — 保存当前课件为我的模板
+//   3. DELETE /api/v1/courseware-templates/personal/{id} — 删除我的个人模板
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"tedna/internal/middleware"
+	"tedna/internal/models"
+	"tedna/internal/repository"
+	"tedna/internal/utils"
+)
+
+// CoursewareTemplateHandler 课件个人模板处理器
+type CoursewareTemplateHandler struct{}
+
+// NewCoursewareTemplateHandler 创建课件个人模板处理器
+func NewCoursewareTemplateHandler() *CoursewareTemplateHandler {
+	return &CoursewareTemplateHandler{}
+}
+
+// ListTemplatesWithUser GET /api/v1/courseware-templates/with-user
+// 返回系统模板 + 当前用户的个人模板
+func (h *CoursewareTemplateHandler) ListTemplatesWithUser(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	templates, err := repository.ListCWTemplatesWithUser(r.Context(), claims.UserID, true)
+	if err != nil {
+		utils.InternalError(w, "查询模板失败: "+err.Error())
+		return
+	}
+	utils.Success(w, templates)
+}
+
+// SaveAsMyTemplate POST /api/v1/coursewares/{id}/save-as-template
+// 将当前课件的导航栏HTML + 风格配置保存为个人可复用模板
+func (h *CoursewareTemplateHandler) SaveAsMyTemplate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	// 提取课件ID: /api/v1/coursewares/{id}/save-as-template
+	cwID := extractCoursewareMiddleID(r.URL.Path, "/save-as-template")
+	if cwID == "" {
+		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	// 解析请求体
+	var req models.SaveAsMyTemplateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		utils.BadRequest(w, "模板名称不能为空")
+		return
+	}
+
+	// 查询课件详情
+	cw, err := repository.GetCoursewareByID(r.Context(), cwID)
+	if err != nil {
+		utils.InternalError(w, "课件不存在: "+err.Error())
+		return
+	}
+	// 权限校验：只能保存自己的课件为模板
+	if cw.UserID != claims.UserID {
+		utils.Forbidden(w, "无权操作此课件")
+		return
+	}
+
+	// 构建个人模板
+	// 从课件style_config中提取风格类别（如果请求中未指定）
+	styleCategory := req.StyleCategory
+	if styleCategory == "" {
+		styleCategory = extractStyleCategoryFromConfig(cw.StyleConfig)
+	}
+	if styleCategory == "" {
+		styleCategory = "minimalist" // 兜底默认
+	}
+
+	// 从课件已生成的页面中取第1页HTML作为sample_pages
+	pages, _ := repository.ListCoursewarePages(r.Context(), cwID)
+	samplePagesJSON := "[]"
+	if len(pages) > 0 {
+		// 取第1页（封面页）的完整HTML作为样例
+		for _, p := range pages {
+			if p.PageNumber == 1 && p.HTMLContent != "" {
+				sampleJSON, _ := json.Marshal([]string{p.HTMLContent})
+				samplePagesJSON = string(sampleJSON)
+				break
+			}
+		}
+	}
+
+	userID := claims.UserID
+	tpl := &models.CoursewareTemplate{
+		Name:               strings.TrimSpace(req.Name),
+		Description:        req.Description,
+		StyleCategory:      styleCategory,
+		ColorScheme:        extractFieldFromConfig(cw.StyleConfig, "color_scheme_raw"),
+		CSSVariables:       extractFieldFromConfig(cw.StyleConfig, "css_variables_raw"),
+		SamplePages:        samplePagesJSON,
+		IsActive:           true,
+		SortOrder:          0,
+		UserID:             &userID,
+		Scope:              models.CWTemplateScopePersonal,
+		SourceCoursewareID: &cwID,
+	}
+
+	// 尝试从style_config中获取原始模板的配色和CSS变量
+	// style_config格式: {"template_id":"xxx","logo_url":"...","org_name":"..."}
+	templateID := extractFieldFromConfig(cw.StyleConfig, "template_id")
+	if templateID != "" {
+		// 从原始系统模板复制配色和CSS变量
+		origTpl, origErr := repository.GetCWTemplateByID(r.Context(), templateID)
+		if origErr == nil {
+			tpl.ColorScheme = origTpl.ColorScheme
+			tpl.CSSVariables = origTpl.CSSVariables
+			if tpl.StyleCategory == "" || tpl.StyleCategory == "minimalist" {
+				tpl.StyleCategory = origTpl.StyleCategory
+			}
+		}
+	}
+
+	if err := repository.CreatePersonalTemplate(r.Context(), tpl); err != nil {
+		utils.InternalError(w, "保存模板失败: "+err.Error())
+		return
+	}
+
+	utils.Success(w, map[string]interface{}{
+		"id":      tpl.ID,
+		"name":    tpl.Name,
+		"message": fmt.Sprintf("模板「%s」保存成功", tpl.Name),
+	})
+}
+
+// DeleteMyTemplate DELETE /api/v1/courseware-templates/personal/{id}
+// 删除我的个人模板
+func (h *CoursewareTemplateHandler) DeleteMyTemplate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	// 提取模板ID: /api/v1/courseware-templates/personal/{id}
+	tplID := extractPersonalTemplateID(r.URL.Path)
+	if tplID == "" {
+		utils.BadRequest(w, "缺少模板ID")
+		return
+	}
+
+	if err := repository.DeletePersonalTemplate(r.Context(), tplID, claims.UserID); err != nil {
+		utils.InternalError(w, err.Error())
+		return
+	}
+	utils.Success(w, map[string]string{"message": "模板删除成功"})
+}
+
+// ==================== 辅助函数 ====================
+
+// extractStyleCategoryFromConfig 从style_config JSON中提取style_category
+func extractStyleCategoryFromConfig(styleConfig string) string {
+	if styleConfig == "" {
+		return ""
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(styleConfig), &m); err != nil {
+		return ""
+	}
+	if v, ok := m["style_category"]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// extractFieldFromConfig 从style_config JSON中提取指定字段
+func extractFieldFromConfig(styleConfig string, field string) string {
+	if styleConfig == "" {
+		return ""
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(styleConfig), &m); err != nil {
+		return ""
+	}
+	if v, ok := m[field]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// extractPersonalTemplateID 从 /api/v1/courseware-templates/personal/{id} 提取ID
+func extractPersonalTemplateID(path string) string {
+	const prefix = "/api/v1/courseware-templates/personal/"
+	if !strings.HasPrefix(path, prefix) {
+		return ""
+	}
+	rest := path[len(prefix):]
+	rest = strings.TrimRight(rest, "/")
+	if strings.Contains(rest, "/") {
+		return ""
+	}
+	return rest
+}

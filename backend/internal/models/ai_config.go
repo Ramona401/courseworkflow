@@ -131,10 +131,44 @@ const (
 // 从 lesson_plan 场景中独立出来,便于单独调模型/温度/降级链(管理员可在 AI 管理中心前端界面直接调整,无需改代码)
 const (
 	SceneAssistantDesigner = "assistant_designer" // AI 助手对话式创作(Sonnet,可在管理界面切换)
+
+	// 课件工坊场景代码常量
+	SceneCWNavRefine       = "courseware_nav_refine"      // 课件导航栏样式微调
+	SceneCWPageRefine      = "courseware_page_refine"     // 课件单页内容微调
+	SceneCWIndex           = "courseware_index"            // 课件索引生成
+	SceneCWScheme          = "courseware_scheme"           // 课件方案翻译
+	SceneCWGenerate        = "courseware_generate"         // 课件HTML生成
+	SceneCWTemplateExtract = "courseware_template_extract" // 课件模板AI提取
+	SceneCWTemplateRefine  = "courseware_template_refine"  // 课件模板AI微调
+)
+
+// v0.41新增：v0.42预留场景代码常量（多入口+多媒体阶段启用）
+const (
+	SceneCWImageGen    = "courseware_image_gen"    // 课件图片生成提示词优化（Haiku）
+	SceneCWPPTExtract  = "courseware_ppt_extract"  // PPT内容提取与索引生成（Sonnet）
+	SceneCWTopicDirect = "courseware_topic_direct" // 主题直接生成课件索引（Sonnet）
+)
+
+// v0.42.1新增：视频生成场景代码常量
+const (
+	SceneCWVideoGen = "courseware_video_gen" // 课件视频生成（豆包Seedance）
+)
+
+// v0.42.9新增：TTS语音合成场景代码常量
+const (
+	SceneCWSubtitleTTS = "courseware_subtitle_tts" // 课件字幕TTS配音（豆包seed-tts-2.0）
+)
+
+// v0.42.11新增：3D单页课件生成场景代码常量
+const (
+	SceneCW3DSingle = "courseware_3d_single" // 3D互动单页课件生成（Claude Sonnet 4.6）
 )
 
 // ValidSceneCodes 有效场景代码列表
 // v87新增 stage_coach;v114新增 assistant_designer
+// v0.41新增 courseware_image_gen/courseware_ppt_extract/courseware_topic_direct（预留v0.42）
+// v0.42.1新增 courseware_video_gen
+// v0.42.11新增 courseware_3d_single
 var ValidSceneCodes = []string{
 	SceneScanner, SceneEvaluator, SceneMeta,
 	SceneTranslator, SceneReviewer,
@@ -142,9 +176,23 @@ var ValidSceneCodes = []string{
 	SceneAIFix, SceneLessonPlan,
 	SceneStageCoach,
 	SceneAssistantDesigner,
+	SceneCWNavRefine, SceneCWPageRefine,
+	SceneCWIndex, SceneCWScheme, SceneCWGenerate,
+	SceneCWTemplateExtract, SceneCWTemplateRefine,
+	// v0.41 预留（v0.42 启用）
+	SceneCWImageGen, SceneCWPPTExtract, SceneCWTopicDirect,
+	// v0.42.1 新增
+	SceneCWVideoGen,
+	// v0.42.9 新增
+	SceneCWSubtitleTTS,
+	// v0.42.11 新增
+	SceneCW3DSingle,
 }
 
 // SceneNameMap 场景代码→中文名映射
+// v0.41新增3个预留场景的中文名
+// v0.42.1新增 courseware_video_gen
+// v0.42.11新增 courseware_3d_single
 var SceneNameMap = map[string]string{
 	SceneScanner:           "扫描定位",
 	SceneEvaluator:         "评估打分",
@@ -158,10 +206,30 @@ var SceneNameMap = map[string]string{
 	SceneLessonPlan:        "教案备课对话",
 	SceneStageCoach:        "阶段教练评估",
 	SceneAssistantDesigner: "AI助手对话式创作",
+	SceneCWIndex:           "课件索引生成",
+	SceneCWScheme:          "课件方案翻译",
+	SceneCWGenerate:        "课件HTML生成",
+	SceneCWNavRefine:       "课件导航栏微调",
+	SceneCWPageRefine:      "课件单页微调",
+	SceneCWTemplateExtract: "课件模板AI提取",
+	SceneCWTemplateRefine:  "课件模板AI微调",
+	// v0.41 预留（v0.42 启用）
+	SceneCWImageGen:    "课件图片生成",
+	SceneCWPPTExtract:  "PPT内容提取",
+	SceneCWTopicDirect: "主题直接生成课件",
+	// v0.42.1 新增
+	SceneCWVideoGen: "课件视频生成",
+	// v0.42.9 新增
+	SceneCWSubtitleTTS: "课件字幕TTS配音",
+	// v0.42.11 新增
+	SceneCW3DSingle: "3D互动单页生成",
 }
 
 // SceneGroupMap 场景代码→分组映射（v78新增，v87补充stage_coach，v114补充 assistant_designer）
 // 归入 lesson_plan 组:Designer 也服务于教案备课生态(老师创建 AI 助手→助手帮教师备课)
+// v0.41新增3个预留场景归入 courseware 组
+// v0.42.1新增 courseware_video_gen 归入 courseware 组
+// v0.42.11新增 courseware_3d_single 归入 courseware 组
 var SceneGroupMap = map[string]string{
 	SceneScanner:           "pipeline",
 	SceneEvaluator:         "pipeline",
@@ -175,6 +243,23 @@ var SceneGroupMap = map[string]string{
 	SceneLessonPlan:        "lesson_plan",
 	SceneStageCoach:        "lesson_plan",
 	SceneAssistantDesigner: "lesson_plan",
+	SceneCWIndex:           "courseware",
+	SceneCWScheme:          "courseware",
+	SceneCWGenerate:        "courseware",
+	SceneCWNavRefine:       "courseware",
+	SceneCWPageRefine:      "courseware",
+	SceneCWTemplateExtract: "courseware",
+	SceneCWTemplateRefine:  "courseware",
+	// v0.41 预留（v0.42 启用）
+	SceneCWImageGen:    "courseware",
+	SceneCWPPTExtract:  "courseware",
+	SceneCWTopicDirect: "courseware",
+	// v0.42.1 新增
+	SceneCWVideoGen: "courseware",
+	// v0.42.9 新增
+	SceneCWSubtitleTTS: "courseware",
+	// v0.42.11 新增
+	SceneCW3DSingle: "courseware",
 }
 
 // IsValidSceneCode 检查场景代码是否有效

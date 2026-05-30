@@ -46,15 +46,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 	"tedna/internal/utils"
 )
+
+// aiLog 模块级结构化日志器
+var aiLog = logger.WithModule("ai.client")
 
 // ==================== 常量 ====================
 
@@ -318,7 +321,9 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 	}
 
 	primaryErr := err
-	log.Printf("[AI Fallback] 主模型 %s 所有重试失败: %s", primaryModel, err.Error())
+	aiLog.Warn("主模型所有重试失败",
+		"model", primaryModel,
+		"error", err.Error())
 
 	// -------- 第2阶段：依次尝试fallback模型（v85新增）--------
 	for i, fbModel := range cfg.FallbackModels {
@@ -327,14 +332,19 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 			continue
 		}
 
-		log.Printf("[AI Fallback] 尝试降级模型 %d/%d: %s（场景: %s）",
-			i+1, len(cfg.FallbackModels), fbModel, getSceneFromTrace(traceCtx))
+		aiLog.Info("尝试降级模型",
+			"index", i+1,
+			"total", len(cfg.FallbackModels),
+			"fallback_model", fbModel,
+			"scene", getSceneFromTrace(traceCtx))
 
 		result, err = callAIWithRetries(cfg, fbModel, messages, endpoint, MaxFallbackRetries)
 		if err == nil {
 			// fallback模型调用成功
 			fbLatMs := time.Since(startTime).Milliseconds()
-			log.Printf("[AI Fallback] 降级模型 %s 调用成功（原始模型: %s）", fbModel, primaryModel)
+			aiLog.Info("降级模型调用成功",
+				"fallback_model", fbModel,
+				"original_model", primaryModel)
 			emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
 				fbLatMs, "success", "", len(result.Content), false,
 				true, primaryModel)
@@ -343,7 +353,9 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 			return result, nil
 		}
 
-		log.Printf("[AI Fallback] 降级模型 %s 也失败: %s", fbModel, err.Error())
+		aiLog.Warn("降级模型也失败",
+			"fallback_model", fbModel,
+			"error", err.Error())
 	}
 
 	// 所有模型（主+fallback）都失败
@@ -374,14 +386,19 @@ func callAIWithRetries(cfg *EffectiveConfig, model string, messages []ChatMessag
 		// 非首次调用时等待退避时间
 		if attempt > 0 {
 			delay := getRetryDelay(attempt - 1)
-			log.Printf("[AI重试] 模型 %s 第%d次重试，等待%s", model, attempt, delay)
+			aiLog.Info("非流式重试等待",
+				"model", model,
+				"attempt", attempt,
+				"delay", delay)
 			time.Sleep(delay)
 		}
 
 		result, err := callAIOnce(cfg, endpoint, jsonBody)
 		if err == nil {
 			if attempt > 0 {
-				log.Printf("[AI重试] 模型 %s 第%d次重试成功", model, attempt)
+				aiLog.Info("非流式重试成功",
+					"model", model,
+					"attempt", attempt)
 			}
 			return result, nil
 		}
@@ -393,8 +410,11 @@ func callAIWithRetries(cfg *EffectiveConfig, model string, messages []ChatMessag
 			return nil, err
 		}
 
-		log.Printf("[AI重试] 模型 %s 调用失败（第%d/%d次）: %s",
-			model, attempt+1, maxRetries+1, err.Error())
+		aiLog.Warn("非流式调用失败",
+			"model", model,
+			"attempt", attempt+1,
+			"max_attempts", maxRetries+1,
+			"error", err.Error())
 	}
 
 	return nil, fmt.Errorf("模型 %s 在%d次尝试后失败: %w", model, maxRetries+1, lastErr)

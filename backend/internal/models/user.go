@@ -37,6 +37,8 @@ type UserInfo struct {
 	CreatedAt          *time.Time `json:"created_at"`
 	UpdatedAt          *time.Time `json:"updated_at"`
 	HasTeachingProfile bool       `json:"has_teaching_profile"`
+	OrgLogoURL         string     `json:"org_logo_url"`          // 用户所属组织的Logo URL（学校>区域>空）
+	OrgName            string     `json:"org_name"`              // 用户所属组织名称
 }
 
 // ToUserInfo 将 User 转换为 UserInfo

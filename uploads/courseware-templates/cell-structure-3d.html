@@ -1,0 +1,1642 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>细胞结构工作室</title>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.171.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.171.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+      color: #24281d;
+      background: #f5f0e7;
+    }
+    button { font: inherit; cursor: pointer; border: 0; background: none; }
+
+    .app {
+      height: 100vh;
+      display: grid;
+      grid-template-rows: 76px minmax(0, 1fr);
+      background:
+        radial-gradient(circle at 30% 10%, rgba(177, 219, 103, 0.28), transparent 28%),
+        radial-gradient(circle at 82% 62%, rgba(122, 94, 191, 0.13), transparent 30%),
+        #f5f0e7;
+    }
+    .glass {
+      border: 1px solid rgba(88, 100, 61, 0.16);
+      background: rgba(255, 252, 245, 0.82);
+      box-shadow: 0 16px 40px rgba(68, 58, 38, 0.08);
+      backdrop-filter: blur(16px);
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+      border-radius: 0 0 14px 14px;
+    }
+    .brand { display: flex; align-items: center; gap: 14px; }
+    .logo {
+      width: 48px;
+      height: 48px;
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      font-size: 28px;
+      background: linear-gradient(135deg, #b99cff, #d7f084, #4fa878);
+      box-shadow: 0 10px 26px rgba(52, 70, 37, 0.18);
+    }
+    .brand h1 { margin: 0; font-size: 24px; line-height: 1.1; }
+    .brand p { margin: 4px 0 0; color: #786f61; font-size: 13px; }
+    .status { display: flex; align-items: center; gap: 24px; font-size: 14px; }
+    .status-card {
+      padding: 10px 18px;
+      border-radius: 9px;
+      border: 1px solid #e8dfcf;
+      background: rgba(255, 255, 255, 0.65);
+    }
+    .status-card b { color: #4c8c21; }
+
+    .main {
+      min-height: 0;
+      padding: 12px;
+      display: grid;
+      gap: 12px;
+      grid-template-columns: 220px minmax(0, 1fr) 310px;
+    }
+    .sidebar, .details {
+      min-height: 0;
+      border-radius: 12px;
+      padding: 12px;
+      overflow: hidden;
+    }
+    .side-title {
+      height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .org-list {
+      height: calc(100% - 48px);
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .org-item {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 40px minmax(0, 1fr) 28px;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 8px;
+      padding: 8px;
+      border-radius: 9px;
+      border: 1px solid transparent;
+      text-align: left;
+      background: rgba(255, 255, 255, 0.48);
+      transition: 0.18s ease;
+    }
+    .org-item:hover { background: rgba(255,255,255,0.82); border-color: #ddd3c4; }
+    .org-item.active {
+      background: rgba(217, 239, 166, 0.78);
+      border-color: #afd55f;
+    }
+
+    .bio-icon {
+      display: inline-block;
+      width: 38px;
+      height: 38px;
+      border-radius: 9px;
+      overflow: hidden;
+      position: relative;
+      box-shadow:
+        0 2px 5px rgba(40,50,25,0.10),
+        inset 0 1px 0 rgba(255,255,255,0.7),
+        inset 0 -1px 1px rgba(0,0,0,0.04);
+    }
+    .bio-icon svg { display: block; width: 100%; height: 100%; }
+    .bio-icon-sm { width: 30px; height: 30px; border-radius: 7px; }
+    .bio-icon-lg {
+      width: 64px;
+      height: 64px;
+      border-radius: 13px;
+      box-shadow:
+        0 5px 14px rgba(40,50,25,0.18),
+        inset 0 2px 0 rgba(255,255,255,0.75),
+        inset 0 -1px 2px rgba(0,0,0,0.06);
+    }
+
+    .org-name { font-size: 14px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .org-sub { font-size: 12px; color: #746d62; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .eye {
+      color: #726b60;
+      font-size: 16px;
+      text-align: center;
+      cursor: pointer;
+      width: 28px;
+      height: 28px;
+      line-height: 28px;
+      border-radius: 6px;
+      transition: 0.15s ease;
+    }
+    .eye:hover { background: rgba(0,0,0,0.07); color: #4c8c21; }
+    .org-item.is-hidden { opacity: 0.45; }
+    .org-item.is-hidden .bio-icon { filter: grayscale(0.5); }
+
+    .workspace {
+      min-height: 0;
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) 222px;
+      gap: 12px;
+    }
+
+    .scene-wrap {
+      position: relative;
+      overflow: hidden;
+      border-radius: 16px;
+      border: 1px solid #ded6c8;
+      background:
+        radial-gradient(circle at 32% 16%, rgba(177, 219, 103, 0.34), transparent 24%),
+        radial-gradient(circle at 72% 62%, rgba(122, 94, 191, 0.18), transparent 30%),
+        radial-gradient(circle at 50% 96%, rgba(78, 118, 80, 0.16), transparent 28%),
+        linear-gradient(135deg, #fbf4e9 0%, #edf3dd 48%, #fff9ef 100%);
+      box-shadow: 0 20px 52px rgba(33, 43, 23, 0.12);
+    }
+    .scene-tabs {
+      position: absolute;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 6;
+      display: flex;
+      gap: 2px;
+      padding: 4px;
+      border-radius: 11px;
+      background: rgba(255, 252, 245, 0.92);
+      border: 1px solid #e0d6c4;
+      box-shadow: 0 6px 20px rgba(40,40,20,0.10);
+      backdrop-filter: blur(10px);
+    }
+    .scene-tab {
+      padding: 6px 18px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #6b6358;
+      border-radius: 8px;
+      transition: 0.16s ease;
+    }
+    .scene-tab:hover { color: #325d16; }
+    .scene-tab.active {
+      background: linear-gradient(180deg, #c9e480, #8dbd2e);
+      color: #1f3a0a;
+      box-shadow: 0 2px 6px rgba(96, 126, 34, 0.30);
+    }
+    .scene-view {
+      position: absolute;
+      inset: 0;
+      visibility: hidden;
+      opacity: 0;
+      transition: opacity 0.25s ease;
+    }
+    .scene-view.active {
+      visibility: visible;
+      opacity: 1;
+    }
+    #scene { width: 100%; height: 100%; display: block; }
+    .scene-title {
+      position: absolute;
+      left: 28px;
+      top: 22px;
+      z-index: 3;
+      pointer-events: none;
+    }
+    .scene-title .mode { color: #4c8c21; font-weight: 700; font-size: 13px; margin-bottom: 4px; }
+    .scene-title h2 { margin: 0; font-size: 32px; }
+    .scene-title p { margin: 8px 0 0; color: #746d62; font-size: 13px; }
+    .hud {
+      position: absolute;
+      right: 18px;
+      bottom: 16px;
+      z-index: 4;
+      padding: 9px 12px;
+      border-radius: 9px;
+      border: 1px solid #ddd3c4;
+      background: rgba(255,255,255,0.78);
+      color: #746d62;
+      font-size: 12px;
+      backdrop-filter: blur(12px);
+    }
+
+    /* —— 实景对照视图 —— */
+    .real-view {
+      display: flex;
+      flex-direction: column;
+      padding: 70px 28px 20px;
+      height: 100%;
+    }
+    .real-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      margin-bottom: 12px;
+    }
+    .real-header .mode { color: #4c8c21; font-weight: 700; font-size: 13px; margin-bottom: 4px; }
+    .real-header h2 { margin: 0; font-size: 26px; }
+    .real-header p { margin: 4px 0 0; color: #746d62; font-size: 13px; }
+    .zoom-btn {
+      padding: 9px 18px;
+      border-radius: 10px;
+      border: 1px solid #afd55f;
+      background: linear-gradient(180deg, #f1f8df, #e0eebf);
+      color: #325d16;
+      font-size: 13px;
+      font-weight: 600;
+      box-shadow: 0 3px 8px rgba(96, 126, 34, 0.15);
+      transition: 0.16s ease;
+    }
+    .zoom-btn:hover { transform: translateY(-1px); box-shadow: 0 5px 12px rgba(96, 126, 34, 0.22); }
+
+    /* —— 实景图片容器：无黑框，自然融入背景 —— */
+    .real-img-wrap {
+      flex: 1;
+      min-height: 0;
+      border-radius: 14px;
+      overflow: hidden;
+      /* 浅色渐变背景，与场景整体色调一致，替代黑色条纹 */
+      background:
+        radial-gradient(ellipse at 50% 50%, rgba(237, 243, 221, 0.6), rgba(251, 244, 233, 0.8)),
+        #f5f0e7;
+      border: 1px solid rgba(175, 213, 95, 0.35);
+      position: relative;
+      cursor: zoom-in;
+      box-shadow:
+        0 8px 24px rgba(33, 43, 23, 0.08),
+        inset 0 0 0 1px rgba(255, 255, 255, 0.5);
+      transition: box-shadow 0.2s ease;
+    }
+    .real-img-wrap:hover {
+      box-shadow:
+        0 12px 32px rgba(33, 43, 23, 0.12),
+        inset 0 0 0 1px rgba(255, 255, 255, 0.6);
+    }
+    .real-img-wrap img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      /* 让图片与浅色背景自然融合 */
+      border-radius: 13px;
+      padding: 4px;
+    }
+    .real-img-wrap .img-fallback {
+      display: none;
+      position: absolute;
+      inset: 0;
+      align-items: center;
+      justify-content: center;
+      color: #9b9282;
+      font-size: 14px;
+      text-align: center;
+      padding: 24px;
+      background: rgba(245, 240, 231, 0.95);
+    }
+    .real-img-wrap.img-error img { display: none; }
+    .real-img-wrap.img-error .img-fallback { display: flex; }
+    .real-caption {
+      margin-top: 10px;
+      text-align: center;
+      color: #746d62;
+      font-size: 12px;
+    }
+
+    /* —— Lightbox 全屏放大 —— */
+    .lightbox {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 15, 15, 0.93);
+      z-index: 1000;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 40px;
+      cursor: zoom-out;
+    }
+    .lightbox.active { display: flex; }
+    .lightbox img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      border-radius: 8px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    }
+    .lightbox-close {
+      position: absolute;
+      top: 24px;
+      right: 30px;
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.12);
+      color: white;
+      font-size: 26px;
+      backdrop-filter: blur(8px);
+      transition: 0.16s ease;
+    }
+    .lightbox-close:hover { background: rgba(255, 255, 255, 0.25); }
+
+    .bottom {
+      display: grid;
+      grid-template-columns: 1fr 1.25fr 0.92fr;
+      gap: 12px;
+      min-width: 0;
+    }
+    .dock {
+      border-radius: 12px;
+      padding: 14px;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .dock-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 14px;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+    .badge {
+      font-size: 12px;
+      color: #3d7d21;
+      background: #edf8dc;
+      border-radius: 7px;
+      padding: 4px 8px;
+      font-weight: 600;
+    }
+
+    .micro-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      grid-template-rows: 1fr;
+      gap: 8px;
+      height: calc(100% - 36px);
+      place-items: center;
+    }
+    .micro-view {
+      position: relative;
+      aspect-ratio: 1 / 1;
+      border-radius: 50%;
+      overflow: hidden;
+      border: 1px solid #d7cdbb;
+      transition: 0.2s ease;
+      height: 100%;
+      width: auto;
+      max-width: 100%;
+      margin: 0 auto;
+      background:
+        radial-gradient(circle at 32% 28%, rgba(255,255,255,0.95) 0%, rgba(252,246,232,0.6) 30%, transparent 60%),
+        radial-gradient(circle at 45% 42%, #fffaf0 0%, #ebe2cd 70%, #c8bda2 100%);
+    }
+    .micro-view::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      box-shadow:
+        inset 0 0 14px rgba(0,0,0,0.20),
+        inset 0 0 0 2px rgba(255,255,255,0.4);
+      z-index: 5;
+      pointer-events: none;
+    }
+    .micro-shape {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 72%;
+      height: 72%;
+      z-index: 2;
+      transition: transform 0.35s cubic-bezier(.4,.2,.2,1);
+    }
+    .micro-shape svg { width: 100%; height: 100%; display: block; }
+    .micro-bg-particles {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      background-image:
+        radial-gradient(circle at 18% 22%, rgba(125,76,196,0.32) 0, transparent 4%),
+        radial-gradient(circle at 82% 18%, rgba(95,157,52,0.32) 0, transparent 5%),
+        radial-gradient(circle at 28% 78%, rgba(242,124,40,0.28) 0, transparent 4%),
+        radial-gradient(circle at 75% 80%, rgba(120,199,222,0.32) 0, transparent 5%),
+        radial-gradient(circle at 50% 50%, rgba(143,179,72,0.18) 0, transparent 7%);
+    }
+    .micro-label {
+      position: absolute;
+      bottom: 9px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 10px;
+      font-weight: 600;
+      color: #3d3530;
+      background: rgba(255,255,255,0.88);
+      padding: 2px 8px;
+      border-radius: 9px;
+      z-index: 6;
+      white-space: nowrap;
+    }
+    .micro-mag {
+      position: absolute;
+      top: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 10.5px;
+      font-weight: 800;
+      color: #fff;
+      background: rgba(40,30,15,0.72);
+      padding: 2px 8px;
+      border-radius: 7px;
+      letter-spacing: 0.5px;
+      z-index: 6;
+    }
+
+    .browser-groups {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: calc(100% - 36px);
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .browser-group {
+      display: grid;
+      grid-template-columns: 62px minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      padding: 6px;
+      border-radius: 9px;
+      background: rgba(255, 255, 255, 0.42);
+    }
+    .group-label {
+      font-size: 11px;
+      color: #5f584d;
+      font-weight: 700;
+      line-height: 1.25;
+    }
+    .group-items {
+      display: flex;
+      gap: 7px;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+    }
+    .group-icon {
+      flex-shrink: 0;
+      cursor: pointer;
+      transition: 0.18s ease;
+      position: relative;
+    }
+    .group-icon:hover { transform: scale(1.13); }
+    .group-icon.active {
+      transform: scale(1.08);
+      outline: 2px solid #95c94a;
+      outline-offset: 2px;
+      border-radius: 9px;
+    }
+    .group-icon.hidden { opacity: 0.32; }
+    .group-icon::after {
+      content: attr(data-tip);
+      position: absolute;
+      bottom: -22px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(30, 30, 25, 0.92);
+      color: #fff;
+      font-size: 10.5px;
+      padding: 2px 6px;
+      border-radius: 5px;
+      white-space: nowrap;
+      pointer-events: none;
+      opacity: 0;
+      transition: 0.15s ease;
+      z-index: 10;
+    }
+    .group-icon:hover::after { opacity: 1; }
+
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .ctrl {
+      height: 38px;
+      border-radius: 9px;
+      border: 1px solid #ddd3c4;
+      background: rgba(255,255,255,0.72);
+      color: #494337;
+      font-size: 13px;
+      transition: 0.16s ease;
+    }
+    .ctrl:hover { background: white; }
+    .ctrl.active {
+      border-color: #95c94a;
+      background: #eaf6cf;
+      color: #325d16;
+      font-weight: 700;
+    }
+
+    .details {
+      display: grid;
+      gap: 12px;
+      grid-template-rows: 1fr 210px 1fr;
+      padding: 0;
+    }
+    .panel { border-radius: 12px; padding: 16px; overflow: hidden; }
+    .detail-top {
+      display: flex;
+      gap: 14px;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+    .detail-top h3 { margin: 0; font-size: 20px; }
+    .detail-top p { margin: 4px 0 0; color: #746d62; font-size: 13px; }
+    .line { height: 1px; background: #e4dbcd; margin: 14px 0; }
+    .stats div {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 13px;
+      margin-bottom: 10px;
+    }
+    .stats span:first-child { color: #746d62; }
+    .desc { color: #5f584d; font-size: 13px; line-height: 1.75; }
+    .mini-chart {
+      height: 32px;
+      margin-bottom: 10px;
+      display: grid;
+      grid-template-columns: 66px 1fr;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+      color: #746d62;
+    }
+    .chart-bg {
+      height: 28px;
+      border-radius: 8px;
+      background: linear-gradient(90deg, rgba(138,87,216,0.16), transparent);
+    }
+    .env-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid #e4dbcd;
+      font-size: 13px;
+    }
+
+    @media (max-width: 1100px) {
+      body { overflow: auto; }
+      .app { height: auto; min-height: 100vh; }
+      .main { grid-template-columns: 1fr; }
+      .sidebar, .details { min-height: 360px; }
+      .workspace { min-height: 720px; }
+      .bottom { grid-template-columns: 1fr; }
+      .status { display: none; }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="app">
+    <header class="header glass">
+      <div class="brand">
+        <div class="logo">🌿</div>
+        <div>
+          <h1>细胞结构工作室</h1>
+          <p>3D 交互式生物学</p>
+        </div>
+      </div>
+      <div class="status">
+        <div class="status-card">项目：植物细胞探索</div>
+        <div class="status-card">模拟状态：<b>● 运行中</b>　00:05:30　实时</div>
+      </div>
+    </header>
+
+    <main class="main">
+      <aside class="sidebar glass">
+        <div class="side-title">
+          <span>细胞器列表</span>
+          <span style="font-size:11px;font-weight:500;color:#888">3D 预览</span>
+        </div>
+        <div id="orgList" class="org-list"></div>
+      </aside>
+
+      <section class="workspace">
+        <section class="scene-wrap">
+          <div class="scene-tabs">
+            <button class="scene-tab active" data-view="3d">3D 模型</button>
+            <button class="scene-tab" data-view="real">实景对照</button>
+          </div>
+
+          <div class="scene-view active" data-view="3d">
+            <div class="scene-title">
+              <div class="mode">科学模式 · 程序几何</div>
+              <h2>植物细胞</h2>
+              <p>拖动旋转 · 滚轮缩放 · Shift 拖动平移 · 点击选择</p>
+            </div>
+            <canvas id="scene"></canvas>
+            <div class="hud">GPU 使用率 68% · 实时渲染 · 选中高亮</div>
+          </div>
+
+          <div class="scene-view real-view" data-view="real">
+            <div class="real-header">
+              <div>
+                <div class="mode">实景对照</div>
+                <h2>植物细胞显微图像</h2>
+                <p>点击图片可放大查看 · 番红-固绿染色</p>
+              </div>
+              <button class="zoom-btn" id="zoomBtn">⛶ 全屏放大</button>
+            </div>
+            <div class="real-img-wrap" id="realImgWrap">
+              <img id="realImg"
+                   src="https://aipkuailabcom20250925.oss-cn-beijing.aliyuncs.com/users/4/2026/05/1778771339057_7dc19d4f0fdabbf9.png"
+                   alt="植物细胞实景全景图"
+                   onerror="this.parentElement.classList.add('img-error');" />
+              <div class="img-fallback">⚠ 图片加载失败<br/>请检查网络或链接</div>
+            </div>
+            <div class="real-caption">真实植物细胞显微图像，与左侧 3D 模型对照学习</div>
+          </div>
+        </section>
+
+        <section class="bottom">
+          <div class="dock glass">
+            <div class="dock-head">
+              <span>显微镜视图</span>
+              <span class="badge" id="microBadge">观察：细胞核</span>
+            </div>
+            <div id="microGrid" class="micro-grid"></div>
+          </div>
+
+          <div class="dock glass">
+            <div class="dock-head">
+              <span>结构浏览器</span>
+              <span id="visibleCount" style="font-size:12px;color:#746d62;font-weight:500;"></span>
+            </div>
+            <div id="browserGroups" class="browser-groups"></div>
+          </div>
+
+          <div class="dock glass">
+            <div class="dock-head">
+              <span>模拟控制</span>
+              <span style="font-size:11px;color:#888;font-weight:500;">悬停查看说明</span>
+            </div>
+            <div class="controls">
+              <button class="ctrl active" data-option="autoRotate" title="开启后细胞模型自动绕轴旋转，方便从各角度观察">旋转</button>
+              <button class="ctrl" id="focusBtn" title="相机自动飞向当前选中的细胞器，近距离观察（适合远处的小细胞器）">聚焦</button>
+              <button class="ctrl" data-option="xray" title="所有结构变半透明，能看穿外层细胞壁、细胞膜、细胞质，看清内部细胞器的相对位置">透视</button>
+              <button class="ctrl" data-option="isolate" title="仅显示选中的细胞器，其它全部隐藏。适合单独研究某一个细胞器的形态">隔离</button>
+              <button class="ctrl active" data-option="labels" title="显示/隐藏 3D 模型中飘浮的细胞器名称标签">标签</button>
+              <button class="ctrl" id="resetBtn" title="恢复所有视图状态、相机位置、显示选项到默认值">重置</button>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <aside class="details">
+        <section class="panel glass">
+          <div class="side-title">细胞器查看器 <span>⌄</span></div>
+          <div class="detail-top">
+            <div id="detailIcon" class="bio-icon bio-icon-lg"></div>
+            <div>
+              <h3 id="detailName">细胞核</h3>
+              <p id="detailSub">遗传控制中心</p>
+            </div>
+          </div>
+          <div class="line"></div>
+          <div id="detailStats" class="stats"></div>
+          <div class="line"></div>
+          <p id="detailDesc" class="desc"></p>
+        </section>
+
+        <section class="panel glass">
+          <div class="side-title">结构分析 <span>ⓘ</span></div>
+          <div class="mini-chart"><span>体积</span><div class="chart-bg"><svg viewBox="0 0 120 28"><polyline fill="none" stroke="#8a57d8" stroke-width="2" points="0,18 18,15 34,12 54,10 72,13 88,11 104,15 120,12"/></svg></div></div>
+          <div class="mini-chart"><span>表面积</span><div class="chart-bg"><svg viewBox="0 0 120 28"><polyline fill="none" stroke="#8a57d8" stroke-width="2" points="0,20 18,14 34,16 54,12 72,15 88,10 104,17 120,13"/></svg></div></div>
+          <div class="mini-chart"><span>密度</span><div class="chart-bg"><svg viewBox="0 0 120 28"><polyline fill="none" stroke="#8a57d8" stroke-width="2" points="0,16 18,16 34,11 54,12 72,9 88,13 104,10 120,14"/></svg></div></div>
+        </section>
+
+        <section class="panel glass">
+          <div class="side-title">环境条件</div>
+          <div class="env-row"><span>温度</span><b>25.0 ℃</b></div>
+          <div class="env-row"><span>pH 值</span><b>6.8</b></div>
+          <div class="env-row"><span>光照强度</span><b>150 μmol/m²/s</b></div>
+          <div class="env-row"><span>渗透压</span><b>300 mOsm</b></div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <div class="lightbox" id="lightbox">
+    <button class="lightbox-close" id="lightboxClose">×</button>
+    <img id="lightboxImg"
+         src="https://aipkuailabcom20250925.oss-cn-beijing.aliyuncs.com/users/4/2026/05/1778771339057_7dc19d4f0fdabbf9.png"
+         alt="植物细胞实景全景图" />
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const organelles = [
+      { id:'cellWall', name:'细胞壁', subtitle:'纤维素支撑层', color:'#8fb348',
+        desc:'由纤维素等多糖构成的坚韧外层，维持植物细胞外形并抵抗渗透压。',
+        stats:[['结构','纤维素网架'],['位置','最外层'],['厚度','0.1-10 μm']] },
+      { id:'cellMembrane', name:'细胞膜', subtitle:'磷脂双分子层', color:'#b8d16a',
+        desc:'贴附在细胞壁内侧的磷脂双分子层，负责物质交换和细胞信号传递。',
+        stats:[['厚度','约 7-10 nm'],['功能','控制进出'],['状态','柔性流动']] },
+      { id:'cytoplasm', name:'细胞质', subtitle:'生命活动基质', color:'#4e8f7a',
+        desc:'半流动胶状环境，包裹并悬浮细胞器，是多种代谢反应发生的空间。',
+        stats:[['质地','胶状溶胶'],['成分','水、蛋白质、离子'],['功能','物质运输']] },
+      { id:'centralVacuole', name:'中央液泡', subtitle:'储存与膨压调节', color:'#78c7de',
+        desc:'植物细胞中占据大量体积的囊泡，储存水、离子和代谢产物并支撑细胞形态。',
+        stats:[['体积占比','可达 80%'],['内部','细胞液'],['功能','膨压调节']] },
+      { id:'nucleus', name:'细胞核', subtitle:'遗传控制中心', color:'#7d4cc4',
+        desc:'包含染色质和核膜孔，调控基因表达并协调细胞活动。',
+        stats:[['大小','约 5-10 μm'],['位置','偏右上方'],['内容','DNA 与核蛋白']] },
+      { id:'nucleolus', name:'核仁', subtitle:'rRNA 合成场所', color:'#4b1e91',
+        desc:'细胞核内的高密度结构，主要参与 rRNA 合成和核糖体亚基装配。',
+        stats:[['位置','核内'],['膜','无膜'],['功能','核糖体装配']] },
+      { id:'chloroplast', name:'叶绿体', subtitle:'光合作用场所', color:'#5b9c34',
+        desc:'含叶绿素和类囊体片层，将光能转化为化学能并释放氧气。',
+        stats:[['色素','叶绿素'],['结构','类囊体堆叠'],['功能','光合作用']] },
+      { id:'mitochondrion', name:'线粒体', subtitle:'有氧呼吸场所', color:'#f07c2b',
+        desc:'通过内膜嵴扩大反应面积，进行有氧呼吸并产生 ATP。',
+        stats:[['结构','双层膜与嵴'],['产物','ATP'],['数量','多个分布']] },
+      { id:'golgi', name:'高尔基体', subtitle:'分泌加工中心', color:'#ef6545',
+        desc:'由扁平膜囊堆叠而成，负责加工、包装和运输蛋白质与多糖。',
+        stats:[['形态','膜囊堆叠'],['功能','加工分拣'],['位置','核附近']] },
+      { id:'roughER', name:'粗面内质网', subtitle:'蛋白合成网络', color:'#8a57d8',
+        desc:'表面附着核糖体的膜性网络，参与分泌蛋白和膜蛋白合成。',
+        stats:[['表面','附着核糖体'],['功能','蛋白合成'],['连接','近核膜']] },
+      { id:'ribosome', name:'核糖体', subtitle:'蛋白质翻译机', color:'#d98a35',
+        desc:'由 rRNA 和蛋白质组成的小颗粒，可游离于细胞质或附着在粗面内质网上。',
+        stats:[['尺寸','纳米级'],['组成','rRNA + 蛋白'],['功能','翻译蛋白']] }
+    ];
+
+    const categories = [
+      { id:'boundary',  label:'边界系统', ids:['cellWall','cellMembrane'] },
+      { id:'matrix',    label:'内部基质', ids:['cytoplasm','centralVacuole'] },
+      { id:'genetic',   label:'遗传中心', ids:['nucleus','nucleolus'] },
+      { id:'energy',    label:'能量代谢', ids:['chloroplast','mitochondrion'] },
+      { id:'synthesis', label:'合成转运', ids:['roughER','ribosome','golgi'] }
+    ];
+
+    const microLevels = [
+      { id:'low',  label:'100×', zoom:0.55, hint:'低倍：定位' },
+      { id:'mid',  label:'400×', zoom:1.0,  hint:'中倍：形态' },
+      { id:'high', label:'1000×', zoom:1.85, hint:'高倍：细节' }
+    ];
+
+    const state = {
+      selectedId: 'nucleus',
+      hidden: new Set(),
+      autoRotate: true,
+      isolate: false,
+      xray: false,
+      labels: true,
+      view: '3d'
+    };
+
+    function hexToRgb(hex) {
+      return {
+        r: parseInt(hex.slice(1,3), 16),
+        g: parseInt(hex.slice(3,5), 16),
+        b: parseInt(hex.slice(5,7), 16)
+      };
+    }
+    function rgba(hex, a) {
+      const {r,g,b} = hexToRgb(hex);
+      return 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')';
+    }
+    function darken(hex, amount) {
+      const {r,g,b} = hexToRgb(hex);
+      return 'rgb(' + Math.round(r*amount) + ',' + Math.round(g*amount) + ',' + Math.round(b*amount) + ')';
+    }
+    function lighten(hex, t) {
+      const {r,g,b} = hexToRgb(hex);
+      const m = (c) => Math.round(c + (255 - c) * t);
+      return 'rgb(' + m(r) + ',' + m(g) + ',' + m(b) + ')';
+    }
+
+    function organelleIconSVG(o, withBg) {
+      withBg = withBg !== false;
+      const c = o.color;
+      const dark = darken(c, 0.45);
+      const veryDark = darken(c, 0.28);
+      const tint = lighten(c, 0.75);
+
+      const bg = withBg ? `
+        <defs>
+          <linearGradient id="bg-${o.id}" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="${lighten(c, 0.92)}"/>
+            <stop offset="100%" stop-color="${tint}"/>
+          </linearGradient>
+          <linearGradient id="gloss-${o.id}" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="rgba(255,255,255,0.7)"/>
+            <stop offset="50%" stop-color="rgba(255,255,255,0)"/>
+          </linearGradient>
+        </defs>
+        <rect x="0" y="0" width="36" height="36" rx="8" fill="url(#bg-${o.id})"/>
+        <rect x="1" y="1" width="34" height="18" rx="7" fill="url(#gloss-${o.id})"/>
+      ` : '';
+
+      let inner = '';
+      switch (o.id) {
+        case 'cellWall':
+          inner = `
+            <g stroke="${dark}" stroke-width="1" stroke-linecap="round" opacity="0.85">
+              <line x1="6" y1="10" x2="30" y2="9"/>
+              <line x1="6" y1="18" x2="30" y2="19"/>
+              <line x1="6" y1="26" x2="30" y2="27"/>
+            </g>
+            <g stroke="${dark}" stroke-width="0.7" stroke-linecap="round" opacity="0.65">
+              <line x1="11" y1="6" x2="9" y2="30"/>
+              <line x1="19" y1="6" x2="20" y2="30"/>
+              <line x1="27" y1="6" x2="28" y2="30"/>
+            </g>
+          `;
+          break;
+        case 'cellMembrane':
+          inner = `
+            <g fill="${dark}">
+              <circle cx="7" cy="12" r="1.7"/><circle cx="12.5" cy="12" r="1.7"/>
+              <circle cx="18" cy="12" r="1.7"/><circle cx="23.5" cy="12" r="1.7"/>
+              <circle cx="29" cy="12" r="1.7"/>
+              <circle cx="7" cy="24" r="1.7"/><circle cx="12.5" cy="24" r="1.7"/>
+              <circle cx="18" cy="24" r="1.7"/><circle cx="23.5" cy="24" r="1.7"/>
+              <circle cx="29" cy="24" r="1.7"/>
+            </g>
+            <g stroke="${dark}" stroke-width="0.6" opacity="0.55">
+              <line x1="7" y1="13.5" x2="7" y2="22.5"/>
+              <line x1="12.5" y1="13.5" x2="12.5" y2="22.5"/>
+              <line x1="18" y1="13.5" x2="18" y2="22.5"/>
+              <line x1="23.5" y1="13.5" x2="23.5" y2="22.5"/>
+              <line x1="29" y1="13.5" x2="29" y2="22.5"/>
+            </g>
+          `;
+          break;
+        case 'cytoplasm':
+          inner = `
+            <g fill="${dark}">
+              <circle cx="9" cy="9" r="1.3"/>
+              <circle cx="18" cy="7" r="0.9"/>
+              <circle cx="26" cy="11" r="1.4"/>
+              <circle cx="13" cy="15" r="0.9"/>
+              <circle cx="22" cy="18" r="1.5"/>
+              <circle cx="9" cy="22" r="1.2"/>
+              <circle cx="28" cy="24" r="1.0"/>
+              <circle cx="17" cy="26" r="1.3"/>
+              <circle cx="25" cy="29" r="0.9"/>
+              <circle cx="11" cy="29" r="1.0"/>
+            </g>
+          `;
+          break;
+        case 'centralVacuole':
+          inner = `
+            <circle cx="18" cy="18" r="11" fill="${c}" opacity="0.5"/>
+            <circle cx="18" cy="18" r="11" fill="none" stroke="${dark}" stroke-width="0.7"/>
+            <circle cx="14" cy="14" r="3" fill="white" opacity="0.55"/>
+          `;
+          break;
+        case 'nucleus':
+          inner = `
+            <circle cx="18" cy="18" r="11" fill="${c}"/>
+            <g stroke="${veryDark}" stroke-width="0.5" fill="none" opacity="0.7">
+              <ellipse cx="18" cy="18" rx="11" ry="5"/>
+              <ellipse cx="18" cy="18" rx="5" ry="11"/>
+              <ellipse cx="18" cy="18" rx="9" ry="9"/>
+            </g>
+            <circle cx="20" cy="16" r="2.4" fill="${veryDark}" opacity="0.65"/>
+          `;
+          break;
+        case 'nucleolus':
+          inner = `
+            <circle cx="18" cy="18" r="8" fill="${c}"/>
+            <circle cx="18" cy="18" r="8" fill="none" stroke="${veryDark}" stroke-width="0.6"/>
+            <circle cx="15.5" cy="15.5" r="2" fill="white" opacity="0.55"/>
+          `;
+          break;
+        case 'chloroplast':
+          inner = `
+            <ellipse cx="18" cy="18" rx="13" ry="7" fill="${c}"/>
+            <ellipse cx="18" cy="18" rx="13" ry="7" fill="none" stroke="${dark}" stroke-width="0.6"/>
+            <g stroke="${dark}" stroke-width="0.5" opacity="0.75">
+              <line x1="7" y1="15" x2="29" y2="15"/>
+              <line x1="7" y1="18" x2="29" y2="18"/>
+              <line x1="7" y1="21" x2="29" y2="21"/>
+            </g>
+            <g fill="${darken(c, 0.55)}">
+              <ellipse cx="12" cy="18" rx="1.4" ry="3"/>
+              <ellipse cx="18" cy="18" rx="1.4" ry="3"/>
+              <ellipse cx="24" cy="18" rx="1.4" ry="3"/>
+            </g>
+          `;
+          break;
+        case 'mitochondrion':
+          inner = `
+            <ellipse cx="18" cy="18" rx="13" ry="6.5" fill="${c}"/>
+            <ellipse cx="18" cy="18" rx="13" ry="6.5" fill="none" stroke="${dark}" stroke-width="0.6"/>
+            <path d="M 7 18 Q 9 14 11 18 T 15 18 T 19 18 T 23 18 T 27 18 T 29 18"
+                  stroke="${darken(c, 0.4)}" stroke-width="0.9" fill="none"/>
+            <path d="M 8 21 Q 10 24 12 21 T 16 21 T 20 21 T 24 21 T 28 21"
+                  stroke="${darken(c, 0.4)}" stroke-width="0.7" fill="none" opacity="0.7"/>
+          `;
+          break;
+        case 'golgi':
+          inner = `
+            <g stroke="${c}" stroke-width="2.2" fill="none" stroke-linecap="round">
+              <path d="M 8 10 Q 18 7 28 10"/>
+              <path d="M 8 14 Q 18 11 28 14"/>
+              <path d="M 8 18 Q 18 15 28 18"/>
+              <path d="M 8 22 Q 18 19 28 22"/>
+              <path d="M 8 26 Q 18 23 28 26"/>
+            </g>
+            <g fill="${darken(c, 0.5)}">
+              <circle cx="6" cy="13" r="1"/>
+              <circle cx="30" cy="25" r="1"/>
+            </g>
+          `;
+          break;
+        case 'roughER':
+          inner = `
+            <g stroke="${c}" stroke-width="1.7" fill="none">
+              <path d="M 6 11 Q 18 6 30 11 Q 18 16 6 11"/>
+              <path d="M 6 25 Q 18 20 30 25 Q 18 30 6 25"/>
+            </g>
+            <g fill="${darken(c, 0.55)}">
+              <circle cx="10" cy="9" r="1.3"/>
+              <circle cx="18" cy="7.5" r="1.3"/>
+              <circle cx="26" cy="9" r="1.3"/>
+              <circle cx="10" cy="27" r="1.3"/>
+              <circle cx="18" cy="28.5" r="1.3"/>
+              <circle cx="26" cy="27" r="1.3"/>
+            </g>
+          `;
+          break;
+        case 'ribosome':
+          inner = `
+            <g fill="${c}">
+              <circle cx="11" cy="11" r="2.8"/>
+              <circle cx="19" cy="9" r="2.8"/>
+              <circle cx="26" cy="13" r="2.8"/>
+              <circle cx="10" cy="21" r="2.8"/>
+              <circle cx="18" cy="19" r="2.8"/>
+              <circle cx="26" cy="22" r="2.8"/>
+              <circle cx="14" cy="28" r="2.8"/>
+              <circle cx="23" cy="28" r="2.8"/>
+            </g>
+            <g fill="rgba(255,255,255,0.5)">
+              <circle cx="10" cy="10" r="0.9"/>
+              <circle cx="18" cy="8" r="0.9"/>
+              <circle cx="25" cy="12" r="0.9"/>
+              <circle cx="9" cy="20" r="0.9"/>
+              <circle cx="17" cy="18" r="0.9"/>
+              <circle cx="25" cy="21" r="0.9"/>
+              <circle cx="13" cy="27" r="0.9"/>
+              <circle cx="22" cy="27" r="0.9"/>
+            </g>
+          `;
+          break;
+      }
+
+      return '<svg viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg">' + bg + inner + '</svg>';
+    }
+
+    const CELL_WALL_SCALE     = [4.18, 2.36, 1.90];
+    const CELL_MEMBRANE_SCALE = [4.10, 2.30, 1.84];
+    const CYTOPLASM_SCALE     = [3.96, 2.20, 1.74];
+
+    const anchors = {
+      cellWall:[0,0,0], cellMembrane:[0,0,0], cytoplasm:[0,0,0],
+      centralVacuole:[-0.78,-0.05,0.16], nucleus:[1.42,0.66,0.08], nucleolus:[1.42,0.64,0.55],
+      chloroplast:[-2.05,0.58,0.34], mitochondrion:[-2.05,-0.68,0.40], golgi:[0.85,-0.72,0.40],
+      roughER:[1.75,0.04,0.15], ribosome:[2.38,-0.78,0.38]
+    };
+
+    const canvas = document.getElementById('scene');
+    const renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias:true, alpha:true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.8));
+    renderer.setClearColor(0x000000, 0);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
+    camera.position.set(0, 0.7, 7.4);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.autoRotateSpeed = 0.9;
+    controls.minDistance = 4.2;
+    controls.maxDistance = 10;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 1.35));
+    const key = new THREE.DirectionalLight(0xffffff, 2.8);
+    key.position.set(4.5, 5.5, 6);
+    scene.add(key);
+    const rim = new THREE.DirectionalLight(0xb9f28c, 0.8);
+    rim.position.set(-4, 1.5, -2);
+    scene.add(rim);
+    const violet = new THREE.PointLight(0xb69cff, 1.1);
+    violet.position.set(2.5, 2, 2);
+    scene.add(violet);
+
+    const root = new THREE.Group();
+    root.rotation.set(-0.26, 0.16, 0.02);
+    scene.add(root);
+
+    const groups = {};
+    const labelSprites = [];
+    const clickable = [];
+    let halo;
+
+    function createSuperEllipsoidGeometry(radius, hs, vs, exponent) {
+      const positions = [];
+      const indices = [];
+      const sp = (value, exp) => Math.sign(value) * Math.pow(Math.abs(value), exp);
+      for (let y = 0; y <= vs; y++) {
+        const v = y / vs;
+        const theta = -Math.PI / 2 + v * Math.PI;
+        const ct = sp(Math.cos(theta), exponent);
+        const st = sp(Math.sin(theta), exponent);
+        for (let x = 0; x <= hs; x++) {
+          const u = x / hs;
+          const phi = -Math.PI + u * Math.PI * 2;
+          positions.push(radius * ct * sp(Math.cos(phi), exponent), radius * st, radius * ct * sp(Math.sin(phi), exponent));
+        }
+      }
+      for (let y = 0; y < vs; y++) {
+        for (let x = 0; x < hs; x++) {
+          const a = y * (hs + 1) + x;
+          const b = a + hs + 1;
+          indices.push(a, b, a + 1, b, b + 1, a + 1);
+        }
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      g.setIndex(indices);
+      g.computeVertexNormals();
+      return g;
+    }
+
+    function createBeanGeometry() {
+      const geo = createSuperEllipsoidGeometry(1, 42, 20, 0.8);
+      const p = geo.getAttribute('position');
+      const v = new THREE.Vector3();
+      for (let i = 0; i < p.count; i++) {
+        v.fromBufferAttribute(p, i);
+        v.y = v.y * 0.52 + Math.sin(v.x * 1.8) * 0.08;
+        v.z *= 0.42;
+        p.setXYZ(i, v.x, v.y, v.z);
+      }
+      p.needsUpdate = true;
+      geo.computeVertexNormals();
+      return geo;
+    }
+
+    const shellGeo = createSuperEllipsoidGeometry(1, 80, 40, 0.48);
+    const beanGeo = createBeanGeometry();
+
+    function mat(color, opts) {
+      opts = opts || {};
+      return new THREE.MeshPhysicalMaterial({
+        color: color,
+        roughness: opts.roughness !== undefined ? opts.roughness : 0.38,
+        clearcoat: opts.clearcoat !== undefined ? opts.clearcoat : 0.4,
+        transparent: opts.transparent || false,
+        opacity: opts.opacity !== undefined ? opts.opacity : 1,
+        side: opts.side || THREE.FrontSide,
+        emissive: opts.emissive || 0x000000,
+        emissiveIntensity: opts.emissiveIntensity || 0
+      });
+    }
+
+    function register(mesh, id) {
+      mesh.userData.organelleId = id;
+      mesh.userData.baseOpacity = (mesh.material && mesh.material.opacity !== undefined) ? mesh.material.opacity : 1;
+      mesh.userData.baseTransparent = !!(mesh.material && mesh.material.transparent);
+      if (mesh.material && mesh.material.transparent) {
+        mesh.material.depthWrite = false;
+      }
+      clickable.push(mesh);
+      return mesh;
+    }
+
+    function addGroup(id) {
+      const g = new THREE.Group();
+      g.userData.organelleId = id;
+      groups[id] = g;
+      root.add(g);
+      return g;
+    }
+
+    function line(points, color, opacity) {
+      const geo = new THREE.BufferGeometry().setFromPoints(points.map(p => new THREE.Vector3(p[0], p[1], p[2])));
+      const m = new THREE.LineBasicMaterial({ color: color, transparent: opacity < 1, opacity: opacity });
+      return new THREE.Line(geo, m);
+    }
+
+    function makeLabel(text, color) {
+      const c = document.createElement('canvas');
+      c.width = 360; c.height = 96;
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = 'rgba(255,252,245,.86)';
+      roundRect(ctx, 8, 8, 344, 80, 18);
+      ctx.fill();
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(42, 48, 9, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#25281f';
+      ctx.font = 'bold 30px Microsoft YaHei';
+      ctx.fillText(text, 62, 58);
+      const tex = new THREE.CanvasTexture(c);
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent:true, depthTest:false }));
+      sprite.scale.set(1.35, 0.36, 1);
+      labelSprites.push(sprite);
+      root.add(sprite);
+      return sprite;
+    }
+
+    function roundRect(ctx, x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x+r,y);
+      ctx.arcTo(x+w,y,x+w,y+h,r);
+      ctx.arcTo(x+w,y+h,x,y+h,r);
+      ctx.arcTo(x,y+h,x,y,r);
+      ctx.arcTo(x,y,x+w,y,r);
+      ctx.closePath();
+    }
+
+    function buildCell() {
+      const wall = addGroup('cellWall');
+      const wallMesh = register(new THREE.Mesh(shellGeo, mat('#8fb348', {
+        transparent:true, opacity:.20, side:THREE.DoubleSide, clearcoat:.55, roughness:.45
+      })), 'cellWall');
+      wallMesh.scale.set(CELL_WALL_SCALE[0], CELL_WALL_SCALE[1], CELL_WALL_SCALE[2]);
+      wall.add(wallMesh);
+      const wallWire = new THREE.Mesh(shellGeo, new THREE.MeshBasicMaterial({
+        color:'#5c7430', wireframe:true, transparent:true, opacity:.16
+      }));
+      wallWire.scale.set(CELL_WALL_SCALE[0]+0.02, CELL_WALL_SCALE[1]+0.02, CELL_WALL_SCALE[2]+0.02);
+      wall.add(register(wallWire, 'cellWall'));
+
+      const membrane = addGroup('cellMembrane');
+      const membraneMesh = register(new THREE.Mesh(shellGeo, mat('#b8d16a', {
+        transparent:true, opacity:.42, side:THREE.DoubleSide, clearcoat:.7, roughness:.22,
+        emissive:'#3d5d12', emissiveIntensity:.08
+      })), 'cellMembrane');
+      membraneMesh.scale.set(CELL_MEMBRANE_SCALE[0], CELL_MEMBRANE_SCALE[1], CELL_MEMBRANE_SCALE[2]);
+      membrane.add(membraneMesh);
+      const membraneInner = new THREE.Mesh(shellGeo, mat('#a8c45e', {
+        transparent:true, opacity:.28, side:THREE.BackSide, roughness:.4
+      }));
+      membraneInner.scale.set(CELL_MEMBRANE_SCALE[0]-0.04, CELL_MEMBRANE_SCALE[1]-0.04, CELL_MEMBRANE_SCALE[2]-0.04);
+      membrane.add(register(membraneInner, 'cellMembrane'));
+
+      const cytoplasm = addGroup('cytoplasm');
+      const cyt = register(new THREE.Mesh(shellGeo, mat('#2e766f', {
+        transparent:true, opacity:.32, side:THREE.BackSide, roughness:.72
+      })), 'cytoplasm');
+      cyt.scale.set(CYTOPLASM_SCALE[0], CYTOPLASM_SCALE[1], CYTOPLASM_SCALE[2]);
+      cytoplasm.add(cyt);
+
+      for (let j = 0; j < 16; j++) {
+        const pts = [];
+        for (let i = 0; i < 22; i++) {
+          const t = i / 21;
+          const a = j * 0.64 + t * 1.8;
+          pts.push([-2.9 + t * 5.8, Math.sin(a) * (0.4 + j % 4 * 0.16), Math.cos(a * 1.25) * (0.48 + j % 3 * 0.1)]);
+        }
+        cytoplasm.add(line(pts, j % 2 ? '#e6be73' : '#7fc5b3', .28));
+      }
+      for (let i = 0; i < 58; i++) {
+        const a = i * 2.17;
+        const r = 0.55 + (i % 12) * 0.22;
+        const s = new THREE.Mesh(new THREE.SphereGeometry(0.035 + (i % 3) * 0.008, 10, 8),
+          new THREE.MeshStandardMaterial({ color: i % 2 ? '#69c7d3' : '#b96bd8' }));
+        s.position.set(Math.cos(a)*r, Math.sin(a*.85)*1.15, Math.sin(a)*r*.45);
+        cytoplasm.add(s);
+      }
+
+      const vac = addGroup('centralVacuole');
+      const vacMesh = register(new THREE.Mesh(new THREE.SphereGeometry(1,48,24), mat('#83d7ed', {
+        transparent:true, opacity:.78, roughness:.18, clearcoat:.95
+      })), 'centralVacuole');
+      vacMesh.scale.set(1.32,1.22,1.02);
+      vacMesh.position.set(-0.78,-0.05,0.16);
+      vac.add(vacMesh);
+
+      const nucleus = addGroup('nucleus');
+      nucleus.position.set(1.42,.66,.08);
+      nucleus.add(register(new THREE.Mesh(new THREE.SphereGeometry(.78,56,28), mat('#7d4cc4', {
+        transparent:true, opacity:.78, roughness:.36, clearcoat:.55, emissive:'#2b0d54', emissiveIntensity:.12
+      })), 'nucleus'));
+      const nWire = new THREE.Mesh(new THREE.SphereGeometry(.80,32,16),
+        new THREE.MeshBasicMaterial({ color:'#3c126f', wireframe:true, transparent:true, opacity:.32 }));
+      nucleus.add(register(nWire, 'nucleus'));
+
+      const nucleolus = addGroup('nucleolus');
+      const no = register(new THREE.Mesh(new THREE.SphereGeometry(.30,38,18), mat('#40138b', {
+        roughness:.32, clearcoat:.55
+      })), 'nucleolus');
+      no.position.set(1.42,.64,.55);
+      nucleolus.add(no);
+
+      const chloroplast = addGroup('chloroplast');
+      const chloroPositions = [[-2.05,.58,.34,-.3],[2.15,-.50,.38,.35],[2.72,.65,-.16,-.2]];
+      chloroPositions.forEach(p => {
+        const g = new THREE.Group();
+        g.position.set(p[0],p[1],p[2]);
+        g.rotation.set(.32,.16,p[3]);
+        g.add(register(new THREE.Mesh(beanGeo, mat('#5f9d31', { clearcoat:.45 })), 'chloroplast'));
+        [-.22,0,.22].forEach(o => {
+          const th = new THREE.Mesh(new THREE.SphereGeometry(1,18,10),
+            new THREE.MeshStandardMaterial({ color:'#a7d85a', emissive:'#31580e', emissiveIntensity:.16 }));
+          th.position.set(o,.02,.08);
+          th.scale.set(.16,.08,.5);
+          g.add(th);
+        });
+        chloroplast.add(g);
+      });
+
+      const mitochondrion = addGroup('mitochondrion');
+      const mitoPositions = [[-2.05,-.68,.40,.55],[.10,-1.08,.55,-.2],[-2.68,.92,-.14,.2]];
+      mitoPositions.forEach(p => {
+        const g = new THREE.Group();
+        g.position.set(p[0],p[1],p[2]);
+        g.rotation.set(.2,.35,p[3]);
+        const m = register(new THREE.Mesh(beanGeo, mat('#f27c28', {
+          roughness:.28, clearcoat:.65, emissive:'#802600', emissiveIntensity:.1
+        })), 'mitochondrion');
+        m.scale.set(.7,.68,.58);
+        g.add(m);
+        const pts = [];
+        for (let i = 0; i < 42; i++) pts.push([-.58 + i/41*1.16, Math.sin(i*.72)*.18, .34]);
+        g.add(line(pts, '#ffe08a', 1));
+        mitochondrion.add(g);
+      });
+
+      const golgi = addGroup('golgi');
+      golgi.position.set(.85,-.72,.40);
+      golgi.rotation.set(.05,-.2,.2);
+      [-.28,-.14,0,.14,.28].forEach((y,i) => {
+        const tor = register(new THREE.Mesh(new THREE.TorusGeometry(.55,.07,12,48,Math.PI*1.45),
+          mat(i%2 ? '#ff8b4a' : '#ee5e45', { clearcoat:.4 })), 'golgi');
+        tor.position.set(i*.03,y,0);
+        tor.scale.set(.92 - i*.05,.08,.25);
+        golgi.add(tor);
+      });
+
+      const er = addGroup('roughER');
+      er.position.set(1.75,.04,.15);
+      er.rotation.set(.25,.15,-.2);
+      [.78,.96,1.14,1.32].forEach((r,i) => {
+        const tor = register(new THREE.Mesh(new THREE.TorusGeometry(r,.045,12,72,Math.PI*1.55),
+          mat('#8a57d8', { transparent:true, opacity:.86 })), 'roughER');
+        tor.position.y = i*.06 - .1;
+        er.add(tor);
+      });
+
+      const ribosome = addGroup('ribosome');
+      for (let i = 0; i < 88; i++) {
+        const a = i * 2.399;
+        const r = .55 + (i % 9) * .34;
+        let x = Math.cos(a) * r;
+        let y = Math.sin(a) * r * .55;
+        let z = (i % 13 - 6) * .11;
+        if (Math.abs(x) < .55 && Math.abs(y) < .55) { x += 1.2; y -= .15; z += .2; }
+        const s = register(new THREE.Mesh(new THREE.SphereGeometry(.045,10,8),
+          new THREE.MeshStandardMaterial({ color: i % 2 ? '#db8f30' : '#8f5ad5' })), 'ribosome');
+        s.position.set(x,y,z);
+        ribosome.add(s);
+      }
+
+      const labelPos = {
+        cellWall:[-3.5,-1.30,.4], cellMembrane:[-3.15,-1.70,.72], cytoplasm:[2.05,-1.42,1.15],
+        centralVacuole:[-.86,.12,1.65], nucleus:[1.62,.95,1.70], nucleolus:[2.45,.66,1.30],
+        chloroplast:[-2.55,.70,1.40], mitochondrion:[-2.15,-.85,1.50], golgi:[.98,-1.15,1.60],
+        roughER:[2.80,-.08,1.40], ribosome:[3.05,-.92,1.30]
+      };
+
+      organelles.forEach(o => {
+        const sp = makeLabel(o.name, o.color);
+        sp.position.set(labelPos[o.id][0], labelPos[o.id][1], labelPos[o.id][2]);
+        sp.userData.organelleId = o.id;
+      });
+    }
+
+    function updateScene() {
+      const selected = organelles.find(o => o.id === state.selectedId);
+
+      organelles.forEach(o => {
+        let visible = !state.hidden.has(o.id);
+        if (state.isolate && o.id !== state.selectedId) visible = false;
+        if (groups[o.id]) groups[o.id].visible = visible;
+      });
+
+      labelSprites.forEach(s => {
+        const id = s.userData.organelleId;
+        s.visible = state.labels && groups[id] && groups[id].visible;
+      });
+
+      clickable.forEach(mesh => {
+        if (!mesh.material || mesh.material.opacity === undefined) return;
+        const base = mesh.userData.baseOpacity !== undefined ? mesh.userData.baseOpacity : 1;
+        const baseTrans = !!mesh.userData.baseTransparent;
+        if (state.xray) {
+          mesh.material.transparent = true;
+          mesh.material.opacity = Math.min(base, 0.18);
+          mesh.material.depthWrite = false;
+        } else {
+          mesh.material.opacity = base;
+          mesh.material.transparent = baseTrans;
+          mesh.material.depthWrite = !baseTrans;
+        }
+      });
+
+      if (halo) { root.remove(halo); halo = null; }
+      const selectedVisible = !state.hidden.has(selected.id);
+      if (selectedVisible) {
+        halo = new THREE.Group();
+        const color = new THREE.Color(selected.color);
+        const radius = (selected.id === 'cellWall' || selected.id === 'cellMembrane' || selected.id === 'cytoplasm')
+          ? 4.18 : (selected.id === 'roughER' ? 1.4 : 0.9);
+        const p = anchors[selected.id];
+
+        const h1 = new THREE.Mesh(
+          new THREE.TorusGeometry(radius, .018, 10, 96),
+          new THREE.MeshBasicMaterial({ color: color, transparent:true, opacity:.82, depthTest:false })
+        );
+        h1.rotation.x = Math.PI / 2;
+        h1.renderOrder = 999;
+        const h2 = new THREE.Mesh(
+          new THREE.TorusGeometry(radius * .82, .012, 10, 96),
+          new THREE.MeshBasicMaterial({ color:0xffffff, transparent:true, opacity:.42, depthTest:false })
+        );
+        h2.rotation.y = Math.PI / 2;
+        h2.renderOrder = 999;
+
+        halo.position.set(p[0], p[1], p[2]);
+        halo.add(h1, h2);
+        root.add(halo);
+      }
+
+      controls.target.lerp(new THREE.Vector3(anchors[selected.id][0], anchors[selected.id][1], anchors[selected.id][2]), .35);
+    }
+
+    function selectOrganelle(id) {
+      if (state.hidden.has(id)) state.hidden.delete(id);
+      state.selectedId = id;
+      renderUI();
+      updateScene();
+    }
+
+    function renderUI() {
+      const selected = organelles.find(o => o.id === state.selectedId);
+
+      const orgListHtml = organelles.map(o => {
+        const cls = ['org-item'];
+        if (o.id === state.selectedId) cls.push('active');
+        if (state.hidden.has(o.id)) cls.push('is-hidden');
+        const eyeChar = state.hidden.has(o.id) ? '○' : '●';
+        return '<button class="' + cls.join(' ') + '" data-select="' + o.id + '">' +
+          '<span class="bio-icon">' + organelleIconSVG(o, true) + '</span>' +
+          '<span><span class="org-name">' + o.name + '</span>' +
+          '<span class="org-sub">' + o.subtitle + '</span></span>' +
+          '<span class="eye" data-hide="' + o.id + '" title="点击切换显示/隐藏">' + eyeChar + '</span>' +
+          '</button>';
+      }).join('');
+      document.getElementById('orgList').innerHTML = orgListHtml;
+
+      const microHtml = microLevels.map(lvl => {
+        let bgParticles = '';
+        if (lvl.id === 'low') {
+          bgParticles = '<div class="micro-bg-particles"></div>';
+        }
+        return '<div class="micro-view" data-mag="' + lvl.id + '">' +
+          '<div class="micro-mag">' + lvl.label + '</div>' +
+          bgParticles +
+          '<div class="micro-shape" style="transform: translate(-50%, -50%) scale(' + lvl.zoom + ');">' +
+          organelleIconSVG(selected, false) +
+          '</div>' +
+          '<div class="micro-label">' + lvl.hint + '</div>' +
+          '</div>';
+      }).join('');
+      document.getElementById('microGrid').innerHTML = microHtml;
+      const microBadge = document.getElementById('microBadge');
+      if (microBadge) microBadge.textContent = '观察：' + selected.name;
+
+      const visibleCount = organelles.filter(o => !state.hidden.has(o.id)).length;
+      document.getElementById('visibleCount').textContent = visibleCount + ' / ' + organelles.length + ' 可见';
+      const browserHtml = categories.map(cat => {
+        const items = cat.ids.map(id => {
+          const o = organelles.find(x => x.id === id);
+          const cls = ['group-icon','bio-icon','bio-icon-sm'];
+          if (o.id === state.selectedId) cls.push('active');
+          if (state.hidden.has(o.id)) cls.push('hidden');
+          return '<span class="' + cls.join(' ') + '" data-select="' + o.id + '" data-tip="' + o.name + '">' +
+            organelleIconSVG(o, true) + '</span>';
+        }).join('');
+        return '<div class="browser-group">' +
+          '<div class="group-label">' + cat.label + '</div>' +
+          '<div class="group-items">' + items + '</div>' +
+          '</div>';
+      }).join('');
+      document.getElementById('browserGroups').innerHTML = browserHtml;
+
+      document.getElementById('detailIcon').innerHTML = organelleIconSVG(selected, true);
+      document.getElementById('detailName').textContent = selected.name;
+      document.getElementById('detailSub').textContent = selected.subtitle;
+      document.getElementById('detailDesc').textContent = selected.desc;
+      const statsHtml = selected.stats.map(kv =>
+        '<div><span>' + kv[0] + '</span><b>' + kv[1] + '</b></div>').join('');
+      document.getElementById('detailStats').innerHTML = statsHtml;
+
+      document.querySelectorAll('[data-option]').forEach(btn => {
+        btn.classList.toggle('active', !!state[btn.dataset.option]);
+      });
+    }
+
+    function switchView(viewName) {
+      state.view = viewName;
+      document.querySelectorAll('.scene-tab').forEach(t => {
+        t.classList.toggle('active', t.dataset.view === viewName);
+      });
+      document.querySelectorAll('.scene-view').forEach(v => {
+        v.classList.toggle('active', v.dataset.view === viewName);
+      });
+      if (viewName === '3d') {
+        setTimeout(resize, 100);
+      }
+    }
+
+    function openLightbox() {
+      document.getElementById('lightbox').classList.add('active');
+    }
+    function closeLightbox() {
+      document.getElementById('lightbox').classList.remove('active');
+    }
+
+    document.body.addEventListener('click', e => {
+      const tab = e.target.closest('.scene-tab');
+      if (tab) { switchView(tab.dataset.view); return; }
+
+      if (e.target.id === 'zoomBtn' || e.target.id === 'realImg') {
+        openLightbox();
+        return;
+      }
+      if (e.target.id === 'lightbox' || e.target.id === 'lightboxClose' || e.target.id === 'lightboxImg') {
+        closeLightbox();
+        return;
+      }
+
+      const hideBtn = e.target.closest('[data-hide]');
+      if (hideBtn) {
+        e.stopPropagation();
+        const id = hideBtn.dataset.hide;
+        if (state.hidden.has(id)) state.hidden.delete(id);
+        else state.hidden.add(id);
+        renderUI();
+        updateScene();
+        return;
+      }
+
+      const selectBtn = e.target.closest('[data-select]');
+      if (selectBtn) {
+        selectOrganelle(selectBtn.dataset.select);
+        return;
+      }
+
+      const opt = e.target.closest('[data-option]');
+      if (opt) {
+        const key = opt.dataset.option;
+        state[key] = !state[key];
+        renderUI();
+        updateScene();
+        return;
+      }
+
+      if (e.target.id === 'resetBtn') {
+        state.hidden.clear();
+        state.autoRotate = true;
+        state.isolate = false;
+        state.xray = false;
+        state.labels = true;
+        camera.position.set(0, .7, 7.4);
+        controls.target.set(0,0,0);
+        controls.update();
+        renderUI();
+        updateScene();
+        return;
+      }
+
+      if (e.target.id === 'focusBtn') {
+        focusOnSelected();
+        return;
+      }
+    });
+
+    function focusOnSelected() {
+      const sel = organelles.find(o => o.id === state.selectedId);
+      const a = anchors[sel.id];
+      const targetPos = new THREE.Vector3(a[0], a[1], a[2]);
+
+      const isBig = sel.id === 'cellWall' || sel.id === 'cellMembrane' || sel.id === 'cytoplasm';
+      const dist = isBig ? 7.0 : 3.2;
+
+      const dir = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
+      const endPos = targetPos.clone().add(dir.multiplyScalar(dist));
+
+      const wasAutoRotate = state.autoRotate;
+      state.autoRotate = false;
+      renderUI();
+
+      const startPos = camera.position.clone();
+      const startTarget = controls.target.clone();
+      const startTime = performance.now();
+      const duration = 700;
+
+      function step() {
+        const t = Math.min(1, (performance.now() - startTime) / duration);
+        const e = t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t + 2, 2)/2;
+        camera.position.lerpVectors(startPos, endPos, e);
+        controls.target.lerpVectors(startTarget, targetPos, e);
+        controls.update();
+        if (t < 1) requestAnimationFrame(step);
+        else {
+          state.autoRotate = wasAutoRotate;
+          renderUI();
+        }
+      }
+      step();
+    }
+
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') closeLightbox();
+    });
+
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+
+    canvas.addEventListener('pointerdown', e => {
+      const rect = canvas.getBoundingClientRect();
+      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObjects(clickable, false);
+      if (hits.length) {
+        const id = hits[0].object.userData.organelleId;
+        if (id) selectOrganelle(id);
+      }
+    });
+
+    function resize() {
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+      camera.aspect = rect.width / rect.height;
+      camera.updateProjectionMatrix();
+      renderer.setSize(rect.width, rect.height, false);
+    }
+
+    function animate(time) {
+      controls.autoRotate = state.autoRotate;
+      controls.update();
+      if (halo) {
+        const pulse = 1 + Math.sin(time * 0.0026) * 0.04;
+        halo.scale.setScalar(pulse);
+        halo.rotation.z = time * 0.00022;
+      }
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+
+    window.addEventListener('resize', resize);
+
+    buildCell();
+    renderUI();
+    updateScene();
+    resize();
+    animate(0);
+  </script>
+</body>
+</html>
