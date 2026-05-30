@@ -36,3 +36,19 @@ backend/.scannerwork/
 frontend/dist.*/
 frontend/dist.manual-backup.*
 frontend/dist.pre_deploy_*
+
+# ===== v161 补充:运行时数据与历史快照不入库 =====
+# 用户上传的媒体/课本/Logo(运行时数据,只在磁盘+OSS,不进git)
+uploads/
+# 历史代码快照目录
+code-backups/
+# 各类备份/失败/删除标记文件
+*.bak
+*.bak.txt
+*.backup2.*
+*.deleted.*
+*.failed_*
+sql-migrations/**/*.failed_*
+# 误创建的空文件
+frontend/=
+旧文件
