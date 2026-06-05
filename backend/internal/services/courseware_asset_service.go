@@ -4,15 +4,21 @@ package services
 //
 // v0.42 多媒体：AI图片生成 + 手动上传 + 插入HTML + 列表 + 删除
 // v0.42.1 新增：AI视频生成（异步提交+状态查询）
+// 风格锚点轮2新增：
+//   - GenerateImage 生成链路自动套用课件级风格锚点（refImageURL 图生图 + VAOCI 拼 prompt）
+//   - DeleteAsset 删除锚点资产时连带清空课件锚点引用（契约②：避免悬空引用）
+//   - resolveAssetPublicURL 取资产公网URL辅助（契约③：优先 public_oss_url，否则本地路径补域名前缀）
+//   - SetStyleAnchor / ClearStyleAnchor 设/清锚点业务方法（一步式同步：取URL→提取VAOCI→落库）
 //
 // 功能：
-//   - GenerateImage: 调用豆包API生成图片，下载保存到本地
+//   - GenerateImage: 调用豆包API生成图片，下载保存到本地（已设锚点时自动套用风格DNA）
 //   - GenerateVideo: 调用豆包API提交视频生成任务（异步，返回task_id）
 //   - QueryVideoStatus: 查询视频生成任务状态，成功时下载保存到本地
 //   - UploadAsset: 手动上传图片到本地磁盘
 //   - InsertImageToPage: 将图片插入到页面HTML中（替换占位符或追加）
 //   - ListPageAssets / ListCoursewareAssets: 查询图片/视频资产
-//   - DeleteAsset: 删除图片/视频资产（磁盘+数据库）
+//   - DeleteAsset: 删除图片/视频资产（磁盘+数据库+连带删OSS+连带清锚点）
+//   - SetStyleAnchor / ClearStyleAnchor: 设/清课件级风格锚点
 //
 // 存储路径: /uploads/courseware-assets/{courseware_id}/p{num}/{timestamp}_{name}
 // Nginx映射: /uploads/courseware-assets/ → 磁盘目录
@@ -48,6 +54,9 @@ const (
 
 	// CWAssetMaxSize 单张图片最大5MB
 	CWAssetMaxSize = 5 * 1024 * 1024
+
+	// cwAssetPublicHost 本地资产转公网URL的域名前缀（供豆包API下载 / 多模态读图 / 图生图）
+	cwAssetPublicHost = "https://workflow.pkuailab.com"
 )
 
 // 允许的图片MIME类型
@@ -87,6 +96,34 @@ func NewCoursewareAssetService(cfg *config.Config) *CoursewareAssetService {
 	return &CoursewareAssetService{cfg: cfg}
 }
 
+// ==================== 公网URL辅助（契约③）====================
+
+// resolveAssetPublicURL 取资产的公网可访问URL
+// 优先级：public_oss_url（已上云）> 本地 /uploads/ 路径补域名前缀 > 已是 http(s) 则原样
+// 返回空字符串表示无法解析出公网URL（既无公网地址也非本地路径）
+func resolveAssetPublicURL(asset *models.CoursewareAsset) string {
+	if asset == nil {
+		return ""
+	}
+	// 1. 已上云：直接用 OSS 公网URL
+	if strings.TrimSpace(asset.PublicOSSURL) != "" {
+		return strings.TrimSpace(asset.PublicOSSURL)
+	}
+	u := strings.TrimSpace(asset.OssURL)
+	if u == "" {
+		return ""
+	}
+	// 2. 已是公网地址：原样返回
+	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		return u
+	}
+	// 3. 本地 /uploads/ 路径：补域名前缀转公网URL
+	if strings.HasPrefix(u, "/uploads/") {
+		return cwAssetPublicHost + u
+	}
+	return ""
+}
+
 // ==================== AI图片生成 ====================
 
 // GenerateImageServiceRequest AI图片生成请求参数
@@ -110,6 +147,11 @@ type GenerateImageServiceResponse struct {
 }
 
 // GenerateImage 调用豆包API生成图片，下载保存到本地
+//
+// 风格锚点轮2：若课件已设风格锚点（StyleAnchorAssetID 非空），自动套用：
+//   - refImageURL：调用方未显式传 RefImageURL 时，用锚点图公网URL做图生图（视觉一致 + 省token）
+//   - prompt：把锚点 VAOCI 索引文本拼到提示词后做文字约束
+//   - 锚点图自身重生不自我套用（PlaceholderID 命中锚点图时跳过，避免自我参考）
 func (s *CoursewareAssetService) GenerateImage(
 	ctx context.Context,
 	req *GenerateImageServiceRequest,
@@ -135,7 +177,7 @@ func (s *CoursewareAssetService) GenerateImage(
 		return nil, fmt.Errorf("图片生成API未配置: %w", err)
 	}
 
-	// 4. 调用豆包API生成图片
+	// 4. 准备调用参数
 	traceCtx := &ai.TraceContext{
 		SceneCode: "courseware_image_gen",
 		UserID:    &req.UserID,
@@ -145,16 +187,40 @@ func (s *CoursewareAssetService) GenerateImage(
 	if imageSize == "" {
 		imageSize = "1920x1920"
 	}
-	// 构建参考图完整URL（本地路径转公网URL供豆包API下载）
+
+	// 4.1 生成所用提示词（可能被锚点VAOCI增强）
+	effectivePrompt := req.Prompt
+
+	// 4.2 确定参考图URL：调用方显式传入优先；否则尝试套用风格锚点
 	refURL := ""
 	if req.RefImageURL != "" {
+		// 调用方显式指定参考图（如锚点图重生场景，前端会主动传），尊重其意图
 		if strings.HasPrefix(req.RefImageURL, "/uploads/") {
-			refURL = "https://workflow.pkuailab.com" + req.RefImageURL
+			refURL = cwAssetPublicHost + req.RefImageURL
 		} else {
 			refURL = req.RefImageURL
 		}
+	} else if cw.StyleAnchorAssetID != nil && *cw.StyleAnchorAssetID != "" {
+		// 课件已设风格锚点，且调用方未显式传参考图 → 自动套用锚点风格DNA
+		anchorURL, vaoci := s.resolveStyleAnchorForGen(ctx, cw, req.PlaceholderID)
+		if anchorURL != "" {
+			refURL = anchorURL
+			// VAOCI 索引文本拼进提示词做文字约束（与图生图双重保证风格一致）
+			if vaoci != "" {
+				// 兼顾风格一致 + 人物/主体一致：VAOCI 已含风格DNA与角色固定形象，整体作为参考约束
+				effectivePrompt = req.Prompt + "\n\n【风格与人物一致性约束】请严格保持与参考图一致的视觉风格，并保持画面中人物/主体角色的形象（发型、脸型、服装、配色等）与参考图一致：" + vaoci
+			}
+			cwAssetLog.Info("生成图片自动套用风格锚点",
+				"courseware_id", req.CoursewareID,
+				"page_number", req.PageNumber,
+				"anchor_asset_id", *cw.StyleAnchorAssetID,
+				"has_vaoci", vaoci != "",
+			)
+		}
 	}
-	result, err := ai.GenerateImage(ctx, imgCfg, req.Prompt, imageSize, 1, refURL, traceCtx)
+
+	// 5. 调用豆包API生成图片
+	result, err := ai.GenerateImage(ctx, imgCfg, effectivePrompt, imageSize, 1, refURL, traceCtx)
 	if err != nil {
 		return nil, fmt.Errorf("图片生成失败: %w", err)
 	}
@@ -162,14 +228,14 @@ func (s *CoursewareAssetService) GenerateImage(
 		return nil, fmt.Errorf("图片生成未返回有效URL")
 	}
 
-	// 5. 下载第一张图片到本地存储
+	// 6. 下载第一张图片到本地存储
 	imageURL := result.URLs[0]
 	localURL, err := s.downloadAndSaveImage(ctx, req.CoursewareID, req.PageNumber, imageURL, req.Prompt)
 	if err != nil {
 		return nil, fmt.Errorf("下载生成图片失败: %w", err)
 	}
 
-	// 6. 写入数据库
+	// 7. 写入数据库
 	asset := &models.CoursewareAsset{
 		CoursewareID:     req.CoursewareID,
 		PageID:           &page.ID,
@@ -200,6 +266,35 @@ func (s *CoursewareAssetService) GenerateImage(
 		ModelUsed:     result.ModelUsed,
 		RevisedPrompt: result.RevisedPrompt,
 	}, nil
+}
+
+// resolveStyleAnchorForGen 取课件风格锚点的参考图公网URL + VAOCI（供 GenerateImage 自动套用）
+// 返回 ("","")的情形：锚点资产已被删/查不到、锚点图无法解析公网URL、
+//
+//	或当前生成目标占位符正是锚点图自身（锚点图重生不自我套用）。
+func (s *CoursewareAssetService) resolveStyleAnchorForGen(ctx context.Context, cw *models.Courseware, currentPlaceholderID string) (string, string) {
+	if cw.StyleAnchorAssetID == nil || *cw.StyleAnchorAssetID == "" {
+		return "", ""
+	}
+	anchorAsset, err := repository.GetCWAssetByID(ctx, *cw.StyleAnchorAssetID)
+	if err != nil {
+		// 锚点资产查不到（可能被删但未清引用）——本次生成不套用，不报错
+		cwAssetLog.Warn("风格锚点资产查询失败，本次生成跳过套用",
+			"courseware_id", cw.ID,
+			"anchor_asset_id", *cw.StyleAnchorAssetID,
+			"error", err,
+		)
+		return "", ""
+	}
+	// 锚点图自身重生：若当前生成目标占位符与锚点图占位符一致，则不自我参考
+	if currentPlaceholderID != "" && anchorAsset.PlaceholderID == currentPlaceholderID {
+		return "", ""
+	}
+	anchorURL := resolveAssetPublicURL(anchorAsset)
+	if anchorURL == "" {
+		return "", ""
+	}
+	return anchorURL, strings.TrimSpace(cw.StyleAnchorVAOCI)
 }
 
 // downloadAndSaveImage 下载远程图片并保存到本地磁盘
@@ -449,7 +544,12 @@ func (s *CoursewareAssetService) ListCoursewareAssets(ctx context.Context, cours
 
 // ==================== 删除资产 ====================
 
-// DeleteAsset 删除图片/视频资产（磁盘+数据库）
+// DeleteAsset 删除图片/视频资产（磁盘+数据库+连带删OSS+连带清锚点）
+//
+// 风格锚点轮2（契约②）：style_anchor_asset_id 无外键约束，删图不会报错但会留悬空引用。
+// 因此删除前先判断：该资产若是所属课件的当前风格锚点，则先清空课件锚点引用，
+// 否则后续生成图片取锚点图时会查不到 asset 而报错（resolveStyleAnchorForGen 已做兜底，但
+// 在删除时主动清理更干净，避免无效的锚点状态残留在前端展示）。
 func (s *CoursewareAssetService) DeleteAsset(ctx context.Context, assetID string, userID string) error {
 	asset, err := repository.GetCWAssetByID(ctx, assetID)
 	if err != nil {
@@ -462,6 +562,23 @@ func (s *CoursewareAssetService) DeleteAsset(ctx context.Context, assetID string
 	}
 	if cw.UserID != userID {
 		return fmt.Errorf("无权操作此课件")
+	}
+
+	// 契约②：删的资产若是该课件的风格锚点，先清空锚点引用（避免悬空引用）
+	if cw.StyleAnchorAssetID != nil && *cw.StyleAnchorAssetID == assetID {
+		if clrErr := repository.ClearCoursewareStyleAnchor(ctx, cw.ID); clrErr != nil {
+			// 清锚点失败仅记WARN不阻断删除（resolveStyleAnchorForGen 有兜底，不会因悬空引用报错）
+			cwAssetLog.Warn("删除锚点资产时清空课件锚点引用失败(继续删除资产)",
+				"asset_id", assetID,
+				"courseware_id", cw.ID,
+				"error", clrErr,
+			)
+		} else {
+			cwAssetLog.Info("删除锚点资产，已连带清空课件锚点引用",
+				"asset_id", assetID,
+				"courseware_id", cw.ID,
+			)
+		}
 	}
 
 	// 删除物理文件
@@ -477,6 +594,21 @@ func (s *CoursewareAssetService) DeleteAsset(ctx context.Context, assetID string
 		}
 	}
 
+	// v0.42.11: 若该资产已上传到OSS云盘(public_oss_url非空),尽力删除云盘副本
+	// 失败仅记WARN不阻断,避免OSS抖动导致本地删除失败;残留孤儿文件可后续清理
+	if asset.PublicOSSURL != "" {
+		ossSvc := NewOSSService(s.cfg)
+		if delErr := ossSvc.DeleteObjectFromOSS(asset.PublicOSSURL); delErr != nil {
+			cwAssetLog.Warn("删除OSS云盘副本失败(本地仍照常删除)",
+				"asset_id", assetID,
+				"public_oss_url", asset.PublicOSSURL,
+				"error", delErr,
+			)
+		} else {
+			cwAssetLog.Info("OSS云盘副本已删除", "asset_id", assetID, "public_oss_url", asset.PublicOSSURL)
+		}
+	}
+
 	if err := repository.DeleteCWAsset(ctx, assetID); err != nil {
 		return fmt.Errorf("删除资产记录失败: %w", err)
 	}
@@ -485,12 +617,112 @@ func (s *CoursewareAssetService) DeleteAsset(ctx context.Context, assetID string
 	return nil
 }
 
+// ==================== 风格锚点设/清（轮2新增，一步式同步）====================
+
+// SetStyleAnchorResult 设置锚点的返回结果
+type SetStyleAnchorResult struct {
+	AssetID   string `json:"asset_id"`   // 锚点资产ID
+	AnchorURL string `json:"anchor_url"` // 锚点图公网URL（供前端展示缩略图）
+	VAOCI     string `json:"vaoci"`      // 提取出的VAOCI风格索引文本
+}
+
+// SetStyleAnchor 设置课件风格锚点（一步式同步）
+//
+// 流程：校验资产归属 → 取资产公网URL → 多模态读图提取VAOCI → 落库（asset_id + vaoci）。
+// 仅图片资产可设为锚点（视频/音频不支持）。
+// 提取VAOCI为多模态调用，耗时数秒到十几秒，由前端 loading 兜底。
+func (s *CoursewareAssetService) SetStyleAnchor(ctx context.Context, coursewareID string, assetID string, userID string) (*SetStyleAnchorResult, error) {
+	// 1. 校验课件归属
+	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+	if err != nil {
+		return nil, fmt.Errorf("课件不存在: %w", err)
+	}
+	if cw.UserID != userID {
+		return nil, fmt.Errorf("无权操作此课件")
+	}
+
+	// 2. 校验资产存在 + 属于本课件 + 是图片
+	asset, err := repository.GetCWAssetByID(ctx, assetID)
+	if err != nil {
+		return nil, fmt.Errorf("资产不存在: %w", err)
+	}
+	if asset.CoursewareID != coursewareID {
+		return nil, fmt.Errorf("资产不属于此课件")
+	}
+	if asset.AssetType != models.CWAssetTypeImage {
+		return nil, fmt.Errorf("仅图片可设为风格锚点")
+	}
+
+	// 3. 自动上云（轮3增强）：锚点图若未上传OSS，先传一次，拿到稳定的OSS公网地址。
+	//    这样：① 多模态读图/后续图生图用阿里云稳定地址，不依赖本服务器 /uploads/ 可达性；
+	//          ② 锚点 asset 的 public_oss_url 被回写，前端任何页都能用它显示锚点缩略图（跨页缓存）。
+	//    已上云（public_oss_url 非空）则跳过，幂等不重复传。
+	if strings.TrimSpace(asset.PublicOSSURL) == "" && strings.HasPrefix(asset.OssURL, "/uploads/") {
+		ossSvc := NewOSSService(s.cfg)
+		publicURL, upErr := ossSvc.UploadAssetToOSS(asset.OssURL)
+		if upErr != nil {
+			return nil, fmt.Errorf("锚点图上传云盘失败（设锚点需稳定公网地址）: %w", upErr)
+		}
+		// 回写 public_oss_url 持久化（失败仅记WARN，不阻断——本次已拿到URL可用）
+		if updErr := repository.UpdateCWAssetPublicURL(ctx, assetID, publicURL); updErr != nil {
+			cwAssetLog.Warn("锚点图OSS地址回写失败(不阻断设锚点)", "asset_id", assetID, "error", updErr)
+		}
+		asset.PublicOSSURL = publicURL
+		cwAssetLog.Info("设锚点：锚点图已自动上云", "asset_id", assetID, "public_oss_url", publicURL)
+	}
+
+	// 取资产公网URL（契约③：此时 public_oss_url 必有值，优先用它）
+	anchorURL := resolveAssetPublicURL(asset)
+	if anchorURL == "" {
+		return nil, fmt.Errorf("无法解析锚点图的公网URL，请确认图片已正确保存")
+	}
+
+	// 4. 多模态读图提取VAOCI风格索引（一步式同步，失败直接报错）
+	vaoci, err := s.ExtractVAOCIFromImageURL(ctx, anchorURL, userID)
+	if err != nil {
+		return nil, fmt.Errorf("提取风格索引失败: %w", err)
+	}
+
+	// 5. 落库
+	if err := repository.UpdateCoursewareStyleAnchor(ctx, coursewareID, assetID, vaoci); err != nil {
+		return nil, fmt.Errorf("保存风格锚点失败: %w", err)
+	}
+
+	cwAssetLog.Info("设置课件风格锚点成功",
+		"courseware_id", coursewareID,
+		"anchor_asset_id", assetID,
+		"vaoci_len", len([]rune(vaoci)),
+	)
+
+	return &SetStyleAnchorResult{
+		AssetID:   assetID,
+		AnchorURL: anchorURL,
+		VAOCI:     vaoci,
+	}, nil
+}
+
+// ClearStyleAnchor 清除课件风格锚点（两字段置NULL）
+func (s *CoursewareAssetService) ClearStyleAnchor(ctx context.Context, coursewareID string, userID string) error {
+	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+	if err != nil {
+		return fmt.Errorf("课件不存在: %w", err)
+	}
+	if cw.UserID != userID {
+		return fmt.Errorf("无权操作此课件")
+	}
+	if err := repository.ClearCoursewareStyleAnchor(ctx, coursewareID); err != nil {
+		return fmt.Errorf("清除风格锚点失败: %w", err)
+	}
+	cwAssetLog.Info("清除课件风格锚点成功", "courseware_id", coursewareID)
+	return nil
+}
+
 // ==================== 插入图片到页面HTML ====================
 
 // InsertImageToPage 将图片插入到页面HTML中
 // 两种模式：
-//   1. placeholderID非空 → 替换占位符div为<img>标签
-//   2. placeholderID为空 → 在内容区末尾追加<img>标签
+//  1. placeholderID非空 → 替换占位符div为<img>标签
+//  2. placeholderID为空 → 在内容区末尾追加<img>标签
 func (s *CoursewareAssetService) InsertImageToPage(ctx context.Context, coursewareID string, pageNumber int, assetID string, userID string) (string, error) {
 	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
 	if err != nil {

@@ -1,14 +1,15 @@
 /**
- * 外部数据配置页面（P3-1新增，仅admin可访问）
- * - OSS配置区：Endpoint、Bucket、AccessKey ID、AccessKey Secret、索引前缀、HTML前缀
+ * 外部数据配置页面（仅admin可访问）
+ * - OSS读取配置区：Endpoint、Bucket、AccessKey ID/Secret、索引前缀、HTML前缀（内部课程资产，只读）
+ * - OSS上传配置区：上传Bucket、上传Endpoint、上传AccessKey ID/Secret（开放平台课件资产，写权限隔离）
  * - 推送API配置区：推送地址、推送Token
- * - 敏感字段（AccessKey Secret、推送Token）加密存储，脱敏显示
+ * - 敏感字段（两对AccessKey Secret、推送Token）加密存储，脱敏显示
  * - Apple 风格：毛玻璃卡片 + 渐变 + 圆角 + 微动效
  */
 import { useState, useEffect, useCallback } from 'react'
 import { getExternalDataConfigs, updateExternalDataConfigs } from '@/api/external-data'
 import type { ExternalDataConfigItem } from '@/api/external-data'
-import { Save, RefreshCw, Eye, EyeOff, Cloud, Send } from 'lucide-react'
+import { Save, RefreshCw, Eye, EyeOff, Cloud, Send, UploadCloud } from 'lucide-react'
 
 // ==================== 样式常量 ====================
 
@@ -73,7 +74,7 @@ const btnPrimary: React.CSSProperties = {
 
 // ==================== 配置项定义 ====================
 
-/** OSS配置项元数据 */
+/** OSS读取配置项元数据（内部课程资产，只读） */
 const OSS_FIELDS = [
   { key: 'oss_endpoint', label: 'OSS Endpoint', placeholder: '如 oss-cn-beijing.aliyuncs.com', sensitive: false },
   { key: 'oss_bucket', label: 'OSS Bucket', placeholder: '如 my-bucket-name', sensitive: false },
@@ -81,6 +82,14 @@ const OSS_FIELDS = [
   { key: 'oss_access_key_enc', label: 'AccessKey Secret', placeholder: '阿里云 AccessKey Secret（加密存储）', sensitive: true },
   { key: 'oss_index_prefix', label: '索引文件路径前缀', placeholder: '如 indexes/', sensitive: false },
   { key: 'oss_html_prefix', label: 'HTML文件路径前缀', placeholder: '如 lessons/', sensitive: false },
+]
+
+/** OSS上传配置项元数据（开放平台课件资产，写权限隔离） */
+const OSS_UPLOAD_FIELDS = [
+  { key: 'oss_upload_bucket', label: '上传 Bucket', placeholder: '如 20260525zuo', sensitive: false },
+  { key: 'oss_upload_endpoint', label: '上传 Endpoint', placeholder: '如 oss-cn-beijing.aliyuncs.com', sensitive: false },
+  { key: 'oss_upload_access_key_id', label: '上传 AccessKey ID', placeholder: '上传专用 AccessKey ID', sensitive: false },
+  { key: 'oss_upload_access_key_enc', label: '上传 AccessKey Secret', placeholder: '上传专用 AccessKey Secret（加密存储）', sensitive: true },
 ]
 
 /** 推送API配置项元数据 */
@@ -122,12 +131,10 @@ function Toast({ message, type, onClose }: { message: string; type: 'success' | 
 // ==================== 主组件 ====================
 
 export default function ExternalDataPage() {
-  // 配置数据状态
   const [configs, setConfigs] = useState<ExternalDataConfigItem[]>([])
   const [formValues, setFormValues] = useState<Record<string, string>>({})
   const [showSensitive, setShowSensitive] = useState<Record<string, boolean>>({})
 
-  // 通用状态
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null)
@@ -140,11 +147,10 @@ export default function ExternalDataPage() {
       const result = await getExternalDataConfigs()
       setConfigs(result.configs || [])
 
-      // 初始化表单值：非敏感字段用实际值，敏感字段留空（空表示不修改）
       const initialValues: Record<string, string> = {}
       for (const c of (result.configs || [])) {
         if (c.is_sensitive) {
-          initialValues[c.config_key] = '' // 敏感字段：空=不修改
+          initialValues[c.config_key] = ''
         } else {
           initialValues[c.config_key] = c.config_value || ''
         }
@@ -168,7 +174,6 @@ export default function ExternalDataPage() {
       const result = await updateExternalDataConfigs({ configs: formValues })
       setConfigs(result.configs || [])
 
-      // 重置敏感字段输入框为空
       const resetValues: Record<string, string> = {}
       for (const c of (result.configs || [])) {
         if (c.is_sensitive) {
@@ -190,12 +195,10 @@ export default function ExternalDataPage() {
 
   // ==================== 工具方法 ====================
 
-  /** 获取配置项的当前状态信息 */
   const getConfigInfo = (key: string): ExternalDataConfigItem | undefined => {
     return configs.find(c => c.config_key === key)
   }
 
-  /** 切换敏感字段可见性 */
   const toggleSensitive = (key: string) => {
     setShowSensitive(prev => ({ ...prev, [key]: !prev[key] }))
   }
@@ -210,54 +213,32 @@ export default function ExternalDataPage() {
         <label style={labelStyle}>
           {field.label}
           {field.sensitive && info && (
-            <span style={{
-              fontWeight: 400,
-              color: '#8e8e93',
-              marginLeft: '8px',
-              fontSize: '12px',
-            }}>
+            <span style={{ fontWeight: 400, color: '#8e8e93', marginLeft: '8px', fontSize: '12px' }}>
               {info.is_set ? '当前：' + info.config_value : '未配置'}
             </span>
           )}
           {!field.sensitive && info && !info.is_set && (
-            <span style={{
-              fontWeight: 400,
-              color: '#ff9500',
-              marginLeft: '8px',
-              fontSize: '12px',
-            }}>
+            <span style={{ fontWeight: 400, color: '#ff9500', marginLeft: '8px', fontSize: '12px' }}>
               待配置
             </span>
           )}
         </label>
         <div style={{ position: 'relative' }}>
           <input
-            style={{
-              ...inputStyle,
-              paddingRight: field.sensitive ? '44px' : '14px',
-            }}
+            style={{ ...inputStyle, paddingRight: field.sensitive ? '44px' : '14px' }}
             type={field.sensitive && !showSensitive[field.key] ? 'password' : 'text'}
             value={value}
             onChange={e => setFormValues(prev => ({ ...prev, [field.key]: e.target.value }))}
-            placeholder={field.sensitive && info?.is_set
-              ? '留空表示不修改'
-              : field.placeholder}
+            placeholder={field.sensitive && info?.is_set ? '留空表示不修改' : field.placeholder}
             {...inputFocusProps}
           />
           {field.sensitive && (
             <button
               onClick={() => toggleSensitive(field.key)}
               style={{
-                position: 'absolute',
-                right: '10px',
-                top: '50%',
-                transform: 'translateY(-50%)',
-                background: 'none',
-                border: 'none',
-                cursor: 'pointer',
-                color: '#8e8e93',
-                padding: '4px',
-                display: 'flex',
+                position: 'absolute', right: '10px', top: '50%',
+                transform: 'translateY(-50%)', background: 'none', border: 'none',
+                cursor: 'pointer', color: '#8e8e93', padding: '4px', display: 'flex',
               }}
             >
               {showSensitive[field.key] ? <EyeOff size={16} /> : <Eye size={16} />}
@@ -296,10 +277,8 @@ export default function ExternalDataPage() {
 
   return (
     <div style={{ maxWidth: 'none' }}>
-      {/* Toast 提示 */}
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
 
-      {/* 页面描述（标题由MainLayout header提供） */}
       <p style={{ fontSize: '14px', color: '#8e8e93', margin: '0 0 20px 0' }}>配置 OSS 数据源和推送 API 连接信息</p>
 
       {/* 统计卡片 */}
@@ -309,39 +288,49 @@ export default function ExternalDataPage() {
           { label: '已配置', value: configuredCount, color: '#34c759' },
           { label: '待配置', value: pendingCount, color: '#ff9500' },
         ].map(stat => (
-          <div key={stat.label} style={{
-            ...cardStyle,
-            marginBottom: 0,
-            padding: '20px',
-            textAlign: 'center',
-          }}>
+          <div key={stat.label} style={{ ...cardStyle, marginBottom: 0, padding: '20px', textAlign: 'center' }}>
             <div style={{ fontSize: '28px', fontWeight: 700, color: stat.color }}>{stat.value}</div>
             <div style={{ fontSize: '13px', color: '#8e8e93', marginTop: '4px' }}>{stat.label}</div>
           </div>
         ))}
       </div>
 
-      {/* ==================== OSS 配置卡片 ==================== */}
+      {/* ==================== OSS 读取配置卡片 ==================== */}
       <div style={cardStyle}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '24px' }}>
           <Cloud size={18} color="#007aff" />
-          <h2 style={{ fontSize: '17px', fontWeight: 600, color: '#1d1d1f', margin: 0 }}>OSS 数据源配置</h2>
-          <span style={{ fontSize: '12px', color: '#8e8e93' }}>（阿里云 OSS 只读拉取课程索引和 HTML）</span>
+          <h2 style={{ fontSize: '17px', fontWeight: 600, color: '#1d1d1f', margin: 0 }}>OSS 读取配置</h2>
+          <span style={{ fontSize: '12px', color: '#8e8e93' }}>（内部课程资产，只读拉取索引和 HTML）</span>
         </div>
 
-        {/* 第一行：Endpoint + Bucket（两列） */}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
           {OSS_FIELDS.slice(0, 2).map(field => renderField(field))}
         </div>
-
-        {/* 第二行：AccessKey ID + AccessKey Secret（两列） */}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
           {OSS_FIELDS.slice(2, 4).map(field => renderField(field))}
         </div>
-
-        {/* 第三行：索引前缀 + HTML前缀（两列） */}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
           {OSS_FIELDS.slice(4, 6).map(field => renderField(field))}
+        </div>
+      </div>
+
+      {/* ==================== OSS 上传配置卡片 ==================== */}
+      <div style={cardStyle}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+          <UploadCloud size={18} color="#34c759" />
+          <h2 style={{ fontSize: '17px', fontWeight: 600, color: '#1d1d1f', margin: 0 }}>OSS 上传配置</h2>
+          <span style={{ fontSize: '12px', color: '#8e8e93' }}>（课件资产上传专用桶，与读取桶权限隔离）</span>
+        </div>
+        <p style={{ fontSize: '12px', color: '#8e8e93', margin: '0 0 20px 0', lineHeight: 1.6 }}>
+          课件工坊「云盘」上传图片/视频时使用此处配置。上传 AccessKey 留空则回退使用上方读取 AccessKey。
+          建议为上传桶单独配置具备写权限的 AccessKey，实现读写权限隔离。
+        </p>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+          {OSS_UPLOAD_FIELDS.slice(0, 2).map(field => renderField(field))}
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+          {OSS_UPLOAD_FIELDS.slice(2, 4).map(field => renderField(field))}
         </div>
       </div>
 
@@ -357,22 +346,10 @@ export default function ExternalDataPage() {
       </div>
 
       {/* ==================== 操作按钮 ==================== */}
-      <div style={{
-        ...cardStyle,
-        display: 'flex',
-        justifyContent: 'flex-end',
-        gap: '12px',
-        alignItems: 'center',
-        padding: '20px 28px',
-      }}>
+      <div style={{ ...cardStyle, display: 'flex', justifyContent: 'flex-end', gap: '12px', alignItems: 'center', padding: '20px 28px' }}>
         <button
           onClick={loadData}
-          style={{
-            ...btnPrimary,
-            background: '#f5f5f7',
-            color: '#1d1d1f',
-            boxShadow: 'none',
-          }}
+          style={{ ...btnPrimary, background: '#f5f5f7', color: '#1d1d1f', boxShadow: 'none' }}
           onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = '#e8e8ed' }}
           onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = '#f5f5f7' }}
         >
@@ -392,24 +369,21 @@ export default function ExternalDataPage() {
       </div>
 
       {/* ==================== 使用说明 ==================== */}
-      <div style={{
-        ...cardStyle,
-        background: 'rgba(0,122,255,0.03)',
-        border: '1px solid rgba(0,122,255,0.1)',
-      }}>
+      <div style={{ ...cardStyle, background: 'rgba(0,122,255,0.03)', border: '1px solid rgba(0,122,255,0.1)' }}>
         <h3 style={{ fontSize: '14px', fontWeight: 600, color: '#007aff', margin: '0 0 12px 0' }}>使用说明</h3>
         <div style={{ fontSize: '13px', color: '#6e6e73', lineHeight: '1.8' }}>
           <p style={{ margin: '0 0 8px 0' }}>
-            <strong>OSS 配置：</strong>用于从阿里云 OSS 只读拉取课程索引和原始 HTML 文件。
-            AccessKey 建议使用只读权限的子账号密钥。AccessKey Secret 会使用 AES-256 加密后存储。
+            <strong>OSS 读取配置：</strong>从阿里云 OSS 只读拉取课程索引和原始 HTML。AccessKey 建议用只读子账号。
           </p>
           <p style={{ margin: '0 0 8px 0' }}>
-            <strong>推送 API 配置：</strong>Pipeline 定稿后，将修改后的课程内容推送回原始服务器。
-            推送 Token 同样会加密存储。
+            <strong>OSS 上传配置：</strong>课件工坊「云盘」上传资产到独立桶。上传 AccessKey 需具备该桶写权限；
+            留空则回退使用读取 AccessKey。建议读写分桶、分 Key 隔离权限。
+          </p>
+          <p style={{ margin: '0 0 8px 0' }}>
+            <strong>推送 API 配置：</strong>Pipeline 定稿后推送回原始服务器，Token 加密存储。
           </p>
           <p style={{ margin: 0 }}>
-            <strong>安全提示：</strong>敏感字段（AccessKey Secret、推送 Token）保存后仅显示脱敏值，
-            留空提交表示不修改该字段。配置信息变更会记录操作者和时间。
+            <strong>安全提示：</strong>敏感字段保存后仅显示脱敏值，留空提交表示不修改。配置变更记录操作者和时间。
           </p>
         </div>
       </div>

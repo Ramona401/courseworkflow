@@ -349,6 +349,8 @@ export interface LessonPlanChatRequest {
   current_section?: string
   /** v112(P0 STEP 8):AI 助手 ID,空/null 表示不使用助手走兜底 */
   assistant_id?: string | null
+  /** v168(功能B):全委托一键生成完整教案,true 时后端在 write 阶段一次性出稿(仅 write 阶段生效) */
+  full_generate?: boolean
 }
 
 export interface ApplyAISuggestionsRequest {

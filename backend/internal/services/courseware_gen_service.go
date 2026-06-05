@@ -130,10 +130,10 @@ func (s *CoursewareGenService) GeneratePreviewPages(ctx context.Context, coursew
 		EventType: CWSSEGenStart,
 		Data: map[string]interface{}{
 			"courseware_id": coursewareID,
-			"total_pages":  previewCount,
-			"template":     tplInfo.Name,
-			"message":      "正在生成封面预览页，请稍候...",
-			"is_preview":   true,
+			"total_pages":   previewCount,
+			"template":      tplInfo.Name,
+			"message":       "正在生成封面预览页，请稍候...",
+			"is_preview":    true,
 		},
 	})
 
@@ -235,7 +235,7 @@ func (s *CoursewareGenService) GeneratePreviewPages(ctx context.Context, coursew
 	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
 		EventType: CWSSEGenDone,
 		Data: map[string]interface{}{
-			"courseware_id":  coursewareID,
+			"courseware_id": coursewareID,
 			"success_count": successCount,
 			"fail_count":    failCount,
 			"total_pages":   previewCount,
@@ -257,6 +257,13 @@ func (s *CoursewareGenService) GeneratePreviewPages(ctx context.Context, coursew
 func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, coursewareID string, userID string) error {
 	startTime := time.Now()
 
+	// 防并发：同一课件同时只允许一个批量生成任务，避免连点/多标签页重复生成、重复扣 token、写库竞争
+	if _, busy := cwGenRunning.LoadOrStore(coursewareID, struct{}{}); busy {
+		s.broadcastError(coursewareID, "该课件正在生成中，请勿重复触发")
+		return fmt.Errorf("课件正在生成中: %s", coursewareID)
+	}
+	defer cwGenRunning.Delete(coursewareID)
+
 	// ---- 1. 获取课件信息并校验 ----
 	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
 	if err != nil {
@@ -267,7 +274,7 @@ func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, cours
 		s.broadcastError(coursewareID, "无权操作此课件")
 		return fmt.Errorf("无权操作此课件")
 	}
-	if cw.Status != models.CoursewareStatusGenerating {
+	if cw.Status != models.CoursewareStatusGenerating && cw.Status != models.CoursewareStatusPreview {
 		s.broadcastError(coursewareID, "当前状态不允许生成课件: "+cw.Status)
 		return fmt.Errorf("当前状态不允许生成课件: %s", cw.Status)
 	}
@@ -298,7 +305,7 @@ func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, cours
 		GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
 			EventType: CWSSEGenDone,
 			Data: map[string]interface{}{
-				"courseware_id":  coursewareID,
+				"courseware_id": coursewareID,
 				"success_count": len(pages),
 				"fail_count":    0,
 				"total_pages":   len(pages),
@@ -343,10 +350,10 @@ func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, cours
 		EventType: CWSSEGenStart,
 		Data: map[string]interface{}{
 			"courseware_id": coursewareID,
-			"total_pages":  len(remainingPages),
-			"template":     tplInfo.Name,
-			"message":      fmt.Sprintf("开始生成剩余 %d 页课件（导航栏已固定）...", len(remainingPages)),
-			"is_preview":   false,
+			"total_pages":   len(remainingPages),
+			"template":      tplInfo.Name,
+			"message":       fmt.Sprintf("开始生成剩余 %d 页课件（导航栏已固定）...", len(remainingPages)),
+			"is_preview":    false,
 		},
 	})
 
@@ -371,7 +378,7 @@ func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, cours
 			GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
 				EventType: CWSSEGenDone,
 				Data: map[string]interface{}{
-					"courseware_id":  coursewareID,
+					"courseware_id": coursewareID,
 					"success_count": successCount,
 					"fail_count":    failCount,
 					"total_pages":   len(remainingPages),
@@ -402,7 +409,7 @@ func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, cours
 				"current_page": progressNum,
 				"total_pages":  len(remainingPages),
 				"page_title":   page.Title,
-				"message":      fmt.Sprintf("正在生成第 %d/%d 页(P%d)：%s", progressNum, len(remainingPages), pageNum, page.Title),
+				"message":      fmt.Sprintf("正在生成 P%d：%s（本次进度 %d/%d）", pageNum, page.Title, progressNum, len(remainingPages)),
 			},
 		})
 
@@ -497,7 +504,7 @@ func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, cours
 	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
 		EventType: CWSSEGenDone,
 		Data: map[string]interface{}{
-			"courseware_id":  coursewareID,
+			"courseware_id": coursewareID,
 			"success_count": successCount,
 			"fail_count":    failCount,
 			"total_pages":   len(remainingPages),
@@ -514,6 +521,8 @@ func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, cours
 // ==================== P0-5: 中途中断生成 ====================
 
 // cwGenCancelMap 存储每个coursewareID的取消信号channel
+var cwGenRunning sync.Map // 标记 coursewareID 是否有批量生成进行中（防并发重复生成）
+
 var cwGenCancelMap sync.Map
 
 // CancelGenerate 发送取消信号，中断正在进行的批量生成

@@ -10,7 +10,7 @@
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import {
-  getCWTemplatesWithUser, deleteMyTemplate, uploadCWLogo, saveStyleFull, confirmCWStyle,
+  getCWTemplatesWithUser, deleteMyTemplate, uploadCWLogo, saveStyleFull, confirmCWStyle, getLogoHistory, deleteLogoHistory,
   CW_STYLE_CONFIG,
 } from '@/api/coursewares'
 import type { CoursewareTemplate, CoursewareDetail } from '@/api/coursewares'
@@ -51,6 +51,7 @@ export default function StyleSelector({ courseware, coursewareId, onStyleConfirm
   const [confirming, setConfirming] = useState(false)
   const [saved, setSaved] = useState(false)
   const [previewTpl, setPreviewTpl] = useState<CoursewareTemplate | null>(null)
+  const [logoHistory, setLogoHistory] = useState<string[]>([])  // 需求2: 历史 Logo 列表（点击复用免重传）
 
   // ==================== 加载模板 ====================
   const loadTemplates = useCallback(async () => {
@@ -69,6 +70,11 @@ export default function StyleSelector({ courseware, coursewareId, onStyleConfirm
 
   useEffect(() => { loadTemplates() }, [loadTemplates])
 
+  // 需求2: 加载当前用户历史用过的 Logo（去重、最近优先），供下方历史Logo快速复用
+  useEffect(() => {
+    getLogoHistory().then(setLogoHistory).catch(() => { /* 历史Logo加载失败不影响主流程 */ })
+  }, [])
+
   // ==================== Logo上传 ====================
   const handleLogoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -84,6 +90,18 @@ export default function StyleSelector({ courseware, coursewareId, onStyleConfirm
     } finally {
       setUploading(false)
       if (fileInputRef.current) fileInputRef.current.value = ''
+    }
+  }
+
+  // 需求2: 删除一条历史 Logo（清空使用它的课件的 logo_url；由用户自行判断）
+  const handleDeleteLogo = async (url: string) => {
+    if (!window.confirm('确定删除这个历史 Logo 吗？\n使用该 Logo 的课件会一并清空其 Logo（请自行判断）。')) return
+    try {
+      await deleteLogoHistory(url)
+      setLogoHistory(prev => prev.filter(u => u !== url))
+      if (logoURL === url) { setLogoURL(''); setSaved(false) }
+    } catch (e) {
+      alert('删除失败: ' + (e instanceof Error ? e.message : '未知错误'))
     }
   }
 
@@ -164,6 +182,26 @@ export default function StyleSelector({ courseware, coursewareId, onStyleConfirm
             <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px' }}>将显示在课件封面和页脚</div>
           </div>
         </div>
+        {/* 需求2: 历史 Logo 复用 — 点击即选用，免重新上传 */}
+        {logoHistory.length > 0 && (
+          <div style={{ marginTop: '16px' }}>
+            <div style={{ fontSize: '12px', fontWeight: 600, color: C.textSecondary, marginBottom: '8px' }}>🕑 历史 Logo（点击复用，免重新上传）</div>
+            <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+              {logoHistory.map(url => {
+                const active = url === logoURL
+                return (
+                  <div key={url} style={{ position: 'relative', width: '56px', height: '56px' }}>
+                    <div onClick={() => { setLogoURL(url); setSaved(false) }} title="点击复用此 Logo" style={{ width: '100%', height: '100%', borderRadius: '10px', border: `2px solid ${active ? C.primary : C.border}`, background: '#F9FAFB', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', overflow: 'hidden', boxShadow: active ? '0 2px 8px rgba(245,158,11,0.25)' : 'none' }}>
+                      <img src={url} alt="历史Logo" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+                    </div>
+                    {active && <div style={{ position: 'absolute', top: '-4px', left: '-4px', width: '16px', height: '16px', borderRadius: '50%', background: C.primary, color: '#fff', fontSize: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2 }}>✓</div>}
+                    <button onClick={async (e) => { e.stopPropagation(); await handleDeleteLogo(url) }} title="删除此历史 Logo" style={{ position: 'absolute', top: '-6px', right: '-6px', width: '18px', height: '18px', borderRadius: '50%', border: 'none', background: '#EF4444', color: '#fff', fontSize: '12px', lineHeight: '16px', textAlign: 'center', cursor: 'pointer', padding: 0, zIndex: 3, boxShadow: '0 1px 4px rgba(0,0,0,0.3)' }}>×</button>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* ====== 区块2：风格方案选择 ====== */}

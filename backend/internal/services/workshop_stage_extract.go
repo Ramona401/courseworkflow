@@ -7,17 +7,30 @@ package services
 // v82清理：删除废弃函数
 // v84拆分：GenerateStageSummary及相关摘要生成函数 移至 workshop_stage_summary.go
 //
+// v169改动（评审"有分无内容"治本）：
+//   - extractReviewStageFromNatural 改为「JSON优先 + 正则降级」双链路：
+//       1) 先尝试从 AI 回复尾部的 ```json 代码块解析结构化评审数据（与新版 review
+//          阶段提示词约定的格式对齐，最可靠）
+//       2) 解析失败再降级到原有的 Markdown 正则提取（兼容旧格式/AI偶尔漏 JSON）
+//   - 修正原正则两处脏数据：
+//       a) extractDimensionsFromTable 跳过表头行（"评审维度/维度/评分/简短评语"等）
+//       b) 维度 name 剥离 Markdown 粗体星号（"**T1-教学目标**" → "教学目标"）
+//   - parseReviewJSONBlock 复用 ai.ExtractJSON，但优先定位「最后一个 ```json 块」，
+//     避免报告正文里的花括号干扰花括号配平
+//
 // 包含：
 //   - ExtractStructuredFromNaturalReply：从自然语言回复中提取结构化数据（v75）
 //   - DetectLessonPlanContent：检测教案Markdown内容（v75）
 //   - extractScoreFromText：提取评审分数（v75）
-//   - 评审信息提取：extractReviewStageFromNatural等（v77）
+//   - 评审信息提取：extractReviewStageFromNatural等（v77重写，v169增强）
 
 import (
 	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
+
+	aiClient "tedna/internal/ai"
 )
 
 // ==================== 从自然语言回复中提取结构化数据（v75）====================
@@ -167,13 +180,31 @@ func trimTrailingChatter(content string) string {
 	return strings.TrimSpace(strings.Join(lines[:trimEnd], "\n"))
 }
 
-// ==================== 评审信息提取（v77重写）====================
+// ==================== 评审信息提取（v77重写，v169增强：JSON优先+正则降级）====================
 
 // extractReviewStageFromNatural 从review阶段的自然语言回复中提取评审信息
+//
+// v169双链路：
+//
+//	链路1（优先）：解析 AI 回复尾部的 ```json 结构化块（新版提示词约定输出此块）
+//	链路2（降级）：解析失败时，沿用原有 Markdown 正则提取（兼容旧格式）
+//
+// 两条链路任一成功（total_score>0）即返回 hasContent=true；
+// 都失败时返回 hasContent=false，narrative 兜底为对话原文截断（供上层 fallback）。
 func extractReviewStageFromNatural(content string) (string, string, bool) {
+	// ---------- 链路1：JSON 块优先 ----------
+	if structuredJSON, ok := parseReviewJSONBlock(content); ok {
+		// narrative 用完整原文（含 Markdown 报告），截断到 2000 字符供前端展示/记忆
+		narrative := safeUTF8Truncate(content, 2000)
+		wsLog.Info("评审提取走JSON块链路（v169）", "structured_len", len(structuredJSON))
+		return structuredJSON, narrative, true
+	}
+
+	// ---------- 链路2：Markdown 正则降级 ----------
 	totalScore := extractTotalScoreFromReview(content)
 	if totalScore <= 0 {
-		narrative := safeUTF8Truncate(content, 500)
+		narrative := safeUTF8Truncate(content, 2000)
+		wsLog.Warn("评审提取两条链路均失败，返回无结构化（上层将走兜底）", "content_len", len(content))
 		return "{}", narrative, false
 	}
 
@@ -192,7 +223,7 @@ func extractReviewStageFromNatural(content string) (string, string, bool) {
 	b, _ := json.Marshal(structured)
 	narrative := safeUTF8Truncate(content, 2000)
 
-	wsLog.Info("从评审报告中提取结构化数据",
+	wsLog.Info("评审提取走Markdown正则降级链路（v169）",
 		"total_score", totalScore,
 		"dimensions_count", len(dimensions),
 		"good_points_count", len(goodPoints),
@@ -201,6 +232,147 @@ func extractReviewStageFromNatural(content string) (string, string, bool) {
 	)
 
 	return string(b), narrative, true
+}
+
+// parseReviewJSONBlock 从 AI 回复中提取并校验尾部的评审 JSON 块（v169新增）
+//
+// 设计：
+//   - 优先定位「最后一个 ```json ... ``` 代码块」，避免报告正文里的花括号干扰
+//   - 找不到代码块再回退用 ai.ExtractJSON 做花括号配平兜底
+//   - 解析后做最小校验：total_score 必须 >0，否则视为无效
+//   - 解析成功后回填两件事：
+//     a) improvements 缺 id 的补 imp_N
+//     b) dimensions 清洗（剥星号、过滤表头行）——双保险，即便 AI 没完全守约也干净
+//   - 返回标准化后的 JSON 字符串（字段对齐 models.AIReviewResult + 前端 ReviewPanel）
+func parseReviewJSONBlock(content string) (string, bool) {
+	jsonStr := extractLastJSONCodeBlock(content)
+	if jsonStr == "" {
+		// 回退：用全局 ExtractJSON 做花括号配平（可能误匹配，故仅作兜底）
+		if s, ok := aiClient.ExtractJSON(content); ok {
+			jsonStr = s
+		}
+	}
+	if jsonStr == "" {
+		return "", false
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		return "", false
+	}
+
+	// total_score 校验
+	score := toFloat(parsed["total_score"])
+	if score <= 0 || score > 10 {
+		return "", false
+	}
+
+	// dimensions 清洗：剥星号 + 过滤表头行
+	if rawDims, ok := parsed["dimensions"].([]interface{}); ok {
+		cleanDims := make([]interface{}, 0, len(rawDims))
+		for _, d := range rawDims {
+			dm, ok := d.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name := strings.TrimSpace(stripBold(toStr(dm["name"])))
+			if isDimensionHeaderRow(name) {
+				continue // 跳过"评审维度/维度/评分"等表头脏行
+			}
+			dm["name"] = name
+			dm["code"] = strings.TrimSpace(stripBold(toStr(dm["code"])))
+			cleanDims = append(cleanDims, dm)
+		}
+		parsed["dimensions"] = cleanDims
+	}
+
+	// improvements 补 id
+	if rawImps, ok := parsed["improvements"].([]interface{}); ok {
+		for i, imp := range rawImps {
+			im, ok := imp.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if strings.TrimSpace(toStr(im["id"])) == "" {
+				im["id"] = fmt.Sprintf("imp_%d", i+1)
+			}
+		}
+	}
+
+	out, err := json.Marshal(parsed)
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
+// extractLastJSONCodeBlock 提取文本中「最后一个」```json ... ``` 代码块的内容（v169新增）
+// 兼容 ```json 与 ``` （无语言标注）两种围栏；取最后一个，因为评审 JSON 约定在报告末尾
+func extractLastJSONCodeBlock(text string) string {
+	// 匹配 ```json\n...\n``` 或 ```\n...\n```，非贪婪，跨行
+	re := regexp.MustCompile("(?s)```(?:json)?\\s*\\n(.*?)```")
+	matches := re.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	// 取最后一个代码块（评审 JSON 约定在最后）
+	last := matches[len(matches)-1]
+	if len(last) < 2 {
+		return ""
+	}
+	candidate := strings.TrimSpace(last[1])
+	// 必须像个 JSON 对象
+	if !strings.HasPrefix(candidate, "{") {
+		return ""
+	}
+	return candidate
+}
+
+// isDimensionHeaderRow 判断维度 name 是否是表格表头脏行（v169新增）
+func isDimensionHeaderRow(name string) bool {
+	if name == "" {
+		return true
+	}
+	headerKeywords := []string{"评审维度", "维度", "评分", "简短评语", "评语", "得分", "分数"}
+	for _, kw := range headerKeywords {
+		if name == kw {
+			return true
+		}
+	}
+	return false
+}
+
+// stripBold 剥离 Markdown 粗体星号（v169新增）："**T1-教学目标**" → "T1-教学目标"
+func stripBold(s string) string {
+	return strings.TrimSpace(strings.ReplaceAll(s, "*", ""))
+}
+
+// toFloat 宽容地把 interface{} 转 float64（支持 float64/json.Number/字符串）（v169新增）
+func toFloat(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case json.Number:
+		f, _ := n.Float64()
+		return f
+	case string:
+		var f float64
+		if _, err := fmt.Sscanf(strings.TrimSpace(n), "%f", &f); err == nil {
+			return f
+		}
+	}
+	return 0
+}
+
+// toStr 宽容地把 interface{} 转 string（v169新增）
+func toStr(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v", v)
 }
 
 // extractTotalScoreFromReview 从评审报告中提取总分
@@ -325,6 +497,7 @@ func extractTotalScoreFromTable(content string) float64 {
 }
 
 // extractDimensionsFromTable 从Markdown表格中提取维度评分
+// v169修正：跳过表头行（"评审维度/维度/评分"等）+ 剥离 name 的粗体星号
 func extractDimensionsFromTable(content string) []map[string]interface{} {
 	var dimensions []map[string]interface{}
 
@@ -353,11 +526,12 @@ func extractDimensionsFromTable(content string) []map[string]interface{} {
 			continue
 		}
 
-		dimName := strings.TrimSpace(cleanCells[0])
+		dimName := strings.TrimSpace(stripBold(cleanCells[0]))
 		scoreStr := strings.TrimSpace(cleanCells[1])
 		comment := strings.TrimSpace(cleanCells[2])
 
-		if dimName == "维度" || strings.Contains(dimName, "评分") {
+		// v169：跳过表头脏行（原代码只挡了"维度"和含"评分"，漏了"评审维度"作为首格的整行）
+		if isDimensionHeaderRow(dimName) {
 			continue
 		}
 
@@ -372,11 +546,12 @@ func extractDimensionsFromTable(content string) []map[string]interface{} {
 
 		code := ""
 		name := dimName
-		codeRegex := regexp.MustCompile(`^(T\d+)\s+(.+)$`)
+		// 支持 "T1 教学目标" 或 "T1-教学目标" 两种写法
+		codeRegex := regexp.MustCompile(`^(T\d+)[\s\-]+(.+)$`)
 		codeMatches := codeRegex.FindStringSubmatch(dimName)
 		if len(codeMatches) == 3 {
 			code = codeMatches[1]
-			name = codeMatches[2]
+			name = strings.TrimSpace(codeMatches[2])
 		}
 
 		dim := map[string]interface{}{
@@ -565,6 +740,10 @@ func extractSummary(content string) string {
 			break
 		}
 		if strings.HasPrefix(trimmed, "**总分") {
+			break
+		}
+		// v169：遇到 JSON 围栏停止（避免把尾部 JSON 块抠进 summary）
+		if strings.HasPrefix(trimmed, "```") {
 			break
 		}
 		if trimmed != "" {

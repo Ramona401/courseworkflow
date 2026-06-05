@@ -8,6 +8,7 @@ import (
 
 	"tedna/internal/middleware"
 	"tedna/internal/models"
+	"tedna/internal/repository"
 	"tedna/internal/services"
 	"tedna/internal/utils"
 )
@@ -476,6 +477,58 @@ func (h *CoursewareHandler) GetTemplatePreview(w http.ResponseWriter, r *http.Re
 		return
 	}
 	utils.Success(w, t)
+}
+
+// ListLogoHistory GET /api/v1/coursewares/logo-history — 查询当前用户历史用过的 Logo
+// 需求2：风格页"历史 Logo 复用"，去重、最近优先，避免每次重新上传
+func (h *CoursewareHandler) ListLogoHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 20
+	}
+	urls, err := repository.ListUserLogoURLs(r.Context(), claims.UserID, limit)
+	if err != nil {
+		utils.InternalError(w, "查询历史Logo失败: "+err.Error())
+		return
+	}
+	if urls == nil {
+		urls = []string{}
+	}
+	utils.Success(w, map[string]interface{}{"logos": urls})
+}
+
+// DeleteLogoHistory DELETE /api/v1/coursewares/logo-history?url=xxx — 删除一条历史 Logo
+// 需求2：清空当前用户名下所有使用该 logo_url 的课件的 Logo，使其不再出现在历史中（由用户自行判断）
+func (h *CoursewareHandler) DeleteLogoHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+	logoURL := r.URL.Query().Get("url")
+	if strings.TrimSpace(logoURL) == "" {
+		utils.BadRequest(w, "缺少 url 参数")
+		return
+	}
+	affected, err := repository.DeleteUserLogoURL(r.Context(), claims.UserID, logoURL)
+	if err != nil {
+		utils.InternalError(w, "删除历史Logo失败: "+err.Error())
+		return
+	}
+	utils.Success(w, map[string]interface{}{"affected": affected, "message": "已从历史中删除"})
 }
 
 // ==================== 路径解析辅助函数 ====================

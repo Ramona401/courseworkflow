@@ -10,7 +10,15 @@
  *
  * 迭代8变更：
  *   - 移除 StageGateModal（阶段切换弹窗已迁移到 WorkshopTransitionComponents.tsx）
- *   - 主要组件逻辑保持不变
+ *
+ * v169变更（评审"有分无内容"治本·前端双保险）：
+ *   - ReviewPanel 新增维度评分展示（之前只有 summary/good_points/improvements，
+ *     dimensions 数据存在却没渲染）
+ *   - 渲染前清洗脏数据（防历史坏数据）：
+ *       a) 过滤掉 name 为表头行（"评审维度/维度/评分/简短评语"等）的脏维度
+ *       b) 剥离 name/code 里的 Markdown 粗体星号（"**T1-教学目标**" → "T1-教学目标"）
+ *   - 这是与后端 workshop_stage_extract.go 同样清洗逻辑的前端兜底，
+ *     即便老教案的 ai_review_result 里残留脏维度，前端也不会显示出来
  */
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -369,6 +377,25 @@ export function ThinkingIndicator() {
 
 // ==================== AI评审面板 ====================
 
+// v169：维度脏数据清洗 —— 与后端 workshop_stage_extract.go 同样逻辑的前端兜底
+// 剥离粗体星号
+function stripBoldFE(s: unknown): string {
+  return String(s ?? '').replace(/\*/g, '').trim()
+}
+// 判定是否为表头脏行（应过滤掉）
+function isHeaderDimFE(name: string): boolean {
+  if (!name) return true
+  const headers = ['评审维度', '维度', '评分', '简短评语', '评语', '得分', '分数']
+  return headers.includes(name)
+}
+
+interface ReviewDimension {
+  code?: string
+  name?: string
+  score?: number
+  comment?: string
+}
+
 interface ReviewPanelProps {
   review: AIReviewResult
   onApply: (ids?: string[]) => void
@@ -378,6 +405,20 @@ interface ReviewPanelProps {
 
 export function ReviewPanel({ review, onApply, applying, isStageMode = false }: ReviewPanelProps) {
   const isGood = review.total_score >= 8.5
+
+  // v169：清洗维度数据（过滤表头脏行 + 剥星号），防历史坏数据显示出来
+  const rawDims = (review as unknown as { dimensions?: ReviewDimension[] }).dimensions
+  const cleanDims: ReviewDimension[] = Array.isArray(rawDims)
+    ? rawDims
+        .map(d => ({
+          code: stripBoldFE(d.code),
+          name: stripBoldFE(d.name),
+          score: typeof d.score === 'number' ? d.score : undefined,
+          comment: typeof d.comment === 'string' ? d.comment : '',
+        }))
+        .filter(d => !isHeaderDimFE(d.name || '') && typeof d.score === 'number')
+    : []
+
   return (
     <div style={{ padding: '16px', height: '100%', overflowY: 'auto', boxSizing: 'border-box' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px', padding: '14px 16px', background: isGood ? 'rgba(16,185,129,0.08)' : 'rgba(245,158,11,0.08)', borderRadius: '10px', border: `1px solid ${isGood ? '#10B98130' : '#F59E0B30'}` }}>
@@ -389,6 +430,36 @@ export function ReviewPanel({ review, onApply, applying, isStageMode = false }: 
           <div style={{ fontSize: '12px', color: C.textSec, marginTop: '2px', lineHeight: 1.5 }}>{review.summary}</div>
         </div>
       </div>
+
+      {/* v169新增：各维度评分条 */}
+      {cleanDims.length > 0 && (
+        <div style={{ marginBottom: '16px' }}>
+          <div style={{ fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>📊 各维度评分</div>
+          {cleanDims.map((d, i) => {
+            const sc = d.score as number
+            const barGood = sc >= 8.5
+            return (
+              <div key={i} style={{ marginBottom: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '3px' }}>
+                  <span style={{ fontSize: '12px', color: C.textSec, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {d.code ? `${d.code} ` : ''}{d.name || `维度${i + 1}`}
+                  </span>
+                  <span style={{ fontSize: '12px', fontWeight: 600, color: barGood ? C.success : C.accent, width: '32px', textAlign: 'right', flexShrink: 0 }}>
+                    {sc.toFixed(1)}
+                  </span>
+                </div>
+                <div style={{ height: '6px', background: '#F3F4F6', borderRadius: '3px', overflow: 'hidden' }}>
+                  <div style={{ height: '100%', borderRadius: '3px', width: `${Math.min(100, sc * 10)}%`, background: barGood ? C.success : C.accent, transition: 'width 600ms ease' }} />
+                </div>
+                {d.comment && (
+                  <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '3px', lineHeight: 1.5 }}>{d.comment}</div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+
       {(review.good_points || []).length > 0 && (
         <div style={{ marginBottom: '16px' }}>
           <div style={{ fontSize: '13px', fontWeight: 600, color: C.success, marginBottom: '8px' }}>✅ 做得好的</div>

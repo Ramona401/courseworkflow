@@ -3,6 +3,18 @@
  *
  * 从 WorkshopTransitionComponents.tsx 拆分
  * 包含: StageSummaryModal(导出) + StageSummaryCards(内部) + parseStructured(内部)
+ *
+ * v169修复（write/revise 阶段"尚未生成结构化产出物"误报）：
+ *   - 根因：write/revise 阶段的教案正文存在 lesson_plans.content_markdown 和
+ *     本阶段产出的 narrative_output（自然语言）里，而 structured_output 往往是空/{}。
+ *     旧逻辑仅凭 hasStructured(=structuredOutput 非空且非'{}') 判断"有无产出"，
+ *     导致一键生成出完整正文后，弹窗仍显示橙色"本阶段尚未生成结构化产出物"，误导老师。
+ *   - 修复：渲染从「二分」改为「三分」：
+ *       1) hasStructured            → 原结构化摘要卡片（不变）
+ *       2) write/revise 且 narrative 非空（说明正文已生成）→ 绿色"✅ 教案正文已生成"友好卡片
+ *       3) 其余                     → 原橙色"尚未生成结构化产出物"提示
+ *   - 仅改本展示组件，不动后端落库链路；analyze/design/review 行为完全不变。
+ *   - 启用此前被忽略的 narrative 参数（旧代码用 _narrative 丢弃）。
  */
 
 import { useState, useEffect } from 'react'
@@ -324,11 +336,17 @@ interface StageSummaryModalProps {
 
 export function StageSummaryModal({
   stageCode, stageName, stageOrder, totalStages, nextStageItem,
-  structuredOutput, narrative: _narrative, loading, onConfirm, onCancel, completeness,
+  structuredOutput, narrative, loading, onConfirm, onCancel, completeness,
 }: StageSummaryModalProps) {
   const [userNote, setUserNote] = useState('')
   const isLastStage = !nextStageItem || stageOrder >= totalStages
   const hasStructured = structuredOutput && structuredOutput !== '{}'
+
+  // v169：write/revise 阶段的教案正文是非结构化 Markdown，存在 narrative（或 content_markdown）里，
+  // 不进 structured_output。因此即使 hasStructured=false，只要本阶段有 narrative 正文，
+  // 也应视为"已生成正文"，显示绿色友好提示，而非橙色"尚未生成结构化产出物"误报。
+  const isWriteLike = stageCode === 'write' || stageCode === 'revise'
+  const hasWrittenContent = isWriteLike && !!narrative && narrative.trim().length > 0
 
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { setUserNote('') }, [stageCode])
@@ -402,6 +420,7 @@ export function StageSummaryModal({
           ) : (
             <>
               {hasStructured ? (
+                /* 分支1：有结构化产出（analyze/design/review 走这里，write/revise 若也有结构化也走这里）*/
                 <div style={{ marginBottom: '12px' }}>
                   <div style={{
                     fontSize: '11px', fontWeight: 700, color: C.textMuted,
@@ -418,7 +437,29 @@ export function StageSummaryModal({
                   </div>
                   <StageSummaryCards stageCode={stageCode} structuredOutput={structuredOutput} />
                 </div>
+              ) : hasWrittenContent ? (
+                /* 分支2（v169新增）：write/revise 阶段已生成教案正文（非结构化 Markdown）
+                   → 绿色友好提示，不再误报"尚未生成结构化产出物" */
+                <div style={{ marginBottom: '12px' }}>
+                  <div style={{
+                    padding: '16px', borderRadius: '10px',
+                    background: 'rgba(16,185,129,0.06)', border: '1px solid rgba(16,185,129,0.2)',
+                    fontSize: '13px', color: '#166534', lineHeight: 1.6,
+                    display: 'flex', gap: '8px', alignItems: 'flex-start',
+                  }}>
+                    <span style={{ flexShrink: 0, fontSize: '15px' }}>✅</span>
+                    <div>
+                      <div style={{ fontWeight: 600, marginBottom: '2px' }}>
+                        {stageCode === 'revise' ? '修订后的完整教案已生成' : '完整教案正文已生成'}
+                      </div>
+                      <div style={{ fontSize: '12px', color: '#15803D' }}>
+                        已同步到右侧教案预览，可在预览区查看完整内容。如需调整可继续与AI对话，或直接进入下一阶段。
+                      </div>
+                    </div>
+                  </div>
+                </div>
               ) : (
+                /* 分支3：确实没有任何产出 → 原橙色提示 */
                 !loading && (
                   <div style={{
                     padding: '16px', borderRadius: '10px', marginBottom: '12px',

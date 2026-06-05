@@ -123,6 +123,19 @@ func (s *CoursewareService) GetCourseware(ctx context.Context, id string) (*mode
 		}
 	}
 
+	// 风格锚点（轮3）：若已设锚点，查锚点资产拿其公网URL（优先 public_oss_url），
+	// 供前端任何页常驻显示锚点缩略图（无需前端跨页另发请求）。查不到不报错，留空即可。
+	anchorURL := ""
+	if cw.StyleAnchorAssetID != nil && *cw.StyleAnchorAssetID != "" {
+		if anchorAsset, aErr := repository.GetCWAssetByID(ctx, *cw.StyleAnchorAssetID); aErr == nil {
+			if anchorAsset.PublicOSSURL != "" {
+				anchorURL = anchorAsset.PublicOSSURL
+			} else if anchorAsset.OssURL != "" {
+				anchorURL = anchorAsset.OssURL
+			}
+		}
+	}
+
 	resp := &models.CoursewareDetailResponse{
 		ID:              cw.ID,
 		LessonPlanID:    cw.LessonPlanID,
@@ -142,6 +155,10 @@ func (s *CoursewareService) GetCourseware(ctx context.Context, id string) (*mode
 		PipelineID:      cw.PipelineID,
 		SourceType:      cw.SourceType,
 		SourceName:      models.CWSourceNameMap[cw.SourceType],
+		// 风格锚点字段（轮1留的契约①：装配时补齐，否则前端查锚点永远是零值）
+		StyleAnchorAssetID: cw.StyleAnchorAssetID,
+		StyleAnchorVAOCI:   cw.StyleAnchorVAOCI,
+		StyleAnchorURL:     anchorURL,
 		Pages:           pages,
 		CreatedAt:       cw.CreatedAt,
 		UpdatedAt:       cw.UpdatedAt,

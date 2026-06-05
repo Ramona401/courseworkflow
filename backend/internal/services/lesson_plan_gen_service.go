@@ -15,10 +15,22 @@ package services
 // v110(TE-DNA 3.0 P0 STEP 3)改动:
 //   - LessonPlanGenService 新增 assistantService 字段(可选,运行时通过 SetAssistantService 注入)
 //   - Chat 接收 AssistantID,若非空则解析助手 full_prompt,透传到 processChatStageAsync
-//   - processChatStageAsync 新增 assistantPrompt 参数,调用 LoadStagePromptContextV2
-//   - 开场白路径(StartConversation 中的 genStageOpeningMessage)不注入助手:
-//     1) 时序原因:开场白在 StartConversation 时触发,前端还没机会选助手
-//     2) 语义原因:开场白需要保持稳定/熟悉的"备课助手"风格,切换助手应从首次对话开始
+//
+// v168改动(第二批治本·功能B·一键生成完整教案):
+//   - processChatStageAsync 新增 fullGenerate 参数,write 阶段全委托一次性出稿
+//
+// v169改动(多阶段一键生成):
+//   - 全委托从 write 单阶段扩展到 analyze/design/write/revise 四个"写内容"的阶段:
+//       * fullGenerateAnalyzePrompt — 教学分析一键生成(落库走 extractGenericStageFromNatural,宽松)
+//       * fullGenerateDesignPrompt  — 教学设计一键生成(同上)
+//       * fullGenerateWritePrompt   — 教案撰写一键生成(落库走 DetectLessonPlanContent,严格,v168已有)
+//       * fullGenerateRevisePrompt  — 修订定稿一键生成(基于评审建议产出完整教案,落库同 write 严格)
+//   - processChatStageAsync 用 resolveFullGeneratePrompt(stage) 按阶段返回对应指令:
+//       * write 仍保留"已有正文→防重复"三态逻辑(正文为空且 fullGenerate 才注入)
+//       * analyze/design/revise 在 fullGenerate=true 时直接注入各自指令
+//   - review 阶段不参与一键生成(推进过去会自动触发评审,无需额外按钮)
+//   - 重要:本批次产出"纯 AI 一次性生成"内容,前端已在二次确认弹窗与产出卡片明确警示
+//     "纯 AI 产出可能有幻觉、与真实学情/教材不符,务必核对"。后端不重复警示,只负责出稿。
 
 import (
 	"context"
@@ -50,23 +62,127 @@ var (
 // lessonPlanSceneCode 教案生成场景代码，用于从ai_scene_configs获取独立模型配置
 const lessonPlanSceneCode = "lesson_plan"
 
+// fullGenerateWritePrompt 教案撰写阶段·全委托一键生成指令（v168·功能B）
+//
+// 设计原则：本指令格式严格对齐 DetectLessonPlanContent（workshop_stage_extract.go）的判定条件，
+// 确保 AI 一次性产出的教案能被识别并落库。DetectLessonPlanContent 要求：
+//  1. ≥3 个教案标记词（教学目标/重点/难点/过程/准备/作业/板书...）
+//  2. 有 # 开头的标题行，且标题含"教案/教学设计/教学目标/课题..."之一
+//  3. 含"教学过程"或"教学环节"或"教学活动"
+//  4. 含结尾标记（作业布置/板书设计/课后作业/课堂小结/教学反思...之一）
+//  5. 去掉末尾客套话后正文 ≥800 字符
+//
+// 因此本指令强制：用 # 标题、含全部必备小节、教学过程分环节带时间、不分段、不寒暄。
+const fullGenerateWritePrompt = `
+
+== 全委托一键生成模式（系统级指令，最高优先级，覆盖上文所有分段确认要求）==
+老师已明确选择"全委托 AI 一次性生成完整教案"，请你立即一次性输出一份**完整、可直接使用**的教案 Markdown，不要分段、不要等老师确认、不要说"接下来写下一部分"，本次回复就给出全部内容。
+
+输出格式硬性要求（务必全部满足，否则系统无法识别保存）：
+1. 以一级标题开头，格式为：# 《课题》教学设计（或 # 课题 教案）。
+2. 必须包含以下小节，每个小节用 ## 二级标题：
+   ## 教学目标（分知识与技能、过程与方法、情感态度价值观三维，或按核心素养列出，要具体可观察）
+   ## 教学重难点（明确教学重点与教学难点）
+   ## 教学准备（教具、学具、课件、场地等）
+   ## 教学过程（这是核心，必须按环节展开，每个环节标注时间分配，如"一、导入（5分钟）"，环节要包含教师活动与学生活动）
+   ## 作业布置（具体的课后作业或练习）
+   ## 板书设计（本节课的板书结构）
+3. 教学过程要详实，环节完整（导入→新授→巩固→小结等），内容充实，确保整份教案不少于 800 字。
+4. 结尾直接以"板书设计"小节自然结束，**不要**添加"如需修改请告诉我""希望这份教案对您有帮助"等客套话。
+5. 全程使用规范的 Markdown 标题层次（# ## ###），正文用自然中文，不要输出 JSON 或代码块包裹整篇教案。
+
+请现在就开始输出完整教案。`
+
+// fullGenerateAnalyzePrompt 教学分析阶段·全委托一键生成指令（v169）
+//
+// 落库路径：analyze 走 extractGenericStageFromNatural（判定宽松，内容非空即存为 narrative），
+// 故格式要求不必像 write 那样严格，重点是引导 AI 一次性输出完整的、结构清晰的学情/教材分析。
+const fullGenerateAnalyzePrompt = `
+
+== 全委托一键生成模式（系统级指令，最高优先级，覆盖上文所有分段确认/逐步追问要求）==
+老师已明确选择"全委托 AI 一次性完成本阶段（教学分析）"，请你立即一次性输出一份**完整的教学分析**，不要分段、不要反过来追问老师、不要说"接下来分析下一部分"，本次回复就给出全部内容。
+
+请用 Markdown 输出，至少包含以下方面（用 ## 二级标题分节）：
+## 教材分析（本课内容在教材中的地位、知识结构、与前后内容的联系）
+## 课程标准对接（本课对应的课程标准/核心素养要求）
+## 学情分析（该年级学生的认知特点、已有知识基础、可能的学习难点与误区）
+## 核心概念与重难点预判（本课的核心概念，以及预计的教学重点和难点）
+
+要求：内容具体、贴合学科与年级，避免空话套话。结尾不要加"如需调整请告诉我"之类的客套话。
+
+请现在就开始输出完整的教学分析。`
+
+// fullGenerateDesignPrompt 教学设计阶段·全委托一键生成指令（v169）
+//
+// 落库路径：design 走 extractGenericStageFromNatural（宽松）。
+const fullGenerateDesignPrompt = `
+
+== 全委托一键生成模式（系统级指令，最高优先级，覆盖上文所有分段确认/逐步追问要求）==
+老师已明确选择"全委托 AI 一次性完成本阶段（教学设计）"，请你立即一次性输出一份**完整的教学设计方案**，不要分段、不要反过来追问老师，本次回复就给出全部内容。
+
+请用 Markdown 输出，至少包含以下方面（用 ## 二级标题分节）：
+## 教学目标（三维目标或核心素养目标，要具体可观察、可评估）
+## 教学重难点（明确重点与难点，并说明突破难点的策略）
+## 教学策略（采用的教学方法、学习方式，如探究式/任务驱动/小组合作等及理由）
+## 教学活动设计（按环节展开，每个环节给出名称、预计时长、教师活动、学生活动、设计意图）
+## 评价设计（如何检验目标达成，形成性评价与总结性评价的安排）
+
+要求：活动设计要可操作、环节衔接合理、贴合学科与年级。结尾不要加客套话。
+
+请现在就开始输出完整的教学设计方案。`
+
+// fullGenerateRevisePrompt 修订定稿阶段·全委托一键生成指令（v169）
+//
+// 落库路径：revise 与 write 共用 handleWriteStageOutput，需命中 DetectLessonPlanContent（严格）。
+// 故格式要求与 write 完全一致（# 标题 + 全部必备小节 + ≥800字），
+// 区别在于：要求 AI 基于"前面阶段已完成的教案正文 + AI 评审建议"做修订后输出完整教案。
+// 已完成的正文与评审结论已由 LoadStagePromptContextV2 + Episodic 摘要注入上下文，AI 可直接参考。
+const fullGenerateRevisePrompt = `
+
+== 全委托一键生成模式（系统级指令，最高优先级，覆盖上文所有分段确认要求）==
+老师已明确选择"全委托 AI 一次性完成修订定稿"。请你参考前面阶段已经完成的教案正文，以及 AI 评审阶段提出的改进建议，**对教案进行修订并一次性输出修订后的完整教案 Markdown**。不要只输出修改点、不要分段、不要等老师确认，本次回复直接给出修订后的整份教案。
+
+输出格式硬性要求（务必全部满足，否则系统无法识别保存）：
+1. 以一级标题开头，格式为：# 《课题》教学设计（或 # 课题 教案）。
+2. 必须包含以下小节，每个小节用 ## 二级标题：教学目标、教学重难点、教学准备、教学过程（按环节展开并标注时间分配，含教师活动与学生活动）、作业布置、板书设计。
+3. 在原教案基础上落实评审建议的改进点（如时间分配、评价工具、活动设计等），但仍输出**完整**教案而非仅改动部分。
+4. 整份教案不少于 800 字，结尾以"板书设计"小节自然结束，不要加客套话。
+5. 使用规范 Markdown 标题层次，不要用 JSON 或代码块包裹整篇教案。
+
+请现在就开始输出修订后的完整教案。`
+
+// resolveFullGeneratePrompt 按阶段返回对应的全委托一键生成指令（v169）
+//
+// 返回空字符串表示该阶段不支持一键生成（如 review）。
+// write 阶段的"已有正文→防重复"判定不在此处，仍由 processChatStageAsync 单独处理。
+func resolveFullGeneratePrompt(stageCode string) string {
+	switch stageCode {
+	case "analyze":
+		return fullGenerateAnalyzePrompt
+	case "design":
+		return fullGenerateDesignPrompt
+	case "write":
+		return fullGenerateWritePrompt
+	case "revise":
+		return fullGenerateRevisePrompt
+	default:
+		return ""
+	}
+}
+
 // ==================== 服务结构体 ====================
 
 // LessonPlanGenService 教案生成服务
-// v110(TE-DNA 3.0 P0 STEP 3)新增 assistantService 字段,用于解析 AssistantID -> full_prompt
 type LessonPlanGenService struct {
 	cfg              interface{ GetAESKey() string }
 	recipeService    *RecipeService
 	stageService     *WorkshopStageService
-	assistantService *AIAssistantService // v110 新增:运行时注入,用于加载 AI 助手(可选,nil 时不支持 assistant_id)
+	assistantService *AIAssistantService // v110:运行时注入,用于加载 AI 助手(可选)
 }
 
 var lpGenLog = logger.WithModule("lp_gen")
 
 // NewLessonPlanGenService 创建教案生成服务
-//
-// v110 改动:构造函数签名保持不变以免 routes 层大改动;
-// 通过 SetAssistantService 单独注入助手服务,满足"服务初始化顺序无关"的灵活性
 func NewLessonPlanGenService(cfg interface{ GetAESKey() string }) *LessonPlanGenService {
 	return &LessonPlanGenService{
 		cfg:           cfg,
@@ -76,9 +192,6 @@ func NewLessonPlanGenService(cfg interface{ GetAESKey() string }) *LessonPlanGen
 }
 
 // SetAssistantService 注入 AI 助手服务(由 routes 层调用)
-// v110 新增:将 assistant_id 解析能力注入进来
-//   - 未注入时 Chat 接收到 assistant_id 会静默降级到默认 system prompt
-//   - 注入后 Chat 可加载助手,用 full_prompt 替换第4层阶段角色
 func (s *LessonPlanGenService) SetAssistantService(as *AIAssistantService) {
 	s.assistantService = as
 }
@@ -150,7 +263,6 @@ func (s *LessonPlanGenService) StartConversation(
 	lpGenLog.Info("阶段初始化成功", "plan_id", lp.ID, "stages_count", len(snapshots), "first_stage", snapshots[0].StageCode)
 
 	// 生成阶段化开场白
-	// v110 说明:开场白路径不注入 assistant_id,保持稳定"备课助手"风格
 	var openingMsg *models.ConversationMessage
 	openingMsg, err = s.genStageOpeningMessage(ctx, lp, snapshots)
 	if err != nil {
@@ -187,9 +299,6 @@ func (s *LessonPlanGenService) StartConversation(
 }
 
 // genStageOpeningMessage 阶段模式下生成第一阶段的AI开场白
-//
-// v110 说明:开场白路径走原 LoadStagePromptContext(内部等价于传空 assistantPrompt 的 V2)
-// 保持稳定/熟悉的"备课助手"开场体验,不受助手选择影响
 func (s *LessonPlanGenService) genStageOpeningMessage(
 	ctx context.Context,
 	lp *models.LessonPlan,
@@ -213,7 +322,6 @@ func (s *LessonPlanGenService) genStageOpeningMessage(
 		return nil, fmt.Errorf("AI配置加载失败: %w", err)
 	}
 
-	// v89-2：构建TraceContext，关联教案ID和作者
 	planID := lp.ID
 	authorID := lp.AuthorID
 	openingTraceCtx := &aiClient.TraceContext{
@@ -241,11 +349,7 @@ func (s *LessonPlanGenService) genStageOpeningMessage(
 
 // Chat 处理教师输入，AI生成回复并通过SSE流式推送
 //
-// v110(TE-DNA 3.0 P0 STEP 3)改动:
-//   - 若 req.AssistantID 非空,同步解析助手(可见性+激活校验+使用量埋点)
-//   - 解析成功时将 full_prompt 透传到 processChatStageAsync
-//   - 解析失败时静默降级到默认 system prompt(不中断对话),记录 WARN 日志
-//   - assistant_id 为空时保持原行为 100% 不变
+// v169改动：fullGenerate 不再仅 write 生效，透传给 processChatStageAsync 按阶段判定
 func (s *LessonPlanGenService) Chat(
 	ctx context.Context,
 	req *models.LessonPlanChatRequest,
@@ -284,25 +388,18 @@ func (s *LessonPlanGenService) Chat(
 	// v110 新增:解析 AI 助手(若前端传了 assistant_id)
 	assistantPrompt := s.resolveAssistantPrompt(ctx, req.AssistantID, callerID)
 
+	// v168/v169:全委托标志(按阶段在 processChatStageAsync 内判定)
+	fullGenerate := req.FullGenerate
+
 	go func() {
 		bgCtx := context.Background()
-		s.processChatStageAsync(bgCtx, lp, userMsg, currentStageMsgs, req, assistantPrompt)
+		s.processChatStageAsync(bgCtx, lp, userMsg, currentStageMsgs, req, assistantPrompt, fullGenerate)
 	}()
 
 	return nil
 }
 
-// resolveAssistantPrompt v110 新增:将 assistant_id 解析为 full_prompt
-//
-// 返回值:
-//   - 空字符串:表示不注入助手(原行为)。触发场景:
-//     1) req.AssistantID 为空(前端没选)
-//     2) assistantService 未注入
-//     3) 助手加载失败(记 WARN 日志,不中断对话)
-//     4) 助手 full_prompt 为空字符串(异常兜底)
-//   - 非空字符串:助手的 full_prompt,用于替换第4层阶段角色
-//
-// 设计原则:对话流程优先于助手能力,助手失败不应阻塞对话
+// resolveAssistantPrompt v110:将 assistant_id 解析为 full_prompt
 func (s *LessonPlanGenService) resolveAssistantPrompt(
 	ctx context.Context,
 	assistantID string,
@@ -318,8 +415,6 @@ func (s *LessonPlanGenService) resolveAssistantPrompt(
 		return ""
 	}
 
-	// 查询用户角色(用于可见性校验)
-	// 注意:这里只需要 role 字段,学校 ID 由 BuildActorFromClaims 按角色自动反查
 	user, err := repository.FindUserByID(ctx, callerID)
 	if err != nil {
 		lpGenLog.Warn("Chat 加载用户角色失败,降级到默认 prompt",
@@ -347,14 +442,14 @@ func (s *LessonPlanGenService) resolveAssistantPrompt(
 	return a.FullPrompt
 }
 
-// ==================== 2.1 阶段化对话（v84分层记忆 + v87教练集成 + v110助手注入）====================
+// ==================== 2.1 阶段化对话（v84分层记忆 + v87教练集成 + v110助手注入 + v168/v169全委托）====================
 
 // processChatStageAsync 阶段模式：异步处理AI流式回复
 //
-// v110(TE-DNA 3.0 P0 STEP 3)改动:
-//   - 新增 assistantPrompt 参数(空字符串表示不注入助手)
-//   - 调用 stageService.LoadStagePromptContextV2 透传 assistantPrompt
-//   - 其他逻辑完全保持不变(分层记忆/教练检测/write阶段防重复等)
+// v169改动（多阶段一键生成）：
+//   - write 阶段保留原三态（已有正文→防重复 / 正文空+fullGenerate→全委托 / 其余逐轮）
+//   - analyze/design/revise 阶段：fullGenerate=true 时注入 resolveFullGeneratePrompt 返回的对应指令
+//   - review 阶段：resolveFullGeneratePrompt 返回空，不参与一键生成
 func (s *LessonPlanGenService) processChatStageAsync(
 	ctx context.Context,
 	lp *models.LessonPlan,
@@ -362,6 +457,7 @@ func (s *LessonPlanGenService) processChatStageAsync(
 	currentStageMsgs []*models.ConversationMessage,
 	req *models.LessonPlanChatRequest,
 	assistantPrompt string,
+	fullGenerate bool,
 ) {
 	planID := lp.ID
 	currentStage := lp.CurrentStage
@@ -387,10 +483,17 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		return
 	}
 
-	// write阶段防重复生成
+	// 全委托标志：本轮是否实际注入了全委托指令（用于后续跳过停滞检测）
+	fullGenInjected := false
+
 	if currentStage == "write" {
+		// ---------- write 阶段三态处理（v168，保持原逻辑）----------
 		latestLP, freshErr := repository.GetLessonPlanByID(ctx, planID)
-		if freshErr == nil && len(strings.TrimSpace(latestLP.ContentMarkdown)) > 2000 {
+		hasExistingContent := freshErr == nil && len(strings.TrimSpace(latestLP.ContentMarkdown)) > 2000
+
+		switch {
+		case hasExistingContent:
+			// 态a：已有教案内容 → 注入防重复生成指令
 			contentLen := len(latestLP.ContentMarkdown)
 			stageSystemPrompt += fmt.Sprintf(`
 
@@ -405,6 +508,27 @@ func (s *LessonPlanGenService) processChatStageAsync(
 
 			lpGenLog.Info("write阶段已有教案内容，注入防重复生成指令",
 				"plan_id", planID, "stage", currentStage, "content_len", contentLen)
+
+		case fullGenerate:
+			// 态b：正文为空 + 老师选择全委托 → 注入全委托一次性出稿指令
+			stageSystemPrompt += fullGenerateWritePrompt
+			fullGenInjected = true
+			lpGenLog.Info("write阶段全委托一键生成，注入全委托出稿指令",
+				"plan_id", planID, "stage", currentStage)
+
+		default:
+			// 态c：原逐轮分段确认逻辑，stageSystemPrompt 不追加
+		}
+	} else if fullGenerate {
+		// ---------- analyze/design/revise 阶段一键生成（v169）----------
+		if fgPrompt := resolveFullGeneratePrompt(currentStage); fgPrompt != "" {
+			stageSystemPrompt += fgPrompt
+			fullGenInjected = true
+			lpGenLog.Info("阶段全委托一键生成，注入全委托指令",
+				"plan_id", planID, "stage", currentStage)
+		} else {
+			lpGenLog.Warn("收到 fullGenerate 但该阶段不支持一键生成，忽略",
+				"plan_id", planID, "stage", currentStage)
 		}
 	}
 
@@ -425,7 +549,8 @@ func (s *LessonPlanGenService) processChatStageAsync(
 	lpGenLog.Info("v84分层记忆上下文构建完成",
 		"plan_id", planID, "stage", currentStage,
 		"working_msgs", len(currentStageMsgs), "episodic_len", len(episodicSummary),
-		"prior_stages", len(priorOutputs), "assistant_injected", assistantPrompt != "")
+		"prior_stages", len(priorOutputs), "assistant_injected", assistantPrompt != "",
+		"full_generate", fullGenerate, "full_gen_injected", fullGenInjected)
 
 	// 流式推送
 	chunkCount := 0
@@ -495,15 +620,19 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		Message:   aiReply,
 	})
 
-	lpGenLog.Info("AI对话流式回复完成（v84分层记忆+v110助手注入）",
+	lpGenLog.Info("AI对话流式回复完成（v84分层记忆+v110助手注入+v168/v169全委托）",
 		"plan_id", planID, "stage", currentStage,
 		"tokens", result.TokensUsed, "latency_ms", result.LatencyMs,
 		"chunks", chunkCount, "has_content", hasContent,
 		"working_msgs", len(currentStageMsgs),
-		"assistant_injected", assistantPrompt != "")
+		"assistant_injected", assistantPrompt != "",
+		"full_generate", fullGenerate)
 
 	// v87：对话完成后异步检测停滞，插入教练建议
-	go s.checkAndInsertCoachAdvice(ctx, planID, currentStage)
+	// v168/v169：全委托一次性出稿不需要停滞检测（本就是一次性完成），跳过避免误插建议
+	if !fullGenInjected {
+		go s.checkAndInsertCoachAdvice(ctx, planID, currentStage)
+	}
 }
 
 // ==================== v87：停滞检测+教练建议插入 ====================

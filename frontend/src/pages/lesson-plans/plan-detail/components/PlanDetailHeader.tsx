@@ -8,6 +8,14 @@
  * v142优化：exportWord 改为动态导入（按需加载 docx 库 ~300KB），
  *   用户点击「导出Word」按钮时才加载 docx + file-saver，
  *   PlanDetailPage chunk 从 418KB 降至 ~120KB
+ *
+ * v168改动（第二批治本·功能A·正文产出硬门控 切片A·前端体验层）：
+ *   ActionBar 在教案正文（content_markdown）为空时，禁用会被后端拒绝的按钮：
+ *     - submit（提交评审）、publish（发布教案）、courseware（生成课件）
+ *   这些入口后端已加正文非空硬校验，前端提前置灰 + title 提示，避免用户
+ *   点击后才收到错误。delete/workshop/fork 不受影响（删除、返回工坊补正文、
+ *   Fork 他人教案都不应被"自己这份正文为空"拦截）。
+ *   注意：前端禁用仅为体验优化，后端校验才是真正防线。
  */
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -96,6 +104,12 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction, interactions
   // 导出Word加载状态
   const [exporting, setExporting] = useState(false)
 
+  // v168：教案正文是否为空（用于禁用 submit/publish/courseware 按钮）
+  // 与后端 strings.TrimSpace(lp.ContentMarkdown) == "" 判据保持一致
+  const isContentEmpty = !plan.content_markdown || plan.content_markdown.trim() === ''
+  // v168：受正文为空门控的 action 集合——这些入口后端会拒绝空正文教案
+  const contentGatedActions = new Set(['submit', 'publish', 'courseware'])
+
   /**
    * v142优化：点击"导出Word"时动态加载 docx 库
    * 首次点击会多等约 0.5-1 秒加载 chunk，后续浏览器缓存秒开
@@ -157,6 +171,12 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction, interactions
     transition: 'all 150ms ease', whiteSpace: 'nowrap',
     display: 'inline-flex', alignItems: 'center', gap: '5px',
   }
+  // v168：正文为空时被禁用按钮的灰显样式
+  const gatedDisabledBtn: React.CSSProperties = {
+    padding: '9px 20px', borderRadius: '8px', border: `1px solid ${C.border}`,
+    background: '#F3F4F6', fontSize: '14px', fontWeight: 600, color: C.textMuted,
+    cursor: 'not-allowed', transition: 'all 150ms ease', whiteSpace: 'nowrap',
+  }
 
   // ---- 按状态动态构建主操作按钮列表 ----
   const buttons: Array<{ label: string; style: React.CSSProperties; action: string; confirm?: string }> = []
@@ -204,29 +224,44 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction, interactions
       )}
 
       {/* 主操作按钮列表 */}
-      {!actionLoading && buttons.map(btn => (
-        <button
-          key={btn.action}
-          style={btn.style}
-          disabled={isLoading}
-          onClick={() => {
-            if (btn.confirm && !window.confirm(btn.confirm)) return
-            if (btn.action === 'view_pipeline') {
-              if (plan.linked_pipeline_id) navigate(`/workflow/pipelines/${plan.linked_pipeline_id}`)
-              else navigate('/workflow/pipelines')
-              return
-            }
-            // 返回备课工坊：写入sessionStorage后跳转，工坊会自动加载该教案
-            if (btn.action === 'workshop') {
-              sessionStorage.setItem('workshop_active_plan_id', plan.id)
-              navigate('/lesson-plans')
-              return
-            }
-            onAction(btn.action)
-          }}>
-          {btn.label}
-        </button>
-      ))}
+      {!actionLoading && buttons.map(btn => {
+        // v168：受正文门控的 action 且正文为空 → 渲染为禁用态（灰显 + title 提示，不触发 onAction）
+        const gated = contentGatedActions.has(btn.action) && isContentEmpty
+        if (gated) {
+          return (
+            <button
+              key={btn.action}
+              style={gatedDisabledBtn}
+              disabled
+              title="教案正文为空，请先在备课工坊生成完整教案正文后再操作">
+              {btn.label}
+            </button>
+          )
+        }
+        return (
+          <button
+            key={btn.action}
+            style={btn.style}
+            disabled={isLoading}
+            onClick={() => {
+              if (btn.confirm && !window.confirm(btn.confirm)) return
+              if (btn.action === 'view_pipeline') {
+                if (plan.linked_pipeline_id) navigate(`/workflow/pipelines/${plan.linked_pipeline_id}`)
+                else navigate('/workflow/pipelines')
+                return
+              }
+              // 返回备课工坊：写入sessionStorage后跳转，工坊会自动加载该教案
+              if (btn.action === 'workshop') {
+                sessionStorage.setItem('workshop_active_plan_id', plan.id)
+                navigate('/lesson-plans')
+                return
+              }
+              onAction(btn.action)
+            }}>
+            {btn.label}
+          </button>
+        )
+      })}
 
       {/* 导出Word按钮：始终显示，不受主操作加载状态影响 */}
       <button

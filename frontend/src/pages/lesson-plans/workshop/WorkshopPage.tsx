@@ -183,6 +183,19 @@ export default function WorkshopPage() {
     try { return localStorage.getItem('workshop_image_tip_dismissed') === '1' } catch { return false }
   })
 
+  // v168: 正文生成成功提示 toast（3秒自动消失）
+  // 老师疑问"到底生成没生成"的根因是缺少正向反馈——正文落库时主动弹一条提示，
+  // 明确告知"已生成，可在右侧预览/我的教案查看"，消除疑虑。
+  const [contentToast, setContentToast] = useState<string | null>(null)
+  const showContentToast = (msg: string) => {
+    setContentToast(msg)
+    setTimeout(() => setContentToast(null), 4000)
+  }
+
+  // v168(功能B): 一键生成完整教案的进行中状态（防重复点击）
+  // 仅在 write 阶段且正文为空时按钮可见，点击后置 true，直到 SSE 出稿落库（onContentUpdate）或报错（onError）复位
+  const [fullGenerating, setFullGenerating] = useState(false)
+
   // v88:SSE连接引用改为SSEConnection类型(支持close方法)
   const sseRef         = useRef<SSEConnection | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -246,7 +259,18 @@ export default function WorkshopPage() {
           setTimeout(() => setIsStageProcessing(false), 5000)
         }
       },
-      onContentUpdate: (content: string) => setPlanContent(content),
+      onContentUpdate: (content: string) => {
+        // v168：检测正文从"无"到"有"的跃迁——首次拿到非空正文时弹成功提示
+        setPlanContent(prev => {
+          const wasEmpty = !prev || prev.trim().length === 0
+          const nowHas = !!(content && content.trim().length > 0)
+          if (wasEmpty && nowHas) {
+            showContentToast('✅ 教案正文已生成！可在右侧「教案预览」查看，发布后也可在「我的教案」中随时查看')
+            setFullGenerating(false)  // v168(功能B): 全委托出稿落库成功，复位按钮状态
+          }
+          return content
+        })
+      },
       onReviewDone: r => {
         setReviewLoading(false); setApplyingReview(false)
         setReview(r); setRightPanel('review')
@@ -264,6 +288,7 @@ export default function WorkshopPage() {
         setIsThinking(false); setStreaming(null)
         setReviewLoading(false); setApplyingReview(false)
         setIsStageProcessing(false)
+        setFullGenerating(false)  // v168(功能B): 出错时复位一键生成状态，避免按钮卡死
         setMessages(prev => [...prev, {
           id: `err_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
           content: `抱歉,遇到了一点问题:${err}。你可以重试或换个方式表达。`,
@@ -330,6 +355,26 @@ export default function WorkshopPage() {
         setPhase('chatting')
         sessionStorage.setItem('workshop_active_plan_id', effectivePlanId)
         connectSSE(effectivePlanId)
+
+        // v168：从详情页「前往补全正文」入口跳来时，会带 workshop_target_stage 信号，
+        // 恢复完成后自动切到指定阶段（通常是 write 教案撰写），消除"承诺去撰写、实际停在评审/修订"的落差。
+        // 用 switchToStage（与"继续该阶段对话"按钮同款 API，阶段可逆），用完即清，不影响下次正常恢复。
+        try {
+          const targetStage = sessionStorage.getItem('workshop_target_stage')
+          if (targetStage) {
+            sessionStorage.removeItem('workshop_target_stage')
+            // 仅当该阶段存在于当前教案阶段列表时才切，避免对旧模式/无该阶段的教案误操作
+            const exists = (planData.current_stage && planData.stage_config)
+              ? true : false
+            if (exists && planData.current_stage !== targetStage) {
+              await switchToStage(effectivePlanId, targetStage)
+              await refreshStages(effectivePlanId)
+            }
+          }
+        } catch (switchErr) {
+          // 切阶段失败不阻断恢复流程，用户仍可手动在左侧阶段栏切换
+          console.error('恢复后切换目标阶段失败:', switchErr)
+        }
       } catch (e) {
         console.error('恢复教案失败:', e)
         setResumeError('加载教案失败,请重试')
@@ -433,6 +478,81 @@ export default function WorkshopPage() {
         created_at: new Date().toISOString(),
       }])
       setInputText(msgText)
+    }
+  }
+
+  // v168(功能B): 一键生成完整教案
+  // 仅 write 阶段 + 正文为空时可触发。二次确认后，用固定触发语 + full_generate:true 调 chat，
+  // 后端注入全委托出稿指令一次性产出完整教案，走现有 SSE → onContentUpdate 落库反馈（自动弹成功 toast）。
+  const handleFullGenerate = async (stageOverride?: string) => {
+    if (!plan || fullGenerating || isBusy) return
+    // v169：按阶段返回文案配置；不在表中的阶段（如 review）不支持一键生成
+    const FULL_GEN_STAGE_META: Record<string, { name: string; trigger: string; confirmBody: string }> = {
+      analyze: {
+        name: '教学分析',
+        trigger: '请一次性完成本节课的完整教学分析（教材分析、课程标准对接、学情分析、核心概念与重难点预判）。',
+        confirmBody: '将由 AI 一次性生成完整的教学分析（教材分析、课程标准、学情分析、重难点预判）。',
+      },
+      design: {
+        name: '教学设计',
+        trigger: '请一次性完成本节课的完整教学设计方案（教学目标、重难点、教学策略、活动设计、评价设计）。',
+        confirmBody: '将由 AI 一次性生成完整的教学设计方案（教学目标、重难点、教学策略、活动设计、评价设计）。',
+      },
+      write: {
+        name: '教案撰写',
+        trigger: '请一次性生成这节课的完整教案正文。',
+        confirmBody: '将由 AI 一次性生成完整的教案正文（教学目标、重难点、教学过程、作业、板书等）。',
+      },
+      revise: {
+        name: '修订定稿',
+        trigger: '请基于已有教案正文和 AI 评审建议，一次性输出修订后的完整教案。',
+        confirmBody: '将由 AI 参考已有教案正文与评审建议，一次性输出修订后的完整教案。',
+      },
+    }
+    const stage = stageOverride || currentStage
+    const meta = FULL_GEN_STAGE_META[stage]
+    if (!meta) return
+
+    const ok = window.confirm(
+      `⚡ 一键完成「${meta.name}」\n\n` +
+      meta.confirmBody +
+      ' 整个过程无需你逐步确认。\n\n' +
+      '⚠️ 重要提醒：这是纯 AI 一次性生成的内容，可能存在幻觉，或与你班级的真实学情、所用教材不完全相符。' +
+      '请务必通读核对，结合实际情况修改后再使用。\n\n' +
+      '生成后可继续对话局部调整，或用「🔄 重启本阶段」重新来过。\n\n' +
+      '确定现在开始生成吗？'
+    )
+    if (!ok) return
+
+    setFullGenerating(true)
+    setIsThinking(true)
+    const triggerMsg = meta.trigger
+    const localMsg: ConversationMessage = {
+      id: `local_${Date.now()}`, role: 'user' as const, type: 'text' as const,
+      content: triggerMsg,
+      created_at: new Date().toISOString(),
+    }
+    setMessages(prev => [...prev, localMsg])
+    try {
+      await sendChatMessage(plan.id, {
+        message: triggerMsg,
+        assistant_id: assistantId,
+        full_generate: true,
+      })
+    } catch (err) {
+      setIsThinking(false)
+      setFullGenerating(false)
+      console.error('一键生成失败:', err)
+      // v169：优先显示后端返回的真实错误（如"教案当前状态不可编辑"），而非笼统的网络提示
+      const errMsg = err instanceof Error ? err.message : ''
+      const friendly = errMsg && errMsg !== '请求失败'
+        ? `⚠️ 一键生成未能开始：${errMsg}。${errMsg.includes('状态') ? '该教案可能已提交评审或已完成，无法继续生成。' : '请稍后重试。'}`
+        : '⚠️ 一键生成请求发送失败，请检查网络后重试。'
+      setMessages(prev => [...prev, {
+        id: `fullgen_err_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
+        content: friendly,
+        created_at: new Date().toISOString(),
+      }])
     }
   }
 
@@ -594,6 +714,20 @@ export default function WorkshopPage() {
   // P2+P3:确认进入下一阶段
   const handleConfirmTransition = async () => {
     if (!plan) return
+
+    // v168：离开「教案撰写」阶段时，若正文仍未生成 → confirm 拦截
+    // 背景：用户在 write 阶段只走开场白没真正生成正文就推进，会导致"有分无正文"。
+    // 这里在确认进入下一阶段前主动提示，把决定权明确交还用户（可取消回去补，也可坚持推进）。
+    if (currentStage === 'write' && (!planContent || planContent.trim().length === 0)) {
+      const proceed = confirm(
+        '⚠️ 检测到教案正文尚未生成。\n\n' +
+        '建议先在「教案撰写」阶段让 AI 写出完整的教案正文，' +
+        '否则后续 AI 评审将无内容可评、教案详情页也会显示「暂无教案内容」。\n\n' +
+        '确定仍要继续进入下一阶段吗？'
+      )
+      if (!proceed) return
+    }
+
     setShowSummaryModal(false)
 
     const currentIdx      = stageItems.findIndex(s => s.stage_code === currentStage)
@@ -1053,6 +1187,54 @@ export default function WorkshopPage() {
               </button>
             ))}
 
+            {/* v169(多阶段一键生成): 一键完成本阶段按钮
+                显示条件：阶段模式 + 当前阶段支持一键生成(analyze/design/write/revise) + 该阶段尚无产出
+                - write/revise：看 planContent(正文)是否为空
+                - analyze/design：看 stageItems 里该阶段的 has_output 是否为 false
+                review 阶段不在 FULL_GEN_STAGE_BTN 中，不显示按钮（推进过去自动评审）*/}
+            {isStageMode && currentStage && (() => {
+              // 阶段中文名（按钮文案用），与 handleFullGenerate 内 FULL_GEN_STAGE_META 对齐
+              const stageBtnNames: Record<string, string> = {
+                analyze: '教学分析', design: '教学设计', write: '教案撰写', revise: '修订定稿',
+              }
+              const stageName = stageBtnNames[currentStage]
+              if (!stageName) return null  // review 等不支持的阶段
+              // 判空逻辑（v169修复"第一次进入 analyze/design 看不到按钮"）：
+              //   - write/revise：看 planContent(正文)是否为空（正文落在 lesson_plans.content_markdown，准确）
+              //   - analyze/design：原先用 has_output 判空，但阶段开场白也会被存为产出物、污染 has_output，
+              //     导致一进阶段 has_output 就变 true、按钮被错误隐藏。改为看阶段 status：
+              //     只要阶段尚未"完成/跳过"（仍是 pending/in_progress），就应允许一键生成。
+              const contentEmpty = !planContent || planContent.trim().length === 0
+              const curStageItem = stageItems.find(s => s.stage_code === currentStage)
+              const stageFinished = curStageItem?.status === 'completed' || curStageItem?.status === 'skipped'
+              const shouldShow = (currentStage === 'write' || currentStage === 'revise')
+                ? contentEmpty
+                : !stageFinished
+              if (!shouldShow) return null
+              return (
+                <button
+                  onClick={() => handleFullGenerate()}
+                  disabled={isBusy || fullGenerating}
+                  title={`由 AI 一次性生成完整的${stageName}内容，无需逐步确认（生成后请务必核对）`}
+                  style={{
+                    padding: '6px 14px',
+                    borderRadius: '20px',
+                    border: 'none',
+                    background: (isBusy || fullGenerating) ? '#E5E7EB' : 'linear-gradient(135deg, #F59E0B, #FBBF24)',
+                    color: (isBusy || fullGenerating) ? C.textMuted : '#fff',
+                    fontSize: '12px',
+                    fontWeight: 600,
+                    cursor: (isBusy || fullGenerating) ? 'not-allowed' : 'pointer',
+                    boxShadow: (isBusy || fullGenerating) ? 'none' : '0 2px 8px rgba(245,158,11,0.3)',
+                    transition: 'all 150ms ease',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {fullGenerating ? '⏳ 生成中...' : `⚡ 一键完成${stageName}`}
+                </button>
+              )
+            })()}
+
             {isStageMode && currentStage && (
               <button onClick={handleCompleteStageClick} disabled={!canCompleteStage} style={{ marginLeft: 'auto', padding: '7px 16px', borderRadius: '20px', border: 'none', background: !canCompleteStage ? '#E5E7EB' : aiSuggestsComplete ? 'linear-gradient(135deg, #10B981, #34D399)' : 'linear-gradient(135deg, #4F7BE8, #818CF8)', color: !canCompleteStage ? C.textMuted : '#fff', fontSize: '13px', fontWeight: 600, cursor: !canCompleteStage ? 'not-allowed' : 'pointer', transition: 'all 200ms ease', boxShadow: canCompleteStage && aiSuggestsComplete ? '0 3px 12px rgba(16,185,129,0.35)' : canCompleteStage ? '0 3px 10px rgba(79,123,232,0.3)' : 'none', animation: canCompleteStage && aiSuggestsComplete ? 'completePulse 2s ease-in-out infinite' : 'none', whiteSpace: 'nowrap' }}>
                 {summaryLoading ? '加载中...' : nextStageForSummary ? `✅ 完成本阶段,进入${nextStageForSummary.stage_name} →` : '🎉 完成备课'}
@@ -1232,6 +1414,13 @@ export default function WorkshopPage() {
         onClose={() => setModalOpen(false)}
         onSaved={(id) => handleAssistantSaved(id)}
       />
+
+      {/* v168：正文生成成功提示 toast（fixed 定位，复用 PlanDetailTabs 的轻提示风格） */}
+      {contentToast && (
+        <div style={{ position: 'fixed', bottom: '28px', left: '50%', transform: 'translateX(-50%)', maxWidth: '560px', padding: '12px 22px', borderRadius: '10px', background: 'linear-gradient(135deg, #10B981, #34D399)', color: '#fff', fontSize: '13px', fontWeight: 500, lineHeight: 1.6, boxShadow: '0 6px 24px rgba(16,185,129,0.4)', zIndex: 10000, textAlign: 'center' }}>
+          {contentToast}
+        </div>
+      )}
 
       <style>{`
         @keyframes completePulse {

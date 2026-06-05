@@ -14,6 +14,16 @@ package services
 //   7. applyAndReviewAsync — 异步应用建议+重新评审
 //   8. genOpeningMessage — 旧版开场白生成（保留兼容）
 //   9. triggerAutoLessonIndex — review完成后自动生成教案AOCI索引
+//
+// v169改动（评审"有分无内容"治本）：
+//   - handleReviewStageOutput 去掉「total_score<=0 静默return」的硬门槛：
+//       旧逻辑下，只要 extractReviewStageFromNatural 没抠到分数（AI 格式飘了），
+//       后端直接 return，既不保存也不广播 → 前端永远等不到 onReviewDone，
+//       右侧停在"评审报告将自动显示在这里" = 用户"看不到内容"的直接成因。
+//   - 新逻辑：解析得到的 reviewResult 若 total_score<=0，用对话原文兜底
+//       （buildFallbackReview，复用 lesson_plan_gen_prompts.go 的现成函数），
+//       保证前端永远能拿到一个可渲染的 review 对象。
+//   - 仅当兜底也拿不到任何可用内容时才不保存分数（但仍广播 fallback 供展示）。
 
 import (
 	"context"
@@ -45,7 +55,7 @@ func (s *LessonPlanGenService) handleStageOutputSideEffects(
 	case "write", "revise":
 		s.handleWriteStageOutput(ctx, planID, lp, structuredJSON, rawContent)
 	case "review":
-		s.handleReviewStageOutput(ctx, planID, structuredJSON)
+		s.handleReviewStageOutput(ctx, planID, structuredJSON, rawContent)
 	}
 }
 
@@ -116,26 +126,49 @@ func (s *LessonPlanGenService) handleWriteStageOutput(
 }
 
 // handleReviewStageOutput 处理review阶段产出物
+//
+// v169改动：新增 rawContent 参数 + 去掉 total_score<=0 静默return 硬门槛。
+//   - 优先用 extractReviewStageFromNatural 解析出的 structuredJSON
+//   - 若解析为空或 total_score<=0，用 rawContent（AI对话原文）构造 fallback review 广播，
+//     保证前端永远能渲染（评分用兜底7.0，summary 用原文截断）
+//   - 只有在能拿到有效 total_score 时才落库到 lesson_plans.ai_review_result（避免脏分入库）；
+//     fallback 仅广播不落库（不污染数据，但解决"看不到"）
 func (s *LessonPlanGenService) handleReviewStageOutput(
 	ctx context.Context,
 	planID string,
 	structuredJSON string,
+	rawContent string,
 ) {
-	if structuredJSON == "" || structuredJSON == "{}" {
-		return
-	}
-
 	var reviewResult *models.AIReviewResult
-	if err := json.Unmarshal([]byte(structuredJSON), &reviewResult); err != nil || reviewResult == nil {
-		lpGenLog.Warn("解析review阶段structured为AIReviewResult失败", "plan_id", planID, "error", err)
+
+	// 尝试解析结构化 JSON
+	if structuredJSON != "" && structuredJSON != "{}" {
+		if err := json.Unmarshal([]byte(structuredJSON), &reviewResult); err != nil {
+			lpGenLog.Warn("解析review阶段structured为AIReviewResult失败", "plan_id", planID, "error", err)
+			reviewResult = nil
+		}
+	}
+
+	// 判定是否拿到有效评审（含有效总分）
+	hasValidScore := reviewResult != nil && reviewResult.TotalScore > 0
+
+	if !hasValidScore {
+		// v169兜底：解析失败或无有效分数时，用对话原文构造 fallback review 广播
+		// 保证前端右侧面板永远能渲染，不再卡在"评审报告将自动显示在这里"
+		fallback := buildFallbackReview(safeReviewRawFallback(rawContent))
+		fallback.ReviewedAt = time.Now()
+
+		GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
+			EventType: models.LPSSEReviewDone,
+			PlanID:    planID,
+			Review:    fallback,
+		})
+		lpGenLog.Warn("review阶段未解析到有效结构化评审，已广播fallback供前端展示（不落库）",
+			"plan_id", planID, "raw_len", len(rawContent))
 		return
 	}
 
-	if reviewResult.TotalScore <= 0 {
-		lpGenLog.Warn("review阶段structured的total_score无效", "plan_id", planID, "score", reviewResult.TotalScore)
-		return
-	}
-
+	// 正常路径：有有效分数，落库 + 广播
 	reviewResult.ReviewedAt = time.Now()
 
 	resultJSON, _ := json.Marshal(reviewResult)
@@ -145,7 +178,7 @@ func (s *LessonPlanGenService) handleReviewStageOutput(
 		"[]",
 	); err != nil {
 		lpGenLog.Warn("保存review阶段评审结果失败", "plan_id", planID, "error", err)
-		return
+		// 落库失败也仍然广播，保证前端能看到
 	}
 
 	GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
@@ -154,10 +187,23 @@ func (s *LessonPlanGenService) handleReviewStageOutput(
 		Review:    reviewResult,
 	})
 
-	lpGenLog.Info("review阶段评审结果已保存并推送", "plan_id", planID, "score", reviewResult.TotalScore)
+	lpGenLog.Info("review阶段评审结果已保存并推送",
+		"plan_id", planID, "score", reviewResult.TotalScore,
+		"good_points", len(reviewResult.GoodPoints),
+		"improvements", len(reviewResult.Improvements))
 
 	// v89新增：review阶段完成后自动触发教案索引生成
 	go s.triggerAutoLessonIndex(ctx, planID, &reviewResult.TotalScore)
+}
+
+// safeReviewRawFallback 为 fallback review 的 suggestion 字段准备原文（v169新增）
+// 截断到 1500 字符，避免把超长对话整段塞进 review 对象
+func safeReviewRawFallback(rawContent string) string {
+	raw := strings.TrimSpace(rawContent)
+	if raw == "" {
+		return "AI已输出评审内容，请在左侧对话中查看完整评审报告。"
+	}
+	return safeUTF8Truncate(raw, 1500)
 }
 
 // ==================== 触发AI评审 ====================

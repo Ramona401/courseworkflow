@@ -4,6 +4,8 @@ package services
 //
 // 本文件包含：
 //   - assembleFullPage：后端硬拼接导航栏+内容区为完整页面
+//   - normalizeRootCanvas / enforceCanvasDecls：根容器画布契约归一化
+//     （强制压住1920×1080+剥除AI误加的transform+补cw-page类，批量/重生/微调共用）
 //   - buildCSSVarsString：CSS变量内联字符串构建
 //   - ExtractNavByMarkers / extractNavFallback：导航栏标记提取+兜底
 //   - ReplaceNavPageNumbers：页码占位符替换
@@ -45,6 +47,8 @@ func (s *CoursewareGenService) assembleFullPage(contentHTML string, navTemplate 
 	contentTrimmed := strings.TrimSpace(contentHTML)
 	if strings.HasPrefix(contentTrimmed, "<div") && strings.Contains(contentTrimmed[:min(200, len(contentTrimmed))], "1920") {
 		// AI输出了完整的外层div，需要在其第一个子元素位置插入导航栏
+		// 闸门：先归一化根容器（强制1920×1080、剥除AI误加的transform、补cw-page），再插入导航栏
+		contentTrimmed = normalizeRootCanvas(contentTrimmed)
 		// 找到第一个 > 的位置（外层div开标签结束）
 		firstGT := strings.Index(contentTrimmed, ">")
 		if firstGT > 0 {
@@ -68,6 +72,107 @@ func (s *CoursewareGenService) assembleFullPage(contentHTML string, navTemplate 
 	sb.WriteString("\n")
 	sb.WriteString("</div>")
 	return sb.String()
+}
+
+// ==================== 画布契约闸门（批量/重生/微调共用） ====================
+
+// 根容器开标签解析用正则（只作用于最外层<div>的开标签，不碰正文）
+var (
+	cwRootClassRe = regexp.MustCompile(`(?i)class\s*=\s*"([^"]*)"`)
+	cwRootStyleRe = regexp.MustCompile(`(?i)style\s*=\s*"([^"]*)"`)
+	cwTransformRe = regexp.MustCompile(`(?i)transform\s*:[^;"]*;?`)
+)
+
+// normalizeRootCanvas 归一化最外层div的开标签，压住1920×1080画布契约
+//   - 确保 class 含 cw-page（缩放与样式钩子依赖此类名）
+//   - 确保 style 含 width:1920px;height:1080px;overflow:hidden;position:relative
+//   - 剥除 style 中的 transform 声明（防止AI给根容器加scale导致整页缩放/背景比例收缩变形）
+//
+// 只动第一个 <div 开标签，正文一律不碰；非<div开头或无法解析时原样返回。
+// 用于：assembleFullPage（批量生成+单页重生）与 RefinePage（单页微调）。
+func normalizeRootCanvas(html string) string {
+	trimmed := strings.TrimSpace(html)
+	if !strings.HasPrefix(strings.ToLower(trimmed), "<div") {
+		return html
+	}
+	gt := strings.Index(trimmed, ">")
+	if gt < 0 {
+		return html
+	}
+	openTag := trimmed[:gt+1] // 含结尾 >
+	rest := trimmed[gt+1:]
+
+	// ---- 1. 确保 class 含 cw-page ----
+	if m := cwRootClassRe.FindStringSubmatch(openTag); m != nil {
+		classes := m[1]
+		if !strings.Contains(classes, "cw-page") {
+			newClass := strings.TrimSpace(classes + " cw-page")
+			openTag = cwRootClassRe.ReplaceAllLiteralString(openTag, `class="`+newClass+`"`)
+		}
+	} else {
+		// 没有 class 属性，在 <div 后插入
+		openTag = strings.Replace(openTag, "<div", `<div class="cw-page"`, 1)
+	}
+
+	// ---- 2. 规范 style：去 transform + 强制 1920×1080/overflow/position ----
+	if m := cwRootStyleRe.FindStringSubmatch(openTag); m != nil {
+		style := m[1]
+		style = cwTransformRe.ReplaceAllLiteralString(style, "") // 剥除根容器上的 transform
+		style = enforceCanvasDecls(style)
+		openTag = cwRootStyleRe.ReplaceAllLiteralString(openTag, `style="`+style+`"`)
+	} else {
+		// 没有 style 属性，补一个最小画布 style
+		openTag = strings.Replace(openTag, "<div", `<div style="width:1920px;height:1080px;overflow:hidden;position:relative"`, 1)
+	}
+
+	return openTag + rest
+}
+
+// enforceCanvasDecls 在style声明串中强制写入画布契约声明（已存在则覆盖值，不存在则追加）
+// 保留其余声明的原有顺序，最后追加被强制的声明
+func enforceCanvasDecls(style string) string {
+	seen := map[string]string{}
+	var order []string
+	for _, d := range strings.Split(style, ";") {
+		d = strings.TrimSpace(d)
+		if d == "" {
+			continue
+		}
+		idx := strings.Index(d, ":")
+		if idx < 0 {
+			continue
+		}
+		prop := strings.ToLower(strings.TrimSpace(d[:idx]))
+		val := strings.TrimSpace(d[idx+1:])
+		if prop == "" {
+			continue
+		}
+		if _, ok := seen[prop]; !ok {
+			order = append(order, prop)
+		}
+		seen[prop] = val
+	}
+
+	// 固定顺序强制画布声明
+	forceOrder := []string{"width", "height", "overflow"}
+	forceVal := map[string]string{"width": "1920px", "height": "1080px", "overflow": "hidden"}
+	for _, prop := range forceOrder {
+		if _, ok := seen[prop]; !ok {
+			order = append(order, prop)
+		}
+		seen[prop] = forceVal[prop]
+	}
+	// position 缺失则补 relative（已有则尊重AI写的absolute/relative等）
+	if _, ok := seen["position"]; !ok {
+		order = append(order, "position")
+		seen["position"] = "relative"
+	}
+
+	parts := make([]string, 0, len(order))
+	for _, prop := range order {
+		parts = append(parts, prop+":"+seen[prop])
+	}
+	return strings.Join(parts, ";")
 }
 
 // buildCSSVarsString 从模板信息构建CSS变量内联字符串
@@ -377,12 +482,19 @@ func (s *CoursewareGenService) extractHTMLFromAIOutput(aiOutput string) string {
 		return ""
 	}
 
-	// 从<div开始提取到最后一个匹配的</div>
+	// 从<div开始提取
 	htmlPart := text[divStart:]
 
 	// 简单验证：至少有一个闭合的div
 	if !strings.Contains(htmlPart, "</div>") {
 		return ""
+	}
+
+	// 截断到最后一个 </div>，剥掉 AI 在 HTML 之后追加的解释文字 / 代码围栏残留
+	// 修复：微调时 AI 常在 HTML 后补一句"我已经改好了…"或再贴一段```html，
+	// 旧逻辑取 text[divStart:] 直到字符串末尾，导致这些尾巴被当作页面内容存库并渲染到预览。
+	if last := strings.LastIndex(htmlPart, "</div>"); last >= 0 {
+		htmlPart = htmlPart[:last+len("</div>")]
 	}
 
 	return strings.TrimSpace(htmlPart)

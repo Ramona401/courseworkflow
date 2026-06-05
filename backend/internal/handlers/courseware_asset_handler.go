@@ -7,6 +7,10 @@ package handlers
 // v0.42.5 新增:手动上传视频(UploadVideo)
 // v0.42.6+ P2.4:UploadVideo 成功后写入审计日志 audit_logs (courseware.video_upload)
 // v0.42.10 新增:上传资产到阿里云OSS(UploadToOSS)，返回公网URL供复制使用
+// 图片多提示词(本轮):SuggestImagePrompt 响应由 {prompt} 改为 {prompts:[{caption,prompt}]}，
+//   AI 按本页配图需求自主判断该页要几张图(1-N 条)，前端渲染为建议卡片列表。
+// 视频锚点轮(本轮):GenerateVideo 请求体新增 source_frame_asset_id(首帧图资产ID)，
+//   两步流"先出首帧图再生视频"时传入，透传给 service 写 metadata 溯源；空=直接文字生视频。
 //
 // 接口:
 //   POST   /api/v1/coursewares/{id}/pages/{num}/generate-image  — AI生成图片
@@ -19,6 +23,8 @@ package handlers
 //   POST   /api/v1/coursewares/{id}/pages/{num}/generate-video   — v0.42.1 AI生成视频(异步提交)
 //   GET    /api/v1/coursewares/{id}/assets/{asset_id}/video-status — v0.42.1 查询视频生成状态
 //   POST   /api/v1/coursewares/{id}/assets/{asset_id}/upload-oss  — v0.42.10 上传资产到阿里云OSS
+//   POST   /api/v1/coursewares/{id}/pages/{num}/suggest-image-prompt — AI 写详细生图提示词(多条)
+//   POST   /api/v1/coursewares/{id}/pages/{num}/suggest-video-prompt — AI 写视频三件物料
 
 import (
 	"encoding/json"
@@ -53,12 +59,13 @@ func NewCoursewareAssetHandler(assetService *services.CoursewareAssetService, os
 // ==================== AI生成图片 ====================
 
 // GenerateImage POST /api/v1/coursewares/{id}/pages/{num}/generate-image
-// 请求体: {
-//   "prompt": "一张展示AI机器人的卡通插图",
-//   "placeholder_id": "IMG_01",    // 可选:占位符ID
-//   "size": "2560x1440",           // 可选:图片尺寸,默认1920x1920
-//   "ref_image_url": "/uploads/courseware-assets/xxx/p1/xxx.jpg"  // 可选:参考图URL
-// }
+//
+//	请求体: {
+//	  "prompt": "一张展示AI机器人的卡通插图",
+//	  "placeholder_id": "IMG_01",    // 可选:占位符ID
+//	  "size": "2560x1440",           // 可选:图片尺寸,默认1920x1920
+//	  "ref_image_url": "/uploads/courseware-assets/xxx/p1/xxx.jpg"  // 可选:参考图URL
+//	}
 func (h *CoursewareAssetHandler) GenerateImage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
@@ -389,10 +396,16 @@ func (h *CoursewareAssetHandler) InsertImage(w http.ResponseWriter, r *http.Requ
 // ==================== v0.42.1 AI生成视频(异步提交) ====================
 
 // GenerateVideo POST /api/v1/coursewares/{id}/pages/{num}/generate-video
-// 请求体: {
-//   "prompt": "一位教师在讲台前讲解人工智能的基本概念",
-//   "ref_image_url": "/uploads/courseware-assets/xxx/p1/xxx.jpg"  // 可选:参考图(图生视频)
-// }
+//
+//	请求体: {
+//	  "prompt": "一位教师在讲台前讲解人工智能的基本概念",
+//	  "ref_image_url": "/uploads/courseware-assets/xxx/p1/xxx.jpg",  // 可选:参考图(图生视频)
+//	  "source_frame_asset_id": "uuid"  // 可选:首帧图资产ID(两步流时传,写metadata溯源;空=直接文字生视频)
+//	}
+//
+// 视频锚点轮:两步流"先出首帧图→确认→生视频"时，前端把已确认首帧图的 URL 作为 ref_image_url、
+// 首帧图的资产ID作为 source_frame_asset_id 一并传入。前者实现图生视频锁定风格人物，
+// 后者由 service 写入视频资产 metadata 建立"视频←首帧图"血缘。
 func (h *CoursewareAssetHandler) GenerateVideo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
@@ -411,8 +424,9 @@ func (h *CoursewareAssetHandler) GenerateVideo(w http.ResponseWriter, r *http.Re
 	}
 
 	var req struct {
-		Prompt      string `json:"prompt"`
-		RefImageURL string `json:"ref_image_url"`
+		Prompt             string `json:"prompt"`
+		RefImageURL        string `json:"ref_image_url"`
+		SourceFrameAssetID string `json:"source_frame_asset_id"` // 视频锚点轮:首帧图资产ID(可选,两步流溯源用)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, "请求参数格式错误")
@@ -424,11 +438,12 @@ func (h *CoursewareAssetHandler) GenerateVideo(w http.ResponseWriter, r *http.Re
 	}
 
 	svcReq := &services.GenerateVideoServiceRequest{
-		CoursewareID: cwID,
-		PageNumber:   pageNum,
-		Prompt:       req.Prompt,
-		RefImageURL:  req.RefImageURL,
-		UserID:       claims.UserID,
+		CoursewareID:       cwID,
+		PageNumber:         pageNum,
+		Prompt:             req.Prompt,
+		RefImageURL:        req.RefImageURL,
+		UserID:             claims.UserID,
+		SourceFrameAssetID: req.SourceFrameAssetID, // 透传首帧溯源ID
 	}
 
 	resp, err := h.assetService.GenerateVideo(r.Context(), svcReq)
@@ -475,12 +490,12 @@ func (h *CoursewareAssetHandler) QueryVideoStatus(w http.ResponseWriter, r *http
 // 将已有的课件资产（图片/视频/音频）从本地磁盘上传到阿里云OSS
 // 返回公网可访问的URL，用户可以复制到微调HTML等场景使用
 //
-// 响应: {
-//   "asset_id": "uuid",
-//   "local_url": "/uploads/courseware-assets/xxx/p1/xxx.jpg",
-//   "oss_public_url": "https://20260525zuo.oss-cn-beijing.aliyuncs.com/courseware-assets/xxx/p1/xxx.jpg",
-//   "message": "上传云盘成功"
-// }
+//	响应: {
+//	  "asset_id": "uuid",
+//	  "local_url": "/uploads/courseware-assets/xxx/p1/xxx.jpg",
+//	  "oss_public_url": "https://20260525zuo.oss-cn-beijing.aliyuncs.com/courseware-assets/xxx/p1/xxx.jpg",
+//	  "message": "上传云盘成功"
+//	}
 func (h *CoursewareAssetHandler) UploadToOSS(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
@@ -530,6 +545,19 @@ func (h *CoursewareAssetHandler) UploadToOSS(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// v0.42.11: 回写公网URL到数据库 public_oss_url 列,持久化保存
+	// 用于:1)前端常驻显示"已上云+复制URL"  2)删图时识别需连带删OSS
+	// 回写失败仅记日志不阻断(URL已成功返回前端,用户当下可用)
+	if updErr := repository.UpdateCWAssetPublicURL(r.Context(), assetID, publicURL); updErr != nil {
+		utils.Success(w, map[string]interface{}{
+			"asset_id":       assetID,
+			"local_url":      asset.OssURL,
+			"oss_public_url": publicURL,
+			"message":        "上传云盘成功(URL持久化失败,不影响使用)",
+		})
+		return
+	}
+
 	// 5. 返回结果
 	utils.Success(w, map[string]interface{}{
 		"asset_id":       assetID,
@@ -537,6 +565,74 @@ func (h *CoursewareAssetHandler) UploadToOSS(w http.ResponseWriter, r *http.Requ
 		"oss_public_url": publicURL,
 		"message":        "上传云盘成功",
 	})
+}
+
+// ==================== 批次4c+: AI 写详细生图/视频提示词 ====================
+
+// SuggestImagePrompt POST /api/v1/coursewares/{id}/pages/{num}/suggest-image-prompt
+// 读本页方案 + 课件风格，调模型生成【一条或多条】详细、可控、紧扣本页教学需求的生图提示词。
+// 图片多提示词改造：响应由旧版 {prompt:string} 改为 {prompts:[{caption,prompt}]}，
+//
+//	AI 按本页配图需求自主判断该页要几张图(1-N 条)，前端渲染为可勾选的建议卡片列表。
+func (h *CoursewareAssetHandler) SuggestImagePrompt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+	cwID, pageNum := extractCWAssetPageActionPath(r.URL.Path, "/suggest-image-prompt")
+	if cwID == "" || pageNum <= 0 {
+		utils.BadRequest(w, "路径参数错误")
+		return
+	}
+	items, err := h.assetService.SuggestImagePrompt(r.Context(), cwID, pageNum, claims.UserID)
+	if err != nil {
+		utils.InternalError(w, err.Error())
+		return
+	}
+	// 物料存储: AI 出图片建议后顺手写库(best-effort, 失败不阻断响应), 之后进页可先读库零AI
+	if len(items) > 0 {
+		if b, mErr := json.Marshal(items); mErr == nil {
+			_ = repository.UpdatePageImageSuggestions(r.Context(), cwID, pageNum, string(b))
+		}
+	}
+	utils.Success(w, map[string]interface{}{"prompts": items})
+}
+
+// SuggestVideoPrompt POST /api/v1/coursewares/{id}/pages/{num}/suggest-video-prompt
+// 视频分镜(本轮): 返回分镜数组 {storyboards:[{scene,image_prompt,video_prompt,narration}]},
+// AI 按本页内容自主拆 1-N 个分镜, 每镜各有首帧图提示词/图生视频提示词/台词, 前端渲染为可切换的镜头卡片。
+func (h *CoursewareAssetHandler) SuggestVideoPrompt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+	cwID, pageNum := extractCWAssetPageActionPath(r.URL.Path, "/suggest-video-prompt")
+	if cwID == "" || pageNum <= 0 {
+		utils.BadRequest(w, "路径参数错误")
+		return
+	}
+	items, err := h.assetService.SuggestVideoPrompt(r.Context(), cwID, pageNum, claims.UserID)
+	if err != nil {
+		utils.InternalError(w, err.Error())
+		return
+	}
+	// 物料存储: AI 拆视频分镜后顺手写库(best-effort, 失败不阻断响应), 之后进页可先读库零AI
+	if len(items) > 0 {
+		if b, mErr := json.Marshal(items); mErr == nil {
+			_ = repository.UpdatePageVideoStoryboards(r.Context(), cwID, pageNum, string(b))
+		}
+	}
+	utils.Success(w, map[string]interface{}{"storyboards": items})
 }
 
 // ==================== 路径解析辅助函数 ====================

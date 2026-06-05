@@ -125,6 +125,17 @@ else
         false
     fi
 
+    # ---- 必做：go vet 静态检查（阻断，捕获 printf/锁拷贝/不可达代码等编译期查不出的问题）----
+    echo "   2.1.1 go vet 静态检查"
+    VET_LOG="$DEPLOY_LOG_DIR/go-vet_${TIMESTAMP}.log"
+    if go vet ./... > "$VET_LOG" 2>&1; then
+        echo "       ✅ go vet 0 问题"
+    else
+        echo "       ❌ go vet 发现问题（已阻断部署）:"
+        cat "$VET_LOG"
+        false
+    fi
+
     # ---- 可选：golangci-lint ----
     if [ "$RUN_LINT" = "1" ]; then
         echo "   2.2 golangci-lint 检查（RUN_LINT=1）"

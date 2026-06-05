@@ -109,6 +109,19 @@ func registerCoursewareRoutes(
 			return
 		}
 
+		// 需求2: /api/v1/coursewares/logo-history — 查询当前用户历史用过的 Logo（去重、最近优先，免重传）
+		if path == "/api/v1/coursewares/logo-history" || path == "/api/v1/coursewares/logo-history/" {
+			switch r.Method {
+			case http.MethodGet:
+				cwHandler.ListLogoHistory(w, r)
+			case http.MethodDelete:
+				cwHandler.DeleteLogoHistory(w, r)
+			default:
+				http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+			}
+			return
+		}
+
 		if path == "/api/v1/coursewares" || path == "/api/v1/coursewares/" {
 			switch r.Method {
 			case http.MethodGet:
@@ -289,6 +302,33 @@ func dispatchCoursewareSubRoutes(w http.ResponseWriter, r *http.Request, h *hand
 		return
 	}
 
+	// 批次4c+: AI 写详细生图提示词: /api/v1/coursewares/{id}/pages/{num}/suggest-image-prompt
+	if strings.HasSuffix(path, "/suggest-image-prompt") && strings.Contains(path, "/pages/") {
+		assetH.SuggestImagePrompt(w, r)
+		return
+	}
+	// 批次4c+: AI 写详细视频物料: /api/v1/coursewares/{id}/pages/{num}/suggest-video-prompt
+	if strings.HasSuffix(path, "/suggest-video-prompt") && strings.Contains(path, "/pages/") {
+		assetH.SuggestVideoPrompt(w, r)
+		return
+	}
+	// 物料存储·读已存生图建议(GET, 不调AI): /api/v1/coursewares/{id}/pages/{num}/image-suggestions
+	if strings.HasSuffix(path, "/image-suggestions") && strings.Contains(path, "/pages/") {
+		assetH.GetStoredImageSuggestions(w, r)
+		return
+	}
+	// 物料存储·视频分镜(GET=读已存不调AI, POST=保存编辑): /api/v1/coursewares/{id}/pages/{num}/video-storyboards
+	if strings.HasSuffix(path, "/video-storyboards") && strings.Contains(path, "/pages/") {
+		switch r.Method {
+		case http.MethodGet:
+			assetH.GetStoredVideoStoryboards(w, r)
+		case http.MethodPost:
+			assetH.SaveVideoStoryboards(w, r)
+		default:
+			http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		}
+		return
+	}
 	// v0.42.1 AI生成视频: /api/v1/coursewares/{id}/pages/{num}/generate-video
 	if strings.HasSuffix(path, "/generate-video") && strings.Contains(path, "/pages/") {
 		assetH.GenerateVideo(w, r)
@@ -302,6 +342,20 @@ func dispatchCoursewareSubRoutes(w http.ResponseWriter, r *http.Request, h *hand
 	// v0.42.10 上传资产到阿里云OSS: /api/v1/coursewares/{id}/assets/{asset_id}/upload-oss
 	if strings.HasSuffix(path, "/upload-oss") && strings.Contains(path, "/assets/") {
 		assetH.UploadToOSS(w, r)
+		return
+	}
+
+	// 风格锚点（轮2）: /api/v1/coursewares/{id}/style-anchor
+	//   POST=设锚点(取URL→提取VAOCI→落库)  DELETE=清锚点
+	if strings.HasSuffix(path, "/style-anchor") {
+		switch r.Method {
+		case http.MethodPost:
+			assetH.SetStyleAnchor(w, r)
+		case http.MethodDelete:
+			assetH.ClearStyleAnchor(w, r)
+		default:
+			http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		}
 		return
 	}
 
@@ -419,6 +473,10 @@ func dispatchCoursewareSubRoutes(w http.ResponseWriter, r *http.Request, h *hand
 		}
 		return
 	}
+	if strings.Contains(path, "/pages/") && strings.HasSuffix(path, "/regenerate") {
+		genH.RegeneratePage(w, r)
+		return
+	}
 	if strings.Contains(path, "/pages/") && strings.HasSuffix(path, "/refine") {
 		genH.RefinePage(w, r)
 		return
@@ -510,11 +568,12 @@ func dispatchTemplateAIRoutes(w http.ResponseWriter, r *http.Request, h *handler
 // dispatchSubtitleRoutes v0.42.8 字幕轨路由分发
 //
 // 路由映射:
-//   POST   /api/v1/coursewares/{id}/subtitles                     — 创建/更新字幕轨
-//   GET    /api/v1/coursewares/{id}/subtitles                     — 查询字幕轨列表
-//   DELETE /api/v1/coursewares/{id}/subtitles/{sub_id}            — 删除字幕轨
-//   POST   /api/v1/coursewares/{id}/subtitles/{sub_id}/export-srt — 导出 SRT 文件
-//   POST   /api/v1/coursewares/{id}/subtitles/{sub_id}/burn-in    — FFmpeg 硬字幕烧录
+//
+//	POST   /api/v1/coursewares/{id}/subtitles                     — 创建/更新字幕轨
+//	GET    /api/v1/coursewares/{id}/subtitles                     — 查询字幕轨列表
+//	DELETE /api/v1/coursewares/{id}/subtitles/{sub_id}            — 删除字幕轨
+//	POST   /api/v1/coursewares/{id}/subtitles/{sub_id}/export-srt — 导出 SRT 文件
+//	POST   /api/v1/coursewares/{id}/subtitles/{sub_id}/burn-in    — FFmpeg 硬字幕烧录
 func dispatchSubtitleRoutes(w http.ResponseWriter, r *http.Request, h *handlers.CoursewareSubtitleHandler) {
 	path := r.URL.Path
 

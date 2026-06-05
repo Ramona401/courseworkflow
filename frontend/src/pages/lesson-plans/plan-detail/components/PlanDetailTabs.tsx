@@ -14,6 +14,7 @@
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useState, useEffect, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import type { LessonPlan, AIReviewResult } from '@/api/lesson-plans'
 import { updateLessonPlan } from '@/api/lesson-plans'
 import { getPipelineDetail } from '@/api/pipelines'
@@ -176,6 +177,7 @@ interface ContentTabProps {
 }
 
 export function ContentTab({ plan, isOwner, annotations, annotationsLoading, onAnnotationsChange }: ContentTabProps) {
+  const navigate = useNavigate()
   const [paragraphs, setParagraphs]         = useState<string[]>([])
   const [saveToast, setSaveToast]           = useState<string | null>(null)
   const [allExpanded, setAllExpanded]       = useState(false)
@@ -247,6 +249,52 @@ export function ContentTab({ plan, isOwner, annotations, annotationsLoading, onA
     .filter(item => item.paragraphContent.length > 0)
 
   if (!hasContent) {
+    // v168（v2放宽）：区分两种"无正文"场景
+    //   ① 备过课但正文为空 = 历史坏数据。判定依据放宽为二者其一：
+    //        - 有AI评分(ai_review_score)：走到过review阶段但正文未落库
+    //        - 有current_stage(进过备课工坊阶段流程，注释明确"空=未开始/旧模式")
+    //      覆盖全部17份：有分的(如《春》)命中评分，无分但备过课的(如《沁园春雪》《英语》)命中阶段
+    //      → 给醒目橙色修复引导 + 一键跳备课工坊「教案撰写」阶段补全
+    //   ② 既没评分也没阶段痕迹 = 全新空教案 → 保持原"去备课工坊生成"文案
+    const hasScore   = (plan as any).ai_review_score != null
+    const hasStage   = !!((plan as any).current_stage && String((plan as any).current_stage).trim())
+    const isOrphanScore = hasScore || hasStage
+
+    // 复用 PlanDetailHeader 的跳转写法：写 sessionStorage 后跳 /lesson-plans，工坊自动恢复该教案
+    // v168（v3修正）：额外写 workshop_target_stage='write'，让工坊恢复后自动切到「教案撰写」阶段，
+    //   而不是停在教案最后所在的 review/revise 阶段——与提示文案"前往教案撰写补全"保持一致。
+    const goWorkshopFix = () => {
+      sessionStorage.setItem('workshop_active_plan_id', plan.id)
+      sessionStorage.setItem('workshop_target_stage', 'write')
+      navigate('/lesson-plans')
+    }
+
+    if (isOrphanScore && isOwner) {
+      return (
+        <div style={{ padding: '28px' }}>
+          <div style={{ padding: '20px 24px', borderRadius: '12px', background: 'rgba(249,115,22,0.06)', border: '1px solid rgba(249,115,22,0.25)', borderLeft: '4px solid #F97316' }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px' }}>
+              <span style={{ fontSize: '22px', flexShrink: 0, lineHeight: 1.2 }}>⚠️</span>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: '15px', fontWeight: 600, color: '#C2410C', marginBottom: '8px' }}>此教案正文未成功生成</div>
+                <div style={{ fontSize: '13px', color: '#92400E', lineHeight: 1.8, marginBottom: '16px' }}>
+                  检测到本教案备课流程已进行，但教案正文未成功生成。这是早期版本的流程问题：在「教案撰写」环节，AI 当时可能只输出了讨论或评审内容（看起来完整，但不是可上课的教案正文），完整正文没有真正落库。
+                  <br />
+                  问题现已修复。请点击下方按钮回到备课工坊，在「教案撰写」阶段对 AI 说"请把完整教案正文写出来"——之前的教学分析、设计成果都还在，补全后这里即可正常显示。
+                </div>
+                <button
+                  onClick={goWorkshopFix}
+                  style={{ padding: '10px 22px', borderRadius: '8px', border: 'none', background: 'linear-gradient(135deg, #F97316, #FB923C)', color: '#fff', fontSize: '14px', fontWeight: 600, cursor: 'pointer', boxShadow: '0 2px 8px rgba(249,115,22,0.3)' }}>
+                  🛠 前往「教案撰写」补全正文 →
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )
+    }
+
+    // 默认：全新空教案（无评分无正文）
     return (
       <div style={{ padding: '28px', textAlign: 'center', color: C.textMuted }}>
         <div style={{ fontSize: '40px', marginBottom: '12px' }}>📄</div>
