@@ -16,6 +16,10 @@ export interface UserInfo {
   login_count: number
   org_logo_url: string
   org_name: string
+  // v172新增：门户板块可见性。后端按所属组织 settings.portal_modules 计算下发。
+  // key 为板块标识：lesson_plan / courseware / workflow，值 true=可见 false=隐藏。
+  // 可能为 undefined（老 token 缓存或后端未下发时），前端统一按"缺省可见"兜底处理。
+  portal_modules?: Record<string, boolean>
 }
 
 // 登录响应类型

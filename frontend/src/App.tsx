@@ -4,6 +4,11 @@
  * 改动：所有页面组件改为 React.lazy 动态导入，按路由懒加载。
  * 效果：首屏只加载当前路由的 chunk，其他路由按需加载。
  *
+ * v172新增：ModuleGuard 门户板块守卫
+ *   - 给 /workflow（课件审核）加一层组织板块开关守卫
+ *   - 即便登录用户直接敲 URL，所属学校未开通该板块也会被重定向回首页
+ *   - 与门户卡片显隐配套（光藏入口不够，必须守卫路由）
+ *
  * 分包策略（Vite 自动按 dynamic import 边界拆分）：
  *   - 主 chunk：路由框架 + 布局组件 + 守卫
  *   - 课件审核板块 chunk
@@ -156,6 +161,25 @@ function RoleGuard({ children, roles }: { children: React.ReactNode; roles: stri
   return <>{children}</>
 }
 
+/**
+ * ModuleGuard 门户板块守卫（v172）
+ * 校验用户所属组织是否开通了指定板块（portal_modules[moduleKey]）。
+ * 规则：
+ *   - admin 永远放行（后端也会下发全开，这里双保险）
+ *   - portal_modules 缺失 / 该 key 缺失 / 值非 false → 放行（缺省可见，不波及存量）
+ *   - 仅显式 false → 重定向回首页
+ * 注意：必须套在 AuthGuard 内层使用（依赖 user 已存在）。
+ */
+function ModuleGuard({ children, moduleKey }: { children: React.ReactNode; moduleKey: string }) {
+  const { user } = useAuth()
+  if (!user) return <Navigate to="/" replace />
+  if (user.role === 'admin') return <>{children}</>
+  const modules = user.portal_modules
+  const enabled = !modules || !(moduleKey in modules) || modules[moduleKey] !== false
+  if (!enabled) return <Navigate to="/" replace />
+  return <>{children}</>
+}
+
 /* ==================== 主路由 ==================== */
 export default function App() {
   const authValue = useAuthProvider()
@@ -192,8 +216,10 @@ export default function App() {
               <AuthGuard><RoleGuard roles={['admin']}><AITraceDashboardPage /></RoleGuard></AuthGuard>
             } />
 
-            {/* ==================== 课件审核系统 ==================== */}
-            <Route path="/workflow" element={<AuthGuard><MainLayout /></AuthGuard>}>
+            {/* ==================== 课件审核系统（v172：叠加 ModuleGuard 板块守卫） ==================== */}
+            <Route path="/workflow" element={
+              <AuthGuard><ModuleGuard moduleKey="workflow"><MainLayout /></ModuleGuard></AuthGuard>
+            }>
               <Route index element={<DashboardPage />} />
               <Route path="users"         element={<RoleGuard roles={['admin']}><UsersPage /></RoleGuard>} />
               <Route path="ai-config"     element={<RoleGuard roles={['admin']}><AIConfigPage /></RoleGuard>} />

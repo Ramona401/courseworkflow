@@ -1,8 +1,14 @@
 /**
  * OrgFormModal.tsx — 区域/学校 新建/编辑弹窗
+ *
+ * v172新增：编辑学校时，可勾选"门户可见板块"（备课/课件/审核三选项）。
+ *   - 仅 school 类型、edit 模式 显示该区块（区域不挂用户，无需配置）
+ *   - 打开时调 getAdminOrg(id) 读取该组织完整 settings（列表项不含 settings）
+ *   - 保存时把 portal_modules 合并进原 settings 一并提交，不丢失其它已有配置
+ *   - 缺省（从未配置）视为三板块全开
  */
-import { useState } from 'react'
-import { createAdminOrg, updateAdminOrg, uploadOrgLogo } from '@/api/admin'
+import { useState, useEffect } from 'react'
+import { createAdminOrg, updateAdminOrg, uploadOrgLogo, getAdminOrg } from '@/api/admin'
 import type { OrgListItem, CreateOrgRequest, UpdateOrgRequest } from '@/api/admin'
 import { C } from './adminConstants'
 import { UserSearchPicker } from './UserSearchPicker'
@@ -14,6 +20,55 @@ interface OrgFormModalProps {
   regions: OrgListItem[]          // 新建学校时选择所属区域用
   onClose: () => void
   onSaved: () => void
+}
+
+/* 门户板块定义（key 必须与 PortalPage entries 的 key 一致） */
+const PORTAL_MODULE_OPTIONS: { key: string; label: string; desc: string }[] = [
+  { key: 'lesson_plan', label: '📝 备课工坊', desc: 'AI辅助教案开发' },
+  { key: 'courseware',  label: '🎨 课件工坊', desc: 'AI辅助课件生成' },
+  { key: 'workflow',    label: '🖥️ 课件审核', desc: '课件质量评估·审核·验收' },
+]
+
+const ALL_MODULE_KEYS = PORTAL_MODULE_OPTIONS.map(o => o.key)
+
+/**
+ * 从 settings 字符串解析 portal_modules，缺省/缺 key 一律按 true。
+ * 返回一个三 key 齐全的 map，便于复选框直接绑定。
+ */
+function parsePortalModules(settings: string | undefined): Record<string, boolean> {
+  const result: Record<string, boolean> = {}
+  for (const k of ALL_MODULE_KEYS) result[k] = true // 默认全开
+  if (!settings) return result
+  try {
+    const obj = JSON.parse(settings)
+    const pm = obj?.portal_modules
+    if (pm && typeof pm === 'object') {
+      for (const k of ALL_MODULE_KEYS) {
+        if (k in pm) result[k] = pm[k] !== false
+      }
+    }
+  } catch {
+    // 解析失败 → 保持全开
+  }
+  return result
+}
+
+/**
+ * 把 portal_modules 合并进原 settings，序列化返回。
+ * 保留原 settings 里的其它键，仅覆盖 portal_modules。
+ */
+function mergePortalModules(originalSettings: string | undefined, modules: Record<string, boolean>): string {
+  let obj: Record<string, unknown> = {}
+  if (originalSettings) {
+    try {
+      const parsed = JSON.parse(originalSettings)
+      if (parsed && typeof parsed === 'object') obj = parsed as Record<string, unknown>
+    } catch {
+      obj = {}
+    }
+  }
+  obj.portal_modules = modules
+  return JSON.stringify(obj)
 }
 
 export function OrgFormModal({
@@ -28,6 +83,38 @@ export function OrgFormModal({
   const [logoUploading, setLogoUploading] = useState(false)
   const [error, setError]         = useState('')
 
+  // v172：门户板块开关相关状态
+  // 是否显示板块配置区：仅 school + edit
+  const showModuleConfig = type === 'school' && mode === 'edit'
+  const [originalSettings, setOriginalSettings] = useState<string>('') // 该组织原始 settings（保存时合并用）
+  const [modules, setModules] = useState<Record<string, boolean>>(() => {
+    const init: Record<string, boolean> = {}
+    for (const k of ALL_MODULE_KEYS) init[k] = true
+    return init
+  })
+  const [modulesLoading, setModulesLoading] = useState(false)
+
+  // 打开时（编辑学校）拉取完整 settings，初始化复选框
+  useEffect(() => {
+    if (!showModuleConfig || !initial?.id) return
+    let cancelled = false
+    setModulesLoading(true)
+    getAdminOrg(initial.id)
+      .then(full => {
+        if (cancelled) return
+        const settings = full.settings || ''
+        setOriginalSettings(settings)
+        setModules(parsePortalModules(settings))
+      })
+      .catch(() => {
+        // 读取失败时保持默认全开，不阻塞编辑
+      })
+      .finally(() => {
+        if (!cancelled) setModulesLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [showModuleConfig, initial?.id])
+
   const title = mode === 'create'
     ? (type === 'region' ? '新建区域' : '新建学校')
     : (type === 'region' ? '编辑区域' : '编辑学校')
@@ -36,6 +123,10 @@ export function OrgFormModal({
     width: '100%', padding: '10px 14px', borderRadius: '8px',
     border: `1px solid ${C.border}`, fontSize: '14px',
     outline: 'none', boxSizing: 'border-box',
+  }
+
+  const toggleModule = (key: string) => {
+    setModules(prev => ({ ...prev, [key]: !prev[key] }))
   }
 
   const handleSave = async () => {
@@ -52,6 +143,10 @@ export function OrgFormModal({
         await createAdminOrg(req)
       } else {
         const req: UpdateOrgRequest = { name: name.trim(), admin_user_id: adminId || null }
+        // v172：编辑学校时，把板块开关合并进 settings 一并提交
+        if (showModuleConfig) {
+          req.settings = mergePortalModules(originalSettings, modules)
+        }
         await updateAdminOrg(initial!.id, req)
       }
       onSaved(); onClose()
@@ -70,12 +165,13 @@ export function OrgFormModal({
       onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div style={{
         background: C.white, borderRadius: '20px', width: '480px',
-        overflow: 'hidden', boxShadow: '0 20px 60px rgba(0,0,0,0.2)',
+        maxHeight: '90vh', overflowY: 'auto', boxShadow: '0 20px 60px rgba(0,0,0,0.2)',
       }}>
         {/* 头部 */}
         <div style={{
           padding: '20px 24px', borderBottom: `1px solid ${C.border}`,
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          position: 'sticky', top: 0, background: C.white, zIndex: 1,
         }}>
           <div style={{ fontSize: '16px', fontWeight: 700, color: C.text }}>{title}</div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '20px', color: C.textMuted }}>×</button>
@@ -160,6 +256,47 @@ export function OrgFormModal({
                 )}
               </div>
               <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px' }}>支持JPG/PNG/WEBP/SVG，最大2MB。上传后在课件生成时自动使用。</div>
+            </div>
+          )}
+
+          {/* v172：门户可见板块配置（仅 school + edit 显示） */}
+          {showModuleConfig && (
+            <div style={{ marginBottom: '14px' }}>
+              <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '6px' }}>
+                门户可见板块
+              </label>
+              <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '8px' }}>
+                勾选本校老师在首页能进入的工作区。取消勾选后，本校非管理员看不到该入口、也无法直接访问。系统管理员不受此限制。
+              </div>
+              {modulesLoading ? (
+                <div style={{ fontSize: '12px', color: C.textMuted, padding: '8px 0' }}>正在读取当前配置...</div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  {PORTAL_MODULE_OPTIONS.map(opt => {
+                    const checked = modules[opt.key] !== false
+                    return (
+                      <label key={opt.key} style={{
+                        display: 'flex', alignItems: 'center', gap: '10px',
+                        padding: '10px 12px', borderRadius: '8px',
+                        border: `1px solid ${checked ? C.primary : C.border}`,
+                        background: checked ? C.bg : C.white,
+                        cursor: 'pointer', transition: 'all 150ms ease',
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleModule(opt.key)}
+                          style={{ width: 16, height: 16, cursor: 'pointer', accentColor: C.primary }}
+                        />
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: '13px', fontWeight: 600, color: C.text }}>{opt.label}</div>
+                          <div style={{ fontSize: '11px', color: C.textMuted }}>{opt.desc}</div>
+                        </div>
+                      </label>
+                    )
+                  })}
+                </div>
+              )}
             </div>
           )}
 

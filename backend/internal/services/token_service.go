@@ -3,22 +3,18 @@ package services
 // token_service.go — Token积分系统核心业务逻辑
 //
 // v128 新增（阶段C · Token/积分系统）
-// v129 改造（积分机制融合 · 对齐AOCI精确积分计算）：
-//   - ConsumeTokens 从固定汇率改为精确模式（接收CreditCalculation）
-//   - 消费扣减允许透支（对齐AOCI，不再GREATEST防负数）
-//   - 消费流水记录完整计算过程（9个新字段）
+// v129 改造（积分机制融合 · 对齐AOCI精确积分计算）
+// v172 改造（积分管理三级数据权限隔离）：TokenScope + ResolveTokenScope + 各 Scoped 方法
+// v172.2 新增（采购记录隔离）：ListPurchases 旧签名委托 nil；新增 ListPurchasesScoped
 //
-// 原v128注释保留：
-//   - 账户管理（创建/查询/列表/状态更新）
-//   - 积分分配（上级→下级，含余额校验）
-//   - 采购/充值（增加余额+记录）
-//   - 消费扣减（冻结→扣减→记录流水）
-//   - 概览统计
-//   - 预警配置
+// 权限范围设计（fail-closed，任何不确定一律收窄为空集，绝不放大为全量）：
+//   - admin           → 看全部（白名单 nil）
+//   - senior_operator → 仅本校：账户/概览/采购 owner_id ∈ {本校成员user_id ∪ 学校组织ID}；
+//                       消费流水 user_id ∈ 本校成员user_id；
+//                       未绑定学校 / 查询失败 → 空集（看不到任何数据 + 上层给提示）
+//   - operator/viewer → 仅本人：账户/概览/采购 owner_id = 自己；消费流水 user_id = 自己
 //
-// 核心流程：
-//   采购 → 区域账户充值 → 分配到学校账户 → 分配到个人账户 → AI调用消费
-//   AI调用消费流程：预估→冻结→调用→扣减(或释放)→记录流水
+// 核心流程：采购 → 区域账户充值 → 分配到学校账户 → 分配到个人账户 → AI调用消费
 
 import (
 	"context"
@@ -54,19 +50,106 @@ func NewTokenService() *TokenService {
 	return &TokenService{}
 }
 
+// ==================== v172 数据权限范围（TokenScope）====================
+
+// TokenScope 描述当前请求者对积分数据的可见范围
+//
+// 白名单字段语义（与 repository 层完全一致）：
+//   - nil        → 不过滤（看全部，仅 admin）
+//   - 非nil空切片 → 匹配空集（fail-closed，看不到任何数据）
+//   - 非空        → 仅匹配名单内
+//
+// 查询维度复用两个白名单：
+//   - OwnerIDs：账户列表 / 概览统计 / 分配记录 / 采购记录（按 token_accounts.owner_id）
+//   - UserIDs ：消费流水（按 token_consumption_logs.user_id）
+type TokenScope struct {
+	Role          string   // 请求者角色
+	IsAdmin       bool     // 是否系统管理员（看全部）
+	OwnerIDs      []string // 账户/概览/分配/采购 owner_id 白名单
+	UserIDs       []string // 消费流水 user_id 白名单
+	Blocked       bool     // 是否被收窄为空集（如 senior 未绑定学校）
+	BlockedReason string   // 收窄原因（供上层提示）
+}
+
+// ResolveTokenScope 根据角色与用户ID解析数据可见范围（积分系统唯一权限决策点，fail-closed）
+func (s *TokenService) ResolveTokenScope(ctx context.Context, role string, userID string) *TokenScope {
+	if role == "" || userID == "" {
+		return &TokenScope{
+			Role:          role,
+			IsAdmin:       false,
+			OwnerIDs:      []string{},
+			UserIDs:       []string{},
+			Blocked:       true,
+			BlockedReason: "未认证",
+		}
+	}
+
+	switch role {
+	case models.RoleAdmin:
+		return &TokenScope{
+			Role:     role,
+			IsAdmin:  true,
+			OwnerIDs: nil,
+			UserIDs:  nil,
+		}
+
+	case models.RoleSeniorOperator:
+		school, err := repository.GetSchoolByAdminUserID(ctx, userID)
+		if err != nil || school == nil || school.ID == "" {
+			return &TokenScope{
+				Role:          role,
+				IsAdmin:       false,
+				OwnerIDs:      []string{},
+				UserIDs:       []string{},
+				Blocked:       true,
+				BlockedReason: "您尚未绑定学校，请联系系统管理员",
+			}
+		}
+		memberIDs, mErr := repository.ListSchoolMemberIDs(ctx, school.ID)
+		if mErr != nil {
+			tokenLog.Warn("查询本校成员失败，收窄为空集", "school", school.ID, "error", mErr)
+			return &TokenScope{
+				Role:          role,
+				IsAdmin:       false,
+				OwnerIDs:      []string{},
+				UserIDs:       []string{},
+				Blocked:       true,
+				BlockedReason: "查询本校成员失败",
+			}
+		}
+		ownerIDs := make([]string, 0, len(memberIDs)+1)
+		ownerIDs = append(ownerIDs, memberIDs...)
+		ownerIDs = append(ownerIDs, school.ID)
+		userIDs := make([]string, 0, len(memberIDs))
+		userIDs = append(userIDs, memberIDs...)
+
+		return &TokenScope{
+			Role:     role,
+			IsAdmin:  false,
+			OwnerIDs: ownerIDs,
+			UserIDs:  userIDs,
+		}
+
+	default:
+		return &TokenScope{
+			Role:     role,
+			IsAdmin:  false,
+			OwnerIDs: []string{userID},
+			UserIDs:  []string{userID},
+		}
+	}
+}
+
 // ==================== 账户管理 ====================
 
 // CreateAccount 创建积分账户
-// 自动校验账户类型有效性、防止重复创建
 func (s *TokenService) CreateAccount(ctx context.Context, req *models.CreateTokenAccountRequest) (*models.TokenAccount, error) {
-	// 校验账户类型
 	if req.AccountType != models.AccountTypeRegion &&
 		req.AccountType != models.AccountTypeSchool &&
 		req.AccountType != models.AccountTypePersonal {
 		return nil, ErrTokenInvalidAccountType
 	}
 
-	// 校验显示名不为空
 	if req.DisplayName == "" {
 		return nil, fmt.Errorf("账户名称不能为空")
 	}
@@ -115,11 +198,9 @@ func (s *TokenService) GetAccount(ctx context.Context, accountID string) (*model
 		detail.UsagePercent = float64(acc.TotalConsumed) * 100.0 / float64(acc.TotalQuota)
 	}
 
-	// 查预警配置
 	alertCfg, _ := repository.GetTokenAlertConfig(ctx, accountID)
 	detail.AlertConfig = alertCfg
 
-	// 查子账户列表
 	children, _ := repository.ListChildAccounts(ctx, accountID)
 	detail.ChildAccounts = children
 
@@ -131,9 +212,18 @@ func (s *TokenService) GetAccountByOwner(ctx context.Context, accountType string
 	return repository.GetTokenAccountByOwner(ctx, accountType, ownerID)
 }
 
-// ListAccounts 查询账户列表
+// ListAccounts 查询账户列表（旧签名，无范围限制，委托 nil 白名单；保留兼容存量调用）
 func (s *TokenService) ListAccounts(ctx context.Context, accountType string, parentAccountID string, status string, limit int, offset int) ([]*models.TokenAccountListItem, int, error) {
-	return repository.ListTokenAccounts(ctx, accountType, parentAccountID, status, limit, offset)
+	return repository.ListTokenAccounts(ctx, accountType, parentAccountID, status, nil, limit, offset)
+}
+
+// ListAccountsScoped 查询账户列表（v172 范围感知）
+func (s *TokenService) ListAccountsScoped(ctx context.Context, accountType string, parentAccountID string, status string, scope *TokenScope, limit int, offset int) ([]*models.TokenAccountListItem, int, error) {
+	var ownerIDs []string
+	if scope != nil {
+		ownerIDs = scope.OwnerIDs
+	}
+	return repository.ListTokenAccounts(ctx, accountType, parentAccountID, status, ownerIDs, limit, offset)
 }
 
 // UpdateAccountStatus 更新账户状态
@@ -146,22 +236,18 @@ func (s *TokenService) UpdateAccountStatus(ctx context.Context, accountID string
 	return repository.UpdateTokenAccountStatus(ctx, accountID, status)
 }
 
-// GetSchoolAccountByAdmin 根据学校管理员用户ID查找本校积分账户
-// 用于 senior_operator 数据过滤场景
+// GetSchoolAccountByAdmin 根据学校管理员用户ID查找本校积分账户（保留兼容）
 func (s *TokenService) GetSchoolAccountByAdmin(ctx context.Context, adminUserID string) (*models.TokenAccount, error) {
-	// 先查管理员管辖的学校
 	school, err := repository.GetSchoolByAdminUserID(ctx, adminUserID)
 	if err != nil {
 		return nil, err
 	}
-	// 再查该学校的积分账户
 	return repository.GetTokenAccountByOwner(ctx, models.AccountTypeSchool, school.ID)
 }
 
 // ==================== 积分分配 ====================
 
 // AllocateTokens 从上级账户分配积分到下级账户
-// 流程：校验层级关系 → 扣减上级余额 → 增加下级余额 → 记录分配流水
 func (s *TokenService) AllocateTokens(ctx context.Context, fromAccountID string, req *models.AllocateTokensRequest, operatorID string) error {
 	if req.Amount <= 0 {
 		return ErrTokenInvalidAmount
@@ -170,7 +256,6 @@ func (s *TokenService) AllocateTokens(ctx context.Context, fromAccountID string,
 		return ErrTokenSelfAllocate
 	}
 
-	// 验证来源账户
 	fromAcc, err := repository.GetTokenAccountByID(ctx, fromAccountID)
 	if err != nil {
 		return fmt.Errorf("来源账户不存在: %w", err)
@@ -179,7 +264,6 @@ func (s *TokenService) AllocateTokens(ctx context.Context, fromAccountID string,
 		return ErrTokenAccountNotActive
 	}
 
-	// 验证目标账户
 	toAcc, err := repository.GetTokenAccountByID(ctx, req.ToAccountID)
 	if err != nil {
 		return fmt.Errorf("目标账户不存在: %w", err)
@@ -188,13 +272,10 @@ func (s *TokenService) AllocateTokens(ctx context.Context, fromAccountID string,
 		return ErrTokenAccountNotActive
 	}
 
-	// 验证层级关系：目标的parent_account_id应等于来源ID
-	// 允许的分配方向：region→school, school→personal, region→personal(跨级)
 	validRelation := false
 	if toAcc.ParentAccountID != nil && *toAcc.ParentAccountID == fromAccountID {
-		validRelation = true // 直接父子关系
+		validRelation = true
 	}
-	// 也允许从上级的上级分配（region→personal，只要personal的parent的parent是from）
 	if !validRelation && toAcc.ParentAccountID != nil {
 		parentAcc, parentErr := repository.GetTokenAccountByID(ctx, *toAcc.ParentAccountID)
 		if parentErr == nil && parentAcc.ParentAccountID != nil && *parentAcc.ParentAccountID == fromAccountID {
@@ -205,19 +286,15 @@ func (s *TokenService) AllocateTokens(ctx context.Context, fromAccountID string,
 		return ErrTokenNotParentChild
 	}
 
-	// 扣减上级余额（事务内含余额检查）
 	if err := repository.DeductBalanceForAllocation(ctx, fromAccountID, req.Amount); err != nil {
 		return err
 	}
 
-	// 增加下级余额
 	if err := repository.AddBalance(ctx, req.ToAccountID, req.Amount); err != nil {
-		// 尝试回滚上级扣减（尽力而为）
 		_ = repository.AddBalance(ctx, fromAccountID, req.Amount)
 		return fmt.Errorf("增加下级余额失败: %w", err)
 	}
 
-	// 记录分配流水
 	alloc := &models.TokenAllocation{
 		FromAccountID:  fromAccountID,
 		ToAccountID:    req.ToAccountID,
@@ -242,21 +319,28 @@ func (s *TokenService) AllocateTokens(ctx context.Context, fromAccountID string,
 	return nil
 }
 
-// ListAllocations 查询分配记录
+// ListAllocations 查询分配记录（旧签名，无范围限制；保留兼容）
 func (s *TokenService) ListAllocations(ctx context.Context, fromAccountID string, toAccountID string, limit int, offset int) ([]*models.AllocationListItem, int, error) {
-	return repository.ListTokenAllocations(ctx, fromAccountID, toAccountID, limit, offset)
+	return repository.ListTokenAllocations(ctx, fromAccountID, toAccountID, nil, limit, offset)
+}
+
+// ListAllocationsScoped 查询分配记录（v172 范围感知，按 from/to 账户 owner 白名单）
+func (s *TokenService) ListAllocationsScoped(ctx context.Context, fromAccountID string, toAccountID string, scope *TokenScope, limit int, offset int) ([]*models.AllocationListItem, int, error) {
+	var ownerIDs []string
+	if scope != nil {
+		ownerIDs = scope.OwnerIDs
+	}
+	return repository.ListTokenAllocations(ctx, fromAccountID, toAccountID, ownerIDs, limit, offset)
 }
 
 // ==================== 采购/充值 ====================
 
 // PurchaseTokens 采购/充值积分
-// 流程：校验 → 增加账户余额 → 记录采购流水
 func (s *TokenService) PurchaseTokens(ctx context.Context, req *models.PurchaseTokensRequest, operatorID string) error {
 	if req.Amount <= 0 {
 		return ErrTokenInvalidAmount
 	}
 
-	// 验证目标账户
 	acc, err := repository.GetTokenAccountByID(ctx, req.AccountID)
 	if err != nil {
 		return fmt.Errorf("目标账户不存在: %w", err)
@@ -265,7 +349,6 @@ func (s *TokenService) PurchaseTokens(ctx context.Context, req *models.PurchaseT
 		return ErrTokenAccountNotActive
 	}
 
-	// 解析有效期
 	var validUntil *time.Time
 	if req.ValidUntil != nil && *req.ValidUntil != "" {
 		t, parseErr := time.Parse(time.RFC3339, *req.ValidUntil)
@@ -274,12 +357,10 @@ func (s *TokenService) PurchaseTokens(ctx context.Context, req *models.PurchaseT
 		}
 	}
 
-	// 增加账户余额
 	if err := repository.AddBalance(ctx, req.AccountID, req.Amount); err != nil {
 		return err
 	}
 
-	// 记录采购流水
 	purchase := &models.TokenPurchase{
 		AccountID:    req.AccountID,
 		Amount:       req.Amount,
@@ -304,70 +385,61 @@ func (s *TokenService) PurchaseTokens(ctx context.Context, req *models.PurchaseT
 	return nil
 }
 
-// ListPurchases 查询采购记录
+// ListPurchases 查询采购记录（旧签名，无范围限制，委托 nil 白名单；保留兼容）
 func (s *TokenService) ListPurchases(ctx context.Context, accountID string, limit int, offset int) ([]*models.PurchaseListItem, int, error) {
-	return repository.ListTokenPurchases(ctx, accountID, limit, offset)
+	return repository.ListTokenPurchases(ctx, accountID, nil, limit, offset)
+}
+
+// ListPurchasesScoped 查询采购记录（v172.2 范围感知，按目标账户 owner 白名单）
+func (s *TokenService) ListPurchasesScoped(ctx context.Context, accountID string, scope *TokenScope, limit int, offset int) ([]*models.PurchaseListItem, int, error) {
+	var ownerIDs []string
+	if scope != nil {
+		ownerIDs = scope.OwnerIDs
+	}
+	return repository.ListTokenPurchases(ctx, accountID, ownerIDs, limit, offset)
 }
 
 // ==================== 消费流程（AI调用时使用）====================
 
 // ConsumeTokens 消费积分（AI调用完成后调用）
-// v129改造：从固定汇率改为精确模式
-//
-// 对齐AOCI: credits.go 的 ConsumeCredits
-// 行为：
-//   - Calculation为nil且TokensUsed<=0 → 跳过
-//   - 无账户 → 静默跳过（不阻断AI调用，对齐AOCI"无账户视为无限额度"）
-//   - 账户不活跃 → 跳过
-//   - 直接扣减余额（允许透支，对齐AOCI不做余额预检查）
-//   - 记录完整消费流水（含9个精确计算字段）
 func (s *TokenService) ConsumeTokens(ctx context.Context, req *models.TokenConsumeRequest) error {
-	// 确定消费积分数
 	var creditCost float64
 	var calc *models.CreditCalculation
 
 	if req.Calculation != nil && req.Calculation.CreditsConsumed > 0 {
-		// v129新路径：使用精确计算结果
 		creditCost = req.Calculation.CreditsConsumed
 		calc = req.Calculation
 	} else if req.TokensUsed > 0 {
-		// 兜底：没有精确计算时（不应发生，但防御性编程）
 		creditCost = float64(req.TokensUsed) / 1000.0
 		if creditCost <= 0 {
 			return nil
 		}
 	} else {
-		return nil // 无消费
+		return nil
 	}
 
-	// 查找用户的个人账户
 	acc, err := repository.GetTokenAccountByOwner(ctx, models.AccountTypePersonal, req.UserID)
 	if err != nil {
 		if errors.Is(err, repository.ErrTokenAccountNotFound) {
-			// 无账户静默跳过（对齐AOCI：无账户视为无限额度）
 			return nil
 		}
 		return fmt.Errorf("查询用户积分账户失败: %w", err)
 	}
 
-	// 账户不活跃，跳过
 	if acc.Status != models.AccountStatusActive {
 		return nil
 	}
 
-	// 记录消费前余额
 	balanceBefore := acc.Balance
 
-	// 扣减余额（允许透支，对齐AOCI：不做余额预检查，闸门已前置检查过）
 	if err := repository.DirectDeductBalance(ctx, acc.ID, creditCost); err != nil {
 		tokenLog.Warn("消费扣减失败(不阻断AI)",
 			"account", acc.ID,
 			"amount", creditCost,
 			"error", err)
-		return nil // 不阻断AI调用
+		return nil
 	}
 
-	// 记录消费流水（含完整计算过程）
 	consumeLog := &models.TokenConsumptionLog{
 		AccountID:     acc.ID,
 		UserID:        req.UserID,
@@ -380,7 +452,6 @@ func (s *TokenService) ConsumeTokens(ctx context.Context, req *models.TokenConsu
 		LessonPlanID:  req.LessonPlanID,
 		PipelineID:    req.PipelineID,
 	}
-	// 填充v129精确计算字段
 	if calc != nil {
 		consumeLog.InputTokens = calc.InputTokens
 		consumeLog.OutputTokens = calc.OutputTokens
@@ -402,16 +473,34 @@ func (s *TokenService) ConsumeTokens(ctx context.Context, req *models.TokenConsu
 	return nil
 }
 
-// ListConsumptionLogs 查询消费流水
+// ListConsumptionLogs 查询消费流水（旧签名，无范围限制；保留兼容）
 func (s *TokenService) ListConsumptionLogs(ctx context.Context, accountID string, userID string, sceneCode string, limit int, offset int) ([]*models.ConsumptionListItem, int, error) {
-	return repository.ListTokenConsumptionLogs(ctx, accountID, userID, sceneCode, limit, offset)
+	return repository.ListTokenConsumptionLogs(ctx, accountID, userID, sceneCode, nil, limit, offset)
+}
+
+// ListConsumptionLogsScoped 查询消费流水（v172 范围感知，按 user_id 白名单）
+func (s *TokenService) ListConsumptionLogsScoped(ctx context.Context, accountID string, userID string, sceneCode string, scope *TokenScope, limit int, offset int) ([]*models.ConsumptionListItem, int, error) {
+	var userIDs []string
+	if scope != nil {
+		userIDs = scope.UserIDs
+	}
+	return repository.ListTokenConsumptionLogs(ctx, accountID, userID, sceneCode, userIDs, limit, offset)
 }
 
 // ==================== 统计 ====================
 
-// GetOverviewStats 获取Token系统概览统计
+// GetOverviewStats 获取概览统计（旧签名，全系统；保留兼容）
 func (s *TokenService) GetOverviewStats(ctx context.Context) (*models.TokenOverviewStats, error) {
-	return repository.GetTokenOverviewStats(ctx)
+	return repository.GetTokenOverviewStatsScoped(ctx, nil)
+}
+
+// GetOverviewStatsScoped 获取概览统计（v172 范围感知，按 owner_id 白名单）
+func (s *TokenService) GetOverviewStatsScoped(ctx context.Context, scope *TokenScope) (*models.TokenOverviewStats, error) {
+	var ownerIDs []string
+	if scope != nil {
+		ownerIDs = scope.OwnerIDs
+	}
+	return repository.GetTokenOverviewStatsScoped(ctx, ownerIDs)
 }
 
 // ==================== 预警配置 ====================
@@ -423,7 +512,6 @@ func (s *TokenService) GetAlertConfig(ctx context.Context, accountID string) (*m
 
 // UpdateAlertConfig 更新预警配置
 func (s *TokenService) UpdateAlertConfig(ctx context.Context, accountID string, req *models.UpdateAlertConfigRequest) error {
-	// 校验阈值合理性
 	if req.WarnThreshold <= 0 || req.WarnThreshold > 100 {
 		return fmt.Errorf("预警阈值必须在1-100之间")
 	}

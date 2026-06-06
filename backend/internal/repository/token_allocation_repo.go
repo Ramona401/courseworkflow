@@ -6,6 +6,14 @@ package repository
 //   - 分配记录 CRUD
 //   - 消费流水记录 + 查询
 //
+// v172 新增（积分管理三级数据权限隔离）：
+//   - ListTokenConsumptionLogs 增加 userIDs 白名单参数（消费流水按 user_id 过滤）
+//   - ListTokenAllocations 增加 ownerIDs 白名单参数（分配记录按 from/to 账户 owner_id 过滤）
+//   - 白名单语义（安全关键，与 token_account_repo 统一约定）：
+//       * 白名单切片 == nil  → 不过滤（admin 看全部）
+//       * 白名单切片 非nil但为空 → 匹配空集（fail-closed，返回0行，绝不退化为看全部）
+//       * 白名单切片 非空 → 加 = ANY($n) / owner 子查询过滤
+//
 // 对应数据库表：token_allocations / token_consumption_logs
 
 import (
@@ -35,8 +43,13 @@ func CreateTokenAllocation(ctx context.Context, alloc *models.TokenAllocation) e
 	return nil
 }
 
-// ListTokenAllocations 查询分配记录列表（支持按来源/目标账户筛选）
-func ListTokenAllocations(ctx context.Context, fromAccountID string, toAccountID string, limit int, offset int) ([]*models.AllocationListItem, int, error) {
+// ListTokenAllocations 查询分配记录列表（支持按来源/目标账户筛选 + v172 owner_id 白名单）
+//
+// v172：ownerIDs 白名单——仅返回 来源账户 或 目标账户 的 owner_id ∈ 白名单 的分配记录。
+//   - ownerIDs == nil  → 不过滤（admin）
+//   - ownerIDs 为空切片 → AND 1=0（fail-closed，返回空集）
+//   - ownerIDs 非空     → AND (from/to 账户任一 owner_id = ANY($n))
+func ListTokenAllocations(ctx context.Context, fromAccountID string, toAccountID string, ownerIDs []string, limit int, offset int) ([]*models.AllocationListItem, int, error) {
 	where := "1=1"
 	args := []interface{}{}
 	argIdx := 1
@@ -50,6 +63,21 @@ func ListTokenAllocations(ctx context.Context, fromAccountID string, toAccountID
 		where += fmt.Sprintf(" AND a.to_account_id = $%d", argIdx)
 		args = append(args, toAccountID)
 		argIdx++
+	}
+
+	// v172 owner_id 白名单：来源或目标账户的 owner 命中即保留
+	if ownerIDs != nil {
+		if len(ownerIDs) == 0 {
+			where += " AND 1=0"
+		} else {
+			where += fmt.Sprintf(`
+				AND (
+					a.from_account_id IN (SELECT id FROM token_accounts WHERE owner_id = ANY($%d))
+					OR a.to_account_id IN (SELECT id FROM token_accounts WHERE owner_id = ANY($%d))
+				)`, argIdx, argIdx)
+			args = append(args, ownerIDs)
+			argIdx++
+		}
 	}
 
 	// 统计总数
@@ -115,7 +143,7 @@ func CreateTokenConsumptionLog(ctx context.Context, log *models.TokenConsumption
 			 input_tokens, output_tokens, model_name, provider,
 			 cost_usd, exchange_rate, multiplier, credits_consumed, latency_ms)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-			$12, $13, $14, $15, $16, $17, $18, $19, $20)
+		        $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		RETURNING id, created_at
 	`,
 		log.AccountID, log.UserID, log.Amount, log.BalanceBefore, log.BalanceAfter,
@@ -129,8 +157,15 @@ func CreateTokenConsumptionLog(ctx context.Context, log *models.TokenConsumption
 	return nil
 }
 
-// ListTokenConsumptionLogs 查询消费流水列表（支持按账户、用户、场景筛选）
-func ListTokenConsumptionLogs(ctx context.Context, accountID string, userID string, sceneCode string, limit int, offset int) ([]*models.ConsumptionListItem, int, error) {
+// ListTokenConsumptionLogs 查询消费流水列表（支持按账户、用户、场景筛选 + v172 user_id 白名单）
+//
+// v172：userIDs 白名单——仅返回 cl.user_id ∈ 白名单 的流水。
+//   - userIDs == nil  → 不过滤（admin）
+//   - userIDs 为空切片 → AND 1=0（fail-closed，返回空集）
+//   - userIDs 非空     → AND cl.user_id = ANY($n)
+//
+// 说明：senior_operator 传本校成员 user_id 列表；operator/viewer 传 [自己的user_id]。
+func ListTokenConsumptionLogs(ctx context.Context, accountID string, userID string, sceneCode string, userIDs []string, limit int, offset int) ([]*models.ConsumptionListItem, int, error) {
 	where := "1=1"
 	args := []interface{}{}
 	argIdx := 1
@@ -149,6 +184,17 @@ func ListTokenConsumptionLogs(ctx context.Context, accountID string, userID stri
 		where += fmt.Sprintf(" AND cl.scene_code = $%d", argIdx)
 		args = append(args, sceneCode)
 		argIdx++
+	}
+
+	// v172 user_id 白名单（安全关键：nil=不过滤；空切片=匹配空集）
+	if userIDs != nil {
+		if len(userIDs) == 0 {
+			where += " AND 1=0"
+		} else {
+			where += fmt.Sprintf(" AND cl.user_id = ANY($%d)", argIdx)
+			args = append(args, userIDs)
+			argIdx++
+		}
 	}
 
 	// 统计总数

@@ -2,13 +2,15 @@
  * 入口选择页面 — PortalPage
  * 登录后首先进入此页面，根据用户权限显示可用入口卡片：
  * - 📝 备课工坊：教案系统（所有active用户可见）
- * - 🖥️ 课件审核：课件审核系统（admin/senior_operator/operator可见）
  * - 🎨 课件工坊：AI课件生成系统（所有active用户可见）
+ * - 🖥️ 课件审核：课件审核系统（admin/senior_operator/operator可见）
  *
- * 设计遵循PRD v1.0 §8.7：
- * - 简洁的两栏卡片布局
- * - 极浅灰白背景
- * - 白色大卡片，hover轻微上浮+阴影
+ * 可见性两层判定（v172）：
+ *   第1层 角色：entry.roles（'all' 或角色白名单）
+ *   第2层 组织板块开关：user.portal_modules[entry.key]
+ *         - 后端按用户所属学校 settings.portal_modules 下发
+ *         - 仅当显式为 false 时隐藏；缺省/undefined/true 一律可见（不波及存量）
+ *         - admin 后端强制全开，不受限
  */
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
@@ -25,7 +27,7 @@ interface PortalEntry {
 
 const entries: PortalEntry[] = [
   {
-    key: 'lesson-plans',
+    key: 'lesson_plan',
     icon: '📝',
     title: '备课工坊',
     description: 'AI辅助教案开发 · 教案库 · 教研协作',
@@ -49,6 +51,16 @@ const entries: PortalEntry[] = [
     roles: ['admin', 'senior_operator', 'operator'],
   },
 ]
+
+/**
+ * 判断某板块对当前用户是否可见（组织板块开关层）
+ * 规则：portal_modules 缺失，或该 key 缺失，或值非 false → 可见；仅显式 false → 隐藏
+ */
+function isModuleEnabled(modules: Record<string, boolean> | undefined, key: string): boolean {
+  if (!modules) return true            // 后端未下发（老缓存等）→ 默认可见
+  if (!(key in modules)) return true   // 该板块未配置 → 默认可见
+  return modules[key] !== false        // 仅显式 false 才隐藏
+}
 
 /* ==================== 样式常量 ==================== */
 const styles = {
@@ -132,10 +144,13 @@ export default function PortalPage() {
   // 如果没有用户信息，不渲染（AuthGuard会处理跳转）
   if (!user) return null
 
-  // 根据角色过滤可见入口
+  // 双层过滤：角色 + 组织板块开关
   const visibleEntries = entries.filter(entry => {
-    if (entry.roles === 'all') return true
-    return entry.roles.includes(user.role)
+    // 第1层：角色
+    const roleOk = entry.roles === 'all' || entry.roles.includes(user.role)
+    if (!roleOk) return false
+    // 第2层：组织板块开关
+    return isModuleEnabled(user.portal_modules, entry.key)
   })
 
   return (

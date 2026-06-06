@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -214,6 +215,81 @@ func GetSchoolsByRegion(ctx context.Context, regionID string) ([]*models.Organiz
 		orgs = append(orgs, org)
 	}
 	return orgs, nil
+}
+
+// ==================== v172 新增：门户板块可见性查询 ====================
+
+// parsePortalModulesFromSettings 从组织 settings(JSONB字符串) 解析 portal_modules
+//
+// 规则（容错优先，保证不波及存量）：
+//   - settings 为空 / 非法 JSON / 无 portal_modules 键 → 返回全开
+//   - portal_modules 中缺失的板块 key → 该板块按 true 处理（缺省即开启）
+//   - 只有显式写成 false 的板块才会被关闭
+func parsePortalModulesFromSettings(settings string) map[string]bool {
+	result := models.DefaultPortalModules() // 先全开
+
+	settings = strings.TrimSpace(settings)
+	if settings == "" || settings == "{}" {
+		return result
+	}
+
+	// settings 形如 {"portal_modules":{"lesson_plan":true,"workflow":false}, ...}
+	var raw struct {
+		PortalModules map[string]bool `json:"portal_modules"`
+	}
+	if err := json.Unmarshal([]byte(settings), &raw); err != nil {
+		// 解析失败 → 保持全开
+		return result
+	}
+	if raw.PortalModules == nil {
+		// 没有 portal_modules 键 → 保持全开
+		return result
+	}
+
+	// 用显式配置覆盖默认值（仅覆盖出现的 key，缺失的 key 保持 true）
+	for _, k := range models.AllPortalModules {
+		if v, ok := raw.PortalModules[k]; ok {
+			result[k] = v
+		}
+	}
+	return result
+}
+
+// GetUserPortalModules 获取用户所属组织的门户板块可见性配置
+//
+// 查找链路与 GetUserOrgLogo 一致：
+//   school_members → 学校 → 学校 settings；school_members 查不到则教研组兜底反查学校
+// 解析学校 settings 里的 portal_modules；未绑定任何组织 / 查不到 → 返回全开
+//
+// 注意：admin 的"全开"由 auth_service 层兜底，不在此函数处理（此函数只管按组织配置返回）
+func GetUserPortalModules(ctx context.Context, userID string) map[string]bool {
+	var settings string
+
+	// 1. 通过 school_members 查用户所属学校的 settings
+	err := database.DB.QueryRow(ctx, `
+		SELECT COALESCE(o.settings, '{}')
+		FROM school_members sm
+		JOIN organizations o ON o.id = sm.school_id
+		WHERE sm.user_id = $1 AND o.status = 'active'
+		LIMIT 1
+	`, userID).Scan(&settings)
+	if err != nil {
+		// 2. 兜底：通过教研组反查学校 settings
+		err = database.DB.QueryRow(ctx, `
+			SELECT COALESCE(o.settings, '{}')
+			FROM teaching_group_members tgm
+			JOIN teaching_groups tg ON tg.id = tgm.group_id
+			JOIN organizations o ON o.id = tg.school_id
+			WHERE tgm.user_id = $1 AND o.status = 'active'
+			LIMIT 1
+		`, userID).Scan(&settings)
+		if err != nil {
+			// 未绑定任何学校 → 全开
+			return models.DefaultPortalModules()
+		}
+	}
+
+	return parsePortalModulesFromSettings(settings)
 }
 
 // ==================== 教研组 CRUD ====================
@@ -677,7 +753,6 @@ func IsUserInSchoolByGroup(ctx context.Context, userID string, schoolID string) 
 	return count > 0, nil
 }
 
-
 // UpdateOrganizationLogo 更新组织Logo URL
 func UpdateOrganizationLogo(ctx context.Context, id string, logoURL string) error {
 	sql := `UPDATE organizations SET logo_url = $1, updated_at = $2 WHERE id = $3`
@@ -690,7 +765,6 @@ func UpdateOrganizationLogo(ctx context.Context, id string, logoURL string) erro
 	}
 	return nil
 }
-
 
 // GetUserOrgLogo 获取用户所属组织的Logo和名称
 // 查找链路：school_members → 学校 → 学校Logo → 如果没有则取区域Logo
@@ -752,34 +826,34 @@ func GetUserOrgLogo(ctx context.Context, userID string) (string, string) {
 //
 // 复用 organizations + teaching_groups + teaching_group_members 三表 JOIN
 func ListMyLeadOrBackboneGroups(ctx context.Context, userID string) ([]models.PublishTargetGroup, error) {
-        query := `
-                SELECT tg.id, tg.name, COALESCE(o.name, ''), tgm.role
-                FROM teaching_group_members tgm
-                JOIN teaching_groups tg ON tg.id = tgm.group_id
-                LEFT JOIN organizations o ON o.id = tg.school_id
-                WHERE tgm.user_id = $1
-                  AND tgm.role IN ('lead', 'backbone')
-                  AND tg.status = 'active'
-                ORDER BY
-                  CASE tgm.role WHEN 'lead' THEN 0 ELSE 1 END,
-                  tgm.joined_at ASC
-        `
-        rows, err := database.DB.Query(ctx, query, userID)
-        if err != nil {
-                return nil, fmt.Errorf("查询用户管理的教研组失败: %w", err)
-        }
-        defer rows.Close()
+	query := `
+		SELECT tg.id, tg.name, COALESCE(o.name, ''), tgm.role
+		FROM teaching_group_members tgm
+		JOIN teaching_groups tg ON tg.id = tgm.group_id
+		LEFT JOIN organizations o ON o.id = tg.school_id
+		WHERE tgm.user_id = $1
+		  AND tgm.role IN ('lead', 'backbone')
+		  AND tg.status = 'active'
+		ORDER BY
+		  CASE tgm.role WHEN 'lead' THEN 0 ELSE 1 END,
+		  tgm.joined_at ASC
+	`
+	rows, err := database.DB.Query(ctx, query, userID)
+	if err != nil {
+		return nil, fmt.Errorf("查询用户管理的教研组失败: %w", err)
+	}
+	defer rows.Close()
 
-        var groups []models.PublishTargetGroup
-        for rows.Next() {
-                g := models.PublishTargetGroup{}
-                if err := rows.Scan(&g.ID, &g.Name, &g.SchoolName, &g.Role); err != nil {
-                        return nil, fmt.Errorf("扫描教研组行失败: %w", err)
-                }
-                groups = append(groups, g)
-        }
-        if groups == nil {
-                groups = []models.PublishTargetGroup{}
-        }
-        return groups, nil
+	var groups []models.PublishTargetGroup
+	for rows.Next() {
+		g := models.PublishTargetGroup{}
+		if err := rows.Scan(&g.ID, &g.Name, &g.SchoolName, &g.Role); err != nil {
+			return nil, fmt.Errorf("扫描教研组行失败: %w", err)
+		}
+		groups = append(groups, g)
+	}
+	if groups == nil {
+		groups = []models.PublishTargetGroup{}
+	}
+	return groups, nil
 }

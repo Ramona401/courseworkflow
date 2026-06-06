@@ -123,6 +123,7 @@ export interface OrgListItem {
   status: string
   group_count: number
   member_count: number
+  settings?: string        // v172新增：组织设置JSON（含 portal_modules），编辑弹窗读取用
   created_at: string
 }
 

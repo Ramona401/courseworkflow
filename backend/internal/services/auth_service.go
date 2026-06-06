@@ -6,6 +6,10 @@ package services
 //   - Token生成失败 → ERROR
 //   - 更新登录信息失败 → WARN（不影响登录主流程，可接受）
 //   - 用户登录成功 → INFO（记录username/role，便于审计）
+//
+// v172新增：登录/取当前用户时填充 PortalModules（门户板块可见性）
+//   - 普通用户：按所属学校 settings.portal_modules 决定（缺省全开）
+//   - admin：强制全开（保证管理员永远可进所有板块，便于配置和调试）
 
 import (
 	"context"
@@ -50,6 +54,26 @@ var authLog = logger.WithModule("auth")
 // NewAuthService 创建认证服务实例
 func NewAuthService(cfg *config.Config) *AuthService {
 	return &AuthService{cfg: cfg}
+}
+
+// fillUserInfoExtras 填充 UserInfo 的组织相关附加信息（Logo、组织名、门户板块可见性）
+//
+// v172：抽出公共逻辑，Login 与 GetCurrentUser 共用，避免重复。
+//   - OrgLogoURL / OrgName：复用 GetUserOrgLogo
+//   - PortalModules：admin 强制全开；其他角色按组织 settings 配置（缺省全开）
+func fillUserInfoExtras(ctx context.Context, info *models.UserInfo) {
+	// 组织 Logo 与名称
+	orgLogo, orgName := repository.GetUserOrgLogo(ctx, info.ID)
+	info.OrgLogoURL = orgLogo
+	info.OrgName = orgName
+
+	// 门户板块可见性
+	if info.Role == models.RoleAdmin {
+		// admin 永远全开，不受任何组织配置限制
+		info.PortalModules = models.DefaultPortalModules()
+	} else {
+		info.PortalModules = repository.GetUserPortalModules(ctx, info.ID)
+	}
 }
 
 // Login 登录：验证用户名密码，返回 JWT token + 用户信息
@@ -115,11 +139,9 @@ func (s *AuthService) Login(ctx context.Context, req *models.LoginRequest) (*mod
 		"role", user.Role,
 	)
 
-	// 7. 返回 token 和用户信息
+	// 7. 返回 token 和用户信息（含组织 Logo/名称 + 门户板块可见性）
 	info := user.ToUserInfo()
-	orgLogo, orgName := repository.GetUserOrgLogo(ctx, user.ID)
-	info.OrgLogoURL = orgLogo
-	info.OrgName = orgName
+	fillUserInfoExtras(ctx, info)
 
 	return &models.LoginResponse{
 		Token: token,
@@ -191,10 +213,8 @@ func (s *AuthService) GetCurrentUser(ctx context.Context, claims *JWTClaims) (*m
 
 	info := user.ToUserInfo()
 
-	// 查询用户所属组织的Logo和名称（学校>区域>空）
-	orgLogo, orgName := repository.GetUserOrgLogo(ctx, user.ID)
-	info.OrgLogoURL = orgLogo
-	info.OrgName = orgName
+	// 填充组织 Logo/名称 + 门户板块可见性（与 Login 一致）
+	fillUserInfoExtras(ctx, info)
 
 	return info, nil
 }

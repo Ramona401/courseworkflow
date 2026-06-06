@@ -2,11 +2,12 @@ package repository
 
 // token_account_repo.go — Token积分系统数据访问层（账户+采购+预警）
 //
-// v128 新增（阶段C · Token/积分系统）：
-//   - 账户 CRUD + 余额操作（事务安全）
-//   - 采购/充值记录
-//   - 预警配置
-//   - 概览统计
+// v128 新增（阶段C · Token/积分系统）
+// v172 新增（积分管理三级数据权限隔离）：账户/概览 owner_id 白名单
+// v172.1 修复（跨级泄漏）：scoped 非admin 排除 region 账户
+// v172.2 新增（采购记录隔离）：ListTokenPurchases 增加 ownerIDs 白名单
+//   - 采购记录无 owner 维度，需 JOIN token_accounts 取 owner_id 过滤
+//   - 白名单语义同其它查询：nil=不过滤(admin)；空切片=匹配空集(fail-closed)；非空=ANY 且排除 region
 //
 // 对应数据库表：token_accounts / token_purchases / token_alert_configs
 
@@ -24,11 +25,11 @@ import (
 // ==================== 错误常量 ====================
 
 var (
-	ErrTokenAccountNotFound   = errors.New("积分账户不存在")
-	ErrInsufficientBalance    = errors.New("积分余额不足")
-	ErrAccountSuspended       = errors.New("积分账户已冻结")
-	ErrDuplicateAccount       = errors.New("该实体已存在同类型账户")
-	ErrTokenPurchaseNotFound  = errors.New("采购记录不存在")
+	ErrTokenAccountNotFound  = errors.New("积分账户不存在")
+	ErrInsufficientBalance   = errors.New("积分余额不足")
+	ErrAccountSuspended      = errors.New("积分账户已冻结")
+	ErrDuplicateAccount      = errors.New("该实体已存在同类型账户")
+	ErrTokenPurchaseNotFound = errors.New("采购记录不存在")
 )
 
 // ==================== 账户 CRUD ====================
@@ -49,7 +50,6 @@ func CreateTokenAccount(ctx context.Context, acc *models.TokenAccount) error {
 		acc.MonthlyQuota, acc.ExpiresAt, acc.Status,
 	).Scan(&acc.ID, &acc.CreatedAt, &acc.UpdatedAt)
 	if err != nil {
-		// 检查唯一约束冲突
 		if isUniqueViolation(err) {
 			return ErrDuplicateAccount
 		}
@@ -102,9 +102,8 @@ func GetTokenAccountByOwner(ctx context.Context, accountType string, ownerID str
 	return acc, nil
 }
 
-// ListTokenAccounts 查询账户列表（支持按类型、上级账户、状态筛选）
-func ListTokenAccounts(ctx context.Context, accountType string, parentAccountID string, status string, limit int, offset int) ([]*models.TokenAccountListItem, int, error) {
-	// 动态构建WHERE条件
+// ListTokenAccounts 查询账户列表（v172 owner_id 白名单 + v172.1 scoped 排除 region）
+func ListTokenAccounts(ctx context.Context, accountType string, parentAccountID string, status string, ownerIDs []string, limit int, offset int) ([]*models.TokenAccountListItem, int, error) {
 	where := "1=1"
 	args := []interface{}{}
 	argIdx := 1
@@ -125,7 +124,17 @@ func ListTokenAccounts(ctx context.Context, accountType string, parentAccountID 
 		argIdx++
 	}
 
-	// 统计总数
+	if ownerIDs != nil {
+		if len(ownerIDs) == 0 {
+			where += " AND 1=0"
+		} else {
+			where += fmt.Sprintf(" AND ta.owner_id = ANY($%d)", argIdx)
+			args = append(args, ownerIDs)
+			argIdx++
+			where += " AND ta.account_type <> 'region'"
+		}
+	}
+
 	var total int
 	countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM token_accounts ta WHERE %s`, where)
 	if err := database.DB.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
@@ -136,7 +145,6 @@ func ListTokenAccounts(ctx context.Context, accountType string, parentAccountID 
 		limit = 50
 	}
 
-	// 分页查询（含子账户数统计）
 	listQuery := fmt.Sprintf(`
 		SELECT ta.id, ta.account_type, ta.owner_id, ta.display_name,
 		       ta.balance, ta.frozen_amount, ta.total_consumed, ta.total_quota,
@@ -167,7 +175,6 @@ func ListTokenAccounts(ctx context.Context, accountType string, parentAccountID 
 		if err != nil {
 			return nil, 0, fmt.Errorf("扫描积分账户行失败: %w", err)
 		}
-		// 填充计算字段
 		item.AccountTypeName = models.AccountTypeNameMap[item.AccountType]
 		item.StatusName = models.AccountStatusNameMap[item.Status]
 		item.AvailableBalance = item.Balance - item.FrozenAmount
@@ -221,7 +228,6 @@ func ListChildAccounts(ctx context.Context, parentID string) ([]*models.TokenAcc
 // ==================== 余额操作（事务安全）====================
 
 // FreezeTokens 冻结积分（AI调用开始前调用，事务内 SELECT FOR UPDATE）
-// 返回冻结后的账户快照
 func FreezeTokens(ctx context.Context, accountID string, amount float64) (*models.TokenAccount, error) {
 	tx, err := database.DB.Begin(ctx)
 	if err != nil {
@@ -229,7 +235,6 @@ func FreezeTokens(ctx context.Context, accountID string, amount float64) (*model
 	}
 	defer tx.Rollback(ctx)
 
-	// SELECT FOR UPDATE 行锁
 	acc := &models.TokenAccount{}
 	err = tx.QueryRow(ctx, `
 		SELECT id, balance, frozen_amount, status
@@ -242,18 +247,15 @@ func FreezeTokens(ctx context.Context, accountID string, amount float64) (*model
 		return nil, fmt.Errorf("锁定账户失败: %w", err)
 	}
 
-	// 校验账户状态
 	if acc.Status != models.AccountStatusActive {
 		return nil, ErrAccountSuspended
 	}
 
-	// 校验可用余额（balance - frozen_amount >= amount）
 	available := acc.Balance - acc.FrozenAmount
 	if available < amount {
 		return nil, ErrInsufficientBalance
 	}
 
-	// 增加冻结额度
 	now := time.Now()
 	_, err = tx.Exec(ctx, `
 		UPDATE token_accounts
@@ -273,8 +275,6 @@ func FreezeTokens(ctx context.Context, accountID string, amount float64) (*model
 }
 
 // DeductTokens 扣减积分（AI调用完成后调用，释放冻结并扣减余额）
-// frozenAmount: 之前冻结的额度
-// actualAmount: 实际消费的积分（可能小于冻结额度）
 func DeductTokens(ctx context.Context, accountID string, frozenAmount float64, actualAmount float64) error {
 	tx, err := database.DB.Begin(ctx)
 	if err != nil {
@@ -283,7 +283,6 @@ func DeductTokens(ctx context.Context, accountID string, frozenAmount float64, a
 	defer tx.Rollback(ctx)
 
 	now := time.Now()
-	// 释放冻结额度 + 扣减实际消费
 	result, err := tx.Exec(ctx, `
 		UPDATE token_accounts
 		SET frozen_amount = frozen_amount - $1,
@@ -340,8 +339,6 @@ func AddBalance(ctx context.Context, accountID string, amount float64) error {
 }
 
 // DirectDeductBalance 直接扣减余额（消费用，允许透支，不动total_quota）
-// v129变更：删除GREATEST防负数，允许透支（对齐AOCI的ConsumeCredits）
-// 闸门已在AI调用前检查过余额，扣减时不再二次校验
 func DirectDeductBalance(ctx context.Context, accountID string, amount float64) error {
 	now := time.Now()
 	result, err := database.DB.Exec(ctx, `
@@ -368,7 +365,6 @@ func DeductBalanceForAllocation(ctx context.Context, accountID string, amount fl
 	}
 	defer tx.Rollback(ctx)
 
-	// 锁行检查余额
 	var balance float64
 	var frozenAmount float64
 	err = tx.QueryRow(ctx, `
@@ -435,8 +431,16 @@ func CreateTokenPurchase(ctx context.Context, purchase *models.TokenPurchase) er
 	return nil
 }
 
-// ListTokenPurchases 查询采购记录列表
-func ListTokenPurchases(ctx context.Context, accountID string, limit int, offset int) ([]*models.PurchaseListItem, int, error) {
+// ListTokenPurchases 查询采购记录列表（v172.2 增加 ownerIDs 白名单）
+//
+// 采购记录本身无 owner 维度，按目标账户 token_accounts.owner_id 过滤。
+// 白名单语义（与其它查询一致）：
+//   - ownerIDs == nil  → 不过滤（admin 看全部）
+//   - ownerIDs 为空切片 → AND 1=0（fail-closed，返回空集）
+//   - ownerIDs 非空     → AND ta.owner_id = ANY($n) 且 ta.account_type <> 'region'
+//     （scoped 非admin 不应看到上级 region 账户的采购记录）
+func ListTokenPurchases(ctx context.Context, accountID string, ownerIDs []string, limit int, offset int) ([]*models.PurchaseListItem, int, error) {
+	// 采购记录需 JOIN token_accounts 取 owner，统一在 FROM 中 JOIN
 	where := "1=1"
 	args := []interface{}{}
 	argIdx := 1
@@ -447,8 +451,26 @@ func ListTokenPurchases(ctx context.Context, accountID string, limit int, offset
 		argIdx++
 	}
 
+	// v172.2 owner_id 白名单（按目标账户 owner 过滤）
+	if ownerIDs != nil {
+		if len(ownerIDs) == 0 {
+			where += " AND 1=0"
+		} else {
+			where += fmt.Sprintf(" AND ta.owner_id = ANY($%d)", argIdx)
+			args = append(args, ownerIDs)
+			argIdx++
+			where += " AND ta.account_type <> 'region'"
+		}
+	}
+
 	var total int
-	countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM token_purchases p WHERE %s`, where)
+	// 统计也需 JOIN（owner 过滤依赖 ta）
+	countQuery := fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM token_purchases p
+		LEFT JOIN token_accounts ta ON ta.id = p.account_id
+		WHERE %s
+	`, where)
 	if err := database.DB.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("统计采购记录数失败: %w", err)
 	}
@@ -508,7 +530,7 @@ func GetTokenAlertConfig(ctx context.Context, accountID string) (*models.TokenAl
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil // 无配置返回nil,不是错误
+			return nil, nil
 		}
 		return nil, fmt.Errorf("查询预警配置失败: %w", err)
 	}
@@ -536,41 +558,86 @@ func UpsertTokenAlertConfig(ctx context.Context, accountID string, req *models.U
 
 // ==================== 概览统计 ====================
 
-// GetTokenOverviewStats 获取Token系统概览统计
+// GetTokenOverviewStats 获取Token系统概览统计（全系统，admin 用）
 func GetTokenOverviewStats(ctx context.Context) (*models.TokenOverviewStats, error) {
+	return GetTokenOverviewStatsScoped(ctx, nil)
+}
+
+// GetTokenOverviewStatsScoped 获取概览统计（v172 owner_id 白名单 + v172.1 scoped 排除 region）
+func GetTokenOverviewStatsScoped(ctx context.Context, ownerIDs []string) (*models.TokenOverviewStats, error) {
 	stats := &models.TokenOverviewStats{}
 
-	// 总账户数
+	if ownerIDs != nil && len(ownerIDs) == 0 {
+		return stats, nil
+	}
+
+	scoped := ownerIDs != nil
+
+	if scoped {
+		_ = database.DB.QueryRow(ctx,
+			`SELECT COUNT(*) FROM token_accounts
+			 WHERE owner_id = ANY($1) AND account_type <> 'region'`, ownerIDs,
+		).Scan(&stats.TotalAccounts)
+
+		_ = database.DB.QueryRow(ctx,
+			`SELECT COALESCE(SUM(balance),0), COALESCE(SUM(total_consumed),0), COALESCE(SUM(total_quota),0)
+			 FROM token_accounts WHERE owner_id = ANY($1) AND account_type <> 'region'`, ownerIDs,
+		).Scan(&stats.TotalBalance, &stats.TotalConsumed, &stats.TotalQuota)
+
+		_ = database.DB.QueryRow(ctx,
+			`SELECT COALESCE(SUM(cl.amount),0)
+			 FROM token_consumption_logs cl
+			 JOIN token_accounts ta ON ta.id = cl.account_id
+			 WHERE cl.created_at >= CURRENT_DATE AND ta.owner_id = ANY($1) AND ta.account_type <> 'region'`, ownerIDs,
+		).Scan(&stats.TodayConsumed)
+
+		_ = database.DB.QueryRow(ctx,
+			`SELECT COALESCE(SUM(cl.amount),0)
+			 FROM token_consumption_logs cl
+			 JOIN token_accounts ta ON ta.id = cl.account_id
+			 WHERE cl.created_at >= date_trunc('month', CURRENT_DATE) AND ta.owner_id = ANY($1) AND ta.account_type <> 'region'`, ownerIDs,
+		).Scan(&stats.MonthConsumed)
+
+		_ = database.DB.QueryRow(ctx,
+			`SELECT COUNT(*) FROM token_accounts
+			 WHERE owner_id = ANY($1) AND account_type <> 'region' AND status = 'active' AND total_quota > 0
+			       AND (balance - frozen_amount) < total_quota * 0.2`, ownerIDs,
+		).Scan(&stats.LowBalanceCount)
+
+		_ = database.DB.QueryRow(ctx,
+			`SELECT COUNT(*) FROM token_accounts
+			 WHERE owner_id = ANY($1) AND account_type <> 'region' AND status = 'active' AND expires_at IS NOT NULL
+			       AND expires_at <= NOW() + INTERVAL '30 days'`, ownerIDs,
+		).Scan(&stats.ExpiringSoonCount)
+
+		return stats, nil
+	}
+
 	_ = database.DB.QueryRow(ctx,
 		`SELECT COUNT(*) FROM token_accounts`,
 	).Scan(&stats.TotalAccounts)
 
-	// 全系统总余额 + 总消费 + 总配额
 	_ = database.DB.QueryRow(ctx,
 		`SELECT COALESCE(SUM(balance),0), COALESCE(SUM(total_consumed),0), COALESCE(SUM(total_quota),0)
 		 FROM token_accounts`,
 	).Scan(&stats.TotalBalance, &stats.TotalConsumed, &stats.TotalQuota)
 
-	// 今日消费
 	_ = database.DB.QueryRow(ctx,
 		`SELECT COALESCE(SUM(amount),0) FROM token_consumption_logs
 		 WHERE created_at >= CURRENT_DATE`,
 	).Scan(&stats.TodayConsumed)
 
-	// 本月消费
 	_ = database.DB.QueryRow(ctx,
 		`SELECT COALESCE(SUM(amount),0) FROM token_consumption_logs
 		 WHERE created_at >= date_trunc('month', CURRENT_DATE)`,
 	).Scan(&stats.MonthConsumed)
 
-	// 余额预警账户数（可用余额低于总配额20%的活跃账户）
 	_ = database.DB.QueryRow(ctx,
 		`SELECT COUNT(*) FROM token_accounts
 		 WHERE status = 'active' AND total_quota > 0
 		       AND (balance - frozen_amount) < total_quota * 0.2`,
 	).Scan(&stats.LowBalanceCount)
 
-	// 即将过期账户数（30天内过期）
 	_ = database.DB.QueryRow(ctx,
 		`SELECT COUNT(*) FROM token_accounts
 		 WHERE status = 'active' AND expires_at IS NOT NULL
@@ -592,7 +659,7 @@ func isUniqueViolation(err error) bool {
 			tokenContains(err.Error(), "23505"))
 }
 
-// contains 字符串包含检查（辅助函数）
+// tokenContains 字符串包含检查（辅助函数）
 func tokenContains(s, sub string) bool {
 	for i := 0; i <= len(s)-len(sub); i++ {
 		if s[i:i+len(sub)] == sub {

@@ -2,14 +2,17 @@ package routes
 
 // routes_token.go — Token积分系统路由注册
 //
-// v128 新增（阶段C · Token/积分系统）：
-//   - 概览统计（admin + senior_operator）
-//   - 账户管理（admin创建/状态更新，admin+senior查看）
-//   - 积分分配（admin）
-//   - 采购/充值（admin）
-//   - 消费流水（admin + senior_operator）
-//   - 预警配置（admin）
-//   - 我的积分（登录即可）
+// v128 新增（阶段C · Token/积分系统）
+// v172 改造（积分管理三级数据权限隔离）：查询类端点下放 authMW，数据层 TokenScope 收窄
+// v172.2 改造（采购记录隔离）：
+//   - purchases 端点拆分方法：GET（查询采购记录）下放到 authMW（按 TokenScope 收窄），
+//     POST（充值）仍要求 admin（handler 内 claims 二次校验）
+//   - 这样 senior/operator 能看到本校/本人采购记录，但只有 admin 能充值
+//
+// 写操作收口：
+//   创建账户/状态/预警配置 → admin（handler 二次校验）
+//   充值（purchases POST） → admin（handler 二次校验）
+//   积分分配 → admin + senior_operator（handler 二次校验 + senior 来源账户范围校验）
 //
 // 路由前缀：/api/v1/tokens/
 
@@ -20,11 +23,6 @@ import (
 )
 
 // registerTokenRoutes 注册Token积分系统路由
-// 参数说明：
-//   - authMW: 认证中间件
-//   - adminOnly: 仅admin可访问
-//   - adminOrSchoolAdmin: admin + senior_operator可访问
-//   - tokenHandler: Token处理器
 func registerTokenRoutes(
 	mux *http.ServeMux,
 	authMW func(http.Handler) http.Handler,
@@ -36,19 +34,17 @@ func registerTokenRoutes(
 	mux.Handle("/api/v1/tokens/my-account",
 		middleware.Chain(http.HandlerFunc(tokenHandler.GetMyTokenAccount), authMW))
 
-	// ========== 概览统计（admin + senior_operator）==========
+	// ========== 概览统计（登录即可，数据按 TokenScope 收窄）==========
 	mux.Handle("/api/v1/tokens/overview",
-		middleware.Chain(http.HandlerFunc(tokenHandler.GetOverviewStats), authMW, adminOrSchoolAdmin))
+		middleware.Chain(http.HandlerFunc(tokenHandler.GetOverviewStats), authMW))
 
 	// ========== 账户管理 ==========
-	// 创建账户（admin only）
-	// 列表查看（admin + senior_operator）
+	// GET 列表（登录即可，TokenScope 收窄）；POST 创建（admin only，handler 二次校验）
 	mux.Handle("/api/v1/tokens/accounts", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			tokenHandler.ListAccounts(w, r)
 		case http.MethodPost:
-			// 创建账户需admin权限，在此做二次检查
 			claims, _ := middleware.GetClaims(r.Context())
 			if claims == nil || claims.Role != roleAdmin {
 				forbiddenJSON(w, "仅管理员可创建账户")
@@ -58,7 +54,7 @@ func registerTokenRoutes(
 		default:
 			methodNotAllowedJSON(w, "仅支持GET/POST请求")
 		}
-	}), authMW, adminOrSchoolAdmin))
+	}), authMW))
 
 	// 账户详情 + 状态更新 + 分配 + 预警配置（通配分发）
 	mux.Handle("/api/v1/tokens/accounts/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -86,7 +82,7 @@ func registerTokenRoutes(
 			return
 		}
 
-		// /accounts/{id}/alert-config → 预警配置
+		// /accounts/{id}/alert-config → 预警配置（admin only）
 		if hasSuffix(path, "/alert-config") {
 			claims, _ := middleware.GetClaims(r.Context())
 			if claims == nil || claims.Role != roleAdmin {
@@ -104,27 +100,33 @@ func registerTokenRoutes(
 			return
 		}
 
-		// /accounts/{id} → 账户详情
+		// /accounts/{id} → 账户详情（登录即可，handler 内做范围校验 + region 硬拒绝）
 		tokenHandler.GetAccountDetail(w, r)
-	}), authMW, adminOrSchoolAdmin))
+	}), authMW))
 
-	// ========== 分配记录（admin + senior_operator）==========
+	// ========== 分配记录（登录即可，TokenScope 收窄）==========
 	mux.Handle("/api/v1/tokens/allocations",
-		middleware.Chain(http.HandlerFunc(tokenHandler.ListAllocations), authMW, adminOrSchoolAdmin))
+		middleware.Chain(http.HandlerFunc(tokenHandler.ListAllocations), authMW))
 
-	// ========== 采购/充值（admin only）==========
+	// ========== 采购/充值 ==========
+	// v172.2：GET 查询采购记录（登录即可，TokenScope 收窄）；POST 充值（admin only，handler 二次校验）
 	mux.Handle("/api/v1/tokens/purchases", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			tokenHandler.ListPurchases(w, r)
 		case http.MethodPost:
+			claims, _ := middleware.GetClaims(r.Context())
+			if claims == nil || claims.Role != roleAdmin {
+				forbiddenJSON(w, "仅管理员可充值")
+				return
+			}
 			tokenHandler.PurchaseTokens(w, r)
 		default:
 			methodNotAllowedJSON(w, "仅支持GET/POST请求")
 		}
-	}), authMW, adminOnly))
+	}), authMW))
 
-	// ========== 消费流水（admin + senior_operator）==========
+	// ========== 消费流水（登录即可，TokenScope 收窄）==========
 	mux.Handle("/api/v1/tokens/consumption",
-		middleware.Chain(http.HandlerFunc(tokenHandler.ListConsumptionLogs), authMW, adminOrSchoolAdmin))
+		middleware.Chain(http.HandlerFunc(tokenHandler.ListConsumptionLogs), authMW))
 }

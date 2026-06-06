@@ -25,20 +25,49 @@ type User struct {
 	TeachingProfileJSON *string `json:"-"`
 }
 
+// ==================== 门户板块常量（v172新增：组织级板块可见性开关） ====================
+//
+// 门户(PortalPage)三大并行板块的 key，与前端 entries 的 key 一一对应。
+// 通过组织 organizations.settings 里的 portal_modules 配置控制各组织能看到哪些板块。
+// 例：{"portal_modules":{"lesson_plan":true,"courseware":true,"workflow":false}}
+const (
+	PortalModuleLessonPlan = "lesson_plan" // 备课工坊
+	PortalModuleCourseware = "courseware"  // 课件工坊
+	PortalModuleWorkflow   = "workflow"    // 课件审核（即 /workflow，Pipeline 审核系统）
+)
+
+// AllPortalModules 所有门户板块 key 列表
+var AllPortalModules = []string{
+	PortalModuleLessonPlan,
+	PortalModuleCourseware,
+	PortalModuleWorkflow,
+}
+
+// DefaultPortalModules 返回"全部板块开启"的默认配置
+// 用途：没有任何配置 / 解析失败 / admin 时，一律全开（维持现状，不波及存量用户）
+func DefaultPortalModules() map[string]bool {
+	return map[string]bool{
+		PortalModuleLessonPlan: true,
+		PortalModuleCourseware: true,
+		PortalModuleWorkflow:   true,
+	}
+}
+
 // UserInfo 返回给前端的用户信息（不含敏感字段）
 type UserInfo struct {
-	ID                 string     `json:"id"`
-	Username           string     `json:"username"`
-	DisplayName        string     `json:"display_name"`
-	Role               string     `json:"role"`
-	Status             string     `json:"status"`
-	LastLoginAt        *time.Time `json:"last_login_at"`
-	LoginCount         int        `json:"login_count"`
-	CreatedAt          *time.Time `json:"created_at"`
-	UpdatedAt          *time.Time `json:"updated_at"`
-	HasTeachingProfile bool       `json:"has_teaching_profile"`
-	OrgLogoURL         string     `json:"org_logo_url"`          // 用户所属组织的Logo URL（学校>区域>空）
-	OrgName            string     `json:"org_name"`              // 用户所属组织名称
+	ID                 string          `json:"id"`
+	Username           string          `json:"username"`
+	DisplayName        string          `json:"display_name"`
+	Role               string          `json:"role"`
+	Status             string          `json:"status"`
+	LastLoginAt        *time.Time      `json:"last_login_at"`
+	LoginCount         int             `json:"login_count"`
+	CreatedAt          *time.Time      `json:"created_at"`
+	UpdatedAt          *time.Time      `json:"updated_at"`
+	HasTeachingProfile bool            `json:"has_teaching_profile"`
+	OrgLogoURL         string          `json:"org_logo_url"`     // 用户所属组织的Logo URL（学校>区域>空）
+	OrgName            string          `json:"org_name"`         // 用户所属组织名称
+	PortalModules      map[string]bool `json:"portal_modules"`   // v172新增：门户板块可见性（三个key各true/false）
 }
 
 // ToUserInfo 将 User 转换为 UserInfo
@@ -54,6 +83,8 @@ func (u *User) ToUserInfo() *UserInfo {
 		CreatedAt:          u.CreatedAt,
 		UpdatedAt:          u.UpdatedAt,
 		HasTeachingProfile: u.TeachingProfileJSON != nil,
+		// PortalModules 默认全开，由 auth_service 填充时根据组织配置/角色覆盖
+		PortalModules: DefaultPortalModules(),
 	}
 }
 
