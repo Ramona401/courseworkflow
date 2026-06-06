@@ -14,7 +14,7 @@ type Organization struct {
 	ParentID    *string    `json:"parent_id"`
 	AdminUserID *string    `json:"admin_user_id"`
 	Settings    string     `json:"settings"`
-	LogoURL     string     `json:"logo_url"`      // 组织Logo URL
+	LogoURL     string     `json:"logo_url"` // 组织Logo URL
 	Status      string     `json:"status"`
 	CreatedAt   *time.Time `json:"created_at"`
 	UpdatedAt   *time.Time `json:"updated_at"`
@@ -31,10 +31,10 @@ type TeachingGroup struct {
 	SchoolID    string     `json:"school_id"`
 	Subject     string     `json:"subject"`
 	GradeRange  string     `json:"grade_range"`
-	LeadUserID  *string    `json:"lead_user_id"`  // 兼容保留，实际组长通过成员角色管理
+	LeadUserID  *string    `json:"lead_user_id"` // 兼容保留，实际组长通过成员角色管理
 	Description string     `json:"description"`
 	Settings    string     `json:"settings"`
-	LogoURL     string     `json:"logo_url"`      // 组织Logo URL
+	LogoURL     string     `json:"logo_url"` // 组织Logo URL
 	Status      string     `json:"status"`
 	CreatedAt   *time.Time `json:"created_at"`
 	UpdatedAt   *time.Time `json:"updated_at"`
@@ -47,7 +47,7 @@ type TeachingGroupMember struct {
 	ID       string     `json:"id"`
 	GroupID  string     `json:"group_id"`
 	UserID   string     `json:"user_id"`
-	Role     string     `json:"role"`     // member=普通成员 / backbone=骨干教师 / lead=教研组长
+	Role     string     `json:"role"` // member=普通成员 / backbone=骨干教师 / lead=教研组长
 	JoinedAt *time.Time `json:"joined_at"`
 }
 
@@ -209,3 +209,56 @@ type GroupMemberItem struct {
 	Role        string     `json:"role"` // member / backbone / lead
 	JoinedAt    *time.Time `json:"joined_at"`
 }
+
+// ==================== 迭代一 新增：组织管理员模型（对应 organization_admins 表，P2-05） ====================
+//
+// organization_admins 是"组织全部管理员"的权威来源（迭代一新增）。
+// 一个组织可有多个管理员；与 organizations.admin_user_id 单字段并存
+// （旧字段保留作"主管理员"兼容，本表作"全部管理员"权威来源）。
+
+// 组织管理员类型常量
+const (
+	OrgAdminRoleRegion = "region_admin" // 区域管理员（org 须为 region 类型）
+	OrgAdminRoleSchool = "school_admin" // 学校管理员（org 须为 school 类型）
+)
+
+// ValidOrgAdminRoleTypes 有效的组织管理员类型列表
+var ValidOrgAdminRoleTypes = []string{OrgAdminRoleRegion, OrgAdminRoleSchool}
+
+// IsValidOrgAdminRoleType 校验组织管理员类型是否合法
+func IsValidOrgAdminRoleType(t string) bool {
+	for _, v := range ValidOrgAdminRoleTypes {
+		if v == t {
+			return true
+		}
+	}
+	return false
+}
+
+// OrganizationAdmin 组织管理员关联实体（对应 organization_admins 表）
+type OrganizationAdmin struct {
+	OrgID     string     `json:"org_id"`
+	UserID    string     `json:"user_id"`
+	RoleType  string     `json:"role_type"`  // region_admin / school_admin
+	CreatedBy *string    `json:"created_by"` // 任命人（可空）
+	CreatedAt *time.Time `json:"created_at"`
+}
+
+// OrganizationAdminItem 组织管理员列表单条（含用户名、显示名，供前端展示）
+// 对应 repository.ListOrgAdmins 的返回结构：
+//   CreatedBy 用 COALESCE(::text,'') 转为 string（空串表示无任命人/迁移数据）
+type OrganizationAdminItem struct {
+	OrgID       string     `json:"org_id"`
+	UserID      string     `json:"user_id"`
+	Username    string     `json:"username"`
+	DisplayName string     `json:"display_name"`
+	RoleType    string     `json:"role_type"`  // region_admin / school_admin
+	CreatedBy   string     `json:"created_by"` // 任命人ID（空串表示无）
+	CreatedAt   *time.Time `json:"created_at"`
+}
+
+// ==================== 发布目标组（供模板发布等场景复用） ====================
+//
+// 说明：PublishTargetGroup 历史上定义在 courseware_component.go（课件模板发布用）。
+// organization_repo.go 的 ListMyLeadOrBackboneGroups 也返回此类型。
+// 此处不重复定义，避免重复声明编译错误（仅作注释标注其归属）。

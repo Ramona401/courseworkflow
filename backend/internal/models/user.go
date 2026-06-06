@@ -10,11 +10,11 @@ import (
 // User 用户模型，对应数据库 users 表
 // v64(迭代3)新增：TeachingProfile 字段（JSONB，教学风格前测结果）
 type User struct {
-	ID           string     `json:"id"`
-	Username     string     `json:"username"`
-	DisplayName  string     `json:"display_name"`
-	PasswordHash string     `json:"-"`
-	// Role：admin / district_inspector / senior_operator / operator / viewer
+	ID           string `json:"id"`
+	Username     string `json:"username"`
+	DisplayName  string `json:"display_name"`
+	PasswordHash string `json:"-"`
+	// Role：admin / region_admin / district_inspector / senior_operator / operator / viewer
 	Role        string     `json:"role"`
 	Status      string     `json:"status"`
 	LastLoginAt *time.Time `json:"last_login_at"`
@@ -65,9 +65,9 @@ type UserInfo struct {
 	CreatedAt          *time.Time      `json:"created_at"`
 	UpdatedAt          *time.Time      `json:"updated_at"`
 	HasTeachingProfile bool            `json:"has_teaching_profile"`
-	OrgLogoURL         string          `json:"org_logo_url"`     // 用户所属组织的Logo URL（学校>区域>空）
-	OrgName            string          `json:"org_name"`         // 用户所属组织名称
-	PortalModules      map[string]bool `json:"portal_modules"`   // v172新增：门户板块可见性（三个key各true/false）
+	OrgLogoURL         string          `json:"org_logo_url"`   // 用户所属组织的Logo URL（学校>区域>空）
+	OrgName            string          `json:"org_name"`       // 用户所属组织名称
+	PortalModules      map[string]bool `json:"portal_modules"` // v172新增：门户板块可见性（三个key各true/false）
 }
 
 // ToUserInfo 将 User 转换为 UserInfo
@@ -157,7 +157,8 @@ type UserListResponse struct {
 
 const (
 	RoleAdmin             = "admin"
-	RoleDistrictInspector = "district_inspector" // v127新增：区域教研员
+	RoleRegionAdmin       = "region_admin"       // 迭代一(P2-06)新增：区域管理员（管人+积分，管到学校管理员一级）
+	RoleDistrictInspector = "district_inspector" // v127新增：区域教研员（管抽查），与区域管理员并存互不替代
 	RoleSeniorOperator    = "senior_operator"    // 学校管理员
 	RoleOperator          = "operator"           // 骨干教师
 	RoleViewer            = "viewer"             // 普通教师
@@ -168,8 +169,17 @@ const (
 	StatusDisabled = "disabled"
 )
 
-// ValidRoles 有效角色列表（v127新增 district_inspector）
-var ValidRoles = []string{RoleAdmin, RoleDistrictInspector, RoleSeniorOperator, RoleOperator, RoleViewer}
+// ValidRoles 有效角色列表
+// v127新增 district_inspector；迭代一新增 region_admin
+// 顺序约定：admin > region_admin > district_inspector > senior_operator > operator > viewer
+var ValidRoles = []string{
+	RoleAdmin,
+	RoleRegionAdmin,
+	RoleDistrictInspector,
+	RoleSeniorOperator,
+	RoleOperator,
+	RoleViewer,
+}
 var ValidStatuses = []string{StatusActive, StatusDisabled}
 
 func IsValidRole(role string) bool {

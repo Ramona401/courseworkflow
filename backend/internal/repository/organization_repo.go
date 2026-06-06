@@ -217,6 +217,66 @@ func GetSchoolsByRegion(ctx context.Context, regionID string) ([]*models.Organiz
 	return orgs, nil
 }
 
+// ==================== 迭代一 新增：组织树递归查询 ====================
+
+// ListDescendantSchoolIDs 递归查询某区域树下的所有学校ID（WITH RECURSIVE）
+//
+// 用途：
+//   - region_admin 数据范围解析（ResolveDataScope 的 region_admin 分支，Phase 2 接入）
+//   - 迭代二积分三级分配（区域→旗下所有学校）
+//
+// 语义：
+//   - 从 regionID 出发，沿 parent_id 链向下递归（支持多级区域嵌套，当前数据仅两级，递归退化为一层）
+//   - 只返回 type='school' 且 status='active' 的组织ID
+//   - 中间层 region（多级嵌套时）参与递归遍历但不计入返回结果（只要学校）
+//   - regionID 本身不是 school，不会出现在结果里
+//
+// fail-safe：regionID 为空 → 返回空切片（非 nil），由调用方按"空集"语义处理
+func ListDescendantSchoolIDs(ctx context.Context, regionID string) ([]string, error) {
+	if regionID == "" {
+		return []string{}, nil
+	}
+	// 递归 CTE：org_tree 收集 regionID 及其所有后代组织（不限类型）
+	// 最外层 SELECT 再过滤出其中的 school
+	query := `
+		WITH RECURSIVE org_tree AS (
+			-- 基准：起始区域本身，depth=0（仅用于启动递归，不计入结果）
+			SELECT id, type, parent_id, status, 0 AS depth
+			FROM organizations
+			WHERE id = $1
+			UNION ALL
+			-- 递归：所有 parent_id 指向已在树内节点的下级组织，depth 逐层+1
+			SELECT o.id, o.type, o.parent_id, o.status, t.depth + 1
+			FROM organizations o
+			JOIN org_tree t ON o.parent_id = t.id
+		)
+		-- depth > 0 排除起点本身：
+		--   起点若误传为 school，不会把它自己当成"下级学校"返回（堵住误用缺陷）；
+		--   起点若为 region（正常用法），region 自身非 school 本就不会被选，depth 过滤无副作用。
+		--   只返回通过 parent_id 链真正向下到达的下级学校。
+		SELECT id FROM org_tree
+		WHERE type = 'school' AND status = 'active' AND depth > 0
+		ORDER BY id
+	`
+	rows, err := database.DB.Query(ctx, query, regionID)
+	if err != nil {
+		return nil, fmt.Errorf("递归查询区域树下学校失败: %w", err)
+	}
+	defer rows.Close()
+
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历区域树学校结果失败: %w", err)
+	}
+	return ids, nil
+}
+
 // ==================== v172 新增：门户板块可见性查询 ====================
 
 // parsePortalModulesFromSettings 从组织 settings(JSONB字符串) 解析 portal_modules
@@ -691,6 +751,12 @@ func RemoveSchoolMember(ctx context.Context, schoolID string, userID string) err
 
 // IsUserInSchool 检查用户是否属于指定学校（v122 方案B 权威判定）
 // 同时兜底查 teaching_group_members，防止回填遗漏或新加入教研组但 school_members 漏写
+//
+// 注意（迭代一说明）：
+//   本函数保留教研组兜底，服务于"学校管理员校验本校成员、放行管理操作"等 6 处既有调用点
+//   （宁可多放行本校的人，也别漏掉只在教研组的人）。行为与历史一致，不改。
+//   而"数据隔离/防跨校越权"场景（教案/审核隔离）应改用下方 IsUserInSchoolStrict（无兜底），
+//   两者命名即表达语义差异，杜绝再次误用。
 func IsUserInSchool(ctx context.Context, userID string, schoolID string) (bool, error) {
 	var count int
 	// 主判：school_members
@@ -712,6 +778,32 @@ func IsUserInSchool(ctx context.Context, userID string, schoolID string) (bool, 
 	`, userID, schoolID).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("检查用户学校归属(教研组兜底)失败: %w", err)
+	}
+	return count > 0, nil
+}
+
+// IsUserInSchoolStrict 严格判定用户是否属于指定学校（迭代一新增：只认 school_members，无教研组兜底）
+//
+// 与 IsUserInSchool 的区别：
+//   - IsUserInSchool      ：school_members 主判 + 教研组兜底（宽松，给"放行管理操作"用）
+//   - IsUserInSchoolStrict：只认 school_members（严格，给"数据隔离/防跨校越权"用）
+//
+// 设计动机（P0-02 根治）：
+//   P0-02 漏洞的根源是"数据隔离误用了带兜底的归属判断"——只要加个教研组就能看跨校教案。
+//   严格版只认 school_members 这一唯一权威归属来源，加教研组也无法越权看跨校数据。
+//
+// 用途：Phase 4 教案/审核数据隔离收口时使用；以及任何需要严格归属判断的新场景。
+func IsUserInSchoolStrict(ctx context.Context, userID string, schoolID string) (bool, error) {
+	if userID == "" || schoolID == "" {
+		return false, nil
+	}
+	var count int
+	err := database.DB.QueryRow(ctx,
+		`SELECT COUNT(*) FROM school_members WHERE user_id = $1 AND school_id = $2`,
+		userID, schoolID,
+	).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("严格检查学校直接成员失败: %w", err)
 	}
 	return count > 0, nil
 }
@@ -751,6 +843,124 @@ func IsUserInSchoolByGroup(ctx context.Context, userID string, schoolID string) 
 		return false, fmt.Errorf("检查用户学校归属失败: %w", err)
 	}
 	return count > 0, nil
+}
+
+// ==================== 迭代一 新增：组织多管理员 CRUD（organization_admins 表，P2-05）====================
+//
+// organization_admins 是"组织全部管理员"的权威来源（迭代一新增）。
+// 与 organizations.admin_user_id 单字段并存：旧字段保留作"主管理员"兼容，本表作"全部管理员"权威。
+// role_type：region_admin（org 须为 region）/ school_admin（org 须为 school），由 service/handler 层保证类型匹配。
+
+// AddOrgAdmin 任命某用户为某组织的管理员
+// - 幂等：ON CONFLICT (org_id, user_id) 不报错（同组织同用户只一条）
+// - createdBy 任命人（审计用，可空）
+func AddOrgAdmin(ctx context.Context, orgID string, userID string, roleType string, createdBy string) error {
+	if orgID == "" || userID == "" {
+		return fmt.Errorf("orgID 或 userID 为空")
+	}
+	if roleType != "region_admin" && roleType != "school_admin" {
+		return fmt.Errorf("无效的管理员类型: %s", roleType)
+	}
+	var createdByArg interface{}
+	if createdBy == "" {
+		createdByArg = nil
+	} else {
+		createdByArg = createdBy
+	}
+	_, err := database.DB.Exec(ctx, `
+		INSERT INTO organization_admins (org_id, user_id, role_type, created_by)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (org_id, user_id) DO NOTHING
+	`, orgID, userID, roleType, createdByArg)
+	if err != nil {
+		return fmt.Errorf("任命组织管理员失败: %w", err)
+	}
+	return nil
+}
+
+// RemoveOrgAdmin 移除某组织的某管理员
+// - 找不到记录返回 ErrMemberNotFound（供上层判断）
+func RemoveOrgAdmin(ctx context.Context, orgID string, userID string) error {
+	result, err := database.DB.Exec(ctx,
+		`DELETE FROM organization_admins WHERE org_id = $1 AND user_id = $2`,
+		orgID, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("移除组织管理员失败: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrMemberNotFound
+	}
+	return nil
+}
+
+// ListOrgAdmins 列出某组织的全部管理员（含用户名、显示名、类型、任命时间）
+func ListOrgAdmins(ctx context.Context, orgID string) ([]*models.OrganizationAdminItem, error) {
+	query := `
+		SELECT oa.org_id, oa.user_id, u.username, u.display_name, oa.role_type,
+		       COALESCE(oa.created_by::text, ''), oa.created_at
+		FROM organization_admins oa
+		JOIN users u ON u.id = oa.user_id
+		WHERE oa.org_id = $1
+		ORDER BY oa.role_type, oa.created_at
+	`
+	rows, err := database.DB.Query(ctx, query, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("查询组织管理员列表失败: %w", err)
+	}
+	defer rows.Close()
+
+	items := []*models.OrganizationAdminItem{}
+	for rows.Next() {
+		item := &models.OrganizationAdminItem{}
+		if err := rows.Scan(
+			&item.OrgID, &item.UserID, &item.Username, &item.DisplayName,
+			&item.RoleType, &item.CreatedBy, &item.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("扫描组织管理员行失败: %w", err)
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+// CountOrgAdminsByUser 统计某用户当前还担任多少个组织的管理员
+// 用途：移除某组织管理员后，判断该用户是否还是任何组织的管理员（若否，service 层可据此决定是否降级其角色）
+func CountOrgAdminsByUser(ctx context.Context, userID string) (int, error) {
+	var count int
+	err := database.DB.QueryRow(ctx,
+		`SELECT COUNT(*) FROM organization_admins WHERE user_id = $1`,
+		userID,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("统计用户组织管理员身份失败: %w", err)
+	}
+	return count, nil
+}
+
+// ListRegionIDsByAdmin 查询某用户担任 region_admin 的所有区域组织ID
+// 用途：ResolveDataScope 的 region_admin 分支——确定该用户管辖哪些区域（Phase 2 接入）
+// 返回空切片（非 nil）表示该用户不是任何区域的管理员
+func ListRegionIDsByAdmin(ctx context.Context, userID string) ([]string, error) {
+	if userID == "" {
+		return []string{}, nil
+	}
+	rows, err := database.DB.Query(ctx,
+		`SELECT org_id FROM organization_admins WHERE user_id = $1 AND role_type = 'region_admin'`,
+		userID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("查询用户管辖区域失败: %w", err)
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
 }
 
 // UpdateOrganizationLogo 更新组织Logo URL
