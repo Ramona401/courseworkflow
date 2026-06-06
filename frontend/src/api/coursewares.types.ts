@@ -57,6 +57,7 @@ export interface CoursewareDetail {
   style_anchor_asset_id: string | null  // null=未设锚点
   style_anchor_vaoci: string            // 锚点VAOCI索引文本，空=未设
   style_anchor_url: string              // 锚点图公网URL（轮3：跨页显示缩略图，优先OSS地址）
+  kp_codes?: string                     // 课程知识库轮：本课件绑定的课标知识点编码数组JSON文本（如 ["MATH-G3-GM-001"]），空/缺=未绑定
   pages: CoursewarePage[]
   created_at: string
   updated_at: string
@@ -230,6 +231,46 @@ export interface SchemePreset {
   description: string
   grade_hint: string
   page_range: string
+}
+
+// ==================== 课程知识库类型（平台级公共，课件/教案复用） ====================
+
+/**
+ * 课标知识点（对应后端 curriculum_standards 表 / models.CurriculumKP）
+ * 权威/稳定/版本无关，定义各学科各学段知识点与三档深度，是难度自动适配的依据。
+ */
+export interface CurriculumKP {
+  id: string
+  subject: string               // 学科
+  stage: string                 // 学段
+  grade_num: number             // 具体年级1-9（0=学段级）
+  domain: string                // 领域（数与代数/图形与几何...）
+  theme: string                 // 主题
+  kp_code: string               // 知识点全局编码
+  kp_name: string               // 知识点名称
+  content_requirement: string   // 内容要求：学什么
+  academic_requirement: string  // 学业要求：学到什么程度（难度适配核心）
+  teaching_hint: string         // 教学提示
+  depth_level: number           // 难度档 1体验感知/2理解应用/3分析迁移
+  core_competency: string       // 对应核心素养
+  source_ref: string            // 出处
+  confidence: number            // 置信度0-100
+  sort_order: number            // 同年级内排序
+}
+
+/** 知识点查询响应 */
+export interface CurriculumKPResponse {
+  subject: string
+  grade: number
+  knowledge_points: CurriculumKP[] | null
+  total: number
+}
+
+/** 难度档 UI 配置（1-3档对应配色与中文标签） */
+export const CW_DEPTH_LEVEL_CONFIG: Record<number, { label: string; color: string; bg: string }> = {
+  1: { label: '体验感知', color: '#059669', bg: '#D1FAE5' },
+  2: { label: '理解应用', color: '#2563EB', bg: '#DBEAFE' },
+  3: { label: '分析迁移', color: '#7C3AED', bg: '#EDE9FE' },
 }
 
 // ==================== SSE 回调类型 ====================

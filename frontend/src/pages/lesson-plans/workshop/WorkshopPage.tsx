@@ -252,7 +252,12 @@ export default function WorkshopPage() {
         )
       },
       onMessageDone: (msg: ConversationMessage) => {
+        // v172：message_done 是每轮 AI 必发的"本轮已说完话"信号。
+        // 把"生成中"类状态的复位统一挂在这里（而非只挂在 content_update），
+        // 这样 analyze/design 等不发 content_update 的阶段，AI 一回复完
+        // 橙色"⏳生成中..."按钮也会立刻恢复，根治"出来了还显示生成中"。
         setIsThinking(false); setStreaming(null)
+        setFullGenerating(false)  // v172：一键生成出稿完成，复位按钮，不再只依赖 content_update
         setMessages(prev => [...prev, msg])
         if (isStageModeRef.current) {
           setIsStageProcessing(true)
@@ -294,6 +299,17 @@ export default function WorkshopPage() {
           content: `抱歉,遇到了一点问题:${err}。你可以重试或换个方式表达。`,
           created_at: new Date().toISOString(),
         }])
+      },
+      // v172（已撤销后端 done 补发后的现状说明）：
+      // 后端曾短暂尝试每轮补发 done，但因 SSE 是「教案会话级共享长连接」，发 done 会触发
+      // createLessonPlanSSE 的 es.close() 关掉整条连接，导致进入阶段的开场白那轮 done 关连接后、
+      // 随后「一键生成」无连接可收 → 已撤销后端补发。故当前后端正常流程【不再主动发 done】，
+      // 本回调实际不会被触发，仅作为无害兜底保留：若将来后端在「真正会话结束」时再发 done，
+      // 这里能复位「生成中」类状态。日常「生成中」复位由上方 onMessageDone 负责，不依赖本回调。
+      onDone: () => {
+        setIsThinking(false); setStreaming(null)
+        setIsStageProcessing(false)
+        setFullGenerating(false)
       },
       // v88新增:连接状态变化回调 → 驱动顶部指示器颜色
       onConnectionStateChange: (state: SSEConnectionState) => {

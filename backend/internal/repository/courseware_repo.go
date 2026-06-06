@@ -50,6 +50,7 @@ COALESCE(logo_url, ''), COALESCE(org_name, ''), COALESCE(nav_template_html, ''),
 pipeline_id, COALESCE(source_type, 'lesson_plan'), COALESCE(source_file_path, ''),
 COALESCE(edu_module_id, ''), COALESCE(published_version, 0),
 style_anchor_asset_id, COALESCE(style_anchor_vaoci, ''),
+COALESCE(kp_codes::text, ''),
 created_at, updated_at
 FROM coursewares WHERE id = $1`
 	cw := &models.Courseware{}
@@ -60,6 +61,7 @@ FROM coursewares WHERE id = $1`
 		&cw.PipelineID, &cw.SourceType, &cw.SourceFilePath,
 		&cw.EduModuleID, &cw.PublishedVersion,
 		&cw.StyleAnchorAssetID, &cw.StyleAnchorVAOCI,
+		&cw.KPCodes,
 		&cw.CreatedAt, &cw.UpdatedAt,
 	)
 	if err != nil {
@@ -198,15 +200,15 @@ func UpdateCoursewarePipelineID(ctx context.Context, id string, pipelineID strin
 	return err
 }
 
-// DeleteCourseware 删除课件（仅draft状态允许）
+// DeleteCourseware 删除课件（状态校验已上移到 service 层；此处仅按 id 删除，关联子表由 DB 外键 CASCADE 自动清理）
 func DeleteCourseware(ctx context.Context, id string) error {
-	sql := `DELETE FROM coursewares WHERE id = $1 AND status = 'draft'`
+	sql := `DELETE FROM coursewares WHERE id = $1`
 	tag, err := database.DB.Exec(ctx, sql, id)
 	if err != nil {
 		return fmt.Errorf("删除课件失败: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("课件不存在或状态不允许删除")
+		return fmt.Errorf("课件不存在或已被删除")
 	}
 	return nil
 }
@@ -366,6 +368,34 @@ WHERE courseware_id = $9 AND page_number = $10`
 	return nil
 }
 
+// UpdateCWPageIndexFields 仅回填单页的 AOCI 索引列（page_index + 三个 idx 冗余列）
+//
+// v0.44 新增：用于「后台异步补索引」与「夜间索引轮询」。
+// 严格只更新索引相关4列，绝不触碰 title/purpose/content_summary 等用户方案字段，
+// 也不动 html_content / status，避免误伤已生成的方案与课件内容。
+//
+// 参数：
+//
+//	pageIndex —— 层1风格的 AOCI 压缩索引原文（PAGE:..|KT:..|CG:..|IL:..|VF:.. + [K][A][I][R][C] 语义行）
+//	cg        —— 认知层次 1-6（idx_cognitive_level）
+//	il        —— 交互复杂度 1-5（idx_interaction_level）
+//	vf        —— 视觉形式编码（idx_visual_format，如 TH/IT/DG...）
+func UpdateCWPageIndexFields(ctx context.Context, coursewareID string, pageNumber int, pageIndex string, cg int, il int, vf string) error {
+	sql := `UPDATE courseware_pages SET page_index = $1,
+idx_cognitive_level = $2, idx_interaction_level = $3, idx_visual_format = $4,
+updated_at = $5
+WHERE courseware_id = $6 AND page_number = $7`
+	_, err := database.DB.Exec(ctx, sql,
+		pageIndex, cg, il, vf, time.Now(), coursewareID, pageNumber,
+	)
+	if err != nil {
+		return fmt.Errorf("回填课件页面索引列失败(courseware=%s page=%d): %w", coursewareID, pageNumber, err)
+	}
+	// 注意：不校验 RowsAffected==0 —— 后台/夜间回填时该页可能已被删除（老师改了方案），
+	// 此时静默跳过即可，不应视为错误中断整批回填。
+	return nil
+}
+
 // UpdateCWPageHTML 更新页面生成的HTML代码
 func UpdateCWPageHTML(ctx context.Context, pageID string, htmlContent string, placeholderMap string, matchedIDs string, status string) error {
 	sql := `UPDATE courseware_pages SET html_content = $1, placeholder_map = $2::jsonb,
@@ -440,6 +470,20 @@ func ClearCoursewareStyleAnchor(ctx context.Context, id string) error {
 	sql := `UPDATE coursewares SET style_anchor_asset_id = NULL, style_anchor_vaoci = NULL, updated_at = $1 WHERE id = $2`
 	_, err := database.DB.Exec(ctx, sql, time.Now(), id)
 	return err
+}
+
+// ==================== 课程知识库轮：kp_codes 写入 ====================
+
+// UpdateCoursewareKPCodes 写入课件勾选的课标知识点编码数组（JSON文本）
+// kpCodesJSON 为 JSON 数组文本（如 `["MATH-G3-NA-001","MATH-G3-GG-002"]`）；
+// 空串时写 NULL（nullIfEmpty 处理），语义=未勾选。供"从主题创建"勾选后持久化。
+func UpdateCoursewareKPCodes(ctx context.Context, id string, kpCodesJSON string) error {
+	sql := `UPDATE coursewares SET kp_codes = $1::jsonb, updated_at = $2 WHERE id = $3`
+	_, err := database.DB.Exec(ctx, sql, nullIfEmpty(kpCodesJSON), time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("写入课件知识点编码失败: %w", err)
+	}
+	return nil
 }
 
 // ==================== 辅助函数 ====================

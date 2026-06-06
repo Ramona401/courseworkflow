@@ -15,12 +15,40 @@ package services
 //   1-6. 获取教案→调层1 AI→解析OVERVIEW+PAGE索引
 //   7-8. 调层2 AI→解析JSON→合并索引+方案
 //   9-11. 写入数据库→SSE广播
+//
+// 注：层2 JSON 解析（parseSchemeJSON 及其多重兜底、cwExtractJSONArray /
+//     cwExtractJSONObjects / cwExtractSchemeByFields / cwTruncate）已拆分至
+//     同包文件 courseware_index_json.go，保持本文件聚焦业务编排。
+//
+// v0.43 修复（RefineIndex 修改方案不看原文/doc来源被硬拦）：
+//   - RefineIndex 去除 LessonPlanID==nil 硬拦截，改为按 source_type 注入原文上下文：
+//       lesson_plan → 教案正文；doc_upload → 重新读docx原文；其余 → 用课件基本信息
+//   - RefineIndex 内置 docx 原文读取（archive/zip + encoding/xml，不依赖 PPT 服务，
+//     避免与 courseware_ppt_service / courseware_doc_service 形成循环依赖）
+//   - 修改提示词补页数下限约束，避免修改后被概括成极少页
+//
+// v0.44 新增（doc/ppt 直翻路径补脉络与索引，体验Y+方案）：
+//   - GenerateOverviewFromPages：方案出页后用 haiku 快速生成"哪几页干什么"脉络（前台，几秒）
+//   - BackfillPageIndexAsync：后台异步对照"教案原文+当前方案"为每页生成 AOCI 索引并回填
+//     （haiku，整批，复用 parseAOCIIndexOutput 解析，失败不影响主流程）
+//
+// v0.44.1 修复（后台补索引在"改过方案"时可能静默贴错索引）：
+//   BackfillPageIndexAsync 原按"解析顺序第i个 ↔ 当前页第i个"对齐。若老师在后台
+//   任务运行的窗口内改了方案（删页/调序），会导致索引贴错页（比留空更危险）。
+//   本次加双保险：
+//     A. 页数守卫——记录喂给AI的页数，回填前重新查当前页，页数不一致则整体放弃
+//        本次回填（留给夜间轮询补），绝不在不确定对齐时硬写。
+//     B. 标题锚点匹配——不再纯靠顺序，用 AI 回显的页标题(TT) 与当前页标题匹配定位
+//        具体 page_number 再写；匹配不上的块跳过。宁可留空也不贴错。
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -100,8 +128,8 @@ func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID
 		EventType: CWSSEIndexStart,
 		Data: map[string]interface{}{
 			"courseware_id": coursewareID,
-			"lesson_plan":  lp.Title,
-			"message":      "正在分析教案内容，生成课件方案...",
+			"lesson_plan":   lp.Title,
+			"message":       "正在分析教案内容，生成课件方案...",
 		},
 	})
 
@@ -241,9 +269,9 @@ func (s *CoursewareIndexService) saveAndBroadcast(ctx context.Context, coursewar
 	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
 		EventType: CWSSEIndexDone,
 		Data: map[string]interface{}{
-			"courseware_id":   coursewareID,
+			"courseware_id":  coursewareID,
 			"page_count":     len(pages),
-			"index_overview":  overview,
+			"index_overview": overview,
 			"message":        fmt.Sprintf("课件方案生成完成，共 %d 页", len(pages)),
 		},
 	})
@@ -272,126 +300,6 @@ func (s *CoursewareIndexService) buildLayer1UserPrompt(lp *models.LessonPlan, co
 	}
 	sb.WriteString("\n\n请严格按照字典格式输出（先OVERVIEW:概述，再PAGE:页面索引，不要任何格式之外的说明文字）：")
 	return sb.String()
-}
-
-// ==================== 层2 JSON解析 ====================
-
-// parseSchemeJSON 解析层2 AI返回的JSON数组
-// parseSchemeJSON 解析层2 AI返回的JSON数组
-// 使用宽容策略：先尝试直接解析，失败则修复JSON后重试
-func (s *CoursewareIndexService) parseSchemeJSON(aiOutput string) ([]cwSchemeItem, error) {
-	text := strings.TrimSpace(aiOutput)
-	text = cwStripCodeFences(text)
-
-	jsonStr := cwExtractJSONArray(text)
-	if jsonStr == "" {
-		return nil, fmt.Errorf("层2输出中未找到JSON数组")
-	}
-
-	// 第一次尝试：直接解析
-	var schemes []cwSchemeItem
-	if err := json.Unmarshal([]byte(jsonStr), &schemes); err == nil && len(schemes) > 0 {
-		return schemes, nil
-	}
-
-	// 第二次尝试：清理中文标点后解析
-	cleaned := cwCleanChinesePunctuation(jsonStr)
-	if err := json.Unmarshal([]byte(cleaned), &schemes); err == nil && len(schemes) > 0 {
-		return schemes, nil
-	}
-
-	// 第三次尝试：修复JSON值内部的未转义引号
-	fixed := cwFixJSONQuotes(cleaned)
-	if err := json.Unmarshal([]byte(fixed), &schemes); err == nil && len(schemes) > 0 {
-		log.Printf("[courseware_index] 层2 JSON修复后解析成功")
-		return schemes, nil
-	}
-
-	// 第四次尝试：逐个对象提取（最宽容）
-	schemes = cwExtractJSONObjects(cleaned)
-	if len(schemes) > 0 {
-		log.Printf("[courseware_index] 层2通过逐对象提取成功: %d个", len(schemes))
-		return schemes, nil
-	}
-
-	return nil, fmt.Errorf("层2 JSON解析失败(四重兜底均失败), 前200字: %s", cwTruncate(jsonStr, 200))
-}
-
-// cwFixJSONQuotes 修复JSON值内部的未转义双引号
-// 策略：在JSON字符串值内部，如果遇到"不是跟在\后面的"，且后面不是,:]}等JSON分隔符，则转义它
-func cwFixJSONQuotes(s string) string {
-	var result strings.Builder
-	inString := false
-	result.Grow(len(s))
-
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-
-		if c == '"' {
-			if !inString {
-				// 进入字符串
-				inString = true
-				result.WriteByte(c)
-			} else {
-				// 在字符串内遇到引号——判断是结束引号还是内嵌引号
-				// 检查后面的字符：如果是 , : ] } 或空白后跟这些，则是结束引号
-				isEnd := false
-				for j := i + 1; j < len(s); j++ {
-					next := s[j]
-					if next == ' ' || next == '\t' || next == '\n' || next == '\r' {
-						continue
-					}
-					if next == ',' || next == ':' || next == ']' || next == '}' || next == '"' {
-						isEnd = true
-					}
-					break
-				}
-				// 检查前面是否是反斜杠转义
-				if i > 0 && s[i-1] == '\\' {
-					result.WriteByte(c)
-					continue
-				}
-				if isEnd {
-					inString = false
-					result.WriteByte(c)
-				} else {
-					// 内嵌引号，转义为空（直接删除）
-					// 不写入任何东西，等于删除这个引号
-				}
-			}
-		} else {
-			result.WriteByte(c)
-		}
-	}
-	return result.String()
-}
-
-// cwExtractJSONObjects 逐个提取JSON对象（最宽容的兜底方案）
-// 按page_number/title/purpose等关键字段逐个提取
-func cwExtractJSONObjects(text string) []cwSchemeItem {
-	var items []cwSchemeItem
-
-	// 按 "page_number" 分割
-	parts := strings.Split(text, "\"page_number\"")
-	if len(parts) < 2 {
-		return nil
-	}
-
-	for i := 1; i < len(parts); i++ {
-		chunk := "\"page_number\"" + parts[i]
-		// 尝试找到这个对象的结束位置
-		braceEnd := strings.Index(chunk, "}")
-		if braceEnd < 0 {
-			continue
-		}
-		objStr := "{" + chunk[:braceEnd+1]
-		
-		var item cwSchemeItem
-		if err := json.Unmarshal([]byte(objStr), &item); err == nil && item.Title != "" {
-			items = append(items, item)
-		}
-	}
-	return items
 }
 
 // ==================== 合并层1索引+层2方案 ====================
@@ -722,16 +630,10 @@ func cwJoinNonEmpty(sep string, parts ...string) string {
 	return strings.Join(nonEmpty, sep)
 }
 
-// cwExtractJSONArray 从文本中提取JSON数组
-func cwExtractJSONArray(text string) string {
-	start := strings.Index(text, "[")
-	end := strings.LastIndex(text, "]")
-	if start >= 0 && end > start {
-		return text[start : end+1]
-	}
-	return ""
-}
-
+// cwStripCodeFences 剥离Markdown代码围栏
+// 注：此函数为跨服务共享公共工具（template_extract_service / template_refine_service
+//
+//	及其测试均依赖），保持在本文件，请勿随意改动其行为。
 func cwStripCodeFences(text string) string {
 	if strings.HasPrefix(text, "```") {
 		idx := strings.Index(text, "\n")
@@ -768,45 +670,101 @@ func cwSplitBlocks(text string) []string {
 	return blocks
 }
 
-func cwTruncate(s string, maxLen int) string {
-	runes := []rune(s)
-	if len(runes) <= maxLen {
-		return s
-	}
-	return string(runes[:maxLen]) + "..."
-}
-
 // cwCleanChinesePunctuation 清理JSON字符串中的中文标点符号
 // AI在生成JSON时经常使用中文标点，导致JSON解析失败
 // 关键策略：中文引号必须删除（不能替换为英文引号，否则破坏JSON结构）
+//
+// 注：此函数为跨服务共享公共工具（template_extract_service / template_refine_service
+//
+//	及其测试均依赖），保持在本文件，请勿随意改动其行为。
 func cwCleanChinesePunctuation(s string) string {
 	replacer := strings.NewReplacer(
-		"\u201c", "", "\u201d", "",         // 中文双引号 " " → 删除
-		"\u2018", "", "\u2019", "",         // 中文单引号 ' ' → 删除
-		"\u3001", ",", "\uff0c", ",",       // 顿号、全角逗号
-		"\uff1a", ":", "\uff1b", ";",       // 全角冒号、分号
-		"\uff08", "(", "\uff09", ")",       // 全角括号
-		"\u300a", "", "\u300b", "",         // 书名号 《 》→ 删除
-		"\u3008", "", "\u3009", "",         // 尖括号 〈 〉→ 删除
-		"\u2014\u2014", "-",               // 破折号 ——
-		"\u2014", "-",                       // 单个破折号 —
-		"\u2026", "...",                     // 省略号 …
-		"\uff01", "!", "\uff1f", "?",       // 全角感叹号、问号
+		"\u201c", "", "\u201d", "", // 中文双引号 " " → 删除
+		"\u2018", "", "\u2019", "", // 中文单引号 ' ' → 删除
+		"\u3001", ",", "\uff0c", ",", // 顿号、全角逗号
+		"\uff1a", ":", "\uff1b", ";", // 全角冒号、分号
+		"\uff08", "(", "\uff09", ")", // 全角括号
+		"\u300a", "", "\u300b", "", // 书名号 《 》→ 删除
+		"\u3008", "", "\u3009", "", // 尖括号 〈 〉→ 删除
+		"\u2014\u2014", "-", // 破折号 ——
+		"\u2014", "-", // 单个破折号 —
+		"\u2026", "...", // 省略号 …
+		"\uff01", "!", "\uff1f", "?", // 全角感叹号、问号
 	)
 	return replacer.Replace(s)
+}
+
+// cwFixJSONQuotes 修复JSON值内部的未转义双引号
+// 策略：在JSON字符串值内部，如果遇到"不是跟在\后面的"，且后面不是,:]}等JSON分隔符，则转义它
+//
+// 注：此函数为跨服务共享公共工具（template_extract_service / template_refine_service
+//
+//	及其测试均依赖），保持在本文件，请勿随意改动其行为。
+func cwFixJSONQuotes(s string) string {
+	var result strings.Builder
+	inString := false
+	result.Grow(len(s))
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+
+		if c == '"' {
+			if !inString {
+				// 进入字符串
+				inString = true
+				result.WriteByte(c)
+			} else {
+				// 在字符串内遇到引号——判断是结束引号还是内嵌引号
+				// 检查后面的字符：如果是 , : ] } 或空白后跟这些，则是结束引号
+				isEnd := false
+				for j := i + 1; j < len(s); j++ {
+					next := s[j]
+					if next == ' ' || next == '\t' || next == '\n' || next == '\r' {
+						continue
+					}
+					if next == ',' || next == ':' || next == ']' || next == '}' || next == '"' {
+						isEnd = true
+					}
+					break
+				}
+				// 检查前面是否是反斜杠转义
+				if i > 0 && s[i-1] == '\\' {
+					result.WriteByte(c)
+					continue
+				}
+				if isEnd {
+					inString = false
+					result.WriteByte(c)
+				} else {
+					// 内嵌引号，转义为空（直接删除）
+					// 不写入任何东西，等于删除这个引号
+				}
+			}
+		} else {
+			result.WriteByte(c)
+		}
+	}
+	return result.String()
 }
 
 // ==================== v136新增：AI修改方案 ====================
 
 // RefineIndex 根据用户反馈修改课件方案（异步执行，通过SSE推送进度）
+//
+// v0.43 修复：
+//   - 去除 LessonPlanID==nil 硬拦截，doc_upload / topic_direct / ppt_upload 也可修改
+//   - 按 source_type 注入原文上下文（教案正文 / docx原文 / 课件基本信息）
+//   - 补页数下限约束，避免修改后被概括成极少页
+//
 // 流程：
-//   1. 获取当前全部页面方案
-//   2. 拼接用户反馈+当前方案+教案内容
-//   3. 调用层2 AI（scheme场景）重新生成修改后的方案JSON
-//   4. 解析JSON,保留层1索引,仅更新层2用户字段
-//   5. 写入数据库并SSE广播
+//  1. 获取课件 + 当前全部页面方案
+//  2. 按来源取原文上下文
+//  3. 拼接 原文上下文 + 当前方案 + 用户反馈
+//  4. 调用AI（courseware_scheme场景，降级scanner）重新生成方案JSON
+//  5. 解析JSON，尽量保留层1索引，仅更新层2用户字段
+//  6. 写入数据库并SSE广播
 func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID string, userID string, feedback string) error {
-	// ---- 1. 获取课件和教案信息 ----
+	// ---- 1. 获取课件 ----
 	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
 	if err != nil {
 		s.broadcastError(coursewareID, "课件不存在: "+err.Error())
@@ -817,42 +775,55 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 		return fmt.Errorf("无权操作此课件")
 	}
 
-	// 获取当前全部页面
+	// 获取当前全部页面（修改方案的基础）
 	pages, err := repository.ListCoursewarePages(ctx, coursewareID)
 	if err != nil || len(pages) == 0 {
 		s.broadcastError(coursewareID, "当前没有可修改的方案页面")
 		return fmt.Errorf("当前没有可修改的方案页面")
 	}
 
-	// 获取关联教案
-	if cw.LessonPlanID == nil || *cw.LessonPlanID == "" {
-		s.broadcastError(coursewareID, "课件未关联教案，无法生成方案")
-		return fmt.Errorf("课件未关联教案")
-	}
-	lp, err := repository.GetLessonPlanByID(ctx, *cw.LessonPlanID)
-	if err != nil {
-		s.broadcastError(coursewareID, "关联教案不存在")
-		return fmt.Errorf("关联教案不存在: %w", err)
-	}
+	// ---- 2. 按来源取原文上下文 + 课件基本信息 ----
+	// 注意：不再因 LessonPlanID 为空而拒绝；doc/topic/ppt 来源同样支持修改方案
+	title, subject, grade, sourceContext := s.buildRefineSourceContext(ctx, cw)
 
 	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
 		EventType: CWSSEIndexStart,
 		Data: map[string]interface{}{
 			"courseware_id": coursewareID,
-			"message":      "正在根据您的意见修改方案...",
+			"message":       "正在根据您的意见修改方案...",
 		},
 	})
 
-	// ---- 2. 构建修改提示词 ----
+	// ---- 3. 构建修改提示词 ----
 	var promptBuf strings.Builder
-	promptBuf.WriteString("你是课件方案修改专家。用户对当前课件方案提出了修改意见，请根据意见调整方案。\n\n")
-	promptBuf.WriteString(fmt.Sprintf("## 课件基本信息\n- 标题：%s\n- 学科：%s\n- 年级：%s\n\n", lp.Title, lp.Subject, lp.Grade))
+	promptBuf.WriteString("你是课件方案修改专家。用户对当前课件方案提出了修改意见，请结合下方的教案/原始内容，按意见调整方案。\n\n")
+	promptBuf.WriteString(fmt.Sprintf("## 课件基本信息\n- 标题：%s\n- 学科：%s\n- 年级：%s\n\n", title, subject, grade))
+
+	// 原文上下文（教案正文 / docx原文）——有则注入，供AI据实修改而非凭空发挥
+	if strings.TrimSpace(sourceContext) != "" {
+		promptBuf.WriteString("## 教案/原始内容（修改时须依据此内容）\n\n")
+		// 截断，避免超出上下文
+		srcText := sourceContext
+		if len([]rune(srcText)) > 24000 {
+			srcText = string([]rune(srcText)[:24000]) + "\n\n[内容过长，已截取前24000字]"
+		}
+		promptBuf.WriteString(srcText)
+		promptBuf.WriteString("\n\n")
+	}
+
 	promptBuf.WriteString("## 当前方案（需要修改）\n")
 	for _, p := range pages {
 		promptBuf.WriteString(fmt.Sprintf("第%d页 | 标题：%s | 目的：%s | 概要：%s | 交互：%s | 视觉：%s | 复杂度：%d\n",
 			p.PageNumber, p.Title, p.Purpose, p.ContentSummary, p.InteractionType, p.VisualFormat, p.EstimatedComplexity))
 	}
 	promptBuf.WriteString(fmt.Sprintf("\n## 用户修改意见\n%s\n\n", feedback))
+
+	// 页数下限约束：若用户要求增加页数，给出明确区间，避免AI缩水
+	minPages, rangeDesc := cwRecommendPageRange(grade, len([]rune(sourceContext)))
+	promptBuf.WriteString("## 篇幅与页数要求\n")
+	promptBuf.WriteString(fmt.Sprintf("- 若需扩充内容，目标页数区间参考：%s；一般情况下不应少于 %d 页（除非用户明确要求精简）。\n", rangeDesc, minPages))
+	promptBuf.WriteString("- 严禁把方案概括成一页或极少数几页。\n\n")
+
 	promptBuf.WriteString("## 输出要求\n")
 	promptBuf.WriteString("请输出修改后的完整方案，格式为JSON数组。每个元素包含以下字段：\n")
 	promptBuf.WriteString("page_number(int), title(string), purpose(string), content_summary(string), interaction_type(string), visual_format(string), media_requirements(string), estimated_complexity(int 1-5)\n")
@@ -861,7 +832,7 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 	promptBuf.WriteString("视觉形式可选：text_heavy/image_text/diagram/chart/timeline/comparison/gallery/fullscreen_media\n")
 	promptBuf.WriteString("\n请只输出JSON数组，不要有任何额外说明文字。")
 
-	// ---- 3. 调用AI ----
+	// ---- 4. 调用AI ----
 	schemePromptObj, sErr := repository.GetCurrentPromptByKey("prompt_courseware_scheme")
 	systemPrompt := ""
 	if sErr == nil {
@@ -898,7 +869,7 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 		return fmt.Errorf("AI调用失败: %w", err)
 	}
 
-	// ---- 4. 解析AI输出的JSON ----
+	// ---- 5. 解析AI输出的JSON ----
 	schemes, err := s.parseSchemeJSON(callResult.Content)
 	if err != nil {
 		s.broadcastError(coursewareID, "解析修改后的方案失败: "+err.Error())
@@ -909,7 +880,7 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 		return fmt.Errorf("AI未返回有效方案")
 	}
 
-	// ---- 5. 构建新的CoursewarePage列表 ----
+	// ---- 6. 构建新的CoursewarePage列表 ----
 	// 尽量保留原有页面的层1索引信息
 	oldPageMap := make(map[int]*models.CoursewarePage)
 	for _, p := range pages {
@@ -955,23 +926,170 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 		p.PageNumber = i + 1
 	}
 
-	log.Printf("[courseware_index] RefineIndex完成: cw=%s oldPages=%d newPages=%d model=%s tokens=%d feedback=%s",
-		coursewareID, len(pages), len(newPages), callResult.ModelUsed, callResult.TokensUsed, cwTruncate(feedback, 50))
+	log.Printf("[courseware_index] RefineIndex完成: cw=%s source=%s oldPages=%d newPages=%d model=%s tokens=%d feedback=%s",
+		coursewareID, cw.SourceType, len(pages), len(newPages), callResult.ModelUsed, callResult.TokensUsed, cwTruncate(feedback, 50))
 
-	// ---- 6. 保存并广播 ----
+	// ---- 7. 保存并广播 ----
 	// 保留原有概述不变
 	return s.saveAndBroadcast(ctx, coursewareID, cw.IndexOverview, newPages)
 }
 
+// buildRefineSourceContext 为"修改方案"按课件来源装配 标题/学科/年级 与原文上下文
+// 返回 (title, subject, grade, sourceContext)
+//   - lesson_plan：title/subject/grade 取教案，sourceContext 取教案正文
+//   - doc_upload  ：title/subject/grade 取课件，sourceContext 读取docx原文
+//   - 其它(topic/ppt/3d/html)：取课件基本信息，sourceContext 为空（用当前方案即可修改）
+//
+// 设计要点：本函数在 index_service 内部完成 docx 读取，不调用 PPT/Doc 服务，
+// 避免与 courseware_ppt_service / courseware_doc_service 形成循环依赖。
+func (s *CoursewareIndexService) buildRefineSourceContext(ctx context.Context, cw *models.Courseware) (string, string, string, string) {
+	title := cw.Title
+	subject := cw.Subject
+	grade := cw.Grade
+	sourceContext := ""
+
+	switch cw.SourceType {
+	case models.CWSourceLessonPlan:
+		// 关联教案：优先用教案正文作为修改依据
+		if cw.LessonPlanID != nil && *cw.LessonPlanID != "" {
+			lp, err := repository.GetLessonPlanByID(ctx, *cw.LessonPlanID)
+			if err == nil && lp != nil {
+				if strings.TrimSpace(lp.Title) != "" {
+					title = lp.Title
+				}
+				if strings.TrimSpace(lp.Subject) != "" {
+					subject = lp.Subject
+				}
+				if strings.TrimSpace(lp.Grade) != "" {
+					grade = lp.Grade
+				}
+				sourceContext = s.extractLessonPlanContent(lp)
+			} else {
+				log.Printf("[courseware_index] RefineIndex 读取关联教案失败: cw=%s err=%v", cw.ID, err)
+			}
+		}
+
+	case models.CWSourceDocUpload:
+		// Word文档来源：重新读取已存储的docx原文
+		if cw.SourceFilePath != "" {
+			docFullPath := filepath.Join(DocUploadDir, cw.SourceFilePath)
+			text, err := readDocxFullText(docFullPath)
+			if err == nil && strings.TrimSpace(text) != "" {
+				sourceContext = text
+			} else {
+				log.Printf("[courseware_index] RefineIndex 读取docx原文失败: cw=%s path=%s err=%v", cw.ID, docFullPath, err)
+			}
+		}
+	}
+
+	// topic_direct / ppt_upload / 3d_single / html_import：sourceContext 留空，
+	// 仅依据当前方案 + 用户意见进行修改（这些来源原文价值有限或已体现在当前方案中）
+	return title, subject, grade, sourceContext
+}
+
+// readDocxFullText 读取.docx文件的全部正文文本（index_service内部独立实现，无外部依赖）
+// 与 courseware_doc_service.ExtractDocContent 逻辑等价，但不引入服务间依赖，
+// 仅供 RefineIndex 在doc来源时读取原文使用。
+func readDocxFullText(docxPath string) (string, error) {
+	r, err := zip.OpenReader(docxPath)
+	if err != nil {
+		return "", fmt.Errorf("打开docx文件失败: %w", err)
+	}
+	defer r.Close()
+
+	var docFile *zip.File
+	for _, f := range r.File {
+		if f.Name == "word/document.xml" {
+			docFile = f
+			break
+		}
+	}
+	if docFile == nil {
+		return "", fmt.Errorf("docx文件中未找到 word/document.xml")
+	}
+
+	rc, err := docFile.Open()
+	if err != nil {
+		return "", fmt.Errorf("打开document.xml失败: %w", err)
+	}
+	defer rc.Close()
+
+	data, err := readAllFromReader(rc)
+	if err != nil {
+		return "", fmt.Errorf("读取document.xml失败: %w", err)
+	}
+
+	// 按 <w:p> 段落边界提取，<w:t> 内文本拼接
+	decoder := xml.NewDecoder(strings.NewReader(string(data)))
+	decoder.Strict = false
+	decoder.AutoClose = xml.HTMLAutoClose
+
+	var paragraphs []string
+	var cur []string
+	inP := false
+	for {
+		tok, e := decoder.Token()
+		if e != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "p" {
+				inP = true
+				cur = nil
+			}
+		case xml.EndElement:
+			if t.Name.Local == "p" && inP {
+				inP = false
+				para := strings.TrimSpace(strings.Join(cur, ""))
+				if para != "" {
+					paragraphs = append(paragraphs, para)
+				}
+				cur = nil
+			}
+		case xml.CharData:
+			if inP {
+				cur = append(cur, string(t))
+			}
+		}
+	}
+	return strings.Join(paragraphs, "\n\n"), nil
+}
+
+// readAllFromReader 读取io.Reader全部内容（避免在本文件引入io包仅用一次的额外import面）
+func readAllFromReader(rc interface {
+	Read(p []byte) (int, error)
+}) ([]byte, error) {
+	var buf []byte
+	tmp := make([]byte, 32*1024)
+	for {
+		n, err := rc.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil {
+			if err.Error() == "EOF" {
+				return buf, nil
+			}
+			// io.EOF 的字符串也是 "EOF"，上面已处理；其余错误返回
+			if n == 0 {
+				return buf, err
+			}
+		}
+		if n == 0 {
+			return buf, nil
+		}
+	}
+}
 
 // ==================== v0.42新增：从主题直接生成课件索引 ====================
 
 // GenerateIndexFromTopic 从主题直接生成课件索引（无教案，纯AI规划）
 // 流程：
-//   1. 校验课件状态和权限
-//   2. 用主题信息构建提示词，跳过层1（无教案内容可压缩）
-//   3. 直接调层2 AI生成方案JSON
-//   4. 写入数据库并SSE广播
+//  1. 校验课件状态和权限
+//  2. 用主题信息构建提示词，跳过层1（无教案内容可压缩）
+//  3. 直接调层2 AI生成方案JSON
+//  4. 写入数据库并SSE广播
 func (s *CoursewareIndexService) GenerateIndexFromTopic(ctx context.Context, coursewareID string, userID string, req *models.CreateCoursewareFromTopicRequest, preset string) error {
 	// ---- 1. 获取课件信息 ----
 	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
@@ -997,12 +1115,15 @@ func (s *CoursewareIndexService) GenerateIndexFromTopic(ctx context.Context, cou
 		EventType: CWSSEIndexStart,
 		Data: map[string]interface{}{
 			"courseware_id": coursewareID,
-			"message":      "正在根据主题规划课件方案...",
+			"message":       "正在根据主题规划课件方案...",
 		},
 	})
 
 	// ---- 3. 构建主题直接生成的提示词 ----
-	userPrompt := s.buildTopicDirectPrompt(req, preset)
+	// 课程知识库轮：若前端传了知识点编码，先查 curriculum_standards 构建难度适配约束段落
+	// 为空/查询失败/查不到时 constraint 为空串，buildTopicDirectPrompt 退回原有纯主题规划逻辑
+	curriculumConstraint := BuildCurriculumConstraint(ctx, req.KPCodes)
+	userPrompt := s.buildTopicDirectPrompt(req, preset, curriculumConstraint)
 
 	// ---- 4. 加载提示词模板（复用 courseware_scheme 场景） ----
 	schemePrompt, sErr := repository.GetCurrentPromptByKey("prompt_courseware_scheme")
@@ -1092,7 +1213,7 @@ func (s *CoursewareIndexService) GenerateIndexFromTopic(ctx context.Context, cou
 }
 
 // buildTopicDirectPrompt 构建主题直接生成的用户提示词
-func (s *CoursewareIndexService) buildTopicDirectPrompt(req *models.CreateCoursewareFromTopicRequest, preset string) string {
+func (s *CoursewareIndexService) buildTopicDirectPrompt(req *models.CreateCoursewareFromTopicRequest, preset string, curriculumConstraint string) string {
 	var sb strings.Builder
 	sb.WriteString("你是K12课件规划专家。\n根据以下信息，设计一份完整的课件大纲（每页详细说明）。\n\n")
 	sb.WriteString(fmt.Sprintf("学科: %s\n", req.Subject))
@@ -1105,6 +1226,11 @@ func (s *CoursewareIndexService) buildTopicDirectPrompt(req *models.CreateCourse
 	}
 	if req.ExtraNotes != "" {
 		sb.WriteString(fmt.Sprintf("额外说明: %s\n", req.ExtraNotes))
+	}
+
+	// 课程知识库轮：注入课标知识点与难度适配约束（非空时启用"难度自动适配"）
+	if strings.TrimSpace(curriculumConstraint) != "" {
+		sb.WriteString(curriculumConstraint)
 	}
 
 	// 注入方案结构预设
@@ -1129,4 +1255,274 @@ func (s *CoursewareIndexService) buildTopicDirectPrompt(req *models.CreateCourse
 	sb.WriteString("视觉形式可选：text_heavy/image_text/diagram/chart/timeline/comparison/gallery/fullscreen_media\n\n")
 	sb.WriteString("请只输出JSON数组，不要有任何额外说明文字。")
 	return sb.String()
+}
+
+// ==================== v0.44新增：直翻路径补脉络（前台快速）与补索引（后台异步） ====================
+
+// GenerateOverviewFromPages 根据已生成的页面方案，用 haiku 快速生成"哪几页干什么"的脉络概述
+//
+// 用途：doc/ppt 直翻路径出页后，前台立即调用此方法补一段真脉络（替代套话overview）。
+// 输入小（仅页码+标题+目的）、模型便宜（scanner/haiku）、几秒返回，不显著拖慢体验。
+//
+// 返回脉络字符串；失败或为空时返回空串，调用方应退回套话overview，不阻塞主流程。
+func (s *CoursewareIndexService) GenerateOverviewFromPages(
+	ctx context.Context, userID string,
+	title string, subject string, grade string,
+	pages []*models.CoursewarePage,
+) string {
+	if len(pages) == 0 {
+		return ""
+	}
+
+	// 构建提示词：喂页码+标题+目的，要求输出连贯脉络
+	var sb strings.Builder
+	sb.WriteString("你是课件结构分析专家。下面是一份课件的逐页方案，请你用一段连贯的中文概括这份课件的整体脉络。\n\n")
+	sb.WriteString(fmt.Sprintf("课件标题：%s\n学科：%s\n年级：%s\n总页数：%d\n\n", title, subject, grade, len(pages)))
+	sb.WriteString("## 逐页方案\n")
+	for _, p := range pages {
+		sb.WriteString(fmt.Sprintf("第%d页：%s —— %s\n", p.PageNumber, p.Title, p.Purpose))
+	}
+	sb.WriteString("\n## 输出要求\n")
+	sb.WriteString("1. 用80-150字概括，说明这份课件分几个部分、哪几页讲什么，例如\"第1-3页为情境导入，第4-8页讲解核心概念，第9-12页为分组练习，第13页课堂小结\"。\n")
+	sb.WriteString("2. 按页码顺序归并相邻的同类页面，体现教学的递进逻辑。\n")
+	sb.WriteString("3. 只输出这段脉络文字，不要任何标题、前缀、markdown 或额外说明。\n")
+
+	systemPrompt := "你是课件结构分析专家，擅长用简洁连贯的语言概括课件的教学脉络。"
+
+	// 用 scanner 场景（haiku，便宜快）
+	aiCfg, err := ai.GetEffectiveConfig(
+		s.cfg.GetAESKey(), "scanner",
+		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		log.Printf("[courseware_index] 生成脉络-获取AI配置失败，退回套话: %v", err)
+		return ""
+	}
+
+	traceCtx := &ai.TraceContext{SceneCode: "scanner", UserID: &userID}
+	callResult, err := ai.CallAI(aiCfg, systemPrompt, sb.String(), traceCtx)
+	if err != nil {
+		log.Printf("[courseware_index] 生成脉络-AI调用失败，退回套话: %v", err)
+		return ""
+	}
+
+	overview := strings.TrimSpace(cwStripCodeFences(callResult.Content))
+	// 防御：若AI输出异常长（跑题），截断到合理长度
+	if len([]rune(overview)) > 400 {
+		overview = string([]rune(overview)[:400])
+	}
+	return overview
+}
+
+// BackfillPageIndexAsync 后台异步：对照"教案原文 + 当前页面方案"，为每页生成 AOCI 索引并回填
+//
+// 用途：doc/ppt 直翻路径下，页面创建时 page_index 及 CG/IL/VF 索引列为空，
+// 导致后续无法做资源评估。本方法在方案保存后由调用方以 go func 异步触发，
+// 用 haiku 整批对照原文+方案逐页编码 AOCI 索引，回填 4 个索引列。
+//
+// 设计要点：
+//   - 使用独立 context.Background()，不受原请求 ctx 取消影响（后台任务需跑完）
+//   - 回填前重新 ListCoursewarePages 拿"当前"页，对齐老师可能的方案改动
+//   - 复用层1解析 parseAOCIIndexOutput + 编码映射，与教案库索引同构
+//   - 全程失败不 panic、不影响课件可用，仅记日志（索引是增强项）
+//   - 调用 repository.UpdateCWPageIndexFields 只更新索引列，不碰方案/HTML
+//
+// v0.44.1 防贴错双保险：
+//
+//	A. 页数守卫：记录构建提示词时的页数 promptPageCount，回填前重新查当前页，
+//	   若页数与 promptPageCount 不一致（说明老师在窗口期改了方案），整体放弃
+//	   本次回填，留给夜间轮询补——绝不在不确定对齐时硬写。
+//	B. 标题锚点匹配：不靠纯顺序，用 AI 回显的页标题(TT) 与当前页标题匹配定位
+//	   具体 page_number；先精确（去空白相等）后模糊（互相包含）；匹配不上则跳过。
+//	   宁可留空也不贴错。
+//
+// 参数 rawText：教案/文档原文（doc 传 docx 全文，ppt 传各页文本拼接）
+func (s *CoursewareIndexService) BackfillPageIndexAsync(
+	coursewareID string, userID string,
+	title string, subject string, grade string, rawText string,
+) {
+	// 独立后台上下文（不随请求取消而中断）
+	ctx := context.Background()
+
+	defer func() {
+		// 兜底：后台任务绝不因 panic 影响进程
+		if r := recover(); r != nil {
+			log.Printf("[courseware_index] 后台补索引 panic 已恢复: cw=%s r=%v", coursewareID, r)
+		}
+	}()
+
+	// ---- 1. 取当前页面（构建提示词所依据的快照）----
+	pages, err := repository.ListCoursewarePages(ctx, coursewareID)
+	if err != nil || len(pages) == 0 {
+		log.Printf("[courseware_index] 后台补索引-取当前页面失败或为空: cw=%s err=%v", coursewareID, err)
+		return
+	}
+	promptPageCount := len(pages) // 保险A：记录喂给AI的页数
+
+	// ---- 2. 加载层1提示词（AOCI索引字典）----
+	dictPrompt, err := repository.GetCurrentPromptByKey("prompt_courseware_index")
+	if err != nil {
+		log.Printf("[courseware_index] 后台补索引-加载索引字典失败: cw=%s err=%v", coursewareID, err)
+		return
+	}
+
+	// ---- 3. 构建"对照原文+方案"的用户提示词 ----
+	var sb strings.Builder
+	sb.WriteString("请为下面这份课件的每一页生成AOCI压缩索引（仅输出PAGE索引，不需要OVERVIEW概述）。\n")
+	sb.WriteString("索引必须对照【教案/文档原文】与【逐页方案】两者：方案告诉你每页讲什么，原文帮你准确判断知识点、认知层次、能力目标。\n\n")
+	sb.WriteString(fmt.Sprintf("## 课件基本信息\n- 标题：%s\n- 学科：%s\n- 年级：%s\n- 总页数：%d\n\n", title, subject, grade, len(pages)))
+
+	// 原文（截断避免超上下文）
+	srcText := rawText
+	if len([]rune(srcText)) > 20000 {
+		srcText = string([]rune(srcText)[:20000]) + "\n\n[原文过长，已截取前20000字]"
+	}
+	sb.WriteString("## 教案/文档原文\n\n")
+	sb.WriteString(srcText)
+	sb.WriteString("\n\n## 逐页方案（共" + strconv.Itoa(len(pages)) + "页，请严格按此页数与顺序逐页输出索引）\n")
+	for _, p := range pages {
+		sb.WriteString(fmt.Sprintf("第%d页｜标题：%s｜目的：%s｜概要：%s｜交互：%s｜视觉：%s\n",
+			p.PageNumber, p.Title, p.Purpose, p.ContentSummary, p.InteractionType, p.VisualFormat))
+	}
+
+	sb.WriteString("\n## 输出要求\n")
+	sb.WriteString("严格为上面每一页输出一个AOCI索引块，顺序、页数与上面的方案完全一致。\n")
+	sb.WriteString("特别注意：每个索引块的 PAGE 行必须原样回显该页的标题（TT字段），以便系统按标题对齐回填。\n")
+	sb.WriteString("每块格式如下（PAGE行 + 编码行 + 语义行）：\n")
+	sb.WriteString("PAGE:页码|TT:页面标题（与上面方案该页标题保持一致）\n")
+	sb.WriteString("KT:知识类型|CG:认知层次(1-6)|IL:交互复杂度(1-5)|VF:视觉形式编码|TG:类型标记\n")
+	sb.WriteString("[K]知识目标（这一页要让学生掌握的核心知识点，依据原文准确归纳）\n")
+	sb.WriteString("[A]能力目标（这一页训练的能力）\n")
+	sb.WriteString("[I]交互说明（这一页的交互/活动形式）\n")
+	sb.WriteString("[C]内容要点（这一页承载的具体内容）\n\n")
+	sb.WriteString("编码取值说明：\n")
+	sb.WriteString("- CG认知层次：1记忆 2理解 3应用 4分析 5评价 6创造\n")
+	sb.WriteString("- IL交互复杂度：1静态展示 2点击 3输入 4拖拽 5游戏\n")
+	sb.WriteString("- VF视觉形式编码：TH纯文字 IT图文 DG图示 CT图表 TL时间线 CP对比 GL画廊 FM全屏媒体\n\n")
+	sb.WriteString("只输出这些PAGE索引块，不要OVERVIEW、不要JSON、不要任何额外说明文字。")
+
+	// ---- 4. 调用 AI（scanner场景，haiku，整批）----
+	aiCfg, err := ai.GetEffectiveConfig(
+		s.cfg.GetAESKey(), "scanner",
+		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		log.Printf("[courseware_index] 后台补索引-获取AI配置失败: cw=%s err=%v", coursewareID, err)
+		return
+	}
+
+	traceCtx := &ai.TraceContext{SceneCode: "scanner", UserID: &userID}
+	callResult, err := ai.CallAI(aiCfg, dictPrompt.Content, sb.String(), traceCtx)
+	if err != nil {
+		log.Printf("[courseware_index] 后台补索引-AI调用失败: cw=%s err=%v", coursewareID, err)
+		return
+	}
+
+	// ---- 5. 解析 AOCI 索引输出 ----
+	// 注意：splitOverviewAndPages 兼容"无OVERVIEW、直接PAGE"的输出
+	_, pageText := s.splitOverviewAndPages(callResult.Content)
+	rawPages, err := s.parseAOCIIndexOutput(pageText)
+	if err != nil || len(rawPages) == 0 {
+		log.Printf("[courseware_index] 后台补索引-解析索引失败: cw=%s err=%v", coursewareID, err)
+		return
+	}
+
+	// ---- 6. 保险A：页数守卫——回填前重查当前页，页数变了就整体放弃 ----
+	curPages, err := repository.ListCoursewarePages(ctx, coursewareID)
+	if err != nil || len(curPages) == 0 {
+		log.Printf("[courseware_index] 后台补索引-回填前重查页面失败或为空: cw=%s err=%v", coursewareID, err)
+		return
+	}
+	if len(curPages) != promptPageCount {
+		log.Printf("[courseware_index] 后台补索引-页数已变化(喂AI时=%d 当前=%d)，疑似方案被修改，放弃本次回填，留待夜间轮询: cw=%s",
+			promptPageCount, len(curPages), coursewareID)
+		return
+	}
+
+	// ---- 7. 保险B：按标题锚点匹配回填 ----
+	// 建立"标题(规整后) → 当前页"映射，标题为空的页不进映射（无法锚定）。
+	titleMap := make(map[string]*models.CoursewarePage)
+	for _, p := range curPages {
+		key := cwNormalizeTitle(p.Title)
+		if key != "" {
+			// 同名标题仅保留首个（极少见），避免覆盖
+			if _, exists := titleMap[key]; !exists {
+				titleMap[key] = p
+			}
+		}
+	}
+
+	filled := 0
+	matchedPageNums := make(map[int]bool) // 防止两个解析块匹配到同一页
+	for _, rp := range rawPages {
+		rpTitleKey := cwNormalizeTitle(rp.Title)
+		if rpTitleKey == "" {
+			continue // AI未回显标题，无法锚定，跳过
+		}
+
+		// 先精确匹配
+		target, ok := titleMap[rpTitleKey]
+		if !ok {
+			// 再模糊匹配：互相包含（AI可能轻微改写标题）
+			for k, p := range titleMap {
+				if matchedPageNums[p.PageNumber] {
+					continue
+				}
+				if strings.Contains(k, rpTitleKey) || strings.Contains(rpTitleKey, k) {
+					target = p
+					ok = true
+					break
+				}
+			}
+		}
+		if !ok || target == nil {
+			continue // 匹配不上，宁可留空也不贴错
+		}
+		if matchedPageNums[target.PageNumber] {
+			continue // 该页已被其它块匹配过，跳过
+		}
+
+		cg := cwClamp(rp.CG, 1, 6)
+		il := cwClamp(rp.IL, 1, 5)
+		vf := cwNormalizeVF(rp.VF)
+		if err := repository.UpdateCWPageIndexFields(ctx, coursewareID, target.PageNumber, rp.RawIndex, cg, il, vf); err != nil {
+			log.Printf("[courseware_index] 后台补索引-回填第%d页失败: cw=%s err=%v", target.PageNumber, coursewareID, err)
+			continue
+		}
+		matchedPageNums[target.PageNumber] = true
+		filled++
+	}
+
+	log.Printf("[courseware_index] 后台补索引完成: cw=%s 当前页=%d 解析索引=%d 标题匹配回填=%d model=%s tokens=%d",
+		coursewareID, len(curPages), len(rawPages), filled, callResult.ModelUsed, callResult.TokensUsed)
+}
+
+// cwNormalizeTitle 规整页标题用于锚点匹配：去首尾空白 + 去全部内部空白
+// （AI回显标题可能在空格/标点上有细微差异，做轻量归一以提高匹配率）
+func cwNormalizeTitle(s string) string {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return ""
+	}
+	// 去掉所有空白字符（空格/制表/换行），保留其余原貌
+	var b strings.Builder
+	for _, r := range t {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == '\u3000' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// cwNormalizeVF 规整视觉形式编码：非法/空值归一为 TH（纯文字）
+// 仅接受 8 个合法编码，避免非法值进库导致前端映射不到
+func cwNormalizeVF(vf string) string {
+	v := strings.ToUpper(strings.TrimSpace(vf))
+	switch v {
+	case "TH", "IT", "DG", "CT", "TL", "CP", "GL", "FM":
+		return v
+	default:
+		return "TH"
+	}
 }

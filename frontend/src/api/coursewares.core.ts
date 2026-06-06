@@ -13,6 +13,7 @@ import type {
   CWComponentListItem, CWComponentFull, CoursewareTemplate, SeedResult,
   CWSSECallbacks, SchemePreset, RefineSSECallbacks, ExtractSSECallbacks,
   RefineHistoryEntry, PublishTargetsResponse,
+  CurriculumKPResponse,
 } from './coursewares.types'
 
 // ==================== 课件CRUD ====================
@@ -466,6 +467,7 @@ export async function createCoursewareFromTopic(data: {
   topic: string
   page_range?: string
   extra_notes?: string
+  kp_codes?: string[]   // 课程知识库轮：勾选的课标知识点编码数组（可选，用于难度自动适配）
 }): Promise<{ id: string }> {
   const resp = await apiClient.post('/coursewares/from-topic', data)
   return extractData(resp)
@@ -551,5 +553,23 @@ export async function createCoursewareFrom3D(data: {
   description: string
 }): Promise<{ id: string; title: string; source_type: string; status: string; message: string }> {
   const resp = await apiClient.post('/coursewares/from-3d', data)
+  return extractData(resp)
+}
+
+
+// ==================== 课程知识库（平台级公共只读查询，课件/教案复用） ====================
+
+/**
+ * 查询某学科某年级的课标知识点清单（供"从主题创建"勾选 + 难度适配）。
+ * grade 传年级数字 1-9；传 0 或省略则查该学科全部年级（一般应传具体年级）。
+ * 接口：GET /api/v1/curriculum/knowledge-points?subject=数学&grade=3
+ */
+export async function getCurriculumKnowledgePoints(
+  subject: string,
+  grade?: number,
+): Promise<CurriculumKPResponse> {
+  const params: Record<string, string | number> = { subject }
+  if (grade && grade > 0) params.grade = grade
+  const resp = await apiClient.get('/curriculum/knowledge-points', { params })
   return extractData(resp)
 }

@@ -11,6 +11,14 @@ package services
 //   2. Go解析ZIP中的slide*.xml → 提取每页标题+正文
 //   3. 将PPT内容作为上下文 → 调AI生成课件索引（复用层2方案翻译）
 //   4. 写入数据库并SSE广播
+//
+// v0.44 新增（Y+方案：出完方案就出脉络 + 后台补AOCI索引）:
+//   GenerateIndexFromPPT 在层2直翻出页后：
+//     1) 前台立即用 haiku 生成"哪几页干什么"的真脉络（GenerateOverviewFromPages），
+//        替代原先的套话 overview；失败则退回套话，不阻塞。
+//     2) saveAndBroadcast 成功后，go func 异步触发 BackfillPageIndexAsync，
+//        对照 PPT 原文（各页文本拼接）+ 当前方案为每页补 AOCI 索引，供后续资源评估；
+//        失败不影响课件可用。
 
 import (
 	"archive/zip"
@@ -448,8 +456,8 @@ func (s *CoursewarePPTService) GenerateIndexFromPPT(ctx context.Context, coursew
 		EventType: CWSSEIndexStart,
 		Data: map[string]interface{}{
 			"courseware_id": coursewareID,
-			"slide_count":  extractResult.SlideCount,
-			"message":      fmt.Sprintf("已解析PPT(%d页)，正在生成课件方案...", extractResult.SlideCount),
+			"slide_count":   extractResult.SlideCount,
+			"message":       fmt.Sprintf("已解析PPT(%d页)，正在生成课件方案...", extractResult.SlideCount),
 		},
 	})
 
@@ -533,10 +541,18 @@ func (s *CoursewarePPTService) GenerateIndexFromPPT(ctx context.Context, coursew
 		pages = append(pages, page)
 	}
 
-	// 生成概述
-	overview := fmt.Sprintf("来源：PPT上传（%s，%d页），%s·%s，共%d页课件方案。",
-		extractResult.FileName, extractResult.SlideCount,
-		cw.Subject, cw.Grade, len(pages))
+	// ---- 9. 出完方案就出脉络（前台快速，haiku） ----
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEIndexProgress,
+		Data:      map[string]interface{}{"message": "正在生成课件脉络..."},
+	})
+	overview := s.indexService.GenerateOverviewFromPages(ctx, userID, cw.Title, cw.Subject, cw.Grade, pages)
+	if strings.TrimSpace(overview) == "" {
+		// 脉络生成失败，退回套话（不阻塞主流程）
+		overview = fmt.Sprintf("来源：PPT上传（%s，%d页），%s·%s，共%d页课件方案。",
+			extractResult.FileName, extractResult.SlideCount,
+			cw.Subject, cw.Grade, len(pages))
+	}
 
 	pptServiceLog.Info("PPT索引生成完成",
 		"courseware_id", coursewareID,
@@ -546,7 +562,36 @@ func (s *CoursewarePPTService) GenerateIndexFromPPT(ctx context.Context, coursew
 		"tokens", callResult.TokensUsed,
 	)
 
-	return s.indexService.saveAndBroadcast(ctx, coursewareID, overview, pages)
+	// ---- 10. 保存并广播（方案+脉络，前台立即可见） ----
+	if err := s.indexService.saveAndBroadcast(ctx, coursewareID, overview, pages); err != nil {
+		return err
+	}
+
+	// ---- 11. 后台异步补 AOCI 索引（对照 PPT 原文 + 当前方案，不阻塞前台） ----
+	// PPT 无连续正文，rawText 用各页 标题+正文+备注 拼接而成。
+	var rawBuf strings.Builder
+	for _, slide := range extractResult.Slides {
+		rawBuf.WriteString(fmt.Sprintf("【第%d页】", slide.SlideNumber))
+		if slide.Title != "" {
+			rawBuf.WriteString(slide.Title)
+		}
+		rawBuf.WriteString("\n")
+		if slide.BodyText != "" {
+			rawBuf.WriteString(slide.BodyText)
+			rawBuf.WriteString("\n")
+		}
+		if slide.Notes != "" {
+			rawBuf.WriteString("[备注]" + slide.Notes + "\n")
+		}
+		rawBuf.WriteString("\n")
+	}
+	pptTitle := cw.Title
+	pptSubject := cw.Subject
+	pptGrade := cw.Grade
+	rawText := rawBuf.String()
+	go s.indexService.BackfillPageIndexAsync(coursewareID, userID, pptTitle, pptSubject, pptGrade, rawText)
+
+	return nil
 }
 
 // ==================== 提示词构建 ====================
@@ -558,7 +603,7 @@ func (s *CoursewarePPTService) buildPPTIndexPrompt(cw *models.Courseware, ppt *P
 	sb.WriteString("用户提供了一份PPT演示文稿的内容（逐页文本），\n")
 	sb.WriteString("请将其转化为结构化的交互式课件方案。\n\n")
 
-	sb.WriteString(fmt.Sprintf("## 基本信息\n"))
+	sb.WriteString("## 基本信息\n")
 	sb.WriteString(fmt.Sprintf("- 学科: %s\n", cw.Subject))
 	sb.WriteString(fmt.Sprintf("- 年级: %s\n", cw.Grade))
 	sb.WriteString(fmt.Sprintf("- 课件标题: %s\n", cw.Title))
@@ -645,6 +690,3 @@ func sanitizePPTFileName(name string) string {
 
 	return base + ext
 }
-
-
-

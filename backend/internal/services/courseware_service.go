@@ -159,6 +159,7 @@ func (s *CoursewareService) GetCourseware(ctx context.Context, id string) (*mode
 		StyleAnchorAssetID: cw.StyleAnchorAssetID,
 		StyleAnchorVAOCI:   cw.StyleAnchorVAOCI,
 		StyleAnchorURL:     anchorURL,
+		KPCodes:         cw.KPCodes,
 		Pages:           pages,
 		CreatedAt:       cw.CreatedAt,
 		UpdatedAt:       cw.UpdatedAt,
@@ -196,7 +197,7 @@ func (s *CoursewareService) UpdateCoursewareTitle(ctx context.Context, id string
 	return repository.UpdateCoursewareTitle(ctx, id, title)
 }
 
-// DeleteCourseware 删除课件（仅draft状态）
+// DeleteCourseware 删除课件（除已提交审核 in_pipeline 外的任意状态均可删除，删除时由前端二次确认）
 func (s *CoursewareService) DeleteCourseware(ctx context.Context, id string, userID string) error {
 	cw, err := repository.GetCoursewareByID(ctx, id)
 	if err != nil {
@@ -205,8 +206,9 @@ func (s *CoursewareService) DeleteCourseware(ctx context.Context, id string, use
 	if cw.UserID != userID {
 		return fmt.Errorf("无权操作此课件")
 	}
-	if cw.Status != models.CoursewareStatusDraft {
-		return fmt.Errorf("仅草稿状态的课件可删除")
+	// 已提交审核（in_pipeline）的课件关联了审核流程，禁止直接删除；其余状态均允许删除
+	if cw.Status == models.CoursewareStatusInPipeline {
+		return fmt.Errorf("课件已提交审核，请先撤回审核后再删除")
 	}
 	return repository.DeleteCourseware(ctx, id)
 }
@@ -659,6 +661,30 @@ func (s *CoursewareService) CreateCoursewareFromTopic(ctx context.Context, userI
 		return nil, fmt.Errorf("创建课件失败: %w", err)
 	}
 
+	// 课程知识库轮：若勾选了课标知识点，先校验有效性再序列化存入 kp_codes 列。
+	// 第5点修复（迭代回顾）：校验编码真实存在、且属于本课件的学科年级，过滤掉无效/跨学科年级的脏编码，
+	//   双重保险（前端切换学科年级已清空，后端再挡一道）。空/失败均不阻断课件创建，仅记录警告。
+	if len(req.KPCodes) > 0 {
+		// 按编码查课标，比对学科与年级，只留有效项
+		validCodes := s.filterValidKPCodes(ctx, req.KPCodes, req.Subject, req.Grade)
+		if len(validCodes) < len(req.KPCodes) {
+			cwServiceLog.Warn("部分知识点编码无效已过滤",
+				"courseware_id", cw.ID,
+				"submitted", len(req.KPCodes),
+				"valid", len(validCodes),
+			)
+		}
+		if len(validCodes) > 0 {
+			if kpJSON, mErr := json.Marshal(validCodes); mErr == nil {
+				if uErr := repository.UpdateCoursewareKPCodes(ctx, cw.ID, string(kpJSON)); uErr != nil {
+					cwServiceLog.Warn("存储课件知识点编码失败", "error", uErr, "courseware_id", cw.ID)
+				} else {
+					cw.KPCodes = string(kpJSON)
+				}
+			}
+		}
+	}
+
 	cwServiceLog.Info("从主题创建课件",
 		"courseware_id", cw.ID,
 		"subject", req.Subject,
@@ -732,3 +758,98 @@ func (s *CoursewareService) CreateCoursewareFrom3D(ctx context.Context, userID s
 	return cw, nil
 }
 
+
+// ==================== 课程知识库：编码有效性校验（第5点修复） ====================
+
+// filterValidKPCodes 校验并过滤知识点编码：只保留"真实存在于课标库 且 学科年级与课件匹配"的编码。
+// 用途：从主题创建课件存 kp_codes 前调用，挡住前端伪造、跨学科年级残留等脏编码。
+// 设计：复用 repository.GetCurriculumKPsByCodes（一次查询），再在内存里比对学科与年级数字；
+//   任何查询失败都返回空切片（退回"无约束"，绝不阻断创建）。
+//
+// 参数：
+//   codes        — 前端提交的知识点编码数组
+//   subject      — 课件学科（如"数学"）
+//   gradeText    — 课件年级文字（如"三年级"），内部解析为数字与 curriculum_standards.grade_num 比对
+//
+// 返回：有效编码子集（保持原有顺序），全部无效或出错时返回空切片。
+func (s *CoursewareService) filterValidKPCodes(ctx context.Context, codes []string, subject string, gradeText string) []string {
+	if len(codes) == 0 {
+		return nil
+	}
+	kps, err := repository.GetCurriculumKPsByCodes(ctx, codes)
+	if err != nil || len(kps) == 0 {
+		cwServiceLog.Warn("校验知识点编码时查询失败或无匹配", "error", err, "subject", subject, "grade", gradeText)
+		return nil
+	}
+
+	// 解析课件年级文字为数字（与 KnowledgePointSelector.parseGradeNum 同口径：1-12，0=无法识别）
+	gradeNum := parseGradeNumForKP(gradeText)
+
+	// 建立"有效编码"集合：库里存在 + 学科匹配 +（年级可识别时）年级匹配
+	validSet := make(map[string]bool, len(kps))
+	for _, kp := range kps {
+		if kp.Subject != subject {
+			continue // 跨学科，剔除
+		}
+		if gradeNum > 0 && kp.GradeNum > 0 && kp.GradeNum != gradeNum {
+			continue // 跨年级，剔除（年级无法识别或库中为0即学段级时不卡年级）
+		}
+		validSet[kp.KPCode] = true
+	}
+
+	// 按原始提交顺序保留有效项
+	valid := make([]string, 0, len(codes))
+	for _, c := range codes {
+		if validSet[c] {
+			valid = append(valid, c)
+		}
+	}
+	return valid
+}
+
+// parseGradeNumForKP 年级文字→数字（后端校验用，与前端 parseGradeNum 同口径，1-12，0=无法识别）。
+// 独立实现避免跨层依赖；逻辑保持与前端一致，便于双端校验口径统一。
+func parseGradeNumForKP(gradeText string) int {
+	t := strings.TrimSpace(gradeText)
+	if t == "" {
+		return 0
+	}
+	// 高中
+	if strings.Contains(t, "高一") || strings.Contains(t, "高中一") {
+		return 10
+	}
+	if strings.Contains(t, "高二") || strings.Contains(t, "高中二") {
+		return 11
+	}
+	if strings.Contains(t, "高三") || strings.Contains(t, "高中三") {
+		return 12
+	}
+	// 初中
+	if strings.Contains(t, "初一") || strings.Contains(t, "初中一") {
+		return 7
+	}
+	if strings.Contains(t, "初二") || strings.Contains(t, "初中二") {
+		return 8
+	}
+	if strings.Contains(t, "初三") || strings.Contains(t, "初中三") {
+		return 9
+	}
+	// 中文数字年级（一~九、十、十一、十二）
+	cnMap := map[string]int{
+		"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+		"七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12,
+	}
+	for cn, n := range cnMap {
+		if strings.Contains(t, cn+"年级") {
+			return n
+		}
+	}
+	// 阿拉伯数字年级 / 纯数字
+	for i := 12; i >= 1; i-- {
+		num := fmt.Sprintf("%d", i)
+		if strings.Contains(t, num+"年级") || t == num {
+			return i
+		}
+	}
+	return 0
+}

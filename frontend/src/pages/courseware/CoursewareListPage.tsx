@@ -1,5 +1,13 @@
 /**
- * 课件工坊列表页 — CoursewareListPage v4.0（v0.42 PPT入口激活）
+ * 课件工坊列表页 — CoursewareListPage v4.1
+ *
+ * v4.1 变更（本次）：
+ *   - 删除按钮对所有状态的课件都可见（此前仅 draft 草稿才显示删除按钮，
+ *     导致"方案编辑中/风格选择中/课件生成中"等中间状态无法删除）。
+ *     删除前仍走 window.confirm 二次确认（见 handleDelete）。
+ *   - 卡片底部操作区右侧改为 flex 容器：先按状态条件渲染「下载离线包」，
+ *     再无条件渲染「删除」，二者在符合条件时并排显示。
+ *   - 删除二次确认文案补充「删除后无法恢复」。
  *
  * v4.0 变更：
  *   - PPT入口从disabled占位变为可用（文件上传+学科+年级）
@@ -17,6 +25,7 @@ import {
 } from '@/api/coursewares'
 import type { CoursewareListItem } from '@/api/coursewares'
 import apiClient from '@/api/client'
+import KnowledgePointSelector from './KnowledgePointSelector'
 
 // ==================== 常量 ====================
 const C = {
@@ -65,6 +74,8 @@ export default function CoursewareListPage() {
   const [topicGrade, setTopicGrade] = useState('')
   const [topicName, setTopicName] = useState('')
   const [topicNotes, setTopicNotes] = useState('')
+  // 课程知识库：从主题创建时勾选的课标知识点编码（本轮仅暂存，下一轮接入生成注入）
+  const [topicKPCodes, setTopicKPCodes] = useState<string[]>([])
 
   // v0.42 入口B: 从PPT创建相关
   const [pptFile, setPptFile] = useState<File | null>(null)
@@ -98,8 +109,9 @@ export default function CoursewareListPage() {
     } catch { /* */ } finally { setLoading(false) }
   }
 
+  // 删除课件：window.confirm 二次确认后调后端删除接口，成功后刷新列表
   const handleDelete = async (id: string, title: string) => {
-    if (!window.confirm('确定删除课件「' + title + '」？')) return
+    if (!window.confirm('确定删除课件「' + title + '」？删除后无法恢复。')) return
     try { await deleteCourseware(id); loadData() } catch { alert('删除失败') }
   }
 
@@ -108,7 +120,7 @@ export default function CoursewareListPage() {
     setShowCreate(true)
     setCreateMode('select')
     setSelectedPlanId('')
-    setTopicSubject(''); setTopicGrade(''); setTopicName(''); setTopicNotes('')
+    setTopicSubject(''); setTopicGrade(''); setTopicName(''); setTopicNotes(''); setTopicKPCodes([])
     setPptFile(null); setPptSubject(''); setPptGrade(''); setPptTitle('')
     setDocFile(null); setDocSubject(''); setDocGrade(''); setDocTitle('')
   }
@@ -147,6 +159,7 @@ export default function CoursewareListPage() {
         grade: topicGrade,
         topic: topicName.trim(),
         extra_notes: topicNotes.trim() || undefined,
+        kp_codes: topicKPCodes.length > 0 ? topicKPCodes : undefined,
       })
       setShowCreate(false); navigate('/courseware/' + cw.id)
     } catch { alert('创建课件失败') } finally { setCreating(false) }
@@ -457,6 +470,28 @@ export default function CoursewareListPage() {
                     rows={3}
                     style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', resize: 'vertical', boxSizing: 'border-box' }} />
                 </div>
+                {/* 课程知识库：选学科+年级后联动出该年级课标知识点，勾选后用于难度自动适配 */}
+                <div>
+                  <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>
+                    课标知识点（可选，勾选后AI按课标难度自动适配）
+                  </label>
+                  <KnowledgePointSelector
+                    subject={topicSubject}
+                    grade={topicGrade}
+                    selectedCodes={topicKPCodes}
+                    onChange={setTopicKPCodes}
+                  />
+                  {/* 第6点：勾选反馈——勾了知识点即时提示"创建后将按课标难度自动适配"，消除"勾了不知有没有用"的黑箱感 */}
+                  {topicKPCodes.length > 0 && (
+                    <div style={{
+                      marginTop: '8px', padding: '8px 12px', borderRadius: '8px',
+                      background: 'rgba(124,58,237,0.06)', border: '1px solid rgba(124,58,237,0.2)',
+                      fontSize: '12px', color: '#6D28D9', lineHeight: 1.5,
+                    }}>
+                      ✓ 已选 {topicKPCodes.length} 个课标知识点，创建后 AI 将按这些知识点的课标难度要求自动适配课件深度
+                    </div>
+                  )}
+                </div>
               </div>
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
                 <button onClick={() => setCreateMode('select')} style={{ ...btnBase, border: `1px solid ${C.border}`, background: 'transparent', color: C.textSecondary }}>返回</button>
@@ -679,6 +714,8 @@ function CWCard({ item, onDelete, onClick }: {
   const [downloading, setDownloading] = useState(false)
   const sc = CW_STATUS_CONFIG[item.status] || { label: item.status, color: '#6B7280', bg: '#F3F4F6' }
   const src = SOURCE_CONFIG[item.source_type] || SOURCE_CONFIG.lesson_plan
+  // 下载离线包仅在课件已生成可预览之后的状态下才有意义
+  const canDownload = ['preview', 'confirmed', 'in_pipeline'].includes(item.status)
   return (
     <div onClick={onClick} onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}
       style={{
@@ -702,28 +739,31 @@ function CWCard({ item, onDelete, onClick }: {
         <span>📄 {item.page_count} 页</span>
       </div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '14px', paddingTop: '12px', borderTop: '1px solid #E5E7EB' }}>
+        {/* 左侧：创建日期 */}
         <span style={{ fontSize: '12px', color: '#9CA3AF' }}>{item.created_at ? new Date(item.created_at).toLocaleDateString('zh-CN') : ''}</span>
-        {['preview', 'confirmed', 'in_pipeline'].includes(item.status) && (
-          <button
-            onClick={async e => {
-              e.stopPropagation()
-              if (downloading) return
-              setDownloading(true)
-              try { await downloadCoursewareBundle(item.id, item.title) }
-              catch (err) { alert('下载失败: ' + (err instanceof Error ? err.message : '未知错误')) }
-              finally { setDownloading(false) }
-            }}
-            disabled={downloading}
-            style={{ padding: '2px 10px', borderRadius: '6px', border: '1px solid #BFDBFE', background: downloading ? '#EFF6FF' : 'transparent', color: '#2563EB', fontSize: '12px', cursor: downloading ? 'default' : 'pointer' }}>
-            {downloading ? '⏳ 打包中…' : '⬇ 下载离线包'}
-          </button>
-        )}
-        {item.status === 'draft' && (
+        {/* 右侧：操作按钮区——下载离线包（按状态条件）+ 删除（所有状态都显示，删除时二次确认） */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {canDownload && (
+            <button
+              onClick={async e => {
+                e.stopPropagation()
+                if (downloading) return
+                setDownloading(true)
+                try { await downloadCoursewareBundle(item.id, item.title) }
+                catch (err) { alert('下载失败: ' + (err instanceof Error ? err.message : '未知错误')) }
+                finally { setDownloading(false) }
+              }}
+              disabled={downloading}
+              style={{ padding: '2px 10px', borderRadius: '6px', border: '1px solid #BFDBFE', background: downloading ? '#EFF6FF' : 'transparent', color: '#2563EB', fontSize: '12px', cursor: downloading ? 'default' : 'pointer' }}>
+              {downloading ? '⏳ 打包中…' : '⬇ 下载离线包'}
+            </button>
+          )}
+          {/* 删除按钮：对所有状态可见，点击后由 handleDelete 弹出二次确认 */}
           <button onClick={e => { e.stopPropagation(); onDelete(item.id, item.title) }}
-            style={{ padding: '2px 10px', borderRadius: '6px', border: '1px solid #E5E7EB', background: 'transparent', color: '#EF4444', fontSize: '12px', cursor: 'pointer' }}>
+            style={{ padding: '2px 10px', borderRadius: '6px', border: '1px solid #FECACA', background: 'transparent', color: '#EF4444', fontSize: '12px', cursor: 'pointer' }}>
             删除
           </button>
-        )}
+        </div>
       </div>
     </div>
   )

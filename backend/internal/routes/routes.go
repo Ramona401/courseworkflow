@@ -181,6 +181,9 @@ func Setup(cfg *config.Config) http.Handler {
 	// v110:学校管理员处理器
 	schoolAdminHandler := handlers.NewSchoolAdminHandler(userService, orgService)
 
+	// 课程知识库（平台级公共只读查询，课件/教案两处复用）
+	curriculumHandler := handlers.NewCurriculumHandler()
+
 	// v130(课件工坊 Phase 1)新增:课件工坊服务+处理器
 	cwService := services.NewCoursewareService()
 	cwHandler := handlers.NewCoursewareHandler(cwService)
@@ -297,6 +300,9 @@ func Setup(cfg *config.Config) http.Handler {
 
 	// v110:注册学校管理员路由
 	registerSchoolAdminRoutes(mux, authMW, seniorOperatorOnly, schoolAdminHandler)
+
+	// 课程知识库公共只读路由（/api/v1/curriculum/*）
+	registerCurriculumRoutes(mux, authMW, curriculumHandler)
 
 	// v110(TE-DNA 3.0 P0)新增:注册 AI 助手路由
 	registerAIAssistantRoutes(mux, authMW, aiAssistantHandler, assistantDesignerHandler)

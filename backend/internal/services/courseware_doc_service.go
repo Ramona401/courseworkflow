@@ -8,6 +8,19 @@ package services
 //
 // 从 courseware_ppt_service.go 拆分，复用 CoursewarePPTService 的方法接收器
 // 因为PPT和Word共享同一个服务实例（都需要cfg和indexService）
+//
+// v0.43 修复（页数过少）:
+//   buildDocIndexPrompt 此前未给AI任何页数下限/区间约束，导致7000+字教案
+//   被模型概括成1页。本次补齐：按字数估算应展开页数 + 明确学段页数区间 +
+//   结构骨架要求 + 禁止概括成数页的硬约束（与 buildTopicDirectPrompt 对齐）。
+//
+// v0.44 新增（Y+方案：出完方案就出脉络 + 后台补AOCI索引）:
+//   GenerateIndexFromDoc 在层2直翻出页后：
+//     1) 前台立即用 haiku 生成"哪几页干什么"的真脉络（GenerateOverviewFromPages），
+//        替代原先的套话 overview；失败则退回套话，不阻塞。
+//     2) saveAndBroadcast 成功后，go func 异步触发 BackfillPageIndexAsync，
+//        对照 docx 原文 + 当前方案为每页补 AOCI 索引（page_index + CG/IL/VF），
+//        供后续资源评估；失败不影响课件可用。
 
 import (
 	"archive/zip"
@@ -44,10 +57,10 @@ var docAllowedMimeTypes = map[string]bool{
 
 // DocExtractResult Word文档解析结果
 type DocExtractResult struct {
-	FileName   string   `json:"file_name"`   // 原始文件名
-	WordCount  int      `json:"word_count"`  // 字符数
-	Paragraphs []string `json:"paragraphs"`  // 段落列表
-	FullText   string   `json:"full_text"`   // 完整文本
+	FileName   string   `json:"file_name"`  // 原始文件名
+	WordCount  int      `json:"word_count"` // 字符数
+	Paragraphs []string `json:"paragraphs"` // 段落列表
+	FullText   string   `json:"full_text"`  // 完整文本
 }
 
 // UploadDocAndCreateCourseware 上传Word文档并创建课件记录
@@ -290,8 +303,8 @@ func (s *CoursewarePPTService) GenerateIndexFromDoc(ctx context.Context, coursew
 		EventType: CWSSEIndexStart,
 		Data: map[string]interface{}{
 			"courseware_id": coursewareID,
-			"word_count":   extractResult.WordCount,
-			"message":      fmt.Sprintf("已解析文档(%d字)，正在生成课件方案...", extractResult.WordCount),
+			"word_count":    extractResult.WordCount,
+			"message":       fmt.Sprintf("已解析文档(%d字)，正在生成课件方案...", extractResult.WordCount),
 		},
 	})
 
@@ -375,9 +388,19 @@ func (s *CoursewarePPTService) GenerateIndexFromDoc(ctx context.Context, coursew
 		pages = append(pages, page)
 	}
 
-	overview := fmt.Sprintf("来源：教案文档上传（%s，%d字），%s·%s，共%d页课件方案。",
-		extractResult.FileName, extractResult.WordCount,
-		cw.Subject, cw.Grade, len(pages))
+	// ---- 9. 出完方案就出脉络（前台快速，haiku） ----
+	// 用已生成的页面方案让 haiku 快速概括"哪几页干什么"，替代套话 overview。
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEIndexProgress,
+		Data:      map[string]interface{}{"message": "正在生成课件脉络..."},
+	})
+	overview := s.indexService.GenerateOverviewFromPages(ctx, userID, cw.Title, cw.Subject, cw.Grade, pages)
+	if strings.TrimSpace(overview) == "" {
+		// 脉络生成失败，退回套话（不阻塞主流程）
+		overview = fmt.Sprintf("来源：教案文档上传（%s，%d字），%s·%s，共%d页课件方案。",
+			extractResult.FileName, extractResult.WordCount,
+			cw.Subject, cw.Grade, len(pages))
+	}
 
 	pptServiceLog.Info("文档索引生成完成",
 		"courseware_id", coursewareID,
@@ -387,15 +410,89 @@ func (s *CoursewarePPTService) GenerateIndexFromDoc(ctx context.Context, coursew
 		"tokens", callResult.TokensUsed,
 	)
 
-	return s.indexService.saveAndBroadcast(ctx, coursewareID, overview, pages)
+	// ---- 10. 保存并广播（方案+脉络，前台立即可见） ----
+	if err := s.indexService.saveAndBroadcast(ctx, coursewareID, overview, pages); err != nil {
+		return err
+	}
+
+	// ---- 11. 后台异步补 AOCI 索引（对照 docx 原文 + 当前方案，不阻塞前台） ----
+	// 供后续资源评估使用；失败不影响课件可用。
+	docTitle := cw.Title
+	docSubject := cw.Subject
+	docGrade := cw.Grade
+	rawText := extractResult.FullText
+	go s.indexService.BackfillPageIndexAsync(coursewareID, userID, docTitle, docSubject, docGrade, rawText)
+
+	return nil
+}
+
+// cwRecommendPageRange 根据年级学段与教案字数，给出建议页数下限与区间文字
+// 返回 (最小页数, 区间描述)；用于在提示词中对AI施加明确的页数约束，
+// 避免长教案被概括成极少页数。
+func cwRecommendPageRange(grade string, wordCount int) (int, string) {
+	// 先按学段定基础区间
+	seg := cwGradeSegment(grade)
+	var baseMin, baseMax int
+	switch seg {
+	case "primary": // 小学
+		baseMin, baseMax = 15, 25
+	case "senior": // 高中
+		baseMin, baseMax = 22, 35
+	default: // 初中及未知，取初中区间
+		baseMin, baseMax = 20, 30
+	}
+
+	// 再按字数动态托底：经验值约每 350~400 字至少展开 1 页
+	// （教案含目标/重难点/流程/活动/作业等，信息密度高）
+	byWord := wordCount / 380
+	if byWord > baseMin {
+		// 字数要求更高时抬高下限，但不超过该学段上限太多
+		if byWord > baseMax {
+			baseMin = baseMax
+		} else {
+			baseMin = byWord
+		}
+	}
+	if baseMin < 8 {
+		baseMin = 8
+	}
+
+	desc := fmt.Sprintf("%d-%d页", baseMin, baseMax)
+	return baseMin, desc
+}
+
+// cwGradeSegment 将中文年级名粗略归一化为学段（primary/junior/senior）
+// 仅用于页数区间判断，无需精确
+func cwGradeSegment(grade string) string {
+	g := strings.TrimSpace(grade)
+	// 小学关键词
+	for _, k := range []string{"小学", "一年级", "二年级", "三年级", "四年级", "五年级", "六年级", "低段", "高段", "中段"} {
+		if strings.Contains(g, k) {
+			return "primary"
+		}
+	}
+	// 高中关键词
+	for _, k := range []string{"高中", "高一", "高二", "高三"} {
+		if strings.Contains(g, k) {
+			return "senior"
+		}
+	}
+	// 初中关键词
+	for _, k := range []string{"初中", "初一", "初二", "初三", "七年级", "八年级", "九年级"} {
+		if strings.Contains(g, k) {
+			return "junior"
+		}
+	}
+	return "junior"
 }
 
 // buildDocIndexPrompt 构建Word文档→课件方案的提示词
+// v0.43: 补齐页数下限/区间约束 + 结构骨架 + 禁止概括成数页的硬约束
 func (s *CoursewarePPTService) buildDocIndexPrompt(cw *models.Courseware, doc *DocExtractResult, preset string) string {
 	var sb strings.Builder
 	sb.WriteString("你是K12课件规划专家。\n")
 	sb.WriteString("用户提供了一份教案文档的完整内容，\n")
-	sb.WriteString("请将其转化为结构化的交互式课件方案。\n\n")
+	sb.WriteString("请将其转化为结构化的交互式课件方案（逐页规划）。\n\n")
 
 	sb.WriteString("## 基本信息\n")
 	sb.WriteString(fmt.Sprintf("- 学科: %s\n", cw.Subject))
@@ -421,16 +518,28 @@ func (s *CoursewarePPTService) buildDocIndexPrompt(cw *models.Courseware, doc *D
 		}
 	}
 
-	sb.WriteString("\n\n## 转化原则\n")
-	sb.WriteString("1. 保留教案的知识结构和教学设计\n")
+	// ---- 关键修复：明确页数下限/区间，防止长教案被概括成1页 ----
+	minPages, rangeDesc := cwRecommendPageRange(cw.Grade, doc.WordCount)
+	sb.WriteString("\n\n## 篇幅与页数要求（必须遵守）\n")
+	sb.WriteString(fmt.Sprintf("- 本教案约 %d 字，信息量充足，必须充分展开。\n", doc.WordCount))
+	sb.WriteString(fmt.Sprintf("- 目标页数区间：%s，**不得少于 %d 页**。\n", rangeDesc, minPages))
+	sb.WriteString("- 严禁把整份教案概括成一页或极少数几页；教案中的每个教学环节、每个知识点、每个活动都应有独立或拆分的课件页面承载。\n")
+	sb.WriteString("- 若内容确实丰富，可超出区间上限，但绝不可低于下限。\n")
+
+	sb.WriteString("\n## 转化原则\n")
+	sb.WriteString("1. 保留教案的知识结构和教学设计，逐环节落到课件页面\n")
 	sb.WriteString("2. 将文字描述转化为视觉呈现方案（图文、图表、动画等）\n")
 	sb.WriteString("3. 在关键知识点处添加交互环节（选择题、拖拽、填空等）\n")
-	sb.WriteString("4. 补充必要的封面页、目标页和总结页\n\n")
+	sb.WriteString("4. 信息密度高的教学环节应拆分为多页，而非压缩为一页\n")
+	sb.WriteString("5. 结构骨架：封面(1页) → 学习目标(1页) → 知识讲授(主体，按知识点逐页) → 练习/活动(2-3页) → 课堂小结(1页) → 作业布置(1页)\n")
+	sb.WriteString("6. 交互类型分布：纯展示≤40%，简单交互30-40%，复杂交互≤20%\n")
+	sb.WriteString("7. 难度递进：前1/3基础 → 中1/3进阶 → 后1/3综合\n\n")
 
 	sb.WriteString("## 输出要求\n")
 	sb.WriteString("请输出JSON数组格式。每个元素包含以下字段：\n")
 	sb.WriteString("page_number(int), title(string), purpose(string), content_summary(string), ")
 	sb.WriteString("interaction_type(string), visual_format(string), media_requirements(string), estimated_complexity(int 1-5)\n\n")
+	sb.WriteString("page_number 从1开始连续编号。\n")
 	sb.WriteString("交互类型可选：static/click/drag/input/animation/video/game/quiz\n")
 	sb.WriteString("视觉形式可选：text_heavy/image_text/diagram/chart/timeline/comparison/gallery/fullscreen_media\n\n")
 	sb.WriteString("请只输出JSON数组，不要有任何额外说明文字。")

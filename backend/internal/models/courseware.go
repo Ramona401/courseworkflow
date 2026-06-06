@@ -17,6 +17,11 @@ import (
 //            视频上传也用它接通 ffprobe 元数据（duration/width/height/codec/fps/bit_rate）。
 //            Metadata 为原始 JSON 字符串，空串语义=NULL（仓储层 nullIfEmptyJSON 负责空串转 NULL，
 //            避免空串直接写 jsonb 列报错）。
+// 课程知识库轮（本轮）变更：
+//            - CreateCoursewareFromTopicRequest 新增可选字段 KPCodes（选中的课标知识点编码数组）；
+//              为空时完全兼容原有"纯主题规划"逻辑，非空时启用"难度自动适配"。
+//            - 新增 CurriculumKP（课标骨架层）/ TextbookUnit（教材实例层）两个只读模型，
+//              对应 curriculum_standards / textbook_units 两张表。
 
 // ==================== 课件主表模型 ====================
 
@@ -46,6 +51,9 @@ type Courseware struct {
 	StyleAnchorAssetID *string `json:"style_anchor_asset_id"`
 	// StyleAnchorVAOCI 锚点图的 VAOCI 索引文本(多模态AI读图提取结果)；空=未设锚点
 	StyleAnchorVAOCI   string  `json:"style_anchor_vaoci"`
+	// KPCodes 课程知识库轮新增：从主题创建时勾选的课标知识点编码数组的JSON文本
+	// 对应 coursewares.kp_codes(jsonb) 列；空串=未勾选。生成索引时读出注入难度适配约束。
+	KPCodes         string     `json:"kp_codes"`
 	CreatedAt       *time.Time `json:"created_at"`
 	UpdatedAt       *time.Time `json:"updated_at"`
 }
@@ -267,12 +275,17 @@ type CreateCoursewareRequest struct {
 }
 
 // CreateCoursewareFromTopicRequest v0.42新增：从主题直接创建课件请求
+// 课程知识库轮新增 KPCodes：选中的课标知识点编码数组（可选）。
+//   - 为空：完全兼容原有"纯主题规划"逻辑，AI 自行决定难度；
+//   - 非空：服务层据此查 curriculum_standards 注入"难度自动适配约束段落"，
+//           使生成的课件难度严格贴合课标对该年级该知识点的深度要求。
 type CreateCoursewareFromTopicRequest struct {
-	Subject    string `json:"subject"`     // 学科（必填）
-	Grade      string `json:"grade"`       // 年级（必填）
-	Topic      string `json:"topic"`       // 主题名称（必填）
-	PageRange  string `json:"page_range"`  // 期望页数范围（可选，如"15-25"）
-	ExtraNotes string `json:"extra_notes"` // 额外说明（可选）
+	Subject    string   `json:"subject"`     // 学科（必填）
+	Grade      string   `json:"grade"`       // 年级（必填）
+	Topic      string   `json:"topic"`       // 主题名称（必填）
+	PageRange  string   `json:"page_range"`  // 期望页数范围（可选，如"15-25"）
+	ExtraNotes string   `json:"extra_notes"` // 额外说明（可选）
+	KPCodes    []string `json:"kp_codes"`    // 课程知识库轮新增：选中的课标知识点编码数组（可选）
 }
 
 // UpdateCoursewareRequest 更新课件基本信息请求
@@ -401,6 +414,8 @@ type CoursewareDetailResponse struct {
 	StyleAnchorAssetID *string        `json:"style_anchor_asset_id"` // nil=未设锚点
 	StyleAnchorVAOCI   string         `json:"style_anchor_vaoci"`    // 锚点VAOCI索引文本
 	StyleAnchorURL     string         `json:"style_anchor_url"`      // 锚点图公网URL（轮3：供前端跨页显示缩略图，优先OSS地址）
+	// KPCodes 课程知识库轮新增：本课件勾选的课标知识点编码数组JSON文本，供前端生成索引时回传
+	KPCodes         string            `json:"kp_codes"`
 	Pages           []*CoursewarePage `json:"pages"`
 	CreatedAt       *time.Time        `json:"created_at"`
 	UpdatedAt       *time.Time        `json:"updated_at"`
@@ -410,4 +425,46 @@ type CoursewareDetailResponse struct {
 type CoursewareListResponse struct {
 	Coursewares []*CoursewareListItem `json:"coursewares"`
 	Total       int                   `json:"total"`
+}
+
+// ==================== 课程知识库模型（本轮新增，只读） ====================
+
+// CurriculumKP 课标骨架层知识点（对应 curriculum_standards 表）
+// 权威/稳定/版本无关，定义各学科各学段知识点与三档深度，是"难度自动适配"的依据。
+type CurriculumKP struct {
+	ID                  string `json:"id"`
+	Subject             string `json:"subject"`              // 学科
+	Stage               string `json:"stage"`                // 学段（小学低/小学中/小学高/初中）
+	GradeNum            int    `json:"grade_num"`            // 具体年级1-9（0=学段级，无具体年级）
+	Domain              string `json:"domain"`               // 领域（数与代数/图形与几何...）
+	Theme               string `json:"theme"`                // 主题
+	KPCode              string `json:"kp_code"`              // 知识点全局编码
+	KPName              string `json:"kp_name"`              // 知识点名称
+	ContentRequirement  string `json:"content_requirement"`  // 内容要求：学什么、范围
+	AcademicRequirement string `json:"academic_requirement"` // 学业要求：学到什么程度（难度适配核心）
+	TeachingHint        string `json:"teaching_hint"`        // 教学提示
+	DepthLevel          int    `json:"depth_level"`          // 难度档 1体验感知/2理解应用/3分析迁移
+	CoreCompetency      string `json:"core_competency"`      // 对应核心素养
+	SourceRef           string `json:"source_ref"`           // 出处
+	Confidence          int    `json:"confidence"`           // 置信度0-100
+	SortOrder           int    `json:"sort_order"`           // 同年级内排序
+}
+
+// TextbookUnit 教材实例层单元（对应 textbook_units 表）
+// 版本相关，各版本教材每年级每册每单元结构，通过 KPCodesJSON 软关联课标知识点。
+type TextbookUnit struct {
+	ID             string `json:"id"`
+	Subject        string `json:"subject"`         // 学科
+	Publisher      string `json:"publisher"`       // 教材版本（人教版/苏教版/北师大版...）
+	GradeNum       int    `json:"grade_num"`       // 年级1-9
+	Semester       string `json:"semester"`        // 册（上册/下册/全册）
+	UnitNumber     int    `json:"unit_number"`     // 单元序号
+	UnitTitle      string `json:"unit_title"`      // 单元标题
+	LessonTitle    string `json:"lesson_title"`    // 课标题（可空）
+	ContentSummary string `json:"content_summary"` // 单元内容概述
+	KPCodesJSON    string `json:"kp_codes"`        // 引用的课标知识点编码数组（JSON文本，前端解析）
+	IdxDepthLevel  int    `json:"idx_depth_level"` // 该单元综合深度档
+	SourceType     string `json:"source_type"`     // 数据来源（web_search/pdf_upload/manual）
+	Confidence     int    `json:"confidence"`      // 置信度0-100
+	SortOrder      int    `json:"sort_order"`      // 排序
 }

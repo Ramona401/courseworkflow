@@ -27,6 +27,7 @@ import (
 
 	"tedna/internal/middleware"
 	"tedna/internal/models"
+	"tedna/internal/repository"
 	"tedna/internal/services"
 	"tedna/internal/utils"
 )
@@ -267,6 +268,16 @@ func (h *CoursewareIndexHandler) GenerateIndexFromTopic(w http.ResponseWriter, r
 		Topic:      reqBody.Topic,
 		PageRange:  reqBody.PageRange,
 		ExtraNotes: reqBody.ExtraNotes,
+	}
+
+	// 课程知识库轮：从课件记录读出创建时勾选的 kp_codes（JSON文本→[]string），
+	// 注入 req.KPCodes，使 GenerateIndexFromTopic 内的 BuildCurriculumConstraint 生效（难度自动适配）。
+	// 单一数据源：知识点属课件既定属性，从库读而非依赖前端重传，避免不一致。读失败/为空均退回无约束逻辑。
+	if cw, cwErr := repository.GetCoursewareByID(r.Context(), id); cwErr == nil && cw.KPCodes != "" {
+		var codes []string
+		if jErr := json.Unmarshal([]byte(cw.KPCodes), &codes); jErr == nil {
+			req.KPCodes = codes
+		}
 	}
 
 	go func() {

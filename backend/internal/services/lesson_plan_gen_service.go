@@ -31,6 +31,26 @@ package services
 //   - review 阶段不参与一键生成(推进过去会自动触发评审,无需额外按钮)
 //   - 重要:本批次产出"纯 AI 一次性生成"内容,前端已在二次确认弹窗与产出卡片明确警示
 //     "纯 AI 产出可能有幻觉、与真实学情/教材不符,务必核对"。后端不重复警示,只负责出稿。
+//
+// v172改动(SSE 完成信号治本·修复"一键生成要刷新才出来 / 出来了还显示生成中"):
+//   根因：
+//     1) processChatStageAsync 全程只广播 thinking→chunk→(stage_output)→message_done，
+//        从不广播 done 事件。前端 createLessonPlanSSE 只有收到 done 才会主动 es.close()。
+//        后端不发 done → 这条 SSE HTTP 长连接生成完毕后仍挂着不关，直到被 Nginx/浏览器
+//        超时掐断 → 前端 es.onerror 触发自动重连 → 重连调后端 Subscribe(独占模式) →
+//        关闭正在推送的旧 channel → 后续关键事件(message_done/content_update)被丢弃 →
+//        前端永远收不到收尾事件，但内容其实已落库 → "要刷新才出来"。
+//     2) 前端 fullGenerating 复位只挂在 content_update(只有 write/revise 落库才发)，
+//        analyze/design 阶段不发 content_update → "生成中"永不消失。
+//   修复历程更正（v172 当日回滚）：
+//     起初尝试在 processChatStageAsync 结尾 defer 补发 done 让前端 es.close() 收尾，
+//     但本系统的 SSE 是「整个教案会话共享的一条长连接」，并非「一轮对话一条连接」。
+//     每轮结束就发 done → 前端收到后 es.close() 关掉整条会话连接 →
+//     进入阶段时开场白那一轮发的 done 会把连接关掉，导致随后「一键生成」时
+//     已无活动 SSE 连接接收 chunk（前端 Network 中 stream 连接消失），结果收不到、要刷新才出来。
+//     因此已撤销后端补发 done 的做法：SSE 长连接保持开启、等待后续轮次复用，不再每轮关闭。
+//   最终方案：仅在前端 onMessageDone 里复位「生成中」类状态（fullGenerating 等），
+//     既治「出来了还显示生成中」，又不关闭会话长连接（不影响后续轮次接收推送）。
 
 import (
 	"context"
@@ -62,113 +82,6 @@ var (
 // lessonPlanSceneCode 教案生成场景代码，用于从ai_scene_configs获取独立模型配置
 const lessonPlanSceneCode = "lesson_plan"
 
-// fullGenerateWritePrompt 教案撰写阶段·全委托一键生成指令（v168·功能B）
-//
-// 设计原则：本指令格式严格对齐 DetectLessonPlanContent（workshop_stage_extract.go）的判定条件，
-// 确保 AI 一次性产出的教案能被识别并落库。DetectLessonPlanContent 要求：
-//  1. ≥3 个教案标记词（教学目标/重点/难点/过程/准备/作业/板书...）
-//  2. 有 # 开头的标题行，且标题含"教案/教学设计/教学目标/课题..."之一
-//  3. 含"教学过程"或"教学环节"或"教学活动"
-//  4. 含结尾标记（作业布置/板书设计/课后作业/课堂小结/教学反思...之一）
-//  5. 去掉末尾客套话后正文 ≥800 字符
-//
-// 因此本指令强制：用 # 标题、含全部必备小节、教学过程分环节带时间、不分段、不寒暄。
-const fullGenerateWritePrompt = `
-
-== 全委托一键生成模式（系统级指令，最高优先级，覆盖上文所有分段确认要求）==
-老师已明确选择"全委托 AI 一次性生成完整教案"，请你立即一次性输出一份**完整、可直接使用**的教案 Markdown，不要分段、不要等老师确认、不要说"接下来写下一部分"，本次回复就给出全部内容。
-
-输出格式硬性要求（务必全部满足，否则系统无法识别保存）：
-1. 以一级标题开头，格式为：# 《课题》教学设计（或 # 课题 教案）。
-2. 必须包含以下小节，每个小节用 ## 二级标题：
-   ## 教学目标（分知识与技能、过程与方法、情感态度价值观三维，或按核心素养列出，要具体可观察）
-   ## 教学重难点（明确教学重点与教学难点）
-   ## 教学准备（教具、学具、课件、场地等）
-   ## 教学过程（这是核心，必须按环节展开，每个环节标注时间分配，如"一、导入（5分钟）"，环节要包含教师活动与学生活动）
-   ## 作业布置（具体的课后作业或练习）
-   ## 板书设计（本节课的板书结构）
-3. 教学过程要详实，环节完整（导入→新授→巩固→小结等），内容充实，确保整份教案不少于 800 字。
-4. 结尾直接以"板书设计"小节自然结束，**不要**添加"如需修改请告诉我""希望这份教案对您有帮助"等客套话。
-5. 全程使用规范的 Markdown 标题层次（# ## ###），正文用自然中文，不要输出 JSON 或代码块包裹整篇教案。
-
-请现在就开始输出完整教案。`
-
-// fullGenerateAnalyzePrompt 教学分析阶段·全委托一键生成指令（v169）
-//
-// 落库路径：analyze 走 extractGenericStageFromNatural（判定宽松，内容非空即存为 narrative），
-// 故格式要求不必像 write 那样严格，重点是引导 AI 一次性输出完整的、结构清晰的学情/教材分析。
-const fullGenerateAnalyzePrompt = `
-
-== 全委托一键生成模式（系统级指令，最高优先级，覆盖上文所有分段确认/逐步追问要求）==
-老师已明确选择"全委托 AI 一次性完成本阶段（教学分析）"，请你立即一次性输出一份**完整的教学分析**，不要分段、不要反过来追问老师、不要说"接下来分析下一部分"，本次回复就给出全部内容。
-
-请用 Markdown 输出，至少包含以下方面（用 ## 二级标题分节）：
-## 教材分析（本课内容在教材中的地位、知识结构、与前后内容的联系）
-## 课程标准对接（本课对应的课程标准/核心素养要求）
-## 学情分析（该年级学生的认知特点、已有知识基础、可能的学习难点与误区）
-## 核心概念与重难点预判（本课的核心概念，以及预计的教学重点和难点）
-
-要求：内容具体、贴合学科与年级，避免空话套话。结尾不要加"如需调整请告诉我"之类的客套话。
-
-请现在就开始输出完整的教学分析。`
-
-// fullGenerateDesignPrompt 教学设计阶段·全委托一键生成指令（v169）
-//
-// 落库路径：design 走 extractGenericStageFromNatural（宽松）。
-const fullGenerateDesignPrompt = `
-
-== 全委托一键生成模式（系统级指令，最高优先级，覆盖上文所有分段确认/逐步追问要求）==
-老师已明确选择"全委托 AI 一次性完成本阶段（教学设计）"，请你立即一次性输出一份**完整的教学设计方案**，不要分段、不要反过来追问老师，本次回复就给出全部内容。
-
-请用 Markdown 输出，至少包含以下方面（用 ## 二级标题分节）：
-## 教学目标（三维目标或核心素养目标，要具体可观察、可评估）
-## 教学重难点（明确重点与难点，并说明突破难点的策略）
-## 教学策略（采用的教学方法、学习方式，如探究式/任务驱动/小组合作等及理由）
-## 教学活动设计（按环节展开，每个环节给出名称、预计时长、教师活动、学生活动、设计意图）
-## 评价设计（如何检验目标达成，形成性评价与总结性评价的安排）
-
-要求：活动设计要可操作、环节衔接合理、贴合学科与年级。结尾不要加客套话。
-
-请现在就开始输出完整的教学设计方案。`
-
-// fullGenerateRevisePrompt 修订定稿阶段·全委托一键生成指令（v169）
-//
-// 落库路径：revise 与 write 共用 handleWriteStageOutput，需命中 DetectLessonPlanContent（严格）。
-// 故格式要求与 write 完全一致（# 标题 + 全部必备小节 + ≥800字），
-// 区别在于：要求 AI 基于"前面阶段已完成的教案正文 + AI 评审建议"做修订后输出完整教案。
-// 已完成的正文与评审结论已由 LoadStagePromptContextV2 + Episodic 摘要注入上下文，AI 可直接参考。
-const fullGenerateRevisePrompt = `
-
-== 全委托一键生成模式（系统级指令，最高优先级，覆盖上文所有分段确认要求）==
-老师已明确选择"全委托 AI 一次性完成修订定稿"。请你参考前面阶段已经完成的教案正文，以及 AI 评审阶段提出的改进建议，**对教案进行修订并一次性输出修订后的完整教案 Markdown**。不要只输出修改点、不要分段、不要等老师确认，本次回复直接给出修订后的整份教案。
-
-输出格式硬性要求（务必全部满足，否则系统无法识别保存）：
-1. 以一级标题开头，格式为：# 《课题》教学设计（或 # 课题 教案）。
-2. 必须包含以下小节，每个小节用 ## 二级标题：教学目标、教学重难点、教学准备、教学过程（按环节展开并标注时间分配，含教师活动与学生活动）、作业布置、板书设计。
-3. 在原教案基础上落实评审建议的改进点（如时间分配、评价工具、活动设计等），但仍输出**完整**教案而非仅改动部分。
-4. 整份教案不少于 800 字，结尾以"板书设计"小节自然结束，不要加客套话。
-5. 使用规范 Markdown 标题层次，不要用 JSON 或代码块包裹整篇教案。
-
-请现在就开始输出修订后的完整教案。`
-
-// resolveFullGeneratePrompt 按阶段返回对应的全委托一键生成指令（v169）
-//
-// 返回空字符串表示该阶段不支持一键生成（如 review）。
-// write 阶段的"已有正文→防重复"判定不在此处，仍由 processChatStageAsync 单独处理。
-func resolveFullGeneratePrompt(stageCode string) string {
-	switch stageCode {
-	case "analyze":
-		return fullGenerateAnalyzePrompt
-	case "design":
-		return fullGenerateDesignPrompt
-	case "write":
-		return fullGenerateWritePrompt
-	case "revise":
-		return fullGenerateRevisePrompt
-	default:
-		return ""
-	}
-}
 
 // ==================== 服务结构体 ====================
 
@@ -450,6 +363,11 @@ func (s *LessonPlanGenService) resolveAssistantPrompt(
 //   - write 阶段保留原三态（已有正文→防重复 / 正文空+fullGenerate→全委托 / 其余逐轮）
 //   - analyze/design/revise 阶段：fullGenerate=true 时注入 resolveFullGeneratePrompt 返回的对应指令
 //   - review 阶段：resolveFullGeneratePrompt 返回空，不参与一键生成
+//
+// v172说明（已撤销 done 补发）：
+//   本函数不再补发 done 事件。原因：SSE 是教案会话级共享长连接，发 done 会让前端关闭整条连接，
+//   导致进入阶段的开场白那轮 done 关连接后、随后「一键生成」无连接可收。
+//   「生成中」状态的复位改由前端 onMessageDone 处理，不依赖关闭连接。
 func (s *LessonPlanGenService) processChatStageAsync(
 	ctx context.Context,
 	lp *models.LessonPlan,
@@ -630,6 +548,7 @@ func (s *LessonPlanGenService) processChatStageAsync(
 
 	// v87：对话完成后异步检测停滞，插入教练建议
 	// v168/v169：全委托一次性出稿不需要停滞检测（本就是一次性完成），跳过避免误插建议
+	//
 	if !fullGenInjected {
 		go s.checkAndInsertCoachAdvice(ctx, planID, currentStage)
 	}
