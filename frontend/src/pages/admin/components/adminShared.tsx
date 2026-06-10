@@ -3,10 +3,12 @@
  *   Toast / RoleBadge / StatusBadge / StatCard
  *
  * 角色名称与学校体系对齐：
- *   admin           → 系统管理员
- *   senior_operator → 学校管理员
- *   operator        → 骨干教师
- *   viewer          → 普通教师
+ *   admin              → 系统管理员
+ *   region_admin       → 区域管理员（迭代一新增）
+ *   district_inspector → 区域教研员（迭代一新增）
+ *   senior_operator    → 学校管理员
+ *   operator           → 骨干教师
+ *   viewer             → 普通教师
  */
 import { useEffect } from 'react'
 import { C } from './adminConstants'
@@ -40,18 +42,25 @@ export function Toast({ message, type, onClose }: {
 
 // ==================== 角色徽章（与学校体系对齐）====================
 export function RoleBadge({ role, roleName }: { role: string; roleName?: string }) {
+  // 配色映射：
+  //   admin 红（最高权限）/ region_admin 紫（区域级）/ district_inspector 青蓝（区域教研）
+  //   senior_operator 橙（学校管理员）/ operator 蓝（骨干）/ viewer 灰（普通）
   const styleMap: Record<string, { bg: string; color: string }> = {
-    admin:           { bg: C.dangerLight,  color: C.danger  },
-    senior_operator: { bg: C.warningLight, color: C.warning },
-    operator:        { bg: C.primaryLight, color: C.primary },
-    viewer:          { bg: C.bg,           color: C.textSec },
+    admin:              { bg: C.dangerLight,  color: C.danger  },
+    region_admin:       { bg: C.purpleLight,  color: C.purple  },
+    district_inspector: { bg: 'rgba(6,182,212,0.10)', color: '#0891B2' },
+    senior_operator:    { bg: C.warningLight, color: C.warning },
+    operator:           { bg: C.primaryLight, color: C.primary },
+    viewer:             { bg: C.bg,           color: C.textSec },
   }
   // 前端本地中文名（roleName 优先，后端已返回新名称）
   const nameMap: Record<string, string> = {
-    admin:           '系统管理员',
-    senior_operator: '学校管理员',
-    operator:        '骨干教师',
-    viewer:          '普通教师',
+    admin:              '系统管理员',
+    region_admin:       '区域管理员',
+    district_inspector: '区域教研员',
+    senior_operator:    '学校管理员',
+    operator:           '骨干教师',
+    viewer:             '普通教师',
   }
   const s = styleMap[role] || { bg: C.bg, color: C.textSec }
   return (

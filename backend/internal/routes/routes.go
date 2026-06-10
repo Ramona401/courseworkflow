@@ -3,6 +3,8 @@ package routes
 // routes.go — 主路由注册
 //
 // v0.42 多媒体: 新增 CoursewareAssetService + CoursewareAssetHandler
+// 合并重构: 移除学校管理员独立体系(school_admin_handler/routes_school_admin)，
+//          senior_operator 统一走 /admin（registerAdminRoutes 的 adminOrSchoolAdmin 中间件）。
 
 import (
 	"context"
@@ -88,6 +90,10 @@ func Setup(cfg *config.Config) http.Handler {
 
 	wsStageService.SetGenService(lpGenService)
 	wsStageService.SetAESKey(cfg.GetAESKey())
+	// 迭代7B：注入课本服务，使备课工坊各阶段提示词能拼入老师勾选的课本原文
+	wsStageService.SetTextbookService(tbService)
+	// 迭代7B修复：对话流程用的是 lpGenService 内部独立的 stageService 实例，需单独注入课本服务
+	lpGenService.SetTextbookServiceForStage(tbService)
 
 	engine := services.NewEngine(8, 8, 100)
 	pipelineService.SetEngine(engine)
@@ -178,11 +184,15 @@ func Setup(cfg *config.Config) http.Handler {
 	// v129新增：积分策略处理器
 	creditPolicyHandler := handlers.NewCreditPolicyHandler(creditPolicyService)
 
-	// v110:学校管理员处理器
-	schoolAdminHandler := handlers.NewSchoolAdminHandler(userService, orgService)
-
 	// 课程知识库（平台级公共只读查询，课件/教案两处复用）
 	curriculumHandler := handlers.NewCurriculumHandler()
+
+	// 知识库课标压缩入库系统（迭代一：课标先行）
+	kbCompressService := services.NewKBCompressService(cfg)
+	kbReviewService := services.NewKBReviewService()
+	kbCompressHandler := handlers.NewKBCompressHandler(kbCompressService, authService)
+	kbReviewHandler := handlers.NewKBReviewHandler(kbReviewService)
+	kbAdminHandler := handlers.NewKBAdminHandler()
 
 	// v130(课件工坊 Phase 1)新增:课件工坊服务+处理器
 	cwService := services.NewCoursewareService()
@@ -208,8 +218,8 @@ func Setup(cfg *config.Config) http.Handler {
 	// v0.42 多媒体:课件多媒体资产服务+处理器
 	cwAssetService := services.NewCoursewareAssetService(cfg)
 	// v0.42.10: 创建OSS上传服务实例（复用已有配置体系）
-        ossService := services.NewOSSService(cfg)
-        cwAssetHandler := handlers.NewCoursewareAssetHandler(cwAssetService, ossService)
+	ossService := services.NewOSSService(cfg)
+	cwAssetHandler := handlers.NewCoursewareAssetHandler(cwAssetService, ossService)
 
 	// v0.42.1 视频编辑:服务+处理器
 	videoEditService := services.NewVideoEditService(cfg)
@@ -230,7 +240,6 @@ func Setup(cfg *config.Config) http.Handler {
 
 	authMW := middleware.AuthMiddleware(authService)
 	adminOnly := middleware.RequireRole(roleAdmin)
-	seniorOperatorOnly := middleware.RequireRole(roleSeniorOperator)
 	adminOrSchoolAdmin := middleware.RequireRole(roleAdmin, roleSeniorOperator)
 	adminOrInspector := middleware.RequireRole(roleAdmin, roleDistrictInspector)
 
@@ -298,11 +307,11 @@ func Setup(cfg *config.Config) http.Handler {
 	// v129新增：注册积分策略路由
 	registerCreditPolicyRoutes(mux, authMW, adminOnly, creditPolicyHandler)
 
-	// v110:注册学校管理员路由
-	registerSchoolAdminRoutes(mux, authMW, seniorOperatorOnly, schoolAdminHandler)
-
 	// 课程知识库公共只读路由（/api/v1/curriculum/*）
 	registerCurriculumRoutes(mux, authMW, curriculumHandler)
+
+	// 知识库课标压缩入库路由（/api/v1/kb/* + /api/v1/sse/kb/* + /api/v1/admin/kb-authorized）
+	registerKBRoutes(mux, authMW, adminOnly, kbCompressHandler, kbReviewHandler, kbAdminHandler)
 
 	// v110(TE-DNA 3.0 P0)新增:注册 AI 助手路由
 	registerAIAssistantRoutes(mux, authMW, aiAssistantHandler, assistantDesignerHandler)

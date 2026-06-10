@@ -27,22 +27,22 @@ type AIConfigItem struct {
 
 // GlobalConfigResponse 全局配置响应（聚合为一个对象）
 type GlobalConfigResponse struct {
-	APIBaseURL   string     `json:"api_base_url"`   // AI API 基础地址
-	APIKey       string     `json:"api_key"`        // API Key（脱敏显示）
-	APIKeySet    bool       `json:"api_key_set"`    // API Key 是否已配置
-	DefaultModel string     `json:"default_model"`  // 默认模型
-	Temperature  string     `json:"temperature"`    // 默认温度
-	MaxTokens    string     `json:"max_tokens"`     // 默认最大Token数
-	UpdatedAt    *time.Time `json:"updated_at"`     // 最近更新时间
+	APIBaseURL   string     `json:"api_base_url"`  // AI API 基础地址
+	APIKey       string     `json:"api_key"`       // API Key（脱敏显示）
+	APIKeySet    bool       `json:"api_key_set"`   // API Key 是否已配置
+	DefaultModel string     `json:"default_model"` // 默认模型
+	Temperature  string     `json:"temperature"`   // 默认温度
+	MaxTokens    string     `json:"max_tokens"`    // 默认最大Token数
+	UpdatedAt    *time.Time `json:"updated_at"`    // 最近更新时间
 }
 
 // UpdateGlobalConfigRequest 更新全局配置请求体
 type UpdateGlobalConfigRequest struct {
-	APIBaseURL   string `json:"api_base_url"`   // AI API 基础地址
-	APIKey       string `json:"api_key"`        // API Key（明文，后端加密存储；空字符串表示不修改）
-	DefaultModel string `json:"default_model"`  // 默认模型
-	Temperature  string `json:"temperature"`    // 默认温度（字符串，如 "0.7"）
-	MaxTokens    string `json:"max_tokens"`     // 默认最大Token数（字符串，如 "8000"）
+	APIBaseURL   string `json:"api_base_url"`  // AI API 基础地址
+	APIKey       string `json:"api_key"`       // API Key（明文，后端加密存储；空字符串表示不修改）
+	DefaultModel string `json:"default_model"` // 默认模型
+	Temperature  string `json:"temperature"`   // 默认温度（字符串，如 "0.7"）
+	MaxTokens    string `json:"max_tokens"`    // 默认最大Token数（字符串，如 "8000"）
 }
 
 // ==================== AI 场景配置模型 ====================
@@ -133,8 +133,8 @@ const (
 	SceneAssistantDesigner = "assistant_designer" // AI 助手对话式创作(Sonnet,可在管理界面切换)
 
 	// 课件工坊场景代码常量
-	SceneCWNavRefine       = "courseware_nav_refine"      // 课件导航栏样式微调
-	SceneCWPageRefine      = "courseware_page_refine"     // 课件单页内容微调
+	SceneCWNavRefine       = "courseware_nav_refine"       // 课件导航栏样式微调
+	SceneCWPageRefine      = "courseware_page_refine"      // 课件单页内容微调
 	SceneCWIndex           = "courseware_index"            // 课件索引生成
 	SceneCWScheme          = "courseware_scheme"           // 课件方案翻译
 	SceneCWGenerate        = "courseware_generate"         // 课件HTML生成
@@ -187,6 +187,8 @@ var ValidSceneCodes = []string{
 	SceneCWSubtitleTTS,
 	// v0.42.11 新增
 	SceneCW3DSingle,
+	// 知识库课标压缩入库迭代一 新增（默认 opus，未实配回退全局默认）
+	"kb_extract", "kb_compress", "kb_arbitrate",
 }
 
 // SceneNameMap 场景代码→中文名映射
@@ -223,6 +225,10 @@ var SceneNameMap = map[string]string{
 	SceneCWSubtitleTTS: "课件字幕TTS配音",
 	// v0.42.11 新增
 	SceneCW3DSingle: "3D互动单页生成",
+	// 知识库课标压缩入库迭代一 新增
+	"kb_extract":   "知识库-知识点抽取",
+	"kb_compress":  "知识库-课标压缩",
+	"kb_arbitrate": "知识库-语义仲裁",
 }
 
 // SceneGroupMap 场景代码→分组映射（v78新增，v87补充stage_coach，v114补充 assistant_designer）
@@ -260,6 +266,10 @@ var SceneGroupMap = map[string]string{
 	SceneCWSubtitleTTS: "courseware",
 	// v0.42.11 新增
 	SceneCW3DSingle: "courseware",
+	// 知识库课标压缩入库迭代一 新增（独立分组 knowledge_base）
+	"kb_extract":   "knowledge_base",
+	"kb_compress":  "knowledge_base",
+	"kb_arbitrate": "knowledge_base",
 }
 
 // IsValidSceneCode 检查场景代码是否有效

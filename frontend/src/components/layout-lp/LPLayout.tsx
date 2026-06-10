@@ -5,6 +5,9 @@
  * v5.3变更：pageTitles 增加备课配方相关路径
  * v5.2变更：下拉菜单新增"用户管理"入口（admin专属）
  * v110新增：下拉菜单新增"学校管理"入口（senior_operator专属）
+ * Phase6.2新增：区域管理员（region_admin）下拉菜单“用户管理”入口（指向 /admin，不含学校管理）
+ * 合并重构（本次）：删除 senior_operator 的“学校管理→/school-admin”入口，
+ *   统一走“用户管理→/admin”（/admin 已支持 senior 本校视角，含批量导入）。
  */
 import { useState, useRef, useEffect } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
@@ -135,12 +138,13 @@ function UserMenu() {
                 <LPMenuItem icon="📊" label="AI 调用统计" onClick={() => go('/ai-traces', '/lesson-plans')} />
               </>
             )}
-            {/* senior_operator 专属：学校管理 */}
+            {/* region_admin 专属：区域用户管理（指向 /admin，不含学校管理） */}
+            {user?.role === 'region_admin' && (
+              <LPMenuItem icon="👥" label="用户管理" onClick={() => go('/admin', '/lesson-plans')} highlight />
+            )}
+            {/* senior_operator 专属：用户管理（合并重构：删除原"学校管理→/school-admin"入口，统一走 /admin） */}
             {user?.role === 'senior_operator' && (
-              <>
-                <LPMenuItem icon="👥" label="用户管理" onClick={() => go('/admin', '/lesson-plans')} highlight />
-                <LPMenuItem icon="🏫" label="学校管理" onClick={() => go('/school-admin', '/lesson-plans')} highlight />
-              </>
+              <LPMenuItem icon="👥" label="用户管理" onClick={() => go('/admin', '/lesson-plans')} highlight />
             )}
           </div>
 

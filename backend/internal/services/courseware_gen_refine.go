@@ -200,6 +200,13 @@ func (s *CoursewareGenService) RefinePage(ctx context.Context, coursewareID stri
 	// 6.5 归一化根容器：压住1920×1080画布契约、剥除AI误加的transform、补cw-page类
 	refined = normalizeRootCanvas(refined)
 
+	// 批次1（背景保持）：若AI微调中弄丢了注入的背景<style>块，按三级优先级幂等补注
+	rStyleCfg := s.parseStyleConfig(cw.StyleConfig)
+	if rTplInfo, rtErr := s.loadTemplateInfo(ctx, rStyleCfg.TemplateID); rtErr == nil {
+		s.attachUserBackground(ctx, cw, rTplInfo)
+		refined = s.applyTemplateBackground(refined, rTplInfo, pageNum)
+	}
+
 	// 7. 保存微调结果
 	if dbErr := repository.UpdateCWPageHTML(ctx, page.ID, refined, "", page.MatchedComponentIDs, models.CWPageStatusGenerated); dbErr != nil {
 		return "", fmt.Errorf("保存微调结果失败: %w", dbErr)
@@ -252,6 +259,9 @@ func (s *CoursewareGenService) RegenerateSinglePage(ctx context.Context, coursew
 		tplInfo = s.defaultTemplateInfo()
 	}
 	logoURL, orgName := s.resolveLogoAndOrg(ctx, cw, styleCfg)
+
+	// 批次1（背景图库）：单页重生同样挂载老师选择的背景（三级优先级第一级）
+	s.attachUserBackground(ctx, cw, tplInfo)
 
 	genPrompt, err := repository.GetCurrentPromptByKey("prompt_courseware_generate")
 	if err != nil {

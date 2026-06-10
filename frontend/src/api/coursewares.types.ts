@@ -289,6 +289,9 @@ export interface CWSSECallbacks {
   onGenProgress?: (data: { current_page: number; total_pages: number; page_title: string; message: string; error?: string }) => void
   onGenDone?: (data: { courseware_id: string; success_count: number; fail_count: number; total_pages: number; elapsed_ms: number; message: string; errors?: string[]; is_preview?: boolean }) => void
   onError?: (data: { message: string }) => void
+  // P2：SSE 断线自动重连成功后回调（首次连接不触发）。
+  //   业务层据此重新拉取课件最新状态 + 页面列表，补齐断线期间漏收的已生成页，根治"假死"。
+  onReconnected?: () => void
 }
 
 // ==================== 多媒体资产类型 ====================

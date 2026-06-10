@@ -2,7 +2,17 @@ package handlers
 
 // admin_handler.go — 统一用户管理中心处理器(主文件)
 //
-// 迭代一 Phase 3.2 改动(本次)：
+// 合并重构(本次,废弃 SchoolAdminPage 并轨)：
+//   - 新增 BatchCreateAdminUsers: POST /api/v1/admin/users/batch
+//     学校管理页与用户管理页合并后,批量导入教师统一走 /admin/* 体系(不再用 /school-admin/*)。
+//     school_id 走 resolveSchoolScope:
+//       * admin          : 取前端传入的 school_id,必须非空(批量导入须指定目标学校才能入校,
+//                          否则只建用户不入校会产生孤儿,故为空直接 400 拦截);
+//       * senior_operator: 强制本校(忽略前端),与旧 /school-admin/users/batch 数据范围等价。
+//     角色白名单 operator/viewer(IsSchoolAdminCreatableRole);底层复用 userService.BatchCreateUsers
+//     (整批回滚 + 行号失败明细),业务级失败返 200 带 result,系统级异常返 500。
+//
+// 迭代一 Phase 3.2 改动：
 //   - CreateAdminUser: 改用 userService.CreateUserWithSchool 事务化建用户+入校。
 //     * senior_operator 创建：传 targetSchoolID + "admin_create"，事务内"建用户+入校"原子完成；
 //     * admin 创建：传 schoolID=""，只建用户不入校(意图不明确，交后续手动/教研组绑定，与历史一致)。
@@ -22,7 +32,7 @@ package handlers
 //
 // 职责:
 //   - AdminHandler struct定义与构造
-//   - 用户列表/详情/创建/编辑/启用禁用/重置密码
+//   - 用户列表/详情/创建/批量创建/编辑/启用禁用/重置密码
 //   - 课程分配查询与更新
 //   - 统计摘要
 //   - 错误处理函数
@@ -274,6 +284,113 @@ func (h *AdminHandler) CreateAdminUser(w http.ResponseWriter, r *http.Request) {
                         "school_id":   targetSchoolID,
                 }, repository.GetClientIP(r.RemoteAddr))
         utils.Success(w, userInfo)
+}
+
+// ==================== 批量创建用户(合并重构新增) ====================
+
+// BatchCreateAdminUsers POST /api/v1/admin/users/batch
+//
+// 学校管理页与用户管理页合并后,批量导入教师统一走此端点(替代旧 /school-admin/users/batch)。
+//
+// 请求体(对齐 services.BatchCreateUsersRequest,前端只需传 role + users;
+//        admin 额外可带 school_id 指定目标学校):
+//
+//      {
+//        "role": "operator",                 // 批次级统一角色(仅 operator/viewer)
+//        "school_id": "xxx",                  // admin 必填(目标学校);senior 可省(后端强制本校)
+//        "users": [
+//          {"username":"t01","display_name":"教师01","password":"123456"}
+//        ]
+//      }
+//
+// 数据范围(resolveSchoolScope,与列表/详情完全一致):
+//   - admin          : effectiveSchoolID = 前端传入的 school_id;
+//                      【必须非空】——批量导入须把人写入 school_members 才能在本校可见,
+//                      为空则只建用户不入校会产生孤儿账号,故为空直接返回 400 提示先选学校。
+//   - senior_operator: effectiveSchoolID 强制为本校(忽略前端传入),与旧端点数据范围等价。
+//
+// 角色白名单:operator/viewer(IsSchoolAdminCreatableRole);source 按角色区分以保留审计语义:
+//   - senior: "school_admin_batch_create"(与旧端点一致)
+//   - admin : "admin_batch_create"
+//
+// 返回语义(对齐 service 的"整批回滚 + 行号明细"):
+//   - 校验阶段任一行不过 → service 返回 Success=false + Failures,error=nil →
+//     本 handler 返回 HTTP 200 + 完整 result(含每行失败原因),整批未创建任何用户;
+//   - 系统级异常(error 非 nil,如开事务失败)→ 返回 500;
+//   - 全部成功 → Success=true + CreatedCount,返回 200 + result,并写审计日志。
+func (h *AdminHandler) BatchCreateAdminUsers(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+                utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
+                return
+        }
+
+        claims, ok := middleware.GetClaims(r.Context())
+        if !ok {
+                utils.Unauthorized(w, utils.MsgNotLoggedIn)
+                return
+        }
+
+        // 仅解析前端需要提供的字段(role + school_id + users);source 不信任前端,后端按角色强制
+        var body struct {
+                Role     string                   `json:"role"`
+                SchoolID string                   `json:"school_id"`
+                Users    []services.BatchUserItem `json:"users"`
+        }
+        if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+                utils.BadRequest(w, utils.MsgBadRequestBody)
+                return
+        }
+
+        // 数据范围:admin 用前端传入的 school_id,senior 强制本校(忽略前端)
+        effectiveSchoolID, role, scopeErr := resolveSchoolScope(r.Context(), body.SchoolID)
+        if scopeErr != nil {
+                utils.Forbidden(w, scopeErr.Error())
+                return
+        }
+
+        // admin 批量导入必须指定目标学校(为空则会产生不入校的孤儿账号)
+        if effectiveSchoolID == "" {
+                utils.BadRequest(w, "批量导入请先指定目标学校")
+                return
+        }
+
+        // 角色白名单(仅可批量建 operator/viewer)
+        if !models.IsSchoolAdminCreatableRole(body.Role) {
+                utils.BadRequest(w, "仅可批量创建骨干教师(operator)或普通教师(viewer)账号")
+                return
+        }
+
+        // source 按角色区分,保留审计语义(senior 与旧端点一致)
+        source := "admin_batch_create"
+        if role == models.RoleSeniorOperator {
+                source = "school_admin_batch_create"
+        }
+
+        svcReq := &services.BatchCreateUsersRequest{
+                Role:     body.Role,
+                SchoolID: effectiveSchoolID,
+                Source:   source,
+                Users:    body.Users,
+        }
+
+        result, err := h.userService.BatchCreateUsers(r.Context(), svcReq)
+        if err != nil {
+                // 系统级异常(开事务失败/查重失败等):返回 500
+                utils.InternalError(w, "批量创建用户失败: "+err.Error())
+                return
+        }
+
+        // 业务级结果(成功 or 整批校验失败带明细)统一 200 + result 返回
+        if result.Success {
+                repository.WriteAuditLog(claims.UserID, "admin.user_batch_create",
+                        map[string]interface{}{
+                                "role":          body.Role,
+                                "school_id":     effectiveSchoolID,
+                                "created_count": result.CreatedCount,
+                                "source":        source,
+                        }, repository.GetClientIP(r.RemoteAddr))
+        }
+        utils.Success(w, result)
 }
 
 // ==================== 编辑用户 ====================

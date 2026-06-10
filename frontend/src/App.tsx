@@ -9,6 +9,21 @@
  *   - 即便登录用户直接敲 URL，所属学校未开通该板块也会被重定向回首页
  *   - 与门户卡片显隐配套（光藏入口不够，必须守卫路由）
  *
+ * Phase6.2新增（区域管理员）：
+ *   - /admin 路由 RoleGuard 角色白名单加入 region_admin，
+ *     使区域管理员可进入统一用户管理中心（数据由后端 ResolveDataScope 收窄到辖区）
+ *
+ * 合并重构改动（本次，废弃 SchoolAdminPage 并轨）：
+ *   - /school-admin 路由不再渲染 SchoolAdminPage，改为 <Navigate to="/admin" replace/>
+ *     （senior_operator 统一走 /admin 本校视角；保留旧路径重定向，防止存量书签/链接 404）。
+ *   - 移除 SchoolAdminPage 的 lazy import（其文件将在后续清理批次删除）。
+ *
+ * 知识库压缩入库系统（Phase 6 前端）新增：
+ *   - 新增隐藏全屏路由 /kb-admin/curriculum（课标压缩入库主页面）。
+ *     参照 /lesson-plans/review/:id 的脱离布局全屏模式——只套 AuthGuard，不进任何 Layout，
+ *     不出现在 PortalPage 入口卡片（隐藏功能），仅授权人员经直接 URL 访问。
+ *     真正的访问拦截靠后端 RequireKBAuthorized 白名单中间件，前端守卫仅做体验优化不是安全边界。
+ *
  * 分包策略（Vite 自动按 dynamic import 边界拆分）：
  *   - 主 chunk：路由框架 + 布局组件 + 守卫
  *   - 课件审核板块 chunk
@@ -68,12 +83,14 @@ const CWComponentsPage = lazy(() => import('@/pages/courseware/CWComponentsPage'
 const CWTemplatesPage = lazy(() => import('@/pages/courseware/CWTemplatesPage'))
 const CoursewareWorkshopPage = lazy(() => import('@/pages/courseware/CoursewareWorkshopPage'))
 
+/* ==================== 知识库压缩入库系统（隐藏全屏，懒加载） ==================== */
+const KBCurriculumPage = lazy(() => import('@/pages/kb-admin/KBCurriculumPage'))
+
 /* ==================== 通用独立页面（懒加载） ==================== */
 const AccountPage = lazy(() => import('@/pages/account/AccountPage'))
 const AICenterPage = lazy(() => import('@/pages/ai-center/AICenterPage'))
 const AITraceDashboardPage = lazy(() => import('@/pages/ai-traces/AITraceDashboardPage'))
 const AdminPage = lazy(() => import('@/pages/admin/AdminPage'))
-const SchoolAdminPage = lazy(() => import('@/pages/account/SchoolAdminPage'))
 
 /* ==================== 路由加载错误边界 ==================== */
 interface EBProps { children: ReactNode }
@@ -198,22 +215,25 @@ export default function App() {
             {/* ==================== 通用独立页面 ==================== */}
             <Route path="/account" element={<AuthGuard><AccountPage /></AuthGuard>} />
 
-            <Route path="/school-admin" element={
-              <AuthGuard>
-                <RoleGuard roles={['senior_operator']}>
-                  <SchoolAdminPage />
-                </RoleGuard>
-              </AuthGuard>
-            } />
+            {/* 合并重构：/school-admin 旧路径重定向到 /admin（senior 走统一用户管理中心本校视角） */}
+            <Route path="/school-admin" element={<Navigate to="/admin" replace />} />
 
             <Route path="/ai-center" element={
               <AuthGuard><RoleGuard roles={['admin']}><AICenterPage /></RoleGuard></AuthGuard>
             } />
+            {/* Phase6.2：/admin 加入 region_admin（区域管理员） */}
             <Route path="/admin" element={
-              <AuthGuard><RoleGuard roles={['admin','senior_operator']}><AdminPage /></RoleGuard></AuthGuard>
+              <AuthGuard><RoleGuard roles={['admin','senior_operator','region_admin']}><AdminPage /></RoleGuard></AuthGuard>
             } />
             <Route path="/ai-traces" element={
               <AuthGuard><RoleGuard roles={['admin']}><AITraceDashboardPage /></RoleGuard></AuthGuard>
+            } />
+
+            {/* ==================== 知识库压缩入库（隐藏全屏，脱离任何布局；仅授权人员经直接URL访问） ==================== */}
+            {/* 参照 /lesson-plans/review/:id 模式：只套 AuthGuard，不进 Layout，不出现在门户入口卡片。
+                真正的访问拦截靠后端 RequireKBAuthorized 白名单中间件，前端守卫仅体验优化非安全边界。 */}
+            <Route path="/kb-admin/curriculum" element={
+              <AuthGuard><KBCurriculumPage /></AuthGuard>
             } />
 
             {/* ==================== 课件审核系统（v172：叠加 ModuleGuard 板块守卫） ==================== */}

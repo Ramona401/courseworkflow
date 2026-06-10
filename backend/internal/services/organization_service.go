@@ -2,6 +2,16 @@ package services
 
 // organization_service.go — 组织与教研组管理业务逻辑层
 //
+// 组织列表越权修复（Phase 6 验收期补漏）：
+//   ListOrganizations / ListTeachingGroups 新增 scope DataScope 参数，按调用者数据范围过滤：
+//     - admin           → 全量（scope.IsAdmin）
+//     - region_admin    → 仅 scope.OrgIDs（已含辖区区域 + 辖区学校）内的组织
+//     - senior_operator → 仅本校（scope.OrgIDs）+ 本校所属父区域（额外并入，保证组织三栏可用：
+//                         区域栏只读展示上级区域 → 点进去看到本校 → 本校教研组）
+//     - 其它/Blocked    → 空集
+//   教研组列表按"请求的 school_id 是否在可见学校集内"校验，越权（传别校 school_id）返回空集。
+//   过滤在 service 内存层做（组织/教研组数据量小，O(n) 可接受，无需改 repo SQL）。
+//
 // v122 方案B 改动:
 //   - AddGroupMember: 成功后顺便 upsert school_members(保险机制)
 //     语义: 加入本校教研组 = 本校成员
@@ -103,7 +113,16 @@ func (s *OrganizationService) CreateOrganization(ctx context.Context, req *model
 	return org, nil
 }
 
-func (s *OrganizationService) ListOrganizations(ctx context.Context, orgType string, parentID string) (*models.OrganizationListResponse, error) {
+// ListOrganizations 组织列表（按数据范围 scope 过滤，防跨区域/跨校越权）
+//
+// 过滤规则：
+//   - scope.IsAdmin           → 不过滤，返回全量
+//   - scope.Blocked           → 返回空列表（孤儿/未绑校/查询失败）
+//   - region_admin            → 仅保留 scope.OrgIDs（辖区区域 + 辖区学校）内的组织
+//   - senior_operator         → 可见组织集 = scope.OrgIDs（本校）∪ 本校父区域ID
+//                               （额外并入父区域，使组织三栏的"区域"栏能只读展示上级，三栏可用）
+//   - operator/viewer         → scope.OrgIDs 为空切片 → 空集（本不该进 /admin）
+func (s *OrganizationService) ListOrganizations(ctx context.Context, orgType string, parentID string, scope DataScope) (*models.OrganizationListResponse, error) {
 	items, err := repository.ListOrganizations(ctx, orgType, parentID)
 	if err != nil {
 		return nil, err
@@ -111,7 +130,43 @@ func (s *OrganizationService) ListOrganizations(ctx context.Context, orgType str
 	if items == nil {
 		items = []*models.OrganizationListItem{}
 	}
-	return &models.OrganizationListResponse{Organizations: items, Total: len(items)}, nil
+
+	// admin：不过滤，全量返回
+	if scope.IsAdmin {
+		return &models.OrganizationListResponse{Organizations: items, Total: len(items)}, nil
+	}
+
+	// 构造"可见组织ID集合"
+	visible := make(map[string]struct{})
+	for _, id := range scope.OrgIDs {
+		if id != "" {
+			visible[id] = struct{}{}
+		}
+	}
+
+	// senior_operator：额外并入本校所属父区域ID（保证组织三栏的区域栏可只读展示上级）
+	// 仅当 scope 非 Blocked 且存在本校时才查父区域。
+	if scope.Role == models.RoleSeniorOperator && !scope.Blocked {
+		// scope.OrgIDs 对 senior 即 [本校ID]，取第一个查其父区域
+		for _, schoolID := range scope.OrgIDs {
+			if schoolID == "" {
+				continue
+			}
+			school, gErr := repository.GetOrganizationByID(ctx, schoolID)
+			if gErr == nil && school != nil && school.ParentID != nil && *school.ParentID != "" {
+				visible[*school.ParentID] = struct{}{}
+			}
+		}
+	}
+
+	// 按可见集合过滤（visible 为空 → 返回空列表，fail-closed）
+	filtered := make([]*models.OrganizationListItem, 0, len(items))
+	for _, it := range items {
+		if _, ok := visible[it.ID]; ok {
+			filtered = append(filtered, it)
+		}
+	}
+	return &models.OrganizationListResponse{Organizations: filtered, Total: len(filtered)}, nil
 }
 
 func (s *OrganizationService) GetOrganization(ctx context.Context, id string) (*models.Organization, error) {
@@ -225,7 +280,44 @@ func (s *OrganizationService) CreateTeachingGroup(ctx context.Context, req *mode
 	return tg, nil
 }
 
-func (s *OrganizationService) ListTeachingGroups(ctx context.Context, schoolID string) (*models.TeachingGroupListResponse, error) {
+// ListTeachingGroups 教研组列表（按数据范围 scope 校验 school_id 归属，防跨校越权）
+//
+// 规则：
+//   - scope.IsAdmin → 不过滤，按 schoolID（可空）正常查询
+//   - 否则：要求 schoolID 非空且在 scope 可见学校集（SchoolIDs；senior 额外不放区域，
+//           因为教研组只挂学校，区域不直接拥有教研组）内；不满足 → 返回空列表（越权/未指定学校）
+func (s *OrganizationService) ListTeachingGroups(ctx context.Context, schoolID string, scope DataScope) (*models.TeachingGroupListResponse, error) {
+	// admin：原逻辑，全量或按 schoolID 过滤
+	if scope.IsAdmin {
+		items, err := repository.ListTeachingGroups(ctx, schoolID)
+		if err != nil {
+			return nil, err
+		}
+		if items == nil {
+			items = []*models.TeachingGroupListItem{}
+		}
+		return &models.TeachingGroupListResponse{Groups: items, Total: len(items)}, nil
+	}
+
+	// 非 admin：必须指定 school_id，且该 school_id 在可见学校集内
+	empty := &models.TeachingGroupListResponse{Groups: []*models.TeachingGroupListItem{}, Total: 0}
+	if scope.Blocked || schoolID == "" {
+		return empty, nil
+	}
+	allowed := false
+	for _, sid := range scope.SchoolIDs {
+		if sid == schoolID {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		// 请求的学校不在管辖范围 → 空集（防 senior/region 传别校 school_id 越权查教研组）
+		orgLog.Warn("教研组列表越权拦截：请求学校不在管辖范围",
+			"role", scope.Role, "requested_school", schoolID)
+		return empty, nil
+	}
+
 	items, err := repository.ListTeachingGroups(ctx, schoolID)
 	if err != nil {
 		return nil, err

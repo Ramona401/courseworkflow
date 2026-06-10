@@ -24,7 +24,7 @@ import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { ConversationMessage, AIReviewResult, ConvComponent } from '@/api/lesson-plans'
 import { getRecipes, type RecipeListItem } from '@/api/recipes'
-import { getTextbooks, type TextbookListItem } from '@/api/textbooks'
+import { getTextbooks, triggerTextbookOCR, type TextbookListItem } from '@/api/textbooks'
 import { C, SUBJECTS, GRADES, renderMarkdown } from './workshopConstants'
 
 // ==================== 首屏备课表单 ====================
@@ -49,6 +49,9 @@ export function StartForm({ onStart, loading }: StartFormProps) {
   const [textbooksLoading, setTextbooksLoad]  = useState(false)
   const [textbooksLoaded, setTextbooksLoaded] = useState(false)
   const [selectedTextbookIds, setSelectedTBIds] = useState<Set<string>>(new Set())
+  // 迭代7B：勾选未识别课本图时即触发 OCR，下面两个集合驱动卡片"识别中/识别失败"状态显示
+  const [ocrInProgress, setOcrInProgress] = useState<Set<string>>(new Set())  // 正在识别中的图ID
+  const [ocrFailed, setOcrFailed]         = useState<Set<string>>(new Set())  // 识别失败的图ID
 
   // v104修复：配方列表不再精确过滤grade_range（会导致新建配方看不见）
   // 改为只按学科过滤，加载更多配方（limit:50），并支持"全部"/"当前学科"切换
@@ -82,13 +85,52 @@ export function StartForm({ onStart, loading }: StartFormProps) {
     loadTextbooks()
   }, [subject, grade])
 
+  // 迭代7B：勾选课本图。若勾选的是"未识别"图（has_ocr=false），自动触发该图 OCR，
+  // 转圈等识别完——成功则该图后续可被备课参考，失败则标红但仍保留勾选（老师可能仍想关联）。
+  // 取消勾选只移除选中态，不影响已在进行的识别。
   const toggleTextbook = (id: string) => {
-    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-    setSelectedTBIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
+    // 修复：先用当前状态算出"本次是新勾选还是取消勾选"，
+    // setState updater 只做纯粹的选中态切换（不含任何副作用——React StrictMode 下
+    // updater 会被执行两次用于探测副作用，把 OCR 触发放进 updater 会导致勾选不生效）。
+    const willSelect = !selectedTextbookIds.has(id)
+    setSelectedTBIds(prev => {
+      const n = new Set(prev)
+      if (n.has(id)) {
+        n.delete(id)
+      } else {
+        n.add(id)
+      }
+      return n
+    })
+    // 副作用单独在 updater 之外执行：新勾选 + 该图未识别 + 当前没在识别中 → 触发一次 OCR
+    if (willSelect) {
+      const tb = textbooks.find(t => t.id === id)
+      if (tb && !tb.has_ocr && !ocrInProgress.has(id)) {
+        maybeTriggerOCR(id)
+      }
+    }
+  }
+
+  // maybeTriggerOCR 对单张未识别图触发 AI 识别，识别成功后把该图本地 has_ocr 置 true，
+  // 失败则记入 ocrFailed 集合（卡片标红）。全程更新 ocrInProgress 驱动"识别中"转圈。
+  const maybeTriggerOCR = async (id: string) => {
+    setOcrInProgress(prev => { const n = new Set(prev); n.add(id); return n })
+    setOcrFailed(prev => { const n = new Set(prev); n.delete(id); return n })
+    try {
+      await triggerTextbookOCR(id)
+      // 识别成功：本地把该图 has_ocr 标记为 true（无需重新拉列表）
+      setTextbooks(prev => prev.map(t => t.id === id ? { ...t, has_ocr: true } : t))
+    } catch {
+      setOcrFailed(prev => { const n = new Set(prev); n.add(id); return n })
+    } finally {
+      setOcrInProgress(prev => { const n = new Set(prev); n.delete(id); return n })
+    }
   }
 
   const handleSubmit = () => {
     if (!topic.trim()) return
+    // 迭代7B：有图正在识别中时不允许开始备课，避免带着"识别中"的半成品状态进去
+    if (ocrInProgress.size > 0) return
     onStart(subject, grade, topic.trim(), duration, selectedRecipeId || undefined, selectedTextbookIds.size > 0 ? Array.from(selectedTextbookIds) : undefined)
   }
 
@@ -144,9 +186,9 @@ export function StartForm({ onStart, loading }: StartFormProps) {
               {[40, 45, 50, 60].map(d => <button key={d} onClick={() => setDuration(d)} style={selBtn(duration === d)}>{d}分钟</button>)}
             </div>
           </div>
-          <button onClick={handleSubmit} disabled={!topic.trim() || loading}
-            style={{ width: '100%', padding: '14px', borderRadius: '10px', border: 'none', background: !topic.trim() || loading ? '#E5E7EB' : C.primary, color: !topic.trim() || loading ? C.textMuted : '#fff', fontSize: '16px', fontWeight: 600, cursor: !topic.trim() || loading ? 'not-allowed' : 'pointer', transition: 'all 200ms ease' }}>
-            {loading ? '正在准备备课环境...' : selectedRecipeId ? '📦 带配方开始备课 →' : '开始备课 →'}
+          <button onClick={handleSubmit} disabled={!topic.trim() || loading || ocrInProgress.size > 0}
+            style={{ width: '100%', padding: '14px', borderRadius: '10px', border: 'none', background: (!topic.trim() || loading || ocrInProgress.size > 0) ? '#E5E7EB' : C.primary, color: (!topic.trim() || loading || ocrInProgress.size > 0) ? C.textMuted : '#fff', fontSize: '16px', fontWeight: 600, cursor: (!topic.trim() || loading || ocrInProgress.size > 0) ? 'not-allowed' : 'pointer', transition: 'all 200ms ease' }}>
+            {ocrInProgress.size > 0 ? `课本识别中（${ocrInProgress.size}）请稍候...` : loading ? '正在准备备课环境...' : selectedRecipeId ? '📦 带配方开始备课 →' : '开始备课 →'}
           </button>
           {selectedRecipe && (
             <div style={{ marginTop: '12px', padding: '10px 12px', background: 'rgba(79,123,232,0.06)', borderRadius: '8px', fontSize: '12px', color: C.primary, lineHeight: 1.6 }}>
@@ -233,14 +275,24 @@ export function StartForm({ onStart, loading }: StartFormProps) {
             {textbooks.map(tb => {
               const checked = selectedTextbookIds.has(tb.id)
               return (
-                <label key={tb.id} onClick={() => toggleTextbook(tb.id)} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 10px', borderRadius: '8px', cursor: 'pointer', background: checked ? 'rgba(79,123,232,0.08)' : '#fff', border: checked ? '1px solid #4F7BE8' : '1px solid #E5E7EB', fontSize: '12px', color: '#1F2937', transition: 'all 150ms ease' }}>
+                <div key={tb.id} onClick={() => toggleTextbook(tb.id)} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 10px', borderRadius: '8px', cursor: 'pointer', background: checked ? 'rgba(79,123,232,0.08)' : '#fff', border: checked ? '1px solid #4F7BE8' : '1px solid #E5E7EB', fontSize: '12px', color: '#1F2937', transition: 'all 150ms ease', userSelect: 'none' }}>
+                  {/* 修复：原来用 <label> 包 <input>，点击 label 浏览器会原生再切换 input 并二次触发 onClick，
+                      导致 toggleTextbook 被调用两次（勾上又立即取消）→ 看起来"点不动"。
+                      改用 <div> + 纯展示 checkbox（readOnly + pointerEvents:none），点击只走我们自己的 onClick 一次。 */}
                   <input type="checkbox" checked={checked} readOnly style={{ accentColor: '#4F7BE8', pointerEvents: 'none' }} />
                   <img src={tb.image_url} alt="" style={{ width: '28px', height: '28px', objectFit: 'cover', borderRadius: '4px' }} onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
                   <div style={{ maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {tb.chapter || tb.textbook_name}
-                    {tb.has_ocr && <span style={{ marginLeft: '4px', color: '#10B981', fontSize: '10px' }}>✓已识别</span>}
+                    {/* 迭代7B：识别状态优先级 识别中 > 失败 > 已识别；都没有则不显示徽标（即未识别未勾选） */}
+                    {ocrInProgress.has(tb.id)
+                      ? <span style={{ marginLeft: '4px', color: '#F59E0B', fontSize: '10px' }}>⏳识别中…</span>
+                      : ocrFailed.has(tb.id)
+                        ? <span style={{ marginLeft: '4px', color: '#EF4444', fontSize: '10px' }}>⚠识别失败</span>
+                        : tb.has_ocr
+                          ? <span style={{ marginLeft: '4px', color: '#10B981', fontSize: '10px' }}>✓已识别</span>
+                          : <span style={{ marginLeft: '4px', color: '#9CA3AF', fontSize: '10px' }}>未识别</span>}
                   </div>
-                </label>
+                </div>
               )
             })}
           </div>

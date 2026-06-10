@@ -60,6 +60,7 @@ type WorkshopStageService struct {
 		Chat(ctx context.Context, req *models.LessonPlanChatRequest, callerID string) error
 	}
 	aesKey string // v87新增：AES密钥（用于LLM教练评估获取AI配置）
+	textbookService *TextbookService // 迭代7B：课本服务（用于在阶段提示词注入课本原文），由 routes 层注入，可为 nil
 }
 
 var wsLog = logger.WithModule("workshop_stage")
@@ -82,6 +83,13 @@ func (s *WorkshopStageService) SetGenService(gs interface {
 // v87新增
 func (s *WorkshopStageService) SetAESKey(key string) {
 	s.aesKey = key
+}
+
+// SetTextbookService 注入课本服务（由routes层调用）
+// 迭代7B：用于 LoadStagePromptContextV2 在各阶段提示词中注入老师勾选的课本原文。
+// 注入前若为 nil，则课本注入逻辑静默跳过，不影响原有流程。
+func (s *WorkshopStageService) SetTextbookService(ts *TextbookService) {
+	s.textbookService = ts
 }
 
 // ==================== 1. 获取系统默认阶段 ====================
@@ -605,11 +613,35 @@ func (s *WorkshopStageService) LoadStagePromptContextV2(
 
 	// v110 核心改动:调用 V2 版本透传 assistantPrompt
 	// 为空时 V2 内部走原逻辑(完全等价于 V1);非空时替换第4层阶段角色
-	return BuildStageSystemPromptV2(
+	basePrompt := BuildStageSystemPromptV2(
 		ctx, stage, recipe, priorOutputs,
 		lp.Subject, lp.Grade, promptMode, lessonStructure, selectedCompIDs,
 		assistantPrompt,
-	), nil
+	)
+
+	// 迭代7B：注入老师勾选的课本原文（新增一层，置于系统提示词末尾）
+	// 数据来源：lesson_plans.textbook_page_ids（备课工坊新建时勾选并落库）。
+	// 仅在 textbookService 已注入、且本教案确有关联课本时拼接；任何缺失都静默跳过，
+	// 不影响原有六层提示词。课本原文用 OCR 文字（未识别的页会带"未识别"占位提示）。
+	if s.textbookService != nil && strings.TrimSpace(lp.TextbookPageIDs) != "" && lp.TextbookPageIDs != "[]" {
+		var tbIDs []string
+		if uErr := json.Unmarshal([]byte(lp.TextbookPageIDs), &tbIDs); uErr == nil && len(tbIDs) > 0 {
+			tbContext := s.textbookService.BuildTextbookContext(ctx, tbIDs)
+			if strings.TrimSpace(tbContext) != "" {
+				basePrompt += "\n" + tbContext
+				wsLog.Info("已注入课本原文上下文",
+					"plan_id", lp.ID, "stage", stageCode, "textbook_count", len(tbIDs))
+			}
+		}
+	} else if strings.TrimSpace(lp.TextbookPageIDs) != "" && lp.TextbookPageIDs != "[]" {
+		// 防御性告警：教案确实关联了课本图，却因 textbookService 未注入而无法注入课本原文。
+		// 这正是迭代7B曾踩过的"双实例导致 textbookService==nil"坑——一旦再发生，
+		// 这条 Warn 会在日志里立刻暴露，不必再靠老师反馈"AI说看不到课本"才发现。
+		wsLog.Warn("应注入课本但课本服务未注入（textbookService==nil），本次跳过课本原文注入",
+			"plan_id", lp.ID, "stage", stageCode, "textbook_page_ids", lp.TextbookPageIDs)
+	}
+
+	return basePrompt, nil
 }
 
 // ==================== 10. 重启指定阶段 ====================

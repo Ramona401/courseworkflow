@@ -8,11 +8,23 @@
  *   EmptyState     — 空状态引导
  *
  * v168改动（第二批治本·功能A·正文产出硬门控 切片A·前端体验层）：
- *   ActionButtons 在教案正文（content_markdown）为空时，禁用会被后端拒绝的按钮：
- *     - submit（提交评审）、publish（发布教案）、courseware（生成课件）
- *   提前置灰 + title 提示，避免用户点击后才收到后端 400 错误。
- *   resume（继续备课）绝不禁用——正文为空恰恰要靠它回备课工坊补全。
- *   delete 同样不禁用。前端禁用仅为体验优化，后端校验才是真正防线。
+ *   ActionButtons 曾在教案正文（content_markdown）为空时禁用 submit/publish/courseware 按钮。
+ *
+ * Bug 修复（移除列表页正文门控）：
+ *   v168 的正文门控在【我的教案列表页】存在误伤——列表数据来自 getLessonPlans()
+ *   返回的 LessonPlanListItem 精简结构，该结构【不包含 content_markdown 字段】，
+ *   导致 plan.content_markdown 恒为 undefined，isContentEmpty 恒为 true，
+ *   于是 submit/publish/courseware 三个按钮对【所有】教案永远置灰（即使正文完整）。
+ *   这正是"列表页按钮灰、详情页能点"现象的根因（详情页数据带 content_markdown，判断准确）。
+ *
+ *   修复策略：列表页【移除】正文门控，让按钮正常可点。理由——
+ *     1) 列表页拿不到正文字段，前端无法准确判断"正文是否为空"，硬判必然误伤；
+ *     2) "无正文不可发布/提交/生成课件"的真正防线在【后端】（SubmitForReview/
+ *        PublishPersonal/PublishShared/createCourseware 均有正文非空硬校验，返回 400）；
+ *     3) MyPlansPage.handleAction 已有 try/catch，后端拒绝时会弹 toast 提示用户去
+ *        「继续备课」补全正文。准确性优先于"少一次后端往返"的微小即时性。
+ *   注意：详情页 PlanDetailHeader.tsx 的同名门控【保留不动】——详情页数据带
+ *   content_markdown，判断准确，门控能省一次无谓的后端往返。两页面差异是有意为之。
  */
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -63,11 +75,11 @@ export function ActionButtons({ plan, onAction, loadingId }: ActionButtonsProps)
   const isLoading = loadingId === plan.id
   const navigate  = useNavigate()
 
-  // v168：教案正文是否为空（用于禁用 submit/publish/courseware 按钮）
-  // 与后端 strings.TrimSpace(lp.ContentMarkdown) == "" 判据保持一致
-  const isContentEmpty = !plan.content_markdown || plan.content_markdown.trim() === ''
-  // v168：受正文为空门控的 action 集合——这些入口后端会拒绝空正文教案
-  const contentGatedActions = new Set(['submit', 'publish', 'courseware'])
+  // 说明：此前 v168 在此处依据 plan.content_markdown 判断"正文为空"并禁用
+  // submit/publish/courseware 按钮。但列表页的 LessonPlanListItem 不含
+  // content_markdown 字段，该判断恒为"空"，造成所有教案按钮误置灰。
+  // 已移除该门控——按钮正常可点，正文非空校验由后端负责（返回 400 后
+  // MyPlansPage.handleAction 的 catch 会弹 toast 提示用户去补全正文）。
 
   const btnBase: React.CSSProperties = {
     padding: '5px 12px', borderRadius: '6px',
@@ -78,8 +90,6 @@ export function ActionButtons({ plan, onAction, loadingId }: ActionButtonsProps)
   const primaryBtn: React.CSSProperties   = { ...btnBase, background: isLoading ? C.border : C.primary, color: isLoading ? C.textMuted : '#fff' }
   const secondaryBtn: React.CSSProperties = { ...btnBase, background: 'transparent', border: `1px solid ${C.border}`, color: C.textSec }
   const dangerBtn: React.CSSProperties    = { ...btnBase, background: 'transparent', border: '1px solid #FEE2E2', color: C.danger }
-  // v168：正文为空时被禁用按钮的灰显样式
-  const gatedDisabledBtn: React.CSSProperties = { ...btnBase, background: '#F3F4F6', border: `1px solid ${C.border}`, color: C.textMuted, cursor: 'not-allowed' }
 
   // 按状态动态构建操作列表
   const actions: Array<{ label: string; style: React.CSSProperties; action: string; confirm?: string }> = []
@@ -122,36 +132,20 @@ export function ActionButtons({ plan, onAction, loadingId }: ActionButtonsProps)
   return (
     <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
       {isLoading && <span style={{ fontSize: '12px', color: C.primary }}>处理中...</span>}
-      {!isLoading && actions.map(a => {
-        // v168：受正文门控的 action 且正文为空 → 渲染为禁用态（灰显 + title 提示，不触发 onAction）
-        const gated = contentGatedActions.has(a.action) && isContentEmpty
-        if (gated) {
-          return (
-            <button
-              key={a.action}
-              style={gatedDisabledBtn}
-              disabled
-              title="教案正文为空，请先「继续备课」在备课工坊生成完整教案正文后再操作"
-              onClick={e => e.stopPropagation()}>
-              {a.label}
-            </button>
-          )
-        }
-        return (
-          <button
-            key={a.action}
-            style={a.style}
-            onClick={e => {
-              e.stopPropagation()
-              if (a.confirm && !window.confirm(a.confirm)) return
-              // 查看课件进度：直接跳转，不走onAction
-              if (a.action === 'courseware') { onAction(plan.id, a.action); return }
-              onAction(plan.id, a.action)
-            }}>
-            {a.label}
-          </button>
-        )
-      })}
+      {!isLoading && actions.map(a => (
+        <button
+          key={a.action}
+          style={a.style}
+          onClick={e => {
+            e.stopPropagation()
+            if (a.confirm && !window.confirm(a.confirm)) return
+            // 查看课件进度：直接跳转，不走onAction
+            if (a.action === 'courseware') { onAction(plan.id, a.action); return }
+            onAction(plan.id, a.action)
+          }}>
+          {a.label}
+        </button>
+      ))}
     </div>
   )
 }

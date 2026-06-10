@@ -68,6 +68,17 @@ func createTestLessonPlan(t *testing.T, serverURL string, token string, subject 
 		t.Fatal("创建教案成功但ID为空")
 	}
 
+	// v168 起教案发布/提交评审/共享有"正文非空"硬门控（功能A），
+	// 测试创建的教案需带正文才能正常流转状态，否则被 ErrLPContentEmpty 拦在 400。
+	// 直接写 content_markdown（绕过备课工坊生成流程，仅为满足门控前置条件）。
+	_, cmErr := database.DB.Exec(context.Background(),
+		`UPDATE lesson_plans SET content_markdown = $1, updated_at = now() WHERE id = $2`,
+		"# 测试教案正文\n\n本教案正文由集成测试 createTestLessonPlan 自动填充，用于满足正文非空硬门控。", planData.ID,
+	)
+	if cmErr != nil {
+		t.Fatalf("填充测试教案正文失败: %v", cmErr)
+	}
+
 	return planData.ID
 }
 

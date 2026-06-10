@@ -202,6 +202,26 @@ export async function generateCWIndex(coursewareId: string, preset?: string): Pr
   await apiClient.post(`/coursewares/${coursewareId}/generate-index`, preset ? { preset } : {})
 }
 
+// P2：SSE 自动重连参数（照搬教案 lesson-plans.ts 已验证的指数退避范式）
+const CW_SSE_RECONNECT_MAX_RETRIES = 5      // 最大重连次数
+const CW_SSE_RECONNECT_BASE_DELAY_MS = 1000 // 基础重连延迟（毫秒），指数退避基数 1s/2s/4s/8s/16s
+const CW_SSE_RECONNECT_MAX_DELAY_MS = 30000 // 最大重连延迟（毫秒），防退避过长
+
+/**
+ * 订阅课件工坊 SSE（索引生成 / 课件HTML批量生成 共用）
+ *
+ * P2 修复（断线重连 + 假死根治）：
+ *   1. 指数退避自动重连：连接异常断开后 1s→2s→4s→8s→16s 重连，最多 5 次（照搬教案范式）。
+ *      —— 根治"老师刷新页面/切标签页/网络抖动后前端假死、进度不动"。
+ *   2. 单页 error 事件不再关闭整条连接：后端某页 AI 失败会广播 error/gen_progress，
+ *      旧逻辑收到 error 就 close() 整条 SSE，导致后续成功页与 gen_done 完成事件全收不到 → 永久假死。
+ *      新逻辑：error 事件只回调 onError 透传消息，连接保持，直到 gen_done/index_done 正常收尾才关闭。
+ *   3. 重连成功后触发 onReconnected：业务层据此重新拉取课件状态+页面列表，补齐断线期间漏收的已生成页。
+ *
+ * 终止条件（主动 close，不再重连）：收到 gen_done / index_done（正常完成）或业务层手动 close()。
+ * 注意：EventSource 的 onerror 既包括"真正断线"也包括"连接正常关闭后"，故用 isClosed 标志区分，
+ *   正常完成 close 后不再触发重连。
+ */
 export function subscribeCWIndexSSE(
   coursewareId: string,
   callbacks: CWSSECallbacks,
@@ -209,48 +229,100 @@ export function subscribeCWIndexSSE(
   const token = localStorage.getItem('token') || ''
   const url = `${window.location.origin}/api/v1/sse/courseware/${coursewareId}?token=${encodeURIComponent(token)}`
 
-  const evtSource = new EventSource(url)
+  let currentES: EventSource | null = null
+  let retryCount = 0
+  let retryTimer: ReturnType<typeof setTimeout> | null = null
+  let isClosed = false        // 业务层主动关闭 或 正常完成关闭：置 true 后不再重连
+  let isFirstConnect = true   // 首次连接的 connected 不算"重连成功"
 
-  evtSource.addEventListener('connected', (e: MessageEvent) => {
-    try { callbacks.onConnected?.(JSON.parse(e.data)) } catch { /* */ }
-  })
-  evtSource.addEventListener('index_start', (e: MessageEvent) => {
-    try { callbacks.onIndexStart?.(JSON.parse(e.data)) } catch { /* */ }
-  })
-  evtSource.addEventListener('index_page', (e: MessageEvent) => {
-    try { callbacks.onIndexPage?.(JSON.parse(e.data)) } catch { /* */ }
-  })
-  evtSource.addEventListener('index_progress', (e: MessageEvent) => {
-    try { callbacks.onIndexProgress?.(JSON.parse(e.data)) } catch { /* */ }
-  })
-  evtSource.addEventListener('index_done', (e: MessageEvent) => {
-    try { callbacks.onIndexDone?.(JSON.parse(e.data)) } catch { /* */ }
-    evtSource.close()
-  })
-  evtSource.addEventListener('gen_start', (e: MessageEvent) => {
-    try { callbacks.onGenStart?.(JSON.parse(e.data)) } catch { /* */ }
-  })
-  evtSource.addEventListener('gen_page', (e: MessageEvent) => {
-    try { callbacks.onGenPage?.(JSON.parse(e.data)) } catch { /* */ }
-  })
-  evtSource.addEventListener('gen_progress', (e: MessageEvent) => {
-    try { callbacks.onGenProgress?.(JSON.parse(e.data)) } catch { /* */ }
-  })
-  evtSource.addEventListener('gen_done', (e: MessageEvent) => {
-    try { callbacks.onGenDone?.(JSON.parse(e.data)) } catch { /* */ }
-    evtSource.close()
-  })
-  evtSource.addEventListener('error', (e: MessageEvent) => {
-    if (e.data) {
-      try { callbacks.onError?.(JSON.parse(e.data)) } catch { /* */ }
+  const bindEventListeners = (es: EventSource) => {
+    es.addEventListener('connected', (e: MessageEvent) => {
+      retryCount = 0 // 连上即重置重连计数
+      try { callbacks.onConnected?.(JSON.parse(e.data)) } catch { /* */ }
+      if (!isFirstConnect) {
+        // 这是一次"重连成功"：通知业务层补齐断线期间漏收的页面/进度
+        callbacks.onReconnected?.()
+      }
+      isFirstConnect = false
+    })
+    es.addEventListener('index_start', (e: MessageEvent) => {
+      try { callbacks.onIndexStart?.(JSON.parse(e.data)) } catch { /* */ }
+    })
+    es.addEventListener('index_page', (e: MessageEvent) => {
+      try { callbacks.onIndexPage?.(JSON.parse(e.data)) } catch { /* */ }
+    })
+    es.addEventListener('index_progress', (e: MessageEvent) => {
+      try { callbacks.onIndexProgress?.(JSON.parse(e.data)) } catch { /* */ }
+    })
+    es.addEventListener('index_done', (e: MessageEvent) => {
+      try { callbacks.onIndexDone?.(JSON.parse(e.data)) } catch { /* */ }
+      isClosed = true // 正常完成，主动关闭且不再重连
+      es.close()
+    })
+    es.addEventListener('gen_start', (e: MessageEvent) => {
+      try { callbacks.onGenStart?.(JSON.parse(e.data)) } catch { /* */ }
+    })
+    es.addEventListener('gen_page', (e: MessageEvent) => {
+      try { callbacks.onGenPage?.(JSON.parse(e.data)) } catch { /* */ }
+    })
+    es.addEventListener('gen_progress', (e: MessageEvent) => {
+      try { callbacks.onGenProgress?.(JSON.parse(e.data)) } catch { /* */ }
+    })
+    es.addEventListener('gen_done', (e: MessageEvent) => {
+      try { callbacks.onGenDone?.(JSON.parse(e.data)) } catch { /* */ }
+      isClosed = true // 正常完成，主动关闭且不再重连
+      es.close()
+    })
+    // P2 关键：业务级 error 事件（如某页 AI 失败）只透传消息，绝不关闭整条连接，
+    //   让后续成功页与 gen_done 完成事件继续到达，根治"失败一页就整体假死"。
+    es.addEventListener('error', (e: MessageEvent) => {
+      if (e.data) {
+        try { callbacks.onError?.(JSON.parse(e.data)) } catch { /* */ }
+      }
+      // 不再 es.close()
+    })
+
+    // 传输层断开（网络抖动/刷新/切页/服务端关连接）：指数退避自动重连
+    es.onerror = () => {
+      if (isClosed) return // 已正常完成或业务层主动关闭，不重连
+      es.close()
+      currentES = null
+
+      if (retryCount >= CW_SSE_RECONNECT_MAX_RETRIES) {
+        // 重连次数耗尽：透传一条提示给业务层，让其改为轮询/手动刷新兜底
+        callbacks.onError?.({ message: '连接已断开且多次重连失败，请刷新页面查看最新进度（生成仍在后台继续，不会丢失）' })
+        return
+      }
+
+      const delay = Math.min(
+        CW_SSE_RECONNECT_BASE_DELAY_MS * Math.pow(2, retryCount),
+        CW_SSE_RECONNECT_MAX_DELAY_MS,
+      )
+      retryCount++
+      console.log(`[CW-SSE] 连接断开，${delay / 1000}秒后第${retryCount}次重连…（courseware: ${coursewareId}）`)
+      retryTimer = setTimeout(() => {
+        if (isClosed) return
+        connectSSE()
+      }, delay)
     }
-    evtSource.close()
-  })
-  evtSource.onerror = () => {
-    evtSource.close()
   }
 
-  return { close: () => evtSource.close() }
+  const connectSSE = () => {
+    if (isClosed) return
+    const es = new EventSource(url)
+    currentES = es
+    bindEventListeners(es)
+  }
+
+  connectSSE()
+
+  return {
+    close: () => {
+      isClosed = true
+      if (retryTimer) { clearTimeout(retryTimer); retryTimer = null }
+      if (currentES) { currentES.close(); currentES = null }
+    },
+  }
 }
 
 // ==================== 风格模板 ====================

@@ -3,6 +3,9 @@
  *
  * 与 LPLayout 结构完全一致，独立的布局和侧边栏
  * 课件工坊作为第三大板块，拥有独立入口
+ * Phase6.2新增：区域管理员（region_admin）下拉菜单“用户管理”入口（指向 /admin，不含学校管理）
+ * 合并重构（本次）：删除 senior_operator 的“学校管理→/school-admin”入口，
+ *   统一走“用户管理→/admin”（/admin 已支持 senior 本校视角，含批量导入）。
  */
 import { useState, useRef, useEffect } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
@@ -94,12 +97,13 @@ function CWUserMenu() {
                 <CWMenuItem icon="📊" label="AI 调用统计" onClick={() => go('/ai-traces')} />
               </>
             )}
-            {/* senior_operator 专属 */}
+            {/* region_admin 专属：区域用户管理（指向 /admin，不含学校管理） */}
+            {user?.role === 'region_admin' && (
+              <CWMenuItem icon="👥" label="用户管理" onClick={() => go('/admin')} highlight />
+            )}
+            {/* senior_operator 专属：用户管理（合并重构：删除原"学校管理→/school-admin"入口，统一走 /admin） */}
             {user?.role === 'senior_operator' && (
-              <>
-                <CWMenuItem icon="👥" label="用户管理" onClick={() => go('/admin')} highlight />
-                <CWMenuItem icon="🏫" label="学校管理" onClick={() => go('/school-admin')} highlight />
-              </>
+              <CWMenuItem icon="👥" label="用户管理" onClick={() => go('/admin')} highlight />
             )}
           </div>
           <div style={{ height: '1px', background: '#F3F4F6', margin: '0 6px' }} />

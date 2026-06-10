@@ -56,6 +56,9 @@ func registerCoursewareRoutes(
 	// v0.42.5: 视频编辑器草稿处理器
 	draftHandler := handlers.NewVideoDraftHandler()
 
+	// 批次1: 课件背景图库处理器（图集列表 + 课件选择/清除背景并秒换已生成页）
+	bgHandler := handlers.NewCoursewareBackgroundHandler()
+
 	// ==================== 课件索引 SSE(内部 Token 验证,不走 authMW) ====================
 	mux.HandleFunc("/api/v1/sse/courseware/", cwIndexHandler.IndexStream)
 
@@ -146,10 +149,20 @@ func registerCoursewareRoutes(
 			return
 		}
 
+		// 批次1: 课件背景 /api/v1/coursewares/{id}/background — GET=查当前选择 PUT=选择/清除并秒换
+		if strings.HasSuffix(path, "/background") || strings.HasSuffix(path, "/background/") {
+			bgHandler.HandleCoursewareBackground(w, r)
+			return
+		}
+
 		dispatchCoursewareSubRoutes(w, r, cwHandler, cwIndexHandler, cwGenHandler, cwTplHandler, cwAssetHandler, videoEditHandler)
 	}), authMW)
 	mux.Handle("/api/v1/coursewares", cwMux)
 	mux.Handle("/api/v1/coursewares/", cwMux)
+
+	// ==================== 批次1: 背景图库图集列表(登录即可) ====================
+	mux.Handle("/api/v1/courseware-backgrounds", middleware.Chain(http.HandlerFunc(bgHandler.ListSets), authMW))
+	mux.Handle("/api/v1/courseware-backgrounds/", middleware.Chain(http.HandlerFunc(bgHandler.ListSets), authMW))
 
 	// ==================== v136: 方案结构预设(登录即可) ====================
 	mux.Handle("/api/v1/courseware-presets", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

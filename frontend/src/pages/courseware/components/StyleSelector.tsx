@@ -1,11 +1,12 @@
 /**
- * 课件风格选择器 — StyleSelector.tsx v2.0 (2026-05-19)
+ * 课件风格选择器 — StyleSelector.tsx v2.2 (2026-06-10)
+ *
+ * v2.2 改动（配合 TemplateThumb 恢复纯 v2.0）:
+ *   - 移除 v2.1 给 TemplateThumb 传的 index prop（渐进挂载方案已整体放弃，回归一次性渲染）。
+ *   - 两个网格的 .map 改回不带序号；其余逻辑一字未动。
  *
  * v2.0 改造：
- *   - 引入共享 TemplateThumb 组件：
- *     - 自动检测内容尺寸（系统 960×540 vs 个人 1920×1080）
- *     - ResizeObserver 动态算 scale 消除右下留白
- *     - wrapHTML 强制 overflow:hidden 杜绝滚动条
+ *   - 引入共享 TemplateThumb 组件：自动检测内容尺寸、ResizeObserver 动态算 scale、wrapHTML 消滚动条
  *   - 弹窗预览改用 TemplateThumbAuto 自适应宽度
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
@@ -14,7 +15,8 @@ import {
   CW_STYLE_CONFIG,
 } from '@/api/coursewares'
 import type { CoursewareTemplate, CoursewareDetail } from '@/api/coursewares'
-import TemplateThumb, { TemplateThumbAuto } from './TemplateThumb'
+import TemplateThumb from './TemplateThumb'
+import TemplatePagesPreview from './TemplatePagesPreview'
 
 // ==================== 颜色常量 ====================
 const C = {
@@ -349,10 +351,10 @@ export default function StyleSelector({ courseware, coursewareId, onStyleConfirm
             </div>
             {/* 预览区域 — 用共享组件 */}
             <div style={{ padding: '0 28px 20px' }}>
-              <TemplateThumbAuto
-                previewUrl={safeParseArray(previewTpl.preview_urls)[0]}
-                sampleHTML={safeParseArray(previewTpl.sample_pages)[0]}
-                title="模板预览"
+              <TemplatePagesPreview
+                previewUrls={safeParseArray(previewTpl.preview_urls)}
+                samplePages={safeParseArray(previewTpl.sample_pages)}
+                accentColor={safeParse(previewTpl.color_scheme).primary || C.primary}
               />
             </div>
             {/* 配色+选择按钮 */}

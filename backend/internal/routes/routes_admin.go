@@ -2,6 +2,14 @@ package routes
 
 // routes_admin.go — Admin/用户/AI配置/提示词/课程路由注册
 //
+// 合并重构(本次,废弃 SchoolAdminPage 并轨)：
+//   - /api/v1/admin/users/ 分支最前新增 /batch 精确匹配:
+//     POST /api/v1/admin/users/batch → adminHandler.BatchCreateAdminUsers
+//     (批量导入教师统一入口,替代旧 /school-admin/users/batch;走 adminOrSchoolAdmin 中间件,
+//      admin/senior 均可,数据范围由 handler 层 resolveSchoolScope 决定)。
+//     /batch 必须置于 /status、/password、/assignments、用户详情等所有 case 之前,
+//     否则会被 default 当成用户详情(userID=batch)误解析。
+//
 // v122 改动(AdminPage 权限统一):
 //   签名新增 adminOrSchoolAdmin 中间件,对以下路由放开 senior_operator:
 //     - /admin/stats               学校管理员能看概览(数据在 handler 层过滤)
@@ -161,9 +169,16 @@ func registerAdminRoutes(
         }), authMW, adminOrSchoolAdmin))
 
         // 用户详情+子操作 — 学校管理员可管本校用户
+        // 合并重构:/batch 精确匹配置于最前,避免被当成用户详情(userID=batch)误解析
         mux.Handle("/api/v1/admin/users/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
                 path := r.URL.Path
                 switch {
+                case hasSuffix(path, "/batch"):
+                        if r.Method == http.MethodPost {
+                                adminHandler.BatchCreateAdminUsers(w, r)
+                        } else {
+                                methodNotAllowedJSON(w, "仅支持POST请求")
+                        }
                 case hasSuffix(path, "/status"):
                         adminHandler.UpdateAdminUserStatus(w, r)
                 case hasSuffix(path, "/password"):

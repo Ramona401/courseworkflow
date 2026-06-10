@@ -109,6 +109,15 @@ func (s *LessonPlanGenService) SetAssistantService(as *AIAssistantService) {
 	s.assistantService = as
 }
 
+// SetTextbookServiceForStage 注入课本服务到内部 stageService(由 routes 层调用)
+// 迭代7B修复：LessonPlanGenService 内部 stageService 是 NewLessonPlanGenService 时
+// 独立 new 的实例，与 routes 中给 handler 用的 wsStageService 不是同一个对象。
+// 对话流程(Chat→processChatStageAsync)走的是内部这个 stageService，必须单独给它注入
+// textbookService，否则 LoadStagePromptContextV2 里 s.textbookService==nil，课本注入被静默跳过。
+func (s *LessonPlanGenService) SetTextbookServiceForStage(ts *TextbookService) {
+	s.stageService.SetTextbookService(ts)
+}
+
 // ==================== 1. 开始备课会话 ====================
 
 // StartConversation 创建教案+阶段初始化+配方上下文注入+发起AI开场白
@@ -149,6 +158,16 @@ func (s *LessonPlanGenService) StartConversation(
 	if req.RecipeID != "" {
 		lp.RecipeID = &req.RecipeID
 	}
+
+        // 迭代7B：备课工坊勾选的课本图片ID列表落库（写入 lesson_plans.textbook_page_ids，
+        // 供 LoadStagePromptContextV2 在各阶段提示词中注入课本原文，让 AI 参考真实教材内容）
+        if len(req.TextbookPageIDs) > 0 {
+                if tbIDsJSON, mErr := json.Marshal(req.TextbookPageIDs); mErr == nil {
+                        lp.TextbookPageIDs = string(tbIDsJSON)
+                } else {
+                        lpGenLog.Warn("课本图片ID序列化失败，忽略关联", "error", mErr)
+                }
+        }
 
 	if err := repository.CreateLessonPlan(ctx, lp); err != nil {
 		return nil, nil, fmt.Errorf("创建教案失败: %w", err)
@@ -204,11 +223,67 @@ func (s *LessonPlanGenService) StartConversation(
 		}()
 	}
 
+	// 迭代7B：若关联了课本图但其中有未成功识别（无 OCR 文字）的，
+	// 由后端确定性地在开场白末尾拼一句点名提醒（不依赖 AI 自由发挥，必然出现、措辞精确）。
+	// 覆盖 AI 开场白成功与降级两条路径（两者最终都汇合到 openingMsg）。
+	s.appendUnrecognizedTextbookNotice(ctx, req, openingMsg)
+
 	if err2 := s.appendMessage(ctx, lp.ID, openingMsg); err2 != nil {
 		lpGenLog.Warn("写入开场消息失败", "plan_id", lp.ID, "error", err2)
 	}
 
 	return lp, openingMsg, nil
+}
+
+// appendUnrecognizedTextbookNotice 检查勾选的课本图中有几张未识别文字（OCR 为空），
+// 若有，则在开场白消息末尾拼接一句确定性的点名提醒，让老师明确知道哪些课本无法被参考。
+// 设计要点：
+//   - 纯代码判断 + 字符串拼接，不经过 AI，保证"必然出现、措辞精确"；
+//   - 用图在勾选列表中的序号（第X张）定位，老师在课本区按勾选顺序即可对应；
+//   - 任何异常（无关联/查询失败/全部已识别）都静默返回，不影响开场白。
+func (s *LessonPlanGenService) appendUnrecognizedTextbookNotice(
+	ctx context.Context,
+	req *models.StartConversationRequest,
+	openingMsg *models.ConversationMessage,
+) {
+	if openingMsg == nil || len(req.TextbookPageIDs) == 0 {
+		return
+	}
+
+	pages, err := repository.GetTextbookPagesByIDs(ctx, req.TextbookPageIDs)
+	if err != nil || len(pages) == 0 {
+		return
+	}
+
+	// GetTextbookPagesByIDs 返回顺序按 textbook_name+page_number 排，
+	// 与前端勾选顺序未必一致，这里按返回顺序编号"第X张"，并尽量带上章节/教材名帮助老师定位。
+	var unrecognized []string
+	for i, p := range pages {
+		if strings.TrimSpace(p.OCRText) == "" {
+			label := strings.TrimSpace(p.Chapter)
+			if label == "" {
+				label = strings.TrimSpace(p.TextbookName)
+			}
+			if label == "" {
+				unrecognized = append(unrecognized, fmt.Sprintf("第%d张", i+1))
+			} else {
+				unrecognized = append(unrecognized, fmt.Sprintf("第%d张（%s）", i+1, label))
+			}
+		}
+	}
+
+	if len(unrecognized) == 0 {
+		return
+	}
+
+	notice := fmt.Sprintf(
+		"\n\n---\n📷 **课本识别提醒**：你关联的 %d 张课本图中，%s 尚未成功识别文字，本次备课**无法参考这些页面的内容**。建议返回「课本管理」对这些图重新点击「AI识别」，识别成功后再关联进来。",
+		len(pages), strings.Join(unrecognized, "、"),
+	)
+	openingMsg.Content += notice
+
+	lpGenLog.Info("开场白已拼接未识别课本提醒",
+		"plan_id", req.Topic, "total", len(pages), "unrecognized", len(unrecognized))
 }
 
 // genStageOpeningMessage 阶段模式下生成第一阶段的AI开场白

@@ -2,20 +2,44 @@
  * AdminPage — 统一用户管理中心（主文件）
  *
  * 路由：/admin（独立页面，不在任何Layout内）
- * 权限：仅admin（路由层RoleGuard保护）
+ * 权限：admin / senior_operator / region_admin（路由层RoleGuard保护）
  *
  * 5个Tab：
- *   📊 概览       — 统计卡片 + 角色分布横条图 + 最近10条日志快览
+ *   📊 概览       — 统计卡片 + 角色分布横条图 + 最近10条日志快览 + 知识库访问白名单（admin）
  *   👥 用户管理   — 用户列表+学校筛选+详情弹窗（双Tab：基本信息/操作记录）
  *   🏫 组织架构   — 三栏递进：区域→学校→教研组，完整CRUD + 成员管理
- *                   修复：区域列表加载完成后自动选中首个区域并展开学校
- *                         学校列表加载完成后如只有一所学校自动选中并展开教研组
  *   📋 操作日志   — 用户名搜索+日期范围+操作类型+详情展开
  *   🎭 角色权限   — 系统内置角色只读展示 + 自定义角色完整管理
  *
  * 角色名称与学校体系对齐：
- *   admin → 系统管理员 / senior_operator → 学校管理员
+ *   admin → 系统管理员 / region_admin → 区域管理员 / senior_operator → 学校管理员
  *   operator → 骨干教师 / viewer → 普通教师
+ *
+ * 按角色决定可见 Tab 与操作：
+ *   - admin           ：全部 5 个 Tab，默认 overview，可新建用户/批量导入（弹窗内选目标学校）
+ *   - region_admin    ：只看“用户”+“组织架构”两 Tab，默认 users；
+ *                       数据由后端 ResolveDataScope 自动收窄到其管辖区域（区域→学校→用户）；
+ *                       按后端 permission_matrix 仅有 user:view（无 create），故隐藏“新建用户”按钮（只读）。
+ *                       其真正写操作（任命学校管理员）由组织架构 Tab 学校栏的「管理员」面板提供。
+ *   - senior_operator ：只看“用户”+“组织架构”两 Tab，默认 users，可新建用户/批量导入（后端强制本校）
+ *
+ * 合并重构新增（本次，废弃 SchoolAdminPage 并轨）：
+ *   - 顶部新增「📥 批量导入」按钮（admin 与 senior_operator 可见，与“新建用户”并列）。
+ *   - 挂载 BatchImportUsersModal：
+ *       * admin           → mode="admin"，传入 schools 列表，弹窗内选目标学校；
+ *       * senior_operator → mode="self"，后端强制本校。
+ *   - 替代旧 /school-admin 页面的批量导入，统一走 /api/v1/admin/users/batch。
+ *
+ * Phase 6.4 新增（多管理员 UI）：
+ *   - 组织架构 Tab 的学校栏，每张学校卡片新增「🛡️ 管理员」展开按钮（admin 与 region_admin 可见）。
+ *   - 展开后渲染 OrgAdminsPanel：列出/任命/移除该学校的学校管理员（school_admin）。
+ *   - 权限由后端 organization_admin_service 二次校验：admin 任意，region_admin 仅辖区学校。
+ *   - senior_operator 没有写入口（其展开仅"查看成员"），故学校管理员面板对其不出现。
+ *
+ * 知识库压缩入库系统（KB 迭代一 · Phase 6）新增：
+ *   - 概览 Tab 底部新增一张「🔐 知识库访问白名单」展开式卡片（仅 admin 可见——概览 Tab 本就仅 admin）。
+ *   - 展开后渲染 KBAuthorizedPanel：管理"谁能进知识库压缩系统"（/kb-admin/curriculum 隐藏入口）。
+ *   - 白名单不绑角色，仅认成员名单（后端 RequireKBAuthorized 中间件）。
  *
  * FE-AD-01修复：添加searchTimer的useEffect卸载清理，防止组件卸载后触发setState
  */
@@ -40,11 +64,14 @@ import { ConfirmDialog }    from './components/ConfirmDialog'
 import { OrgFormModal }     from './components/OrgFormModal'
 import { GroupFormModal }   from './components/GroupFormModal'
 import { MemberPanel }      from './components/MemberPanel'
+import { OrgAdminsPanel }   from './components/OrgAdminsPanel'
 import { RoleBarChart }     from './components/RoleBarChart'
 import { RecentLogsCard }   from './components/RecentLogsCard'
 import { UserDetailModal }  from './components/UserDetailModal'
 import { CreateUserModal }  from './components/CreateUserModal'
+import { BatchImportUsersModal } from './components/BatchImportUsersModal'
 import { RolesTab }         from './components/RolesTab'
+import { KBAuthorizedPanel } from './components/KBAuthorizedPanel'
 
 // ==================== 三栏列卡（组织架构Tab内部组件）====================
 function ColCard({ title, count, onAdd, addLabel, loading, empty, children }: {
@@ -85,11 +112,23 @@ export default function AdminPage() {
   const { user } = useAuth()
   const navigate  = useNavigate()
   const location  = useLocation()
-  // v122:按角色决定可见 Tab
-  //   admin:全部 5 个 Tab
-  //   senior_operator:只看"用户"和"组织架构",不看概览/日志/角色权限
+
+  // ---- 角色视角判定（Phase6.2）----
+  // isSchoolAdmin：学校管理员（senior_operator）—— 两 Tab + 可新建用户
+  // isRegionAdmin：区域管理员（region_admin）—— 两 Tab + 只读（隐藏新建用户）
+  // isFullAdmin  ：系统管理员（admin）—— 全部 5 Tab + 可新建用户
   const isSchoolAdmin = user?.role === 'senior_operator'
-  const availableTabs = isSchoolAdmin
+  const isRegionAdmin = user?.role === 'region_admin'
+  const isFullAdmin   = user?.role === 'admin'
+  // 是否精简两 Tab 视角（学校管理员 / 区域管理员共用 users + orgs）
+  const isScopedView  = isSchoolAdmin || isRegionAdmin
+  // 是否可新建用户：仅 admin 与 senior_operator（region_admin 无 create 权限）
+  const canCreateUser = isFullAdmin || isSchoolAdmin
+  // Phase 6.4：是否可管理学校管理员（任命/移除）——仅 admin 与 region_admin
+  // （后端 organization_admin_service 对 senior_operator 拒绝，故 senior 不显示此入口）
+  const canManageOrgAdmins = isFullAdmin || isRegionAdmin
+
+  const availableTabs = isScopedView
     ? (['users', 'orgs'] as const)
     : (['overview', 'users', 'orgs', 'logs', 'roles'] as const)
   const availableTabLabels: Record<string, string> = {
@@ -101,14 +140,30 @@ export default function AdminPage() {
   }
   const fromPath: string = (location.state as { from?: string })?.from || '/'
 
-  // ---- Tab状态 ----
-  const [activeTab, setActiveTab] = useState<'overview' | 'users' | 'orgs' | 'logs' | 'roles'>(user?.role === 'senior_operator' ? 'users' : 'overview')
+  // 顶部标题/副标题文案（按角色区分）
+  const headerTitle = isFullAdmin
+    ? '👥 用户管理中心'
+    : isRegionAdmin
+      ? '🌍 区域用户管理'
+      : '🏫 本校用户管理'
+  const headerSubtitle = isFullAdmin
+    ? '统一管理用户、组织架构与操作日志'
+    : isRegionAdmin
+      ? '管理所辖区域的学校与用户（数据已按管辖范围自动收窄）'
+      : '管理本校用户与教研组架构'
+
+  // ---- Tab状态（精简视角默认 users，全权限默认 overview）----
+  const [activeTab, setActiveTab] = useState<'overview' | 'users' | 'orgs' | 'logs' | 'roles'>(
+    (user?.role === 'senior_operator' || user?.role === 'region_admin') ? 'users' : 'overview'
+  )
 
   // ---- 概览Tab ----
   const [stats, setStats]                         = useState<AdminStats | null>(null)
   const [statsLoading, setStatsLoading]           = useState(true)
   const [recentLogs, setRecentLogs]               = useState<AuditLogItem[]>([])
   const [recentLogsLoading, setRecentLogsLoading] = useState(false)
+  // 知识库访问白名单卡片展开开关（仅 admin 概览 Tab 使用）
+  const [showKBPanel, setShowKBPanel]             = useState(false)
 
   // ---- 用户管理Tab ----
   const [users, setUsers]               = useState<AdminUserListItem[]>([])
@@ -124,6 +179,8 @@ export default function AdminPage() {
   const [schoolsLoaded, setSchoolsLoaded] = useState(false)
   const [detailUserId, setDetailUserId]   = useState<string | null>(null)
   const [showCreateModal, setShowCreateModal] = useState(false)
+  // 合并重构：批量导入弹窗开关
+  const [showBatchModal, setShowBatchModal]   = useState(false)
 
   // ---- 组织架构Tab ----
   const [regions, setRegions]         = useState<OrgListItem[]>([])
@@ -135,6 +192,8 @@ export default function AdminPage() {
   const [schLoading, setSchLoading]   = useState(false)
   const [grpLoading, setGrpLoading]   = useState(false)
   const [expandedGroupId, setExpandedGroupId] = useState<string | null>(null)
+  // Phase 6.4：当前展开"学校管理员面板"的学校ID（与教研组成员展开互不影响）
+  const [expandedAdminSchoolId, setExpandedAdminSchoolId] = useState<string | null>(null)
 
   const [orgModal, setOrgModal] = useState<{
     open: boolean; mode: 'create' | 'edit'; type: 'region' | 'school'; initial?: OrgListItem
@@ -163,11 +222,12 @@ export default function AdminPage() {
 
   // ==================== 数据加载 ====================
 
+  // 概览统计：仅全权限 admin 加载（精简视角无概览 Tab，省一次请求）
   const loadStats = useCallback(async () => {
     try { setStatsLoading(true); setStats(await getAdminStats()) }
     catch { /* 忽略 */ } finally { setStatsLoading(false) }
   }, [])
-  useEffect(() => { loadStats() }, [loadStats])
+  useEffect(() => { if (isFullAdmin) loadStats() }, [isFullAdmin, loadStats])
 
   const loadRecentLogs = useCallback(async () => {
     try { setRecentLogsLoading(true); setRecentLogs((await getAdminAuditLogs({ page: 1, page_size: 10 })).logs) }
@@ -175,7 +235,7 @@ export default function AdminPage() {
   }, [])
   useEffect(() => { if (activeTab === 'overview') loadRecentLogs() }, [activeTab, loadRecentLogs])
 
-  // 用户Tab：懒加载学校筛选列表
+  // 用户Tab：懒加载学校筛选列表（后端按角色自动收窄，region_admin 只会拿到辖区学校）
   const loadSchools = useCallback(async () => {
     if (schoolsLoaded) return
     try { const all = await getAdminOrgs(); setSchools(all.filter(o => o.type === 'school')); setSchoolsLoaded(true) }
@@ -217,6 +277,7 @@ export default function AdminPage() {
   }, [])
 
   // ---- 组织架构：加载区域（带自动选中逻辑）----
+  // region_admin 经后端收窄后通常只会拿到自己管辖的区域，会自动选中并展开学校
   const loadRegions = useCallback(async () => {
     try {
       setRegLoading(true)
@@ -235,13 +296,13 @@ export default function AdminPage() {
     if (activeTab === 'orgs') {
       // 切换到组织架构Tab时重新加载（保持自动展开逻辑）
       setSelRegion(null); setSelSchool(null); setSchools2([]); setGroups2([])
-      setExpandedGroupId(null)
+      setExpandedGroupId(null); setExpandedAdminSchoolId(null)
       loadRegions()
     }
   }, [activeTab, loadRegions])
 
   const handleSelectRegion = (r: OrgListItem) => {
-    setSelRegion(r); setSelSchool(null); setGroups2([]); setExpandedGroupId(null)
+    setSelRegion(r); setSelSchool(null); setGroups2([]); setExpandedGroupId(null); setExpandedAdminSchoolId(null)
     loadSchools2(r.id)
   }
   const handleSelectSchool = (s: OrgListItem) => {
@@ -359,14 +420,26 @@ export default function AdminPage() {
         <UserDetailModal
           userId={detailUserId}
           onClose={() => setDetailUserId(null)}
-          onAction={() => { loadUsers(); loadStats(); showToast('操作成功', 'success') }}
+          onAction={() => { loadUsers(); if (isFullAdmin) loadStats(); showToast('操作成功', 'success') }}
         />
       )}
 
       {showCreateModal && (
         <CreateUserModal
           onClose={() => setShowCreateModal(false)}
-          onCreated={() => { loadUsers(); loadStats(); showToast('用户创建成功', 'success') }}
+          onCreated={() => { loadUsers(); if (isFullAdmin) loadStats(); showToast('用户创建成功', 'success') }}
+        />
+      )}
+
+      {/* 合并重构：批量导入教师弹窗
+          admin → mode="admin"，弹窗内选目标学校（schools 来自用户Tab已加载列表）
+          senior_operator → mode="self"，后端强制本校 */}
+      {showBatchModal && (
+        <BatchImportUsersModal
+          mode={isFullAdmin ? 'admin' : 'self'}
+          schools={isFullAdmin ? schools.map(s => ({ id: s.id, name: s.name })) : undefined}
+          onClose={() => setShowBatchModal(false)}
+          onImported={(n) => { loadUsers(); if (isFullAdmin) loadStats(); showToast(`成功导入 ${n} 位教师`, 'success') }}
         />
       )}
 
@@ -379,7 +452,7 @@ export default function AdminPage() {
             showToast(orgModal.mode === 'create' ? '创建成功' : '更新成功', 'success')
             if (orgModal.type === 'region') loadRegions()
             else if (selRegion) loadSchools2(selRegion.id)
-            loadStats()
+            if (isFullAdmin) loadStats()
           }}
         />
       )}
@@ -391,7 +464,7 @@ export default function AdminPage() {
           onClose={() => setGroupModal(p => ({ ...p, open: false }))}
           onSaved={() => {
             showToast(groupModal.mode === 'create' ? '创建成功' : '更新成功', 'success')
-            loadGroups2(selSchool.id); loadStats()
+            loadGroups2(selSchool.id); if (isFullAdmin) loadStats()
           }}
         />
       )}
@@ -405,20 +478,31 @@ export default function AdminPage() {
           {'<- 返回'}
         </button>
         <div style={{ flex: 1, textAlign: 'center' }}>
-          <h1 style={{ fontSize: '18px', fontWeight: 700, color: C.text, margin: 0 }}>{isSchoolAdmin ? '🏫 本校用户管理' : '👥 用户管理中心'}</h1>
+          <h1 style={{ fontSize: '18px', fontWeight: 700, color: C.text, margin: 0 }}>{headerTitle}</h1>
           <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '2px' }}>
-            {isSchoolAdmin ? '管理本校用户与教研组架构' : '统一管理用户、组织架构与操作日志'}
+            {headerSubtitle}
           </div>
         </div>
-        <button onClick={() => setShowCreateModal(true)}
-          style={{ padding: '8px 18px', borderRadius: '8px', border: 'none', background: `linear-gradient(135deg,${C.primary},#7C3AED)`, color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>
-          + 新建用户
-        </button>
+        {/* 新建用户 + 批量导入按钮：仅 admin 与 senior_operator 显示（region_admin 只读，隐藏）*/}
+        {canCreateUser ? (
+          <div style={{ display: 'flex', gap: '10px' }}>
+            <button onClick={() => setShowBatchModal(true)}
+              style={{ padding: '8px 16px', borderRadius: '8px', border: `1px solid ${C.primary}`, background: C.primaryLight, color: C.primary, fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>
+              📥 批量导入
+            </button>
+            <button onClick={() => setShowCreateModal(true)}
+              style={{ padding: '8px 18px', borderRadius: '8px', border: 'none', background: `linear-gradient(135deg,${C.primary},#7C3AED)`, color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>
+              + 新建用户
+            </button>
+          </div>
+        ) : (
+          <div style={{ width: '92px' }} />
+        )}
       </header>
 
       <div style={{ maxWidth: '1400px', margin: '0 auto', padding: '24px' }}>
 
-        {/* Tab切换（5个Tab）*/}
+        {/* Tab切换 */}
         <div style={{ display: 'flex', gap: '4px', marginBottom: '20px', background: C.bg, borderRadius: '12px', padding: '4px', border: `1px solid ${C.border}`, width: 'fit-content' }}>
           {availableTabs.map(tab => (
             <button key={tab} onClick={() => setActiveTab(tab)}
@@ -449,8 +533,29 @@ export default function AdminPage() {
                       setLogFilters(e); setLogFilterInput(e); setLogPage(1)
                     }}
                   />
-                  <div style={{ background: C.primaryLight, borderRadius: '12px', border: `1px solid ${C.primary}22`, padding: '16px 20px', fontSize: '13px', color: C.primary }}>
+                  <div style={{ background: C.primaryLight, borderRadius: '12px', border: `1px solid ${C.primary}22`, padding: '16px 20px', fontSize: '13px', color: C.primary, marginBottom: '16px' }}>
                     💡 点击上方"🏫 组织架构"Tab管理区域、学校和教研组，支持完整的创建、编辑、删除和成员管理。
+                  </div>
+
+                  {/* 知识库访问白名单卡片（KB 迭代一 · Phase 6；概览 Tab 仅 admin 可见，天然限定） */}
+                  <div style={{ background: C.white, borderRadius: '14px', border: `1px solid ${C.border}`, overflow: 'hidden' }}>
+                    <div
+                      onClick={() => setShowKBPanel(p => !p)}
+                      style={{ padding: '16px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer', background: showKBPanel ? C.bg : C.white, transition: 'background 150ms ease' }}>
+                      <div>
+                        <div style={{ fontSize: '15px', fontWeight: 700, color: C.text, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          🔐 知识库访问白名单
+                          <span style={{ fontSize: '11px', fontWeight: 400, color: C.textMuted }}>（隐藏功能 · 课标压缩入库系统）</span>
+                        </div>
+                        <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '3px' }}>
+                          管理"谁能进入知识库压缩系统"。白名单不绑角色，仅认成员名单（系统管理员恒可进）。
+                        </div>
+                      </div>
+                      <span style={{ fontSize: '13px', color: C.primary, fontWeight: 600, whiteSpace: 'nowrap' }}>
+                        {showKBPanel ? '收起 ▲' : '展开管理 ▼'}
+                      </span>
+                    </div>
+                    {showKBPanel && <KBAuthorizedPanel />}
                   </div>
                 </>
               ) : null}
@@ -492,38 +597,38 @@ export default function AdminPage() {
                 ? <div style={{ padding: '40px', textAlign: 'center', color: C.textMuted }}>加载中...</div>
                 : users.length === 0
                 ? <div style={{ padding: '40px', textAlign: 'center', color: C.textMuted }}>暂无用户</div>
-                : users.map((user, idx) => (
-                  <div key={user.id}
+                : users.map((u, idx) => (
+                  <div key={u.id}
                     style={{ display: 'grid', gridTemplateColumns: '2fr 1.5fr 1.5fr 1.2fr 1.5fr 1fr', padding: '14px 20px', alignItems: 'center', borderBottom: idx < users.length - 1 ? `1px solid ${C.border}` : 'none', transition: 'background 150ms ease' }}
                     onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = C.bg }}
                     onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                       <div style={{ width: '34px', height: '34px', borderRadius: '50%', flexShrink: 0, background: `linear-gradient(135deg,${C.primary},#7C3AED)`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: '13px', fontWeight: 700 }}>
-                        {user.display_name?.charAt(0)?.toUpperCase() || 'U'}
+                        {u.display_name?.charAt(0)?.toUpperCase() || 'U'}
                       </div>
                       <div>
-                        <div style={{ fontSize: '14px', fontWeight: 600, color: C.text }}>{user.display_name}</div>
-                        <div style={{ fontSize: '12px', color: C.textMuted }}>@{user.username}</div>
+                        <div style={{ fontSize: '14px', fontWeight: 600, color: C.text }}>{u.display_name}</div>
+                        <div style={{ fontSize: '12px', color: C.textMuted }}>@{u.username}</div>
                       </div>
                     </div>
-                    <div><RoleBadge role={user.role} roleName={user.role_name} /></div>
+                    <div><RoleBadge role={u.role} roleName={u.role_name} /></div>
                     <div>
-                      {user.group_count > 0 ? (
+                      {u.group_count > 0 ? (
                         <div>
-                          <div style={{ fontSize: '13px', color: C.text, fontWeight: 500 }}>{user.group_name || '-'}</div>
-                          <div style={{ fontSize: '11px', color: C.textMuted }}>{user.school_name}{user.group_count > 1 ? `等${user.group_count}个组` : ''}</div>
+                          <div style={{ fontSize: '13px', color: C.text, fontWeight: 500 }}>{u.group_name || '-'}</div>
+                          <div style={{ fontSize: '11px', color: C.textMuted }}>{u.school_name}{u.group_count > 1 ? `等${u.group_count}个组` : ''}</div>
                         </div>
                       ) : (
                         <span style={{ fontSize: '12px', color: C.textMuted }}>未加入教研组</span>
                       )}
                     </div>
-                    <div><StatusBadge status={user.status} /></div>
+                    <div><StatusBadge status={u.status} /></div>
                     <div style={{ fontSize: '12px', color: C.textSec }}>
-                      {user.last_login_at ? String(user.last_login_at).replace('T', ' ').substring(0, 16) : '从未登录'}
-                      <div style={{ fontSize: '11px', color: C.textMuted }}>共{user.login_count}次</div>
+                      {u.last_login_at ? String(u.last_login_at).replace('T', ' ').substring(0, 16) : '从未登录'}
+                      <div style={{ fontSize: '11px', color: C.textMuted }}>共{u.login_count}次</div>
                     </div>
                     <div>
-                      <button onClick={() => setDetailUserId(user.id)}
+                      <button onClick={() => setDetailUserId(u.id)}
                         style={{ padding: '5px 14px', borderRadius: '7px', border: `1px solid ${C.border}`, background: C.bg, fontSize: '12px', color: C.primary, cursor: 'pointer', fontWeight: 500 }}
                         onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = C.primaryLight }}
                         onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = C.bg }}>
@@ -553,8 +658,8 @@ export default function AdminPage() {
 
             {/* 区域栏 */}
             <ColCard title="🌍 区域" count={regions.length}
-              onAdd={() => setOrgModal({ open: true, mode: 'create', type: 'region' })} addLabel="新建区域"
-              loading={regLoading} empty={regions.length === 0 ? '暂无区域，点击右上角新建' : undefined}>
+              onAdd={isFullAdmin ? () => setOrgModal({ open: true, mode: 'create', type: 'region' }) : undefined} addLabel="新建区域"
+              loading={regLoading} empty={regions.length === 0 ? '暂无区域' : undefined}>
               {regions.map(r => (
                 <div key={r.id}>
                   <div onClick={() => handleSelectRegion(r)}
@@ -568,13 +673,16 @@ export default function AdminPage() {
                     <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '8px' }}>
                       {r.admin_user_name ? `管理员：${r.admin_user_name}` : '暂无管理员'}
                     </div>
-                    <div style={{ display: 'flex', gap: '6px' }} onClick={e => e.stopPropagation()}>
-                      <button onClick={() => setOrgModal({ open: true, mode: 'edit', type: 'region', initial: r })} style={rowBtn(C.primary, C.primaryLight)}>✏️ 编辑</button>
-                      <button onClick={() => handleToggleOrgStatus(r)} style={rowBtn(r.status === 'active' ? C.danger : C.success, r.status === 'active' ? C.dangerLight : C.successLight)}>
-                        {r.status === 'active' ? '🚫 禁用' : '✅ 启用'}
-                      </button>
-                      <button onClick={() => handleDeleteOrg(r)} style={rowBtn(C.danger, C.dangerLight)}>🗑️ 删除</button>
-                    </div>
+                    {/* 区域的编辑/禁用/删除：仅 admin 可操作（region_admin 只读）*/}
+                    {isFullAdmin && (
+                      <div style={{ display: 'flex', gap: '6px' }} onClick={e => e.stopPropagation()}>
+                        <button onClick={() => setOrgModal({ open: true, mode: 'edit', type: 'region', initial: r })} style={rowBtn(C.primary, C.primaryLight)}>✏️ 编辑</button>
+                        <button onClick={() => handleToggleOrgStatus(r)} style={rowBtn(r.status === 'active' ? C.danger : C.success, r.status === 'active' ? C.dangerLight : C.successLight)}>
+                          {r.status === 'active' ? '🚫 禁用' : '✅ 启用'}
+                        </button>
+                        <button onClick={() => handleDeleteOrg(r)} style={rowBtn(C.danger, C.dangerLight)}>🗑️ 删除</button>
+                      </div>
+                    )}
                   </div>
                   <div style={{ height: '1px', background: C.border, margin: '0 14px' }} />
                 </div>
@@ -585,9 +693,9 @@ export default function AdminPage() {
             <ColCard
               title={selRegion ? <span>🏫 <span style={{ color: C.primary }}>{selRegion.name}</span> 的学校</span> : '🏫 学校'}
               count={schools2.length}
-              onAdd={selRegion ? () => setOrgModal({ open: true, mode: 'create', type: 'school' }) : undefined} addLabel="新建学校"
+              onAdd={(isFullAdmin && selRegion) ? () => setOrgModal({ open: true, mode: 'create', type: 'school' }) : undefined} addLabel="新建学校"
               loading={schLoading}
-              empty={!selRegion ? '← 请先选择左侧区域' : schools2.length === 0 ? '暂无学校，点击右上角新建' : undefined}>
+              empty={!selRegion ? '← 请先选择左侧区域' : schools2.length === 0 ? '暂无学校' : undefined}>
               {schools2.map(s => (
                 <div key={s.id}>
                   <div onClick={() => handleSelectSchool(s)}
@@ -601,14 +709,37 @@ export default function AdminPage() {
                     <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '8px' }}>
                       {s.admin_user_name ? `管理员：${s.admin_user_name}` : '暂无管理员'} · {s.group_count} 个教研组
                     </div>
-                    <div style={{ display: 'flex', gap: '6px' }} onClick={e => e.stopPropagation()}>
-                      <button onClick={() => setOrgModal({ open: true, mode: 'edit', type: 'school', initial: s })} style={rowBtn(C.primary, C.primaryLight)}>✏️ 编辑</button>
-                      <button onClick={() => handleToggleOrgStatus(s)} style={rowBtn(s.status === 'active' ? C.danger : C.success, s.status === 'active' ? C.dangerLight : C.successLight)}>
-                        {s.status === 'active' ? '🚫 禁用' : '✅ 启用'}
-                      </button>
-                      <button onClick={() => handleDeleteOrg(s)} style={rowBtn(C.danger, C.dangerLight)}>🗑️ 删除</button>
+                    {/* 学校行操作按钮 */}
+                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }} onClick={e => e.stopPropagation()}>
+                      {/* admin 专属：编辑/禁用/删除 */}
+                      {isFullAdmin && (
+                        <>
+                          <button onClick={() => setOrgModal({ open: true, mode: 'edit', type: 'school', initial: s })} style={rowBtn(C.primary, C.primaryLight)}>✏️ 编辑</button>
+                          <button onClick={() => handleToggleOrgStatus(s)} style={rowBtn(s.status === 'active' ? C.danger : C.success, s.status === 'active' ? C.dangerLight : C.successLight)}>
+                            {s.status === 'active' ? '🚫 禁用' : '✅ 启用'}
+                          </button>
+                          <button onClick={() => handleDeleteOrg(s)} style={rowBtn(C.danger, C.dangerLight)}>🗑️ 删除</button>
+                        </>
+                      )}
+                      {/* Phase 6.4：管理员任命入口（admin 与 region_admin 可见）*/}
+                      {canManageOrgAdmins && (
+                        <button
+                          onClick={() => setExpandedAdminSchoolId(p => p === s.id ? null : s.id)}
+                          style={rowBtn(expandedAdminSchoolId === s.id ? C.purple : C.textSec, expandedAdminSchoolId === s.id ? C.purpleLight : C.bg)}>
+                          {expandedAdminSchoolId === s.id ? '收起 ▲' : '🛡️ 管理员'}
+                        </button>
+                      )}
                     </div>
                   </div>
+                  {/* Phase 6.4：学校管理员面板（展开式，仿 MemberPanel）*/}
+                  {expandedAdminSchoolId === s.id && (
+                    <OrgAdminsPanel
+                      orgId={s.id}
+                      orgType="school"
+                      onClose={() => setExpandedAdminSchoolId(null)}
+                      onChanged={() => { if (selRegion) loadSchools2(selRegion.id) }}
+                    />
+                  )}
                   <div style={{ height: '1px', background: C.border, margin: '0 14px' }} />
                 </div>
               ))}
@@ -618,9 +749,9 @@ export default function AdminPage() {
             <ColCard
               title={selSchool ? <span>👨‍🏫 <span style={{ color: C.primary }}>{selSchool.name}</span> 的教研组</span> : '👨‍🏫 教研组'}
               count={groups2.length}
-              onAdd={selSchool ? () => setGroupModal({ open: true, mode: 'create' }) : undefined} addLabel="新建教研组"
+              onAdd={(isFullAdmin && selSchool) ? () => setGroupModal({ open: true, mode: 'create' }) : undefined} addLabel="新建教研组"
               loading={grpLoading}
-              empty={!selSchool ? '← 请先选择中间学校' : groups2.length === 0 ? '暂无教研组，点击右上角新建' : undefined}>
+              empty={!selSchool ? '← 请先选择中间学校' : groups2.length === 0 ? '暂无教研组' : undefined}>
               {groups2.map(g => (
                 <div key={g.id}>
                   <div style={{ padding: '12px 14px' }}>
@@ -633,14 +764,26 @@ export default function AdminPage() {
                       </div>
                       <StatusBadge status={g.status} />
                     </div>
-                    <div style={{ display: 'flex', gap: '6px', marginTop: '8px' }}>
-                      <button onClick={() => setGroupModal({ open: true, mode: 'edit', initial: g })} style={rowBtn(C.primary, C.primaryLight)}>✏️ 编辑</button>
-                      <button onClick={() => handleDeleteGroup(g)} style={rowBtn(C.danger, C.dangerLight)}>🗑️ 删除</button>
-                      <button onClick={() => setExpandedGroupId(p => p === g.id ? null : g.id)}
-                        style={rowBtn(expandedGroupId === g.id ? C.purple : C.textSec, expandedGroupId === g.id ? C.purpleLight : C.bg)}>
-                        {expandedGroupId === g.id ? '收起 ▲' : '👥 成员'}
-                      </button>
-                    </div>
+                    {/* 教研组的编辑/删除：仅 admin 可操作 */}
+                    {isFullAdmin && (
+                      <div style={{ display: 'flex', gap: '6px', marginTop: '8px' }}>
+                        <button onClick={() => setGroupModal({ open: true, mode: 'edit', initial: g })} style={rowBtn(C.primary, C.primaryLight)}>✏️ 编辑</button>
+                        <button onClick={() => handleDeleteGroup(g)} style={rowBtn(C.danger, C.dangerLight)}>🗑️ 删除</button>
+                        <button onClick={() => setExpandedGroupId(p => p === g.id ? null : g.id)}
+                          style={rowBtn(expandedGroupId === g.id ? C.purple : C.textSec, expandedGroupId === g.id ? C.purpleLight : C.bg)}>
+                          {expandedGroupId === g.id ? '收起 ▲' : '👥 成员'}
+                        </button>
+                      </div>
+                    )}
+                    {/* 精简视角（学校/区域管理员）：仅提供查看成员 */}
+                    {!isFullAdmin && (
+                      <div style={{ display: 'flex', gap: '6px', marginTop: '8px' }}>
+                        <button onClick={() => setExpandedGroupId(p => p === g.id ? null : g.id)}
+                          style={rowBtn(expandedGroupId === g.id ? C.purple : C.textSec, expandedGroupId === g.id ? C.purpleLight : C.bg)}>
+                          {expandedGroupId === g.id ? '收起 ▲' : '👥 成员'}
+                        </button>
+                      </div>
+                    )}
                   </div>
                   {expandedGroupId === g.id && (
                     <MemberPanel groupId={g.id} onClose={() => setExpandedGroupId(null)} />

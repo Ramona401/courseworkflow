@@ -54,6 +54,8 @@ import { StageSeparatorBubble } from './components/StageSeparatorBubble'
 import StageComponentsModal from './components/StageComponentsModal'
 import { ResumingView, StartScreen } from './components/WorkshopStartScreen'
 import { getAssessmentResult } from '@/api/assessment'
+// 迭代7B：备课中展示本次关联的课本图
+import { getTextbook, type TextbookDetail } from '@/api/textbooks'
 import ImportPlanModal from './components/ImportPlanModal'
 // v112 (P0 STEP 8):引入 AI 助手选择器和场景类型
 import AssistantSelector from '@/components/ai-assistants/AssistantSelector'
@@ -108,6 +110,8 @@ export default function WorkshopPage() {
   const [startMode, setStartMode] = useState<'choose' | 'new'>('choose')
 
   const [plan, setPlan] = useState<LessonPlan | null>(null)
+  // 迭代7B：本次备课关联的课本图详情（进入备课后按 plan.textbook_page_ids 查出，仅用于展示）
+  const [linkedTextbooks, setLinkedTextbooks] = useState<TextbookDetail[]>([])
   const [messages, setMessages]     = useState<ConversationMessage[]>([])
   const [isThinking, setIsThinking] = useState(false)
   const [streaming, setStreaming]   = useState<StreamingState | null>(null)
@@ -201,6 +205,28 @@ export default function WorkshopPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   // v88:保存planId的ref,供重连回调使用(避免闭包捕获旧值)
   const planIdRef = useRef<string | null>(null)
+
+  // 迭代7B：进入备课（或恢复教案）后，按 plan.textbook_page_ids 查出关联课本图详情用于展示。
+  // 解析 plan.textbook_page_ids（JSON数组字符串），批量 getTextbook 拿缩略图+章节名。
+  // plan 为空或无关联时清空。查询失败静默忽略，不影响备课主流程。
+  useEffect(() => {
+    const ids = (() => {
+      try {
+        const raw = plan?.textbook_page_ids
+        if (!raw || raw === '[]') return [] as string[]
+        const arr = JSON.parse(raw)
+        return Array.isArray(arr) ? (arr as string[]) : []
+      } catch { return [] as string[] }
+    })()
+    if (ids.length === 0) { setLinkedTextbooks([]); return }
+    let cancelled = false
+    Promise.all(ids.map(id => getTextbook(id).catch(() => null)))
+      .then(list => {
+        if (cancelled) return
+        setLinkedTextbooks(list.filter((t): t is TextbookDetail => t !== null))
+      })
+    return () => { cancelled = true }
+  }, [plan])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -951,6 +977,25 @@ export default function WorkshopPage() {
               </div>
             ) : (
               <button onClick={() => navigate('/lesson-plans/recipes')} style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px', color: C.textMuted, background: 'none', border: `1px dashed ${C.border}`, borderRadius: '6px', padding: '6px 8px', cursor: 'pointer', width: '100%', justifyContent: 'center' }}>📦 添加配方</button>
+            )}
+            {/* 迭代7B：本次参考的课本图缩略展示——让老师明确知道这次备课 AI 参考了哪些课本页 */}
+            {linkedTextbooks.length > 0 && (
+              <div style={{ marginTop: '8px', padding: '8px 10px', background: 'rgba(16,185,129,0.06)', borderRadius: '8px', border: '1px solid rgba(16,185,129,0.15)' }}>
+                <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '6px' }}>📷 参考课本（{linkedTextbooks.length}张）</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                  {linkedTextbooks.map(tb => (
+                    <div key={tb.id} title={`${tb.chapter || tb.textbook_name}${tb.has_ocr ? '（已识别）' : '（未识别，AI无法参考）'}`}
+                      onClick={() => navigate('/lesson-plans/textbooks')}
+                      style={{ position: 'relative', cursor: 'pointer', borderRadius: '4px', overflow: 'hidden', border: tb.has_ocr ? '1px solid #10B981' : '1px solid #E5E7EB' }}>
+                      <img src={tb.image_url} alt="" style={{ width: '36px', height: '36px', objectFit: 'cover', display: 'block' }}
+                        onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
+                      {!tb.has_ocr && (
+                        <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'rgba(239,68,68,0.85)', color: '#fff', fontSize: '8px', textAlign: 'center', lineHeight: 1.4 }}>未识别</div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
             )}
           </div>
         )}

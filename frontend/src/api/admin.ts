@@ -7,7 +7,16 @@
  *   - GroupListItem 新增 lead_user_names（所有组长名称，逗号分隔）
  *   - GroupDetail 新增 lead_user_names
  *   - CreateGroupRequest / UpdateGroupRequest 移除 lead_user_id（改由成员角色管理）
- *   - GroupMemberItem.role 支持 'lead' / 'backbone' / 'member'
+ *
+ * Phase6.2改动（区域管理员）：
+ *   - AdminStats 新增 region_admin_count（后端 stats 已返回，类型对齐避免 TS 报错）
+ *   - 新增组织多管理员接口（organization_admins 的 List/Add/Remove），
+ *     对应后端 /api/v1/lesson-plans/organizations/{id}/admins，供第二批多管理员 UI 直接调用
+ *
+ * 合并重构改动（本次，废弃 school-admin 并轨）：
+ *   - 末尾新增批量导入用户 API（batchCreateAdminUsers + 相关类型），
+ *     对接后端 POST /api/v1/admin/users/batch，替代旧 /school-admin/users/batch。
+ *     类型在此独立定义（不再从 school-admin.ts import），因 school-admin.ts 将被删除。
  */
 import client from './client'
 
@@ -76,6 +85,8 @@ export interface AdminStats {
   total_groups: number
   total_members: number
   admin_count: number
+  // Phase6.2新增：区域管理员人数（后端统计已返回，可能为 0）
+  region_admin_count?: number
   senior_operator_count: number
   operator_count: number
   viewer_count: number
@@ -221,6 +232,30 @@ export interface UpdateGroupRequest {
   status?: string
 }
 
+// ==================== 组织多管理员类型（Phase6.2 预埋，第二批 UI 使用）====================
+
+/**
+ * 组织管理员列表项（后端 OrganizationAdminItem）
+ * 对应 organization_admins 表，一个组织可有多个管理员。
+ * role_type：region_admin（区域管理员，挂在 region 组织）/ school_admin（学校管理员，挂在 school 组织）
+ */
+export interface OrgAdminItem {
+  id: string
+  org_id: string
+  user_id: string
+  username: string
+  display_name: string
+  role_type: string        // region_admin / school_admin
+  created_by: string       // 任命人（后端 COALESCE 为字符串，可能为空串）
+  created_at: string
+}
+
+/** 任命组织管理员请求 */
+export interface AddOrgAdminRequest {
+  user_id: string
+  role_type: string        // region_admin / school_admin
+}
+
 // ==================== 统计 API ====================
 
 export async function getAdminStats(): Promise<AdminStats> {
@@ -329,6 +364,31 @@ export async function uploadOrgLogo(orgId: string, file: File): Promise<{ url: s
   return res.data.data!
 }
 
+// ==================== 组织多管理员 API（Phase6.2 预埋，第二批 UI 使用）====================
+// 后端路由：/api/v1/lesson-plans/organizations/{id}/admins
+//   GET    列出某组织的全部管理员
+//   POST   任命一名管理员（body: {user_id, role_type}）
+//   DELETE 移除某管理员（/admins/{user_id}）
+// 权限：admin 任意；region_admin 仅其管辖区域本身或辖区学校（后端 service 二次校验）
+
+/** 列出某组织的全部管理员 */
+export async function getOrgAdmins(orgId: string): Promise<OrgAdminItem[]> {
+  const res = await client.get<{ code: number; data: { admins: OrgAdminItem[]; total: number } }>(
+    `/lesson-plans/organizations/${orgId}/admins`
+  )
+  return res.data.data?.admins ?? []
+}
+
+/** 任命一名组织管理员 */
+export async function addOrgAdmin(orgId: string, data: AddOrgAdminRequest): Promise<void> {
+  await client.post(`/lesson-plans/organizations/${orgId}/admins`, data)
+}
+
+/** 移除某组织管理员 */
+export async function removeOrgAdmin(orgId: string, userId: string): Promise<void> {
+  await client.delete(`/lesson-plans/organizations/${orgId}/admins/${userId}`)
+}
+
 // ==================== 教研组管理 API ====================
 
 export async function getAdminGroups(school_id?: string): Promise<GroupListItem[]> {
@@ -395,6 +455,58 @@ export async function getAdminAuditLogs(
 ): Promise<AuditLogListResult> {
   const res = await client.get<{ code: number; data: AuditLogListResult }>(
     '/admin/audit-logs', { params }
+  )
+  return res.data.data!
+}
+
+// ==================== 批量导入用户 API（合并重构：替代 school-admin 批量端点）====================
+// 后端路由：POST /api/v1/admin/users/batch（adminOrSchoolAdmin 中间件）
+//   - admin          : 必须传 school_id（目标学校），后端按此入校；为空后端返回 400
+//   - senior_operator: 可省 school_id，后端强制本校（忽略前端传入）
+//   - 角色白名单：operator / viewer（后端二次强制）
+//   - 整批回滚：任一行失败则一个都不创建，返回行号失败明细供前端逐行标红
+
+/** 批量导入的单个用户条目（与后端 services.BatchUserItem 对齐） */
+export interface BatchUserItem {
+  username: string
+  display_name: string
+  password: string
+}
+
+/** 批量建用户请求（前端只传 role + school_id + users；source 由后端按角色强制） */
+export interface BatchCreateAdminUsersRequest {
+  role: string                 // operator / viewer
+  school_id?: string           // admin 必填（目标学校）；senior 可省（后端强制本校）
+  users: BatchUserItem[]
+}
+
+/** 单行失败明细（行号 1-based，对齐操作员看到的表格行） */
+export interface BatchCreateUserFailure {
+  index: number
+  username: string
+  reason: string
+}
+
+/** 批量建用户结果（与后端 services.BatchCreateUsersResult 对齐） */
+export interface BatchCreateUsersResult {
+  success: boolean
+  created_count: number
+  total_count: number
+  failures: BatchCreateUserFailure[]
+}
+
+/**
+ * 批量创建用户 POST /admin/users/batch
+ * 后端整批回滚 + 行号失败明细：
+ *   - 成功 → success=true, created_count=条目数, failures=[]
+ *   - 整批校验失败 → success=false, created_count=0, failures 逐行原因（HTTP 仍 200）
+ *   - 系统级异常（如空列表、开事务失败）→ 抛错（HTTP 非 200，由调用方 catch）
+ */
+export async function batchCreateAdminUsers(
+  req: BatchCreateAdminUsersRequest
+): Promise<BatchCreateUsersResult> {
+  const res = await client.post<{ code: number; data: BatchCreateUsersResult }>(
+    '/admin/users/batch', req
   )
   return res.data.data!
 }

@@ -264,6 +264,7 @@ export interface LessonPlan {
   recipe_name: string | null
   version: number
   current_stage: string | null       // Phase 7B-9:当前阶段代码
+  textbook_page_ids: string | null   // 迭代7B:关联课本图片ID的JSON数组字符串
   stage_config: string | null        // Phase 7B-9:阶段配置快照JSON
   created_at: string
   updated_at: string

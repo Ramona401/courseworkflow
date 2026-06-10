@@ -1,0 +1,397 @@
+/**
+ * 课件模板缩略图组件 — TemplateThumb v3.2 (2026-06-09)
+ *
+ * ============ v3.2 修复:部分卡片永久空白(callback ref 与宽度监听竞态) ============
+ *
+ * v3.1 的 bug:为解决 observe 时机改用了 callback ref(setNode),但 useContainerWidth
+ *   仍用 RefObject(nodeRef)且其 useLayoutEffect 只在挂载时跑一次。callback ref 写入
+ *   nodeRef.current 的时机与该 layoutEffect 存在竞态——时机不巧时 layoutEffect 跑时
+ *   nodeRef.current 还是 null → containerW 永远 0 → scale 永远 0 → iframe 永不渲染。
+ *   且该 effect 不会重跑,滚动也救不回来 → 部分卡片永久空白(尤其个人/大体积模板)。
+ *
+ * v3.2 纠正(回归稳定结构,去掉 callback ref 花活):
+ *   1. 用回普通 useRef(containerRef),useContainerWidth 与 IO 都观察同一稳定节点,
+ *      消除竞态,scale 一定能拿到。
+ *   2. IO 触发用 useLayoutEffect(挂载后、绘制前跑,此时 containerRef.current 必有值)。
+ *   3. requestAnimationFrame 延一帧再做「初次同步检查 + 建立 IO」,
+ *      确保内层 <main> 布局与滚动位置已稳定。
+ *   4. 【关键】IO 持续观察直到进入视口才 disconnect,绝不因「初次同步检查没命中」就早退,
+ *      ——v3.1 的致命早退分支删除。同步检查只作加速,IO 作为兜底保证滚动一定补触发。
+ *   5. root 仍自动取最近可滚动祖先(v3.1 抓对的内层 <main> 滚动根因保留)。
+ *
+ * ============ v3.0 P5 性能优化:视口懒加载(只改卡片版,弹窗版不动) ============
+ *   - 3D 模板(previewUrl):小预判 100px,快滚到才创建,延后最重的 WebGL 负载。
+ *   - 静态模板(sampleHTML):大预判 600px,老师滚到前已提前渲染,看真实样式无白块。
+ *   - 进入视口即永久保持渲染,不重复创建/销毁,不闪。
+ *   - 占位态仍渲染带 ref 的容器 div + fallback,保证 observer 有可观察目标。
+ *   - 弹窗版 TemplateThumbAuto 完全不动(单 iframe 无瓶颈,加 IO 反有空白风险)。
+ *
+ * ---------- 历史版本 ----------
+ * v2.0(2026-05-19):wrapHTML 兼容完整文档 + useLayoutEffect 消闪烁 + ResizeObserver rAF 节流
+ * v1.0:overflow:hidden 消滚动条 + detectSize 识别 1920/960 + ResizeObserver 动态算 scale
+ *
+ * 使用方式(对外 props 与渲染结果不变,调用方无需改动):
+ *   <TemplateThumb previewUrl="..." sampleHTML="..." fallback={<div/>} />
+ *   优先级:previewUrl(3D) > sampleHTML > fallback
+ */
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+
+// ==================== 懒加载预判距离常量 ====================
+
+/** 3D 模板(previewUrl)的视口预判像素:小值,尽量晚创建(WebGL 最重)。 */
+const ROOT_MARGIN_3D_PX = 100
+
+/** 静态模板(sampleHTML)的视口预判像素:大值,提前预加载,老师无感看真实样式。 */
+const ROOT_MARGIN_STATIC_PX = 600
+
+// ==================== 辅助函数 ====================
+
+/** 检测 HTML 声明的画布尺寸,默认 960×540。 */
+function detectSize(html: string): { w: number; h: number } {
+  const m1 = html.match(/width\s*:\s*(\d+)px[^}]*height\s*:\s*(\d+)px/i)
+  if (m1) return { w: parseInt(m1[1]), h: parseInt(m1[2]) }
+  const m2 = html.match(/width\s*=\s*["']?(\d+)["']?[^>]*height\s*=\s*["']?(\d+)["']?/i)
+  if (m2) return { w: parseInt(m2[1]), h: parseInt(m2[2]) }
+  return { w: 960, h: 540 }
+}
+
+/** 包裹 HTML 片段,注入 overflow:hidden reset;完整文档只注 <head>,纯片段外层包裹。 */
+function wrapHTML(html: string, w: number, h: number): string {
+  const resetCSS = `html,body{margin:0;padding:0;overflow:hidden;width:${w}px;height:${h}px;}::-webkit-scrollbar{display:none;}`
+  const isFullDoc = /<!DOCTYPE|<html[\s>]/i.test(html)
+
+  if (isFullDoc) {
+    if (/<head[\s>]/i.test(html)) {
+      return html.replace(/<head[^>]*>/i, match => `${match}<style>${resetCSS}</style>`)
+    }
+    if (/<html[\s>]/i.test(html)) {
+      return html.replace(/<html[^>]*>/i, match => `${match}<head><style>${resetCSS}</style></head>`)
+    }
+    return `<head><style>${resetCSS}</style></head>${html}`
+  }
+
+  return `<!DOCTYPE html>
+<html style="margin:0;padding:0;overflow:hidden;width:${w}px;height:${h}px;">
+<head>
+<meta charset="UTF-8">
+<style>${resetCSS} body>*{display:block;}</style>
+</head>
+<body>${html}</body>
+</html>`
+}
+
+/**
+ * 向上查找最近的可滚动祖先(overflow-y 为 auto/scroll 且内容超出)。
+ * 作为 IntersectionObserver 的 root,使懒加载在内层滚动容器(如 CWLayout 的 <main>)中正确触发。
+ * 找不到返回 null(IO 用默认视口)。
+ */
+function findScrollParent(el: HTMLElement | null): HTMLElement | null {
+  let node: HTMLElement | null = el?.parentElement || null
+  while (node && node !== document.body && node !== document.documentElement) {
+    const style = window.getComputedStyle(node)
+    const oy = style.overflowY
+    if ((oy === 'auto' || oy === 'scroll') && node.scrollHeight > node.clientHeight) {
+      return node
+    }
+    node = node.parentElement
+  }
+  return null
+}
+
+// ==================== 自定义 Hook：带节流的容器宽度监听 ====================
+
+/**
+ * 监听元素宽度变化(rAF 节流 + 2px 阈值)。useLayoutEffect 绘制前拿尺寸消闪烁。
+ */
+function useContainerWidth(ref: React.RefObject<HTMLDivElement | null>, initialWidth = 0): number {
+  const [width, setWidth] = useState(initialWidth)
+  const rafIdRef = useRef<number | null>(null)
+  const lastWidthRef = useRef<number>(initialWidth)
+
+  useLayoutEffect(() => {
+    if (!ref.current) return
+    const el = ref.current
+
+    const initW = Math.floor(el.clientWidth)
+    if (initW > 0) {
+      lastWidthRef.current = initW
+      setWidth(initW)
+    }
+
+    const observer = new ResizeObserver(entries => {
+      if (rafIdRef.current !== null) cancelAnimationFrame(rafIdRef.current)
+      rafIdRef.current = requestAnimationFrame(() => {
+        rafIdRef.current = null
+        for (const entry of entries) {
+          const newW = Math.floor(entry.contentRect.width)
+          if (Math.abs(newW - lastWidthRef.current) >= 2 && newW > 0) {
+            lastWidthRef.current = newW
+            setWidth(newW)
+          }
+        }
+      })
+    })
+
+    observer.observe(el)
+    return () => {
+      observer.disconnect()
+      if (rafIdRef.current !== null) cancelAnimationFrame(rafIdRef.current)
+    }
+  }, [ref])
+
+  return width
+}
+
+// ==================== 自定义 Hook：视口懒加载(v3.2 稳定重写) ====================
+
+/**
+ * 监听元素是否进入(可滚动祖先或视口的)可视区,用于懒加载 iframe。
+ *
+ * v3.2 设计(消除 v3.1 竞态 + 保证滚动一定补触发):
+ *   - 与 useContainerWidth 共用同一个稳定的 containerRef(普通 useRef),不用 callback ref。
+ *   - useLayoutEffect 中 requestAnimationFrame 延一帧:等内层 <main> 布局/滚动位置稳定后,
+ *     ① 找可滚动祖先当 root;② 做同步初次检查(加速首屏);
+ *     ③ 无论同步检查命中与否,都建立 IO 持续观察,进入视口才置 inView 并 disconnect。
+ *   - 「进入即永久保持」:inView 一旦 true 不再变回 false,不重复创建/销毁。
+ *   兜底:不支持 IntersectionObserver 的极旧环境直接立即渲染。
+ *
+ * @param ref 容器 div 的 RefObject(与 useContainerWidth 同一个)
+ * @param marginPx 预判像素:3D 传 100,静态传 600
+ * @returns 是否已进入可视区(true 后永久为 true)
+ */
+function useInViewport(ref: React.RefObject<HTMLDivElement | null>, marginPx: number): boolean {
+  const [inView, setInView] = useState(false)
+
+  useLayoutEffect(() => {
+    if (inView) return
+    const el = ref.current
+    if (!el) return
+
+    // 兜底:不支持 IO → 立即渲染
+    if (typeof IntersectionObserver === 'undefined') {
+      setInView(true)
+      return
+    }
+
+    let observer: IntersectionObserver | null = null
+    let rafId: number | null = null
+    let cancelled = false
+
+    // 延一帧,等布局与滚动位置稳定后再判断与观察
+    rafId = requestAnimationFrame(() => {
+      rafId = null
+      if (cancelled || !ref.current) return
+      const node = ref.current
+      const rootEl = findScrollParent(node) // null = 默认视口
+
+      // ① 同步初次检查(加速首屏,但不作为唯一手段)
+      const elRect = node.getBoundingClientRect()
+      const viewTop = rootEl ? rootEl.getBoundingClientRect().top : 0
+      const viewBottom = rootEl ? rootEl.getBoundingClientRect().bottom : window.innerHeight
+      if (elRect.bottom >= viewTop - marginPx && elRect.top <= viewBottom + marginPx) {
+        setInView(true)
+        return // 已可见:无需再建 IO
+      }
+
+      // ② 无论如何都建立 IO 持续观察(关键:不因同步检查没命中就放弃,滚动一定能补触发)
+      observer = new IntersectionObserver(
+        entries => {
+          for (const entry of entries) {
+            if (entry.isIntersecting) {
+              setInView(true)
+              observer?.disconnect()
+              observer = null
+              break
+            }
+          }
+        },
+        { root: rootEl, rootMargin: `${marginPx}px`, threshold: 0 },
+      )
+      observer.observe(node)
+    })
+
+    return () => {
+      cancelled = true
+      if (rafId !== null) cancelAnimationFrame(rafId)
+      if (observer) { observer.disconnect(); observer = null }
+    }
+  }, [ref, marginPx, inView])
+
+  return inView
+}
+
+// ==================== 组件 Props ====================
+interface TemplateThumbProps {
+  previewUrl?: string
+  sampleHTML?: string
+  fallback?: React.ReactNode
+  height?: number
+  title?: string
+}
+
+/**
+ * 模板缩略图组件 — 卡片版(固定高度 160px)
+ *
+ * v3.2:回归稳定 containerRef 结构,useContainerWidth 与 useInViewport 共用同一 ref,
+ * 消除 v3.1 的竞态;懒加载 root 自动指向内层滚动容器,同步检查 + 持续 IO 双保险。
+ */
+export default function TemplateThumb({
+  previewUrl, sampleHTML, fallback, height = 160, title = '模板预览',
+}: TemplateThumbProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const containerW = useContainerWidth(containerRef, 0)
+  // 3D 用小预判(100),静态/兜底用大预判(600)
+  const marginPx = previewUrl ? ROOT_MARGIN_3D_PX : ROOT_MARGIN_STATIC_PX
+  const inView = useInViewport(containerRef, marginPx)
+
+  // 分支1:3D 模板(preview_url 加载本地 HTML)
+  if (previewUrl) {
+    const iframeW = 1440, iframeH = 900
+    const scale = containerW > 0 ? containerW / iframeW : 0
+    return (
+      <div ref={containerRef} style={{
+        width: '100%', height: `${height}px`, position: 'relative',
+        overflow: 'hidden', background: '#0a0a0a',
+      }}>
+        {inView && scale > 0 ? (
+          <iframe
+            src={previewUrl}
+            loading="lazy"
+            style={{
+              width: `${iframeW}px`, height: `${iframeH}px`, border: 'none',
+              pointerEvents: 'none',
+              transform: `scale(${scale})`, transformOrigin: 'top left',
+              position: 'absolute', top: 0, left: 0,
+            }}
+            sandbox="allow-scripts allow-same-origin"
+            title={title}
+          />
+        ) : (
+          <div style={{ position: 'absolute', inset: 0 }}>{fallback}</div>
+        )}
+      </div>
+    )
+  }
+
+  // 分支2:普通模板(sampleHTML 包裹后 srcDoc 渲染)
+  if (sampleHTML) {
+    const { w: iframeW, h: iframeH } = detectSize(sampleHTML)
+    const scale = containerW > 0 ? containerW / iframeW : 0
+    return (
+      <div ref={containerRef} style={{
+        width: '100%', height: `${height}px`, position: 'relative',
+        overflow: 'hidden', background: '#f1f5f9',
+      }}>
+        {inView && scale > 0 ? (
+          <iframe
+            srcDoc={wrapHTML(sampleHTML, iframeW, iframeH)}
+            loading="lazy"
+            style={{
+              width: `${iframeW}px`, height: `${iframeH}px`, border: 'none',
+              pointerEvents: 'none',
+              transform: `scale(${scale})`, transformOrigin: 'top left',
+              position: 'absolute', top: 0, left: 0,
+            }}
+            sandbox="allow-scripts"
+            title={title}
+          />
+        ) : (
+          <div style={{ position: 'absolute', inset: 0 }}>{fallback}</div>
+        )}
+      </div>
+    )
+  }
+
+  // 分支3:兜底渲染(本就无 iframe)
+  return (
+    <div ref={containerRef} style={{
+      width: '100%', height: `${height}px`, overflow: 'hidden',
+    }}>{fallback}</div>
+  )
+}
+
+// ==================== 弹窗大预览版(自适应宽度,不动) ====================
+
+/**
+ * 模板缩略图组件 — 弹窗版(高度按 16:9 自适应宽度)。
+ * 【不加懒加载】:永远单 iframe 无瓶颈;弹窗内 overflow:auto,加 IO 反有空白风险。
+ */
+export function TemplateThumbAuto({
+  previewUrl, sampleHTML, fallback, maxWidth = 1024, title = '模板预览',
+}: {
+  previewUrl?: string
+  sampleHTML?: string
+  fallback?: React.ReactNode
+  maxWidth?: number
+  title?: string
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const containerW = useContainerWidth(containerRef, maxWidth)
+
+  if (previewUrl) {
+    const iframeW = 1440, iframeH = 900
+    const scale = containerW > 0 ? containerW / iframeW : 0
+    const containerH = Math.ceil(iframeH * scale)
+    return (
+      <div ref={containerRef} style={{
+        width: '100%', height: `${containerH}px`, position: 'relative',
+        overflow: 'hidden', borderRadius: '14px', border: '1px solid #E5E7EB',
+        background: '#0a0a0a',
+      }}>
+        {scale > 0 && (
+          <iframe
+            src={previewUrl}
+            loading="lazy"
+            style={{
+              width: `${iframeW}px`, height: `${iframeH}px`, border: 'none',
+              transform: `scale(${scale})`, transformOrigin: 'top left',
+              position: 'absolute', top: 0, left: 0,
+            }}
+            sandbox="allow-scripts allow-same-origin"
+            title={title}
+          />
+        )}
+      </div>
+    )
+  }
+
+  if (sampleHTML) {
+    const { w: iframeW, h: iframeH } = detectSize(sampleHTML)
+    const wrapped = wrapHTML(sampleHTML, iframeW, iframeH)
+    const scale = containerW > 0 ? containerW / iframeW : 0
+    const containerH = Math.ceil(iframeH * scale)
+    return (
+      <div ref={containerRef} style={{
+        width: '100%', height: `${containerH}px`, position: 'relative',
+        overflow: 'hidden', borderRadius: '14px', border: '1px solid #E5E7EB',
+        background: '#f8fafc',
+      }}>
+        {scale > 0 && (
+          <iframe
+            srcDoc={wrapped}
+            loading="lazy"
+            style={{
+              width: `${iframeW}px`, height: `${iframeH}px`, border: 'none',
+              transform: `scale(${scale})`, transformOrigin: 'top left',
+              position: 'absolute', top: 0, left: 0,
+            }}
+            sandbox="allow-scripts"
+            title={title}
+          />
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div ref={containerRef} style={{
+      width: '100%', height: '300px',
+      borderRadius: '14px', border: '1px solid #E5E7EB',
+      background: '#F8FAFC', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      color: '#9CA3AF', fontSize: '14px',
+    }}>{fallback || '暂无预览'}</div>
+  )
+}
+
+// useEffect 标记导出(避免 ESLint unused import 警告;本组件保留 useEffect 兼容性)
+export const _unusedHookGuard = useEffect

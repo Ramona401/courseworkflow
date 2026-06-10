@@ -2,6 +2,11 @@ package handlers
 
 // inspection_handler.go — 区域抽查HTTP处理器
 //
+// 抽查详情越权修复（Phase 6 验收期·越权审计补漏）：
+//   GetInspection 改为取 claims 并把 callerRole+callerID 传给 service，由 service 做归属校验
+//   （admin 放行任意；非 admin 必须是该记录已分配的审查员，否则 403）。
+//   此前仅按 id 直接返回，inspector 可跨辖区查看他人抽查详情——本次堵死。
+//
 // v127 新增（多级审核体系 · 区域抽查）：
 //   - 抽查列表与详情
 //   - 提交抽查结果（通过/撤回）
@@ -75,6 +80,7 @@ func (h *InspectionHandler) ListInspections(w http.ResponseWriter, r *http.Reque
 // ==================== 抽查详情 ====================
 
 // GetInspection GET /api/v1/inspections/{id}
+// 归属校验在 service 层：admin 放行任意；非 admin 必须是该记录已分配的审查员。
 func (h *InspectionHandler) GetInspection(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
@@ -87,7 +93,13 @@ func (h *InspectionHandler) GetInspection(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	record, err := h.inspService.GetInspection(r.Context(), id)
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		return
+	}
+
+	record, err := h.inspService.GetInspection(r.Context(), id, claims.Role, claims.UserID)
 	if err != nil {
 		h.handleInspectionError(w, err)
 		return

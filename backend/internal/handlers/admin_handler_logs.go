@@ -1,11 +1,20 @@
 package handlers
 
 // admin_handler_logs.go — 组织列表查询 + 操作日志查询接口
+//
+// 组织列表越权修复（Phase 6 验收期补漏）：
+//   ListAdminOrgs / ListAdminGroups 这两个 /admin/* 端点经 adminOrSchoolAdmin 中间件，
+//   admin 与 senior_operator 都可达，故必须按真实 claims 解析数据范围后传 service 过滤，
+//   不能假定调用者一定是 admin。与 /lesson-plans/organizations 共用同一套 ResolveDataScope。
+//   （注：当前前端组织架构 Tab 走 /lesson-plans/organizations；本两端点为历史遗留，
+//     仍一并堵住数据范围，防止绕过前端直接调用 API 越权。）
 
 import (
 	"net/http"
 	"strconv"
 
+	"tedna/internal/middleware"
+	"tedna/internal/services"
 	"tedna/internal/repository"
 	"tedna/internal/utils"
 )
@@ -16,7 +25,18 @@ func (h *AdminHandler) ListAdminOrgs(w http.ResponseWriter, r *http.Request) {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
-	result, err := h.orgService.ListOrganizations(r.Context(), r.URL.Query().Get("type"), r.URL.Query().Get("parent_id"))
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		return
+	}
+	scope := services.ResolveDataScope(r.Context(), claims.Role, claims.UserID)
+	result, err := h.orgService.ListOrganizations(
+		r.Context(),
+		r.URL.Query().Get("type"),
+		r.URL.Query().Get("parent_id"),
+		scope,
+	)
 	if err != nil {
 		utils.InternalError(w, "获取组织列表失败")
 		return
@@ -30,7 +50,13 @@ func (h *AdminHandler) ListAdminGroups(w http.ResponseWriter, r *http.Request) {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
-	result, err := h.orgService.ListTeachingGroups(r.Context(), r.URL.Query().Get("school_id"))
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		return
+	}
+	scope := services.ResolveDataScope(r.Context(), claims.Role, claims.UserID)
+	result, err := h.orgService.ListTeachingGroups(r.Context(), r.URL.Query().Get("school_id"), scope)
 	if err != nil {
 		utils.InternalError(w, "获取教研组列表失败")
 		return

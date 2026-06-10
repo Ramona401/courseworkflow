@@ -24,7 +24,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
-  getCourseware, generateCWIndex, generateCWIndexFromTopic, subscribeCWIndexSSE,
+  getCourseware, getCoursewarePages, generateCWIndex, generateCWIndexFromTopic, subscribeCWIndexSSE,
   confirmCWIndex, generateCWPreview, saveCWNavTemplate,
   generateCWPages, CW_STATUS_CONFIG, refineNav, refinePage, cancelGenerate,
   generateCWIndexFromPPT,
@@ -48,6 +48,7 @@ import { injectPreviewMode } from './components/courseware-workshop/previewInjec
 import CWFullscreenPreview from './components/courseware-workshop/CWFullscreenPreview'
 import SlideshowPlayer from './components/courseware-workshop/SlideshowPlayer'
 import VideoStoryboardPanel from './components/VideoStoryboardPanel'
+import BackgroundPicker from './components/courseware-workshop/BackgroundPicker'
 
 // ==================== 主组件 ====================
 export default function CoursewareWorkshopPage() {
@@ -298,7 +299,12 @@ export default function CoursewareWorkshopPage() {
         onConnected: () => setSseMessage('已连接，AI正在修改方案...'),
         onIndexStart: d => setSseMessage(String((d as Record<string, unknown>).message || '')),
         onIndexProgress: d => setSseMessage(String((d as Record<string, unknown>).message || '')),
-        onIndexPage: page => setPages(prev => prev.some(p => p.page_number === page.page_number) ? prev.map(p => p.page_number === page.page_number ? page : p) : [...prev, page]),
+        onIndexPage: page => setPages(prev => {
+          const next = prev.some(p => p.page_number === page.page_number)
+            ? prev.map(p => p.page_number === page.page_number ? page : p)
+            : [...prev, page]
+          return next.slice().sort((a, b) => a.page_number - b.page_number)
+        }),
         onIndexDone: d => { setSseMessage('\u2705 ' + d.message); setRefining(false); setRefineFeedback(''); loadCourseware() },
         onError: d => { setSseMessage('\u274c ' + d.message); setRefining(false) },
       })
@@ -328,7 +334,12 @@ export default function CoursewareWorkshopPage() {
         onConnected: () => setSseMessage('已连接，正在分析教案...'),
         onIndexStart: d => setSseMessage(String((d as Record<string, unknown>).message || '')),
         onIndexProgress: d => setSseMessage(String((d as Record<string, unknown>).message || '')),
-        onIndexPage: page => setPages(prev => prev.some(p => p.page_number === page.page_number) ? prev.map(p => p.page_number === page.page_number ? page : p) : [...prev, page]),
+        onIndexPage: page => setPages(prev => {
+          const next = prev.some(p => p.page_number === page.page_number)
+            ? prev.map(p => p.page_number === page.page_number ? page : p)
+            : [...prev, page]
+          return next.slice().sort((a, b) => a.page_number - b.page_number)
+        }),
         onIndexDone: d => { setSseMessage(`✅ ${d.message}`); setGenerating(false); goToStep(1); loadCourseware() },
         onError: d => { setSseMessage(`❌ ${d.message}`); setGenerating(false) },
       })
@@ -356,7 +367,7 @@ export default function CoursewareWorkshopPage() {
         onGenStart: d => setPreviewGenMessage(d.message),
         onGenProgress: d => setPreviewGenMessage(d.message),
         onGenPage: d => { setPreviewPages(p => [...p, { page_number: d.page_number, title: d.title, html_content: d.html_content }]) },
-        onGenDone: d => { setPreviewGenRunning(false); setPreviewGenMessage(d.fail_count > 0 ? `⚠️ ${d.message}` : `✅ ${d.message}`); loadCourseware() },
+        onGenDone: d => { setPreviewGenRunning(false); if (d.fail_count > 0) { setPreviewGenMessage(`❌ ${d.message}`) } else { setPreviewGenMessage(`✅ ${d.message}`); loadCourseware() } },
         onError: d => { setPreviewGenMessage(`❌ ${d.message}`); setPreviewGenRunning(false) },
       })
     } catch { setPreviewGenMessage('❌ 启动失败'); setPreviewGenRunning(false) }
@@ -549,15 +560,68 @@ export default function CoursewareWorkshopPage() {
       await generateCWPages(id); sseRef.current?.close()
       sseRef.current = subscribeCWIndexSSE(id, {
         onConnected: () => setBuildMessage('已连接...'),
-        onGenStart: d => { setBuildMessage(d.message); setBuildProgress({ current: 0, total: d.total_pages }) },
-        onGenProgress: d => { setBuildMessage(d.message); setBuildProgress(p => ({ ...p, current: d.current_page })) },
-        onGenPage: d => { setGeneratedPages(p => {
-          const exists = p.some(x => x.page_number === d.page_number)
-          if (exists) return p.map(x => x.page_number === d.page_number ? { page_number: d.page_number, title: d.title, html_content: d.html_content } : x)
-          return [...p, { page_number: d.page_number, title: d.title, html_content: d.html_content }]
-        }); setBuildPreviewNum(d.page_number) },
-        onGenDone: d => { setBuildRunning(false); setBuildMessage(d.fail_count > 0 ? `⚠️ ${d.message}` : `✅ ${d.message}`); loadCourseware() },
-        onError: d => { setBuildMessage(`❌ ${d.message}`); setBuildRunning(false) },
+        onGenStart: d => {
+          // 迭代二P1并发收尾：只记录本次需生成总数；不再把后端那句含单个 Px 的 message
+          // 直接当进度展示（并发下 Px 会乱跳）。完成数改由 generatedPages 真实落库数计算。
+          setBuildMessage('正在同时生成多页课件，请稍候…')
+          setBuildProgress({ current: 0, total: d.total_pages })
+        },
+        onGenProgress: d => {
+          // 并发下 d.current_page 是"最后到达事件的序号"，会忽大忽小，不能当完成数。
+          // 这里只维持一句固定提示，真实进度（已完成/剩余）由下方按 generatedPages 实时算。
+          void d
+          setBuildMessage('正在同时生成多页课件，请稍候…')
+        },
+        onGenPage: d => {
+          // 迭代二P1并发收尾：后端并发生成，gen_page 事件按"哪页先画完先到"顺序抵达，
+          // 不再等于页码顺序。这里按 page_number 升序维护已生成列表，保证上方标签恒为 P1 P2 P3... 有序。
+          setGeneratedPages(p => {
+            const next = p.some(x => x.page_number === d.page_number)
+              ? p.map(x => x.page_number === d.page_number ? { page_number: d.page_number, title: d.title, html_content: d.html_content } : x)
+              : [...p, { page_number: d.page_number, title: d.title, html_content: d.html_content }]
+            return next.slice().sort((a, b) => a.page_number - b.page_number)
+          })
+          // 预览框只单向前移到"已到达的最大页号"：既有"在推进"的反馈，又不会因乱序到达而来回乱跳
+          setBuildPreviewNum(prev => d.page_number > prev ? d.page_number : prev)
+        },
+        // P2 需求②：完成后——全部成功才不动（停在批量生成页让老师自行点"确认课件→"）；
+        //   有失败页则明确提示并【留在批量生成页】，老师可对失败页点"继续生成"自动补齐，
+        //   不再自动跳到确认提交页（避免带着缺页进入下一步）。loadCourseware 会刷新真实状态与页面。
+        onGenDone: d => {
+          setBuildRunning(false)
+          if (d.fail_count > 0) {
+            setBuildMessage(`⚠️ ${d.message}。失败的页面可点下方"继续生成"自动重试补齐（成功页不会重做）。`)
+          } else {
+            setBuildMessage(`✅ ${d.message}`)
+          }
+          loadCourseware()
+        },
+        onError: d => { setBuildMessage(`❌ ${d.message}`); /* 单页错误不终止整批：不再 setBuildRunning(false)，等 gen_done 统一收尾 */ },
+        // P2 需求（假死根治）：SSE 断线重连成功后，主动拉一次课件最新状态 + 页面列表，
+        //   把断线期间漏收的已生成页补齐到 generatedPages，进度立刻对上，不再"假死"。
+        onReconnected: async () => {
+          setBuildMessage('🔄 连接已恢复，正在同步最新进度…')
+          try {
+            const fresh = await getCourseware(id)
+            const freshPages = await getCoursewarePages(id)
+            setCourseware(fresh)
+            setPages(freshPages)
+            const gp = freshPages
+              .filter(p => p.html_content && p.html_content.trim())
+              .map(p => ({ page_number: p.page_number, title: p.title, html_content: p.html_content }))
+              .slice().sort((a, b) => a.page_number - b.page_number)
+            setGeneratedPages(gp)
+            // 若后端其实已完成（状态推进到 preview），则结束运行态
+            if (fresh.status === 'preview' || fresh.status === 'confirmed') {
+              setBuildRunning(false)
+              setBuildMessage('✅ 已同步：课件生成已完成')
+            } else {
+              setBuildMessage('正在同时生成多页课件，请稍候…')
+            }
+          } catch {
+            setBuildMessage('🔄 连接已恢复，但同步进度失败，可手动刷新页面查看')
+          }
+        },
       })
     } catch { setBuildMessage('❌ 启动失败'); setBuildRunning(false) }
   }
@@ -670,6 +734,16 @@ export default function CoursewareWorkshopPage() {
   const cwRemainingCount = Math.max(0, cwTotalCount - cwDoneCount)
   // 中断态：封面之外已生成部分页，但仍有剩余未生成（说明上次生成被中断）
   const cwInterrupted = cwDoneCount > 1 && cwRemainingCount > 0
+  // 迭代二P1并发收尾：批量生成进度的"真实口径"派生值（替代会乱跳的 buildProgress.current）
+  //   batchTotal —— 本次需生成的页数（后端 onGenStart 下发的 total；为 0 时回退用剩余页数）
+  //   batchDone  —— 本次已真实落库完成的页数 = 当前已落库总数 - 开跑前就已完成的数，夹在 [0, batchTotal]
+  //     该数源自有序的 generatedPages（已落库才计数），单调递增、永不回跳、与上方标签数一致
+  const batchTotal = buildProgress.total > 0 ? buildProgress.total : cwRemainingCount
+  // 本次已完成数直接取 generatedPages 实时长度（SSE 增量更新，与左下"已生成 N 页"同源），
+  // cap 在 [0, batchTotal] 内防越界。不再用 cwDoneCount 推算（那是 loadCourseware 快照，生成中不更新会恒 0）。
+  const batchDone = Math.max(0, Math.min(batchTotal, generatedPages.length))
+  const batchRemaining = Math.max(0, batchTotal - batchDone)
+  const batchPercent = batchTotal > 0 ? Math.round((batchDone / batchTotal) * 100) : 0
 
   return (
     <div style={{ maxWidth: 960, margin: '0 auto' }}>
@@ -816,6 +890,11 @@ export default function CoursewareWorkshopPage() {
             </div>
           )}
 
+          {/* 批次2（背景图库）：选背景秒换封面（零token零等待），后续批量生成的内页自动带内页底纹 */}
+          {previewPages.length > 0 && !previewGenRunning && (
+            <BackgroundPicker coursewareId={id!} onSwapped={loadCourseware} />
+          )}
+
           {/* P0-2: 导航栏AI微调输入区 */}
           {previewPages.length > 0 && !previewGenRunning && (
             <div style={{ marginTop: 16, padding: '16px', borderRadius: 10, border: `1px solid ${C.border}`, background: '#FAFAFA' }}>
@@ -842,9 +921,12 @@ export default function CoursewareWorkshopPage() {
             {!buildRunning && <button onClick={() => goToStep(3)} style={{ padding: '8px 16px', borderRadius: 8, border: `1px solid ${C.border}`, background: 'transparent', color: C.textSecondary, fontSize: 13, cursor: 'pointer' }}>← 返回确认导航栏</button>}
           </div>
           {msgBar(buildMessage)}
-          {buildProgress.total > 0 && <div style={{ marginBottom: 20 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, color: C.textSecondary, marginBottom: 6 }}><span>{cwInterrupted ? '续传进度（已完成页不会重做）' : '生成进度'}</span><span>本次需生成 {buildProgress.total} 页 · 已完成 {buildProgress.current} 页</span></div>
-            <div style={{ height: 8, borderRadius: 4, background: '#F3F4F6', overflow: 'hidden' }}><div style={{ height: '100%', borderRadius: 4, transition: 'width 500ms', width: `${(buildProgress.current / buildProgress.total) * 100}%`, background: 'linear-gradient(90deg, #F59E0B, #EF4444)' }} /></div>
+          {batchTotal > 0 && <div style={{ marginBottom: 20 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, color: C.textSecondary, marginBottom: 6 }}>
+              <span>{cwInterrupted ? '续传进度（已完成页不会重做）' : '生成进度（多页同时进行）'}</span>
+              <span>本次需生成 {batchTotal} 页 · 已完成 <b style={{ color: C.success }}>{batchDone}</b> 页 · 剩余 {batchRemaining} 页</span>
+            </div>
+            <div style={{ height: 8, borderRadius: 4, background: '#F3F4F6', overflow: 'hidden' }}><div style={{ height: '100%', borderRadius: 4, transition: 'width 500ms', width: `${batchPercent}%`, background: 'linear-gradient(90deg, #F59E0B, #EF4444)' }} /></div>
           </div>}
           {renderPagePreview(generatedPages, buildPreviewNum, setBuildPreviewNum, true)}
           {/* v0.42.12 续生成提示条：检测到上次生成被中断（已生成部分页但仍有剩余） */}

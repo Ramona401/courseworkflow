@@ -227,10 +227,20 @@ func TestIsValidStatus(t *testing.T) {
 	}
 }
 
-// TestValidRoles_Count 测试角色常量数量=4
+// TestValidRoles_Count 测试角色常量数量=6（迭代一 P2-06 新增 region_admin）
 func TestValidRoles_Count(t *testing.T) {
-	if len(ValidRoles) != 5 {
-		t.Errorf("ValidRoles应有5个角色, 实际%d", len(ValidRoles))
+	if len(ValidRoles) != 6 {
+		t.Errorf("ValidRoles应有6个角色, 实际%d", len(ValidRoles))
+	}
+	// 迭代一新增的 region_admin 必须在有效角色集合内（多管理员 region_admin 链路依赖）
+	found := false
+	for _, r := range ValidRoles {
+		if r == RoleRegionAdmin {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("ValidRoles 应包含 region_admin")
 	}
 }
 

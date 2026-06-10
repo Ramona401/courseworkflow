@@ -12,3 +12,4 @@
 export * from './coursewares.types'
 export * from './coursewares.core'
 export * from './coursewares.media'
+export * from './coursewares.bg'

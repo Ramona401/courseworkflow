@@ -4,6 +4,10 @@
  * v6.1变更：修复 header 缩进（去掉多余的 logo img）
  * v6.0 改版：与备课工坊 LPLayout 视觉风格统一
  * v110新增：学校管理员下拉菜单入口（senior_operator专属）
+ * Phase6.2新增：区域管理员（region_admin）下拉菜单“用户管理”入口（指向 /admin）
+ *   - region_admin 不提供“学校管理”（那是单校 /school-admin，区域管理员管辖多校走 /admin）
+ * 合并重构（本次）：删除 senior_operator 的“学校管理→/school-admin”入口，
+ *   统一走“用户管理→/admin”（/admin 已支持 senior 本校视角，含批量导入）。
  */
 import { useState, useRef, useEffect } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
@@ -76,10 +80,12 @@ function UserMenu() {
   }
 
   const roleNames: Record<string, string> = {
-    admin:           '系统管理员',
-    senior_operator: '学校管理员',
-    operator:        '骨干教师',
-    viewer:          '普通教师',
+    admin:              '系统管理员',
+    region_admin:       '区域管理员',
+    district_inspector: '区域教研员',
+    senior_operator:    '学校管理员',
+    operator:           '骨干教师',
+    viewer:             '普通教师',
   }
 
   return (
@@ -116,12 +122,13 @@ function UserMenu() {
                 <DropdownItem icon="📊" label="AI 调用统计" onClick={() => go('/ai-traces', '/workflow')} />
               </>
             )}
-            {/* senior_operator 专属：学校管理 */}
+            {/* region_admin 专属：区域用户管理（指向 /admin，不含学校管理） */}
+            {user?.role === 'region_admin' && (
+              <DropdownItem icon="👥" label="用户管理" onClick={() => go('/admin', '/workflow')} highlight />
+            )}
+            {/* senior_operator 专属：用户管理（合并重构：删除原"学校管理→/school-admin"入口，统一走 /admin） */}
             {user?.role === 'senior_operator' && (
-              <>
-                <DropdownItem icon="👥" label="用户管理" onClick={() => go('/admin', '/workflow')} highlight />
-                <DropdownItem icon="🏫" label="学校管理" onClick={() => go('/school-admin', '/workflow')} highlight />
-              </>
+              <DropdownItem icon="👥" label="用户管理" onClick={() => go('/admin', '/workflow')} highlight />
             )}
           </div>
 

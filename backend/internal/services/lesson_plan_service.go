@@ -19,6 +19,25 @@ package services
 //   门控判据极简：strings.TrimSpace(lp.ContentMarkdown) == ""，
 //   与阶段完成度系统（checkWriteStage 的篇幅/关键词软提醒）完全解耦，
 //   避免误伤合法的短教案。审核端（L1/L2 approved）的正文校验在 review_v2_service.go。
+//
+// 迭代一 Phase 4 改动（数据隔离收口）：
+//   ListLessonPlans 新增 scope *DataScope 入参，从 DataScope 中拆出 UserIDs/IsAdmin
+//   传给 repository.ListLessonPlans，实现"教案列表只返回请求者可见范围内的教案"。
+//   可见性规则（A 本人 ∪ C 管辖成员 ∪ B 共享可见）的 SQL 拼接在 repo 层；
+//   本层只负责把 DataScope 转成 repo 能接受的原始参数（避免 repo 反向依赖 services）。
+//   scope 为 nil 时按 fail-closed 退化为"非 admin + 空白名单"（只看共享教案），
+//   绝不退化为 admin 全量——任何不确定都收窄，不放大。
+//
+// 迭代一 Phase 4 收尾改动（共享发布越权封堵）：
+//   新增 ErrLPNotPublisher 错误。PublishShared 原先只校验"状态必须 approved"，
+//   未校验调用者身份——任何登录用户拿到一个 approved 教案 ID 都能调它翻状态，
+//   是一个越权口子。本次补上"仅作者本人 OR admin 可共享发布"的校验：
+//     - 作者本人：callerID == lp.AuthorID（教师对自己已通过的教案做收尾确认）。
+//     - admin：通过 FindUserByID 反查角色判定（超级管理员兜底，与 ReviewL1 的
+//       admin 判定惯例一致，无需给 PublishShared 加 role 参数、不动 handler 签名）。
+//     - 其他所有人（含审核员 senior_operator/教研组长/其他教师）：拒绝。
+//   语义依据：审核员的"公开权力"体现在审核通过（approved 即对全平台可见），
+//   不需要也不应该再经手"共享发布"这一步，避免权限链条出现重复与责任模糊。
 
 import (
         "context"
@@ -48,6 +67,8 @@ var (
         ErrLPGroupRequired      = errors.New("提交评审需要指定教研组")
         // v168新增：教案正文为空时禁止提交评审/发布（功能A硬门控）
         ErrLPContentEmpty       = errors.New("教案正文为空，请先在备课工坊生成完整教案正文后再操作")
+        // Phase 4 收尾新增：共享发布越权封堵——仅作者本人或 admin 可共享发布
+        ErrLPNotPublisher       = errors.New("只有作者本人或系统管理员可以共享发布此教案")
         ErrTemplateNotFound     = errors.New("提示词模板不存在")
         ErrTemplateLevelInvalid = errors.New("无效的模板层级")
         ErrTemplateNameRequired = errors.New("模板名称不能为空")
@@ -230,8 +251,26 @@ func (s *LessonPlanService) GetLessonPlan(ctx context.Context, id string) (*mode
 }
 
 // ListLessonPlans 获取教案列表
-func (s *LessonPlanService) ListLessonPlans(ctx context.Context, authorID string, groupID string, status string, subject string, grade string, limit int, offset int, qualityLevel int, structureType int, cognitiveLevel int, pedagogyIntensity int) (*models.LessonPlanListResponse, error) {
-        items, total, err := repository.ListLessonPlans(ctx, authorID, groupID, status, subject, grade, limit, offset, qualityLevel, structureType, cognitiveLevel, pedagogyIntensity)
+//
+// 迭代一 Phase 4（数据隔离收口）：新增 scope *DataScope 入参。
+//   从 scope 中拆出 UserIDs（本人 ∪ 管辖成员白名单）与 IsAdmin（是否看全部），
+//   传给 repository.ListLessonPlans。可见性 OR 子句（本人/管辖 ∪ 共享可见）在 repo 层拼接。
+//   scope 为 nil 的防御性处理：退化为"非 admin + 空白名单"——只能看共享教案，
+//   绝不退化为 admin 全量（fail-closed）。正常调用路径由 handler 保证 scope 非 nil。
+func (s *LessonPlanService) ListLessonPlans(ctx context.Context, authorID string, groupID string, status string, subject string, grade string, limit int, offset int, qualityLevel int, structureType int, cognitiveLevel int, pedagogyIntensity int, scope *DataScope) (*models.LessonPlanListResponse, error) {
+        // 从 DataScope 拆出 repo 层需要的原始参数（repo 不能反向依赖 services 包）
+        var scopeUserIDs []string
+        scopeIsAdmin := false
+        if scope != nil {
+                scopeIsAdmin = scope.IsAdmin
+                scopeUserIDs = scope.UserIDs
+        } else {
+                // 防御性 fail-closed：scope 缺失时按非 admin + 空白名单处理，
+                // 仅靠 repo 层 OR 子句的"共享可见"分支放行，绝不放大为全量。
+                scopeUserIDs = []string{}
+        }
+
+        items, total, err := repository.ListLessonPlans(ctx, authorID, groupID, status, subject, grade, limit, offset, qualityLevel, structureType, cognitiveLevel, pedagogyIntensity, scopeUserIDs, scopeIsAdmin)
         if err != nil {
                 return nil, err
         }
@@ -468,14 +507,39 @@ func (s *LessonPlanService) ReviewLessonPlan(ctx context.Context, planID string,
 
 // PublishShared 共享发布
 //
-// v168新增：共享发布前校验教案正文非空（功能A硬门控）。
+// v168改动：共享发布前校验教案正文非空（功能A硬门控）。
 // 共享发布是教案对外可见的最终状态，绝不允许无正文教案进入。
 // 正常情况下能走到 approved 的教案已经过审核端校验，这里是双保险。
+//
+// 迭代一 Phase 4 收尾改动（越权封堵）：
+//   新增"仅作者本人 OR admin 可共享发布"的身份校验。原先此方法只校验状态，
+//   导致任何登录用户拿到一个 approved 教案 ID 就能调它翻状态（越权）。
+//   - 作者本人（callerID == lp.AuthorID）：放行。教师对自己已通过的教案做收尾确认。
+//   - admin：放行（超级管理员兜底）。通过 FindUserByID 反查角色判定，
+//     与 review_v2_service.go 的 ReviewL1 admin 判定惯例一致，无需给本方法加 role 参数。
+//   - 其他所有人（含审核员 senior_operator/教研组长/其他教师）：返回 ErrLPNotPublisher。
+//     审核员的"公开权力"已在审核通过（approved 即全平台可见）时行使完毕，
+//     不应再经手共享发布，避免权限链重复与责任模糊。
 func (s *LessonPlanService) PublishShared(ctx context.Context, id string, callerID string) error {
         lp, err := repository.GetLessonPlanByID(ctx, id)
         if err != nil {
                 return s.mapNotFoundErr(err)
         }
+
+        // Phase 4 收尾：身份校验——仅作者本人 OR admin 可共享发布
+        isAuthor := lp.AuthorID == callerID
+        isAdmin := false
+        if !isAuthor {
+                // 非作者时才需反查角色判断是否 admin（作者本人直接放行，省一次查询）
+                if u, uErr := repository.FindUserByID(ctx, callerID); uErr == nil && u.Role == models.RoleAdmin {
+                        isAdmin = true
+                }
+        }
+        if !isAuthor && !isAdmin {
+                lpLog.Info("共享发布被拦截：调用者非作者且非管理员", "plan_id", id, "caller", callerID)
+                return ErrLPNotPublisher
+        }
+
         if lp.Status != models.LPStatusApproved {
                 return errors.New("只有评审通过的教案可以共享发布")
         }

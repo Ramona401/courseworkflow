@@ -96,6 +96,26 @@ func registerLessonPlanRoutes(
         }), authMW))
 
         mux.Handle("/api/v1/lesson-plans/organizations/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                path := r.URL.Path
+                // ---- 迭代一 Phase 5：组织多管理员端点（/admins 优先于单组织 GET/PUT/DELETE 判定）----
+                // 权限分层（admin 任何组织 / region_admin 仅辖区学校 / 其它拒绝）在 service 层判定。
+                if indexOf(path, "/admins/") >= 0 && r.Method == http.MethodDelete {
+                        // DELETE .../{id}/admins/{user_id}
+                        orgHandler.RemoveOrgAdmin(w, r)
+                        return
+                }
+                if hasSuffix(path, "/admins") {
+                        switch r.Method {
+                        case http.MethodGet:
+                                orgHandler.ListOrgAdmins(w, r)
+                        case http.MethodPost:
+                                orgHandler.AddOrgAdmin(w, r)
+                        default:
+                                methodNotAllowedJSON(w, "仅支持GET/POST请求")
+                        }
+                        return
+                }
+                // ---- 原有单组织 CRUD ----
                 switch r.Method {
                 case http.MethodGet:
                         orgHandler.GetOrganization(w, r)

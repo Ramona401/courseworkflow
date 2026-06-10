@@ -13,7 +13,8 @@ import (
 // 发版时只需修改此处一个位置，避免多处硬编码漏改
 // 审查修复C-01：版本号必须与实际发布版本保持一致
 // v0.41.0: 生成质量对齐edu平台（提示词v5+预览降级+响应式+场景预留）
-const AppVersion = "0.42.0"
+// v0.43.0: 迭代二Phase1-P1 课件批量生成串行改受控并发
+const AppVersion = "0.43.0"
 
 // Config 全局配置结构体
 type Config struct {
@@ -41,6 +42,13 @@ type Config struct {
 	AIAPIBaseURL   string
 	AIAPIKey       string
 	AIDefaultModel string
+
+	// 迭代二Phase1-P1：课件批量生成并发数
+	// 控制 GenerateRemainingPages 同时生成的页面数（信号量容量）。
+	// 默认 4；环境变量 COURSEWARE_GEN_CONCURRENCY 可调。
+	// 设为 1 即退化为原串行行为（零风险回滚开关）；
+	// 出现 AI 中转并发配额报错时调小，配额充裕时可调大。
+	CoursewareGenConcurrency int
 }
 
 // Load 从环境变量加载配置
@@ -63,6 +71,15 @@ func Load() *Config {
 		AIAPIBaseURL:   getEnv("AI_API_BASE_URL", ""),
 		AIAPIKey:       getEnv("AI_API_KEY", ""),
 		AIDefaultModel: getEnv("AI_DEFAULT_MODEL", "anthropic/claude-sonnet-4-5"),
+
+		// 迭代二Phase1-P1：课件批量生成并发数，默认4
+		CoursewareGenConcurrency: GetIntEnv("COURSEWARE_GEN_CONCURRENCY", 4),
+	}
+
+	// 迭代二Phase1-P1：并发数兜底校验——非法值（≤0）一律回退为1（串行），防止信号量容量为0导致死锁
+	if cfg.CoursewareGenConcurrency < 1 {
+		log.Printf("COURSEWARE_GEN_CONCURRENCY 非法值(%d)，已回退为 1（串行）", cfg.CoursewareGenConcurrency)
+		cfg.CoursewareGenConcurrency = 1
 	}
 
 	// 验证必要配置——缺失任何一项均无法安全运行，启动阶段直接退出

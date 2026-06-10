@@ -2,6 +2,16 @@ package services
 
 // inspection_service.go — 区域抽查业务逻辑
 //
+// 抽查详情越权修复（Phase 6 验收期·越权审计补漏）：
+//   GetInspection 此前只按 id 取记录直接返回，无任何归属校验。中间件 adminOrInspector
+//   只能挡住"非 inspector"，挡不住"inspector A 查 inspector B（他区）的记录"——属横向越权
+//   （能看到他人辖区抽查的教案全文与审查意见）。
+//   现改为：GetInspection 增加 callerRole + callerID 参数，与写端点 ReviewInspection 同口径校验：
+//     - admin           → 放行任意记录；
+//     - 非 admin（inspector）→ 必须是该记录已分配的审查员（record.InspectorID == callerID）；
+//                            未分配（InspectorID==nil）或分配给他人 → ErrInspectionNoPermission（403）。
+//   口径刻意与 ReviewInspection 完全一致：列表只给"分配给我的"，详情同口径，读写闭环、不放大可见面。
+//
 // v127 新增（多级审核体系 · 区域抽查）：
 //   - 抽查记录管理（查看、分配、提交结果）
 //   - 自动抽样（按学校配置的比例随机抽取已发布教案）
@@ -58,8 +68,13 @@ func (s *InspectionService) ListInspections(ctx context.Context, inspectorID str
 	return &models.InspectionListResponse{Items: items, Total: total}, nil
 }
 
-// GetInspection 获取抽查详情
-func (s *InspectionService) GetInspection(ctx context.Context, id string) (*models.InspectionRecord, error) {
+// GetInspection 获取抽查详情（带调用者归属校验，防跨辖区越权看他人抽查）
+//
+// 权限口径（与 ReviewInspection 写端点一致）：
+//   - callerRole == admin → 放行任意记录；
+//   - 非 admin → 必须是该记录已分配的审查员（record.InspectorID 非空且等于 callerID），
+//                否则返回 ErrInspectionNoPermission（handler 映射 403）。
+func (s *InspectionService) GetInspection(ctx context.Context, id string, callerRole string, callerID string) (*models.InspectionRecord, error) {
 	record, err := repository.GetInspectionByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, repository.ErrInspectionNotFound) {
@@ -67,6 +82,16 @@ func (s *InspectionService) GetInspection(ctx context.Context, id string) (*mode
 		}
 		return nil, err
 	}
+
+	// 归属校验：非 admin 必须是该记录已分配的审查员
+	if callerRole != models.RoleAdmin {
+		if record.InspectorID == nil || *record.InspectorID != callerID {
+			inspLog.Warn("抽查详情越权拦截",
+				"inspection_id", id, "caller", callerID, "caller_role", callerRole)
+			return nil, ErrInspectionNoPermission
+		}
+	}
+
 	return record, nil
 }
 

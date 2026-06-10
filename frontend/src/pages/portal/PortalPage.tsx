@@ -4,6 +4,7 @@
  * - 📝 备课工坊：教案系统（所有active用户可见）
  * - 🎨 课件工坊：AI课件生成系统（所有active用户可见）
  * - 🖥️ 课件审核：课件审核系统（admin/senior_operator/operator可见）
+ * - 👥 用户管理：统一用户管理中心（admin/senior_operator/region_admin可见）
  *
  * 可见性两层判定（v172）：
  *   第1层 角色：entry.roles（'all' 或角色白名单）
@@ -11,6 +12,10 @@
  *         - 后端按用户所属学校 settings.portal_modules 下发
  *         - 仅当显式为 false 时隐藏；缺省/undefined/true 一律可见（不波及存量）
  *         - admin 后端强制全开，不受限
+ *
+ * Phase6.2新增（区域管理员）：
+ *   - 新增“用户管理”入口卡片，指向 /admin，对 admin/senior_operator/region_admin 可见
+ *   - 该卡片不参与组织板块开关过滤（管理入口不属于教学三板块），仅按角色白名单显隐
  */
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
@@ -23,6 +28,8 @@ interface PortalEntry {
   description: string
   path: string
   roles: string[] | 'all'  // 'all' 表示所有active用户可见
+  // 是否参与“组织板块开关”过滤。教学三板块为 true；管理类入口为 false（仅按角色显隐）
+  moduleGated: boolean
 }
 
 const entries: PortalEntry[] = [
@@ -33,6 +40,7 @@ const entries: PortalEntry[] = [
     description: 'AI辅助教案开发 · 教案库 · 教研协作',
     path: '/lesson-plans',
     roles: 'all',
+    moduleGated: true,
   },
   {
     key: 'courseware',
@@ -41,6 +49,7 @@ const entries: PortalEntry[] = [
     description: 'AI辅助课件生成 · 模板组件 · 多媒体',
     path: '/courseware',
     roles: 'all',
+    moduleGated: true,
   },
   {
     key: 'workflow',
@@ -49,6 +58,18 @@ const entries: PortalEntry[] = [
     description: '课件质量评估 · 审核 · 定稿 · 验收',
     path: '/workflow',
     roles: ['admin', 'senior_operator', 'operator'],
+    moduleGated: true,
+  },
+  {
+    // 管理入口：统一用户管理中心。区域管理员的核心工作场所。
+    // admin / senior_operator / region_admin 三类管理角色可见；不受组织板块开关限制。
+    key: 'admin',
+    icon: '👥',
+    title: '用户管理',
+    description: '用户 · 组织架构 · 教研组 · 权限',
+    path: '/admin',
+    roles: ['admin', 'senior_operator', 'region_admin'],
+    moduleGated: false,
   },
 ]
 
@@ -144,12 +165,13 @@ export default function PortalPage() {
   // 如果没有用户信息，不渲染（AuthGuard会处理跳转）
   if (!user) return null
 
-  // 双层过滤：角色 + 组织板块开关
+  // 双层过滤：角色 + 组织板块开关（管理类入口 moduleGated=false 跳过第2层）
   const visibleEntries = entries.filter(entry => {
     // 第1层：角色
     const roleOk = entry.roles === 'all' || entry.roles.includes(user.role)
     if (!roleOk) return false
-    // 第2层：组织板块开关
+    // 第2层：组织板块开关（仅教学三板块参与）
+    if (!entry.moduleGated) return true
     return isModuleEnabled(user.portal_modules, entry.key)
   })
 

@@ -85,6 +85,7 @@ type StartConversationRequest struct {
         TemplateID      string `json:"template_id"`      // 提示词模板ID（可选）
         GroupID         string `json:"group_id"`         // 教研组ID（可选）
         RecipeID        string `json:"recipe_id"`        // 备课配方ID（可选，Phase 7A新增）
+	TextbookPageIDs []string `json:"textbook_page_ids"` // 迭代7B：备课工坊勾选的课本图片ID列表，注入写教案上下文
 }
 
 // LessonPlanChatRequest 教案对话请求

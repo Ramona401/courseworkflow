@@ -7,6 +7,11 @@
  *     * admin 可创建任意角色
  *     * senior_operator 只能创建 operator / viewer(不能创建 admin 或其他学校管理员)
  *   - 默认选中 operator(最常用的骨干教师角色)
+ *
+ * Phase6.2 说明(区域管理员):
+ *   - region_admin(区域管理员)按后端 permission_matrix 仅有 user:view 不含 create,
+ *     因此不进入 availableRoles 任何分支(返回空数组),且 AdminPage 已对其隐藏“新建用户”按钮,
+ *     正常情况下 region_admin 不会打开本弹窗。此处保险起见:空选项时禁用创建按钮并提示无权限。
  */
 import { useState, useMemo } from 'react'
 import { createAdminUser } from '@/api/admin'
@@ -28,8 +33,13 @@ export function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
 
   // v122:按登录者角色过滤可创建的角色选项
   // admin 可创建所有角色,senior_operator 只能创建 operator/viewer
+  // region_admin/其他角色不在此返回任何选项(无 create 权限)
   const availableRoles = useMemo(() => {
-    const allRoles = ROLE_OPTIONS.filter(r => r.value) // 去掉"全部角色"选项
+    // 去掉“全部角色”占位项；同时排除“区域管理员/区域教研员”——
+    // 这两个区域级账号由系统管理员统一开通,不在普通新建用户下拉里提供
+    const allRoles = ROLE_OPTIONS.filter(
+      r => r.value && r.value !== 'region_admin' && r.value !== 'district_inspector'
+    )
     if (user?.role === 'admin') {
       return allRoles
     }
@@ -37,11 +47,17 @@ export function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
       // 学校管理员只能创建低于自己级别的角色
       return allRoles.filter(r => r.value === 'operator' || r.value === 'viewer')
     }
-    // 其他角色不应该走到这里(路由层已拦截),保险起见返回空
+    // 其他角色(含 region_admin)不应该走到这里(按钮已隐藏 + 路由层已拦截),保险起见返回空
     return []
   }, [user?.role])
 
+  // 无可创建角色时禁止创建(防御:region_admin 等误入)
+  const noCreatableRole = availableRoles.length === 0
+
   const handleCreate = async () => {
+    if (noCreatableRole) {
+      setError('当前角色无权创建用户'); return
+    }
     if (!form.username.trim() || !form.display_name.trim() || form.password.length < 6) {
       setError('请填写完整信息(密码至少6位)'); return
     }
@@ -90,6 +106,13 @@ export function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
             </div>
           )}
 
+          {/* 防御提示:无可创建角色 */}
+          {noCreatableRole && (
+            <div style={{ padding: '10px 14px', borderRadius: '8px', marginBottom: '16px', background: C.warningLight, color: C.warning, fontSize: '12px', lineHeight: 1.6 }}>
+              ⚠️ 当前角色无权创建用户。
+            </div>
+          )}
+
           {/* 文本字段 */}
           {fields.map(f => (
             <div key={f.key} style={{ marginBottom: '14px' }}>
@@ -112,6 +135,7 @@ export function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
             <select
               value={form.role}
               onChange={e => setForm(p => ({ ...p, role: e.target.value }))}
+              disabled={noCreatableRole}
               style={{ width: '100%', padding: '10px 14px', borderRadius: '10px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box', background: C.white }}>
               {availableRoles.map(r => (
                 <option key={r.value} value={r.value}>{r.label}</option>
@@ -125,12 +149,12 @@ export function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
               取消
             </button>
             <button
-              onClick={handleCreate} disabled={saving}
+              onClick={handleCreate} disabled={saving || noCreatableRole}
               style={{
                 flex: 2, padding: '10px', borderRadius: '10px', border: 'none',
-                background: saving ? C.textMuted : `linear-gradient(135deg,${C.primary},#7C3AED)`,
+                background: (saving || noCreatableRole) ? C.textMuted : `linear-gradient(135deg,${C.primary},#7C3AED)`,
                 color: '#fff', fontSize: '14px', fontWeight: 600,
-                cursor: saving ? 'not-allowed' : 'pointer',
+                cursor: (saving || noCreatableRole) ? 'not-allowed' : 'pointer',
               }}>
               {saving ? '创建中...' : '创建用户'}
             </button>

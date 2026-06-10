@@ -53,7 +53,7 @@ func (s *CoursewareGenService) assembleFullPage(contentHTML string, navTemplate 
 		firstGT := strings.Index(contentTrimmed, ">")
 		if firstGT > 0 {
 			// 在外层div开标签后插入导航栏
-			return contentTrimmed[:firstGT+1] + "\n" + nav + "\n" + contentTrimmed[firstGT+1:]
+			return s.applyTemplateBackground(contentTrimmed[:firstGT+1]+"\n"+nav+"\n"+contentTrimmed[firstGT+1:], tplInfo, pageNum)
 		}
 	}
 
@@ -71,7 +71,7 @@ func (s *CoursewareGenService) assembleFullPage(contentHTML string, navTemplate 
 	sb.WriteString("</div>")
 	sb.WriteString("\n")
 	sb.WriteString("</div>")
-	return sb.String()
+	return s.applyTemplateBackground(sb.String(), tplInfo, pageNum)
 }
 
 // ==================== 画布契约闸门（批量/重生/微调共用） ====================
@@ -325,6 +325,9 @@ func (s *CoursewareGenService) buildPreviewUserPrompt(
 	// 风格配置
 	s.appendStyleConfig(&sb, tplInfo)
 
+	// 任务2（分页参考注入）：按页型就近选取所选模板的官方样例页注入提示词，传递布局/装饰/背景质感
+	s.appendSamplePageReference(&sb, tplInfo, page, pageNum, totalPages)
+
 	// 参考组件
 	s.appendMatchedComponents(&sb, matchedComps)
 
@@ -388,6 +391,9 @@ func (s *CoursewareGenService) buildBatchUserPrompt(
 	// 风格配置
 	s.appendStyleConfig(&sb, tplInfo)
 
+	// 任务2（分页参考注入）：按页型就近选取所选模板的官方样例页注入提示词，传递布局/装饰/背景质感
+	s.appendSamplePageReference(&sb, tplInfo, page, pageNum, totalPages)
+
 	// 参考组件
 	s.appendMatchedComponents(&sb, matchedComps)
 
@@ -428,6 +434,220 @@ func (s *CoursewareGenService) appendMatchedComponents(sb *strings.Builder, matc
 		sb.WriteString("\n```\n")
 	}
 	sb.WriteString("\n")
+}
+
+// ==================== 任务2：模板样例页参考注入（分页参考注入） ====================
+
+// cwSampleRefMaxRunes 单个样例页注入提示词的最大字符数（rune计数，防中文截半）。
+// 12000上限覆盖4套新模板最长封面样例（小画本10625字符），保证样例嵌入的背景图URL不被截掉。
+const cwSampleRefMaxRunes = 12000
+
+// pickSamplePageIndex 按"当前页页型"挑选最匹配的模板样例页下标。
+//
+// 5页标准模板（sample_pages 固定顺序：封面/学习目标/内容讲解/互动练习/课后作业）：
+//   - 第1页 → 封面样例(0)
+//   - 第2页 → 学习目标样例(1)
+//   - 最后1页 → 课后作业样例(4)
+//   - 互动型页（click/drag/game/quiz 或交互复杂度≥4）→ 互动练习样例(3)
+//   - 其余 → 内容讲解样例(2)
+//
+// 非5页模板（旧单页模板/AI提取草稿等）：封面参考第1个样例，其余参考最后1个样例（单样例即同一个）。
+// 返回：样例下标 + 页型中文标签（注入提示词时告知AI）。
+func pickSamplePageIndex(samplesLen int, page *models.CoursewarePage, pageNum int, totalPages int) (int, string) {
+	if samplesLen == 5 {
+		switch {
+		case pageNum == 1:
+			return 0, "封面"
+		case pageNum == 2:
+			return 1, "学习目标"
+		case pageNum == totalPages:
+			return 4, "课后作业"
+		default:
+			it := page.InteractionType
+			if it == "click" || it == "drag" || it == "game" || it == "quiz" || page.IdxInteractionLevel >= 4 {
+				return 3, "互动练习"
+			}
+			return 2, "内容讲解"
+		}
+	}
+	// 非5页模板的回退策略
+	if pageNum == 1 || samplesLen == 1 {
+		return 0, "通用样例"
+	}
+	return samplesLen - 1, "通用样例"
+}
+
+// appendSamplePageReference 把"与本页页型最接近的模板官方样例页HTML"追加进AI生成提示词。
+//
+// 设计要点（对齐课件UI提升PRD第五节·分页参考注入）：
+//   - 样例页是模板作者精心设计的视觉基准（含布局骨架、装饰语言、嵌入的OSS背景图与可读性蒙版做法），
+//     注入后AI生成的页面质感向官方样例靠拢，而不是只拿到几个CSS变量"凭空发挥"。
+//   - 只注入1页（页型就近匹配），控制提示词体积；超长按rune安全截断。
+//   - 模板无样例（SamplePages为空）时静默跳过，行为与旧版完全一致——零回归风险。
+//   - 明确约束AI：参考视觉、绝不照抄占位文字；输出结构仍按系统提示词要求（<div>而非样例的<section>）。
+func (s *CoursewareGenService) appendSamplePageReference(
+	sb *strings.Builder,
+	tplInfo *cwTemplateInfo,
+	page *models.CoursewarePage,
+	pageNum int, totalPages int,
+) {
+	if tplInfo == nil || page == nil {
+		return
+	}
+	// 批次1：先解析老师图库选择（三级优先级第一级），样例段与硬约束段共用
+	userBgDecls := resolveUserBgDecls(tplInfo, pageNum)
+	if len(tplInfo.SamplePages) == 0 {
+		// 模板无样例页（旧/个人模板）：无样例可参考；老师选了背景仍须硬约束告知AI
+		if userBgDecls != "" {
+			sb.WriteString("## 本页背景（硬性要求）\n")
+			sb.WriteString("本页根容器背景必须使用老师选定的背景图与蒙版，声明如下。请勿用纯色 var(--cw-bg) 替代（系统也会在后端强制注入），正文卡片请用半透明底+backdrop-filter:blur保证可读：\n")
+			sb.WriteString("\x60\x60\x60css\n.cw-page{" + userBgDecls + "}\n\x60\x60\x60\n\n")
+		}
+		return
+	}
+	idx, label := pickSamplePageIndex(len(tplInfo.SamplePages), page, pageNum, totalPages)
+	if idx < 0 || idx >= len(tplInfo.SamplePages) {
+		return
+	}
+	sample := strings.TrimSpace(tplInfo.SamplePages[idx])
+	if sample == "" {
+		return
+	}
+
+	// rune 安全截断，防中文截半
+	truncated := false
+	runes := []rune(sample)
+	if len(runes) > cwSampleRefMaxRunes {
+		sample = string(runes[:cwSampleRefMaxRunes])
+		truncated = true
+	}
+
+	sb.WriteString(fmt.Sprintf("## 模板官方样例页参考（页型：%s）\n", label))
+	sb.WriteString("下面是所选风格模板中与本页页型最匹配的官方样例页HTML，请把它当作本页的视觉基准：\n")
+	sb.WriteString("- 严格沿用其布局骨架、装饰语言、卡片质感、圆角阴影与留白节奏；\n")
+	sb.WriteString("- 本页背景必须沿用样例的官方背景图与蒙版方案（见下方【本页背景】硬性要求，系统也会在后端强制注入）；\n")
+	sb.WriteString("- 正文内容必须按上方【本页方案】重写，绝不照抄样例中的占位文字；\n")
+	sb.WriteString("- 配色以上方CSS变量为准；样例外层的<section>仅为展示包装，你的输出仍须按系统提示词要求输出<div>结构；\n")
+	sb.WriteString("- 若本任务要求只生成内容区，则只参考样例的内容区部分，忽略其整页框架。\n")
+	sb.WriteString("```html\n")
+	sb.WriteString(sample)
+	if truncated {
+		sb.WriteString("\n<!-- ...样例过长已截断，参考以上部分即可 -->")
+	}
+	sb.WriteString("\n```\n\n")
+
+	// 背景硬约束（修复：AI严格服从系统提示词的 背景色:var(--cw-bg) 指令，建议性参考被无视）：
+	// 从样例提取官方背景声明（含OSS背景图URL+可读性蒙版渐变），作为硬性要求明示给AI，
+	// 并告知后端 applyTemplateBackground 会兜底强制注入——AI据此按"内容压在背景图上"的前提
+	// 设计半透明卡片+backdrop-filter，避免后端注入后出现可读性冲突。
+	bgDecls := userBgDecls
+	if bgDecls == "" {
+		bgDecls = extractSampleBackgroundDecls(tplInfo.SamplePages, pageNum)
+	}
+	if bgDecls != "" {
+		sb.WriteString("## 本页背景（硬性要求）\n")
+		sb.WriteString("本页根容器背景必须使用下列指定背景图与蒙版（老师选定的背景，或模板官方背景），声明如下。请勿用纯色 var(--cw-bg) 替代（系统也会在后端强制注入此背景）：\n")
+		sb.WriteString("\x60\x60\x60css\n.cw-page{" + bgDecls + "}\n\x60\x60\x60\n")
+		sb.WriteString("说明：此背景图是风格模板自带的官方资源，属于系统约束\"不依赖外部资源\"的唯一允许例外；")
+		sb.WriteString("正文卡片请用半透明底+backdrop-filter:blur浮于背景之上，保证文字可读。\n\n")
+	}
+}
+
+// ==================== 模板官方背景兜底注入（确定性，不依赖AI采纳） ====================
+
+// 样例CSS规则提取正则：.cw-page.cover{...} / .cw-page.inner{...}（[^}]字符类天然跨行）
+var (
+	cwSampleCoverRuleRe = regexp.MustCompile(`\.cw-page\.cover\s*\{([^}]*)\}`)
+	cwSampleInnerRuleRe = regexp.MustCompile(`\.cw-page\.inner\s*\{([^}]*)\}`)
+)
+
+// extractSampleBackgroundDecls 从模板样例页CSS中提取官方背景声明（仅background*系列，分号连接）。
+// 封面(pageNum==1)取封面样例(下标0)的 .cw-page.cover 规则；其余页取内容样例(下标2)的 .cw-page.inner 规则。
+// 规则不存在、或规则内不含 url((即无背景图，旧模板/个人模板/纯色模板)时返回空串 → 调用方零注入零回归。
+func extractSampleBackgroundDecls(samplePages []string, pageNum int) string {
+	if len(samplePages) == 0 {
+		return ""
+	}
+	var sample string
+	var re *regexp.Regexp
+	if pageNum == 1 {
+		sample = samplePages[0]
+		re = cwSampleCoverRuleRe
+	} else {
+		idx := 2
+		if idx >= len(samplePages) {
+			idx = len(samplePages) - 1
+		}
+		sample = samplePages[idx]
+		re = cwSampleInnerRuleRe
+	}
+	m := re.FindStringSubmatch(sample)
+	if m == nil {
+		return ""
+	}
+	body := m[1]
+	if !strings.Contains(body, "url(") {
+		return "" // 无背景图的模板不注入，避免画蛇添足
+	}
+	var out []string
+	for _, d := range strings.Split(body, ";") {
+		d = strings.TrimSpace(d)
+		if strings.HasPrefix(strings.ToLower(d), "background") {
+			out = append(out, d)
+		}
+	}
+	return strings.Join(out, ";")
+}
+
+// applyTemplateBackground 后端兜底：把模板官方背景声明强制注入页面根容器。
+//
+// 背景（本次修复的根因）：系统提示词明确指令"背景色:var(--cw-bg)"+"不依赖外部资源"，
+// AI严格服从，导致样例参考里建议性的"可沿用背景图"被无视。本函数把背景从"AI建议"
+// 升级为"后端确定性注入"——生成完成后在根容器开标签后插入
+// <style>.cw-page{background...!important}</style>，!important 压过AI写在根容器
+// 内联样式上的 background:var(--cw-bg)。
+//
+// 安全性：
+//   - 模板无背景声明（旧/个人/纯色模板）→ 原样返回，零回归；
+//   - 先过 normalizeRootCanvas 画布闸门（幂等）确保根容器带 .cw-page 类，注入样式按类选择器生效；
+//   - TEDNA-TPL-BG 标记做幂等保护，微调/重生回流不重复注入；
+//   - 注入的<style>随 html_content 持久化，离线ZIP与edu运行时同样生效。
+//
+// 调用点：封面预览(GeneratePreviewPages)、批量生成与单页重生(assembleFullPage两个出口)。
+func (s *CoursewareGenService) applyTemplateBackground(html string, tplInfo *cwTemplateInfo, pageNum int) string {
+	if tplInfo == nil || strings.TrimSpace(html) == "" {
+		return html
+	}
+	// 批次1三级优先级：老师图库选择(课件级) > 模板自带背景(样例提取) > 无
+	bgDecls := resolveUserBgDecls(tplInfo, pageNum)
+	if bgDecls == "" {
+		bgDecls = extractSampleBackgroundDecls(tplInfo.SamplePages, pageNum)
+	}
+	if bgDecls == "" {
+		return html
+	}
+	if strings.Contains(html, "TEDNA-TPL-BG") {
+		return html // 已注入过，幂等跳过
+	}
+	out := normalizeRootCanvas(html)
+	trimmed := strings.TrimSpace(out)
+	if !strings.HasPrefix(strings.ToLower(trimmed), "<div") {
+		return html
+	}
+	gt := strings.Index(trimmed, ">")
+	if gt < 0 {
+		return html
+	}
+	var parts []string
+	for _, d := range strings.Split(bgDecls, ";") {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			parts = append(parts, d+" !important")
+		}
+	}
+	styleTag := "<style>/* TEDNA-TPL-BG 模板官方背景兜底注入 */.cw-page{" + strings.Join(parts, ";") + "}</style>"
+	cwGenLog.Info("模板官方背景已兜底注入", "page_num", pageNum)
+	return trimmed[:gt+1] + styleTag + trimmed[gt+1:]
 }
 
 // ==================== 组件匹配 ====================
@@ -551,6 +771,11 @@ func (s *CoursewareGenService) loadTemplateInfo(ctx context.Context, templateID 
 	// 解析配色方案
 	if tpl.ColorScheme != "" {
 		_ = json.Unmarshal([]byte(tpl.ColorScheme), &info.ColorScheme)
+	}
+	// 任务2（分页参考注入）：解析模板样例页数组，供生成提示词按页型注入官方样例参考。
+	// 解析失败不致命——SamplePages 留空时 appendSamplePageReference 静默跳过，行为退回旧版。
+	if tpl.SamplePages != "" {
+		_ = json.Unmarshal([]byte(tpl.SamplePages), &info.SamplePages)
 	}
 	return info, nil
 }

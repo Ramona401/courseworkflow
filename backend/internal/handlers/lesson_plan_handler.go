@@ -9,6 +9,19 @@ package handlers
 //   返回该错误，handler 需将其映射为 400 + 明确文案，前端 catch 后可直接展示，
 //   而非落入 default 分支被吞成 500「操作失败，请稍后重试」。
 //   语义上"正文为空"是请求内容不合格（400），区别于"状态不允许"（403）。
+//
+// 迭代一 Phase 4 改动（数据隔离收口）：
+//   ListLessonPlans 端点原先完全不取 claims，所有筛选参数都来自 URL query——
+//   任何登录用户只要不传 author_id 就能列出全库教案，是数据越权的裸洞。
+//   本次改为：从 JWT claims 取出 role+userID，调 services.ResolveDataScope 解析出
+//   "该请求者能看到哪些教案"的数据范围（DataScope），再传给 service 层。
+//   可见性规则（本人 ∪ 管辖成员 ∪ 共享可见）的实际过滤在 repo 层 SQL 拼接。
+//   未取到 claims（理论上 authMW 已拦截未登录请求）时按未认证 401 处理。
+//
+// 迭代一 Phase 4 收尾改动（共享发布越权封堵）：
+//   handleLPError 新增 ErrLPNotPublisher 分支，归入 403 Forbidden。
+//   service 层 PublishShared 在调用者既非作者本人、也非 admin 时返回该错误，
+//   语义上属于"权限不足"（与 ErrLPNotAuthor 同类），故映射 403 而非 400/500。
 
 import (
         "encoding/json"
@@ -18,6 +31,7 @@ import (
         "strconv"
         "strings"
 
+        "tedna/internal/middleware"
         "tedna/internal/models"
         "tedna/internal/services"
         "tedna/internal/utils"
@@ -35,11 +49,27 @@ func NewLessonPlanHandler(lpService *services.LessonPlanService) *LessonPlanHand
 
 // ==================== 教案列表 ====================
 
+// ListLessonPlans 教案列表端点
+//
+// 迭代一 Phase 4（数据隔离收口）：取 claims 解析数据范围后再查询。
+//   - 取不到 claims → 401（authMW 通常已挡，这里是双保险）。
+//   - 取到 claims → ResolveDataScope(role,userID) 得 DataScope，传给 service。
+//     admin 看全部；senior/region_admin 看管辖成员；operator/viewer 看本人；
+//     此外任何登录用户都能看到 published_shared/approved 的共享教案（教案库浏览）。
 func (h *LessonPlanHandler) ListLessonPlans(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodGet {
                 utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
                 return
         }
+
+        // Phase 4：取 JWT claims，解析当前请求者的数据可见范围
+        claims, ok := middleware.GetClaims(r.Context())
+        if !ok || claims.UserID == "" {
+                utils.Unauthorized(w, utils.MsgNotLoggedIn)
+                return
+        }
+        scope := services.ResolveDataScope(r.Context(), claims.Role, claims.UserID)
+
         q := r.URL.Query()
         authorID := q.Get("author_id")
         groupID := q.Get("group_id")
@@ -53,7 +83,7 @@ func (h *LessonPlanHandler) ListLessonPlans(w http.ResponseWriter, r *http.Reque
         cognitiveLevel, _ := strconv.Atoi(q.Get("cognitive_level"))
         pedagogyIntensity, _ := strconv.Atoi(q.Get("pedagogy_intensity"))
 
-        result, err := h.lpService.ListLessonPlans(r.Context(), authorID, groupID, status, subject, grade, limit, offset, qualityLevel, structureType, cognitiveLevel, pedagogyIntensity)
+        result, err := h.lpService.ListLessonPlans(r.Context(), authorID, groupID, status, subject, grade, limit, offset, qualityLevel, structureType, cognitiveLevel, pedagogyIntensity, &scope)
         if err != nil {
                 log.Printf("获取教案列表失败: %v", err)
                 utils.InternalError(w, "获取教案列表失败")
@@ -364,10 +394,13 @@ func (h *LessonPlanHandler) handleLPError(w http.ResponseWriter, err error) {
                 // 前端 catch 后直接展示该明确文案，引导用户去备课工坊补全正文。
                 utils.BadRequest(w, err.Error())
         case errors.Is(err, services.ErrLPNotAuthor),
+                errors.Is(err, services.ErrLPNotPublisher),
                 errors.Is(err, services.ErrLPCannotEdit),
                 errors.Is(err, services.ErrLPCannotSubmit),
                 errors.Is(err, services.ErrLPCannotDevelop),
                 errors.Is(err, services.ErrLPAlreadyDeveloping):
+                // Phase 4 收尾：ErrLPNotPublisher 归入 403——"非作者非管理员不能共享发布"
+                // 属于权限不足，与 ErrLPNotAuthor 同类。
                 utils.Fail(w, http.StatusForbidden, err.Error())
         case errors.Is(err, services.ErrLPNotFound),
                 errors.Is(err, services.ErrTemplateNotFound):

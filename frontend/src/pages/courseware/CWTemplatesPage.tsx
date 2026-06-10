@@ -1,14 +1,16 @@
 /**
- * 课件风格模板页面 — CWTemplatesPage v5.1 (2026-05-22)
+ * 课件风格模板页面 — CWTemplatesPage v5.3 (2026-06-10)
+ *
+ * v5.3 改动（配合 TemplateThumb 恢复纯 v2.0）:
+ *   - 移除 v5.2 给 TplCard / TemplateThumb 传的 index prop（渐进挂载方案已整体放弃，回归一次性渲染）。
+ *   - TplCard 去掉 index 形参；两处 .map 改回不带序号；其余逻辑一字未动。
  *
  * v5.1 改造 (P2-2):
- *   - TplCard 草稿模式新增「更新于 xxx」时间标签
- *   - 草稿卡片下方显示紫色「草稿」角标 + 更新时间
+ *   - TplCard 草稿模式新增「更新于 xxx」时间标签 + 草稿紫色角标
  *
  * v5.0 改造：
- *   - 引入共享 TemplateThumb 组件统一缩略图渲染（自适应宽度+消滚动条+自动识别1920/960）
+ *   - 引入共享 TemplateThumb 组件统一缩略图渲染
  *   - 弹窗预览改用 TemplateThumbAuto 组件
- *   - 卡片高度根据实际内容比例计算，消除右下空白
  *
  * 功能：模板浏览 + 风格筛选 + admin新建/编辑/删除 + 「组件预览」
  */
@@ -20,6 +22,7 @@ import {
 import type { CoursewareTemplate, CWComponentListItem, CWComponentFull, ExtractTemplateResponse } from '@/api/coursewares'
 import { useAuth } from '@/store/auth'
 import TemplateThumb, { TemplateThumbAuto } from './components/TemplateThumb'
+import TemplatePagesPreview from './components/TemplatePagesPreview'
 import TemplateExtractModal from './components/TemplateExtractModal'
 import TemplateRefineModal from './components/TemplateRefineModal'
 
@@ -235,7 +238,7 @@ export default function CWTemplatesPage() {
   )
 }
 
-/* ==================== 模板卡片（v5.1: 草稿显示更新时间） ==================== */
+/* ==================== 模板卡片 ==================== */
 function TplCard({ t, isAdmin, currentUserId, onPreview, onEdit, onDelete, onUnpublish }: {
   t: CoursewareTemplate; isAdmin: boolean; currentUserId?: string; onPreview: () => void; onEdit: () => void; onDelete: () => void; onUnpublish?: () => void
 }) {
@@ -247,7 +250,6 @@ function TplCard({ t, isAdmin, currentUserId, onPreview, onEdit, onDelete, onUnp
   const is3D = t.style_category === 'immersive'
   const isDraft = !!t.is_draft
 
-  // 16:9 缩略图：高度由父容器宽度 * 9/16 算出，这里固定 160 适配 280~300px 卡片
   const fallback = (
     <div style={{
       height: '100%',
@@ -375,7 +377,7 @@ function TplPreviewModal({ t, onClose }: { t: CoursewareTemplate; onClose: () =>
         {/* 样例页面预览 */}
         <div style={{ padding: '0 28px 20px' }}>
           <div style={{ fontSize: '15px', fontWeight: 700, color: '#1F2937', marginBottom: '14px' }}>📺 样例页面预览</div>
-          <TemplateThumbAuto previewUrl={previewUrls[0]} sampleHTML={pages[0]} title="模板预览" />
+          <TemplatePagesPreview previewUrls={previewUrls} samplePages={pages} accentColor={colors.primary || C.primary} />
         </div>
 
         {/* 配色方案 */}
