@@ -160,9 +160,9 @@ func registerCoursewareRoutes(
 	mux.Handle("/api/v1/coursewares", cwMux)
 	mux.Handle("/api/v1/coursewares/", cwMux)
 
-	// ==================== 批次1: 背景图库图集列表(登录即可) ====================
-	mux.Handle("/api/v1/courseware-backgrounds", middleware.Chain(http.HandlerFunc(bgHandler.ListSets), authMW))
-	mux.Handle("/api/v1/courseware-backgrounds/", middleware.Chain(http.HandlerFunc(bgHandler.ListSets), authMW))
+	// ==================== 批次1+3: 背景图库子树(列表/AI生成/上传/归档删除/升级系统库, 登录即可, 权限在handler内细分) ====================
+	mux.Handle("/api/v1/courseware-backgrounds", middleware.Chain(http.HandlerFunc(bgHandler.HandleLibrary), authMW))
+	mux.Handle("/api/v1/courseware-backgrounds/", middleware.Chain(http.HandlerFunc(bgHandler.HandleLibrary), authMW))
 
 	// ==================== v136: 方案结构预设(登录即可) ====================
 	mux.Handle("/api/v1/courseware-presets", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

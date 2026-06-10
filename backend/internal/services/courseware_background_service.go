@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"strings"
 
+	"tedna/internal/config"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 )
@@ -117,11 +118,13 @@ func swapInjectedBackground(html string, bgDecls string) (string, bool) {
 // ==================== 背景图库业务服务 ====================
 
 // CoursewareBackgroundService 课件背景图库服务（无状态）
-type CoursewareBackgroundService struct{}
+type CoursewareBackgroundService struct {
+	cfg *config.Config // 批次3：AI生成/上传背景需要AES密钥(豆包配置解密)与OSS上传配置
+}
 
 // NewCoursewareBackgroundService 创建背景图库服务
-func NewCoursewareBackgroundService() *CoursewareBackgroundService {
-	return &CoursewareBackgroundService{}
+func NewCoursewareBackgroundService(cfg *config.Config) *CoursewareBackgroundService {
+	return &CoursewareBackgroundService{cfg: cfg}
 }
 
 // ListSets 查询当前用户可见的图集（系统图库 + 本人个人集）

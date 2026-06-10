@@ -56,3 +56,8 @@ frontend/=
 *.backup.*
 backend/internal/**/*.backup.*
 backend/internal/**/*.backup2.*
+
+# ===== 运维产物（备份/失败件/缓存），不入库 =====
+*_failed.*
+__pycache__/
+*.pyc

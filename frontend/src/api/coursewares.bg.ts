@@ -1,9 +1,12 @@
 /**
- * 课件工坊 API —— 背景图库层 (coursewares.bg.ts)（批次2新建）
+ * 课件工坊 API —— 背景图库层 (coursewares.bg.ts)（批次2新建，批次3扩展生产入口）
  *
  * 背景图库：一集 = 头图(封面用) + 内页图 两张OSS公网图。
  * 课件选中某集后，后端把两URL快照写入课件，并对已生成页做"秒换"
  * （纯字符串替换注入的背景<style>块，零AI调用零token，秒级完成）。
+ *
+ * 批次3新增：AI生成一套(generateBackgroundSet) / 上传一套(uploadBackgroundSet) /
+ * 归档删除(deleteBackgroundSet) / admin升级系统图库(promoteBackgroundSet)。
  * 经桶文件 coursewares.ts 透出，对外 import 路径不变。
  */
 import apiClient from './client'
@@ -42,7 +45,21 @@ export interface CWBackgroundResult {
   swapped_pages: number  // 被秒换背景的已生成页数
 }
 
-// ==================== API ====================
+/** 批次3: AI生成一套背景的请求参数 */
+export interface GenerateBackgroundSetParams {
+  courseware_id?: string   // 非空=生成后自动应用到该课件
+  name?: string            // 集名称（空=后端默认"AI背景·MMDD-HHmm"）
+  cover_prompt: string     // 封面图提示词
+  content_prompt: string   // 内页图提示词（后端会强制追加"浅色低对比、适合做底纹"约束）
+}
+
+/** 批次3: 图集生产（AI生成/上传）结果——selection非空表示已自动应用到课件 */
+export interface CWBackgroundProduceResult {
+  set: CWBackgroundSet
+  selection?: CWBackgroundResult
+}
+
+// ==================== 选择/清除（批次2） ====================
 
 /** 背景图集列表（系统图库 + 我的个人集） */
 export async function listBackgroundSets(): Promise<{ sets: CWBackgroundSet[]; total: number }> {
@@ -73,5 +90,50 @@ export async function clearCWBackground(coursewareId: string): Promise<CWBackgro
     { clear: true },
     { timeout: 30000 },
   )
+  return extractData(resp)
+}
+
+// ==================== 生产入口（批次3） ====================
+
+/**
+ * AI生成一套背景（封面+内页两张16:9, 2560×1440）→ 上OSS → 建个人集 → 自动应用到课件。
+ * 两张图串行生成+下载+上云，全程可能需1-3分钟，超时给到5分钟。
+ */
+export async function generateBackgroundSet(params: GenerateBackgroundSetParams): Promise<CWBackgroundProduceResult> {
+  const resp = await apiClient.post('/courseware-backgrounds/generate', params, { timeout: 300000 })
+  return extractData(resp)
+}
+
+/**
+ * 上传一套背景（两张图, ≤5MB, JPG/PNG/WEBP）→ 上OSS → 建个人集 → 自动应用到课件。
+ * multipart字段: name / courseware_id / cover / content
+ */
+export async function uploadBackgroundSet(params: {
+  name?: string
+  coursewareId?: string
+  cover: File
+  content: File
+}): Promise<CWBackgroundProduceResult> {
+  const fd = new FormData()
+  if (params.name) fd.append('name', params.name)
+  if (params.coursewareId) fd.append('courseware_id', params.coursewareId)
+  fd.append('cover', params.cover)
+  fd.append('content', params.content)
+  const resp = await apiClient.post('/courseware-backgrounds/upload', fd, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 120000,
+  })
+  return extractData(resp)
+}
+
+/** 删除（归档）图集：个人集=本人/admin，系统集=仅admin。已选用该集的课件不受影响（URL快照） */
+export async function deleteBackgroundSet(setId: string): Promise<{ id: string }> {
+  const resp = await apiClient.delete('/courseware-backgrounds/' + setId)
+  return extractData(resp)
+}
+
+/** admin专属：把个人图集升级为系统图库（全体用户可见） */
+export async function promoteBackgroundSet(setId: string): Promise<CWBackgroundSet> {
+  const resp = await apiClient.post('/courseware-backgrounds/' + setId + '/promote', {})
   return extractData(resp)
 }

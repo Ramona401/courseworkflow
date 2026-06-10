@@ -892,7 +892,8 @@ export default function CoursewareWorkshopPage() {
 
           {/* 批次2（背景图库）：选背景秒换封面（零token零等待），后续批量生成的内页自动带内页底纹 */}
           {previewPages.length > 0 && !previewGenRunning && (
-            <BackgroundPicker coursewareId={id!} onSwapped={loadCourseware} />
+            <BackgroundPicker coursewareId={id!} onSwapped={loadCourseware} disabled={buildRunning}
+              cwTitle={courseware.title} cwSubject={courseware.subject} cwGrade={courseware.grade} />
           )}
 
           {/* P0-2: 导航栏AI微调输入区 */}
@@ -970,6 +971,12 @@ export default function CoursewareWorkshopPage() {
           </div>
           {renderPagePreview(generatedPages, buildPreviewNum, setBuildPreviewNum, true)}
           
+          {/* 批次3小修8: 确认提交页也嵌背景图选择器(事后换背景是高频场景); 小修7: 批量生成中禁用防竞态 */}
+          {generatedPages.length > 0 && (
+            <BackgroundPicker coursewareId={id!} onSwapped={loadCourseware} disabled={buildRunning}
+              cwTitle={courseware.title} cwSubject={courseware.subject} cwGrade={courseware.grade} />
+          )}
+
           {/* P0-4: 每页AI微调 */}
           {generatedPages.length > 0 && (
             <div style={{ marginTop: 16, padding: '16px', borderRadius: 10, border: `1px solid ${C.border}`, background: '#FAFAFA' }}>

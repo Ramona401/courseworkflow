@@ -18,6 +18,9 @@ package services
 //   - resolveLogoAndOrg：Logo和机构名优先级链解析
 //
 // 拆分自原 courseware_gen_service.go（v142 结构化日志迁移+模块化拆分）
+// 批次3小修5：appendSamplePageReference 背景措辞改为来源感知——
+//   老师在图库选了背景时，不再出现"必须沿用样例官方背景图"的矛盾指令，
+//   样例参考bullet与【本页背景(硬性要求)】段均按实际背景来源动态措辞。
 
 import (
 	"context"
@@ -429,9 +432,9 @@ func (s *CoursewareGenService) appendMatchedComponents(sb *strings.Builder, matc
 		if len(code) > 2000 {
 			code = code[:2000] + "\n<!-- ... 代码截断 -->"
 		}
-		sb.WriteString("```html\n")
+		sb.WriteString("\x60\x60\x60html\n")
 		sb.WriteString(code)
-		sb.WriteString("\n```\n")
+		sb.WriteString("\n\x60\x60\x60\n")
 	}
 	sb.WriteString("\n")
 }
@@ -485,6 +488,9 @@ func pickSamplePageIndex(samplesLen int, page *models.CoursewarePage, pageNum in
 //   - 只注入1页（页型就近匹配），控制提示词体积；超长按rune安全截断。
 //   - 模板无样例（SamplePages为空）时静默跳过，行为与旧版完全一致——零回归风险。
 //   - 明确约束AI：参考视觉、绝不照抄占位文字；输出结构仍按系统提示词要求（<div>而非样例的<section>）。
+//
+// 批次3小修5：背景指令统一指向【本页背景(硬性要求)】段，按来源（老师图库选择/模板官方背景）
+// 动态措辞，根治"老师选了背景"与"必须沿用样例官方背景"的自相矛盾。
 func (s *CoursewareGenService) appendSamplePageReference(
 	sb *strings.Builder,
 	tplInfo *cwTemplateInfo,
@@ -499,9 +505,7 @@ func (s *CoursewareGenService) appendSamplePageReference(
 	if len(tplInfo.SamplePages) == 0 {
 		// 模板无样例页（旧/个人模板）：无样例可参考；老师选了背景仍须硬约束告知AI
 		if userBgDecls != "" {
-			sb.WriteString("## 本页背景（硬性要求）\n")
-			sb.WriteString("本页根容器背景必须使用老师选定的背景图与蒙版，声明如下。请勿用纯色 var(--cw-bg) 替代（系统也会在后端强制注入），正文卡片请用半透明底+backdrop-filter:blur保证可读：\n")
-			sb.WriteString("\x60\x60\x60css\n.cw-page{" + userBgDecls + "}\n\x60\x60\x60\n\n")
+			s.appendBackgroundHardRule(sb, userBgDecls, "老师在背景图库中为本课件选定的背景图")
 		}
 		return
 	}
@@ -525,32 +529,39 @@ func (s *CoursewareGenService) appendSamplePageReference(
 	sb.WriteString(fmt.Sprintf("## 模板官方样例页参考（页型：%s）\n", label))
 	sb.WriteString("下面是所选风格模板中与本页页型最匹配的官方样例页HTML，请把它当作本页的视觉基准：\n")
 	sb.WriteString("- 严格沿用其布局骨架、装饰语言、卡片质感、圆角阴影与留白节奏；\n")
-	sb.WriteString("- 本页背景必须沿用样例的官方背景图与蒙版方案（见下方【本页背景】硬性要求，系统也会在后端强制注入）；\n")
+	sb.WriteString("- 本页背景以下方【本页背景（硬性要求）】段为准（系统也会在后端强制注入）；样例自带的背景仅作质感参考，若与硬性要求不一致请以硬性要求为准；\n")
 	sb.WriteString("- 正文内容必须按上方【本页方案】重写，绝不照抄样例中的占位文字；\n")
 	sb.WriteString("- 配色以上方CSS变量为准；样例外层的<section>仅为展示包装，你的输出仍须按系统提示词要求输出<div>结构；\n")
 	sb.WriteString("- 若本任务要求只生成内容区，则只参考样例的内容区部分，忽略其整页框架。\n")
-	sb.WriteString("```html\n")
+	sb.WriteString("\x60\x60\x60html\n")
 	sb.WriteString(sample)
 	if truncated {
 		sb.WriteString("\n<!-- ...样例过长已截断，参考以上部分即可 -->")
 	}
-	sb.WriteString("\n```\n\n")
+	sb.WriteString("\n\x60\x60\x60\n\n")
 
-	// 背景硬约束（修复：AI严格服从系统提示词的 背景色:var(--cw-bg) 指令，建议性参考被无视）：
-	// 从样例提取官方背景声明（含OSS背景图URL+可读性蒙版渐变），作为硬性要求明示给AI，
-	// 并告知后端 applyTemplateBackground 会兜底强制注入——AI据此按"内容压在背景图上"的前提
-	// 设计半透明卡片+backdrop-filter，避免后端注入后出现可读性冲突。
+	// 背景硬约束（来源感知）：三级优先级——老师图库选择 > 模板样例提取 > 无。
+	// 把背景从"AI建议"升级为明示的硬性要求，并告知后端 applyTemplateBackground 会兜底强制注入，
+	// AI据此按"内容压在背景图上"的前提设计半透明卡片+backdrop-filter，避免注入后可读性冲突。
 	bgDecls := userBgDecls
+	bgSource := "老师在背景图库中为本课件选定的背景图"
 	if bgDecls == "" {
 		bgDecls = extractSampleBackgroundDecls(tplInfo.SamplePages, pageNum)
+		bgSource = "风格模板自带的官方背景图"
 	}
 	if bgDecls != "" {
-		sb.WriteString("## 本页背景（硬性要求）\n")
-		sb.WriteString("本页根容器背景必须使用下列指定背景图与蒙版（老师选定的背景，或模板官方背景），声明如下。请勿用纯色 var(--cw-bg) 替代（系统也会在后端强制注入此背景）：\n")
-		sb.WriteString("\x60\x60\x60css\n.cw-page{" + bgDecls + "}\n\x60\x60\x60\n")
-		sb.WriteString("说明：此背景图是风格模板自带的官方资源，属于系统约束\"不依赖外部资源\"的唯一允许例外；")
-		sb.WriteString("正文卡片请用半透明底+backdrop-filter:blur浮于背景之上，保证文字可读。\n\n")
+		s.appendBackgroundHardRule(sb, bgDecls, bgSource)
 	}
+}
+
+// appendBackgroundHardRule 追加【本页背景(硬性要求)】段（小修5抽出的公共函数，来源感知措辞）
+// bgSource 为背景来源的中文描述：老师图库选择 / 模板官方背景，措辞随来源变化不再互相矛盾
+func (s *CoursewareGenService) appendBackgroundHardRule(sb *strings.Builder, bgDecls string, bgSource string) {
+	sb.WriteString("## 本页背景（硬性要求）\n")
+	sb.WriteString(fmt.Sprintf("本页根容器背景必须使用下列指定的背景图与蒙版（来源：%s），声明如下。请勿用纯色 var(--cw-bg) 替代（系统也会在后端强制注入此背景）：\n", bgSource))
+	sb.WriteString("\x60\x60\x60css\n.cw-page{" + bgDecls + "}\n\x60\x60\x60\n")
+	sb.WriteString(fmt.Sprintf("说明：此背景图是%s，属于系统约束\"不依赖外部资源\"的唯一允许例外；", bgSource))
+	sb.WriteString("正文卡片请用半透明底+backdrop-filter:blur浮于背景之上，保证文字可读。\n\n")
 }
 
 // ==================== 模板官方背景兜底注入（确定性，不依赖AI采纳） ====================
@@ -711,7 +722,7 @@ func (s *CoursewareGenService) extractHTMLFromAIOutput(aiOutput string) string {
 	}
 
 	// 截断到最后一个 </div>，剥掉 AI 在 HTML 之后追加的解释文字 / 代码围栏残留
-	// 修复：微调时 AI 常在 HTML 后补一句"我已经改好了…"或再贴一段```html，
+	// 修复：微调时 AI 常在 HTML 后补一句"我已经改好了…"或再贴一段代码围栏，
 	// 旧逻辑取 text[divStart:] 直到字符串末尾，导致这些尾巴被当作页面内容存库并渲染到预览。
 	if last := strings.LastIndex(htmlPart, "</div>"); last >= 0 {
 		htmlPart = htmlPart[:last+len("</div>")]
@@ -722,16 +733,16 @@ func (s *CoursewareGenService) extractHTMLFromAIOutput(aiOutput string) string {
 
 // cwGenStripCodeFences 去除AI输出中的markdown代码块标记
 func cwGenStripCodeFences(text string) string {
-	// 处理 ```html 或 ``` 开头
-	if strings.HasPrefix(text, "```") {
+	// 处理 \x60\x60\x60html 或 \x60\x60\x60 开头
+	if strings.HasPrefix(text, "\x60\x60\x60") {
 		idx := strings.Index(text, "\n")
 		if idx >= 0 {
 			text = text[idx+1:]
 		}
 	}
 	text = strings.TrimSpace(text)
-	// 处理末尾的 ```
-	if strings.HasSuffix(text, "```") {
+	// 处理末尾的 \x60\x60\x60
+	if strings.HasSuffix(text, "\x60\x60\x60") {
 		text = text[:len(text)-3]
 	}
 	return strings.TrimSpace(text)
