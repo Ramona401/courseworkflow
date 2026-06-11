@@ -66,6 +66,12 @@ func (s *CoursewareGenService) attachUserBackground(ctx context.Context, cw *mod
 	}
 	tplInfo.CoverBgURL = cover
 	tplInfo.ContentBgURL = content
+	// 字体F1：同步读取课件级字体方案code挂进生成上下文（与背景共用挂载时机；读失败按未选处理不阻断生成）
+	if fontCode, fErr := repository.GetCoursewareFontScheme(ctx, cw.ID); fErr == nil {
+		tplInfo.FontSchemeCode = fontCode
+	} else {
+		cwGenLog.Warn("读取课件字体方案失败，按未选处理", "error", fErr, "courseware_id", cw.ID)
+	}
 }
 
 // ==================== 背景秒换（确定性字符串操作，零token） ====================

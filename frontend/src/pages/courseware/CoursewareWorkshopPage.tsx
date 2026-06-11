@@ -12,12 +12,11 @@
  * 主组件逻辑与交互完全不变，仅改为 import 上述模块。
  *
  * 关键设计（保留供理解）：
- *   - buildPreviewNum 是 Step5 唯一选中页真相源；mediaPageNum 是其只读别名；
- *     一个 useEffect 监听其变化自动 listPageAssets 拉当前页媒体并以 cancelled 标志防串页。
+ *   - buildPreviewNum 是 Step5 唯一选中页真相源；多媒体管理已整体迁入
+ *     MediaManagerPanel.tsx（批次W1），以 pageNum 接收选中页，内部自动拉取本页媒体防串页。
  *   - source_type==='3d_single' 时早返回走 ThreeDSingleView，不走标准六步。
- *   - 图片 Tab 进页/切未拉过页自动调 suggestImagePrompt 出多条配图建议（按页 imgSuggestCache 缓存）。
- *   - 单页微调支持附截图(refineImage,data URI,≤8MB)走多模态 + 输入框 Ctrl+V 粘贴截图；
- *     重生(handleRegeneratePage)带二次确认、清本页插图、与微调互斥。
+ *   - 图片配图建议/批量生成/视频编辑等逻辑见 MediaManagerPanel.tsx。
+ *   - 单页微调/重生已迁入 RefinePanel.tsx（批次W2），保存模板迁入 TemplateSavePanel.tsx。
  *   - 批量生成支持中断续传（跳过已生成页）。
  *   - 「☁️云盘」上传成功写 public_oss_url；删除已上云资产弹强警告确认。
  */
@@ -49,6 +48,11 @@ import CWFullscreenPreview from './components/courseware-workshop/CWFullscreenPr
 import SlideshowPlayer from './components/courseware-workshop/SlideshowPlayer'
 import VideoStoryboardPanel from './components/VideoStoryboardPanel'
 import BackgroundPicker from './components/courseware-workshop/BackgroundPicker'
+import FontPicker from './components/courseware-workshop/FontPicker'
+import MediaManagerPanel from './components/courseware-workshop/MediaManagerPanel'
+import RefinePanel from './components/courseware-workshop/RefinePanel'
+import AppearancePanel from './components/courseware-workshop/AppearancePanel'
+import TemplateSavePanel from './components/courseware-workshop/TemplateSavePanel'
 
 // ==================== 主组件 ====================
 export default function CoursewareWorkshopPage() {
@@ -89,12 +93,7 @@ export default function CoursewareWorkshopPage() {
   const [generatedPages, setGeneratedPages] = useState<{ page_number: number; title: string; html_content: string }[]>([])
   const [buildPreviewNum, setBuildPreviewNum] = useState(0)
 
-  // P0-4: 页面微调状态(批次4b: refinePageNum 已删除, 统一用 buildPreviewNum 作为唯一选中页)
-  const [refineInput, setRefineInput] = useState('')
-  const [refineRunning, setRefineRunning] = useState(false)
-  // 批次4a: 单页微调截图(data URI, 走多模态) + 重生运行态
-  const [refineImage, setRefineImage] = useState('')
-  const [regenRunning, setRegenRunning] = useState(false)
+  // 批次W2: 页面微调状态/逻辑已迁入 RefinePanel.tsx; 模板保存已迁入 TemplateSavePanel.tsx
 
   // v136: 方案预设+AI修改方案+回退
   const [presets, setPresets] = useState<SchemePreset[]>([])
@@ -109,76 +108,44 @@ export default function CoursewareWorkshopPage() {
   const [fullscreenOpen, setFullscreenOpen] = useState(false)
   const [fullscreenPageNum, setFullscreenPageNum] = useState(1)
   const [fullscreenCodeView, setFullscreenCodeView] = useState(false)
-  // v137: 保存模板状态
-  const [saveTplName, setSaveTplName] = useState('')
-  const [savingTpl, setSavingTpl] = useState(false)
+
 
   const [slideshowOpen, setSlideshowOpen] = useState(false)
   const [slideshowInitPage, setSlideshowInitPage] = useState(1)
-  // v0.42 多媒体: 媒体管理状态(批次4b: mediaPageNum 改为 buildPreviewNum 的只读别名,
-  //   下方所有读 mediaPageNum 的引用无需改动; 已删除独立的页码 state 和下拉选择器)
-  const [mediaAssets, setMediaAssetsRaw] = useState<import('@/api/coursewares').CoursewareAsset[]>([])
-  const setMediaAssets = setMediaAssetsRaw  // 批次4b: 保持下方 setMediaAssets 调用不变
-  const [mediaGenPrompt, setMediaGenPrompt] = useState('')
-  const [mediaSize, setMediaSize] = useState('1920x1920')
-  const [mediaGenerating, setMediaGenerating] = useState(false)
-  const [mediaMessage, setMediaMessage] = useState('')
-  const [mediaPreviewUrl, setMediaPreviewUrl] = useState('')
-  const [mediaRefUrl, setMediaRefUrl] = useState('')  // 参考图URL（图生图）
-  // 批次4c+: AI 写详细提示词运行态 + 视频三件物料中的分镜图提示词/台词展示
-  const [mediaPromptSuggesting, setMediaPromptSuggesting] = useState(false)
-  // 图片多提示词: AI 返回的多条配图建议(每条含 caption/prompt/各自尺寸)
-  //   仅当 AI 返回 >1 条时以卡片列表呈现; ==1 条时沿用老行为直接填入生成框
-  const [imgSuggestions, setImgSuggestions] = useState<(ImagePromptSuggestion & { size: string })[]>([])
-  // 勾选了哪几条做批量生成(默认不选, 老师主动勾); 存下标集合
-  const [imgSuggestSelected, setImgSuggestSelected] = useState<Set<number>>(new Set())
-  // 批量生成运行态 + 进度(已完成/总数)
-  const [batchGenRunning, setBatchGenRunning] = useState(false)
-  const [batchGenProgress, setBatchGenProgress] = useState({ done: 0, total: 0 })
-  // 风格快选+Tab(本轮): 当前展示的建议 Tab 下标; 当前选中的图片风格 key(空=未选)
-  const [activeImgSuggestTab, setActiveImgSuggestTab] = useState(0)
-  const [mediaStyleKey, setMediaStyleKey] = useState('')
-  // 遗留项②：显式记住上次追加的风格后缀确切文本，剥离时直接 replace 该串，不靠 endsWith 位置判断
-  const [styleSuffixText, setStyleSuffixText] = useState('')
-  // 图片多提示词(新交互): 自动拉取建议的运行态 + 每页建议缓存(切回不重复调 AI)
-  const [imgSuggestLoading, setImgSuggestLoading] = useState(false)
-  const imgSuggestCache = useRef<Map<number, (ImagePromptSuggestion & { size: string })[]>>(new Map())
-  // v0.42.1 视频生成状态
-  const [mediaTab, setMediaTab] = useState<'image'|'video'>('image')  // 多媒体Tab切换
-  // v0.42.1 视频编辑状态
-  const [editorOpen, setEditorOpen] = useState(false)         // 视频编辑器弹窗
-  const [editorExporting, setEditorExporting] = useState(false) // 编辑器导出中
+  // 批次W1: 多媒体管理的全部状态/effect/处理函数已整体迁入 MediaManagerPanel.tsx
+  // 批次W2: Step5工作台Tab(默认「页面微调」=最高频动作; 图片/视频两Tab共用MediaManagerPanel实例)
+  const [wsTab, setWsTab] = useState<'refine' | 'background' | 'font' | 'image' | 'video' | 'template'>('refine')  // W3: 背景/字体独立Tab
 
   // ---- 风格锚点（轮3）：设/清锚点运行态 + 操作方法 ----
   const [anchorSetting, setAnchorSetting] = useState('')   // 正在设为锚点的资产ID（''=无）
   const [anchorClearing, setAnchorClearing] = useState(false)
 
   // 设为锚点：一步式同步（后端取URL→多模态提取VAOCI→落库），成功后乐观更新 courseware
-  const handleSetAnchor = async (assetId: string) => {
+  const handleSetAnchor = async (assetId: string, notify?: (msg: string) => void) => {  // W1: notify把提示路由回MediaManagerPanel消息条
     if (!id || anchorSetting) return
     setAnchorSetting(assetId)
-    setMediaMessage('🎨 正在将该图设为风格锚点（AI读图提取风格DNA，约需数秒）...')
+    notify?.('🎨 正在将该图设为风格锚点（AI读图提取风格DNA，约需数秒）...')
     try {
       const res = await setStyleAnchor(id, assetId)
       // 乐观更新：把锚点两字段写回 courseware，无需整页 reload
       setCourseware(prev => prev ? { ...prev, style_anchor_asset_id: res.asset_id, style_anchor_vaoci: res.vaoci, style_anchor_url: res.anchor_url } : prev)
-      setMediaMessage('✅ 已设为风格锚点！后续生成的配图将自动参考此图风格，保持全课件视觉统一')
+      notify?.('✅ 已设为风格锚点！后续生成的配图将自动参考此图风格，保持全课件视觉统一')
     } catch (e) {
-      setMediaMessage('❌ 设置锚点失败: ' + (e instanceof Error ? e.message : '未知错误'))
+      notify?.('❌ 设置锚点失败: ' + (e instanceof Error ? e.message : '未知错误'))
     } finally { setAnchorSetting('') }
   }
 
   // 清除锚点：成功后乐观更新 courseware 锚点字段为空
-  const handleClearAnchor = async () => {
+  const handleClearAnchor = async (notify?: (msg: string) => void) => {  // W1: notify同上, 顶部锚点条调用时不传(静默)
     if (!id || anchorClearing) return
     if (!confirm('确定清除风格锚点？清除后新生成的配图将不再自动套用此风格。')) return
     setAnchorClearing(true)
     try {
       await clearStyleAnchor(id)
       setCourseware(prev => prev ? { ...prev, style_anchor_asset_id: null, style_anchor_vaoci: '', style_anchor_url: '' } : prev)
-      setMediaMessage('✅ 已清除风格锚点')
+      notify?.('✅ 已清除风格锚点')
     } catch (e) {
-      setMediaMessage('❌ 清除锚点失败: ' + (e instanceof Error ? e.message : '未知错误'))
+      notify?.('❌ 清除锚点失败: ' + (e instanceof Error ? e.message : '未知错误'))
     } finally { setAnchorClearing(false) }
   }
 
@@ -187,63 +154,7 @@ export default function CoursewareWorkshopPage() {
 
   
 
-  // 批次4b: mediaPageNum 作为 buildPreviewNum 的只读别名——唯一选中页真相源
-  const mediaPageNum = buildPreviewNum
 
-  // 批次4b: 选中页(buildPreviewNum)变化时, 自动拉取当前页媒体资产并清空旧的
-  //   替代原来媒体下拉 onChange 里的手动拉取逻辑; 切页即换页媒体, 防串页
-  useEffect(() => {
-    if (!id || buildPreviewNum <= 0) { setMediaAssetsRaw([]); return }
-    let cancelled = false
-    setMediaAssetsRaw([])
-    listPageAssets(id, buildPreviewNum)
-      .then(res => { if (!cancelled) setMediaAssetsRaw(res.assets || []) })
-      .catch(() => { if (!cancelled) setMediaAssetsRaw([]) })
-    return () => { cancelled = true }
-  }, [id, buildPreviewNum])
-
-  // 图片多提示词: 切页或切 Tab 时清空 AI 多条建议列表 + 生成框 + 参考图(防串页残留)
-  //   新页默认空生成框, 老师点卡片「填入」才填; 避免上一页手输/填入内容串到新页
-  useEffect(() => {
-    setImgSuggestions([]); setImgSuggestSelected(new Set())
-    setMediaGenPrompt(''); setMediaRefUrl('')
-    setActiveImgSuggestTab(0); setMediaStyleKey('')
-  }, [buildPreviewNum, mediaTab])
-
-  // 图片多提示词(新交互): 进入图片Tab/切到未拉过的页时, 自动出本页配图建议
-  //   顺序: 本会话缓存 → 库已存(getStoredImageSuggestions, 不调AI省token) → 都没有才调AI(那条会自动写库)
-  useEffect(() => {
-    if (mediaTab !== 'image' || !id || buildPreviewNum <= 0) return
-    const cached = imgSuggestCache.current.get(buildPreviewNum)
-    if (cached) { setImgSuggestions(cached); return }
-    let cancelled = false
-    setImgSuggestLoading(true)
-    const pageNum = buildPreviewNum
-    getStoredImageSuggestions(id, pageNum)
-      .then(stored => {
-        if (cancelled) return null
-        const list = (stored.prompts || []).map(it => ({ ...it, size: mediaSize }))
-        if (list.length > 0) {
-          imgSuggestCache.current.set(pageNum, list)
-          setImgSuggestions(list)
-          setMediaMessage('✅ 已载入本页已存的 ' + list.length + ' 条配图建议（未消耗AI）')
-          return null
-        }
-        return suggestImagePrompt(id, pageNum)
-      })
-      .then(res => {
-        if (cancelled || !res) return
-        const list = (res.prompts || []).map(it => ({ ...it, size: mediaSize }))
-        imgSuggestCache.current.set(pageNum, list)
-        setImgSuggestions(list)
-        setMediaMessage(list.length > 0
-          ? '✅ AI 建议本页配 ' + list.length + ' 张图，请在下方勾选或逐条填入生成框'
-          : '⚠️ AI 未给出配图建议，可手动填写提示词生成')
-      })
-      .catch(e => { if (!cancelled) setMediaMessage('❌ 生成配图建议失败: ' + (e instanceof Error ? e.message : '未知错误') + '（可点「重新生成配图建议」重试，或手动填写）') })
-      .finally(() => { if (!cancelled) setImgSuggestLoading(false) })
-    return () => { cancelled = true }
-  }, [mediaTab, buildPreviewNum, id])
 
   useEffect(() => { if (id) loadCourseware(); return () => { sseRef.current?.close() } }, [id])
 
@@ -274,6 +185,24 @@ export default function CoursewareWorkshopPage() {
       }
     } catch { alert('加载课件失败'); navigate('/courseware') } finally { setLoading(false) }
   }, [id, navigate])
+
+  // 字体F2b: 背景/字体秒换后的局部刷新——不整页loading重载, 保住选择器内的"已秒换N页"成功提示
+  //   只重拉页面列表更新预览(秒换只改页面HTML, 不动步骤/状态), 失败静默(老师可手动刷新)
+  const refreshPagesOnly = useCallback(async () => {
+    if (!id) return
+    try {
+      const freshPages = await getCoursewarePages(id)
+      setPages(freshPages)
+      const gp = freshPages.filter(p => p.html_content && p.html_content.trim())
+        .map(p => ({ page_number: p.page_number, title: p.title, html_content: p.html_content }))
+        .slice().sort((a, b) => a.page_number - b.page_number)
+      if (gp.length > 0) {
+        setGeneratedPages(gp)
+        const pp = gp.filter(p => p.page_number === 1)
+        if (pp.length > 0) setPreviewPages(pp)
+      }
+    } catch { /* 局部刷新失败不打断流程 */ }
+  }, [id])
 
   // v136: 通用步骤回退
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -396,159 +325,10 @@ export default function CoursewareWorkshopPage() {
     } catch (e) { setPreviewGenMessage('\u274c 微调失败: ' + (e instanceof Error ? e.message : '未知错误')) } finally { setNavRefining(false) }
   }
 
-  // P0-4: 单页AI微调(批次4a: 支持随附截图走多模态; 微调=保留页内已插入图片)
-  const handleRefinePage = async () => {
-    // 批次4b: 选中页统一用 buildPreviewNum(大预览框当前页)
-    if (!id || buildPreviewNum <= 0 || !refineInput.trim()) return
-    setRefineRunning(true)
-    try {
-      // refineImage 非空时随请求传入, 后端走多模态微调(CallAIMultimodal)
-      const result = await refinePage(id, buildPreviewNum, refineInput.trim(), refineImage || undefined)
-      if (result.html_content) {
-        setGeneratedPages(prev => prev.map(p => p.page_number === buildPreviewNum ? { ...p, html_content: result.html_content } : p))
-      }
-      setRefineInput(''); setRefineImage('')
-      setBuildMessage('\u2705 ' + result.message)
-    } catch (e) { setBuildMessage('\u274c 微调失败: ' + (e instanceof Error ? e.message : '未知错误')) } finally { setRefineRunning(false) }
-  }
-
-  // 批次4a: 单页从零重生(重生=不保留页内已插入图片, 异于微调的增量改; 后端无并发锁故运行态禁用按钮)
-  const handleRegeneratePage = async () => {
-    // 批次4b: 选中页统一用 buildPreviewNum
-    if (!id || buildPreviewNum <= 0 || regenRunning || refineRunning) return
-    // 二次确认: 重生会清空本页已插入的图片
-    if (!confirm('⚠️ 重生第 ' + buildPreviewNum + ' 页将按方案从零重画整页，会清空本页已插入的图片（图片资产仍在多媒体库，可重新插入）。确定重生？')) return
-    setRegenRunning(true); setBuildMessage('🔄 正在重生第 ' + buildPreviewNum + ' 页，请稍候...')
-    try {
-      const result = await regenerateCWPage(id, buildPreviewNum)
-      if (result.html_content) {
-        setGeneratedPages(prev => prev.map(p => p.page_number === buildPreviewNum ? { ...p, html_content: result.html_content } : p))
-      }
-      setBuildMessage('\u2705 ' + result.message)
-    } catch (e) { setBuildMessage('\u274c 重生失败: ' + (e instanceof Error ? e.message : '未知错误')) } finally { setRegenRunning(false) }
-  }
-
-  // 批次4c: 共用——将图片文件读为 dataURI 存入 refineImage(8MB上限, 截图微调走多模态)
-  //   fromPaste=true 表示来自剪贴板粘贴, 额外给出"已粘贴"提示
-  const loadRefineImageFile = (f: File, fromPaste = false) => {
-    if (f.size > 8 * 1024 * 1024) { setBuildMessage('\u274c 截图不能超过8MB'); return }
-    const reader = new FileReader()
-    reader.onload = () => {
-      setRefineImage(typeof reader.result === 'string' ? reader.result : '')
-      if (fromPaste) setBuildMessage('\u2705 已从剪贴板粘贴截图，微调将参考该图')
-    }
-    reader.onerror = () => setBuildMessage('\u274c 截图读取失败')
-    reader.readAsDataURL(f)
-  }
-
-  // 批次4c 需求②: 微调输入框 Ctrl+V 粘贴剪贴板图片 → 作为微调参考截图
-  //   仅当剪贴板含图片时 preventDefault 并消费; 纯文本粘贴走默认行为不受影响(绑在input上防全页冲突)
-  const handleRefinePaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
-    const items = e.clipboardData?.items
-    if (!items) return
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i]
-      if (it.type && it.type.startsWith('image/')) {
-        const f = it.getAsFile()
-        if (!f) continue
-        e.preventDefault()  // 阻止二进制内容污染文本输入框
-        loadRefineImageFile(f, true)
-        return
-      }
-    }
-    // 剪贴板无图片 → 不拦截, 让默认文本粘贴正常进行
-  }
 
 
-  // 图片多提示词(新交互): 「🔄重新生成配图建议」——重新调 AI 覆盖本页建议缓存并出卡片
-  //   统一以卡片呈现(含单条), 不再自动填入生成框; 老师选中卡片「填入」才进框
-  const handleSuggestImagePrompt = async () => {
-    if (!id || buildPreviewNum <= 0 || mediaPromptSuggesting) return
-    setMediaPromptSuggesting(true); setMediaMessage('🤖 AI 正在按本页方案重新撰写配图建议...')
-    try {
-      const res = await suggestImagePrompt(id, buildPreviewNum)
-      const list = (res.prompts || []).map(it => ({ ...it, size: mediaSize }))
-      imgSuggestCache.current.set(buildPreviewNum, list)
-      setImgSuggestions(list)
-      setImgSuggestSelected(new Set())
-      setMediaMessage(list.length > 0
-        ? '✅ AI 建议本页配 ' + list.length + ' 张图，请在下方勾选或逐条填入生成框'
-        : '⚠️ AI 未给出配图建议，可手动填写提示词生成')
-    } catch (e) { setMediaMessage('❌ 生成配图建议失败: ' + (e instanceof Error ? e.message : '未知错误')) }
-    finally { setMediaPromptSuggesting(false) }
-  }
 
-  // 图片多提示词: 切换某条建议的勾选状态
-  const toggleImgSuggest = (idx: number) => {
-    setImgSuggestSelected(prev => {
-      const next = new Set(prev)
-      if (next.has(idx)) next.delete(idx); else next.add(idx)
-      return next
-    })
-  }
 
-  // 图片多提示词: 修改某条建议的尺寸
-  const setImgSuggestSize = (idx: number, size: string) => {
-    setImgSuggestions(prev => prev.map((it, i) => i === idx ? { ...it, size } : it))
-  }
-
-  // 风格快选: 点风格把其描述作为后缀融入生成框(同风格再点=取消; 换风格=替换旧后缀)
-  //   不污染正文: 维护 mediaStyleKey, 替换时先剥掉上一个风格后缀("，"+旧desc)再接新的
-  const toggleImgStyle = (key: string) => {
-    const next = CW_IMG_STYLES.find(s => s.key === key)
-    setMediaGenPrompt(prev => {
-      let base = prev
-      // 遗留项②：用 styleSuffixText 记录的"上次追加的确切后缀串"直接剥除，
-      //   不依赖 endsWith 位置——即便用户在后缀之后又手输了内容，也能精准剥掉旧风格描述。
-      if (styleSuffixText) {
-        // 优先整体替换"，+后缀"，否则替换裸后缀，最后兜底清尾部标点
-        if (base.includes('，' + styleSuffixText)) base = base.replace('，' + styleSuffixText, '')
-        else if (base.includes(styleSuffixText)) base = base.replace(styleSuffixText, '')
-        base = base.replace(/[，,\s]+$/, '')
-      }
-      // 再点同一风格 = 取消(只剥不加)
-      if (key === mediaStyleKey) { setStyleSuffixText(''); return base }
-      // 换/选新风格 = 追加新后缀，并记住这次追加的确切文本供下次剥离
-      const desc = next ? next.desc : ''
-      setStyleSuffixText(desc)
-      return base ? base + '，' + desc : desc
-    })
-    setMediaStyleKey(key === mediaStyleKey ? '' : key)
-  }
-
-  // 图片多提示词: 把某条建议填入生成框(老师可微调后单独生成)
-  const fillImgSuggest = (idx: number) => {
-    const it = imgSuggestions[idx]
-    if (!it) return
-    setMediaGenPrompt(it.prompt)
-    setMediaSize(it.size)
-    setMediaMessage('✅ 已把第 ' + (idx + 1) + ' 条提示词填入生成框，可微调后点「生成图片」')
-  }
-
-  // 图片多提示词: 批量生成勾选的多张图(串行, 避免并发打爆豆包 API; 逐张塞入 mediaAssets)
-  const handleBatchGenImages = async () => {
-    if (!id || buildPreviewNum <= 0 || batchGenRunning) return
-    const idxList = Array.from(imgSuggestSelected).sort((a, b) => a - b)
-    if (idxList.length === 0) { setMediaMessage('⚠️ 请先勾选要生成的图片'); return }
-    setBatchGenRunning(true)
-    setBatchGenProgress({ done: 0, total: idxList.length })
-    setMediaMessage('🤖 开始批量生成 ' + idxList.length + ' 张图，逐张生成中...')
-    let okCount = 0; let failCount = 0
-    for (let k = 0; k < idxList.length; k++) {
-      const it = imgSuggestions[idxList[k]]
-      if (!it || !it.prompt.trim()) { failCount++; continue }
-      setBatchGenProgress({ done: k, total: idxList.length })
-      setMediaMessage('🤖 正在生成第 ' + (k + 1) + '/' + idxList.length + ' 张：' + (it.caption || it.prompt.slice(0, 20)))
-      try {
-        const res = await generateCWImage(id, buildPreviewNum, it.prompt.trim(), undefined, it.size)
-        setMediaAssets(prev => [{ id: res.asset_id, courseware_id: id, page_id: null, placeholder_id: '', asset_type: 'image', generation_prompt: it.prompt, oss_url: res.url, file_size: 0, mime_type: 'image/png', status: 'uploaded', created_at: new Date().toISOString() }, ...prev])
-        okCount++
-      } catch { failCount++ }
-    }
-    setBatchGenProgress({ done: idxList.length, total: idxList.length })
-    setMediaMessage((failCount > 0 ? '⚠️' : '✅') + ' 批量生成完成：成功 ' + okCount + ' 张' + (failCount > 0 ? '，失败 ' + failCount + ' 张' : ''))
-    setBatchGenRunning(false)
-  }
 
   // Step 4: 批量生成剩余页
   const handleBuildStart = async () => {
@@ -676,17 +456,18 @@ export default function CoursewareWorkshopPage() {
             <div style={{ fontSize: 14, fontWeight: 600, color: C.textPrimary }}>📄 已生成 {pageList.length} 页</div>
             {showSlideshow && <button onClick={() => openSlideshow()} style={{ padding: '6px 14px', borderRadius: 8, border: `1px solid ${C.primary}`, background: C.primaryBg, color: C.primary, fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>🖥️ 全屏放映</button>}
           </div>
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          {/* W3: 胶片条——单行横向滚动, 页数再多也只占一行高度(PPT/Canva同款导航模式) */}
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'nowrap', overflowX: 'auto', paddingBottom: 6 }}>
             {pageList.map(gp => (
-              <button key={gp.page_number} onClick={() => setCurrentNum(gp.page_number)} style={{
-                padding: '8px 14px', borderRadius: 10, cursor: 'pointer',
+              <button key={gp.page_number} onClick={() => setCurrentNum(gp.page_number)} title={'P' + gp.page_number + ' ' + gp.title} style={{
+                padding: '6px 10px', borderRadius: 8, cursor: 'pointer', flexShrink: 0, whiteSpace: 'nowrap',
                 border: `2px solid ${activePage === gp.page_number ? C.primary : C.border}`,
                 background: activePage === gp.page_number ? C.primaryBg : C.white,
                 color: activePage === gp.page_number ? C.primary : C.textPrimary,
-                fontSize: 13, fontWeight: activePage === gp.page_number ? 600 : 400, transition: 'all 200ms',
+                fontSize: 12, fontWeight: activePage === gp.page_number ? 600 : 400, transition: 'all 200ms',
               }}>
                 <span style={{ fontWeight: 700 }}>P{gp.page_number}</span>
-                <span style={{ marginLeft: 6, color: C.textSecondary, fontSize: 12 }}>{gp.title.length > 10 ? gp.title.slice(0, 10) + '...' : gp.title}</span>
+                <span style={{ marginLeft: 5, color: C.textSecondary, fontSize: 11 }}>{gp.title.length > 6 ? gp.title.slice(0, 6) + '…' : gp.title}</span>
               </button>
             ))}
           </div>
@@ -762,7 +543,7 @@ export default function CoursewareWorkshopPage() {
             <span style={{ flex: 1, fontSize: 12, color: C.textSecondary, lineHeight: 1.5, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }} title={courseware.style_anchor_vaoci}>
               {courseware.style_anchor_vaoci ? courseware.style_anchor_vaoci : '（已设锚点，后续配图自动套用此风格）'}
             </span>
-            <button onClick={handleClearAnchor} disabled={anchorClearing}
+            <button onClick={() => handleClearAnchor()} disabled={anchorClearing}
               style={{ padding: '4px 12px', borderRadius: 6, border: '1px solid ' + C.danger, background: 'transparent', color: C.danger, fontSize: 12, cursor: anchorClearing ? 'default' : 'pointer', whiteSpace: 'nowrap' }}>
               {anchorClearing ? '清除中...' : '✕ 清除锚点'}
             </button>
@@ -892,7 +673,7 @@ export default function CoursewareWorkshopPage() {
 
           {/* 批次2（背景图库）：选背景秒换封面（零token零等待），后续批量生成的内页自动带内页底纹 */}
           {previewPages.length > 0 && !previewGenRunning && (
-            <BackgroundPicker coursewareId={id!} onSwapped={loadCourseware} disabled={buildRunning}
+            <AppearancePanel coursewareId={id!} onSwapped={refreshPagesOnly} disabled={buildRunning}
               cwTitle={courseware.title} cwSubject={courseware.subject} cwGrade={courseware.grade} />
           )}
 
@@ -962,535 +743,51 @@ export default function CoursewareWorkshopPage() {
 
         {/* Step 5: 确认提交 */}
         {activeStep >= 5 && <div>
-          <div style={{ textAlign: 'center', marginBottom: 20 }}>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
-              <button onClick={() => goToStep(4)} style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid ' + C.border, background: 'transparent', color: C.textSecondary, fontSize: 13, cursor: 'pointer' }}>{'← 返回重新生成'}</button>
+          {/* W3: 紧凑页头——撤掉大图标仪式区, 把首屏垂直空间还给预览主体 */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: C.textPrimary }}>✅ 课件预览与确认
+              <span style={{ fontSize: 13, fontWeight: 400, color: C.textMuted, marginLeft: 8 }}>共 {generatedPages.length} 页</span>
             </div>
-            <div style={{ fontSize: 48, marginBottom: 8 }}>✅</div>
-            <div style={{ fontSize: 18, fontWeight: 600, color: C.textPrimary, marginBottom: 4 }}>课件预览与确认</div>
+            <button onClick={() => goToStep(4)} style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid ' + C.border, background: 'transparent', color: C.textSecondary, fontSize: 13, cursor: 'pointer' }}>← 返回重新生成</button>
           </div>
           {renderPagePreview(generatedPages, buildPreviewNum, setBuildPreviewNum, true)}
           
-          {/* 批次3小修8: 确认提交页也嵌背景图选择器(事后换背景是高频场景); 小修7: 批量生成中禁用防竞态 */}
-          {generatedPages.length > 0 && (
-            <BackgroundPicker coursewareId={id!} onSwapped={loadCourseware} disabled={buildRunning}
-              cwTitle={courseware.title} cwSubject={courseware.subject} cwGrade={courseware.grade} />
-          )}
 
-          {/* P0-4: 每页AI微调 */}
-          {generatedPages.length > 0 && (
-            <div style={{ marginTop: 16, padding: '16px', borderRadius: 10, border: `1px solid ${C.border}`, background: '#FAFAFA' }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 8 }}>🎨 对某页不满意？在上方预览区选中该页，输入修改意见</div>
-              {/* 批次4b: 删除独立页码下拉, 统一跟随上方大预览框选中页 buildPreviewNum */}
-              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
-                <span style={{ padding: '8px 12px', borderRadius: 8, background: C.primaryBg, color: C.primary, fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap' }}>
-                  当前：第 {buildPreviewNum || '—'} 页
-                </span>
-                <input value={refineInput} onChange={e => setRefineInput(e.target.value)}
-                  placeholder="例如：标题字号再大一些、增加图片占位...（可 Ctrl+V 粘贴截图，先在上方选要改的页）"
-                  onKeyDown={e => { if (e.key === 'Enter' && !refineRunning && buildPreviewNum > 0) handleRefinePage() }}
-                  onPaste={handleRefinePaste}
-                  style={{ flex: 1, padding: '10px 14px', borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 14, outline: 'none', minWidth: 200 }}
-                  disabled={refineRunning} />
-                <button onClick={handleRefinePage} disabled={refineRunning || buildPreviewNum <= 0 || !refineInput.trim()}
-                  style={{ padding: '10px 20px', borderRadius: 8, border: 'none', background: buildPreviewNum > 0 && refineInput.trim() && !refineRunning ? '#7C3AED' : '#E5E7EB', color: buildPreviewNum > 0 && refineInput.trim() && !refineRunning ? '#fff' : '#9CA3AF', fontSize: 14, fontWeight: 600, cursor: buildPreviewNum > 0 && refineInput.trim() && !refineRunning ? 'pointer' : 'default', whiteSpace: 'nowrap' }}>
-                  {refineRunning ? '⏳ 微调中...' : '🎨 AI微调'}
+
+
+
+          {/* 批次W2: Step5工作台Tab——预览区下方收纳全部工具, 页面高度恒定; 默认「页面微调」(最高频) */}
+          {generatedPages.length > 0 && <>
+            <div style={{ display: 'flex', gap: 8, marginTop: 20, flexWrap: 'wrap', borderBottom: '2px solid ' + C.border, paddingBottom: 12 }}>
+              {([['refine', '🛠 页面微调'], ['background', '🎨 背景'], ['font', '🔤 字体'], ['image', '🖼 图片'], ['video', '🎬 视频'], ['template', '💾 保存模板']] as const).map(([k, label]) => (
+                <button key={k} onClick={() => setWsTab(k)}
+                  style={{ padding: '10px 22px', borderRadius: 10, cursor: 'pointer',
+                    border: '2px solid ' + (wsTab === k ? C.primary : C.border),
+                    background: wsTab === k ? C.primaryBg : '#fff',
+                    color: wsTab === k ? C.primary : C.textSecondary,
+                    fontSize: 14, fontWeight: wsTab === k ? 600 : 400, transition: 'all 200ms' }}>
+                  {label}
                 </button>
-              </div>
-              {/* 批次4a: 截图粘贴 + 重生本页 */}
-              <div style={{ display: 'flex', gap: 10, marginTop: 10, flexWrap: 'wrap', alignItems: 'center' }}>
-                {refineImage ? (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <img src={refineImage} alt="参考截图" style={{ width: 40, height: 40, objectFit: 'cover', borderRadius: 6, border: '2px solid #7C3AED' }} />
-                    <span style={{ fontSize: 11, color: '#7C3AED' }}>已附截图(微调将参考)</span>
-                    <button onClick={() => setRefineImage('')} disabled={refineRunning || regenRunning} style={{ padding: '2px 8px', borderRadius: 4, border: '1px solid #EF4444', background: 'transparent', color: '#EF4444', fontSize: 11, cursor: (refineRunning || regenRunning) ? 'default' : 'pointer' }}>移除</button>
-                  </div>
-                ) : (
-                  <button onClick={() => {
-                    const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*'
-                    inp.onchange = (ev) => {
-                      const f = (ev.target as HTMLInputElement).files?.[0]
-                      if (!f) return
-                      loadRefineImageFile(f)
-                    }; inp.click()
-                  }} disabled={refineRunning || regenRunning} style={{ padding: '8px 14px', borderRadius: 8, border: '1px dashed #7C3AED', background: 'rgba(124,58,237,0.04)', color: '#7C3AED', fontSize: 13, cursor: (refineRunning || regenRunning) ? 'default' : 'pointer' }}>📷 附截图微调（或在输入框 Ctrl+V 粘贴）</button>
-                )}
-                <div style={{ flex: 1 }} />
-                <button onClick={handleRegeneratePage} disabled={buildPreviewNum <= 0 || regenRunning || refineRunning}
-                  title={buildPreviewNum <= 0 ? '请先在上方预览区选中页' : '按方案从零重画本页(会清空本页已插入的图片)'}
-                  style={{ padding: '8px 18px', borderRadius: 8, border: 'none', background: (buildPreviewNum > 0 && !regenRunning && !refineRunning) ? 'linear-gradient(135deg, #F59E0B, #EF4444)' : '#E5E7EB', color: (buildPreviewNum > 0 && !regenRunning && !refineRunning) ? '#fff' : '#9CA3AF', fontSize: 13, fontWeight: 600, cursor: (buildPreviewNum > 0 && !regenRunning && !refineRunning) ? 'pointer' : 'default', whiteSpace: 'nowrap' }}>
-                  {regenRunning ? '⏳ 重生中...' : '🔄 重生本页'}
-                </button>
-              </div>
-              <div style={{ marginTop: 6, fontSize: 11, color: '#9CA3AF' }}>💡 微调=在现有页面上增量修改、保留已插图片；重生=按方案从零重画、不保留已插图片。页面变形/损坏时用重生补救。截图除「附截图微调」选文件外，也可在微调输入框直接 Ctrl+V 粘贴。</div>
+              ))}
             </div>
-          )}
-          {/* v137: 保存为我的模板 */}
-          {generatedPages.length > 0 && (
-            <div style={{ marginTop: 16, padding: '16px', borderRadius: 10, border: `1px solid ${C.border}`, background: '#FAFAFA' }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 8 }}>💾 保存为我的模板（下次生成课件可复用当前风格和导航栏）</div>
-              <div style={{ display: 'flex', gap: 10 }}>
-                <input value={saveTplName} onChange={e => setSaveTplName(e.target.value)}
-                  placeholder="输入模板名称，如：我的品牌模板-蓝色版"
-                  style={{ flex: 1, padding: '10px 14px', borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 14, outline: 'none' }} />
-                <button onClick={async () => {
-                  if (!id || !saveTplName.trim() || savingTpl) return
-                  setSavingTpl(true)
-                  try {
-                    const res = await saveAsMyTemplate(id, { name: saveTplName.trim() })
-                    alert(res.message || '模板保存成功！')
-                    setSaveTplName('')
-                  } catch (e) { alert('保存失败: ' + (e instanceof Error ? e.message : '未知错误')) }
-                  finally { setSavingTpl(false) }
-                }} disabled={savingTpl || !saveTplName.trim()}
-                  style={{ padding: '10px 20px', borderRadius: 8, border: 'none', background: saveTplName.trim() && !savingTpl ? '#059669' : '#E5E7EB', color: saveTplName.trim() && !savingTpl ? '#fff' : '#9CA3AF', fontSize: 14, fontWeight: 600, cursor: saveTplName.trim() && !savingTpl ? 'pointer' : 'default', whiteSpace: 'nowrap' }}>
-                  {savingTpl ? '⏳ 保存中...' : '💾 保存模板'}
-                </button>
-              </div>
-            </div>
-          )}
-          <div style={{ marginTop: 16, padding: 20, borderRadius: 12, border: '1px solid ' + C.border, background: '#FAFAFA' }}>
-              <div style={{ fontSize: 15, fontWeight: 600, color: C.textPrimary, marginBottom: 12 }}>🖼️ 多媒体管理</div>
-
-              {/* v0.42.1: 图片/视频Tab切换 */}
-              <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-                <button onClick={() => setMediaTab('image')} style={{ padding: '8px 20px', borderRadius: 8, border: '1px solid ' + (mediaTab === 'image' ? C.primary : C.border), background: mediaTab === 'image' ? C.primaryBg : '#fff', color: mediaTab === 'image' ? C.primary : C.textSecondary, fontSize: 14, fontWeight: mediaTab === 'image' ? 600 : 400, cursor: 'pointer' }}>🖼️ 图片</button>
-                <button onClick={() => setMediaTab('video')} style={{ padding: '8px 20px', borderRadius: 8, border: '1px solid ' + (mediaTab === 'video' ? '#7C3AED' : C.border), background: mediaTab === 'video' ? 'rgba(124,58,237,0.06)' : '#fff', color: mediaTab === 'video' ? '#7C3AED' : C.textSecondary, fontSize: 14, fontWeight: mediaTab === 'video' ? 600 : 400, cursor: 'pointer' }}>🎬 视频</button>
-              </div>
-
-              {/* 批次4b: 删除独立页码下拉, 媒体管理跟随上方大预览框选中页 buildPreviewNum */}
-              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16, alignItems: 'center' }}>
-                <span style={{ padding: '10px 14px', borderRadius: 8, background: C.primaryBg, color: C.primary, fontSize: 14, fontWeight: 600, whiteSpace: 'nowrap' }}>
-                  正在管理：第 {mediaPageNum || '—'} 页的{mediaTab === 'video' ? '视频' : '图片'}
-                </span>
-                {mediaPageNum > 0 && (
-                  <button
-                    onClick={async () => {
-                      if (!id || mediaPageNum <= 0) return
-                      try {
-                        const res = await listPageAssets(id, mediaPageNum)
-                        setMediaAssets(res.assets || [])
-                      } catch { setMediaAssets([]) }
-                    }}
-                    style={{ padding: '10px 16px', borderRadius: 8, border: '1px solid ' + C.border, background: '#fff', color: C.textSecondary, fontSize: 13, cursor: 'pointer' }}
-                  >
-                    🔄 刷新列表
-                  </button>
-                )}
-                <span style={{ fontSize: 12, color: C.textMuted }}>（切换上方预览页即可管理对应页的媒体）</span>
-              </div>
-
-              {mediaPageNum > 0 && mediaTab === 'image' && (
-                <>
-                {/* 轮3：每页图列表顶部常驻锚点缩略图条——锚点是课件级，会话内从 courseware 状态直接读，跨页无需请求 */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, padding: '8px 12px', borderRadius: 10, background: courseware.style_anchor_asset_id ? 'rgba(245,158,11,0.07)' : '#FAFAFA', border: '1px solid ' + (courseware.style_anchor_asset_id ? 'rgba(245,158,11,0.3)' : C.border) }}>
-                  {courseware.style_anchor_asset_id ? (
-                    <>
-                      {courseware.style_anchor_url && (
-                        <img src={courseware.style_anchor_url} alt="风格锚点" onClick={() => setMediaPreviewUrl(courseware.style_anchor_url)} style={{ width: 44, height: 44, objectFit: 'cover', borderRadius: 8, border: '2px solid #F59E0B', cursor: 'pointer', flexShrink: 0 }} title="点击查看锚点大图" />
-                      )}
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 12, fontWeight: 600, color: '#B45309' }}>⭐ 当前风格锚点</div>
-                        <div style={{ fontSize: 11, color: C.textMuted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>本页及全课件配图将自动参考此图，保持风格与人物一致</div>
-                      </div>
-                      <button onClick={handleClearAnchor} disabled={anchorClearing}
-                        style={{ padding: '4px 12px', borderRadius: 6, border: '1px solid ' + C.danger, background: 'transparent', color: C.danger, fontSize: 12, cursor: anchorClearing ? 'default' : 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>
-                        {anchorClearing ? '清除中...' : '✕ 清除锚点'}
-                      </button>
-                    </>
-                  ) : (
-                    <div style={{ fontSize: 12, color: C.textMuted, lineHeight: 1.5 }}>
-                      💡 还未设风格锚点。在下方任意图片上点「⭐设为锚点」，之后全课件配图都会自动参考它，保持<b>画风与人物形象一致</b>。
-                    </div>
-                  )}
-                </div>
-                {/* 上半: 左右两栏 —— 左=AI配图建议(Tab切换), 右=生成图片(含风格快选) */}
-                <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-
-                  {/* 左栏: AI 配图建议(进页面自动出; 多条用 Tab 切换, 紧凑) */}
-                  <div style={{ flex: '1 1 320px', padding: 16, borderRadius: 10, border: '1px solid ' + C.border, background: '#fff' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, flexWrap: 'wrap', gap: 6 }}>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary }}>✨ AI 配图建议</div>
-                      <button onClick={handleSuggestImagePrompt} disabled={mediaPromptSuggesting || mediaGenerating || imgSuggestLoading}
-                        style={{ padding: '4px 12px', borderRadius: 6, border: '1px dashed #7C3AED', background: 'rgba(124,58,237,0.04)', color: '#7C3AED', fontSize: 12, fontWeight: 600, cursor: (mediaPromptSuggesting || mediaGenerating || imgSuggestLoading) ? 'default' : 'pointer' }}>
-                        {mediaPromptSuggesting ? '⏳ 撰写中...' : '🔄 重新生成'}
-                      </button>
-                    </div>
-
-                    {imgSuggestLoading && (
-                      <div style={{ padding: '16px 12px', borderRadius: 8, background: 'rgba(124,58,237,0.04)', color: '#7C3AED', fontSize: 12, textAlign: 'center' }}>⏳ AI 正在按本页方案生成配图建议...</div>
-                    )}
-
-                    {!imgSuggestLoading && imgSuggestions.length === 0 && (
-                      <div style={{ padding: '16px 12px', borderRadius: 8, background: '#FAFAFA', color: C.textMuted, fontSize: 12, textAlign: 'center', lineHeight: 1.6 }}>暂无配图建议<br/>本页可能无图片占位（用SVG/CSS自绘）。<br/>可点「🔄 重新生成」，或在右侧手动描述生成。</div>
-                    )}
-
-                    {imgSuggestions.length >= 1 && (() => {
-                      // Tab 越界保护(重新生成后条数变少时)
-                      const safeTab = activeImgSuggestTab < imgSuggestions.length ? activeImgSuggestTab : 0
-                      const it = imgSuggestions[safeTab]
-                      return (
-                      <div>
-                        <div style={{ fontSize: 12, color: C.textSecondary, marginBottom: 8 }}>AI 建议本页配 {imgSuggestions.length} 张图（{imgSuggestions.length > 1 ? '切 Tab 查看，勾选可批量生成' : '可填入右侧微调后生成'}）· 已勾选 {imgSuggestSelected.size}/{imgSuggestions.length}</div>
-
-                        {/* Tab 标签条(每个标签带勾选框 — 选甲: 切着看, 勾着选) */}
-                        {imgSuggestions.length > 1 && (
-                          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
-                            {imgSuggestions.map((s, idx) => {
-                              const active = idx === safeTab
-                              const checked = imgSuggestSelected.has(idx)
-                              return (
-                                <div key={idx} onClick={() => setActiveImgSuggestTab(idx)}
-                                  style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '5px 10px', borderRadius: 8, cursor: 'pointer', border: '1px solid ' + (active ? '#7C3AED' : C.border), background: active ? 'rgba(124,58,237,0.08)' : '#fff' }}>
-                                  <input type="checkbox" checked={checked} onChange={(e) => { e.stopPropagation(); toggleImgSuggest(idx) }} onClick={(e) => e.stopPropagation()} disabled={batchGenRunning}
-                                    style={{ width: 14, height: 14, cursor: batchGenRunning ? 'default' : 'pointer', accentColor: '#7C3AED' }} />
-                                  <span style={{ fontSize: 12, fontWeight: active ? 600 : 400, color: active ? '#7C3AED' : C.textSecondary }}>图{idx + 1}</span>
-                                </div>
-                              )
-                            })}
-                          </div>
-                        )}
-
-                        {/* 当前 Tab 的建议内容 */}
-                        {it && (
-                          <div style={{ padding: 10, borderRadius: 8, border: '1px solid ' + C.border, background: '#FAFAFA' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                              {imgSuggestions.length === 1 && (
-                                <input type="checkbox" checked={imgSuggestSelected.has(safeTab)} onChange={() => toggleImgSuggest(safeTab)} disabled={batchGenRunning}
-                                  style={{ width: 15, height: 15, cursor: batchGenRunning ? 'default' : 'pointer', accentColor: '#7C3AED' }} />
-                              )}
-                              <span style={{ fontSize: 12, fontWeight: 600, color: C.textPrimary }}>{'图 ' + (safeTab + 1)}{it.caption ? '：' + it.caption : ''}</span>
-                            </div>
-                            <div style={{ fontSize: 12, color: C.textSecondary, lineHeight: 1.6, whiteSpace: 'pre-wrap', maxHeight: 180, overflowY: 'auto' }}>{it.prompt}</div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-                              <span style={{ fontSize: 11, color: '#6B7280' }}>尺寸:</span>
-                              <select value={it.size} onChange={e => setImgSuggestSize(safeTab, e.target.value)} disabled={batchGenRunning}
-                                style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid ' + C.border, fontSize: 11 }}>
-                                <option value="1920x1920">1:1 正方形</option>
-                                <option value="2560x1440">16:9 宽屏</option>
-                                <option value="3072x1280">2.4:1 超宽</option>
-                                <option value="1440x2560">9:16 竖屏</option>
-                              </select>
-                              <button onClick={() => fillImgSuggest(safeTab)} disabled={batchGenRunning}
-                                style={{ padding: '4px 10px', borderRadius: 6, border: '1px solid #7C3AED', background: 'rgba(124,58,237,0.06)', color: '#7C3AED', fontSize: 11, cursor: batchGenRunning ? 'default' : 'pointer' }}>
-                                → 填入右侧
-                              </button>
-                            </div>
-                          </div>
-                        )}
-
-                        {/* 批量生成进度条 */}
-                        {batchGenRunning && batchGenProgress.total > 0 && (
-                          <div style={{ marginTop: 10 }}>
-                            <div style={{ height: 6, borderRadius: 3, background: '#EDE9FE', overflow: 'hidden' }}>
-                              <div style={{ height: '100%', borderRadius: 3, transition: 'width 400ms', width: (batchGenProgress.done / batchGenProgress.total * 100) + '%', background: 'linear-gradient(90deg, #7C3AED, #6D28D9)' }} />
-                            </div>
-                            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }}>已完成 {batchGenProgress.done} / {batchGenProgress.total} 张</div>
-                          </div>
-                        )}
-
-                        {/* 批量生成(选甲: 勾选多个 Tab 后批量) */}
-                        {imgSuggestions.length > 1 && (
-                          <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
-                            <button onClick={handleBatchGenImages} disabled={batchGenRunning || mediaGenerating || imgSuggestSelected.size === 0}
-                              style={{ padding: '8px 16px', borderRadius: 8, border: 'none', background: (!batchGenRunning && !mediaGenerating && imgSuggestSelected.size > 0) ? 'linear-gradient(135deg, #7C3AED, #6D28D9)' : '#E5E7EB', color: (!batchGenRunning && !mediaGenerating && imgSuggestSelected.size > 0) ? '#fff' : '#9CA3AF', fontSize: 13, fontWeight: 600, cursor: (!batchGenRunning && !mediaGenerating && imgSuggestSelected.size > 0) ? 'pointer' : 'default' }}>
-                              {batchGenRunning ? '⏳ 批量生成中...' : '🤖 批量生成勾选的 ' + imgSuggestSelected.size + ' 张'}
-                            </button>
-                            <button onClick={() => { setImgSuggestSelected(new Set()) }} disabled={batchGenRunning}
-                              style={{ padding: '8px 14px', borderRadius: 8, border: '1px solid ' + C.border, background: '#fff', color: C.textSecondary, fontSize: 13, cursor: batchGenRunning ? 'default' : 'pointer' }}>
-                              取消勾选
-                            </button>
-                          </div>
-                        )}
-                        <div style={{ marginTop: 6, fontSize: 11, color: '#9CA3AF' }}>💡 批量生成串行调用 AI，生成的图自动进入下方「本页图片」列表。</div>
-                      </div>
-                      )
-                    })()}
-                  </div>
-
-                  {/* 右栏: 生成图片(风格快选 + 生成框 + 尺寸 + 参考图 + 生成按钮) */}
-                  <div style={{ flex: '1 1 320px', padding: 16, borderRadius: 10, border: '1px solid ' + C.border, background: '#fff' }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 8 }}>🤖 生成图片</div>
-
-                    {/* 风格快选: 点选把风格描述融入提示词(同风格再点=取消, 换风格=替换)
-                        遗留项③：已设风格锚点时，配图由后端自动套用锚点VAOCI，优先级 锚点 > 快选预设；
-                        此时禁用快选并提示，避免双重风格指令打架 */}
-                    <div style={{ marginBottom: 8 }}>
-                      {courseware.style_anchor_asset_id ? (
-                        <div style={{ padding: '8px 12px', borderRadius: 8, background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', fontSize: 11, color: '#B45309', lineHeight: 1.6 }}>
-                          ⭐ 已设风格锚点，配图将<b>自动套用锚点风格</b>以保持全课件统一，无需再选画面风格（如需手动指定风格，请先在顶部清除锚点）。
-                        </div>
-                      ) : (
-                        <>
-                          <div style={{ fontSize: 11, color: '#6B7280', marginBottom: 6 }}>🎨 画面风格（点选融入提示词，让出图更好看）:</div>
-                          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                            {CW_IMG_STYLES.map(s => {
-                              const on = mediaStyleKey === s.key
-                              return (
-                                <button key={s.key} onClick={() => toggleImgStyle(s.key)} disabled={mediaGenerating}
-                                  style={{ padding: '5px 10px', borderRadius: 14, border: '1px solid ' + (on ? '#7C3AED' : C.border), background: on ? 'rgba(124,58,237,0.1)' : '#fff', color: on ? '#7C3AED' : C.textSecondary, fontSize: 11, fontWeight: on ? 600 : 400, cursor: mediaGenerating ? 'default' : 'pointer' }}>
-                                  {s.label}
-                                </button>
-                              )
-                            })}
-                          </div>
-                        </>
-                      )}
-                    </div>
-
-                    <textarea
-                      value={mediaGenPrompt}
-                      onChange={e => setMediaGenPrompt(e.target.value)}
-                      placeholder="从左侧建议点「→ 填入右侧」，或在此手动描述要生成的图片；可点上方风格按钮美化"
-                      rows={5}
-                      style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: '1px solid ' + C.border, fontSize: 13, resize: 'vertical', outline: 'none', boxSizing: 'border-box' }}
-                      disabled={mediaGenerating}
-                    />
-                    <div style={{ marginTop: 8 }}>
-                      <span style={{ fontSize: 12, color: '#6B7280', marginRight: 8 }}>图片比例:</span>
-                      <select value={mediaSize} onChange={e => setMediaSize(e.target.value)}
-                        style={{ padding: '6px 10px', borderRadius: 6, border: '1px solid #E5E7EB', fontSize: 12 }}
-                        disabled={mediaGenerating}>
-                        <option value="1920x1920">1:1 正方形</option>
-                        <option value="2560x1440">16:9 宽屏</option>
-                        <option value="3072x1280">2.4:1 超宽</option>
-                        <option value="1440x2560">9:16 竖屏</option>
-                      </select>
-                    </div>
-                    <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                      <span style={{ fontSize: 12, color: '#6B7280' }}>参考图:</span>
-                      {mediaRefUrl ? (
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <img src={mediaRefUrl} alt="参考图" style={{ width: 40, height: 40, objectFit: 'cover', borderRadius: 6, border: '2px solid #7C3AED' }} />
-                          <span style={{ fontSize: 11, color: '#7C3AED' }}>已选择参考图</span>
-                          <button onClick={() => setMediaRefUrl('')} style={{ padding: '2px 8px', borderRadius: 4, border: '1px solid #EF4444', background: 'transparent', color: '#EF4444', fontSize: 11, cursor: 'pointer' }}>取消</button>
-                        </div>
-                      ) : (
-                        <>
-                        <span style={{ fontSize: 11, color: '#9CA3AF' }}>无</span>
-                        <button onClick={() => {
-                          const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*'
-                          inp.onchange = async (ev) => {
-                            const f = (ev.target as HTMLInputElement).files?.[0]
-                            if (!f || !id || mediaPageNum <= 0) return
-                            if (f.size > 5 * 1024 * 1024) { setMediaMessage('❌ 参考图不能超过5MB'); return }
-                            setMediaMessage('⏳ 上传参考图中...')
-                            try {
-                              const res = await uploadCWImage(id, mediaPageNum, f)
-                              setMediaRefUrl(res.url)
-                              setMediaAssets(prev => [{ id: res.asset_id, courseware_id: id!, page_id: null, placeholder_id: '', asset_type: 'image', generation_prompt: '', oss_url: res.url, file_size: res.file_size, mime_type: res.mime_type, status: 'uploaded', created_at: new Date().toISOString() }, ...prev])
-                              setMediaMessage('✅ 参考图上传成功，已自动选为参考图')
-                            } catch (e) { setMediaMessage('❌ 上传失败: ' + (e instanceof Error ? e.message : '未知错误')) }
-                          }; inp.click()
-                        }} style={{ padding: '3px 10px', borderRadius: 5, border: '1px solid #7C3AED', background: 'rgba(124,58,237,0.06)', color: '#7C3AED', fontSize: 11, cursor: 'pointer' }}>📤 上传参考图</button>
-                        </>
-                      )}
-                    </div>
-                    <button
-                      onClick={async () => {
-                        if (!id || mediaPageNum <= 0 || !mediaGenPrompt.trim() || mediaGenerating) return
-                        setMediaGenerating(true); setMediaMessage('')
-                        try {
-                          const res = await generateCWImage(id, mediaPageNum, mediaGenPrompt.trim(), undefined, mediaSize, mediaRefUrl || undefined)
-                          setMediaMessage('✅ 图片生成成功！')
-                          setMediaAssets(prev => [{ id: res.asset_id, courseware_id: id, page_id: null, placeholder_id: '', asset_type: 'image', generation_prompt: mediaGenPrompt, oss_url: res.url, file_size: 0, mime_type: 'image/png', status: 'uploaded', created_at: new Date().toISOString() }, ...prev])
-                        } catch (e) { setMediaMessage('❌ 生成失败: ' + (e instanceof Error ? e.message : '未知错误')) }
-                        finally { setMediaGenerating(false) }
-                      }}
-                      disabled={mediaGenerating || !mediaGenPrompt.trim()}
-                      style={{ marginTop: 8, padding: '10px 20px', borderRadius: 8, border: 'none', background: mediaGenPrompt.trim() && !mediaGenerating ? 'linear-gradient(135deg, #7C3AED, #6D28D9)' : '#E5E7EB', color: mediaGenPrompt.trim() && !mediaGenerating ? '#fff' : '#9CA3AF', fontSize: 14, fontWeight: 600, cursor: mediaGenPrompt.trim() && !mediaGenerating ? 'pointer' : 'default', width: '100%' }}
-                    >
-                      {mediaGenerating ? '⏳ AI生成中（约10-30秒）...' : '🤖 生成图片'}
-                    </button>
-                  </div>
-                </div>
-
-                {/* 下半: 手动上传(通栏) */}
-                <div style={{ marginTop: 16, padding: 16, borderRadius: 10, border: '1px solid ' + C.border, background: '#fff' }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 8 }}>📤 手动上传图片</div>
-                  <div style={{ padding: '20px 16px', borderRadius: 8, border: '2px dashed ' + C.border, textAlign: 'center', cursor: 'pointer', background: '#FAFAFA' }}
-                    onClick={() => { const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*'; inp.onchange = async (ev) => { const f = (ev.target as HTMLInputElement).files?.[0]; if (!f || !id) return; if (f.size > 5 * 1024 * 1024) { setMediaMessage('❌ 图片不能超过5MB'); return } setMediaGenerating(true); setMediaMessage(''); try { const res = await uploadCWImage(id, mediaPageNum, f); setMediaMessage('✅ 上传成功！'); setMediaAssets(prev => [{ id: res.asset_id, courseware_id: id!, page_id: null, placeholder_id: '', asset_type: 'image', generation_prompt: '', oss_url: res.url, file_size: res.file_size, mime_type: res.mime_type, status: 'uploaded', created_at: new Date().toISOString() }, ...prev]) } catch (e) { setMediaMessage('❌ 上传失败: ' + (e instanceof Error ? e.message : '未知错误')) } finally { setMediaGenerating(false) } }; inp.click() }}
-                  >
-                    <div style={{ fontSize: 28, marginBottom: 6 }}>📷</div>
-                    <div style={{ fontSize: 13, color: C.textSecondary }}>点击选择图片</div>
-                    <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }}>支持 JPG/PNG/WEBP/GIF/SVG，最大5MB</div>
-                  </div>
-                </div>
-                </>
-              )}
-
-              {/* 提示消息 */}
-              {mediaTab === 'image' && mediaMessage && <div style={{ marginTop: 12, padding: '10px 14px', borderRadius: 8, background: mediaMessage.startsWith('❌') ? '#FEE2E2' : '#D1FAE5', color: mediaMessage.startsWith('❌') ? '#DC2626' : '#059669', fontSize: 13 }}>{mediaMessage}</div>}
-
-              {/* 已上传图片列表 */}
-              {(mediaAssets.filter(a => a.asset_type === 'image').length > 0 || courseware.style_anchor_asset_id) && mediaTab === 'image' && (
-                <div style={{ marginTop: 16 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 8 }}>📎 第 {mediaPageNum} 页的图片（{mediaAssets.filter(a => a.asset_type === 'image').length}张）</div>
-                  <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                    {/* 做法B：锚点图作为置顶特殊项，永远排在每页图片列表最前（读 courseware 会话缓存，跨页常驻）。
-                        点「参考」即把锚点图塞进右栏参考图，手动图生图取用；下方本页 .map 已排除锚点图本身避免重复。 */}
-                    {courseware.style_anchor_asset_id && courseware.style_anchor_url && (
-                      <div key={'anchor-pinned'} style={{ width: 'calc(25% - 9px)', minWidth: 180, borderRadius: 10, border: '2px solid #F59E0B', overflow: 'hidden', background: 'rgba(245,158,11,0.04)' }}>
-                        <img src={courseware.style_anchor_url} alt="风格锚点" onClick={() => setMediaPreviewUrl(courseware.style_anchor_url)} style={{ width: '100%', height: 140, objectFit: 'cover', display: 'block', cursor: 'pointer' }} title="点击查看锚点大图" />
-                        <div style={{ padding: '8px 10px' }}>
-                          <div style={{ fontSize: 11, color: '#B45309', fontWeight: 600, marginBottom: 6 }}>★ 课件风格锚点</div>
-                          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                            <button
-                              onClick={() => { setMediaRefUrl(courseware.style_anchor_url); setMediaMessage('✅ 已选锚点图为参考图，本次生成将参考锚点风格与人物') }}
-                              style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #7C3AED', background: 'rgba(124,58,237,0.06)', color: '#7C3AED', fontSize: 11, cursor: 'pointer' }}
-                            >参考</button>
-                            <button onClick={handleClearAnchor} disabled={anchorClearing}
-                              style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid ' + C.danger, background: 'transparent', color: C.danger, fontSize: 11, cursor: anchorClearing ? 'default' : 'pointer' }}
-                            >{anchorClearing ? '清除中' : '✕清除锚点'}</button>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                    {mediaAssets.filter(a => a.asset_type === 'image' && a.id !== courseware.style_anchor_asset_id).map(asset => (
-                      <div key={asset.id} style={{ width: 'calc(25% - 9px)', minWidth: 180, borderRadius: 10, border: '1px solid ' + C.border, overflow: 'hidden', background: '#fff' }}>
-                        <img src={asset.oss_url} alt="课件图片" onClick={() => setMediaPreviewUrl(asset.oss_url)} style={{ width: '100%', height: 140, objectFit: 'cover', display: 'block', cursor: 'pointer' }} title="点击查看大图" />
-                        <div style={{ padding: '8px 10px' }}>
-                          <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 6 }}>{asset.generation_prompt ? '🤖 AI生成' : '📤 手动上传'}{asset.public_oss_url ? ' · ☁️已上云' : ''}</div>
-                          <div style={{ display: 'flex', gap: 4 }}>
-                            
-                            {/* 风格锚点（轮3）：当前锚点显示高亮态，否则可点击设为锚点 */}
-                            {courseware.style_anchor_asset_id === asset.id ? (
-                              <span style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #F59E0B', background: 'rgba(245,158,11,0.12)', color: '#B45309', fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap' }} title="当前风格锚点">★ 锚点</span>
-                            ) : (
-                              <button
-                                onClick={() => handleSetAnchor(asset.id)}
-                                disabled={!!anchorSetting}
-                                title="设为风格锚点：后续配图将自动参考此图风格，保持全课件视觉统一"
-                                style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #F59E0B', background: 'rgba(245,158,11,0.06)', color: '#B45309', fontSize: 11, cursor: anchorSetting ? 'default' : 'pointer', whiteSpace: 'nowrap' }}
-                              >{anchorSetting === asset.id ? '⏳设置中' : '⭐设为锚点'}</button>
-                            )}
-                            <button
-                              onClick={() => { setMediaRefUrl(asset.oss_url); setMediaMessage('✅ 已选为参考图，AI将参考此图风格生成新图片') }}
-                              style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #7C3AED', background: 'rgba(124,58,237,0.06)', color: '#7C3AED', fontSize: 11, cursor: 'pointer' }}
-                            >参考</button>
-                            {asset.public_oss_url ? (
-                              <button
-                                onClick={async () => {
-                                  try {
-                                    await navigator.clipboard.writeText(asset.public_oss_url!)
-                                    setMediaMessage('📋 云盘链接已复制到剪贴板')
-                                  } catch { setMediaMessage('❌ 复制失败，请手动复制') }
-                                }}
-                                style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #059669', background: 'rgba(5,150,105,0.06)', color: '#059669', fontSize: 11, cursor: 'pointer' }}
-                                title="已上传云盘，点击复制公网链接"
-                              >📋 复制链接</button>
-                            ) : (
-                              <button
-                                onClick={async () => {
-                                  if (!id) return
-                                  setMediaMessage('⏳ 正在上传到云盘...')
-                                  try {
-                                    const res = await uploadAssetToOSS(id, asset.id)
-                                    await navigator.clipboard.writeText(res.oss_public_url)
-                                    setMediaAssets(prev => prev.map(a => a.id === asset.id ? { ...a, public_oss_url: res.oss_public_url } : a))
-                                    setMediaMessage('✅ 已上传云盘，链接已复制到剪贴板')
-                                  } catch (e) { setMediaMessage('❌ 上传云盘失败: ' + (e instanceof Error ? e.message : '未知错误')) }
-                                }}
-                                style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #0891B2', background: 'rgba(8,145,178,0.06)', color: '#0891B2', fontSize: 11, cursor: 'pointer' }}
-                                title="上传到云盘获取公网链接"
-                              >☁️云盘</button>
-                            )}
-                            <button
-                              onClick={async () => {
-                                if (!id) return
-                                const warnMsg = asset.public_oss_url
-                                  ? '⚠️ 这张图片已上传云盘。删除将同时移除云盘副本，若课件中已使用该云盘链接，图片将无法显示，且不可恢复。确定删除？'
-                                  : '确定删除这张图片？'
-                                if (!confirm(warnMsg)) return
-                                try {
-                                  await deleteCWAsset(id, asset.id)
-                                  setMediaAssets(prev => prev.filter(a => a.id !== asset.id))
-                                  setMediaMessage('✅ 已删除')
-                                } catch (e) { setMediaMessage('❌ 删除失败: ' + (e instanceof Error ? e.message : '未知错误')) }
-                              }}
-                              style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #EF4444', background: 'rgba(239,68,68,0.06)', color: '#EF4444', fontSize: 11, cursor: 'pointer' }}
-                            >删除</button>
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              
-              {/* 视频生成区: 抽成 VideoStoryboardPanel(AI分镜两步法), 见 components/VideoStoryboardPanel.tsx */}
-              {mediaTab === 'video' && mediaPageNum > 0 && (
-                <VideoStoryboardPanel
-                  coursewareId={id!}
-                  pageNum={mediaPageNum}
-                  styleAnchorAssetId={courseware.style_anchor_asset_id}
-                  onAssetCreated={(asset) => setMediaAssets(prev => prev.some(a => a.id === asset.id) ? prev : [asset, ...prev])}
-                  onPreviewImage={(url) => setMediaPreviewUrl(url)}
-                />
-              )}
-
-              {/* v0.42.1: 视频列表 + 拼接 + 裁剪（视频Tab下） */}
-              {mediaTab === 'video' && mediaPageNum > 0 && mediaAssets.filter(a => a.asset_type === 'video').length > 0 && (
-                <div style={{ marginTop: 16 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: '#7C3AED' }}>🎬 第 {mediaPageNum} 页的视频（{mediaAssets.filter(a => a.asset_type === 'video').length}个）</span>
-                    <button onClick={() => setEditorOpen(true)} style={{ padding: '6px 14px', borderRadius: 8, border: '1px solid #7C3AED', background: 'rgba(124,58,237,0.06)', color: '#7C3AED', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>🎬 打开视频编辑器</button>
-                  </div>
-                  <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                    {mediaAssets.filter(a => a.asset_type === 'video').map(asset => (
-                      <div key={asset.id} style={{ width: 240, borderRadius: 10, border: '1px solid ' + C.border, overflow: 'hidden', background: '#fff' }}>
-                        <video src={asset.oss_url} controls style={{ width: '100%', height: 135, display: 'block', background: '#000', objectFit: 'contain' }} />
-                        <div style={{ padding: '8px 10px' }}>
-                          <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 4 }}>{asset.generation_prompt ? '🤖 ' + asset.generation_prompt.slice(0,25) + (asset.generation_prompt.length > 25 ? '...' : '') : '📤 手动上传'}{asset.public_oss_url ? ' · ☁️已上云' : ''}</div>
-                          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                            
-                            {asset.public_oss_url ? (
-                              <button onClick={async () => {
-                                try {
-                                  await navigator.clipboard.writeText(asset.public_oss_url!)
-                                  setMediaMessage('📋 云盘链接已复制到剪贴板')
-                                } catch { setMediaMessage('❌ 复制失败，请手动复制') }
-                              }} style={{ padding: '3px 8px', borderRadius: 5, border: '1px solid #059669', background: 'rgba(5,150,105,0.06)', color: '#059669', fontSize: 10, cursor: 'pointer' }} title="已上传云盘，点击复制公网链接">📋 复制链接</button>
-                            ) : (
-                              <button onClick={async () => {
-                                if (!id) return
-                                setMediaMessage('⏳ 正在上传到云盘...')
-                                try {
-                                  const res = await uploadAssetToOSS(id, asset.id)
-                                  await navigator.clipboard.writeText(res.oss_public_url)
-                                  setMediaAssets(prev => prev.map(a => a.id === asset.id ? { ...a, public_oss_url: res.oss_public_url } : a))
-                                  setMediaMessage('✅ 已上传云盘，链接已复制到剪贴板')
-                                } catch (e) { setMediaMessage('❌ 上传云盘失败: ' + (e instanceof Error ? e.message : '未知错误')) }
-                              }} style={{ padding: '3px 8px', borderRadius: 5, border: '1px solid #0891B2', background: 'rgba(8,145,178,0.06)', color: '#0891B2', fontSize: 10, cursor: 'pointer' }} title="上传到云盘获取公网链接">☁️云盘</button>
-                            )}
-                            <button onClick={async () => {
-                                if (!id) return
-                                const warnMsg = asset.public_oss_url
-                                  ? '⚠️ 这个视频已上传云盘。删除将同时移除云盘副本，若课件中已使用该云盘链接，视频将无法播放，且不可恢复。确定删除？'
-                                  : '确定删除此视频？'
-                                if (!confirm(warnMsg)) return
-                                try { await deleteCWAsset(id, asset.id); setMediaAssets(prev => prev.filter(a => a.id !== asset.id)); setMediaMessage('✅ 已删除') } catch (e) { setMediaMessage('❌ 删除失败: ' + (e instanceof Error ? e.message : '')) }
-                              }} style={{ padding: '3px 8px', borderRadius: 5, border: '1px solid #EF4444', background: 'rgba(239,68,68,0.06)', color: '#EF4444', fontSize: 10, cursor: 'pointer' }}>删除</button>
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-
-
-                </div>
-              )}
-
-
-              {/* 图片大图预览弹窗 */}
-              {mediaPreviewUrl && (
-                <div onClick={() => setMediaPreviewUrl('')} style={{ position: 'fixed', inset: 0, zIndex: 99990, background: 'rgba(0,0,0,0.75)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'zoom-out' }}>
-                  <img src={mediaPreviewUrl} alt="大图预览" style={{ maxWidth: '90vw', maxHeight: '90vh', borderRadius: 12, boxShadow: '0 8px 40px rgba(0,0,0,0.5)' }} />
-                  <button onClick={(e) => { e.stopPropagation(); setMediaPreviewUrl('') }} style={{ position: 'absolute', top: 24, right: 24, width: 40, height: 40, borderRadius: '50%', border: 'none', background: 'rgba(255,255,255,0.2)', color: '#fff', fontSize: 20, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>✕</button>
-                </div>
-              )}
-            </div>
+            {wsTab === 'refine' && (
+              <RefinePanel coursewareId={id!} pageNum={buildPreviewNum}
+                onPageUpdated={(pn, html) => setGeneratedPages(prev => prev.map(p => p.page_number === pn ? { ...p, html_content: html } : p))} />
+            )}
+            {wsTab === 'background' && (
+              <AppearancePanel mode="background" coursewareId={id!} onSwapped={refreshPagesOnly} disabled={buildRunning}
+                cwTitle={courseware.title} cwSubject={courseware.subject} cwGrade={courseware.grade} />
+            )}
+            {wsTab === 'font' && (
+              <AppearancePanel mode="font" coursewareId={id!} onSwapped={refreshPagesOnly} disabled={buildRunning} />
+            )}
+            {(wsTab === 'image' || wsTab === 'video') && (
+              <MediaManagerPanel coursewareId={id!} pageNum={buildPreviewNum} courseware={courseware} mediaTab={wsTab}
+                anchorSetting={anchorSetting} anchorClearing={anchorClearing}
+                onSetAnchor={handleSetAnchor} onClearAnchor={handleClearAnchor} />
+            )}
+            {wsTab === 'template' && <TemplateSavePanel coursewareId={id!} />}
+          </>}
         </div>}
       </div>
 
@@ -1506,48 +803,7 @@ export default function CoursewareWorkshopPage() {
 
       {slideshowOpen && allSlideshowPages.length > 0 && <SlideshowPlayer pages={allSlideshowPages} initialPage={slideshowInitPage} onClose={() => setSlideshowOpen(false)} />}
 
-      {/* 视频编辑器弹窗（类剪映多片段时间轴编辑） */}
-      {editorOpen && (
-        <VideoEditorModal
-          coursewareId={id!}
-          videos={mediaAssets.filter(a => a.asset_type === 'video' && a.oss_url).map(a => ({
-            id: a.id,
-            url: a.oss_url,
-            label: a.generation_prompt || a.oss_url.split('/').pop()?.slice(0, 30) || '视频',
-          }))}
-          exporting={editorExporting}
-          onClose={() => setEditorOpen(false)}
-          onUploadVideo={async (file, onProgress) => {
-            if (!id || mediaPageNum <= 0) return null
-            const res = await uploadCWVideo(id, mediaPageNum, file, onProgress)
-            const newAsset = {
-              id: res.asset_id, courseware_id: id, page_id: null, placeholder_id: '',
-              asset_type: 'video' as const, generation_prompt: file.name,
-              oss_url: res.url, file_size: res.file_size, mime_type: res.mime_type,
-              status: 'uploaded', created_at: new Date().toISOString(),
-            }
-            setMediaAssets(prev => [newAsset, ...prev])
-            return { id: res.asset_id, url: res.url, label: file.name }
-          }}
-          onExport={async (clips) => {
-            if (!id || editorExporting) return
-            setEditorExporting(true); setMediaMessage('')
-            try {
-              const res = await advancedConcatCWVideos(id, clips)
-              setMediaMessage('\u2705 ' + res.message)
-              setMediaAssets(prev => [{
-                id: res.asset_id, courseware_id: id!, page_id: null, placeholder_id: '',
-                asset_type: 'video', generation_prompt: '\u7f16\u8f91\u5bfc\u51fa ' + clips.length + '\u4e2a\u7247\u6bb5',
-                oss_url: res.url, file_size: 0, mime_type: 'video/mp4', status: 'uploaded',
-                created_at: new Date().toISOString(),
-              }, ...prev])
-              setEditorOpen(false)
-            } catch (e) {
-              setMediaMessage('\u274c \u5bfc\u51fa\u5931\u8d25: ' + (e instanceof Error ? e.message : ''))
-            } finally { setEditorExporting(false) }
-          }}
-        />
-      )}
+      {/* 批次W1: 视频编辑器弹窗已随多媒体逻辑迁入 MediaManagerPanel */}
 
     </div>
   )

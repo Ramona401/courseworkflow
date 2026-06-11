@@ -75,6 +75,7 @@ type cwTemplateInfo struct {
 	SamplePages   []string          // 任务2新增：模板样例页HTML数组（分页参考注入生成提示词）
 	CoverBgURL    string            // 批次1新增：课件级老师选择的封面背景URL（图库快照，空=未选）
 	ContentBgURL  string            // 批次1新增：课件级老师选择的内页背景URL（空=未选）
+	FontSchemeCode string            // 字体F1新增：课件级老师选择的字体方案code（空=未选）
 }
 
 // ==================== Step 1: 生成预览页（仅封面P1） ====================

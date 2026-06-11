@@ -59,6 +59,9 @@ func registerCoursewareRoutes(
 	// 批次1: 课件背景图库处理器（图集列表 + 课件选择/清除背景并秒换已生成页）
 	bgHandler := handlers.NewCoursewareBackgroundHandler()
 
+	// 字体F1: 课件字体方案处理器（方案列表 + 课件选择/清除字体并秒换已生成页）
+	fontHandler := handlers.NewCoursewareFontHandler()
+
 	// ==================== 课件索引 SSE(内部 Token 验证,不走 authMW) ====================
 	mux.HandleFunc("/api/v1/sse/courseware/", cwIndexHandler.IndexStream)
 
@@ -149,6 +152,12 @@ func registerCoursewareRoutes(
 			return
 		}
 
+		// 字体F1: 课件字体 /api/v1/coursewares/{id}/font — GET=查当前选择 PUT=选择/清除并秒换
+		if strings.HasSuffix(path, "/font") || strings.HasSuffix(path, "/font/") {
+			fontHandler.HandleCoursewareFont(w, r)
+			return
+		}
+
 		// 批次1: 课件背景 /api/v1/coursewares/{id}/background — GET=查当前选择 PUT=选择/清除并秒换
 		if strings.HasSuffix(path, "/background") || strings.HasSuffix(path, "/background/") {
 			bgHandler.HandleCoursewareBackground(w, r)
@@ -163,6 +172,9 @@ func registerCoursewareRoutes(
 	// ==================== 批次1+3: 背景图库子树(列表/AI生成/上传/归档删除/升级系统库, 登录即可, 权限在handler内细分) ====================
 	mux.Handle("/api/v1/courseware-backgrounds", middleware.Chain(http.HandlerFunc(bgHandler.HandleLibrary), authMW))
 	mux.Handle("/api/v1/courseware-backgrounds/", middleware.Chain(http.HandlerFunc(bgHandler.HandleLibrary), authMW))
+
+	// 字体F1: 字体方案列表(5套系统预设常量, 登录即可)
+	mux.Handle("/api/v1/courseware-fonts", middleware.Chain(http.HandlerFunc(fontHandler.ListSchemes), authMW))
 
 	// ==================== v136: 方案结构预设(登录即可) ====================
 	mux.Handle("/api/v1/courseware-presets", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

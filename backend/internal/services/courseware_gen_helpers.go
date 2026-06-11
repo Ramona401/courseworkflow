@@ -625,7 +625,7 @@ func extractSampleBackgroundDecls(samplePages []string, pageNum int) string {
 //   - 注入的<style>随 html_content 持久化，离线ZIP与edu运行时同样生效。
 //
 // 调用点：封面预览(GeneratePreviewPages)、批量生成与单页重生(assembleFullPage两个出口)。
-func (s *CoursewareGenService) applyTemplateBackground(html string, tplInfo *cwTemplateInfo, pageNum int) string {
+func (s *CoursewareGenService) applyTemplateBackgroundOnly(html string, tplInfo *cwTemplateInfo, pageNum int) string {
 	if tplInfo == nil || strings.TrimSpace(html) == "" {
 		return html
 	}
@@ -863,4 +863,14 @@ func (s *CoursewareGenService) resolveLogoAndOrg(ctx context.Context, cw *models
 	}
 
 	return logoURL, orgName
+}
+
+// ==================== 字体F1：背景+字体统一注入出口 ====================
+
+// applyTemplateBackground 包装函数：原背景兜底注入逻辑整体更名为 applyTemplateBackgroundOnly（零改动），
+// 本包装让所有既有调用点（封面预览 / assembleFullPage两个出口 / 单页微调补注 / 单页重生）
+// 自动同时获得字体方案注入，无需逐处修改调用方。
+// applyFontInjection 自带 TEDNA-TPL-FONT 幂等保护与未选字体跳过逻辑（见 courseware_font_service.go）。
+func (s *CoursewareGenService) applyTemplateBackground(html string, tplInfo *cwTemplateInfo, pageNum int) string {
+	return s.applyFontInjection(s.applyTemplateBackgroundOnly(html, tplInfo, pageNum), tplInfo)
 }
