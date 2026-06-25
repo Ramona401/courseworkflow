@@ -36,9 +36,10 @@ import (
 var cwGenLog = logger.WithModule("cw_gen")
 
 // P2：单页 AI 生成失败时的自动重试参数
-//   cwGenMaxAttempts —— 单页最多尝试次数（1 次原始 + 重试，共 3 次尝试 = 重试2次）
-//   cwGenRetryBaseDelay —— 重试基础间隔，第 n 次重试前等待 n*base（1s、2s），扛中转商偶发 HTTP 500
-//   重试只在该页失败时发生，且在该页自身 goroutine 内串行进行，不阻塞其他并发页 → 成功页速度不受影响
+//
+//	cwGenMaxAttempts —— 单页最多尝试次数（1 次原始 + 重试，共 3 次尝试 = 重试2次）
+//	cwGenRetryBaseDelay —— 重试基础间隔，第 n 次重试前等待 n*base（1s、2s），扛中转商偶发 HTTP 500
+//	重试只在该页失败时发生，且在该页自身 goroutine 内串行进行，不阻塞其他并发页 → 成功页速度不受影响
 const (
 	cwGenMaxAttempts    = 3
 	cwGenRetryBaseDelay = 1 * time.Second
@@ -68,13 +69,13 @@ type cwStyleConfig struct {
 
 // cwTemplateInfo 模板的关键信息（用于注入AI提示词）
 type cwTemplateInfo struct {
-	Name          string            // 模板名称
-	StyleCategory string            // 风格类别
-	CSSVariables  map[string]string // CSS变量键值对
-	ColorScheme   map[string]string // 配色方案键值对
-	SamplePages   []string          // 任务2新增：模板样例页HTML数组（分页参考注入生成提示词）
-	CoverBgURL    string            // 批次1新增：课件级老师选择的封面背景URL（图库快照，空=未选）
-	ContentBgURL  string            // 批次1新增：课件级老师选择的内页背景URL（空=未选）
+	Name           string            // 模板名称
+	StyleCategory  string            // 风格类别
+	CSSVariables   map[string]string // CSS变量键值对
+	ColorScheme    map[string]string // 配色方案键值对
+	SamplePages    []string          // 任务2新增：模板样例页HTML数组（分页参考注入生成提示词）
+	CoverBgURL     string            // 批次1新增：课件级老师选择的封面背景URL（图库快照，空=未选）
+	ContentBgURL   string            // 批次1新增：课件级老师选择的内页背景URL（空=未选）
 	FontSchemeCode string            // 字体F1新增：课件级老师选择的字体方案code（空=未选）
 }
 
@@ -159,6 +160,8 @@ func (s *CoursewareGenService) GeneratePreviewPages(ctx context.Context, coursew
 	})
 
 	// ---- 7. 生成封面页 ----
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（封面预览，操作者=userID）
+	previewSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
 	successCount := 0
 	failCount := 0
 	var errors []string
@@ -185,7 +188,7 @@ func (s *CoursewareGenService) GeneratePreviewPages(ctx context.Context, coursew
 		userPrompt := s.buildPreviewUserPrompt(page, pageNum, totalPages, tplInfo, logoURL, orgName, matchedComps, cw)
 
 		// 调用AI生成
-		traceCtx := &ai.TraceContext{SceneCode: "courseware_generate", UserID: &userID}
+		traceCtx := &ai.TraceContext{SceneCode: "courseware_generate", UserID: &userID, SchoolID: schoolIDPtr(previewSchoolID)}
 		result, aiErr := ai.CallAI(aiCfg, genPrompt.Content, userPrompt, traceCtx)
 		if aiErr != nil {
 			errMsg := fmt.Sprintf("封面预览AI生成失败: %v", aiErr)
@@ -439,6 +442,8 @@ func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, cours
 	defer cwGenCancelMap.Delete(coursewareID)
 
 	// ---- 9. 受控并发生成 ----
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（批量生成，操作者=userID；提到 goroutine 外解析一次，并发页共用）
+	remainingSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
 	// 共享计数器 + 错误收集，全部用 mu 保护
 	var (
 		mu           sync.Mutex
@@ -516,7 +521,7 @@ func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, cours
 
 			// 调用AI生成（每页独立 traceCtx，无共享）；P2：失败自动重试最多 cwGenMaxAttempts 次
 			//   重试仅发生在该页失败时，串行在本 goroutine 内重试，不阻塞其他并发页 → 成功页速度不变。
-			traceCtx := &ai.TraceContext{SceneCode: "courseware_generate", UserID: &userID}
+			traceCtx := &ai.TraceContext{SceneCode: "courseware_generate", UserID: &userID, SchoolID: schoolIDPtr(remainingSchoolID)}
 			var result *ai.CallResult
 			var aiErr error
 			for attempt := 1; attempt <= cwGenMaxAttempts; attempt++ {

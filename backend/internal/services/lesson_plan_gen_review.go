@@ -99,7 +99,54 @@ func (s *LessonPlanGenService) handleWriteStageOutput(
 
 	if content == "" {
 		lpGenLog.Warn("write阶段未能提取到教案内容", "plan_id", planID)
+		// v203修复（画布不更新）：本轮AI回复未识别到完整教案（可能是对话性内容如
+		// "正文已更新不再重复输出"），但DB已有正文时，仍广播已有正文刷新画布，
+		// 保证画布与DB始终同步——否则老师看到AI说"已更新"但画布纹丝不动。
+		existingForBroadcast := strings.TrimSpace(lp.ContentMarkdown)
+		if existingForBroadcast != "" {
+			GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
+				EventType: models.LPSSEContentUpdate,
+				PlanID:    planID,
+				Content:   existingForBroadcast,
+			})
+			lpGenLog.Info("write阶段未提取到新内容，广播已有教案正文刷新画布",
+				"plan_id", planID, "existing_len", len(existingForBroadcast))
+		}
 		return
+	}
+
+	// v203修复（只存后半部分）：缩写保护——当AI模型因max_tokens截断只输出后半段教案时，
+	// 该截断片段可能通过DetectLessonPlanContent的五重检测（后半段仍含足够标记词），
+	// 如果不拦截就会整段覆盖之前已存的完整教案，导致教案永久丢失前半部分。
+	// 保护规则：已有正文≥800字 且 新正文不到已有的70% 且 新正文前300字不含"教学目标/教学设计"
+	// （不是从头开始的完整新版教案）→ 拒绝覆盖，广播已有正文刷新画布。
+	// 安全边界：
+	//   - 首次生成（已有为空）→ 不触发（正常保存）
+	//   - 老师要求缩短但从头写的完整版 → 前300字含"教学目标"，允许覆盖
+	//   - 修订/扩写后的更长版 → 新>已有*70%，允许覆盖
+	//   - AI截断的后半段 → 短且不含开头标志，拦截覆盖
+	existingMd := strings.TrimSpace(lp.ContentMarkdown)
+	existingRunes := []rune(existingMd)
+	newRunes := []rune(content)
+	if len(existingRunes) > 800 && len(newRunes) < len(existingRunes)*7/10 {
+		headLen := 300
+		if len(newRunes) < headLen {
+			headLen = len(newRunes)
+		}
+		headCheck := string(newRunes[:headLen])
+		if !strings.Contains(headCheck, "教学目标") && !strings.Contains(headCheck, "教学设计") {
+			lpGenLog.Warn("write阶段缩写保护：新内容明显短于已有内容且非完整教案开头，拒绝覆盖",
+				"plan_id", planID,
+				"existing_runes", len(existingRunes),
+				"new_runes", len(newRunes))
+			// 广播已有正文刷新画布（保持同步）
+			GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
+				EventType: models.LPSSEContentUpdate,
+				PlanID:    planID,
+				Content:   existingMd,
+			})
+			return
+		}
 	}
 
 	// 更新教案正文到lesson_plans表
@@ -240,7 +287,7 @@ func (s *LessonPlanGenService) executeAIReviewAsync(ctx context.Context, lp *mod
 
 	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
 	if err != nil {
-		s.broadcastError(planID, "AI评审配置失败: "+err.Error())
+		s.broadcastError(planID, "", "AI评审配置失败: "+err.Error())
 		return
 	}
 
@@ -256,7 +303,7 @@ func (s *LessonPlanGenService) executeAIReviewAsync(ctx context.Context, lp *mod
 	}
 	result, err := aiClient.CallAI(aiCfg, systemPrompt, reviewPrompt, reviewTraceCtx)
 	if err != nil {
-		s.broadcastError(planID, "AI评审失败: "+err.Error())
+		s.broadcastError(planID, "", "AI评审失败: "+err.Error())
 		return
 	}
 
@@ -335,13 +382,13 @@ func (s *LessonPlanGenService) applyAndReviewAsync(
 
 	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
 	if err != nil {
-		s.broadcastError(planID, "AI配置失败: "+err.Error())
+		s.broadcastError(planID, "", "AI配置失败: "+err.Error())
 		return
 	}
 
 	suggestions := extractSuggestionsByIDs(lp.AIReviewResult, suggestionIDs)
 	if len(suggestions) == 0 {
-		s.broadcastError(planID, "未找到有效的改进建议")
+		s.broadcastError(planID, "", "未找到有效的改进建议")
 		return
 	}
 
@@ -359,13 +406,13 @@ func (s *LessonPlanGenService) applyAndReviewAsync(
 	}
 	result, err := aiClient.CallAI(aiCfg, systemPrompt, optimizePrompt, optimizeTraceCtx)
 	if err != nil {
-		s.broadcastError(planID, "AI优化失败: "+err.Error())
+		s.broadcastError(planID, "", "AI优化失败: "+err.Error())
 		return
 	}
 
 	newContent := strings.TrimSpace(result.Content)
 	if newContent == "" {
-		s.broadcastError(planID, "AI优化返回内容为空")
+		s.broadcastError(planID, "", "AI优化返回内容为空")
 		return
 	}
 

@@ -234,7 +234,8 @@ export default function RecipesPage() {
   const isFiltered = scopeFilter !== 'all' || subjectFilter !== '全部'
   const handleReset = () => { setScopeFilter('all'); setSubjectFilter('全部') }
 
-  const handleEdit = (id: string) => navigate(`/lesson-plans/recipes/${id}/edit`, { state: { from: '/lesson-plans/recipes' } })
+  // 配方搭建一页化批次4：编辑入口改指向分步向导编辑态（旧单页编辑器已退役为重定向）
+  const handleEdit = (id: string) => navigate(`/lesson-plans/recipes/wizard/${id}`)
   const handleFork = async (id: string) => {
     if (loadingId) return; setLoadingId(id)
     try { const f = await forkRecipe(id); showToast(`已Fork配方「${f.name}」✓`); if (activeTab === 'mine') await loadRecipes() }

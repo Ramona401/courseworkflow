@@ -261,14 +261,16 @@ func UpdateRecipe(ctx context.Context, id string, req *models.UpdateRecipeReques
 		    custom_notes = $7, custom_prompt = $8,
 		    lesson_structure = $9, prompt_mode = $10,
 		    stages_config = $11,
-		    version = version + 1, updated_at = $12
-		WHERE id = $13 AND status = 'active'
+		    subject = $12, grade_range = $13,
+		    version = version + 1, updated_at = $14
+		WHERE id = $15 AND status = 'active'
 	`,
 		req.Name, req.Description, string(componentJSON),
 		req.StudentProfile, req.TeachingStyle, req.SchoolRequirements,
 		req.CustomNotes, req.CustomPrompt,
 		lessonStructure, promptMode,
 		stagesConfig,
+		req.Subject, req.GradeRange,
 		now, id,
 	)
 	if err != nil {

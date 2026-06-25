@@ -1,23 +1,22 @@
 package ai
 
-// client_tts.go — 豆包(Volcengine) seed-tts-2.0 语音合成API客户端
+// client_tts.go — TTS语音合成客户端（多provider分流路由层）
 //
-// v0.42.9 新增：对接豆包 TTS API，为字幕条生成配音
+// S-V1.5 重构（迭代3.5子专项S）：
+//   - 引入 tts_provider 配置分流：volcano_v3（火山豆包语音v3，默认）/ volcano_openai（旧OpenAI兼容，已知不可用，保留回退）
+//   - 真相修正：豆包语音合成2.0不走火山方舟，走 openspeech.bytedance.com 的 v3 接口，
+//     鉴权为 APP ID + Access Token（X-Api-App-Id / X-Api-Access-Key 请求头），
+//     旧实现调用的 {方舟base_url}/audio/speech 端点不存在，这是历史404的真正根因。
+//   - 音色表替换为账号实际开通的豆包2.0真实音色（_uranus_ / saturn_ 系，10个）。
+//   - v3具体实现在 client_tts_v3.go；本文件保留路由、音色表、配置加载、旧OpenAI实现。
+//   - 将来接入阿里云百炼TTS：加 provider 常量 + 新实现文件 + GetTTSConfig 分支即可。
 //
-// API 模式：同步调用（与图片生成类似），返回音频二进制流
-//
-// 请求格式（火山引擎 OpenAPI 兼容格式）：
-//   POST {base_url}/audio/speech
-//   Body: { model, input, voice, response_format, speed }
-//   返回: 音频二进制流（mp3）
-//
-// 配置管理：
-//   - 复用图片API的 image_api_base_url 和 image_api_key_enc（同一个豆包平台）
-//   - tts_default_model: 默认TTS模型名（ai_configs表）
-//   - ai_scene_configs.courseware_subtitle_tts 可覆盖模型
-//
-// 音色列表：
-//   豆包 seed-tts-2.0 内置中文+英文音色，通过 voice 参数指定
+// 配置键（ai_configs表，经 /api/v1/admin/tts-config 维护）：
+//   - tts_provider          : volcano_v3 / volcano_openai（缺省按 volcano_v3）
+//   - tts_app_id            : 火山豆包语音应用的 APP ID（明文）
+//   - tts_access_token_enc  : 火山 Access Token（AES加密存储）
+//   - tts_v3_base_url       : 可选，v3接口基地址覆盖（缺省 https://openspeech.bytedance.com）
+//   旧OpenAI路径仍读: image_api_base_url / image_api_key_enc / tts_default_model
 
 import (
 	"bytes"
@@ -42,9 +41,20 @@ import (
 // 模块日志
 var ttsLog = logger.WithModule("ai_tts")
 
+// ==================== Provider 常量 ====================
+
+const (
+	// TTSProviderVolcanoV3 火山豆包语音 v3 接口（openspeech.bytedance.com，APP ID + Access Token 鉴权）
+	TTSProviderVolcanoV3 = "volcano_v3"
+	// TTSProviderOpenAI 旧 OpenAI 兼容接口路径（已知不可用，仅作历史回退保留）
+	TTSProviderOpenAI = "volcano_openai"
+	// ttsV3DefaultBaseURL v3 接口默认基地址
+	ttsV3DefaultBaseURL = "https://openspeech.bytedance.com"
+)
+
 // ==================== 请求/响应结构体 ====================
 
-// TTSRequest TTS语音合成请求体（豆包OpenAI兼容格式）
+// TTSRequest TTS语音合成请求体（旧OpenAI兼容格式，仅 volcano_openai 路径使用）
 type TTSRequest struct {
 	Model          string  `json:"model"`                     // 模型名
 	Input          string  `json:"input"`                     // 要合成的文本
@@ -58,22 +68,25 @@ type TTSResult struct {
 	AudioFilePath string  // 生成的音频文件本地路径
 	AudioURL      string  // 音频文件的公网URL
 	Duration      float64 // 音频时长（秒，由ffprobe获取）
-	ModelUsed     string  // 使用的模型
+	ModelUsed     string  // 使用的模型/资源标识
 	FileSize      int64   // 文件大小（字节）
 }
 
 // TTSConfig TTS语音合成API配置（从AI配置中心加载）
 type TTSConfig struct {
-	APIBaseURL string // API基地址（复用图片API）
-	APIKey     string // 明文API Key（已解密，复用图片API）
-	Model      string // TTS模型名
+	Provider    string // provider标识：volcano_v3 / volcano_openai
+	APIBaseURL  string // API基地址（v3为openspeech域名；openai路径复用图片API）
+	APIKey      string // 明文API Key（仅openai路径使用）
+	Model       string // 模型/资源标识（v3路径仅作展示与追踪标签）
+	AppID       string // 火山豆包语音 APP ID（仅v3路径）
+	AccessToken string // 火山 Access Token 明文（仅v3路径，已解密）
 }
 
 // ==================== 音色定义 ====================
 
 // TTSVoice 单个音色定义
 type TTSVoice struct {
-	Code     string `json:"code"`     // 音色代码（传给API的voice参数）
+	Code     string `json:"code"`     // 音色代码（传给API的speaker/voice参数）
 	Name     string `json:"name"`     // 音色名称（中文展示）
 	Language string `json:"language"` // 适用语言：zh-CN / en-US / multi
 	Gender   string `json:"gender"`   // 性别：female / male
@@ -81,27 +94,30 @@ type TTSVoice struct {
 }
 
 // AvailableTTSVoices 可用音色列表
-// 豆包 seed-tts-2.0 内置音色（精选常用的）
+// S-V1.5：替换为账号实际开通的豆包语音合成2.0真实音色（来自火山控制台音色详情页）。
+// 命名规律：*_uranus_bigtts 为通用2.0音色，saturn_* 为角色扮演2.0音色，
+// 两类对应 X-Api-Resource-Id 均为 seed-tts-2.0（由 client_tts_v3.go 自动推导）。
+// 账号共99个音色，此处精选K12课件配音常用10个；新增音色只需在此加一行。
 var AvailableTTSVoices = []TTSVoice{
-	// 中文女声
-	{Code: "zh_female_shuangkuai", Name: "爽快女声", Language: "zh-CN", Gender: "female", Style: "活泼清晰"},
-	{Code: "zh_female_wennuan", Name: "温暖女声", Language: "zh-CN", Gender: "female", Style: "温柔亲切"},
-	{Code: "zh_female_tianmei", Name: "甜美女声", Language: "zh-CN", Gender: "female", Style: "甜美可爱"},
-	{Code: "zh_female_qingche", Name: "清澈女声", Language: "zh-CN", Gender: "female", Style: "清澈干净"},
-	// 中文男声
-	{Code: "zh_male_chunhou", Name: "醇厚男声", Language: "zh-CN", Gender: "male", Style: "沉稳大气"},
-	{Code: "zh_male_yangguang", Name: "阳光男声", Language: "zh-CN", Gender: "male", Style: "阳光积极"},
-	{Code: "zh_male_qinqie", Name: "亲切男声", Language: "zh-CN", Gender: "male", Style: "亲切自然"},
-	// 英文女声
-	{Code: "en_female_sarah", Name: "Sarah", Language: "en-US", Gender: "female", Style: "Professional"},
-	{Code: "en_female_emily", Name: "Emily", Language: "en-US", Gender: "female", Style: "Friendly"},
+	// 中文女声·通用
+	{Code: "zh_female_vv_uranus_bigtts", Name: "vivi 2.0", Language: "zh-CN", Gender: "female", Style: "通用场景·自然清晰"},
+	{Code: "zh_female_xiaohe_uranus_bigtts", Name: "小何", Language: "zh-CN", Gender: "female", Style: "通用场景·亲切讲解"},
+	// 中文男声·通用
+	{Code: "zh_male_m191_uranus_bigtts", Name: "云舟", Language: "zh-CN", Gender: "male", Style: "通用场景·沉稳叙述"},
+	{Code: "zh_male_taocheng_uranus_bigtts", Name: "小天", Language: "zh-CN", Gender: "male", Style: "通用场景·阳光自然"},
+	// 中文女声·角色扮演（适合低学段课件）
+	{Code: "saturn_zh_female_cancan_tob", Name: "知性灿灿", Language: "zh-CN", Gender: "female", Style: "角色扮演·知性教师感"},
+	{Code: "saturn_zh_female_keainvsheng_tob", Name: "可爱女生", Language: "zh-CN", Gender: "female", Style: "角色扮演·活泼可爱"},
+	{Code: "saturn_zh_female_tiaopigongzhu_tob", Name: "调皮公主", Language: "zh-CN", Gender: "female", Style: "角色扮演·俏皮童趣"},
+	// 中文男声·角色扮演
+	{Code: "saturn_zh_male_shuanglangshaonian_tob", Name: "爽朗少年", Language: "zh-CN", Gender: "male", Style: "角色扮演·少年朝气"},
+	{Code: "saturn_zh_male_tiancaitongzhuo_tob", Name: "天才同桌", Language: "zh-CN", Gender: "male", Style: "角色扮演·聪明同伴"},
 	// 英文男声
-	{Code: "en_male_ryan", Name: "Ryan", Language: "en-US", Gender: "male", Style: "Clear"},
-	{Code: "en_male_adam", Name: "Adam", Language: "en-US", Gender: "male", Style: "Deep"},
-	// 多语言（中英双语）
-	{Code: "multi_female_shuangyu", Name: "双语女声", Language: "multi", Gender: "female", Style: "中英流畅切换"},
-	{Code: "multi_male_shuangyu", Name: "双语男声", Language: "multi", Gender: "male", Style: "中英流畅切换"},
+	{Code: "en_male_tim_uranus_bigtts", Name: "Tim", Language: "en-US", Gender: "male", Style: "General · Clear"},
 }
+
+// ttsDefaultVoice 默认音色（未指定时使用）
+const ttsDefaultVoice = "zh_female_vv_uranus_bigtts"
 
 // GetTTSVoicesByLanguage 按语言筛选可用音色
 func GetTTSVoicesByLanguage(language string) []TTSVoice {
@@ -119,35 +135,55 @@ func GetTTSVoicesByLanguage(language string) []TTSVoice {
 	return result
 }
 
-// ==================== TTS 合成核心函数 ====================
+// ==================== TTS 合成入口（provider分流路由） ====================
 
-// SynthesizeSpeech 调用豆包TTS API合成语音
-// 参数：
-//   - cfg: TTS API配置
+// SynthesizeSpeech 语音合成统一入口——按配置中的provider分流到具体实现
+// 参数与返回值对所有provider保持一致，调用方（字幕服务等）零改动：
+//   - cfg: TTS API配置（GetTTSConfig加载）
 //   - text: 要合成的文本
-//   - voice: 音色代码
+//   - voice: 音色代码（空则用默认音色）
 //   - speed: 语速（0则默认1.0）
 //   - outputDir: 输出文件目录
 //   - outputName: 输出文件名（不含扩展名，自动加.mp3）
 //   - traceCtx: 追踪上下文（可为nil）
 func SynthesizeSpeech(ctx context.Context, cfg *TTSConfig, text string, voice string, speed float64, outputDir string, outputName string, traceCtx *TraceContext) (*TTSResult, error) {
+	// 公共参数校验与默认值
 	if cfg == nil {
 		return nil, fmt.Errorf("TTS配置为空")
-	}
-	if cfg.APIBaseURL == "" || cfg.APIKey == "" {
-		return nil, fmt.Errorf("TTS API未配置（请在AI管理中心配置图片/视频生成API地址和密钥）")
-	}
-	if cfg.Model == "" {
-		return nil, fmt.Errorf("TTS模型未配置")
 	}
 	if text == "" {
 		return nil, fmt.Errorf("合成文本不能为空")
 	}
 	if voice == "" {
-		voice = "zh_female_shuangkuai" // 默认中文爽快女声
+		voice = ttsDefaultVoice
 	}
 	if speed <= 0 {
 		speed = 1.0
+	}
+
+	// 按provider分流
+	switch cfg.Provider {
+	case TTSProviderVolcanoV3:
+		return synthesizeSpeechV3(ctx, cfg, text, voice, speed, outputDir, outputName, traceCtx)
+	case TTSProviderOpenAI:
+		return synthesizeSpeechOpenAI(ctx, cfg, text, voice, speed, outputDir, outputName, traceCtx)
+	default:
+		// 未知provider按v3处理（v3为当前唯一可用通道）
+		ttsLog.Warn("未知TTS provider，按volcano_v3处理", "provider", cfg.Provider)
+		return synthesizeSpeechV3(ctx, cfg, text, voice, speed, outputDir, outputName, traceCtx)
+	}
+}
+
+// ==================== 旧OpenAI兼容实现（volcano_openai路径，保留回退） ====================
+
+// synthesizeSpeechOpenAI 旧OpenAI兼容格式实现（原SynthesizeSpeech主体，原样保留）
+// 已知该路径对豆包2.0不可用（端点不存在），仅作provider回退选项保留。
+func synthesizeSpeechOpenAI(ctx context.Context, cfg *TTSConfig, text string, voice string, speed float64, outputDir string, outputName string, traceCtx *TraceContext) (*TTSResult, error) {
+	if cfg.APIBaseURL == "" || cfg.APIKey == "" {
+		return nil, fmt.Errorf("TTS API未配置（请在AI管理中心配置图片/视频生成API地址和密钥）")
+	}
+	if cfg.Model == "" {
+		return nil, fmt.Errorf("TTS模型未配置")
 	}
 
 	// 构建API URL
@@ -167,7 +203,7 @@ func SynthesizeSpeech(ctx context.Context, cfg *TTSConfig, text string, voice st
 		return nil, fmt.Errorf("序列化TTS请求失败: %w", err)
 	}
 
-	ttsLog.Info("调用TTS语音合成API",
+	ttsLog.Info("调用TTS语音合成API(OpenAI兼容路径)",
 		"url", apiURL,
 		"model", cfg.Model,
 		"text_len", len(text),
@@ -235,7 +271,7 @@ func SynthesizeSpeech(ctx context.Context, cfg *TTSConfig, text string, voice st
 	// 获取音频时长（通过ffprobe）
 	duration := getAudioDuration(outputPath)
 
-	ttsLog.Info("TTS合成成功",
+	ttsLog.Info("TTS合成成功(OpenAI兼容路径)",
 		"model", cfg.Model,
 		"voice", voice,
 		"text_len", len(text),
@@ -303,12 +339,59 @@ func getAudioDuration(filePath string) float64 {
 
 // ==================== 配置加载 ====================
 
-// GetTTSConfig 从AI配置中心加载TTS API配置
-// 复用图片API的 base_url 和 api_key，单独读取 tts_default_model
+// GetTTSConfig 从AI配置中心加载TTS配置（S-V1.5：按provider分支加载）
+//   - volcano_v3（默认）: 读 tts_app_id + tts_access_token_enc(AES解密) + 可选tts_v3_base_url
+//   - volcano_openai    : 沿用旧逻辑（image_api_base_url/image_api_key_enc/tts_default_model）
 func GetTTSConfig(aesKey string) (*TTSConfig, error) {
 	ctx := context.Background()
 	cfg := &TTSConfig{}
 
+	// 读取provider（缺省/为空按 volcano_v3）
+	var provider string
+	_ = database.DB.QueryRow(ctx,
+		`SELECT config_value FROM ai_configs WHERE config_key = 'tts_provider'`).Scan(&provider)
+	if strings.TrimSpace(provider) == "" {
+		provider = TTSProviderVolcanoV3
+	}
+	cfg.Provider = provider
+
+	// ---------- volcano_v3 分支 ----------
+	if provider == TTSProviderVolcanoV3 {
+		// APP ID（必填）
+		var appID string
+		if err := database.DB.QueryRow(ctx,
+			`SELECT config_value FROM ai_configs WHERE config_key = 'tts_app_id'`).Scan(&appID); err != nil || strings.TrimSpace(appID) == "" {
+			return nil, fmt.Errorf("TTS未配置：缺少火山APP ID（请在AI管理中心或 /api/v1/admin/tts-config 配置）")
+		}
+		cfg.AppID = strings.TrimSpace(appID)
+
+		// Access Token（必填，AES解密）
+		var tokenEnc string
+		if err := database.DB.QueryRow(ctx,
+			`SELECT config_value FROM ai_configs WHERE config_key = 'tts_access_token_enc'`).Scan(&tokenEnc); err != nil || strings.TrimSpace(tokenEnc) == "" {
+			return nil, fmt.Errorf("TTS未配置：缺少火山Access Token（请在AI管理中心或 /api/v1/admin/tts-config 配置）")
+		}
+		token, err := utils.DecryptAES(tokenEnc, aesKey)
+		if err != nil {
+			return nil, fmt.Errorf("TTS Access Token解密失败: %w", err)
+		}
+		cfg.AccessToken = token
+
+		// 基地址（可选覆盖，缺省官方域名）
+		var baseURL string
+		_ = database.DB.QueryRow(ctx,
+			`SELECT config_value FROM ai_configs WHERE config_key = 'tts_v3_base_url'`).Scan(&baseURL)
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = ttsV3DefaultBaseURL
+		}
+		cfg.APIBaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+
+		// Model字段在v3路径仅作展示标签（实际resource id按音色推导）
+		cfg.Model = "seed-tts-2.0"
+		return cfg, nil
+	}
+
+	// ---------- volcano_openai 分支（旧逻辑原样保留） ----------
 	// 复用图片API的基地址
 	var baseURL string
 	err := database.DB.QueryRow(ctx,

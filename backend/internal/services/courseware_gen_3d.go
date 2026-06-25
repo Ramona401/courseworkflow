@@ -79,11 +79,11 @@ func (s *CoursewareGenService) Generate3DSinglePage(ctx context.Context, coursew
 		EventType: CWSSEGenStart,
 		Data: map[string]interface{}{
 			"courseware_id": coursewareID,
-			"total_pages":  1,
-			"template":     "3D互动单页",
-			"message":      "正在生成3D互动单页，这可能需要1-3分钟，请耐心等待...",
-			"is_preview":   false,
-			"is_3d_single": true,
+			"total_pages":   1,
+			"template":      "3D互动单页",
+			"message":       "正在生成3D互动单页，这可能需要1-3分钟，请耐心等待...",
+			"is_preview":    false,
+			"is_3d_single":  true,
 		},
 	})
 
@@ -109,7 +109,9 @@ func (s *CoursewareGenService) Generate3DSinglePage(ctx context.Context, coursew
 	})
 
 	// ---- 7. 调用AI生成（单次调用，输出完整3D HTML） ----
-	traceCtx := &ai.TraceContext{SceneCode: "courseware_3d_single", UserID: &userID}
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（3D单页生成，操作者=userID）
+	td3SchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
+	traceCtx := &ai.TraceContext{SceneCode: "courseware_3d_single", UserID: &userID, SchoolID: schoolIDPtr(td3SchoolID)}
 	result, aiErr := ai.CallAI(aiCfg, genPrompt.Content, userPrompt, traceCtx)
 	if aiErr != nil {
 		errMsg := fmt.Sprintf("3D单页AI生成失败: %v", aiErr)
@@ -172,7 +174,7 @@ func (s *CoursewareGenService) Generate3DSinglePage(ctx context.Context, coursew
 	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
 		EventType: CWSSEGenDone,
 		Data: map[string]interface{}{
-			"courseware_id":  coursewareID,
+			"courseware_id": coursewareID,
 			"success_count": 1,
 			"fail_count":    0,
 			"total_pages":   1,

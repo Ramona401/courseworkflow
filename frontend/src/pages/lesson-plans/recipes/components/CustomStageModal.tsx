@@ -2,7 +2,18 @@
  * CustomStageModal — 自定义阶段创建/编辑弹窗
  *
  * 迭代5新增：老师在配方编辑器中添加/编辑自定义备课阶段
- * 包含：阶段代码、名称、AI角色、系统提示词、提示词变体、产出物格式、门控模式、可跳过
+ * 包含：阶段代码、名称、AI角色、系统提示词、对话策略、产出物格式、门控模式、可跳过
+ *
+ * 【配方搭建一页化 · 批次2C】清理「引导版/高效版」双策略残留（保守口径）：
+ *   背景：主流程恒走 guided（动作2 批次A.1/B.1 已下线备课模式选择器），efficient 维度填了
+ *   也永不被后端读取，与「配方一律 guided」口径不一致，故清理。
+ *   做法（保守，不改写存量数据，不碰后端字段/API）：
+ *     - UI 上「🧭 引导版策略 / ⚡ 高效版策略」两栏并为单个「💬 对话策略」全宽框；
+ *       底层 prompt_variants 的 guided 键保持不变（后端读取键名不可改），仅去掉 UI 的「版本」语义。
+ *     - 编辑老阶段时，prompt_variants JSON 里 guided 之外的键（主要是 efficient，也含任何其它键）
+ *       由 preservedExtraVariants 原样存住、提交时合并写回——隐藏不可编辑，但数据零丢失。
+ *     - 新建阶段 preservedExtraVariants 为空，JSON 仅 { guided }，天然干净。
+ *   注：efficient 的「深清理」（连后端字段/存量数据一起退役）属 prompt_mode 全局清理范畴，另案处理。
  */
 import { useState, useEffect } from 'react'
 import type { CreateCustomStageRequest, UpdateCustomStageRequest } from '@/api/recipes'
@@ -47,21 +58,23 @@ export default function CustomStageModal({ mode, initial, onConfirm, onCancel, s
   const [stageName, setStageName] = useState(initial?.stage_name || '')
   const [aiRole, setAIRole] = useState(initial?.ai_role || '')
   const [systemPrompt, setSystemPrompt] = useState(initial?.system_prompt || '')
-  const [guidedVariant, setGuidedVariant] = useState('')
-  const [efficientVariant, setEfficientVariant] = useState('')
+  // 批次2C：单一「对话策略」，底层仍对应 prompt_variants.guided 键
+  const [dialogStrategy, setDialogStrategy] = useState('')
+  // 批次2C（保守）：编辑老阶段时，guided 之外的键（如 efficient）原样存住，提交时合并写回，不丢数据
+  const [preservedExtraVariants, setPreservedExtraVariants] = useState<Record<string, string>>({})
   const [outputFormat, setOutputFormat] = useState(initial?.output_format || '')
   const [gateMode, setGateMode] = useState(initial?.gate_mode || 'suggest')
   const [skippable, setSkippable] = useState(initial?.skippable ?? true)
 
-  // 解析 prompt_variants JSON
+  // 解析 prompt_variants JSON：guided 进对话策略输入框，其余键（efficient 等）进 preserved 隐藏保留
   useEffect(() => {
     if (initial?.prompt_variants) {
       try {
-        const pv = JSON.parse(initial.prompt_variants)
-         
+        const pv = JSON.parse(initial.prompt_variants) as Record<string, string>
+        const { guided, ...rest } = pv
         // eslint-disable-next-line react-hooks/set-state-in-effect
-        setGuidedVariant(pv.guided || '')
-        setEfficientVariant(pv.efficient || '')
+        setDialogStrategy(guided || '')
+        setPreservedExtraVariants(rest || {})
       } catch { /* 忽略解析错误 */ }
     }
   }, [initial?.prompt_variants])
@@ -71,10 +84,13 @@ export default function CustomStageModal({ mode, initial, onConfirm, onCancel, s
     if (!stageName.trim() || !aiRole.trim()) return
     if (!isEdit && !stageCode.trim()) return
 
-    // 构建 prompt_variants JSON
-    const variants: Record<string, string> = {}
-    if (guidedVariant.trim()) variants.guided = guidedVariant.trim()
-    if (efficientVariant.trim()) variants.efficient = efficientVariant.trim()
+    // 构建 prompt_variants JSON：先铺隐藏保留键（老 efficient 等），再写当前对话策略到 guided
+    const variants: Record<string, string> = { ...preservedExtraVariants }
+    if (dialogStrategy.trim()) {
+      variants.guided = dialogStrategy.trim()
+    } else {
+      delete variants.guided
+    }
     const promptVariantsJSON = Object.keys(variants).length > 0 ? JSON.stringify(variants) : '{}'
 
     if (isEdit) {
@@ -174,18 +190,13 @@ export default function CustomStageModal({ mode, initial, onConfirm, onCancel, s
               placeholder="你是一位{AI角色}，负责帮助老师..." rows={4} style={textareaSt} />
           </div>
 
-          {/* 提示词变体 */}
-          <div style={{ display: 'flex', gap: '12px' }}>
-            <div style={{ flex: 1 }}>
-              <label style={labelSt}>🧭 引导版策略</label>
-              <textarea value={guidedVariant} onChange={e => setGuidedVariant(e.target.value)}
-                placeholder="引导版对话策略..." rows={3} style={textareaSt} />
-            </div>
-            <div style={{ flex: 1 }}>
-              <label style={labelSt}>⚡ 高效版策略</label>
-              <textarea value={efficientVariant} onChange={e => setEfficientVariant(e.target.value)}
-                placeholder="高效版对话策略..." rows={3} style={textareaSt} />
-            </div>
+          {/* 批次2C：单一「对话策略」（原引导版/高效版两栏合并；底层仍写 prompt_variants.guided） */}
+          <div>
+            <label style={labelSt}>💬 对话策略
+              <span style={{ fontWeight: 400, color: C.textMuted, marginLeft: '8px', fontSize: '11px' }}>该阶段 AI 与老师对话的引导方式（可选）</span>
+            </label>
+            <textarea value={dialogStrategy} onChange={e => setDialogStrategy(e.target.value)}
+              placeholder="例如：先抛出 2-3 个引导问题帮老师澄清目标，再逐步给出方案..." rows={3} style={textareaSt} />
           </div>
 
           {/* 产出物格式 */}

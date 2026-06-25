@@ -2,6 +2,9 @@ package handlers
 
 // video_edit_handler.go — 课件视频编辑HTTP处理器
 //
+// S-V1 新增（迭代3.5子专项S：剪辑系统字幕配音收尾）：
+//   POST /api/v1/coursewares/{id}/videos/mix-narration   — 配音混入成片（TTS旁白按时间轴混音）
+//
 // v0.42.4 新增：
 //   POST /api/v1/coursewares/{id}/videos/mute           — 视频静音（去除音轨）
 //   POST /api/v1/coursewares/{id}/videos/extract-audio   — 音轨分离（提取MP3）
@@ -259,6 +262,61 @@ func (h *VideoEditHandler) ExtractAudio(w http.ResponseWriter, r *http.Request) 
 	resp, err := h.editService.ExtractAudio(r.Context(), &services.ExtractAudioRequest{
 		CoursewareID: cwID,
 		AssetID:      req.AssetID,
+		UserID:       claims.UserID,
+	})
+	if err != nil {
+		utils.InternalError(w, err.Error())
+		return
+	}
+	utils.Success(w, resp)
+}
+
+// ==================== 配音混入成片（S-V1新增） ====================
+
+// MixNarration POST /api/v1/coursewares/{id}/videos/mix-narration
+// 请求体: { "asset_id": "成片视频资产ID", "subtitle_id": "字幕轨ID", "gain": 1.0 }
+// 把字幕轨中已生成的TTS配音按各字幕条 start_sec 定位混入视频，产出新视频资产。
+// gain 为可选旁白增益（0.1~3.0，默认1.0），视频流零重编码（-c:v copy）。
+func (h *VideoEditHandler) MixNarration(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	cwID := extractVideoEditCoursewareID(r.URL.Path, "/videos/mix-narration")
+	if cwID == "" {
+		utils.BadRequest(w, "路径参数错误")
+		return
+	}
+
+	var req struct {
+		AssetID    string  `json:"asset_id"`
+		SubtitleID string  `json:"subtitle_id"`
+		Gain       float64 `json:"gain"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+	if req.AssetID == "" {
+		utils.BadRequest(w, "asset_id不能为空")
+		return
+	}
+	if req.SubtitleID == "" {
+		utils.BadRequest(w, "subtitle_id不能为空")
+		return
+	}
+
+	resp, err := h.editService.MixNarration(r.Context(), &services.MixNarrationRequest{
+		CoursewareID: cwID,
+		AssetID:      req.AssetID,
+		SubtitleID:   req.SubtitleID,
+		Gain:         req.Gain,
 		UserID:       claims.UserID,
 	})
 	if err != nil {

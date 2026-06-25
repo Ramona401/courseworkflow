@@ -468,3 +468,55 @@ type TextbookUnit struct {
 	Confidence     int    `json:"confidence"`      // 置信度0-100
 	SortOrder      int    `json:"sort_order"`      // 排序
 }
+
+// ==================== 课件页面级版本与回退模型（页面级版本与回退·新增） ====================
+// 对应 courseware_page_versions 表。每次"覆盖式修改 html_content"前存一份旧版本快照，
+// 支持查看历次版本 + 一键回退到任意历史版本（回退本身可逆）。
+// 本期挂载点：单页AI微调(refine) / 单页重生(regenerate)；背景/字体秒换本期不挂(留枚举位备用)。
+
+// CoursewarePageVersion 课件页面 html_content 版本快照（完整记录，含 HTML）
+// 用于 GetPageVersion（取单版完整内容预览/回退）与 CreatePageVersion 返回值。
+type CoursewarePageVersion struct {
+        ID           string     `json:"id"`
+        PageID       string     `json:"page_id"`       // 归属页（courseware_pages.id）
+        CoursewareID string     `json:"courseware_id"` // 归属课件（冗余存，便于按课件批量查清）
+        VersionNo    int        `json:"version_no"`    // 该页第几版，每页独立从1递增
+        HTMLContent  string     `json:"html_content"`  // 该版本的完整页面HTML快照（非diff）
+        Source       string     `json:"source"`        // 版本来源枚举（见 CWPageVersionSource* 常量）
+        Note         string     `json:"note"`          // 可选备注（微调指令/重生说明/回退说明）
+        CreatedAt    *time.Time `json:"created_at"`
+}
+
+// CoursewarePageVersionListItem 版本列表单条（轻量，不含 html_content，省流量）
+// 用于 ListPageVersions —— 前端列表只显示版本号/来源/备注/时间，点"预览"再单独取完整HTML。
+type CoursewarePageVersionListItem struct {
+        ID        string     `json:"id"`
+        VersionNo int        `json:"version_no"`
+        Source    string     `json:"source"`
+        Note      string     `json:"note"`
+        CreatedAt *time.Time `json:"created_at"`
+}
+
+// ==================== 课件页面版本来源常量 ====================
+// source 字段枚举：标识这一版"是什么操作之前的旧版本"，前端据此显示友好标签。
+
+const (
+        CWPageVersionSourceRefine     = "refine"     // 单页AI微调前的旧版（本期挂载）
+        CWPageVersionSourceRegenerate = "regenerate" // 单页重生前的旧版（本期挂载）
+        CWPageVersionSourceBackground = "background" // 背景秒换前的旧版（本期不挂，留位备用）
+        CWPageVersionSourceFont       = "font"       // 字体秒换前的旧版（本期不挂，留位备用）
+        CWPageVersionSourceNavResync  = "nav_resync" // 导航栏分母刷新前的旧版（本期不挂，留位备用）
+        CWPageVersionSourceRollback   = "rollback"   // 回退操作时存的"回退前当前版"（保证回退可逆）
+        CWPageVersionSourceManual     = "manual"     // 预留：手动存档
+)
+
+// CWPageVersionSourceNameMap 版本来源中文标签映射（前端列表显示用）
+var CWPageVersionSourceNameMap = map[string]string{
+        CWPageVersionSourceRefine:     "🎨 微调前",
+        CWPageVersionSourceRegenerate: "🔄 重生前",
+        CWPageVersionSourceBackground: "🖼 换背景前",
+        CWPageVersionSourceFont:       "🔤 换字体前",
+        CWPageVersionSourceNavResync:  "📄 页码刷新前",
+        CWPageVersionSourceRollback:   "↩️ 回退前",
+        CWPageVersionSourceManual:     "💾 手动存档",
+}

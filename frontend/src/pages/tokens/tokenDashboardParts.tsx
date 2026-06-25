@@ -1,26 +1,34 @@
 /**
  * tokenDashboardParts.tsx — 积分管理页子组件与共享样式
  *
- * v172 拆分：从 TokenDashboardPage.tsx 抽出表格 / 弹窗 / 积分策略Tab，
- * 使主页面在新增三级权限角色逻辑后仍保持 <600 行。
+ * v172 拆分：从 TokenDashboardPage.tsx 抽出表格 / 弹窗 / 共享样式。
+ * v199 拆分：PricingTab（积分策略Tab）已拆至 tokenDashboardPricing.tsx（超 600 红线拆分），
+ *           本文件不再含汇率倍率编辑与模型单价表逻辑。
+ *
+ * 共享样式 C/cardStyle/thStyle/tdStyle/inputStyle 仍在本文件 export，
+ * 被 tokenDashboardPricing / tokenSummaryReport / TokenDashboardPage 多处 import（单一真相源）。
+ *
+ * 究极彻底版·批次2（账户选择器接入）：
+ *   - PurchaseModal（充值）接入 AccountPicker(mode="all")：可搜索/类型筛选/滚动加载。
+ *   - AllocateModal（分配）接入 AccountPicker(mode="children")：只显示来源账户的合法下级。
  *
  * 导出：
  *   - 共享样式常量 C / cardStyle / tabBtnStyle / thStyle / tdStyle / inputStyle 等
- *   - StatCard
+ *   - StatCard / Pagination
  *   - AccountsTable / AllocationsTable / PurchasesTable / ConsumptionTable
  *   - CreateAccountModal / PurchaseModal / AllocateModal
- *   - PricingTab
+ *   - ModalOverlay / FormField
  */
 import { useState, useEffect } from 'react'
 import {
   createTokenAccount, purchaseTokens, allocateTokens,
-  getModelPrices, getSystemCreditPolicy, simulateCredits,
   type TokenAccountListItem, type AllocationListItem,
   type PurchaseListItem, type ConsumptionListItem,
-  type ModelPrice, type CreditPolicy, type CreditCalculation,
   ACCOUNT_TYPE_OPTIONS, PURCHASE_TYPE_OPTIONS, ACCOUNT_STATUS_COLORS,
-  SCENE_CODE_LABELS, PROVIDER_COLORS,
+  SCENE_CODE_LABELS,
 } from '@/api/tokens'
+import { loadAliasResolver } from '@/api/modelAliasResolve'
+import AccountPicker from './AccountPicker'
 
 // ==================== 样式常量 ====================
 export const C = {
@@ -78,6 +86,41 @@ export function StatCard({ label, value, color }: { label: string; value: string
   )
 }
 
+// ==================== 分页器（P1，四列表共用）====================
+export function Pagination({ page, pageSize, total, onChange }: { page: number; pageSize: number; total: number; onChange: (p: number) => void }) {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  if (total <= 0 || totalPages <= 1) return null
+
+  const canPrev = page > 1
+  const canNext = page < totalPages
+
+  const btnStyle = (enabled: boolean): React.CSSProperties => ({
+    padding: '6px 14px', borderRadius: '8px',
+    border: `1px solid ${enabled ? C.primary : C.border}`,
+    background: enabled ? C.white : C.bg,
+    color: enabled ? C.primary : C.textMuted,
+    cursor: enabled ? 'pointer' : 'not-allowed',
+    fontSize: '13px', fontWeight: 500,
+  })
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '12px', marginTop: '16px', padding: '8px 0' }}>
+      <button style={btnStyle(canPrev)} disabled={!canPrev} onClick={() => canPrev && onChange(page - 1)}>
+        ← 上一页
+      </button>
+      <span style={{ fontSize: '13px', color: C.textSec }}>
+        第 <strong style={{ color: C.text }}>{page}</strong> / {totalPages} 页
+      </span>
+      <button style={btnStyle(canNext)} disabled={!canNext} onClick={() => canNext && onChange(page + 1)}>
+        下一页 →
+      </button>
+      <span style={{ fontSize: '12px', color: C.textMuted, marginLeft: '8px' }}>
+        共 {total.toLocaleString()} 条
+      </span>
+    </div>
+  )
+}
+
 // ==================== 账户表格 ====================
 export function AccountsTable({ items, canAllocate, onAllocate }: { items: TokenAccountListItem[]; canAllocate: boolean; onAllocate: (id: string) => void }) {
   if (!items?.length) return <div style={{ textAlign: 'center', color: C.textMuted, padding: '40px' }}>暂无账户数据</div>
@@ -125,8 +168,12 @@ export function AccountsTable({ items, canAllocate, onAllocate }: { items: Token
 }
 
 // ==================== 分配记录表格 ====================
+// P3：过滤掉 allocation_type='monthly' 的月度自充值（from=to，语义混乱），
+//     只展示人为分配(manual/initial)。过滤在组件内完成，主页面无感知。
 export function AllocationsTable({ items }: { items: AllocationListItem[] }) {
-  if (!items?.length) return <div style={{ textAlign: 'center', color: C.textMuted, padding: '40px' }}>暂无分配记录</div>
+  const visibleItems = (items || []).filter(a => a.allocation_type !== 'monthly')
+
+  if (!visibleItems.length) return <div style={{ textAlign: 'center', color: C.textMuted, padding: '40px' }}>暂无分配记录</div>
   return (
     <div style={{ background: C.white, borderRadius: '12px', border: `1px solid ${C.border}`, overflow: 'auto' }}>
       <table style={{ width: '100%', borderCollapse: 'collapse' }}>
@@ -135,7 +182,7 @@ export function AllocationsTable({ items }: { items: AllocationListItem[] }) {
           <th style={thStyle}>类型</th><th style={thStyle}>操作人</th><th style={thStyle}>备注</th><th style={thStyle}>时间</th>
         </tr></thead>
         <tbody>
-          {items.map(a => (
+          {visibleItems.map(a => (
             <tr key={a.id}>
               <td style={tdStyle}>{a.from_account_name}</td>
               <td style={tdStyle}>{a.to_account_name}</td>
@@ -181,14 +228,29 @@ export function PurchasesTable({ items }: { items: PurchaseListItem[] }) {
 }
 
 // ==================== 消费流水表格 ====================
-export function ConsumptionTable({ items }: { items: ConsumptionListItem[] }) {
+export function ConsumptionTable({ items, isAdmin = false }: { items: ConsumptionListItem[]; isAdmin?: boolean }) {
+  // 批三-3a：模型列与美元成本列仅 admin 可见；非 admin（区域/学校管理员/老师）只看场景+积分。
+  // admin 看到的模型列也显示业务别名（批三-2 映射），不暴露真实模型名。
+  const [resolveAlias, setResolveAlias] = useState<((m: string) => string) | null>(null)
+
+  useEffect(() => {
+    // 仅 admin 拉别名规则（接口 adminOnly，非 admin 不调，避免 403）
+    if (!isAdmin) { setResolveAlias(null); return }
+    let alive = true
+    loadAliasResolver().then(fn => { if (alive) setResolveAlias(() => fn) })
+    return () => { alive = false }
+  }, [isAdmin])
+
   if (!items?.length) return <div style={{ textAlign: 'center', color: C.textMuted, padding: '40px' }}>暂无消费记录</div>
   return (
     <div style={{ background: C.white, borderRadius: '12px', border: `1px solid ${C.border}`, overflow: 'auto' }}>
       <table style={{ width: '100%', borderCollapse: 'collapse' }}>
         <thead><tr>
           <th style={thStyle}>用户</th><th style={thStyle}>消费积分</th><th style={thStyle}>场景</th>
-          <th style={thStyle}>模型</th><th style={thStyle}>Token(入/出)</th><th style={thStyle}>美元成本</th><th style={thStyle}>余额变化</th><th style={thStyle}>时间</th>
+          {isAdmin && <th style={thStyle}>模型</th>}
+          <th style={thStyle}>Token(入/出)</th>
+          {isAdmin && <th style={thStyle}>美元成本</th>}
+          <th style={thStyle}>余额变化</th><th style={thStyle}>时间</th>
         </tr></thead>
         <tbody>
           {items.map(c => (
@@ -196,9 +258,9 @@ export function ConsumptionTable({ items }: { items: ConsumptionListItem[] }) {
               <td style={tdStyle}>{c.user_name}</td>
               <td style={tdStyle}><span style={{ fontWeight: 600, color: C.red }}>-{c.amount.toLocaleString()}</span></td>
               <td style={tdStyle}><span style={{ fontSize: '12px', padding: '2px 6px', borderRadius: '4px', background: 'rgba(139,92,246,0.08)', color: C.purple }}>{SCENE_CODE_LABELS[c.scene_code] || c.scene_code}</span></td>
-              <td style={{ ...tdStyle, fontSize: '12px' }}>{c.model_used}</td>
+              {isAdmin && <td style={{ ...tdStyle, fontSize: '12px' }}>{resolveAlias ? resolveAlias(c.model_used) : '…'}</td>}
               <td style={tdStyle}><span style={{ fontSize: '12px' }}>{c.input_tokens > 0 ? `${c.input_tokens.toLocaleString()} / ${c.output_tokens.toLocaleString()}` : c.tokens_used.toLocaleString()}</span></td>
-              <td style={tdStyle}><span style={{ fontSize: '12px', color: C.textSec }}>{c.cost_usd > 0 ? `$${c.cost_usd.toFixed(6)}` : '-'}</span></td>
+              {isAdmin && <td style={tdStyle}><span style={{ fontSize: '12px', color: C.textSec }}>{c.cost_usd > 0 ? `$${c.cost_usd.toFixed(6)}` : '-'}</span></td>}
               <td style={{ ...tdStyle, fontSize: '12px', color: C.textSec }}>{c.balance_before.toLocaleString()} → {c.balance_after.toLocaleString()}</td>
               <td style={{ ...tdStyle, fontSize: '12px', color: C.textSec }}>{new Date(c.created_at).toLocaleString('zh-CN')}</td>
             </tr>
@@ -270,9 +332,9 @@ export function CreateAccountModal({ onClose, onSuccess }: { onClose: () => void
   )
 }
 
-// ==================== 采购/充值弹窗 ====================
-export function PurchaseModal({ accounts, onClose, onSuccess }: { accounts: TokenAccountListItem[]; onClose: () => void; onSuccess: () => void }) {
-  const [accountId, setAccountId] = useState(accounts[0]?.id || '')
+// ==================== 采购/充值弹窗（批次2：接入 AccountPicker mode="all"）====================
+export function PurchaseModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
+  const [accountId, setAccountId] = useState('')
   const [amount, setAmount] = useState(0)
   const [purchaseType, setPurchaseType] = useState('purchase')
   const [memo, setMemo] = useState('')
@@ -291,10 +353,12 @@ export function PurchaseModal({ accounts, onClose, onSuccess }: { accounts: Toke
 
   return (
     <ModalOverlay onClose={onClose} title="充值积分">
-      <FormField label="目标账户">
-        <select value={accountId} onChange={e => setAccountId(e.target.value)} style={inputStyle}>
-          {accounts.map(a => <option key={a.id} value={a.id}>{a.display_name} ({a.account_type_name})</option>)}
-        </select>
+      <FormField label="目标账户（可搜索/按类型筛选）">
+        <AccountPicker
+          mode="all"
+          value={accountId}
+          onChange={(id) => setAccountId(id)}
+        />
       </FormField>
       <FormField label="充值积分数"><input type="number" value={amount || ''} onChange={e => setAmount(Number(e.target.value))} placeholder="请输入积分数量" style={inputStyle} /></FormField>
       <FormField label="充值类型">
@@ -312,11 +376,11 @@ export function PurchaseModal({ accounts, onClose, onSuccess }: { accounts: Toke
   )
 }
 
-// ==================== 分配积分弹窗 ====================
-export function AllocateModal({ fromAccountId, accounts, onClose, onSuccess }: { fromAccountId: string; accounts: TokenAccountListItem[]; onClose: () => void; onSuccess: () => void }) {
-  const fromAcc = accounts.find(a => a.id === fromAccountId)
-  const childAccounts = accounts.filter(a => a.id !== fromAccountId)
-  const [toAccountId, setToAccountId] = useState(childAccounts[0]?.id || '')
+// ==================== 分配积分弹窗（批次2：接入 AccountPicker mode="children" 究极版）====================
+// 目标账户只显示"来源账户的合法下级"（后端 getAllocatableTargets + 三重防越权），
+// 从根本上防止选到非下级账户导致分配失败。
+export function AllocateModal({ fromAccountId, fromAccountName, fromAccountBalance, onClose, onSuccess }: { fromAccountId: string; fromAccountName?: string; fromAccountBalance?: number; onClose: () => void; onSuccess: () => void }) {
+  const [toAccountId, setToAccountId] = useState('')
   const [amount, setAmount] = useState(0)
   const [memo, setMemo] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -335,12 +399,16 @@ export function AllocateModal({ fromAccountId, accounts, onClose, onSuccess }: {
   return (
     <ModalOverlay onClose={onClose} title="分配积分">
       <div style={{ padding: '12px', background: C.primaryLight, borderRadius: '8px', marginBottom: '12px', fontSize: '13px' }}>
-        来源：<strong>{fromAcc?.display_name}</strong>（可用余额：{fromAcc?.available_balance.toLocaleString()} 积分）
+        来源：<strong>{fromAccountName || '当前账户'}</strong>
+        {typeof fromAccountBalance === 'number' && <>（可用余额：{fromAccountBalance.toLocaleString()} 积分）</>}
       </div>
-      <FormField label="目标账户">
-        <select value={toAccountId} onChange={e => setToAccountId(e.target.value)} style={inputStyle}>
-          {childAccounts.map(a => <option key={a.id} value={a.id}>{a.display_name} ({a.account_type_name})</option>)}
-        </select>
+      <FormField label="目标账户（仅显示该账户的下级）">
+        <AccountPicker
+          mode="children"
+          fromAccountId={fromAccountId}
+          value={toAccountId}
+          onChange={(id) => setToAccountId(id)}
+        />
       </FormField>
       <FormField label="分配积分数"><input type="number" value={amount || ''} onChange={e => setAmount(Number(e.target.value))} placeholder="请输入积分数量" style={inputStyle} /></FormField>
       <FormField label="备注"><input value={memo} onChange={e => setMemo(e.target.value)} placeholder="可选" style={inputStyle} /></FormField>
@@ -350,124 +418,5 @@ export function AllocateModal({ fromAccountId, accounts, onClose, onSuccess }: {
         <button onClick={handleSubmit} disabled={submitting} style={submitBtnStyle}>{submitting ? '分配中...' : '分配'}</button>
       </div>
     </ModalOverlay>
-  )
-}
-
-// ==================== 积分策略Tab ====================
-export function PricingTab() {
-  const [policy, setPolicy] = useState<CreditPolicy | null>(null)
-  const [prices, setPrices] = useState<ModelPrice[]>([])
-  const [simResult, setSimResult] = useState<CreditCalculation | null>(null)
-  const [simModel, setSimModel] = useState('')
-  const [simInput, setSimInput] = useState(1000)
-  const [simOutput, setSimOutput] = useState(500)
-  const [loading, setLoading] = useState(true)
-
-  useEffect(() => {
-    const load = async () => {
-      setLoading(true)
-      try {
-        const [p, m] = await Promise.all([getSystemCreditPolicy(), getModelPrices()])
-        setPolicy(p)
-        setPrices(m || [])
-        if (m && m.length > 0) setSimModel(m[0].model_name)
-      } catch { /* ignore */ }
-      setLoading(false)
-    }
-    load()
-  }, [])
-
-  const handleSimulate = async () => {
-    if (!simModel) return
-    try {
-      const r = await simulateCredits({ model_name: simModel, input_tokens: simInput, output_tokens: simOutput })
-      setSimResult(r)
-    } catch { /* ignore */ }
-  }
-
-  if (loading) return <div style={{ textAlign: 'center', color: C.textMuted, padding: '40px' }}>加载中...</div>
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-      <div style={{ ...cardStyle, display: 'flex', gap: '32px', alignItems: 'center', flexWrap: 'wrap' }}>
-        <div>
-          <div style={{ fontSize: '12px', color: C.textMuted, marginBottom: '4px' }}>💱 汇率（美元→积分）</div>
-          <div style={{ fontSize: '28px', fontWeight: 700, color: C.primary }}>{policy?.exchange_rate ?? 7}</div>
-        </div>
-        <div style={{ fontSize: '24px', color: C.textMuted }}>×</div>
-        <div>
-          <div style={{ fontSize: '12px', color: C.textMuted, marginBottom: '4px' }}>📊 倍率</div>
-          <div style={{ fontSize: '28px', fontWeight: 700, color: C.purple }}>{policy?.multiplier ?? 1}</div>
-        </div>
-        <div style={{ fontSize: '24px', color: C.textMuted }}>=</div>
-        <div>
-          <div style={{ fontSize: '12px', color: C.textMuted, marginBottom: '4px' }}>有效汇率</div>
-          <div style={{ fontSize: '28px', fontWeight: 700, color: C.green }}>{((policy?.exchange_rate ?? 7) * (policy?.multiplier ?? 1)).toFixed(2)}</div>
-        </div>
-        <div style={{ flex: 1, fontSize: '13px', color: C.textSec, minWidth: '200px' }}>
-          积分 = 美元成本 × {policy?.exchange_rate ?? 7} × {policy?.multiplier ?? 1}<br/>
-          <span style={{ fontSize: '12px', color: C.textMuted }}>{policy?.description || ''}</span>
-        </div>
-      </div>
-
-      <div style={{ ...cardStyle }}>
-        <div style={{ fontSize: '15px', fontWeight: 600, color: C.text, marginBottom: '12px' }}>🧮 积分模拟计算器</div>
-        <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-end', flexWrap: 'wrap' }}>
-          <div>
-            <div style={{ fontSize: '12px', color: C.textSec, marginBottom: '4px' }}>模型</div>
-            <select value={simModel} onChange={e => setSimModel(e.target.value)} style={{ ...inputStyle, width: '260px' }}>
-              {prices.filter(p => p.is_active).map(p => <option key={p.id} value={p.model_name}>{p.display_name || p.model_name}</option>)}
-            </select>
-          </div>
-          <div>
-            <div style={{ fontSize: '12px', color: C.textSec, marginBottom: '4px' }}>输入Tokens</div>
-            <input type="number" value={simInput} onChange={e => setSimInput(Number(e.target.value))} style={{ ...inputStyle, width: '120px' }} />
-          </div>
-          <div>
-            <div style={{ fontSize: '12px', color: C.textSec, marginBottom: '4px' }}>输出Tokens</div>
-            <input type="number" value={simOutput} onChange={e => setSimOutput(Number(e.target.value))} style={{ ...inputStyle, width: '120px' }} />
-          </div>
-          <button onClick={handleSimulate} style={{ padding: '10px 20px', borderRadius: '8px', border: 'none', background: C.primary, color: C.white, cursor: 'pointer', fontWeight: 600, fontSize: '14px' }}>计算</button>
-        </div>
-        {simResult && (
-          <div style={{ marginTop: '16px', padding: '16px', background: 'rgba(79,123,232,0.04)', borderRadius: '12px', display: 'flex', gap: '24px', flexWrap: 'wrap' }}>
-            <div><span style={{ fontSize: '12px', color: C.textMuted }}>美元成本</span><div style={{ fontSize: '18px', fontWeight: 600, color: C.text }}>${simResult.cost_usd.toFixed(6)}</div></div>
-            <div><span style={{ fontSize: '12px', color: C.textMuted }}>× 汇率 {simResult.exchange_rate} × 倍率 {simResult.multiplier}</span><div style={{ fontSize: '18px', fontWeight: 600, color: C.text }}>=</div></div>
-            <div><span style={{ fontSize: '12px', color: C.textMuted }}>积分消耗</span><div style={{ fontSize: '24px', fontWeight: 700, color: C.primary }}>{simResult.credits_consumed.toFixed(4)} 积分</div></div>
-          </div>
-        )}
-      </div>
-
-      <div style={{ background: C.white, borderRadius: '12px', border: `1px solid ${C.border}`, overflow: 'auto' }}>
-        <div style={{ padding: '16px 20px', borderBottom: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <span style={{ fontSize: '15px', fontWeight: 600, color: C.text }}>📋 模型单价表（每1K Tokens）</span>
-          <span style={{ fontSize: '12px', color: C.textMuted }}>{prices.length} 个模型</span>
-        </div>
-        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-          <thead><tr>
-            <th style={thStyle}>模型</th><th style={thStyle}>供应商</th>
-            <th style={thStyle}>输入 ($/1K)</th><th style={thStyle}>输出 ($/1K)</th>
-            <th style={thStyle}>输入 (积分/1K)</th><th style={thStyle}>输出 (积分/1K)</th>
-            <th style={thStyle}>状态</th>
-          </tr></thead>
-          <tbody>
-            {prices.map(p => {
-              const rate = (policy?.exchange_rate ?? 7) * (policy?.multiplier ?? 1)
-              return (
-                <tr key={p.id}>
-                  <td style={tdStyle}><span style={{ fontWeight: 600 }}>{p.display_name || p.model_name}</span><br/><span style={{ fontSize: '11px', color: C.textMuted }}>{p.model_name}</span></td>
-                  <td style={tdStyle}><span style={{ fontSize: '12px', padding: '2px 8px', borderRadius: '4px', background: `${PROVIDER_COLORS[p.provider] || '#9CA3AF'}15`, color: PROVIDER_COLORS[p.provider] || '#9CA3AF' }}>{p.provider}</span></td>
-                  <td style={tdStyle}>${p.cost_per_1k_input.toFixed(4)}</td>
-                  <td style={tdStyle}>${p.cost_per_1k_output.toFixed(4)}</td>
-                  <td style={tdStyle}><span style={{ fontWeight: 600, color: C.primary }}>{(p.cost_per_1k_input * rate).toFixed(4)}</span></td>
-                  <td style={tdStyle}><span style={{ fontWeight: 600, color: C.primary }}>{(p.cost_per_1k_output * rate).toFixed(4)}</span></td>
-                  <td style={tdStyle}><span style={{ color: p.is_active ? C.green : C.textMuted }}>{p.is_active ? '✓ 启用' : '✗ 禁用'}</span></td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
-      </div>
-    </div>
   )
 }

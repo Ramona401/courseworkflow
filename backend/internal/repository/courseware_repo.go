@@ -428,15 +428,9 @@ func DeleteAllCoursewarePages(ctx context.Context, coursewareID string) error {
 
 // ReorderCoursewarePages 重新排序课件页面
 func ReorderCoursewarePages(ctx context.Context, coursewareID string, pageIDs []string) error {
-	for i, pid := range pageIDs {
-		sql := `UPDATE courseware_pages SET page_number = $1, updated_at = $2
-WHERE id = $3 AND courseware_id = $4`
-		_, err := database.DB.Exec(ctx, sql, i+1, time.Now(), pid, coursewareID)
-		if err != nil {
-			return fmt.Errorf("排序课件页面失败(id=%s): %w", pid, err)
-		}
-	}
-	return nil
+	// 修正：原实现逐页裸 UPDATE page_number，会撞 UNIQUE(courseware_id,page_number) 约束
+	// （把某页改成 N 时表里可能仍有另一页是 N）。改为复用两阶段避撞的事务重排。
+	return ResequenceCoursewarePagesByIDs(ctx, coursewareID, pageIDs)
 }
 
 // CountCoursewarePages 统计课件页面数

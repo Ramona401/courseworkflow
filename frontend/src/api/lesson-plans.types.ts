@@ -352,6 +352,10 @@ export interface LessonPlanChatRequest {
   assistant_id?: string | null
   /** v168(功能B):全委托一键生成完整教案,true 时后端在 write 阶段一次性出稿(仅 write 阶段生效) */
   full_generate?: boolean
+  /** 子轮二(B2 轮次序号):前端每发起一轮 chat 自增的客户端轮次 id。
+   *  后端原样回带到该轮所有 SSE 事件的 client_turn_id，前端据此丢弃"过期轮次"的迟到回复。
+   *  不传时后端行为不变(回带空串，前端不过滤)。 */
+  client_turn_id?: string
 }
 
 export interface ApplyAISuggestionsRequest {
@@ -451,6 +455,8 @@ export type LPSSEEventType =
   | 'stage_started'     // Phase 7B-9:进入新阶段
   | 'stage_complete'    // Phase 7B-9:AI建议完成当前阶段
   | 'stage_output'      // Phase 7B-9:阶段产出物已生成
+  | 'suggested_actions' // 迭代3.5 B-2:建议芯片事件(后端在message_done后单独广播)
+  | 'retry_notice'      // 子轮二(重试可见性):空流自动重试时后端广播,提示文案在 content 字段
   | 'error'
   | 'done'
 
@@ -461,6 +467,28 @@ export interface ExtractionHint {
   source_content: string
   extraction_type: string
   plan_id: string
+}
+
+/**
+ * 建议芯片（迭代3.5 Phase B-2 新增）
+ *
+ * 与后端 models/lesson_plan_gen.go 的 SuggestedAction 结构体字段逐一对齐。
+ * action_type 协议上只允许五种正式枚举（send_text/full_generate/switch_stage/
+ * open_tool/confirm_structure），后端 ParseSuggestedActions 已做白名单清洗；
+ * 前端类型此处放宽为 string，由转换层（chipActions.suggestedActionToChip）
+ * 做第二道防御过滤——未知类型最终被 dispatchChip 静默忽略，协议安全底线不破。
+ */
+export interface SuggestedAction {
+  /** 芯片唯一标识（后端缺失时自动补 sa_N） */
+  id: string
+  /** 表情前缀（可为空串） */
+  emoji: string
+  /** 文案（后端保证非空） */
+  label: string
+  /** 动作类型（协议五枚举之一，前端再防御一次） */
+  action_type: string
+  /** 动作参数（text/stage/tool 等，按 action_type 取用） */
+  payload?: Record<string, unknown>
 }
 
 /** SSE事件完整结构(Phase 7B-9:新增stage_data字段) */
@@ -474,7 +502,12 @@ export interface LPSSEEvent {
   review?: AIReviewResult
   extraction_hint?: ExtractionHint
   stage_data?: StageEventData         // Phase 7B-9:阶段事件数据
+  suggested_actions?: SuggestedAction[] // 迭代3.5 B-2:动态建议芯片数组(suggested_actions事件携带)
   error?: string
+  /** 子轮二(B2 轮次序号):本事件归属哪一轮 chat。仅 chat 主轮次(及其派生)非空，系统旁路为空。 */
+  client_turn_id?: string
+  /** 助手轻量选择入口·可见性补丁:本轮实际注入(匹配)的助手名,仅 message_done 携带;空=纯骨架 */
+  assistant_label?: string
 }
 
 /* ==================== 类型定义:萃取队列(Phase5新增)==================== */

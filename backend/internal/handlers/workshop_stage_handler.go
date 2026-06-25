@@ -174,7 +174,10 @@ func (h *WorkshopStageHandler) AdvanceStage(w http.ResponseWriter, r *http.Reque
 	}
 	var stage interface{}
 	var err error
-	if len(req.SelectedComponentIDs) > 0 {
+	if r.URL.Query().Get("silent_eval") == "1" {
+		// 对话模式：跳过阶段质量教练过程打分（仍照常透传选中组件给下一阶段）
+		stage, err = h.stageService.AdvanceStageSilent(r.Context(), planID, req.TargetStageCode, claims.UserID, req.SelectedComponentIDs)
+	} else if len(req.SelectedComponentIDs) > 0 {
 		stage, err = h.stageService.AdvanceStageWithComponents(r.Context(), planID, req.TargetStageCode, claims.UserID, req.SelectedComponentIDs)
 	} else {
 		stage, err = h.stageService.AdvanceStage(r.Context(), planID, req.TargetStageCode, claims.UserID)

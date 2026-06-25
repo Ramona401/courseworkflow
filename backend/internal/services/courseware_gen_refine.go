@@ -8,6 +8,10 @@ package services
 //   - RegenerateSinglePage：单页重新生成（依据页面方案从零重画，复用批量零件 + normalizeRootCanvas）
 //
 // 拆分自原 courseware_gen_service.go（v142 结构化日志迁移+模块化拆分）
+//
+// 页面级版本与回退（新增）：RefinePage 与 RegenerateSinglePage 在覆盖 html_content 前，
+//   各调一次 s.SavePageVersionBeforeOverwrite 把旧 HTML 存为版本快照（refine/regenerate），
+//   供老师查看历次版本并一键回退。统一快照入口实现见 courseware_page_version.go（内部判空跳过首次生成）。
 
 import (
 	"context"
@@ -78,7 +82,9 @@ func (s *CoursewareGenService) RefineNav(ctx context.Context, coursewareID strin
 	if err != nil {
 		return "", fmt.Errorf("获取AI配置失败: %w", err)
 	}
-	traceCtx := &ai.TraceContext{SceneCode: models.SceneCWNavRefine, UserID: &userID}
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（导航栏微调，操作者=userID）
+	navSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
+	traceCtx := &ai.TraceContext{SceneCode: models.SceneCWNavRefine, UserID: &userID, SchoolID: schoolIDPtr(navSchoolID)}
 	result, aiErr := ai.CallAI(aiCfg, systemPrompt, userPrompt, traceCtx)
 	if aiErr != nil {
 		return "", fmt.Errorf("AI微调失败: %w", aiErr)
@@ -172,7 +178,9 @@ func (s *CoursewareGenService) RefinePage(ctx context.Context, coursewareID stri
 	if err != nil {
 		return "", fmt.Errorf("获取AI配置失败: %w", err)
 	}
-	traceCtx := &ai.TraceContext{SceneCode: models.SceneCWPageRefine, UserID: &userID}
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（单页微调，操作者=userID）
+	pageSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
+	traceCtx := &ai.TraceContext{SceneCode: models.SceneCWPageRefine, UserID: &userID, SchoolID: schoolIDPtr(pageSchoolID)}
 
 	// 5.1 调用AI：有截图走多模态，失败则降级纯文本；无截图直接纯文本
 	var result *ai.CallResult
@@ -206,6 +214,10 @@ func (s *CoursewareGenService) RefinePage(ctx context.Context, coursewareID stri
 		s.attachUserBackground(ctx, cw, rTplInfo)
 		refined = s.applyTemplateBackground(refined, rTplInfo, pageNum)
 	}
+
+	// 【页面级版本】保存微调结果前，先把旧 HTML(page.HTMLContent) 存为一个 refine 版本快照，
+	//   供老师改坏后回退到微调前。统一入口内部判空（首次生成旧值为空则跳过），存版失败不阻断微调。
+	s.SavePageVersionBeforeOverwrite(ctx, page.ID, coursewareID, page.HTMLContent, models.CWPageVersionSourceRefine, instruction)
 
 	// 7. 保存微调结果
 	if dbErr := repository.UpdateCWPageHTML(ctx, page.ID, refined, "", page.MatchedComponentIDs, models.CWPageStatusGenerated); dbErr != nil {
@@ -284,7 +296,9 @@ func (s *CoursewareGenService) RegenerateSinglePage(ctx context.Context, coursew
 	}
 
 	// 5. 调用AI生成内容区
-	traceCtx := &ai.TraceContext{SceneCode: "courseware_generate", UserID: &userID}
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（单页重生，操作者=userID）
+	regenSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
+	traceCtx := &ai.TraceContext{SceneCode: "courseware_generate", UserID: &userID, SchoolID: schoolIDPtr(regenSchoolID)}
 	result, aiErr := ai.CallAI(aiCfg, genPrompt.Content, userPrompt, traceCtx)
 	if aiErr != nil {
 		return "", fmt.Errorf("AI重新生成失败: %w", aiErr)
@@ -296,6 +310,10 @@ func (s *CoursewareGenService) RegenerateSinglePage(ctx context.Context, coursew
 
 	// 6. 后端拼接导航栏（assembleFullPage 内含 normalizeRootCanvas 画布闸门）
 	fullPageHTML := s.assembleFullPage(contentHTML, cw.NavTemplateHTML, pageNum, totalPages, tplInfo)
+
+	// 【页面级版本】保存重生结果前，先把旧 HTML(page.HTMLContent) 存为一个 regenerate 版本快照，
+	//   供老师重生后觉得旧版更好时回退。统一入口内部判空（旧值为空则跳过），存版失败不阻断重生。
+	s.SavePageVersionBeforeOverwrite(ctx, page.ID, coursewareID, page.HTMLContent, models.CWPageVersionSourceRegenerate, "")
 
 	// 7. 保存
 	matchedIDs := s.buildMatchedComponentIDs(matchedComps)

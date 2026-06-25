@@ -3,6 +3,21 @@
  *
  * v79 新增：分步向导式配方创建
  * 所有步骤组件共享此文件的颜色、样式、类型
+ *
+ * 动作2（批次A）：WizardFormData 移除 teachingStyle/customNotes/customPrompt
+ *   三字段（教学风格/备课心得/自定义提示词归属 AI 助手层）；
+ *   createEmptyFormData 默认学科由 'AI' 修正为 '人工智能'（与 SUBJECTS 对齐）。
+ * 动作2（批次A.1）：WIZARD_STEPS 删除「教学组件」步骤项——向导下线该步骤，
+ *   组件改由备课时 skill_router 后端按学科年级自动匹配（手动指定组件保留在编辑器高级区）；
+ *   向导步骤由 6 步缩为 5 步（基本信息/教师知识/教案结构/备课流程/预览确认）。
+ *   selectedCompIds 字段保留（向导中恒为空集 → 备课时后端自动匹配；亦供提交 payload 与编辑器使用）；
+ *   promptMode 字段保留并恒为 'guided'——向导不再提供「备课模式」选择器
+ *   （引导/高效 仅在专家配方里曾用、对话模式恒 guided，故下线该旋钮，后端逻辑不变）。
+ *
+ * v202 学科统一：SUBJECTS 三端（备课工坊/配方向导/课件工坊）统一为同一份 17 学科清单。
+ *   本次变更——'信息技术'→'信息科技'对齐课标库；新增 科学/道德与法治/音乐/美术/体育/劳动
+ *   （'道德与法治'用全称对齐后端 SubjectCodeMap）；'政治'保留（高中段用，义务段用'道德与法治'）。
+ *   createEmptyFormData 默认学科仍为 '人工智能'（仍在新清单中，无需调整）。
  */
 
 import type {
@@ -26,9 +41,12 @@ export const C = {
 }
 
 /* ==================== 学科和年级选项 ==================== */
+// v202 学科统一：三端统一为同一份 17 学科；'信息技术'→'信息科技'对齐课标库；
+//   新增 科学/道德与法治/音乐/美术/体育/劳动（'道德与法治'用全称对齐后端编码表）。
 export const SUBJECTS = [
-  '人工智能', '语文', '数学', '英语', '物理', '化学', '生物',
-  '历史', '地理', '政治', '信息技术',
+  '语文', '数学', '英语', '人工智能', '物理', '化学', '生物',
+  '历史', '地理', '政治', '信息科技', '科学',
+  '道德与法治', '音乐', '美术', '体育', '劳动',
 ]
 
 export const GRADES = [
@@ -75,8 +93,7 @@ export interface WizardStepDef {
 
 export const WIZARD_STEPS: WizardStepDef[] = [
   { key: 'basic', title: '基本信息', icon: '📦', desc: '配方名称、学科和年级', optional: false },
-  { key: 'knowledge', title: '教师知识', icon: '🧠', desc: '学情、风格和特殊要求', optional: true },
-  { key: 'components', title: '教学组件', icon: '🧩', desc: 'AI智能推荐教学组件', optional: true },
+  { key: 'knowledge', title: '教师知识', icon: '🧠', desc: '学情和学校要求', optional: true },
   { key: 'structure', title: '教案结构', icon: '📋', desc: '定义教案的格式要求', optional: true },
   { key: 'workflow', title: '备课流程', icon: '🔧', desc: '配置备课的阶段流程', optional: true },
   { key: 'preview', title: '预览确认', icon: '👁️', desc: '确认配置并创建配方', optional: false },
@@ -92,18 +109,16 @@ export interface WizardFormData {
 
   // 步骤2：教师知识
   studentProfile: string
-  teachingStyle: string
   schoolRequirements: string
-  customNotes: string
-  customPrompt: string
 
-  // 步骤3：组件选择
+  // 组件选择（批次A.1 起向导已无「教学组件」步骤，此字段恒为空集 →
+  //   备课时由后端 skill_router 自动匹配；字段保留以兼容提交 payload 与编辑器手动指定）
   selectedCompIds: Set<string>
 
-  // 步骤4：教案结构
+  // 步骤3：教案结构
   lessonStructure: LessonStructureBlock[]
 
-  // 步骤5：备课流程
+  // 步骤4：备课流程（promptMode 恒为 'guided'，向导已无备课模式选择器；字段保留照常提交）
   promptMode: PromptMode
   stageFlow: StageFlowItem[]
 }
@@ -113,13 +128,10 @@ export function createEmptyFormData(): WizardFormData {
   return {
     name: '',
     description: '',
-    subject: 'AI',
+    subject: '人工智能',
     gradeRange: '七年级',
     studentProfile: '',
-    teachingStyle: '',
     schoolRequirements: '',
-    customNotes: '',
-    customPrompt: '',
     selectedCompIds: new Set(),
     lessonStructure: [],
     promptMode: 'guided',

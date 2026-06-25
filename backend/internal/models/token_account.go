@@ -9,6 +9,12 @@ package models
 //   - TokenConsumeRequest 新增 CreditCalculation 字段（精确计算结果）
 //   - 积分计算由 CreditPolicyService.CalculateCredits 完成（见 credit_policy.go）
 //
+// 积分消费汇总报告 batch 新增（本次）：
+//   - ConsumptionSummaryRow      ：汇总报告单行（一个学校/老师/模型/场景/日期）
+//   - ConsumptionSummaryResponse ：汇总报告响应（总计 + rows 数组 + 维度回显）
+//   这两个类型供 token_summary_repo.go 的 5 维度聚合查询与 handler 返回使用，
+//   不改动任何现有类型。
+//
 // 积分计算公式（v129 新机制）：
 //   cost_usd = (input_tokens/1000 × cost_per_1k_input) + (output_tokens/1000 × cost_per_1k_output)
 //   credits  = cost_usd × exchange_rate × multiplier
@@ -94,12 +100,12 @@ type TokenAccount struct {
 // v129变更：Amount 从 int64 → float64
 type TokenAllocation struct {
 	ID             string     `json:"id"`
-	FromAccountID  string     `json:"from_account_id"`  // 来源账户
-	ToAccountID    string     `json:"to_account_id"`    // 目标账户
-	Amount         float64    `json:"amount"`           // 分配积分数量
-	AllocationType string     `json:"allocation_type"`  // manual/monthly/initial
-	Memo           string     `json:"memo"`             // 备注
-	OperatorID     string     `json:"operator_id"`      // 操作人
+	FromAccountID  string     `json:"from_account_id"` // 来源账户
+	ToAccountID    string     `json:"to_account_id"`   // 目标账户
+	Amount         float64    `json:"amount"`          // 分配积分数量
+	AllocationType string     `json:"allocation_type"` // manual/monthly/initial
+	Memo           string     `json:"memo"`            // 备注
+	OperatorID     string     `json:"operator_id"`     // 操作人
 	CreatedAt      *time.Time `json:"created_at"`
 }
 
@@ -107,28 +113,28 @@ type TokenAllocation struct {
 // v129变更：金额字段从 int64 → float64，新增精确计算字段
 type TokenConsumptionLog struct {
 	ID            string     `json:"id"`
-	AccountID     string     `json:"account_id"`      // 消费账户
-	UserID        string     `json:"user_id"`         // 用户ID
-	Amount        float64    `json:"amount"`          // 消费积分数量
-	BalanceBefore float64    `json:"balance_before"`  // 消费前余额
-	BalanceAfter  float64    `json:"balance_after"`   // 消费后余额
-	SceneCode     string     `json:"scene_code"`      // AI场景代码
-	ModelUsed     string     `json:"model_used"`      // 旧字段，保留兼容
-	TokensUsed    int        `json:"tokens_used"`     // 旧字段，保留兼容（总token数）
-	LessonPlanID  *string    `json:"lesson_plan_id"`  // 关联教案ID
-	PipelineID    *string    `json:"pipeline_id"`     // 关联Pipeline ID
-	Memo          string     `json:"memo"`            // 备注
+	AccountID     string     `json:"account_id"`     // 消费账户
+	UserID        string     `json:"user_id"`        // 用户ID
+	Amount        float64    `json:"amount"`         // 消费积分数量
+	BalanceBefore float64    `json:"balance_before"` // 消费前余额
+	BalanceAfter  float64    `json:"balance_after"`  // 消费后余额
+	SceneCode     string     `json:"scene_code"`     // AI场景代码
+	ModelUsed     string     `json:"model_used"`     // 旧字段，保留兼容
+	TokensUsed    int        `json:"tokens_used"`    // 旧字段，保留兼容（总token数）
+	LessonPlanID  *string    `json:"lesson_plan_id"` // 关联教案ID
+	PipelineID    *string    `json:"pipeline_id"`    // 关联Pipeline ID
+	Memo          string     `json:"memo"`           // 备注
 	CreatedAt     *time.Time `json:"created_at"`
 	// v129新增：精确积分计算字段（对齐AOCI的ai_model_calls表）
-	InputTokens     int     `json:"input_tokens"`      // 输入token数
-	OutputTokens    int     `json:"output_tokens"`     // 输出token数
-	ModelName       string  `json:"model_name"`        // 模型名称
-	Provider        string  `json:"provider"`          // 供应商
-	CostUSD         float64 `json:"cost_usd"`          // 美元成本
-	ExchangeRate    float64 `json:"exchange_rate"`     // 汇率
-	Multiplier      float64 `json:"multiplier"`        // 倍率
-	CreditsConsumed float64 `json:"credits_consumed"`  // 精确积分消耗
-	LatencyMs       int     `json:"latency_ms"`        // 调用耗时（毫秒）
+	InputTokens     int     `json:"input_tokens"`     // 输入token数
+	OutputTokens    int     `json:"output_tokens"`    // 输出token数
+	ModelName       string  `json:"model_name"`       // 模型名称
+	Provider        string  `json:"provider"`         // 供应商
+	CostUSD         float64 `json:"cost_usd"`         // 美元成本
+	ExchangeRate    float64 `json:"exchange_rate"`    // 汇率
+	Multiplier      float64 `json:"multiplier"`       // 倍率
+	CreditsConsumed float64 `json:"credits_consumed"` // 精确积分消耗
+	LatencyMs       int     `json:"latency_ms"`       // 调用耗时（毫秒）
 }
 
 // TokenPurchase 积分采购/充值记录（对应 token_purchases 表）
@@ -147,15 +153,15 @@ type TokenPurchase struct {
 
 // TokenAlertConfig 积分预警配置（对应 token_alert_configs 表）
 type TokenAlertConfig struct {
-	ID               string     `json:"id"`
-	AccountID        string     `json:"account_id"`        // 关联账户
-	WarnThreshold    int        `json:"warn_threshold"`    // 预警阈值（百分比）
-	UrgentThreshold  int        `json:"urgent_threshold"`  // 紧急阈值（百分比）
-	IsEnabled        bool       `json:"is_enabled"`        // 是否启用
-	LastWarnAt       *time.Time `json:"last_warn_at"`      // 上次预警时间
-	LastUrgentAt     *time.Time `json:"last_urgent_at"`    // 上次紧急预警时间
-	CreatedAt        *time.Time `json:"created_at"`
-	UpdatedAt        *time.Time `json:"updated_at"`
+	ID              string     `json:"id"`
+	AccountID       string     `json:"account_id"`       // 关联账户
+	WarnThreshold   int        `json:"warn_threshold"`   // 预警阈值（百分比）
+	UrgentThreshold int        `json:"urgent_threshold"` // 紧急阈值（百分比）
+	IsEnabled       bool       `json:"is_enabled"`       // 是否启用
+	LastWarnAt      *time.Time `json:"last_warn_at"`     // 上次预警时间
+	LastUrgentAt    *time.Time `json:"last_urgent_at"`   // 上次紧急预警时间
+	CreatedAt       *time.Time `json:"created_at"`
+	UpdatedAt       *time.Time `json:"updated_at"`
 }
 
 // ==================== 请求结构体 ====================
@@ -221,10 +227,10 @@ type TokenAccountListItem struct {
 	TotalConsumed    float64    `json:"total_consumed"`
 	TotalQuota       float64    `json:"total_quota"`
 	MonthlyQuota     float64    `json:"monthly_quota"`
-	UsagePercent     float64    `json:"usage_percent"`     // 已用占比
+	UsagePercent     float64    `json:"usage_percent"` // 已用占比
 	Status           string     `json:"status"`
-	StatusName       string     `json:"status_name"`       // 中文名
-	ChildCount       int        `json:"child_count"`       // 子账户数
+	StatusName       string     `json:"status_name"` // 中文名
+	ChildCount       int        `json:"child_count"` // 子账户数
 	ExpiresAt        *time.Time `json:"expires_at"`
 	CreatedAt        *time.Time `json:"created_at"`
 }
@@ -237,26 +243,26 @@ type TokenAccountListResponse struct {
 
 // TokenAccountDetail 账户详情（含预警配置+子账户摘要）
 type TokenAccountDetail struct {
-	TokenAccount                                  // 嵌入账户实体
-	AccountTypeName  string                       `json:"account_type_name"`
-	StatusName       string                       `json:"status_name"`
-	AvailableBalance float64                      `json:"available_balance"`
-	UsagePercent     float64                      `json:"usage_percent"`
-	AlertConfig      *TokenAlertConfig            `json:"alert_config"`   // 预警配置（可能为nil）
-	ChildAccounts    []*TokenAccountListItem      `json:"child_accounts"` // 子账户列表
+	TokenAccount                             // 嵌入账户实体
+	AccountTypeName  string                  `json:"account_type_name"`
+	StatusName       string                  `json:"status_name"`
+	AvailableBalance float64                 `json:"available_balance"`
+	UsagePercent     float64                 `json:"usage_percent"`
+	AlertConfig      *TokenAlertConfig       `json:"alert_config"`   // 预警配置（可能为nil）
+	ChildAccounts    []*TokenAccountListItem `json:"child_accounts"` // 子账户列表
 }
 
 // AllocationListItem 分配记录列表项
 // v129变更：Amount 从 int64 → float64
 type AllocationListItem struct {
-	ID               string     `json:"id"`
-	FromAccountName  string     `json:"from_account_name"` // 来源账户名
-	ToAccountName    string     `json:"to_account_name"`   // 目标账户名
-	Amount           float64    `json:"amount"`
-	AllocationType   string     `json:"allocation_type"`
-	Memo             string     `json:"memo"`
-	OperatorName     string     `json:"operator_name"`     // 操作人名称
-	CreatedAt        *time.Time `json:"created_at"`
+	ID              string     `json:"id"`
+	FromAccountName string     `json:"from_account_name"` // 来源账户名
+	ToAccountName   string     `json:"to_account_name"`   // 目标账户名
+	Amount          float64    `json:"amount"`
+	AllocationType  string     `json:"allocation_type"`
+	Memo            string     `json:"memo"`
+	OperatorName    string     `json:"operator_name"` // 操作人名称
+	CreatedAt       *time.Time `json:"created_at"`
 }
 
 // AllocationListResponse 分配记录列表响应
@@ -269,8 +275,8 @@ type AllocationListResponse struct {
 // v129变更：金额字段从 int64 → float64，新增精确计算字段
 type ConsumptionListItem struct {
 	ID            string     `json:"id"`
-	AccountName   string     `json:"account_name"`    // 账户名称
-	UserName      string     `json:"user_name"`       // 用户名
+	AccountName   string     `json:"account_name"` // 账户名称
+	UserName      string     `json:"user_name"`    // 用户名
 	Amount        float64    `json:"amount"`
 	BalanceBefore float64    `json:"balance_before"`
 	BalanceAfter  float64    `json:"balance_after"`
@@ -301,7 +307,7 @@ type ConsumptionListResponse struct {
 // v129变更：Amount 从 int64 → float64
 type PurchaseListItem struct {
 	ID           string     `json:"id"`
-	AccountName  string     `json:"account_name"`  // 账户名称
+	AccountName  string     `json:"account_name"` // 账户名称
 	Amount       float64    `json:"amount"`
 	PurchaseType string     `json:"purchase_type"`
 	OrderNo      string     `json:"order_no"`
@@ -320,22 +326,70 @@ type PurchaseListResponse struct {
 // TokenOverviewStats Token概览统计（Dashboard用）
 // v129变更：金额字段从 int64 → float64
 type TokenOverviewStats struct {
-	TotalAccounts     int     `json:"total_accounts"`     // 总账户数
-	TotalBalance      float64 `json:"total_balance"`      // 全系统总余额
-	TotalConsumed     float64 `json:"total_consumed"`     // 全系统总消费
-	TotalQuota        float64 `json:"total_quota"`        // 全系统总配额
-	TodayConsumed     float64 `json:"today_consumed"`     // 今日消费
-	MonthConsumed     float64 `json:"month_consumed"`     // 本月消费
-	LowBalanceCount   int     `json:"low_balance_count"`  // 余额预警账户数
+	TotalAccounts     int     `json:"total_accounts"`      // 总账户数
+	TotalBalance      float64 `json:"total_balance"`       // 全系统总余额
+	TotalConsumed     float64 `json:"total_consumed"`      // 全系统总消费
+	TotalQuota        float64 `json:"total_quota"`         // 全系统总配额
+	TodayConsumed     float64 `json:"today_consumed"`      // 今日消费
+	MonthConsumed     float64 `json:"month_consumed"`      // 本月消费
+	LowBalanceCount   int     `json:"low_balance_count"`   // 余额预警账户数
 	ExpiringSoonCount int     `json:"expiring_soon_count"` // 即将过期账户数
 }
 
 // TokenBalanceCheckResult Token余额检查结果（Guard用）
 // v129变更：对齐AOCI的HasAvailableCredits三元组设计
 type TokenBalanceCheckResult struct {
-	HasAccount  bool    `json:"has_account"`   // 是否有账户
-	HasBalance  bool    `json:"has_balance"`   // 余额是否 > 0（允许最后一次透支）
-	Available   float64 `json:"available"`     // 可用余额
-	AccountID   string  `json:"account_id"`    // 账户ID
-	Message     string  `json:"message"`       // 提示信息
+	HasAccount bool    `json:"has_account"` // 是否有账户
+	HasBalance bool    `json:"has_balance"` // 余额是否 > 0（允许最后一次透支）
+	Available  float64 `json:"available"`   // 可用余额
+	AccountID  string  `json:"account_id"`  // 账户ID
+	Message    string  `json:"message"`     // 提示信息
+}
+
+// ==================== 积分消费汇总报告（batch 新增）====================
+
+// 汇总维度常量（与前端 dimension 参数、handler 解析一一对应）
+const (
+	SummaryDimRegion = "region" // 按区域汇总（admin 专用，四级JOIN到区域组织）
+	SummaryDimSchool = "school" // 按学校汇总
+	SummaryDimUser   = "user"   // 按老师（user_id）汇总
+	SummaryDimModel  = "model"  // 按模型汇总
+	SummaryDimScene  = "scene"  // 按AI场景汇总
+	SummaryDimTime   = "time"   // 按天汇总（柱状图）
+)
+
+// ConsumptionSummaryRow 汇总报告单行
+//
+// 一行代表一个汇总对象（一个学校 / 一个老师 / 一个模型 / 一个场景 / 一天）。
+// 字段语义按维度不同：
+//   - school 维度：Key=学校组织ID，Label=学校名
+//   - user   维度：Key=user_id，   Label=老师display_name
+//   - model  维度：Key=Label=模型名（model_name 原值）
+//   - scene  维度：Key=scene_code，Label=场景中文名（SceneNameMap，取不到回退原码）
+//   - time   维度：Key=Label=日期字符串(YYYY-MM-DD)
+//
+// 金额统一用 credits_consumed 汇总（已验证全表 credits 与 amount 一致且非零）。
+type ConsumptionSummaryRow struct {
+	Key      string  `json:"key"`       // 维度键（学校ID/user_id/模型名/场景码/日期）
+	Label    string  `json:"label"`     // 展示名（中文/友好名）
+	Credits  float64 `json:"credits"`   // 该维度消费积分合计（credits_consumed SUM）
+	CostUSD  float64 `json:"cost_usd"`  // 该维度美元成本合计（前端按角色显隐：仅admin看）
+	Calls    int     `json:"calls"`     // 该维度调用次数（COUNT）
+	Percent  float64 `json:"percent"`   // 占总积分的百分比（0-100，后端算好）
+}
+
+// ConsumptionSummaryResponse 汇总报告响应
+//
+// 返回某一维度的完整排行 + 总计。前端据此渲染排行榜（school/user/model/scene）
+// 或柱状图（time）。total 三项是该 scope 范围内的总和（用于占比分母与总览卡片）。
+type ConsumptionSummaryResponse struct {
+	Dimension    string                   `json:"dimension"`     // 回显维度
+	From         string                   `json:"from"`          // 回显时间范围起（空=不限）
+	To           string                   `json:"to"`            // 回显时间范围止（空=不限）
+	TotalCredits float64                  `json:"total_credits"` // scope内总消费积分
+	TotalCostUSD float64                  `json:"total_cost_usd"` // scope内总成本USD
+	TotalCalls   int                      `json:"total_calls"`   // scope内总调用次数
+	Rows         []*ConsumptionSummaryRow `json:"rows"`          // 排行/趋势数据
+	ScopeBlocked bool                     `json:"scope_blocked,omitempty"` // 范围被收窄为空集
+	ScopeMessage string                   `json:"scope_message,omitempty"` // 收窄原因
 }

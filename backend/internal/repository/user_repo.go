@@ -8,12 +8,19 @@ package repository
 //   - 新增 UpdateTeachingProfile：更新用户教学风格前测结果
 //   - 新增 GetTeachingProfile：获取用户教学风格前测结果（解析后）
 //
-// 迭代一 Phase 3.2 新增（本次）：
+// 迭代一 Phase 3.2 新增：
 //   - CreateUserTx     ：CreateUser 的事务版（接收调用方传入的 pgx.Tx，供"建用户+入校"原子事务编排）
 //   - IsUniqueViolation：判断 error 是否为 PostgreSQL 唯一约束冲突(SQLSTATE 23505)
 //                        用于方案A——并发下两请求同时插入同名用户时，靠 users_username_key
 //                        唯一约束兜底，撞约束后翻译成"用户名已存在"友好错误。
 //   原有全部函数(CreateUser/FindUserByID/...)一字未改，仅在文件末尾追加新函数。
+//
+// 积分越权修复 新增（本次）：
+//   - ListPrivilegedUserIDs：列出系统中所有特权角色(admin/region_admin)的 user_id。
+//     用于 token_service.ResolveTokenScope 的 senior 分支剔除"上级账户"——
+//     学校管理员(senior_operator)解析本校成员时，须把混在 school_members 里的
+//     admin/region_admin 从可见白名单中减掉，否则会越权看到/分配系统管理员账户。
+//     （admin 因测试需要保留在 school_members 中，故不删数据，仅在消费点过滤。）
 
 import (
         "context"
@@ -386,4 +393,50 @@ func IsUniqueViolation(err error) bool {
                 return pgErr.Code == "23505"
         }
         return false
+}
+
+// ==================== 积分越权修复 新增：列出特权角色用户ID ====================
+
+// ListPrivilegedUserIDs 列出系统中所有"特权角色"用户的 user_id。
+//
+// 特权角色定义：admin（系统管理员）+ region_admin（区域管理员）。
+// 这两类是学校管理员(senior_operator)的"上级/系统级"角色，按"下级看不到上级"原则，
+// senior 在解析本校可见范围时必须把它们排除。
+//
+// 背景（积分越权修复）：
+//   admin 因历史迁移(source=migration)和误入教研组(source=group_member)被登记进了
+//   school_members 表。token_service.ResolveTokenScope 的 senior 分支调
+//   ListSchoolMemberIDs 取本校成员时，会把 admin 的 user_id 一并取出，导致 admin 的
+//   个人积分账户落进 senior 的可见白名单 —— 学校管理员因此越权看到、甚至能给
+//   系统管理员分配积分（实测截图证实）。
+//
+// 设计取舍：
+//   - 不删 school_members 里的 admin 记录（admin 需保留本校归属以便测试各身份视角）；
+//   - 改在唯一消费点 ResolveTokenScope 做差集过滤（最小改动、不波及其它复用
+//     ListSchoolMemberIDs 的场景）；
+//   - 本函数即"要剔除谁"的权威数据来源。
+//
+// 性能：全系统 admin/region_admin 通常仅个位数，单条 IN 查询极快。
+//
+// 返回：所有 role IN ('admin','region_admin') 的 user_id 切片（可能为空切片）。
+func ListPrivilegedUserIDs(ctx context.Context) ([]string, error) {
+        rows, err := database.DB.Query(ctx,
+                `SELECT id FROM users WHERE role IN ('admin', 'region_admin')`,
+        )
+        if err != nil {
+                return nil, err
+        }
+        defer rows.Close()
+
+        ids := []string{}
+        for rows.Next() {
+                var id string
+                if err := rows.Scan(&id); err == nil {
+                        ids = append(ids, id)
+                }
+        }
+        if err := rows.Err(); err != nil {
+                return nil, err
+        }
+        return ids, nil
 }

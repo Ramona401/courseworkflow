@@ -65,6 +65,7 @@ import { OrgFormModal }     from './components/OrgFormModal'
 import { GroupFormModal }   from './components/GroupFormModal'
 import { MemberPanel }      from './components/MemberPanel'
 import { OrgAdminsPanel }   from './components/OrgAdminsPanel'
+import { SchoolOverseasInline } from './components/SchoolOverseasInline'
 import { RoleBarChart }     from './components/RoleBarChart'
 import { RecentLogsCard }   from './components/RecentLogsCard'
 import { UserDetailModal }  from './components/UserDetailModal'
@@ -72,6 +73,7 @@ import { CreateUserModal }  from './components/CreateUserModal'
 import { BatchImportUsersModal } from './components/BatchImportUsersModal'
 import { RolesTab }         from './components/RolesTab'
 import { KBAuthorizedPanel } from './components/KBAuthorizedPanel'
+import { OverseasPolicyPanel } from './components/OverseasPolicyPanel'
 
 // ==================== 三栏列卡（组织架构Tab内部组件）====================
 function ColCard({ title, count, onAdd, addLabel, loading, empty, children }: {
@@ -164,6 +166,8 @@ export default function AdminPage() {
   const [recentLogsLoading, setRecentLogsLoading] = useState(false)
   // 知识库访问白名单卡片展开开关（仅 admin 概览 Tab 使用）
   const [showKBPanel, setShowKBPanel]             = useState(false)
+  // 学校境外授权卡片展开开关（仅 admin 概览 Tab 使用·批二-A）
+  const [showOverseasPanel, setShowOverseasPanel] = useState(false)
 
   // ---- 用户管理Tab ----
   const [users, setUsers]               = useState<AdminUserListItem[]>([])
@@ -194,6 +198,8 @@ export default function AdminPage() {
   const [expandedGroupId, setExpandedGroupId] = useState<string | null>(null)
   // Phase 6.4：当前展开"学校管理员面板"的学校ID（与教研组成员展开互不影响）
   const [expandedAdminSchoolId, setExpandedAdminSchoolId] = useState<string | null>(null)
+  // 批二-B：当前展开"学校境外授权面板"的学校ID（仅 admin，与管理员面板互不影响）
+  const [expandedOverseasSchoolId, setExpandedOverseasSchoolId] = useState<string | null>(null)
 
   const [orgModal, setOrgModal] = useState<{
     open: boolean; mode: 'create' | 'edit'; type: 'region' | 'school'; initial?: OrgListItem
@@ -557,6 +563,27 @@ export default function AdminPage() {
                     </div>
                     {showKBPanel && <KBAuthorizedPanel />}
                   </div>
+
+                  {/* 学校境外模型授权卡片（批二-A；概览 Tab 仅 admin 可见，天然限定） */}
+                  <div style={{ background: C.white, borderRadius: '14px', border: `1px solid ${C.border}`, overflow: 'hidden', marginTop: '16px' }}>
+                    <div
+                      onClick={() => setShowOverseasPanel(p => !p)}
+                      style={{ padding: '16px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer', background: showOverseasPanel ? C.bg : C.white, transition: 'background 150ms ease' }}>
+                      <div>
+                        <div style={{ fontSize: '15px', fontWeight: 700, color: C.text, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          🌐 学校境外模型授权
+                          <span style={{ fontSize: '11px', fontWeight: 400, color: C.textMuted }}>（双网关分流 · 境外放行白名单）</span>
+                        </div>
+                        <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '3px' }}>
+                          管理"哪些学校可走境外模型"。默认全部学校境内(qwen-max)，仅授权学校放行 claude/gemini 等。
+                        </div>
+                      </div>
+                      <span style={{ fontSize: '13px', color: C.warning, fontWeight: 600, whiteSpace: 'nowrap' }}>
+                        {showOverseasPanel ? '收起 ▲' : '展开管理 ▼'}
+                      </span>
+                    </div>
+                    {showOverseasPanel && <OverseasPolicyPanel />}
+                  </div>
                 </>
               ) : null}
           </div>
@@ -729,6 +756,14 @@ export default function AdminPage() {
                           {expandedAdminSchoolId === s.id ? '收起 ▲' : '🛡️ 管理员'}
                         </button>
                       )}
+                      {/* 批二-B：境外模型授权就近开关入口（仅 admin） */}
+                      {isFullAdmin && (
+                        <button
+                          onClick={() => setExpandedOverseasSchoolId(p => p === s.id ? null : s.id)}
+                          style={rowBtn(expandedOverseasSchoolId === s.id ? C.warning : C.textSec, expandedOverseasSchoolId === s.id ? C.warningLight : C.bg)}>
+                          {expandedOverseasSchoolId === s.id ? '收起 ▲' : '🌐 境外模型'}
+                        </button>
+                      )}
                     </div>
                   </div>
                   {/* Phase 6.4：学校管理员面板（展开式，仿 MemberPanel）*/}
@@ -738,6 +773,14 @@ export default function AdminPage() {
                       orgType="school"
                       onClose={() => setExpandedAdminSchoolId(null)}
                       onChanged={() => { if (selRegion) loadSchools2(selRegion.id) }}
+                    />
+                  )}
+                  {/* 批二-B：学校境外授权面板（展开式，仅 admin） */}
+                  {expandedOverseasSchoolId === s.id && (
+                    <SchoolOverseasInline
+                      schoolId={s.id}
+                      schoolName={s.name}
+                      onClose={() => setExpandedOverseasSchoolId(null)}
                     />
                   )}
                   <div style={{ height: '1px', background: C.border, margin: '0 14px' }} />

@@ -494,7 +494,9 @@ func (s *CoursewarePPTService) GenerateIndexFromPPT(ctx context.Context, coursew
 		Data:      map[string]interface{}{"message": "AI正在分析PPT内容，规划课件结构..."},
 	})
 
-	traceCtx := &ai.TraceContext{SceneCode: "courseware_scheme", UserID: &userID}
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（PPT直翻方案，操作者=userID）
+	pptSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
+	traceCtx := &ai.TraceContext{SceneCode: "courseware_scheme", UserID: &userID, SchoolID: schoolIDPtr(pptSchoolID)}
 	callResult, err := ai.CallAI(aiCfg, systemPrompt, userPrompt, traceCtx)
 	if err != nil {
 		s.broadcastError(coursewareID, "AI规划失败: "+err.Error())

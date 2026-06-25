@@ -1,5 +1,10 @@
 /**
- * VideoEditorModal.tsx — 类剪映多片段视频编辑器主组件 v8.0 (B1瘦身)
+ * VideoEditorModal.tsx — 类剪映多片段视频编辑器主组件 v8.1 (S-V2)
+ *
+ * S-V2 改动:
+ *   ✨ handleExport 的临时 window.confirm 替换为正式三选项导出弹窗
+ *      (仅视频 / 视频+字幕烧录 / 视频+字幕+配音, 见 VideoEditorExportDialog)
+ *   ✨ 无可用字幕时保持旧行为直接导出纯视频, 不弹窗打扰
  *
  * v8.0 (B1瘦身) 重大改动:
  *   ✨ 从 1157行 瘦身到 ~580行
@@ -28,6 +33,8 @@ import VideoEditorExitDialog from './video-editor/VideoEditorExitDialog'
 import VideoEditorProgressBar from './video-editor/VideoEditorProgressBar'
 import type { SubtitleSegment } from './video-editor/VideoEditorSubtitleTrack'
 import VideoEditorTTSModal from './video-editor/VideoEditorTTSModal'
+import VideoEditorExportDialog from './video-editor/VideoEditorExportDialog'
+import type { ExportMode } from './video-editor/VideoEditorExportDialog'
 
 // ==================== 主组件 ====================
 export default function VideoEditorModal({
@@ -92,12 +99,51 @@ export default function VideoEditorModal({
   // v0.42.9 TTS 弹窗
   const [showTTSModal, setShowTTSModal] = useState(false)
   const [subtitleDbId, setSubtitleDbId] = useState('')
+  // S-V2 三选项导出弹窗
+  const [showExportDialog, setShowExportDialog] = useState(false)
+  const [exportSubId, setExportSubId] = useState('')
 
   // === Refs(供 setInterval/RAF 闭包读取最新值) ===
   const clipsRef = useRef(clips); clipsRef.current = clips
   const playIdxRef = useRef(playIdx); playIdxRef.current = playIdx
   const playModeRef = useRef(playMode); playModeRef.current = playMode
   const transActiveRef = useRef(false); transActiveRef.current = transActive
+
+  // ==================== S-V3前移: 预览同步播放TTS配音 ====================
+  // 原理: 编辑器已有50ms进度循环持续计算全局播放时间(playElapsed)，
+  // 此处挂一条隐藏audio通道，循环每拍调用syncNarration：播放头落在某条
+  // 已配音字幕的时间窗内(起点~起点+配音时长)即播放其mp3并对齐偏移，
+  // 离开窗口/视频暂停则暂停。拖播放头、暂停继续、停止全部自然跟随。
+  const narrationRef = useRef<HTMLAudioElement>(null)
+  const subtitleSegmentsRef = useRef(subtitleSegments); subtitleSegmentsRef.current = subtitleSegments
+  const subtitleLanguageRef = useRef(subtitleLanguage); subtitleLanguageRef.current = subtitleLanguage
+  const currentNarrationIdRef = useRef('')
+
+  const syncNarration = useCallback((globalTime: number, videoPaused: boolean) => {
+    const na = narrationRef.current; if (!na) return
+    const segs = subtitleSegmentsRef.current.filter(x => x.language === subtitleLanguageRef.current && !!x.tts_audio_url)
+    const seg = segs.find(x => {
+      const d = (x.tts_duration && x.tts_duration > 0) ? x.tts_duration : (x.end_sec - x.start_sec)
+      return globalTime >= x.start_sec && globalTime < x.start_sec + d
+    })
+    if (!seg) { if (!na.paused) na.pause(); currentNarrationIdRef.current = ''; return }
+    if (videoPaused) { if (!na.paused) na.pause(); return }
+    const offset = globalTime - seg.start_sec
+    if (currentNarrationIdRef.current !== seg.id) {
+      // 进入新字幕条的配音窗口: 换源、对齐偏移、起播
+      currentNarrationIdRef.current = seg.id
+      na.src = seg.tts_audio_url as string
+      try { na.currentTime = offset } catch { /* 元数据未就绪时忽略 */ }
+      na.volume = 1.0
+      na.play().catch(() => { /* 浏览器拦截时静默 */ })
+    } else {
+      // 同一条配音播放中: 漂移超过0.3秒就重新对齐(与分离音轨同款策略)
+      if (Math.abs(na.currentTime - offset) > 0.3) { try { na.currentTime = offset } catch { /* */ } }
+      if (na.paused) na.play().catch(() => { /* */ })
+    }
+  }, [])
+
+  const stopNarration = useCallback(() => { narrationRef.current?.pause(); currentNarrationIdRef.current = '' }, [])
 
   // ==================== 草稿持久化 ====================
   const saveDraftToServer = useCallback(async (name?: string) => {
@@ -202,7 +248,7 @@ export default function VideoEditorModal({
   const handleTimelineDrop = useCallback((e: React.DragEvent) => { setTimelineDragOver(false); const vid = e.dataTransfer.getData(DRAG_TYPE_ASSET); if (!vid) return; const v = videos.find(x => x.id === vid); if (v) addClip(v) }, [videos, addClip])
 
   // ==================== 播放核心 ====================
-  const stopAll = useCallback(() => { videoARef.current?.pause(); videoBRef.current?.pause(); stopAudio(); cancelAnimationFrame(transRAF.current); resetVolumes(); switchingRef.current = false; setPlayMode('none'); setPlayIdx(-1); setPlayElapsed(0); setTransActive(false); setTransProgress(0); setVideoLoading(false); setPausedAtTime(-1) }, [resetVolumes, stopAudio])
+  const stopAll = useCallback(() => { videoARef.current?.pause(); videoBRef.current?.pause(); stopAudio(); stopNarration(); cancelAnimationFrame(transRAF.current); resetVolumes(); switchingRef.current = false; setPlayMode('none'); setPlayIdx(-1); setPlayElapsed(0); setTransActive(false); setTransProgress(0); setVideoLoading(false); setPausedAtTime(-1) }, [resetVolumes, stopAudio, stopNarration])
 
   const loadAndSeek = useCallback((v: HTMLVideoElement, clip: EditorClip): Promise<void> => {
     return new Promise(resolve => {
@@ -258,7 +304,7 @@ export default function VideoEditorModal({
 
   const togglePlayPause = useCallback(() => {
     if (transActiveRef.current || switchingRef.current) return; const a = activeVideoRef.current; if (!a) return; const audio = audioRef.current
-    if (playMode !== 'none' && !a.paused) { a.pause(); audio?.pause(); return }
+    if (playMode !== 'none' && !a.paused) { a.pause(); audio?.pause(); narrationRef.current?.pause(); return }
     if (playMode !== 'none' && a.paused) { a.play().catch(() => {}); audio?.play().catch(() => {}); return }
     if (clips.length > 0) { if (pausedAtTime >= 0) resumeFromTime(pausedAtTime); else playAll() }
   }, [playMode, clips, playAll, pausedAtTime, resumeFromTime])
@@ -293,11 +339,11 @@ export default function VideoEditorModal({
       const idx = playIdxRef.current, all = clipsRef.current; if (idx < 0 || idx >= all.length) return
       const clip = all[idx], a = activeVideoRef.current; if (!a || !clip) return
       if (mode === 'single') {
-        if (a.currentTime >= clip.trimEnd - 0.05) { a.pause(); stopAudio(); setPlayMode('none'); setPlayIdx(-1) }
-        let singleEl = 0; for (let i = 0; i < idx; i++) singleEl += all[i].trimEnd - all[i].trimStart; singleEl += Math.max(0, a.currentTime - clip.trimStart); setPlayElapsed(singleEl)
+        if (a.currentTime >= clip.trimEnd - 0.05) { a.pause(); stopAudio(); stopNarration(); setPlayMode('none'); setPlayIdx(-1) }
+        let singleEl = 0; for (let i = 0; i < idx; i++) singleEl += all[i].trimEnd - all[i].trimStart; singleEl += Math.max(0, a.currentTime - clip.trimStart); setPlayElapsed(singleEl); syncNarration(singleEl, a.paused)
         return
       }
-      let el = 0; for (let i = 0; i < idx; i++) el += all[i].trimEnd - all[i].trimStart; el += Math.max(0, a.currentTime - clip.trimStart); setPlayElapsed(el)
+      let el = 0; for (let i = 0; i < idx; i++) el += all[i].trimEnd - all[i].trimStart; el += Math.max(0, a.currentTime - clip.trimStart); setPlayElapsed(el); syncNarration(el, a.paused)
       const audio = audioRef.current; if (audio && clip.audioUrl && !audio.paused) { const exp = a.currentTime - clip.trimStart; if (Math.abs(audio.currentTime - exp) > 0.2) { try { audio.currentTime = exp } catch { /* */ } } }
       if (idx >= all.length - 1) { if (a.currentTime >= clip.trimEnd - 0.05) stopAll(); return }
       const t = clip.transition || 'none', td = clip.transDur || 0.5
@@ -305,7 +351,7 @@ export default function VideoEditorModal({
       else { if (a.currentTime >= clip.trimEnd - 0.05) doCrossfade(idx, idx + 1) }
     }
     const tmr = setInterval(check, 50); return () => clearInterval(tmr)
-  }, [doCrossfade, stopAll, stopAudio])
+  }, [doCrossfade, stopAll, stopAudio, syncNarration])
 
   // 键盘
   useEffect(() => { const fn = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); if (clips.length > 0) setShowExitConfirm(true); else { stopAll(); onClose() } }; if (e.key === ' ') { e.preventDefault(); togglePlayPause() } }; window.addEventListener('keydown', fn); return () => window.removeEventListener('keydown', fn) }, [onClose, stopAll, togglePlayPause, clips.length])
@@ -362,12 +408,51 @@ export default function VideoEditorModal({
     inp.click()
   }, [onUploadVideo])
 
+  // ==================== S字幕修: TTS前强制落库 ====================
+  // 修复：原逻辑在已有subtitleDbId时跳过保存直接开弹窗，导致后端读到的是
+  // 数据库里的过期字幕快照（text为空→配音被静默跳过）。现在无论是否已有
+  // 轨ID，打开TTS弹窗前都把当前本地segments完整upsert落库。
+  const handleRequestTTS = useCallback(() => {
+    if (!coursewareId || subtitleSegments.length === 0) { alert('请先添加字幕条'); return }
+    if (!subtitleSegments.some(s => s.text.trim().length > 0)) { alert('字幕内容为空，请先双击字幕条输入文本'); return }
+    upsertSubtitle(coursewareId, { scope_type: 'editor_draft', language: subtitleLanguage, segments: JSON.stringify(subtitleSegments) })
+      .then(r => { if (r?.id) setSubtitleDbId(r.id); setShowTTSModal(true) })
+      .catch(e => alert('保存字幕失败: ' + (e instanceof Error ? e.message : '未知错误')))
+  }, [coursewareId, subtitleSegments, subtitleLanguage])
+
   // ==================== 导出 + 退出 ====================
-  const handleExport = useCallback(() => {
+  // S-V2: 导出前同步落库字幕（拿到轨ID）。有非空字幕则弹三选项导出弹窗
+  // （仅视频/+字幕烧录/+字幕+配音），无字幕保持旧行为直接导出纯视频不打扰。
+  const handleExport = useCallback(async () => {
     if (clips.length === 0 || exporting) return; stopAll()
-    if (coursewareId && subtitleSegments.length > 0) { upsertSubtitle(coursewareId, { scope_type: 'editor_draft', language: subtitleLanguage, segments: JSON.stringify(subtitleSegments) }).catch(e => console.warn('[字幕持久化] 导出前保存失败:', e)) }
-    onExport(clips.map(c => ({ asset_id: c.id, start_sec: c.trimStart, end_sec: c.trimEnd, transition: c.transition, trans_dur: c.transDur })))
-  }, [clips, exporting, stopAll, coursewareId, subtitleSegments, subtitleLanguage, onExport])
+    let subId = subtitleDbId
+    if (coursewareId && subtitleSegments.length > 0) {
+      try {
+        const r = await upsertSubtitle(coursewareId, { scope_type: 'editor_draft', language: subtitleLanguage, segments: JSON.stringify(subtitleSegments) })
+        if (r?.id) { subId = r.id; setSubtitleDbId(r.id) }
+      } catch (e) { console.warn('[字幕持久化] 导出前保存失败:', e) }
+    }
+    const textCount = subtitleSegments.filter(s => s.text.trim().length > 0).length
+    if (textCount === 0 || !subId) {
+      // 无可用字幕：直接导出纯视频（与S-V2前无配音时的行为一致）
+      onExport(
+        clips.map(c => ({ asset_id: c.id, start_sec: c.trimStart, end_sec: c.trimEnd, transition: c.transition, trans_dur: c.transDur })),
+        {},
+      )
+      return
+    }
+    setExportSubId(subId)
+    setShowExportDialog(true)
+  }, [clips, exporting, stopAll, coursewareId, subtitleSegments, subtitleLanguage, subtitleDbId, onExport])
+
+  // S-V2: 三选项弹窗确认——按所选模式组装options交给父级执行串行链
+  const handleExportConfirm = useCallback((mode: ExportMode) => {
+    setShowExportDialog(false)
+    onExport(
+      clips.map(c => ({ asset_id: c.id, start_sec: c.trimStart, end_sec: c.trimEnd, transition: c.transition, trans_dur: c.transDur })),
+      { burnSubtitle: mode !== 'video', mixNarration: mode === 'narration', subtitleId: exportSubId },
+    )
+  }, [clips, exportSubId, onExport])
 
   const doClose = useCallback(() => { stopAll(); setShowExitConfirm(false); onClose() }, [stopAll, onClose])
   const handleCloseClick = useCallback(() => { if (clips.length > 0) setShowExitConfirm(true); else doClose() }, [clips.length, doClose])
@@ -408,9 +493,12 @@ export default function VideoEditorModal({
           <span style={{ fontSize: 12, color: C.textMuted }}>🎞️ 多轨道时间轴 — 三轨堆叠 · 拖手柄裁剪 · 点击标尺跳转 · 空格播放</span>
           {clips.length >= 2 && <button onClick={playMode === 'all' ? stopAll : playAll} style={{ padding: '5px 14px', borderRadius: 6, border: `1px solid ${C.playing}`, background: playMode === 'all' ? C.playing + '15' : 'transparent', color: C.playing, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>{playMode === 'all' ? '⏹ 停止' : '▶ 连贯预览'}</button>}
         </div>
-        <VideoEditorTimeline clips={clips} activeIdx={activeIdx} playIdx={playIdx} playMode={playMode} dragIdx={dragIdx} dragOverIdx={dragOverIdx} timelineDragOver={timelineDragOver} phTime={phTime} draggingPH={draggingPH} phDragTime={phDragTime} setActiveIdx={setActiveIdx} removeClip={removeClip} updateClip={updateClip} playSingle={playSingle} handleDragStart={handleDragStart} handleDragOver={handleDragOver} handleDrop={handleDrop} setDragIdx={setDragIdx} setDragOverIdx={setDragOverIdx} handleTimelineDragOver={handleTimelineDragOver} handleTimelineDragLeave={handleTimelineDragLeave} handleTimelineDrop={handleTimelineDrop} handleRulerClick={handleRulerClick} rulerRef={rulerRef} handlePHDown={handlePHDown} subtitleSegments={subtitleSegments.filter(s => s.language === subtitleLanguage)} subtitleLanguage={subtitleLanguage} onSubtitleSegmentsChange={setSubtitleSegments} onEditSubtitleSegment={setEditingSubtitle} onRequestTTS={() => { if (subtitleDbId) { setShowTTSModal(true) } else if (coursewareId && subtitleSegments.length > 0) { upsertSubtitle(coursewareId, { scope_type: 'editor_draft', language: subtitleLanguage, segments: JSON.stringify(subtitleSegments) }).then(r => { if (r?.id) { setSubtitleDbId(r.id); setShowTTSModal(true) } }).catch(e => alert('保存字幕失败: ' + (e instanceof Error ? e.message : '未知错误'))) } else { alert('请先添加字幕条') } }} />
+        <VideoEditorTimeline clips={clips} activeIdx={activeIdx} playIdx={playIdx} playMode={playMode} dragIdx={dragIdx} dragOverIdx={dragOverIdx} timelineDragOver={timelineDragOver} phTime={phTime} draggingPH={draggingPH} phDragTime={phDragTime} setActiveIdx={setActiveIdx} removeClip={removeClip} updateClip={updateClip} playSingle={playSingle} handleDragStart={handleDragStart} handleDragOver={handleDragOver} handleDrop={handleDrop} setDragIdx={setDragIdx} setDragOverIdx={setDragOverIdx} handleTimelineDragOver={handleTimelineDragOver} handleTimelineDragLeave={handleTimelineDragLeave} handleTimelineDrop={handleTimelineDrop} handleRulerClick={handleRulerClick} rulerRef={rulerRef} handlePHDown={handlePHDown} subtitleSegments={subtitleSegments.filter(s => s.language === subtitleLanguage)} subtitleLanguage={subtitleLanguage} onSubtitleSegmentsChange={setSubtitleSegments} onEditSubtitleSegment={setEditingSubtitle} onRequestTTS={handleRequestTTS} />
         <div style={{ marginTop: 6, fontSize: 11, color: C.textMuted, textAlign: 'center' }}>💡 拖手柄裁剪 · 点击标尺跳转 · 拖▼播放头定位 · 空格播放/暂停 · ESC退出</div>
       </div>
+
+      {/* S-V3前移: 预览配音播放通道(隐藏audio, 由50ms进度循环驱动) */}
+      <audio ref={narrationRef} preload="auto" style={{ display: 'none' }} />
 
       {/* v0.42.9 TTS 配音弹窗 */}
       {showTTSModal && coursewareId && subtitleDbId && (
@@ -419,13 +507,23 @@ export default function VideoEditorModal({
           subtitleId={subtitleDbId}
           segments={subtitleSegments.filter(s => s.language === subtitleLanguage)}
           language={subtitleLanguage}
-          onComplete={(updated) => { setSubtitleSegments(updated); setShowTTSModal(false) }}
+          onComplete={(updated) => { setSubtitleSegments(prev => prev.map(s => { const u = updated.find(x => x.id === s.id); return u ? { ...s, tts_audio_url: u.tts_audio_url, tts_voice: u.tts_voice, tts_duration: u.tts_duration, tts_generated_at: u.tts_generated_at } : s })) }}
           onClose={() => setShowTTSModal(false)}
         />
       )}
 
+      {/* S-V2 三选项导出弹窗 */}
+      {showExportDialog && (
+        <VideoEditorExportDialog
+          subtitleCount={subtitleSegments.filter(s => s.text.trim().length > 0).length}
+          narratedCount={subtitleSegments.filter(s => !!s.tts_audio_url).length}
+          onConfirm={handleExportConfirm}
+          onCancel={() => setShowExportDialog(false)}
+        />
+      )}
+
       {/* 字幕编辑弹窗 */}
-      {editingSubtitle && <VideoEditorSubtitleModal segment={editingSubtitle} languages={SUBTITLE_LANGUAGES} onSave={(updated) => { setSubtitleSegments(prev => prev.map(s => s.id === updated.id ? updated : s)); setEditingSubtitle(null) }} onClose={() => setEditingSubtitle(null)} />}
+      {editingSubtitle && <VideoEditorSubtitleModal segment={editingSubtitle} languages={SUBTITLE_LANGUAGES} onSave={(updated) => { setSubtitleSegments(prev => updated.text.trim() ? prev.map(s => s.id === updated.id ? updated : s) : prev.filter(s => s.id !== updated.id)); setEditingSubtitle(null) }} onClose={() => { const ed = editingSubtitle; setSubtitleSegments(prev => prev.filter(s => !(ed && s.id === ed.id && !s.text.trim() && !s.tts_audio_url))); setEditingSubtitle(null) }} />}
 
       {/* 退出确认弹窗 */}
       {showExitConfirm && <VideoEditorExitDialog clipCount={clips.length} onSaveDraft={async (name) => { await saveDraftToServer(name); doClose() }} onDiscard={doClose} onCancel={() => setShowExitConfirm(false)} />}

@@ -15,6 +15,10 @@ package ai
 // v71新增：CallAIMultimodal多模态Vision调用
 // v85新增：主模型失败后依次尝试fallback模型
 // v92重构：从原client.go拆分为独立文件
+//
+// v197新增：多模态入口接入境内/境外模型分流（applyModelPolicy），
+//   未授权学校的境外模型与境外fallback一律降级境内。
+//   注：图像/视频生成走 client_image.go/client_video.go（豆包，境内），不经本入口。
 
 import (
 	"encoding/json"
@@ -88,6 +92,13 @@ func CallAIMultimodal(cfg *EffectiveConfig, systemPrompt string, userText string
 	if allowed, errMsg := invokeCreditCheck(traceCtx); !allowed {
 		return nil, fmt.Errorf(errMsg)
 	}
+
+	// v197新增：模型境内/境外分流——按学校授权策略原地改写 cfg.Model 与 FallbackModels
+	// 必须在下方构建 modelsToTry 之前调用，主模型与fallback链一并境内化
+	applyModelPolicy(cfg, traceCtx)
+
+	// v197修复：分流可能整通道切换 cfg.APIBaseURL，endpoint 须在分流后重算，否则境内key发到境外网关致401
+	endpoint = strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
 
 	// -------- 构建模型尝试列表：主模型 + fallback模型 --------
 	type modelAttempt struct {

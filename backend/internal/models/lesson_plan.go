@@ -36,6 +36,7 @@ type LessonPlan struct {
 	ForkCount         int        `json:"fork_count"`          // 被fork次数
 	TemplateID        *string    `json:"template_id"`         // 使用的提示词模板ID
 	RecipeID          *string    `json:"recipe_id"`           // Phase 7A：使用的备课配方ID
+	UnitPlanID        *string    `json:"unit_plan_id"`        // 大单元备课：挂载的单元方案ID（nil=未挂载，挂载后五阶段注入并让大纲让位）
 	ViewCount         int        `json:"view_count"`          // 浏览次数
 	UseCount          int        `json:"use_count"`           // 使用次数
 	Version           int        `json:"version"`             // 版本号

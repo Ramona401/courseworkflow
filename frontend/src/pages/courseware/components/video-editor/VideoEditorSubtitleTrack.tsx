@@ -3,18 +3,22 @@
  *
  * v0.42.8 新增：替换原有的字幕轨占位行
  * v0.42.8.1 性能修复：拖拽字幕条改为 controlled draft 模式
- *   - 拖动期间只更新本地 draftSeg state（零全链路重渲染）
- *   - pointerup 时一次性调 onSegmentsChange 提交最终值
+ * S-V3a 专业化改造（对标专业剪辑软件交互习惯）：
+ *   A1 防误加：单击空白=取消选中（不再新增！）；新增改为「双击空白处」或「+字幕」按钮
+ *   A3 选中态：单击字幕条=选中（金色高亮描边），Delete/Backspace 删除选中条
+ *      （已生成配音的条目删除前弹确认；输入框聚焦时按键不触发删除）
+ *   A4 防重叠：拖拽移动/调边界时钳制在相邻字幕条之间，临近边界6像素自动吸附；
+ *      双击新增时自动适配点击处的可用空隙，空间不足提示而非强行重叠
  *
  * 功能：
  *   - 在时间轴第三轨渲染字幕条（按 startSec/endSec 定位）
- *   - 点击空白区域新增字幕条（默认3秒）
- *   - 双击字幕条打开编辑弹窗
- *   - 拖拽字幕条左右边界调整时长（controlled draft）
- *   - 拖拽字幕条中间调整位置（controlled draft）
- *   - 删除字幕条
+ *   - 双击空白区域 / 点「+字幕」按钮 新增字幕条（默认3秒，自动避让相邻条）
+ *   - 单击字幕条选中，Delete 删除；双击字幕条打开编辑弹窗
+ *   - 拖拽字幕条左右边界调整时长（controlled draft + 邻界钳制吸附）
+ *   - 拖拽字幕条中间调整位置（controlled draft + 邻界钳制吸附）
+ *   - 删除字幕条（✕按钮或Delete键，带配音的先确认）
  */
-import { useRef, useState, useEffect } from 'react'
+import { useRef, useState, useEffect, useCallback } from 'react'
 import { PX_PER_SEC } from './VideoEditorConstants'
 import { clipPxWidth } from './VideoEditorUtils'
 import type { EditorClip } from './VideoEditorTypes'
@@ -64,6 +68,9 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
   const pxToSec = totalDur > 0 && totalPx > 0 ? totalDur / totalPx : 1 / PX_PER_SEC
   const secToPx = totalPx > 0 && totalDur > 0 ? totalPx / totalDur : PX_PER_SEC
 
+  // ==================== S-V3a A3: 选中态 ====================
+  const [selectedId, setSelectedId] = useState('')
+
   // ==================== controlled draft 拖拽状态 ====================
   // 拖动期间不触发 onSegmentsChange，只更新本地 draft
   // pointerup 时一次性提交，避免每像素重渲染整个时间轴
@@ -94,18 +101,38 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
       const dx = e.clientX - ds.startX
       const dt = dx * pxToSec
       const minLen = 0.5 // 最短0.5秒
+      const SNAP = 6 * pxToSec // S-V3a A4: 临近边界6像素自动吸附
+
+      // S-V3a A4: 计算相邻字幕条形成的左右边界（防重叠）
+      let lb = 0
+      let rb = totalDur
+      for (const s of segments) {
+        if (s.id === ds.segId) continue
+        if (s.end_sec <= ds.origStart + 0.01 && s.end_sec > lb) lb = s.end_sec
+        if (s.start_sec >= ds.origEnd - 0.01 && s.start_sec < rb) rb = s.start_sec
+      }
+      // 历史重叠数据兜底：边界倒挂时退回全轨范围，不阻塞拖拽
+      if (lb > rb) { lb = 0; rb = totalDur }
 
       let newStart = ds.origStart
       let newEnd = ds.origEnd
 
       if (ds.type === 'move') {
         const dur = ds.origEnd - ds.origStart
-        newStart = Math.max(0, Math.min(totalDur - dur, ds.origStart + dt))
+        newStart = Math.max(lb, Math.min(rb - dur, ds.origStart + dt))
+        // 吸附到相邻边界
+        if (Math.abs(newStart - lb) < SNAP) newStart = lb
+        if (Math.abs(newStart + dur - rb) < SNAP) newStart = rb - dur
+        newStart = Math.max(0, newStart)
         newEnd = newStart + dur
       } else if (ds.type === 'left') {
-        newStart = Math.max(0, Math.min(ds.origEnd - minLen, ds.origStart + dt))
+        newStart = Math.max(lb, Math.min(ds.origEnd - minLen, ds.origStart + dt))
+        if (Math.abs(newStart - lb) < SNAP) newStart = lb
+        newStart = Math.max(0, newStart)
       } else {
-        newEnd = Math.max(ds.origStart + minLen, Math.min(totalDur, ds.origEnd + dt))
+        newEnd = Math.max(ds.origStart + minLen, Math.min(rb, ds.origEnd + dt))
+        if (Math.abs(newEnd - rb) < SNAP) newEnd = rb
+        newEnd = Math.min(totalDur, newEnd)
       }
 
       // 只更新本地 draft（不触发 segments 重渲染）
@@ -118,7 +145,7 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
       if (draft && ds) {
         onSegmentsChange(segments.map(s =>
           s.id === draft.segId
-            ? { ...s, start_sec: draft.start_sec, end_sec: draft.end_sec }
+            ? { ...s, start_sec: Math.round(draft.start_sec * 100) / 100, end_sec: Math.round(draft.end_sec * 100) / 100 }
             : s
         ))
       }
@@ -133,16 +160,77 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
     }
   }, [dragState, segments, onSegmentsChange, totalDur, pxToSec])
 
-  // ==================== 点击空白添加字幕 ====================
+  // ==================== S-V3a A3: 删除（统一入口，带配音先确认） ====================
+  const deleteSeg = useCallback((segId: string) => {
+    const seg = segments.find(s => s.id === segId)
+    if (!seg) return
+    if (seg.tts_audio_url && !window.confirm('该字幕已生成配音，删除后配音关联将丢失。确定删除？')) return
+    onSegmentsChange(segments.filter(s => s.id !== segId))
+    setSelectedId(prev => (prev === segId ? '' : prev))
+  }, [segments, onSegmentsChange])
+
+  // Delete/Backspace 删除选中条（输入框/文本域/可编辑区聚焦时不触发）
+  useEffect(() => {
+    const fn = (e: KeyboardEvent) => {
+      if (e.key !== 'Delete' && e.key !== 'Backspace') return
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+      if (!selectedId) return
+      e.preventDefault()
+      deleteSeg(selectedId)
+    }
+    window.addEventListener('keydown', fn)
+    return () => window.removeEventListener('keydown', fn)
+  }, [selectedId, deleteSeg])
+
+  // ==================== S-V3a A1: 单击空白=取消选中；双击空白=新增 ====================
   const trackRef = useRef<HTMLDivElement>(null)
+
+  // 单击轨道背景：只取消选中，绝不新增（专业剪辑软件习惯）
   const handleTrackClick = (e: React.MouseEvent) => {
-    // 只在直接点击轨道背景时触发，不在字幕条上触发
+    if (e.target !== trackRef.current) return
+    setSelectedId('')
+  }
+
+  // 双击轨道背景：在点击处新增字幕（A4: 自动适配可用空隙，不与相邻条重叠）
+  const handleTrackDoubleClick = (e: React.MouseEvent) => {
     if (e.target !== trackRef.current) return
     const rect = trackRef.current!.getBoundingClientRect()
     const clickX = e.clientX - rect.left
     const clickSec = clickX * pxToSec
-    // 新字幕默认3秒
-    const startSec = Math.max(0, clickSec - 1.5)
+
+    // 求点击处的可用空隙（左界=左侧最近字幕的end，右界=右侧最近字幕的start）
+    let lb = 0
+    let rb = totalDur
+    for (const s of segments) {
+      if (s.end_sec <= clickSec && s.end_sec > lb) lb = s.end_sec
+      if (s.start_sec >= clickSec && s.start_sec < rb) rb = s.start_sec
+    }
+    if (rb - lb < 0.5) { alert('此处空间不足（不足0.5秒），请换个位置双击或先调整相邻字幕') ; return }
+
+    let startSec = Math.max(lb, clickSec - 1.5)
+    let endSec = Math.min(rb, startSec + 3)
+    if (endSec - startSec < 0.5) startSec = Math.max(lb, endSec - 0.5)
+
+    const newSeg: SubtitleSegment = {
+      id: makeId(),
+      start_sec: Math.round(startSec * 100) / 100,
+      end_sec: Math.round(endSec * 100) / 100,
+      text: '',
+      language,
+    }
+    onSegmentsChange([...segments, newSeg])
+    setSelectedId(newSeg.id)
+    // 立即打开编辑弹窗（取消且未填文本时由父组件自动清理空条）
+    onEditSegment(newSeg)
+  }
+
+  // 「+字幕」按钮：追加到最后一条字幕之后（无字幕时从0开始）
+  const handleAddAtEnd = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    const lastEnd = segments.reduce((m, s) => Math.max(m, s.end_sec), 0)
+    if (totalDur - lastEnd < 0.5) { alert('时间轴尾部空间不足（不足0.5秒），请双击轨道空白处插入') ; return }
+    const startSec = lastEnd
     const endSec = Math.min(totalDur, startSec + 3)
     const newSeg: SubtitleSegment = {
       id: makeId(),
@@ -152,14 +240,8 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
       language,
     }
     onSegmentsChange([...segments, newSeg])
-    // 立即打开编辑弹窗
+    setSelectedId(newSeg.id)
     onEditSegment(newSeg)
-  }
-
-  // ==================== 删除字幕条 ====================
-  const handleDeleteSeg = (segId: string, e: React.MouseEvent) => {
-    e.stopPropagation()
-    onSegmentsChange(segments.filter(s => s.id !== segId))
   }
 
   // 空状态
@@ -183,13 +265,14 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
     <div
       ref={trackRef}
       onClick={handleTrackClick}
+      onDoubleClick={handleTrackDoubleClick}
       style={{
         position: 'relative',
         height: 40, minWidth: totalPx,
         marginTop: 4, borderRadius: 6,
         background: 'rgba(245,158,11,0.06)',
         border: '1px solid rgba(245,158,11,0.2)',
-        cursor: 'text',
+        cursor: 'default',
         boxSizing: 'border-box',
         overflow: 'hidden',
       }}
@@ -204,10 +287,12 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
         const left = effectiveStart * secToPx
         const width = Math.max(20, (effectiveEnd - effectiveStart) * secToPx)
         const hasTTS = !!seg.tts_audio_url
+        const isSelected = selectedId === seg.id
 
         return (
           <div
             key={seg.id}
+            onClick={(e) => { e.stopPropagation(); setSelectedId(seg.id) }}
             onDoubleClick={(e) => { e.stopPropagation(); onEditSegment(seg) }}
             style={{
               position: 'absolute',
@@ -219,6 +304,8 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
                   ? 'linear-gradient(135deg, rgba(245,158,11,0.35) 0%, rgba(245,158,11,0.2) 100%)'
                   : 'linear-gradient(135deg, rgba(245,158,11,0.25) 0%, rgba(245,158,11,0.12) 100%)',
               border: `1px solid ${isDragging ? 'rgba(245,158,11,0.8)' : 'rgba(245,158,11,0.5)'}`,
+              // S-V3a A3: 选中态金色高亮描边（boxShadow不改变布局尺寸）
+              boxShadow: isSelected ? '0 0 0 1.5px #F59E0B, 0 0 8px rgba(245,158,11,0.4)' : 'none',
               cursor: dragState ? 'grabbing' : 'grab',
               overflow: 'hidden',
               display: 'flex', alignItems: 'center',
@@ -232,6 +319,7 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
             <div
               onPointerDown={e => {
                 e.preventDefault(); e.stopPropagation()
+                setSelectedId(seg.id)
                 setDragState({ segId: seg.id, type: 'left', startX: e.clientX, origStart: seg.start_sec, origEnd: seg.end_sec })
               }}
               style={{
@@ -244,6 +332,7 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
             <div
               onPointerDown={e => {
                 e.preventDefault(); e.stopPropagation()
+                setSelectedId(seg.id)
                 setDragState({ segId: seg.id, type: 'move', startX: e.clientX, origStart: seg.start_sec, origEnd: seg.end_sec })
               }}
               style={{
@@ -257,7 +346,7 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
                 fontSize: 10, color: '#F59E0B',
                 whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                 maxWidth: '100%', textShadow: '0 1px 2px rgba(0,0,0,0.5)',
-                fontWeight: 500,
+                fontWeight: isSelected ? 700 : 500,
               }}>
                 {seg.text || '(空字幕)'}
               </span>
@@ -266,6 +355,7 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
             <div
               onPointerDown={e => {
                 e.preventDefault(); e.stopPropagation()
+                setSelectedId(seg.id)
                 setDragState({ segId: seg.id, type: 'right', startX: e.clientX, origStart: seg.start_sec, origEnd: seg.end_sec })
               }}
               style={{
@@ -276,7 +366,7 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
             />
             {/* 删除按钮 */}
             <button
-              onClick={e => handleDeleteSeg(seg.id, e)}
+              onClick={e => { e.stopPropagation(); deleteSeg(seg.id) }}
               style={{
                 position: 'absolute', top: 1, right: 6, zIndex: 2,
                 background: 'rgba(0,0,0,0.5)', border: 'none',
@@ -297,6 +387,20 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
           </div>
         )
       })}
+
+      {/* S-V3a A1: 「+字幕」按钮（常驻，新增的主入口之一） */}
+      <button
+        onClick={handleAddAtEnd}
+        style={{
+          position: 'absolute', top: 2, right: onRequestTTS && segments.length > 0 ? 58 : 4, zIndex: 3,
+          background: 'rgba(245,158,11,0.2)', border: '1px solid rgba(245,158,11,0.5)',
+          color: '#FCD34D', fontSize: 10, cursor: 'pointer',
+          padding: '2px 8px', borderRadius: 4, fontWeight: 600,
+        }}
+        onMouseEnter={e => { e.currentTarget.style.background = 'rgba(245,158,11,0.35)' }}
+        onMouseLeave={e => { e.currentTarget.style.background = 'rgba(245,158,11,0.2)' }}
+        title="在最后一条字幕之后添加新字幕"
+      >＋ 字幕</button>
 
       {/* TTS 配音入口按钮（字幕数 > 0 时显示） */}
       {segments.length > 0 && onRequestTTS && (
@@ -321,7 +425,7 @@ export default function VideoEditorSubtitleTrack(props: SubtitleTrackProps) {
           pointerEvents: 'none',
         }}>
           <span style={{ fontSize: 11, color: 'rgba(245,158,11,0.5)', fontStyle: 'italic' }}>
-            💬 点击添加字幕 · 双击编辑
+            💬 双击空白添加字幕 · 或点右上「＋字幕」
           </span>
         </div>
       )}

@@ -215,7 +215,20 @@ func (s *CoursewareService) DeleteCourseware(ctx context.Context, id string, use
 
 // ==================== 状态流转 ====================
 
-// ConfirmIndex 确认课件索引，状态从 indexing → styling
+// ConfirmIndex 确认课件索引。
+//
+// 【状态保持修复（PRD 5.2 共性根因）】原实现无条件把状态设为 styling，假设"确认方案的下一步
+// 永远是去选风格"。这对【首次】走流程的新课件（draft/indexing）是对的；但对【已经走到后面、
+// 甚至生成过 HTML/媒体】的老课件——老师回 Step1 改了方案（如加一页）再点"确认方案"——这句话
+// 会把课件一脚踹回 styling(序号2)，导致"确认导航栏/批量生成/确认提交"等后续步骤全部消失，
+// 老师误以为辛苦做的图片视频丢了（实际数据都在，只是被状态机挡在后面步骤之外）。
+//
+// 修复策略（借用 CoursewareStatusOrder 序号判断，与 RollbackStatus 同一套思路）：
+//   - 当前序号 ≤ styling(2)：首次流程，保持原行为 → 设为 styling，引导去选风格；
+//   - 当前序号 ≥ generating(3)：老课件回头改方案，已选过风格/生成过页，不回退到 styling，
+//     保持在 preview，让老师能直接继续往后走。新增/改动的页本就是 pending 状态，
+//     到批量生成步骤会自动补生成，不影响已有内容。
+//   这样新课件首次流程完全不变，老课件改方案不再被踢出后续步骤。
 func (s *CoursewareService) ConfirmIndex(ctx context.Context, id string, userID string) error {
 	cw, err := repository.GetCoursewareByID(ctx, id)
 	if err != nil {
@@ -234,6 +247,19 @@ func (s *CoursewareService) ConfirmIndex(ctx context.Context, id string, userID 
 		return fmt.Errorf("课件没有任何页面，请先生成索引")
 	}
 	_ = repository.UpdateCoursewarePageCount(ctx, id, count)
+
+	// 状态保持修复：依据当前状态在状态机中的序号决定确认后落到哪个状态。
+	curOrder, ok := models.CoursewareStatusOrder[cw.Status]
+	stylingOrder := models.CoursewareStatusOrder[models.CoursewareStatusStyling] // =2
+	if ok && curOrder >= models.CoursewareStatusOrder[models.CoursewareStatusGenerating] {
+		// 老课件（已走过风格、生成过页）回头改方案：不回退到 styling，保持在 preview，
+		// 让老师能直接继续"确认导航栏/批量生成/确认提交"，已有媒体与已生成页不受影响。
+		cwServiceLog.Info("确认方案：老课件保持后续可走状态（不回退styling）",
+			"courseware_id", id, "from", cw.Status, "to", models.CoursewareStatusPreview)
+		return repository.UpdateCoursewareStatus(ctx, id, models.CoursewareStatusPreview)
+	}
+	_ = stylingOrder // 保留语义可读性（首次流程落 styling，下一行即为该路径）
+	// 首次流程（draft/indexing/或本就在styling）：保持原行为，引导去选风格。
 	return repository.UpdateCoursewareStatus(ctx, id, models.CoursewareStatusStyling)
 }
 
@@ -544,6 +570,7 @@ func (s *CoursewareService) AddPage(ctx context.Context, coursewareID string, us
 		return nil, fmt.Errorf("添加页面失败: %w", err)
 	}
 	_ = repository.UpdateCoursewarePageCount(ctx, coursewareID, count+1)
+	_ = s.ResyncCWPageNumbers(ctx, coursewareID) // (2) bar denominator: resync after add
 	return page, nil
 }
 
@@ -561,6 +588,7 @@ func (s *CoursewareService) DeletePage(ctx context.Context, coursewareID string,
 	}
 	count, _ := repository.CountCoursewarePages(ctx, coursewareID)
 	_ = repository.UpdateCoursewarePageCount(ctx, coursewareID, count)
+	_ = s.ResyncCWPageNumbers(ctx, coursewareID) // (2) bar denominator: resync after delete
 	return nil
 }
 
@@ -573,7 +601,12 @@ func (s *CoursewareService) ReorderPages(ctx context.Context, coursewareID strin
 	if cw.UserID != userID {
 		return fmt.Errorf("无权操作此课件")
 	}
-	return repository.ReorderCoursewarePages(ctx, coursewareID, pageIDs)
+	if err := repository.ReorderCoursewarePages(ctx, coursewareID, pageIDs); err != nil {
+return err
+}
+// ② 导航栏分母专题：重排后刷新各页导航栏分子分母（页号已由 Reorder 落定，失败不阻断）
+_ = s.ResyncCWPageNumbers(ctx, coursewareID)
+return nil
 }
 
 // ==================== v136新增：步骤回退 ====================

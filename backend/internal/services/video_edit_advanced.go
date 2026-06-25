@@ -125,6 +125,9 @@ func (s *VideoEditService) AdvancedConcat(ctx context.Context, req *AdvancedConc
 	}
 	var clips []preparedClip
 	hasTransition := false
+	// 页归属继承：成片继承第一个源片段的页归属
+	// （修复：无页归属的资产在按页列表查询中不可见，导出视频刷新后"失踪"）
+	var inheritPageID *string
 
 	for i, clip := range req.Clips {
 		asset, err := repository.GetCWAssetByID(ctx, clip.AssetID)
@@ -139,6 +142,10 @@ func (s *VideoEditService) AdvancedConcat(ctx context.Context, req *AdvancedConc
 		}
 		if asset.OssURL == "" || !strings.HasPrefix(asset.OssURL, CWAssetURLPrefix) {
 			return nil, fmt.Errorf("片段%d: 无有效视频文件", i+1)
+		}
+		// 记录第一个片段的页归属，供成片继承
+		if i == 0 {
+			inheritPageID = asset.PageID
 		}
 		relativePath := asset.OssURL[len(CWAssetURLPrefix):]
 		fullPath := filepath.Join(CWAssetUploadDir, relativePath)
@@ -266,6 +273,7 @@ func (s *VideoEditService) AdvancedConcat(ctx context.Context, req *AdvancedConc
 	localURL := CWAssetURLPrefix + filepath.Join(req.CoursewareID, "videos", outputName)
 	newAsset := &models.CoursewareAsset{
 		CoursewareID:     req.CoursewareID,
+		PageID:           inheritPageID, // 继承第一个源片段的页归属
 		PlaceholderID:    "",
 		AssetType:        models.CWAssetTypeVideo,
 		GenerationPrompt: fmt.Sprintf("高级拼接%d个片段", len(clips)),

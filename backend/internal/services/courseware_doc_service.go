@@ -341,7 +341,9 @@ func (s *CoursewarePPTService) GenerateIndexFromDoc(ctx context.Context, coursew
 		Data:      map[string]interface{}{"message": "AI正在分析教案文档，规划课件结构..."},
 	})
 
-	traceCtx := &ai.TraceContext{SceneCode: "courseware_scheme", UserID: &userID}
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（Word文档直翻方案，操作者=userID）
+	docSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
+	traceCtx := &ai.TraceContext{SceneCode: "courseware_scheme", UserID: &userID, SchoolID: schoolIDPtr(docSchoolID)}
 	callResult, err := ai.CallAI(aiCfg, systemPrompt, userPrompt, traceCtx)
 	if err != nil {
 		s.broadcastError(coursewareID, "AI规划失败: "+err.Error())

@@ -9,6 +9,14 @@
  *   - 新增模型积分预览API
  *   - 新增模拟计算API
  *   - ConsumptionListItem 新增9个精确计算字段
+ *
+ * 究极彻底版·批次1 新增（账户选择/搜索基础设施）：
+ *   - getTokenAccounts 的 params 增加 keyword（按账户名模糊搜索，后端 ILIKE）
+ *   - 新增 getAllocatableTargets：拿某来源账户的"合法下级账户"（究极版分配弹窗用）
+ *
+ * 究极彻底版·A 新增（分配记录 total 精确）：
+ *   - getTokenAllocations 的 params 增加 exclude_monthly（为 true 时后端排除月度自充值，
+ *     使 items 与 total 一致）。分配记录Tab 传 true。
  */
 import apiClient from './client'
 
@@ -202,6 +210,29 @@ export interface CreditCalculation {
   credits_consumed: number
 }
 
+/** 消费汇总报告——单行（一个区域/学校/老师/模型/场景/日期） */
+export interface ConsumptionSummaryRow {
+  key: string       // 维度键（区域ID/学校ID/user_id/模型名/场景码/日期）
+  label: string     // 展示名（中文/友好名，后端已翻译 scene 中文）
+  credits: number   // 该维度消费积分合计
+  cost_usd: number  // 该维度美元成本合计（仅 admin 前端展示）
+  calls: number     // 该维度调用次数
+  percent: number   // 占总积分百分比（0-100，后端算好）
+}
+
+/** 消费汇总报告——响应（某维度的排行/趋势 + 总计） */
+export interface ConsumptionSummaryResponse {
+  dimension: string                  // 回显维度
+  from: string                       // 回显时间范围起（空=不限）
+  to: string                         // 回显时间范围止（空=不限）
+  total_credits: number              // scope内总消费积分
+  total_cost_usd: number             // scope内总成本USD
+  total_calls: number                // scope内总调用次数
+  rows: ConsumptionSummaryRow[]      // 排行/趋势数据
+  scope_blocked?: boolean            // 范围被收窄为空集
+  scope_message?: string             // 收窄原因
+}
+
 // ==================== 请求类型 ====================
 
 export interface CreateAccountRequest {
@@ -283,11 +314,17 @@ export async function getTokenOverview() {
   return extractData<TokenOverviewStats>(resp)
 }
 
-/** 获取账户列表 */
+/** 获取账户列表（批次1：新增 keyword 账户名模糊搜索） */
 export async function getTokenAccounts(params?: {
-  type?: string; parent_id?: string; status?: string; limit?: number; offset?: number
+  type?: string; parent_id?: string; status?: string; keyword?: string; limit?: number; offset?: number
 }) {
   const resp = await apiClient.get('/tokens/accounts', { params })
+  return extractData<{ items: TokenAccountListItem[]; total: number }>(resp)
+}
+
+/** 获取某来源账户的"合法下级账户"（究极版分配弹窗用，后端按 scope 收窄） */
+export async function getAllocatableTargets(fromAccountId: string) {
+  const resp = await apiClient.get(`/tokens/accounts/${fromAccountId}/allocatable-targets`)
   return extractData<{ items: TokenAccountListItem[]; total: number }>(resp)
 }
 
@@ -315,9 +352,9 @@ export async function allocateTokens(fromAccountId: string, req: AllocateTokensR
   return extractData<{ message: string }>(resp)
 }
 
-/** 获取分配记录 */
+/** 获取分配记录（A：新增 exclude_monthly，为 true 时后端排除月度自充值，total 与显示一致） */
 export async function getTokenAllocations(params?: {
-  from_account_id?: string; to_account_id?: string; limit?: number; offset?: number
+  from_account_id?: string; to_account_id?: string; exclude_monthly?: boolean; limit?: number; offset?: number
 }) {
   const resp = await apiClient.get('/tokens/allocations', { params })
   return extractData<{ items: AllocationListItem[]; total: number }>(resp)
@@ -343,6 +380,18 @@ export async function getTokenConsumption(params?: {
 }) {
   const resp = await apiClient.get('/tokens/consumption', { params })
   return extractData<{ items: ConsumptionListItem[]; total: number }>(resp)
+}
+
+/** 获取消费汇总报告（6维度：region/school/user/model/scene/time，后端按 scope 收窄） */
+export async function getConsumptionSummary(params: {
+  dimension: 'region' | 'school' | 'user' | 'model' | 'scene' | 'time'
+  from?: string          // YYYY-MM-DD（可选）
+  to?: string            // YYYY-MM-DD（可选）
+  school_filter?: string // 下钻：限定某学校（传学校组织ID，后端转成员并求交集）
+  user_filter?: string   // 下钻：限定某老师（传user_id，后端校验在scope内）
+}) {
+  const resp = await apiClient.get('/tokens/consumption-summary', { params })
+  return extractData<ConsumptionSummaryResponse>(resp)
 }
 
 /** 获取预警配置 */

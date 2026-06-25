@@ -262,6 +262,14 @@ func (s *TextbookService) DeleteTextbookPage(ctx context.Context, id string, cal
 
 // RecognizeTextbookPage 调用AI识别课本图片中的文字内容
 // 读取图片→base64编码→发送给AI Vision→回填OCR结果
+//
+// v200修复(P1-17)：识别结果用于注入备课上下文，原system prompt要求"公式用LaTeX输出"
+// 导致教材里的分数(如½)被识别成 \frac{1}{2} 这类代码，前端renderMarkdown不解析LaTeX，
+// 老师看到的就是"分数显示为代码"。本次改写OCR system prompt：
+//   - 删除"公式用LaTeX输出"要求
+//   - 分数一律用 a/b 纯文本(如 1/2)、带分数用 "1又3/4"，上下标用自然语言或纯文本
+//   - 明令禁止输出 LaTeX、\frac、$...$、HTML标签、代码块
+// 表格仍用Markdown表格(前端renderMarkdown支持/将支持，不冲突)。
 func (s *TextbookService) RecognizeTextbookPage(ctx context.Context, id string, callerID string) (string, error) {
 	page, err := repository.GetTextbookPageByID(ctx, id)
 	if err != nil {
@@ -293,11 +301,25 @@ func (s *TextbookService) RecognizeTextbookPage(ctx context.Context, id string, 
 	}
 
 	// 构造多模态消息（OpenAI兼容格式）
+	// v198：补操作者(callerID) UserID + 所属学校ID，供模型境内/境外分流判定（原 traceCtx=nil，无分流无埋点，一并补齐）
+	tbUID := callerID
+	tbSchoolID, _ := repository.GetSchoolIDByUserID(ctx, callerID)
+	tbTraceCtx := &ai.TraceContext{SceneCode: "scanner", UserID: &tbUID, SchoolID: schoolIDPtr(tbSchoolID)}
+
+	// v200(P1-17)：OCR system prompt — 严禁LaTeX/代码，分数走纯文本，避免注入备课上下文后显示为代码
+	ocrSystemPrompt := "你是课本文字识别专家。请仔细识别图片中的所有文字内容，包括标题、正文、注释、图表中的文字等，按原文排版顺序输出，保持段落结构。\n" +
+		"重要的输出格式约束（必须严格遵守）：\n" +
+		"1. 分数一律用纯文本斜杠形式表达，例如二分之一写成 1/2，四分之三写成 3/4，带分数（如一又三分之四）写成 1又3/4。\n" +
+		"2. 上标、下标、指数等用自然语言或纯文本表达，例如 x的平方 可写成 x^2 或“x的平方”，化学式中的下标如水写成 H2O，不要使用任何特殊排版语法。\n" +
+		"3. 严禁输出 LaTeX 代码（如 \\frac、\\times、$...$、\\(...\\) 等）、HTML 标签、Markdown 代码块（```）。所有数学与科学符号都必须以中小学生能直接读懂的普通文本或常见符号（+ - × ÷ = / 等）呈现。\n" +
+		"4. 如果有表格，可以用 Markdown 表格格式输出。\n" +
+		"目标：识别结果将直接作为课本原文参考供老师备课使用，必须是干净、可读、不含任何代码或排版标记的纯文本。"
+
 	result, err := ai.CallAIMultimodal(cfg,
-		"你是课本文字识别专家。请仔细识别图片中的所有文字内容，包括标题、正文、注释、图表中的文字、公式等。按原文排版顺序输出，保持段落结构。如果有表格，用Markdown表格格式输出。如果有公式，用LaTeX格式输出。",
+		ocrSystemPrompt,
 		"请识别这张课本图片中的所有文字内容：",
 		dataURI,
-		nil,
+		tbTraceCtx,
 	)
 	if err != nil {
 		return "", fmt.Errorf("AI识别失败: %w", err)

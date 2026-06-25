@@ -9,6 +9,8 @@
  *   - TrackDef         多轨道定义结构
  *   - TransDef         转场定义结构
  *   - VideoAssetInfo   素材库视频简化结构
+ *
+ * S-V2: onExport 的 options 扩展 burnSubtitle 字段（三选项导出弹窗）
  */
 
 // ==================== 片段数据 ====================
@@ -75,8 +77,15 @@ export interface VideoEditorModalProps {
   coursewareId?: string
   /** 关闭编辑器回调 */
   onClose: () => void
-  /** 导出最终拼接结果回调 */
-  onExport: (clips: { asset_id: string; start_sec: number; end_sec: number; transition: string; trans_dur: number }[]) => void
+  /**
+   * 导出最终拼接结果回调
+   * options（S-V2三选项导出弹窗传出，父级据此串行执行后处理链）:
+   *   - burnSubtitle: true 时在成片上烧录硬字幕（advancedConcat → burnIn）
+   *   - mixNarration: true 时在最新成片上混入TTS配音（… → mixNarration）
+   *   - subtitleId:   字幕轨数据库ID（烧录与混音共用）
+   * 执行顺序: 拼接 → 烧录字幕 → 混入配音；每步失败降级保留上一步产物。
+   */
+  onExport: (clips: { asset_id: string; start_sec: number; end_sec: number; transition: string; trans_dur: number }[], options?: { mixNarration?: boolean; subtitleId?: string; burnSubtitle?: boolean }) => void
   /** 是否正在导出(用于禁用导出按钮) */
   exporting?: boolean
   /** 素材库上传视频回调(可选,父组件实现上传 API + 更新 videos 列表) */

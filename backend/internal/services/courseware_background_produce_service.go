@@ -77,9 +77,12 @@ func (s *CoursewareBackgroundService) GenerateSet(ctx context.Context, userID st
 	if err != nil {
 		return nil, fmt.Errorf("图片生成API未配置: %w", err)
 	}
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（背景图生成，走豆包ai.GenerateImage不经文本分流；填SchoolID仅供消费按学校归属）
+	bgSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
 	traceCtx := &ai.TraceContext{
 		SceneCode: "courseware_image_gen",
 		UserID:    &userID,
+		SchoolID:  schoolIDPtr(bgSchoolID),
 	}
 	// 3. 内页提示词强制追加底纹约束（不依赖前端传入，后端保底）
 	contentPrompt = contentPrompt + cwBgContentSuffix

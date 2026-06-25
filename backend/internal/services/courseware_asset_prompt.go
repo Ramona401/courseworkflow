@@ -132,7 +132,9 @@ func cwStripTagBlock(html, tag string) string {
 // cwExtractVAOCIField 从一行 VAOCI 索引文本中切出指定字段段(如 A 属性段 / C 角色段)的正文。
 //
 // VAOCI 落库形态为单行，字段以 " | " 分隔，例如：
-//   风格锚点[d-a-c-a-b-b]: F:焦点 | L:前-..;中-..;后-.. | A:皮克斯3D渲染.. | C:角色1：约7-8岁.. | S:情境 | E:16:9
+//
+//	风格锚点[d-a-c-a-b-b]: F:焦点 | L:前-..;中-..;后-.. | A:皮克斯3D渲染.. | C:角色1：约7-8岁.. | S:情境 | E:16:9
+//
 // 本函数定位 "{字母}:"（容忍全/半角冒号）起点，截到下一个字段分隔符(" | " 或 "|")之前（或行尾）。
 //
 // 稳健性考量：
@@ -214,15 +216,15 @@ func cwExtractVAOCICharSection(vaoci string) string {
 
 // buildImagePromptUserInputFromHTML 图片专用: 校验权限, 喂"页面主体 HTML"为主 + 少量方案语义辅助。
 //
-//      配图提示词依据【当前页 HTML 实际的图片占位】(<img> 标签/明确的图片占位容器)产出:
-//      有占位才给提示词, SVG/CSS 自绘图形不算占位, 无占位则 AI 返回空数组。
-//      方案字段(标题/目的/摘要)仅作语义辅助, 帮 AI 理解每个占位该配什么图。
+//	配图提示词依据【当前页 HTML 实际的图片占位】(<img> 标签/明确的图片占位容器)产出:
+//	有占位才给提示词, SVG/CSS 自绘图形不算占位, 无占位则 AI 返回空数组。
+//	方案字段(标题/目的/摘要)仅作语义辅助, 帮 AI 理解每个占位该配什么图。
 //
-//      风格锚点联动(图片轮)：课件已设锚点时，按优先级注入三段——
-//        ①【已锚定视觉风格（最高优先级）】(A 属性段) — 强压制画风，放在最显眼处；
-//        ②【已锚定人物形象】(C 角色段) — 人物外貌留白交给图生图；
-//        ③【锚点图参考提示词】(锚点图 generation_prompt 非空时) — 参考画风措辞。
-//      系统提示词 v5 据这三段决定"严格采用锚定风格 / 不写详细人物外貌 / 参考锚点画风措辞"。
+//	风格锚点联动(图片轮)：课件已设锚点时，按优先级注入三段——
+//	  ①【已锚定视觉风格（最高优先级）】(A 属性段) — 强压制画风，放在最显眼处；
+//	  ②【已锚定人物形象】(C 角色段) — 人物外貌留白交给图生图；
+//	  ③【锚点图参考提示词】(锚点图 generation_prompt 非空时) — 参考画风措辞。
+//	系统提示词 v5 据这三段决定"严格采用锚定风格 / 不写详细人物外貌 / 参考锚点画风措辞"。
 func (s *CoursewareAssetService) buildImagePromptUserInputFromHTML(ctx context.Context, coursewareID string, pageNum int, userID string) (string, error) {
 	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
 	if err != nil {
@@ -298,9 +300,11 @@ func (s *CoursewareAssetService) buildImagePromptUserInputFromHTML(ctx context.C
 // buildMediaPromptUserInput 校验权限并把本页方案+课件信息拼成喂给 AI 的用户输入（视频物料专用）
 //
 // 视频锚点联动(本轮)：课件已设锚点时，在课件信息之后、本页方案之前注入三段——
-//   ①【已锚定视觉风格】(A 段) — 供 storyboard_prompt(首帧图)严守锚定风格；
-//   ②【已锚定人物形象】(C 段) — 供首帧图人物外貌留白(图生视频保一致)；
-//   ③【锚点图参考提示词】(锚点图 generation_prompt 非空时) — 供首帧图参考画风措辞。
+//
+//	①【已锚定视觉风格】(A 段) — 供 storyboard_prompt(首帧图)严守锚定风格；
+//	②【已锚定人物形象】(C 段) — 供首帧图人物外貌留白(图生视频保一致)；
+//	③【锚点图参考提示词】(锚点图 generation_prompt 非空时) — 供首帧图参考画风措辞。
+//
 // 三段措辞针对"视频两步法"调整：明确风格人物锁定在首帧图、video_prompt 不必重述。
 // prompt_courseware_video_prompt v2 据这三段是否存在决定各物料的分工。
 // 未设锚点则三段全跳过，AI 走"未锚定"分支自行决定首帧图画风与人物外貌。
@@ -395,7 +399,9 @@ func (s *CoursewareAssetService) SuggestImagePrompt(ctx context.Context, coursew
 	if err != nil {
 		return nil, fmt.Errorf("获取AI配置失败: %w", err)
 	}
-	traceCtx := &ai.TraceContext{SceneCode: sceneCWMediaPrompt, UserID: &userID}
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（AI写配图提示词，操作者=userID）
+	imgPromptSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
+	traceCtx := &ai.TraceContext{SceneCode: sceneCWMediaPrompt, UserID: &userID, SchoolID: schoolIDPtr(imgPromptSchoolID)}
 	result, aiErr := ai.CallAI(aiCfg, sysPrompt.Content, userInput, traceCtx)
 	if aiErr != nil {
 		return nil, fmt.Errorf("AI生成提示词失败: %w", aiErr)
@@ -435,7 +441,9 @@ func (s *CoursewareAssetService) SuggestVideoPrompt(ctx context.Context, coursew
 	if err != nil {
 		return nil, fmt.Errorf("获取AI配置失败: %w", err)
 	}
-	traceCtx := &ai.TraceContext{SceneCode: sceneCWMediaPrompt, UserID: &userID}
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（AI写视频物料提示词，操作者=userID）
+	vidPromptSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
+	traceCtx := &ai.TraceContext{SceneCode: sceneCWMediaPrompt, UserID: &userID, SchoolID: schoolIDPtr(vidPromptSchoolID)}
 	result, aiErr := ai.CallAI(aiCfg, sysPrompt.Content, userInput, traceCtx)
 	if aiErr != nil {
 		return nil, fmt.Errorf("AI生成视频物料失败: %w", aiErr)

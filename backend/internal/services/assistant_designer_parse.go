@@ -1,28 +1,55 @@
 package services
 
-// assistant_designer_parse.go — AI助手创作服务解析函数
+// assistant_designer_parse.go — AI助手创作服务解析函数 + 组件检索辅助
 //
 // 从 assistant_designer_service.go 拆分,包含:
 //   - parseAIDecision: AI决策JSON解析(四重兜底)
 //   - extractFieldsLenient: 字段级宽容提取
 //   - extractLongFieldValue: 长字段值提取
+//   - buildMatchRequestFromParams / extractIntArray: 从 AI query_params 构造匹配请求
+//   - flattenMatchedGroups / buildComponentContext: 扁平化与组件上下文拼接
+//   - rerankFlatComponentsForDesigner: v194 语义级实时组件推荐(词法精排)
 //
 // v141 改进：log.Printf → adpLog 结构化日志
+// v194 改进：
+//   - buildMatchRequestFromParams 的 Limit 从 3 放大到 6(给词法精排留候选池)
+//   - flattenMatchedGroups 支持 n<=0 表示"不截断,全部收进来"(供精排前先全收)
+//   - 新增 rerankFlatComponentsForDesigner:复用同包 skill_router.go 的词法精排零件
+//     (extractRerankKeywords / scoreCandidateLexical),对扁平化候选按老师当轮发言
+//     重排并取全局 Top-N。这些零件与本文件同属 services 包,可直接调用无需导出。
 
 import (
-	"encoding/json"
-	"fmt"
-	"regexp"
-	"strings"
+        "encoding/json"
+        "fmt"
+        "regexp"
+        "sort"
+        "strings"
 
-	"tedna/internal/ai"
-	"tedna/internal/logger"
-	"tedna/internal/models"
-	"tedna/internal/utils"
+        "tedna/internal/ai"
+        "tedna/internal/logger"
+        "tedna/internal/models"
+        "tedna/internal/utils"
 )
 
 // 模块日志
 var adpLog = logger.WithModule("designer_parse")
+
+// ============================================================================
+// v194 组件检索可调常量(集中便于调参)
+// ============================================================================
+
+const (
+        // designerCandidateLimitPerType 硬筛阶段每个 library_type 取的候选条数。
+        // MatchComponents 的 Limit 是"每 library_type 的 ROW_NUMBER Top-N"。
+        // 老值为 3,精排空间太小;放大到 6 给词法精排留足候选池
+        // (与 skill_router.skillRouterCandidateLimitPerType 同款思路)。
+        designerCandidateLimitPerType = 6
+
+        // designerInjectTopN 语义精排后跨类目拍平、全局注入给 AI 的上限条数。
+        // 与 skill_router.skillRouterTopN 一致取 4:给 AI 足够"权威依据"又不至于把
+        // 生成的 system prompt 撑得过长。
+        designerInjectTopN = 4
+)
 
 // ============================================================================
 //
@@ -41,66 +68,66 @@ var adpLog = logger.WithModule("designer_parse")
 //   - **字段值里包含未转义的 " 单引号** ← 这是最常见最致命的
 
 func parseAIDecision(raw string) (*AIDesignerDecision, error) {
-	text := strings.TrimSpace(raw)
-	if text == "" {
-		return nil, fmt.Errorf("空响应")
-	}
+        text := strings.TrimSpace(raw)
+        if text == "" {
+                return nil, fmt.Errorf("空响应")
+        }
 
-	// 策略 1:标准提取
-	if jsonStr, ok := ai.ExtractJSON(text); ok {
-		var decision AIDesignerDecision
-		if err := json.Unmarshal([]byte(jsonStr), &decision); err == nil {
-			if decision.Action == "" {
-				decision.Action = "draft_directly"
-			}
-			return &decision, nil
-		}
-	}
+        // 策略 1:标准提取
+        if jsonStr, ok := ai.ExtractJSON(text); ok {
+                var decision AIDesignerDecision
+                if err := json.Unmarshal([]byte(jsonStr), &decision); err == nil {
+                        if decision.Action == "" {
+                                decision.Action = "draft_directly"
+                        }
+                        return &decision, nil
+                }
+        }
 
-	// 策略 2:手动补大括号
-	// 判据:文本含 "action" 字段但没以 { 开头
-	openBrace := "{"
-	closeBrace := "}"
-	if !strings.HasPrefix(text, openBrace) && strings.Contains(text, "\"action\"") {
-		fixed := text
-		if !strings.HasSuffix(strings.TrimSpace(fixed), closeBrace) {
-			fixed = fixed + "\n" + closeBrace
-		}
-		fixed = openBrace + "\n" + fixed
-		var decision AIDesignerDecision
-		if err := json.Unmarshal([]byte(fixed), &decision); err == nil {
-			adpLog.Info("手动补大括号后解析成功")
-			if decision.Action == "" {
-				decision.Action = "draft_directly"
-			}
-			return &decision, nil
-		}
-	}
+        // 策略 2:手动补大括号
+        // 判据:文本含 "action" 字段但没以 { 开头
+        openBrace := "{"
+        closeBrace := "}"
+        if !strings.HasPrefix(text, openBrace) && strings.Contains(text, "\"action\"") {
+                fixed := text
+                if !strings.HasSuffix(strings.TrimSpace(fixed), closeBrace) {
+                        fixed = fixed + "\n" + closeBrace
+                }
+                fixed = openBrace + "\n" + fixed
+                var decision AIDesignerDecision
+                if err := json.Unmarshal([]byte(fixed), &decision); err == nil {
+                        adpLog.Info("手动补大括号后解析成功")
+                        if decision.Action == "" {
+                                decision.Action = "draft_directly"
+                        }
+                        return &decision, nil
+                }
+        }
 
-	// 策略 3:直接整段解析(末位防线,依赖 JSON 合法)
-	var decision AIDesignerDecision
-	if err := json.Unmarshal([]byte(text), &decision); err == nil {
-		if decision.Action == "" {
-			decision.Action = "draft_directly"
-		}
-		return &decision, nil
-	}
+        // 策略 3:直接整段解析(末位防线,依赖 JSON 合法)
+        var decision AIDesignerDecision
+        if err := json.Unmarshal([]byte(text), &decision); err == nil {
+                if decision.Action == "" {
+                        decision.Action = "draft_directly"
+                }
+                return &decision, nil
+        }
 
-	// 策略 4 (v114):字段级宽容提取 - 绕过 json.Unmarshal
-	// 只在看起来像 JSON 的文本上触发(以 { 开头,含有 action 或 reply_text)
-	if strings.HasPrefix(text, "{") && (strings.Contains(text, "\"action\"") || strings.Contains(text, "\"reply_text\"")) {
-		d := extractFieldsLenient(text)
-		if d != nil && strings.TrimSpace(d.ReplyText) != "" {
-			adpLog.Info("策略4字段级宽容提取成功",
-				"action", d.Action,
-				"reply_len", len(d.ReplyText),
-				"draft_len", len(d.UpdatedDraft),
-			)
-			return d, nil
-		}
-	}
+        // 策略 4 (v114):字段级宽容提取 - 绕过 json.Unmarshal
+        // 只在看起来像 JSON 的文本上触发(以 { 开头,含有 action 或 reply_text)
+        if strings.HasPrefix(text, "{") && (strings.Contains(text, "\"action\"") || strings.Contains(text, "\"reply_text\"")) {
+                d := extractFieldsLenient(text)
+                if d != nil && strings.TrimSpace(d.ReplyText) != "" {
+                        adpLog.Info("策略4字段级宽容提取成功",
+                                "action", d.Action,
+                                "reply_len", len(d.ReplyText),
+                                "draft_len", len(d.UpdatedDraft),
+                        )
+                        return d, nil
+                }
+        }
 
-	return nil, fmt.Errorf("所有 JSON 提取策略均失败")
+        return nil, fmt.Errorf("所有 JSON 提取策略均失败")
 }
 
 // ============================================================================
@@ -117,110 +144,110 @@ func parseAIDecision(raw string) (*AIDesignerDecision, error) {
 //     (AI 几乎总是按 Meta-Prompt 里的示例顺序输出,否则我们的 Meta-Prompt 写错了)
 
 var (
-	// action 字段值相对简单:限定枚举值,不含引号
-	reAction = regexp.MustCompile(`"action"\s*:\s*"([a-z_]+)"`)
+        // action 字段值相对简单:限定枚举值,不含引号
+        reAction = regexp.MustCompile(`"action"\s*:\s*"([a-z_]+)"`)
 )
 
 func extractFieldsLenient(text string) *AIDesignerDecision {
-	d := &AIDesignerDecision{
-		Action:       "draft_directly", // 默认兜底
-		QueryParams:  nil,               // 策略 4 不解析嵌套对象
-		ReplyText:    "",
-		UpdatedDraft: "",
-	}
+        d := &AIDesignerDecision{
+                Action:       "draft_directly", // 默认兜底
+                QueryParams:  nil,               // 策略 4 不解析嵌套对象
+                ReplyText:    "",
+                UpdatedDraft: "",
+        }
 
-	// action: 简单正则
-	if m := reAction.FindStringSubmatch(text); len(m) >= 2 {
-		d.Action = m[1]
-	}
+        // action: 简单正则
+        if m := reAction.FindStringSubmatch(text); len(m) >= 2 {
+                d.Action = m[1]
+        }
 
-	// reply_text: 宽容提取到下一个顶层字段之前
-	d.ReplyText = extractLongFieldValue(text, "reply_text", []string{"updated_draft"})
+        // reply_text: 宽容提取到下一个顶层字段之前
+        d.ReplyText = extractLongFieldValue(text, "reply_text", []string{"updated_draft"})
 
-	// updated_draft: 宽容提取到文本末尾的 } 之前
-	d.UpdatedDraft = extractLongFieldValue(text, "updated_draft", nil)
+        // updated_draft: 宽容提取到文本末尾的 } 之前
+        d.UpdatedDraft = extractLongFieldValue(text, "updated_draft", nil)
 
-	// 如果 action=search_components 但没有 query_params,降级为 draft_directly
-	// 避免 handler 层试图查库时用 nil 的 query_params 引发空指针
-	if d.Action == "search_components" && d.QueryParams == nil {
-		d.Action = "draft_directly"
-	}
+        // 如果 action=search_components 但没有 query_params,降级为 draft_directly
+        // 避免 handler 层试图查库时用 nil 的 query_params 引发空指针
+        if d.Action == "search_components" && d.QueryParams == nil {
+                d.Action = "draft_directly"
+        }
 
-	return d
+        return d
 }
 
 // extractLongFieldValue 从 text 里按"字段名":"值" 定位字段,把值原文抽出来
 // 终止条件:遇到 nextFields 中任一字段名的出现;或文本末尾的 } 之前
 // 返回的字符串是字段值的原文(已做基本反转义:\n → 真换行,\" → ",\\ → \)
 func extractLongFieldValue(text, field string, nextFields []string) string {
-	// 找字段起点:"field_name" : "
-	keyPattern := `"` + field + `"`
-	keyIdx := strings.Index(text, keyPattern)
-	if keyIdx < 0 {
-		return ""
-	}
+        // 找字段起点:"field_name" : "
+        keyPattern := `"` + field + `"`
+        keyIdx := strings.Index(text, keyPattern)
+        if keyIdx < 0 {
+                return ""
+        }
 
-	// 从 keyIdx 后找第一个 " (字段值的开引号)
-	afterKey := keyIdx + len(keyPattern)
-	quoteIdx := strings.Index(text[afterKey:], "\"")
-	if quoteIdx < 0 {
-		return ""
-	}
-	valueStart := afterKey + quoteIdx + 1 // 跳过开引号
+        // 从 keyIdx 后找第一个 " (字段值的开引号)
+        afterKey := keyIdx + len(keyPattern)
+        quoteIdx := strings.Index(text[afterKey:], "\"")
+        if quoteIdx < 0 {
+                return ""
+        }
+        valueStart := afterKey + quoteIdx + 1 // 跳过开引号
 
-	// 找字段值的终点:
-	// - 如果 nextFields 非空,找第一个 "nextField" 出现的位置,然后回退到最近的 "
-	// - 如果 nextFields 为空,找最后一个 " (在文本末尾 } 之前)
-	valueEnd := -1
+        // 找字段值的终点:
+        // - 如果 nextFields 非空,找第一个 "nextField" 出现的位置,然后回退到最近的 "
+        // - 如果 nextFields 为空,找最后一个 " (在文本末尾 } 之前)
+        valueEnd := -1
 
-	if len(nextFields) > 0 {
-		// 找最近的下一字段起点
-		minNext := -1
-		for _, nf := range nextFields {
-			pat := `"` + nf + `"`
-			idx := strings.Index(text[valueStart:], pat)
-			if idx >= 0 {
-				absIdx := valueStart + idx
-				if minNext < 0 || absIdx < minNext {
-					minNext = absIdx
-				}
-			}
-		}
-		if minNext > 0 {
-			// 从 minNext 往前扫描,找最近的 "(这个 " 就是当前字段值的闭引号)
-			// 跳过紧邻的 "," 或 "\n," 等结构
-			sub := text[valueStart:minNext]
-			lastQuote := strings.LastIndex(sub, "\"")
-			if lastQuote >= 0 {
-				valueEnd = valueStart + lastQuote
-			}
-		}
-	}
+        if len(nextFields) > 0 {
+                // 找最近的下一字段起点
+                minNext := -1
+                for _, nf := range nextFields {
+                        pat := `"` + nf + `"`
+                        idx := strings.Index(text[valueStart:], pat)
+                        if idx >= 0 {
+                                absIdx := valueStart + idx
+                                if minNext < 0 || absIdx < minNext {
+                                        minNext = absIdx
+                                }
+                        }
+                }
+                if minNext > 0 {
+                        // 从 minNext 往前扫描,找最近的 "(这个 " 就是当前字段值的闭引号)
+                        // 跳过紧邻的 "," 或 "\n," 等结构
+                        sub := text[valueStart:minNext]
+                        lastQuote := strings.LastIndex(sub, "\"")
+                        if lastQuote >= 0 {
+                                valueEnd = valueStart + lastQuote
+                        }
+                }
+        }
 
-	if valueEnd < 0 {
-		// nextFields 为空或没找到,退到文本末尾找最后一个 "
-		// 先把末尾的 } 和空白去掉
-		trimmed := strings.TrimRight(text, " \t\n\r}")
-		lastQuote := strings.LastIndex(trimmed, "\"")
-		if lastQuote > valueStart {
-			valueEnd = lastQuote
-		}
-	}
+        if valueEnd < 0 {
+                // nextFields 为空或没找到,退到文本末尾找最后一个 "
+                // 先把末尾的 } 和空白去掉
+                trimmed := strings.TrimRight(text, " \t\n\r}")
+                lastQuote := strings.LastIndex(trimmed, "\"")
+                if lastQuote > valueStart {
+                        valueEnd = lastQuote
+                }
+        }
 
-	if valueEnd <= valueStart {
-		return ""
-	}
+        if valueEnd <= valueStart {
+                return ""
+        }
 
-	raw := text[valueStart:valueEnd]
-	// 做基本反转义(AI 有时是转义了的,有时没有,都兼容一下)
-	// 注意顺序:\\ 必须先转,否则会破坏 \" 和 \n 的处理
-	raw = strings.ReplaceAll(raw, `\\`, "\x00") // 临时占位
-	raw = strings.ReplaceAll(raw, `\"`, `"`)
-	raw = strings.ReplaceAll(raw, `\n`, "\n")
-	raw = strings.ReplaceAll(raw, `\t`, "\t")
-	raw = strings.ReplaceAll(raw, `\r`, "\r")
-	raw = strings.ReplaceAll(raw, "\x00", `\`) // 还原 \
-	return raw
+        raw := text[valueStart:valueEnd]
+        // 做基本反转义(AI 有时是转义了的,有时没有,都兼容一下)
+        // 注意顺序:\\ 必须先转,否则会破坏 \" 和 \n 的处理
+        raw = strings.ReplaceAll(raw, `\\`, "\x00") // 临时占位
+        raw = strings.ReplaceAll(raw, `\"`, `"`)
+        raw = strings.ReplaceAll(raw, `\n`, "\n")
+        raw = strings.ReplaceAll(raw, `\t`, "\t")
+        raw = strings.ReplaceAll(raw, `\r`, "\r")
+        raw = strings.ReplaceAll(raw, "\x00", `\`) // 还原 \
+        return raw
 }
 
 // ============================================================================
@@ -228,103 +255,195 @@ func extractLongFieldValue(text, field string, nextFields []string) string {
 // ============================================================================
 
 func buildMatchRequestFromParams(
-	params map[string]interface{},
-	dCtx *DesignerContext,
+        params map[string]interface{},
+        dCtx *DesignerContext,
 ) *models.MatchComponentsRequest {
-	req := &models.MatchComponentsRequest{
-		Subject:    dCtx.Subject,
-		GradeRange: dCtx.Grade,
-	}
+        req := &models.MatchComponentsRequest{
+                Subject:    dCtx.Subject,
+                GradeRange: dCtx.Grade,
+        }
 
-	if v, ok := params["library_types"].([]interface{}); ok {
-		for _, item := range v {
-			if s, ok := item.(string); ok && s != "" {
-				req.LibraryTypes = append(req.LibraryTypes, s)
-			}
-		}
-	}
+        if v, ok := params["library_types"].([]interface{}); ok {
+                for _, item := range v {
+                        if s, ok := item.(string); ok && s != "" {
+                                req.LibraryTypes = append(req.LibraryTypes, s)
+                        }
+                }
+        }
 
-	req.CognitiveLevel = extractIntArray(params, "cognitive_levels")
-	req.StageTiming = extractIntArray(params, "stage_timing")
-	req.PedagogyIntensity = extractIntArray(params, "pedagogy_intensities")
+        req.CognitiveLevel = extractIntArray(params, "cognitive_levels")
+        req.StageTiming = extractIntArray(params, "stage_timing")
+        req.PedagogyIntensity = extractIntArray(params, "pedagogy_intensities")
 
-	req.Limit = 3
+        // v194:召回池从 3 放大到 6/类,给后续词法精排留足候选;
+        // 注意这是"每 library_type 的 Top-N",最终注入给 AI 的会被
+        // rerankFlatComponentsForDesigner 跨类目精排后收敛到 designerInjectTopN(4)。
+        req.Limit = designerCandidateLimitPerType
 
-	return req
+        return req
 }
 
 func extractIntArray(m map[string]interface{}, key string) []int {
-	v, ok := m[key].([]interface{})
-	if !ok {
-		return nil
-	}
-	result := make([]int, 0, len(v))
-	for _, item := range v {
-		if f, ok := item.(float64); ok {
-			result = append(result, int(f))
-		}
-	}
-	return result
+        v, ok := m[key].([]interface{})
+        if !ok {
+                return nil
+        }
+        result := make([]int, 0, len(v))
+        for _, item := range v {
+                if f, ok := item.(float64); ok {
+                        result = append(result, int(f))
+                }
+        }
+        return result
 }
 
 // ============================================================================
 // 辅助:扁平化 + 组件上下文拼接
 // ============================================================================
 
+// flattenMatchedGroups 把按 library_type 分组的匹配结果拍平为单层切片。
+//
+// v194 语义:参数 n 控制截断——
+//   - n > 0 :最多收 n 条(老行为,保留兼容)。
+//   - n <= 0:不截断,全部收进来(供 rerankFlatComponentsForDesigner 先全收再精排)。
 func flattenMatchedGroups(
-	groups []*models.MatchedComponentGroup,
-	n int,
+        groups []*models.MatchedComponentGroup,
+        n int,
 ) []*flatComponent {
-	flat := make([]*flatComponent, 0, n)
-	for _, g := range groups {
-		for _, c := range g.Components {
-			if len(flat) >= n {
-				return flat
-			}
-			flat = append(flat, &flatComponent{
-				LibraryType: g.LibraryType,
-				LibraryName: g.LibraryName,
-				Data:        c,
-			})
-		}
-	}
-	return flat
+        capHint := n
+        if capHint <= 0 {
+                capHint = 16 // 仅作切片预分配提示,不限制实际长度
+        }
+        flat := make([]*flatComponent, 0, capHint)
+        for _, g := range groups {
+                for _, c := range g.Components {
+                        if n > 0 && len(flat) >= n {
+                                return flat
+                        }
+                        flat = append(flat, &flatComponent{
+                                LibraryType: g.LibraryType,
+                                LibraryName: g.LibraryName,
+                                Data:        c,
+                        })
+                }
+        }
+        return flat
+}
+
+// ============================================================================
+// v194 语义级实时组件推荐:词法精排
+// ============================================================================
+
+// designerRerankItem 精排过程中的候选内部表示(包一层打分与原始顺序)。
+type designerRerankItem struct {
+        fc           *flatComponent
+        score        int // 词法精排得分;无发言/全 0 分时按原序保底
+        originalRank int // 在扁平化结果里的原始顺序,作打分相同时的稳定次级键
+}
+
+// rerankFlatComponentsForDesigner 对扁平化候选按老师当轮发言做词法精排,取全局 Top-N。
+//
+// 设计与边界(与 skill_router 的精排哲学一致,零 AI 零额外延迟):
+//   - 复用同包 skill_router.go 的 extractRerankKeywords(切词)与 scoreCandidateLexical
+//     (对单个 MatchedComponent 按其 AOCI 索引语义标签行 + 标题做词法重合打分,命中标签
+//     权重高于命中标题),这两个函数与本文件同属 services 包,可直接调用。
+//   - recentUserText 为老师当轮发言;为空 → 不精排,直接按原序取前 topN(保底地板)。
+//   - 打分后按 (得分降序, 原始顺序升序) 稳定排序,跨 library_type 拍平取全局 topN。
+//   - 全部 0 分(关键词与任何候选都不重合)时,稳定排序不改变原序,等价保底——
+//     即"按相关性挑不出来就退回硬筛原序(quality 降序)"。
+//   - 任何异常输入(candidates 为空 / topN<=0)都安全返回,绝不 panic。
+func rerankFlatComponentsForDesigner(
+        candidates []*flatComponent,
+        recentUserText string,
+        topN int,
+) []*flatComponent {
+        if len(candidates) == 0 {
+                return candidates
+        }
+        if topN <= 0 {
+                topN = designerInjectTopN
+        }
+
+        // 提取关键词(复用 skill_router 的切词逻辑)。
+        keywords := extractRerankKeywords(recentUserText)
+
+        items := make([]*designerRerankItem, 0, len(candidates))
+        for i, c := range candidates {
+                items = append(items, &designerRerankItem{
+                        fc:           c,
+                        score:        0,
+                        originalRank: i,
+                })
+        }
+
+        reranked := false
+        if len(keywords) > 0 {
+                for _, it := range items {
+                        // 复用 skill_router 的单组件词法打分(读 AOCI 索引标签行 + 标题)。
+                        it.score = scoreCandidateLexical(it.fc.Data, keywords)
+                }
+                // 按 (得分降序, 原始顺序升序) 稳定排序。
+                sort.SliceStable(items, func(i, j int) bool {
+                        if items[i].score != items[j].score {
+                                return items[i].score > items[j].score
+                        }
+                        return items[i].originalRank < items[j].originalRank
+                })
+                reranked = true
+        }
+        // 否则:保持原序(MatchComponents 已按 quality 降序),即保底地板。
+
+        if topN > len(items) {
+                topN = len(items)
+        }
+
+        out := make([]*flatComponent, 0, topN)
+        for _, it := range items[:topN] {
+                out = append(out, it.fc)
+        }
+
+        adpLog.Info("Designer组件语义精排完成",
+                "candidate_count", len(candidates),
+                "injected_count", len(out),
+                "reranked", reranked,
+                "keyword_count", len(keywords))
+        return out
 }
 
 func buildComponentContext(flatComps []*flatComponent, dCtx *DesignerContext) string {
-	if len(flatComps) == 0 {
-		return "(未查到相关组件)"
-	}
-	var b strings.Builder
-	for i, fc := range flatComps {
-		c := fc.Data
-		b.WriteString(fmt.Sprintf("## [%d] %s\n", i+1, c.DisplayLabel))
-		b.WriteString(fmt.Sprintf("- 类型:%s (%s)", fc.LibraryType, fc.LibraryName))
-		if dCtx.Subject != "" {
-			b.WriteString(fmt.Sprintf(" 学科:%s", dCtx.Subject))
-		}
-		if dCtx.Grade != "" {
-			b.WriteString(fmt.Sprintf(" 学段:%s", dCtx.Grade))
-		}
-		b.WriteString("\n")
+        if len(flatComps) == 0 {
+                return "(未查到相关组件)"
+        }
+        var b strings.Builder
+        for i, fc := range flatComps {
+                c := fc.Data
+                b.WriteString(fmt.Sprintf("## [%d] %s\n", i+1, c.DisplayLabel))
+                b.WriteString(fmt.Sprintf("- 类型:%s (%s)", fc.LibraryType, fc.LibraryName))
+                if dCtx.Subject != "" {
+                        b.WriteString(fmt.Sprintf(" 学科:%s", dCtx.Subject))
+                }
+                if dCtx.Grade != "" {
+                        b.WriteString(fmt.Sprintf(" 学段:%s", dCtx.Grade))
+                }
+                b.WriteString("\n")
 
-		if strings.TrimSpace(c.ComponentIndex) != "" {
-			b.WriteString("- AOCI 索引:\n")
-			b.WriteString(c.ComponentIndex)
-			b.WriteString("\n")
-		} else if strings.TrimSpace(c.DesignLogic) != "" {
-			b.WriteString("- 设计逻辑:")
-			b.WriteString(utils.SafeTruncate(c.DesignLogic, 400))
-			b.WriteString("\n")
-		}
-		b.WriteString("\n")
-	}
-	return b.String()
+                if strings.TrimSpace(c.ComponentIndex) != "" {
+                        b.WriteString("- AOCI 索引:\n")
+                        b.WriteString(c.ComponentIndex)
+                        b.WriteString("\n")
+                } else if strings.TrimSpace(c.DesignLogic) != "" {
+                        b.WriteString("- 设计逻辑:")
+                        b.WriteString(utils.SafeTruncate(c.DesignLogic, 400))
+                        b.WriteString("\n")
+                }
+                b.WriteString("\n")
+        }
+        return b.String()
 }
 
 func defaultStr(s, fallback string) string {
-	if strings.TrimSpace(s) == "" {
-		return fallback
-	}
-	return s
+        if strings.TrimSpace(s) == "" {
+                return fallback
+        }
+        return s
 }

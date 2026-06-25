@@ -50,7 +50,8 @@ func getCreditPolicyByScope(ctx context.Context, scope string, scopeID *string) 
 	if scopeID == nil {
 		query = `SELECT id, scope, scope_id, exchange_rate, multiplier, description,
 		                updated_by, created_at, updated_at
-		         FROM token_credit_policies WHERE scope = $1 AND scope_id IS NULL LIMIT 1`
+		         FROM token_credit_policies WHERE scope = $1 AND scope_id IS NULL
+		         ORDER BY updated_at DESC LIMIT 1`
 		args = []interface{}{scope}
 	} else {
 		query = `SELECT id, scope, scope_id, exchange_rate, multiplier, description,
@@ -84,6 +85,41 @@ func UpsertCreditPolicy(ctx context.Context, scope string, scopeID *string,
 	}
 
 	var p models.CreditPolicy
+
+	// 系统级 scope_id 为 NULL：PG 唯一约束 NULL≠NULL，ON CONFLICT 不命中会每次插新行（脏数据根因）。
+	// 故系统级走"先 UPDATE 最新行，无则 INSERT"。
+	if scopeID == nil {
+		err := database.DB.QueryRow(ctx, `
+			UPDATE token_credit_policies SET
+			  exchange_rate = $1, multiplier = $2, description = $3, updated_by = $4, updated_at = NOW()
+			WHERE id = (
+			  SELECT id FROM token_credit_policies
+			  WHERE scope = $5 AND scope_id IS NULL
+			  ORDER BY updated_at DESC LIMIT 1
+			)
+			RETURNING id, scope, scope_id, exchange_rate, multiplier, description, updated_by, created_at, updated_at
+		`, exchangeRate, multiplier, description, updatedBy, scope,
+		).Scan(&p.ID, &p.Scope, &p.ScopeID, &p.ExchangeRate, &p.Multiplier,
+			&p.Description, &p.UpdatedBy, &p.CreatedAt, &p.UpdatedAt)
+		if err == nil {
+			return &p, nil
+		}
+		if err != pgx.ErrNoRows {
+			return nil, fmt.Errorf("更新系统积分策略失败: %w", err)
+		}
+		err = database.DB.QueryRow(ctx, `
+			INSERT INTO token_credit_policies (scope, scope_id, exchange_rate, multiplier, description, updated_by)
+			VALUES ($1, NULL, $2, $3, $4, $5)
+			RETURNING id, scope, scope_id, exchange_rate, multiplier, description, updated_by, created_at, updated_at
+		`, scope, exchangeRate, multiplier, description, updatedBy,
+		).Scan(&p.ID, &p.Scope, &p.ScopeID, &p.ExchangeRate, &p.Multiplier,
+			&p.Description, &p.UpdatedBy, &p.CreatedAt, &p.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("创建系统积分策略失败: %w", err)
+		}
+		return &p, nil
+	}
+
 	err := database.DB.QueryRow(ctx, `
 		INSERT INTO token_credit_policies (scope, scope_id, exchange_rate, multiplier, description, updated_by)
 		VALUES ($1, $2, $3, $4, $5, $6)

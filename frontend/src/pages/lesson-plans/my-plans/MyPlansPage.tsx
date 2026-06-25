@@ -276,6 +276,9 @@ export default function MyPlansPage() {
     try {
       switch (action) {
         case 'resume':
+          // 写入两模式共享的会话恢复信号 —— WorkshopModeRouter 据此判模式、ConversationModePage/WorkshopPage 据此恢复该教案
+          // 注:下面 navigate 携带的 location.state.resumePlanId 目前无任何页面读取(历史死信号),真正让恢复生效的是上面这行 sessionStorage
+          sessionStorage.setItem('workshop_active_plan_id', planId)
           navigate('/lesson-plans', { state: { resumePlanId: planId } })
           setLoadingId(null)
           return

@@ -18,11 +18,75 @@ package services
 //   - parseReviewJSONBlock 复用 ai.ExtractJSON，但优先定位「最后一个 ```json 块」，
 //     避免报告正文里的花括号干扰花括号配平
 //
+// v189改动（改动A：放宽 DetectLessonPlanContent 的 # 标题硬判定 — 评审bug治本核心）：
+//   - 原逻辑：必须存在以 "#" 开头且含教案标题词的行作为正文起点，否则整体返回 ""。
+//     副作用：AI 偶尔输出"通篇无 # 标题"（纯文本小标题）的完整教案时，即便五重叠加
+//     闸门（≥3标记词 + 教学过程 + 结尾标记 + ≥800字）全部满足，也会被这一道格式井号
+//     判死，导致正文不落库、评审拿不到正文报"请回撰写阶段"。
+//   - 新逻辑：保留"优先找 # 标题行"为主路径；找不到 # 标题时，降级用"第一行含教案
+//     标题词的纯文本行"作为正文起点。后续 hasProcess + hasEnding + ≥800字 三道闸 +
+//     前置 markerCount≥3 全部不变（五重叠加仍足够严，唯一放宽的只是格式井号）。
+//   - 实现：把原"只扫 # 行"的单次循环拆为两段——先按原口径找带 # 的标题行；
+//     未命中再做一次降级扫描，找第一行 TrimSpace 后含 titleMarkers 任一词的非空行。
+//
+// v189改动（改动B：剥离评审 narrative 里泄漏的 ```json 块 — 评审报告夹JSON给老师看）：
+//   - 问题：extractReviewStageFromNatural 两条链路构造 narrative 时直接 safeUTF8Truncate
+//     完整原文，而原文末尾带着供解析用的 ```json 块（提示词约定 AI 输出），JSON 被
+//     parseReviewJSONBlock 解析走了，但原文里那段 JSON 未被剥离，原样下发到前端，
+//     老师就在报告里看到一坨 json{...}。
+//   - 修法：新增 stripReviewJSONBlock，复用 extractLastJSONCodeBlock 同款围栏正则把
+//     ```json / ``` 块整段移除并清理尾部空白与 ---，两条链路构造 narrative 时先剥块
+//     再截断。只剥展示文本，parseReviewJSONBlock 仍吃原始 content，解析逻辑零影响；
+//     无 JSON 块的旧格式报告原样返回不受影响。
+//
+// v193改动（write/revise 阶段「教师建议块」硬切 — 创新剥离·轻路落地）：
+//   - 背景：write/revise 阶段 AI 出完整教案时，常自作主张新增设计阶段从未与老师讨论过、
+//     却会实质影响教学组织的新活动（如"录配音发班级群评选最美好声音"这类作业形式），
+//     把这些"加戏"直接写进教案正文当作既定方案，甚至评审阶段还自夸这些虚构内容，
+//     老师难以分辨哪些是自己拍板的、哪些是 AI 私自添加的。
+//   - 方案（轻路）：约定 AI 把这类"设计阶段未讨论、需老师定夺的创新建议"写进一个专用围栏
+//     ```teacher_suggestion ... ``` 块（提示词侧约束，见 workshop_stage_prompts.go 与
+//     lesson_plan_gen_fullgen_prompts.go 的 write/revise 四处）。后端在提取教案前，用
+//     splitSuggestionBlock 把该块从 content 中整段切走：
+//       * pureContent（已无建议块）喂 DetectLessonPlanContent → 教案正文【硬保证】不含建议；
+//       * 切出的建议文本拼进 narrative（老师在 AI 对话气泡看得到、但不落库教案正文）。
+//   - 为什么可靠：剥离是【代码强制】，无论 AI 把建议块放正文前还是正文后，后端都先切干净
+//     再提取，不依赖 AI 自觉把建议放对位置；即便 AI 没用建议块、把创新混进正文，也只是
+//     回退到 v193 前的老行为（不会更糟），用提示词持续引导 AI 用建议块。
+//   - 安全：本次仅新增 splitSuggestionBlock + 改 extractWriteStageFromNatural 一个函数；
+//     DetectLessonPlanContent / extractReviewStageFromNatural / 所有评审辅助函数一字未动。
+//     专用围栏 ```teacher_suggestion 与 ```json（评审）、```suggested_actions（芯片）三套
+//     围栏互不匹配（info-string 各不相同），互不干扰。
+//
+// v200改动（P0-04：评审 narrative 残留 ```suggested_actions 芯片块 — 治本）：
+//   - 问题：review 阶段 AI 在评审报告末尾同时输出两套围栏——评审用 ```json 块、给老师的
+//     推进芯片用 ```suggested_actions 块。extractReviewStageFromNatural 构造 narrative 时
+//     只调 stripReviewJSONBlock 剥 json 块，而该正则按设计不匹配 ```suggested_actions
+//     围栏（两套围栏 info-string 不同、刻意互斥，见 lesson_plan_gen_actions.go），导致
+//     芯片块原样残留在 narrative 中，下发并显示在右侧教案画布，老师看到一坨
+//     suggested_actions{...} 代码。
+//   - 修法：在三处 narrative 构造时，于 stripReviewJSONBlock 外再套一层同包现成的
+//     StripSuggestedActionsBlock（专剥 ```suggested_actions 围栏，绝不动 ```json）。
+//
+// v200改动（P0-04 补漏：write/revise 阶段教案正文落库残留 ```suggested_actions 芯片块）：
+//   - 问题：write/revise 阶段 AI 出完整教案时，也会在教案正文末尾（板书设计之后）追加
+//     ```suggested_actions 芯片块。extractWriteStageFromNatural 先 splitSuggestionBlock
+//     只剥 ```teacher_suggestion 块，再 DetectLessonPlanContent 从标题行 lines[startIdx:]
+//     一直取到末尾（trimTrailingChatter 只去客套话、不剥芯片围栏），导致芯片块被当成正文
+//     尾巴一起截进 content_markdown 落库，显示到右侧画布。这是与 review 阶段同源但不同
+//     出口的残留（首例《春》因芯片块恰好被截在正文范围外而未暴露，本例《分数》暴露）。
+//   - 修法：extractWriteStageFromNatural 中，对 DetectLessonPlanContent 提取出的
+//     lessonContent 再套一层 StripSuggestedActionsBlock 后才落库（治本：不论 AI 把芯片块
+//     放正文何处，落库正文都不含芯片块）；未识别到教案的降级 narrative 同样补剥一层。
+//     不改 DetectLessonPlanContent 本体（它被前端 isFullLessonPlanMessage 口径对齐、被多
+//     处复用，影响面大），只在 write/revise 专用提取入口剥，影响面最小。
+//
 // 包含：
 //   - ExtractStructuredFromNaturalReply：从自然语言回复中提取结构化数据（v75）
-//   - DetectLessonPlanContent：检测教案Markdown内容（v75）
+//   - DetectLessonPlanContent：检测教案Markdown内容（v75，v189放宽#判定）
+//   - splitSuggestionBlock：切出 write/revise 的「教师建议块」（v193）
 //   - extractScoreFromText：提取评审分数（v75）
-//   - 评审信息提取：extractReviewStageFromNatural等（v77重写，v169增强）
+//   - 评审信息提取：extractReviewStageFromNatural等（v77重写，v169增强，v189剥JSON块，v200剥芯片块）
 
 import (
 	"encoding/json"
@@ -47,28 +111,125 @@ func ExtractStructuredFromNaturalReply(stageCode string, content string) (struct
 	}
 }
 
+// ==================== v193：教师建议块（teacher_suggestion）切割 ====================
+
+// suggestionFenceRegex 匹配「教师建议块」专用围栏 ```teacher_suggestion\n ... \n```
+// 非贪婪、跨行；info-string 固定为 teacher_suggestion，与 ```json（评审）、
+// ```suggested_actions（芯片）两套围栏的 info-string 均不同，正则互不匹配、互不干扰。
+var suggestionFenceRegex = regexp.MustCompile("(?s)```teacher_suggestion\\s*\\n(.*?)```")
+
+// splitSuggestionBlock 从 AI 回复中切出所有「教师建议块」。
+//
+// 返回：
+//   - pureContent：移除所有 ```teacher_suggestion 块后的纯净回复（用于教案提取，
+//     保证落库教案正文绝不含建议——这是 v193 的硬保证核心）；
+//   - suggestionText：所有建议块内文本合并后的结果（用于拼进 narrative 让老师看到）。
+//
+// 设计要点：
+//   - 无建议块时：pureContent 原样返回、suggestionText 为空，行为与 v193 前完全一致；
+//   - 多个建议块时：内容按出现顺序用空行合并；
+//   - 只切专用围栏，绝不动 ```json / ```suggested_actions 等其它围栏。
+func splitSuggestionBlock(content string) (pureContent string, suggestionText string) {
+	if content == "" {
+		return "", ""
+	}
+
+	// 提取所有建议块内文本
+	matches := suggestionFenceRegex.FindAllStringSubmatch(content, -1)
+	var parts []string
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		inner := strings.TrimSpace(m[1])
+		if inner != "" {
+			parts = append(parts, inner)
+		}
+	}
+	suggestionText = strings.TrimSpace(strings.Join(parts, "\n\n"))
+
+	// 从原文整段移除建议块，得到纯净内容
+	pureContent = suggestionFenceRegex.ReplaceAllString(content, "")
+	// 清理因移除产生的连续空行（最多保留一个空行）
+	pureContent = regexp.MustCompile(`\n{3,}`).ReplaceAllString(pureContent, "\n\n")
+	pureContent = strings.TrimSpace(pureContent)
+
+	return pureContent, suggestionText
+}
+
 // extractWriteStageFromNatural 从write/revise阶段的自然语言回复中提取教案内容
+//
+// v193：提取教案前先用 splitSuggestionBlock 切走「教师建议块」——
+//   * pureContent（无建议块）喂 DetectLessonPlanContent，落库教案正文硬保证不含建议；
+//   * 切出的建议文本拼进 narrative，老师在对话气泡看得到、但不进教案。
+//
+// v200（P0-04补漏）：DetectLessonPlanContent 提取出的正文会从标题行一直取到末尾，AI 追加在
+//   教案末尾的 ```suggested_actions 芯片块会被一并截进正文。故对 lessonContent 再套
+//   StripSuggestedActionsBlock 后才落库，保证落库教案正文绝不含芯片块；未识别到教案时的
+//   降级 narrative 同样补剥一层（与展示路径口径一致）。
 func extractWriteStageFromNatural(content string) (string, string, bool) {
-	lessonContent := DetectLessonPlanContent(content)
+	// v193：先切走教师建议块，后续教案提取只认纯净内容
+	pureContent, suggestionText := splitSuggestionBlock(content)
+
+	lessonContent := DetectLessonPlanContent(pureContent)
 	if lessonContent == "" {
-		narrative := safeUTF8Truncate(content, 500)
+		// 未识别到完整教案：narrative 用纯净内容截断（v200补剥芯片块）；若有建议块，仍把建议拼上供老师看
+		narrative := safeUTF8Truncate(StripSuggestedActionsBlock(pureContent), 500)
+		narrative = appendSuggestionToNarrative(narrative, suggestionText)
 		return "{}", narrative, false
 	}
+
+	// v200（P0-04补漏）：剥掉被 DetectLessonPlanContent 一并截进正文的 ```suggested_actions 芯片块，
+	// 保证落库教案正文绝不含芯片代码；剥后重新 TrimSpace 去尾部残留空白。
+	lessonContent = strings.TrimSpace(StripSuggestedActionsBlock(lessonContent))
+
 	structured := map[string]interface{}{"content_markdown": lessonContent}
 	b, _ := json.Marshal(structured)
-	narrativeIdx := strings.Index(content, lessonContent)
+
+	// narrative：取纯净内容里「教案正文之前」的文字（原逻辑），再拼上建议块文本
+	narrativeIdx := strings.Index(pureContent, lessonContent)
 	narrative := ""
 	if narrativeIdx > 0 {
-		narrative = strings.TrimSpace(content[:narrativeIdx])
+		narrative = strings.TrimSpace(pureContent[:narrativeIdx])
 	}
 	if narrative == "" {
 		narrative = fmt.Sprintf("已生成教案（%d字符）", len(lessonContent))
 	}
-	wsLog.Info("从自然语言回复中提取到教案内容", "content_len", len(lessonContent), "narrative_len", len(narrative))
+	narrative = appendSuggestionToNarrative(narrative, suggestionText)
+
+	wsLog.Info("从自然语言回复中提取到教案内容",
+		"content_len", len(lessonContent), "narrative_len", len(narrative),
+		"has_suggestion", suggestionText != "")
 	return string(b), narrative, true
 }
 
+// appendSuggestionToNarrative 把「教师建议块」文本以醒目前缀拼到 narrative 末尾（v193）。
+//
+// narrative 是给老师在对话气泡展示的文本（不落库教案正文），把 AI 的创新建议放这里，
+// 既让老师看得到、可决策，又与教案正文物理分离。建议为空时原样返回 narrative。
+func appendSuggestionToNarrative(narrative string, suggestionText string) string {
+	if strings.TrimSpace(suggestionText) == "" {
+		return narrative
+	}
+	block := "💡 我的补充建议（供您参考，未写入教案正文）：\n" + suggestionText
+	if strings.TrimSpace(narrative) == "" {
+		return block
+	}
+	return narrative + "\n\n" + block
+}
+
 // DetectLessonPlanContent 检测并提取AI回复中的完整教案Markdown内容
+//
+// 判定为有效教案需同时满足（五重叠加，缺一不可）：
+//  1. markerCount ≥ 3：命中至少3个教案标记词（教学目标/教学过程/作业布置…）
+//  2. 能定位正文起点 startIdx：
+//     - 主路径：存在以 "#" 开头且含教案标题词的行（最规范）
+//     - 降级路径（v189新增）：无 # 标题时，取第一行"含教案标题词的纯文本非空行"
+//  3. hasProcess：含"教学过程/教学环节/教学活动"任一
+//  4. hasEnding：含"作业布置/板书设计/课后作业/课堂小结…"任一结尾标记
+//  5. 截取后正文长度 ≥ 800 字符
+//
+// v189：放宽第2条对格式井号的硬要求——格式井号缺失不再判死，但其余四道闸不变。
 func DetectLessonPlanContent(content string) string {
 	if content == "" {
 		return ""
@@ -93,11 +254,15 @@ func DetectLessonPlanContent(content string) string {
 		return ""
 	}
 	lines := strings.Split(content, "\n")
-	startIdx := -1
+
+	// titleMarkers：用于定位"正文起点"的教案标题词；# 标题与纯文本降级两路径共用
 	titleMarkers := []string{
 		"教案", "教学设计", "教学目标", "课题", "课时",
 		"教学重点", "教学难点", "教学重难点", "教学准备",
 	}
+
+	// ---------- 起点定位：主路径——优先找以 # 开头且含标题词的行 ----------
+	startIdx := -1
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(trimmed, "#") {
@@ -113,6 +278,28 @@ func DetectLessonPlanContent(content string) string {
 			break
 		}
 	}
+
+	// ---------- 起点定位：降级路径（v189）——无 # 标题时，取第一行含标题词的纯文本非空行 ----------
+	// 仅当主路径未命中（startIdx<0）才执行；后续 hasProcess/hasEnding/≥800字 三道闸不受影响。
+	if startIdx < 0 {
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			for _, marker := range titleMarkers {
+				if strings.Contains(trimmed, marker) {
+					startIdx = i
+					break
+				}
+			}
+			if startIdx >= 0 {
+				break
+			}
+		}
+	}
+
+	// 两条路径都找不到正文起点：仍判否（连一行含标题词的内容都没有，不像教案）
 	if startIdx < 0 {
 		return ""
 	}
@@ -120,7 +307,9 @@ func DetectLessonPlanContent(content string) string {
 	// 教学过程：支持多种命名方式
 	hasProcess := strings.Contains(content, "教学过程") ||
 		strings.Contains(content, "教学环节") ||
-		strings.Contains(content, "教学活动")
+		strings.Contains(content, "教学活动") ||
+		(strings.Contains(content, "学生活动") &&
+			(strings.Contains(content, "教师话术") || strings.Contains(content, "教师活动")))
 	// 结尾标记：支持多种命名方式（AI输出变体较多）
 	hasEnding := strings.Contains(content, "作业布置") ||
 		strings.Contains(content, "板书设计") ||
@@ -180,22 +369,30 @@ func trimTrailingChatter(content string) string {
 	return strings.TrimSpace(strings.Join(lines[:trimEnd], "\n"))
 }
 
-// ==================== 评审信息提取（v77重写，v169增强：JSON优先+正则降级）====================
+// ==================== 评审信息提取（v77重写，v169增强：JSON优先+正则降级；v189剥JSON块；v200剥芯片块）====================
 
 // extractReviewStageFromNatural 从review阶段的自然语言回复中提取评审信息
 //
 // v169双链路：
 //
-//	链路1（优先）：解析 AI 回复尾部的 ```json 结构化块（新版提示词约定输出此块）
-//	链路2（降级）：解析失败时，沿用原有 Markdown 正则提取（兼容旧格式）
+//      链路1（优先）：解析 AI 回复尾部的 ```json 结构化块（新版提示词约定输出此块）
+//      链路2（降级）：解析失败时，沿用原有 Markdown 正则提取（兼容旧格式）
 //
 // 两条链路任一成功（total_score>0）即返回 hasContent=true；
 // 都失败时返回 hasContent=false，narrative 兜底为对话原文截断（供上层 fallback）。
+//
+// v189（改动B）：两条链路构造 narrative 前先调 stripReviewJSONBlock 剥掉尾部 ```json 块，
+// 避免供解析用的 JSON 原样泄漏给老师看；解析仍吃原始 content 不受影响。
+//
+// v200（P0-04）：在 stripReviewJSONBlock 外再套 StripSuggestedActionsBlock，剥掉评审报告
+// 末尾的 ```suggested_actions 芯片块（stripReviewJSONBlock 的正则按设计不匹配该围栏，
+// 故芯片块原本会残留在 narrative 里显示到右侧画布）。两函数职责正交、叠加无副作用；
+// 芯片解析/广播走 ParseSuggestedActions 吃原始 content，不受本改动影响。
 func extractReviewStageFromNatural(content string) (string, string, bool) {
 	// ---------- 链路1：JSON 块优先 ----------
 	if structuredJSON, ok := parseReviewJSONBlock(content); ok {
-		// narrative 用完整原文（含 Markdown 报告），截断到 2000 字符供前端展示/记忆
-		narrative := safeUTF8Truncate(content, 2000)
+		// narrative 用原文（含 Markdown 报告）但先剥掉尾部 JSON 块与芯片块，再截断到 2000 字符供前端展示/记忆
+		narrative := safeUTF8Truncate(StripSuggestedActionsBlock(stripReviewJSONBlock(content)), 2000)
 		wsLog.Info("评审提取走JSON块链路（v169）", "structured_len", len(structuredJSON))
 		return structuredJSON, narrative, true
 	}
@@ -203,7 +400,7 @@ func extractReviewStageFromNatural(content string) (string, string, bool) {
 	// ---------- 链路2：Markdown 正则降级 ----------
 	totalScore := extractTotalScoreFromReview(content)
 	if totalScore <= 0 {
-		narrative := safeUTF8Truncate(content, 2000)
+		narrative := safeUTF8Truncate(StripSuggestedActionsBlock(stripReviewJSONBlock(content)), 2000)
 		wsLog.Warn("评审提取两条链路均失败，返回无结构化（上层将走兜底）", "content_len", len(content))
 		return "{}", narrative, false
 	}
@@ -221,7 +418,7 @@ func extractReviewStageFromNatural(content string) (string, string, bool) {
 		"summary":      summary,
 	}
 	b, _ := json.Marshal(structured)
-	narrative := safeUTF8Truncate(content, 2000)
+	narrative := safeUTF8Truncate(StripSuggestedActionsBlock(stripReviewJSONBlock(content)), 2000)
 
 	wsLog.Info("评审提取走Markdown正则降级链路（v169）",
 		"total_score", totalScore,
@@ -232,6 +429,38 @@ func extractReviewStageFromNatural(content string) (string, string, bool) {
 	)
 
 	return string(b), narrative, true
+}
+
+// stripReviewJSONBlock 从评审原文中剥离所有 ```json / ``` 围栏代码块（v189改动B新增）
+//
+// 用途：构造给老师看的 narrative 前，把供 parseReviewJSONBlock 解析用、但不该展示的
+// 尾部 JSON 块整段移除，避免报告里夹一坨 json{...}。
+//
+// 实现：复用与解析端 extractLastJSONCodeBlock 同款围栏正则（```json 或 ``` 无语言标注），
+// 全局移除所有匹配块（不止最后一个，AI 偶尔多输出几个也一并清掉），再清理因移除产生的
+// 尾部多余空白与单独成行的 ---。只剥围栏块，不动报告正文。
+//
+// 安全：只用于展示文本构造，不改变解析输入；无围栏块时原样返回。
+func stripReviewJSONBlock(content string) string {
+	if content == "" {
+		return ""
+	}
+	// 与 extractLastJSONCodeBlock 同款围栏匹配：```json\n...\n``` 或 ```\n...\n```，跨行非贪婪
+	re := regexp.MustCompile("(?s)```(?:json)?\\s*\\n.*?```")
+	stripped := re.ReplaceAllString(content, "")
+
+	// 清理尾部：移除因剥块残留的空行与单独成行的 ---
+	lines := strings.Split(stripped, "\n")
+	trimEnd := len(lines)
+	for i := len(lines) - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" || trimmed == "---" {
+			trimEnd = i
+			continue
+		}
+		break
+	}
+	return strings.TrimSpace(strings.Join(lines[:trimEnd], "\n"))
 }
 
 // parseReviewJSONBlock 从 AI 回复中提取并校验尾部的评审 JSON 块（v169新增）

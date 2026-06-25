@@ -9,28 +9,74 @@ package services
 //
 // 设计背景（v168/v169）：
 //   「一键生成」让老师在某个阶段一次性产出完整内容，无需逐轮分段确认。
-//   覆盖 4 个「写内容」的阶段：
-//     - analyze（教学分析）落库走 extractGenericStageFromNatural（宽松，内容非空即存）
-//     - design （教学设计）同上（宽松）
-//     - write  （教案撰写）落库走 DetectLessonPlanContent（严格，需命中教案结构判定）
-//     - revise （修订定稿）与 write 共用 handleWriteStageOutput，落库判定同样严格
-//   review（AI 评审）阶段不参与一键生成（推进过去会自动触发评审）。
+//   覆盖 4 个「写内容」的阶段：analyze / design / write / revise。
+//   review（AI 评审）阶段不参与一键生成。
 //
-// 调用入口：processChatStageAsync（lesson_plan_gen_service.go）按当前阶段决定是否注入：
-//   - write 阶段：在「正文为空 + fullGenerate」时注入 fullGenerateWritePrompt（其余两态见主文件）
-//   - analyze/design/revise：fullGenerate=true 时调 resolveFullGeneratePrompt 取对应指令注入
+// v190 修复4（方案乙落地）：design 的 fullGenerateDesignPrompt 由「当场出完整设计方案」
+//   改为「确认设计要点 + 引导去 write + 追加交接芯片」。
+//
+// v191 阶段二修复（改动C）：design 交接芯片由两枚（full_generate + switch_stage）改为一枚
+//   （只留 full_generate）。原因：前端 computeVisibleChips 动态分支会过滤掉 switch_stage
+//   导航芯片（方向A 设计：推进统一交回剧本 advance_stage 芯片），导致 switch_stage 那枚
+//   在前端被静默丢弃、老师永远看不到。去掉它，避免给 AI「该给两枚」的错误预期。
+//   其余三常量（write/analyze/revise）与 resolveFullGeneratePrompt 一字未动。
+//
+// v198 变更（教学逻辑内核·一键出稿路径接入）：
+//   - 在 analyze / write / revise 三个「真正出内容」的一键指令的「请现在就开始输出」之前，
+//     各插入一段「教学逻辑内核（精简版）」fullGenLogicCore 常量。目的是把对话路径
+//     （buildDialogueGuidelines 第5层注入的 pedagogyLogicCore）所强调的四条底层要求
+//     —— 学科逻辑锚定（合理具象化但不建立错误心智模型）、真实生活化情景引入、
+//     例子单线贯穿避免频繁换例、逻辑严谨优先于语义相似 —— 同样作用到「一键出稿」路径,
+//     根治"逐环节写时还讲逻辑、一键生成时却堆术语/换例/编伪机制"的路径不一致。
+//   - design 的 fullGenerateDesignPrompt 不接入：它不产出教案正文（只引导去 write 出稿），
+//     内核规范对它无作用面;真正的设计逻辑约束由对话路径 design 阶段的 pedagogyLogicCore 承担。
+//   - 安全：fullGenLogicCore 是纯指导性自然语言,插在格式硬要求之后、"请现在就开始输出"之前,
+//     不改任何输出格式硬要求、不引入任何新围栏(不碰 teacher_suggestion / json / suggested_actions),
+//     故对 DetectLessonPlanContent 的五重识别闸门与 splitSuggestionBlock 的建议块切割零影响。
+//
+// v200 变更（design 一键生成「名实归一」·路线A·粒度①——撤销 v190 方案乙）：
+//   - 背景：v190 方案乙把 design 一键生成改成「不出设计稿、只说一句承接 + 甩一枚去 write 的
+//     交接芯片」。但前端按钮文案「⚡ 一键完成教学设计」与确认弹窗承诺「一次性生成完整的
+//     教学设计方案（教学目标、重难点、教学策略、活动设计、评价设计）」并未同步——形成
+//     「按钮名实不符」：老师点了以为得到一份教学设计方案，实际啥设计都没出、直接被导去
+//     write 出逐句详案，体验上等于「design 阶段被跳过」。这是 v190 设计变更遗留的体验坑，
+//     不是代码 bug。
+//   - 本次（路线A）：让 design 一键生成名副其实——当场输出一份完整的「教学设计方案」，
+//     与按钮名/确认弹窗对齐。粒度①（骨架级）：列各环节「名称+时间+核心活动+设计意图」，
+//     point 到活动设计为止，【不写逐句师生话术】——逐句详案是下一个 write 阶段的产物，
+//     两阶段粒度分工清晰、不重叠（教学设计 ≠ 教案详案，符合教学设计专业惯例）。
+//   - 不再甩「去 write」的交接芯片：design 自己出方案后，推进交给剧本 STAGE_FOLLOWUP_CHIPS
+//     ['design'] 里现成那枚 advance_stage「✅ 按这个写正文」（老师看完方案满意即点它进 write）。
+//   - 接入 fullGenLogicCore：design 现在真出设计内容了，应与 analyze/write/revise 一样受
+//     教学逻辑内核四条约束（学科逻辑锚定 / 真实情境 / 单线贯穿 / 逻辑严谨）。
+//   - 安全（关键）：design 阶段产出【不落教案正文】——ExtractStructuredFromNaturalReply 对
+//     design 走 default 分支 extractGenericStageFromNatural（只存 summary，不写 content_markdown）；
+//     handleStageOutputSideEffects 的 switch 不含 design（无 UpdateLessonPlanContent 副作用）。
+//     故 design 一键生成无论出多完整的设计方案，都不会污染右侧教案画布、不会与 write 产出打架。
+//     本指令不含任何围栏（不碰 teacher_suggestion / json / suggested_actions），对 P0-04 的
+//     芯片块剥离与 DetectLessonPlanContent 五重识别闸门零影响。
+//   - 其余三常量（write/analyze/revise）、fullGenLogicCore、resolveFullGeneratePrompt 一字未动。
+
+// fullGenLogicCore 一键出稿路径的「教学逻辑内核（精简版）」（v198）
+//
+// 这是对话路径 pedagogyLogicCore 的精简版,只保留对"一次性出稿"最关键的四条底层约束,
+// 不含分学段差异化措辞(一键路径拿不到便于分档的上下文,故统一用"尽量单线贯穿"的稳妥口径,
+// 学段差异化由对话路径承担)。措辞强调"合理具象化但不教条",避免逼 AI 对低龄学生堆术语。
+const fullGenLogicCore = `
+
+== 教学逻辑内核（重要,贯穿整份教案）==
+1. 学科逻辑锚定：动笔前先想清楚"本课要让学生真正理解的那一条学科核心逻辑/原理"是什么,整份教案的所有环节、例子、活动都应当为讲清这一条服务,而不是各自看着热闹却互不咬合。允许、并且鼓励用学生这个年龄能听懂的生活化比喻把抽象原理讲明白;但比喻只能简化,不能建立"违背学科真实机制、会让学生形成错误认知"的心智模型。
+   反例(不要这样写)：讲"AI图像识别"时说成"AI先识别颜色、再识别形状、再组合起来判断"——这把 AI 讲成了人类预先设定好步骤的串行流水线,违背了 AI 从大量样本中自己学到特征的本质,会让学生形成错误理解。
+   正例(可以这样写)：讲"AI图像识别"时说成"AI 看过几百万张猫的照片,自己总结出了'猫大概长什么样'的感觉,而不是我们一条一条教它规则"——既具象、学生能懂,又没有歪曲本质。
+2. 真实生活化情景引入：导入与核心情境要取自学生真实的生活经验或当下真实的社会/科技问题(2025 新课标要求课程设计与学生实际生活相关联),不要用脱离学生经验的抽象设例硬凑。
+3. 例子连贯升华：尽量用一个核心例子/情境贯穿全课,在不同环节上对同一个例子持续深入、层层引申,而不是每个环节都换一个新例子——频繁换例会增加学生(尤其低年级)的认知负荷,削弱逻辑主线。确需第二个例子时,它也应与主例共享同一条核心逻辑、起对照或递进作用。
+4. 逻辑严谨优先于"看起来像好教案"：判断一个环节/活动/例子该不该写进去,标准是"它是否真的在为本课核心逻辑服务、机制是否站得住脚",而不是"它读起来像不像一个漂亮的教学设计"。不要为了显得丰富就堆砌专业术语、罗列多个互不关联的前沿名词,或堆砌华丽但与主线无关的活动。
+`
 
 // fullGenerateWritePrompt 教案撰写阶段·全委托一键生成指令（v168·功能B）
 //
 // 设计原则：本指令格式严格对齐 DetectLessonPlanContent（workshop_stage_extract.go）的判定条件，
-// 确保 AI 一次性产出的教案能被识别并落库。DetectLessonPlanContent 要求：
-//  1. ≥3 个教案标记词（教学目标/重点/难点/过程/准备/作业/板书...）
-//  2. 有 # 开头的标题行，且标题含"教案/教学设计/教学目标/课题..."之一
-//  3. 含"教学过程"或"教学环节"或"教学活动"
-//  4. 含结尾标记（作业布置/板书设计/课后作业/课堂小结/教学反思...之一）
-//  5. 去掉末尾客套话后正文 ≥800 字符
-//
-// 因此本指令强制：用 # 标题、含全部必备小节、教学过程分环节带时间、不分段、不寒暄。
+// 确保 AI 一次性产出的教案能被识别并落库。
 const fullGenerateWritePrompt = `
 
 == 全委托一键生成模式（系统级指令，最高优先级，覆盖上文所有分段确认要求）==
@@ -49,12 +95,17 @@ const fullGenerateWritePrompt = `
 4. 结尾直接以"板书设计"小节自然结束，**不要**添加"如需修改请告诉我""希望这份教案对您有帮助"等客套话。
 5. 全程使用规范的 Markdown 标题层次（# ## ###），正文用自然中文，不要输出 JSON 或代码块包裹整篇教案。
 
+
+== 设计忠实与创新建议剥离（重要）==
+- 凡是前面"教学设计"阶段已经和老师明确商定的教学环节、活动形式、课堂收尾、作业安排，必须忠实还原老师确认过的方案，不得擅自更换形式、升级玩法或替换成你认为更好的设计。
+- 教学设计阶段没有具体讨论、但完整教案结构上必须有的部分（如作业布置、板书设计、教学准备），可以合理补全。
+- 但如果你产生了"教学设计阶段从未与老师讨论过、且会实质影响课堂组织方式"的新想法或新活动（例如一种具体的作业活动形式、一个新的互动环节、一种新的评价玩法），绝对不要写进教案正文当作既定方案；而要把它单独写进一个 ` + "```teacher_suggestion" + ` 代码块（块内用自然中文说明建议及理由，写在完整教案 Markdown 之外、不要塞进教案小节里），由老师决定是否采纳。教案正文只含与老师达成共识的内容。建议最多 1-2 条。
+
+` + fullGenLogicCore + `
+
 请现在就开始输出完整教案。`
 
 // fullGenerateAnalyzePrompt 教学分析阶段·全委托一键生成指令（v169）
-//
-// 落库路径：analyze 走 extractGenericStageFromNatural（判定宽松，内容非空即存为 narrative），
-// 故格式要求不必像 write 那样严格，重点是引导 AI 一次性输出完整的、结构清晰的学情/教材分析。
 const fullGenerateAnalyzePrompt = `
 
 == 全委托一键生成模式（系统级指令，最高优先级，覆盖上文所有分段确认/逐步追问要求）==
@@ -68,33 +119,45 @@ const fullGenerateAnalyzePrompt = `
 
 要求：内容具体、贴合学科与年级，避免空话套话。结尾不要加"如需调整请告诉我"之类的客套话。
 
+` + fullGenLogicCore + `
+
 请现在就开始输出完整的教学分析。`
 
-// fullGenerateDesignPrompt 教学设计阶段·全委托一键生成指令（v169）
+// fullGenerateDesignPrompt 教学设计阶段·全委托一键生成指令
 //
-// 落库路径：design 走 extractGenericStageFromNatural（宽松）。
+// v200（路线A·粒度①，撤销 v190 方案乙）：design 一键生成名副其实——当场输出一份完整的
+// 「教学设计方案（骨架级）」，与前端按钮「⚡ 一键完成教学设计」及确认弹窗承诺对齐。
+//
+//      粒度①：每个环节给「名称 + 时间 + 核心活动 + 设计意图」，point 到活动设计为止，
+//      【不写逐句师生话术】——逐句详案是下一个 write 阶段的产物，两阶段粒度分工清晰、不重叠。
+//
+//      推进交给剧本 STAGE_FOLLOWUP_CHIPS['design'] 现成的 advance_stage「✅ 按这个写正文」芯片，
+//      本指令不再甩任何交接芯片。
+//
+//      安全：design 阶段产出不落教案正文（走 extractGenericStageFromNatural，无落库副作用），
+//      故无论方案多完整都不会污染右侧画布；本指令不含任何围栏，对 P0-04 剥离与
+//      DetectLessonPlanContent 识别闸门零影响。已接入 fullGenLogicCore。
 const fullGenerateDesignPrompt = `
 
 == 全委托一键生成模式（系统级指令，最高优先级，覆盖上文所有分段确认/逐步追问要求）==
-老师已明确选择"全委托 AI 一次性完成本阶段（教学设计）"，请你立即一次性输出一份**完整的教学设计方案**，不要分段、不要反过来追问老师，本次回复就给出全部内容。
+老师已明确选择"全委托 AI 一次性完成本阶段（教学设计）"，请你立即一次性输出一份**完整的教学设计方案**，不要分段、不要反过来追问老师、不要说"接下来设计下一部分"，本次回复就给出全部内容。
+
+【关键·粒度边界】本阶段产出的是"教学设计方案/环节蓝图"，不是逐句成稿教案。也就是说：把每个教学环节的**框架**设计清楚即可——这个环节叫什么、大约几分钟、核心做什么活动、为什么这样设计（设计意图）；但**不要在本阶段写出逐字逐句的教师话术、师生对话台词**。那些细化到每一句怎么说的"详案"，是下一个「教案撰写」阶段的工作，留到那时再写。请严格守住这条粒度边界，避免本阶段就把详案写满、与下一阶段重复。
 
 请用 Markdown 输出，至少包含以下方面（用 ## 二级标题分节）：
-## 教学目标（三维目标或核心素养目标，要具体可观察、可评估）
-## 教学重难点（明确重点与难点，并说明突破难点的策略）
-## 教学策略（采用的教学方法、学习方式，如探究式/任务驱动/小组合作等及理由）
-## 教学活动设计（按环节展开，每个环节给出名称、预计时长、教师活动、学生活动、设计意图）
-## 评价设计（如何检验目标达成，形成性评价与总结性评价的安排）
+## 教学目标（紧扣课标核心素养，具体可观察）
+## 教学重难点（明确教学重点与教学难点）
+## 设计思路（本课的整体设计主线/核心情境，以及为什么这样设计——呼应下面的教学逻辑内核）
+## 教学环节设计（这是核心：按环节依次列出，每个环节给出【环节名称】+【时间分配】+【核心活动/做什么】+【设计意图/为什么这样安排】四要素；环节要构成完整闭环，如 导入→探究新知→巩固应用→小结 等；只写环节框架与活动设计，不写逐句师生话术）
+## 评价设计（如何在课堂中检验学生是否达成目标，如随堂提问、任务单、表现性评价等）
 
-要求：活动设计要可操作、环节衔接合理、贴合学科与年级。结尾不要加客套话。
+要求：内容具体、贴合学科与年级，环节之间逻辑连贯、围绕同一条核心主线，避免空话套话。结尾不要加"如需调整请告诉我"之类的客套话；也不要输出 JSON 或代码块。
+
+` + fullGenLogicCore + `
 
 请现在就开始输出完整的教学设计方案。`
 
 // fullGenerateRevisePrompt 修订定稿阶段·全委托一键生成指令（v169）
-//
-// 落库路径：revise 与 write 共用 handleWriteStageOutput，需命中 DetectLessonPlanContent（严格）。
-// 故格式要求与 write 完全一致（# 标题 + 全部必备小节 + ≥800字），
-// 区别在于：要求 AI 基于"前面阶段已完成的教案正文 + AI 评审建议"做修订后输出完整教案。
-// 已完成的正文与评审结论已由 LoadStagePromptContextV2 + Episodic 摘要注入上下文，AI 可直接参考。
 const fullGenerateRevisePrompt = `
 
 == 全委托一键生成模式（系统级指令，最高优先级，覆盖上文所有分段确认要求）==
@@ -107,23 +170,30 @@ const fullGenerateRevisePrompt = `
 4. 整份教案不少于 800 字，结尾以"板书设计"小节自然结束，不要加客套话。
 5. 使用规范 Markdown 标题层次，不要用 JSON 或代码块包裹整篇教案。
 
+
+== 设计忠实与创新建议剥离（重要）==
+- 凡是前面"教学设计"阶段已经和老师明确商定的教学环节、活动形式、课堂收尾、作业安排，必须忠实还原老师确认过的方案，不得擅自更换形式、升级玩法或替换成你认为更好的设计。
+- 教学设计阶段没有具体讨论、但完整教案结构上必须有的部分（如作业布置、板书设计、教学准备），可以合理补全。
+- 但如果你产生了"教学设计阶段从未与老师讨论过、且会实质影响课堂组织方式"的新想法或新活动（例如一种具体的作业活动形式、一个新的互动环节、一种新的评价玩法），绝对不要写进教案正文当作既定方案；而要把它单独写进一个 ` + "```teacher_suggestion" + ` 代码块（块内用自然中文说明建议及理由，写在完整教案 Markdown 之外、不要塞进教案小节里），由老师决定是否采纳。教案正文只含与老师达成共识的内容。建议最多 1-2 条。
+
+` + fullGenLogicCore + `
+
 请现在就开始输出修订后的完整教案。`
 
 // resolveFullGeneratePrompt 按阶段返回对应的全委托一键生成指令（v169）
 //
 // 返回空字符串表示该阶段不支持一键生成（如 review）。
-// write 阶段的"已有正文→防重复"判定不在此处，仍由 processChatStageAsync 单独处理。
 func resolveFullGeneratePrompt(stageCode string) string {
-	switch stageCode {
-	case "analyze":
-		return fullGenerateAnalyzePrompt
-	case "design":
-		return fullGenerateDesignPrompt
-	case "write":
-		return fullGenerateWritePrompt
-	case "revise":
-		return fullGenerateRevisePrompt
-	default:
-		return ""
-	}
+        switch stageCode {
+        case "analyze":
+                return fullGenerateAnalyzePrompt
+        case "design":
+                return fullGenerateDesignPrompt
+        case "write":
+                return fullGenerateWritePrompt
+        case "revise":
+                return fullGenerateRevisePrompt
+        default:
+                return ""
+        }
 }

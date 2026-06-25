@@ -262,7 +262,7 @@ func (h *AnnotationHandler) ResolveAnnotation(w http.ResponseWriter, r *http.Req
 type AIFixAnnotationRequest struct {
 	ParagraphContent  string `json:"paragraph_content"`  // 原段落文字
 	AnnotationContent string `json:"annotation_content"` // 批注意见
-	PlanContext        string `json:"plan_context"`        // 教案全貌（学科/年级/课题/完整正文）
+	PlanContext       string `json:"plan_context"`       // 教案全貌（学科/年级/课题/完整正文）
 }
 
 // annotationAIFixSystemPrompt AI辅助修改专用系统提示词
@@ -308,7 +308,7 @@ func (h *AnnotationHandler) AIFixAnnotation(w http.ResponseWriter, r *http.Reque
 	}
 
 	// 鉴权：必须已登录
-	_, ok := middleware.GetClaims(r.Context())
+	claims, ok := middleware.GetClaims(r.Context())
 	if !ok {
 		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
@@ -387,6 +387,10 @@ func (h *AnnotationHandler) AIFixAnnotation(w http.ResponseWriter, r *http.Reque
 
 	// 流式调用AI，逐token推送chunk事件
 	startTime := time.Now()
+	// v198：补操作者 UserID + 所属学校ID，供模型境内/境外分流判定（原 traceCtx=nil 且 claims 被丢弃，一并补齐）
+	annUID := claims.UserID
+	annSchoolID, _ := repository.GetSchoolIDByUserID(r.Context(), claims.UserID)
+	annTraceCtx := &ai.TraceContext{SceneCode: "lesson_plan", UserID: &annUID, SchoolID: schoolIDPtrH(annSchoolID)}
 	callResult, callErr := ai.CallAIStream(
 		aiCfg,
 		annotationAIFixSystemPrompt,
@@ -395,7 +399,7 @@ func (h *AnnotationHandler) AIFixAnnotation(w http.ResponseWriter, r *http.Reque
 			writeAnnotationSSEEvent(w, flusher, "chunk", map[string]string{"chunk": chunk})
 			return nil
 		},
-		nil,
+		annTraceCtx,
 	)
 
 	if callErr != nil {

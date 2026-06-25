@@ -265,6 +265,7 @@ func (s *CoursewareSubtitleService) BurnInSubtitle(ctx context.Context, subtitle
 	localURL := CWAssetURLPrefix + filepath.Join(coursewareID, "videos", outputName)
 	newAsset := &models.CoursewareAsset{
 		CoursewareID:     coursewareID,
+		PageID:           asset.PageID, // S-V2修复: 烧录成片继承源视频页归属(5.1.5契约,缺失则按页资产列表不可见)
 		PlaceholderID:    "",
 		AssetType:        models.CWAssetTypeVideo,
 		GenerationPrompt: fmt.Sprintf("字幕烧录(%s, %d条)", sub.Language, len(segments)),

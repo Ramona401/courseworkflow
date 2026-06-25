@@ -5,6 +5,7 @@ package routes
 // v0.42 多媒体: 新增 CoursewareAssetService + CoursewareAssetHandler
 // 合并重构: 移除学校管理员独立体系(school_admin_handler/routes_school_admin)，
 //          senior_operator 统一走 /admin（registerAdminRoutes 的 adminOrSchoolAdmin 中间件）。
+// 助手轻量选择入口 Phase 1: 新增 TeacherAssistantPrefHandler，注册老师×学科助手偏好读写与可选助手列表路由。
 
 import (
 	"context"
@@ -135,6 +136,9 @@ func Setup(cfg *config.Config) http.Handler {
 	creditPolicyService := services.NewCreditPolicyService()
 	tokenGuard := services.NewTokenGuard(true)
 
+	// v197新增：注入模型分流所需的 AES 密钥（用于解密境内通道 key）
+	ai.SetModelPolicyConfig(cfg.GetAESKey())
+
 	// v129新增：注入AI调用积分回调钩子
 	ai.SetCreditHook(
 		// 消费回调
@@ -187,6 +191,10 @@ func Setup(cfg *config.Config) http.Handler {
 	// 课程知识库（平台级公共只读查询，课件/教案两处复用）
 	curriculumHandler := handlers.NewCurriculumHandler()
 
+	// 课程大纲（大单元备课能力·批次一）：服务 + 处理器
+	courseOutlineService := services.NewCourseOutlineService()
+	courseOutlineHandler := handlers.NewCourseOutlineHandler(courseOutlineService)
+
 	// 知识库课标压缩入库系统（迭代一：课标先行）
 	kbCompressService := services.NewKBCompressService(cfg)
 	kbReviewService := services.NewKBReviewService()
@@ -211,6 +219,13 @@ func Setup(cfg *config.Config) http.Handler {
 	cwPPTService := services.NewCoursewarePPTService(cfg, cwIndexService)
 	cwIndexHandler.SetPPTService(cwPPTService)
 
+	// 课件↔教案对齐报告：构造对齐校验服务，双向注入
+	//   - 注入 cwIndexService：方案落库(saveAndBroadcast)后自动异步触发对齐校验
+	//   - 注入 cwIndexHandler：暴露 GET 查询 / POST 手动重算 两端点
+	cwAlignmentService := services.NewCoursewareAlignmentService(cfg)
+	cwIndexService.SetAlignmentService(cwAlignmentService)
+	cwIndexHandler.SetAlignmentService(cwAlignmentService)
+
 	// v134(课件工坊 Phase 4B)新增:课件HTML逐页AI生成服务+处理器
 	cwGenService := services.NewCoursewareGenService(cfg)
 	cwGenHandler := handlers.NewCoursewareGenHandler(cwGenService, cwService)
@@ -231,6 +246,9 @@ func Setup(cfg *config.Config) http.Handler {
 
 	// v110(TE-DNA 3.0 P0)新增:AI 助手处理器
 	aiAssistantHandler := handlers.NewAIAssistantHandler(aiAssistantService)
+
+	// 助手轻量选择入口 Phase 1 新增:老师×学科助手偏好处理器(复用 aiAssistantService 做可选列表与可见性校验)
+	taPrefHandler := handlers.NewTeacherAssistantPrefHandler(aiAssistantService)
 
 	// v113(TE-DNA 3.0 P0.5)新增:AI 助手对话式创作处理器
 	assistantDesignerHandler := handlers.NewAssistantDesignerHandler(assistantDesignerService)
@@ -297,7 +315,7 @@ func Setup(cfg *config.Config) http.Handler {
 
 	registerAdminRoutes(mux, authMW, adminOnly, adminOrSchoolAdmin, adminHandler, orgHandler, roleHandler, userHandler, aiConfigHandler, promptHandler, edHandler, courseHandler, wsStageHandler, aiTraceHandler)
 	registerPipelineRoutes(mux, authMW, pipelineHandler, sseHandler)
-	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler, annotationHandler, reviewAIHandler, assetHandler, interactionHandler)
+	registerLessonPlanRoutes(mux, authMW, orgHandler, compHandler, lpHandler, lpGenHandler, recipeHandler, wsStageHandler, assessHandler, tbHandler, annotationHandler, reviewAIHandler, assetHandler, interactionHandler, taPrefHandler)
 
 	// v127新增：注册多级审核 + 抽查路由
 	registerReviewV2Routes(mux, authMW, adminOnly, adminOrInspector, adminOrSchoolAdmin, reviewV2Handler, inspectionHandler)
@@ -309,6 +327,12 @@ func Setup(cfg *config.Config) http.Handler {
 
 	// 课程知识库公共只读路由（/api/v1/curriculum/*）
 	registerCurriculumRoutes(mux, authMW, curriculumHandler)
+
+	// 课程大纲路由（/api/v1/course-outlines）
+	registerCourseOutlineRoutes(mux, authMW, courseOutlineHandler)
+
+	// 单元方案路由（大单元备课·独立模块，/api/v1/unit-plans）
+	registerUnitPlanRoutes(mux, authMW, cfg)
 
 	// 知识库课标压缩入库路由（/api/v1/kb/* + /api/v1/sse/kb/* + /api/v1/admin/kb-authorized）
 	registerKBRoutes(mux, authMW, adminOnly, kbCompressHandler, kbReviewHandler, kbAdminHandler)

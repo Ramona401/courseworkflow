@@ -3,7 +3,18 @@
  *
  * 从 CoursewareWorkshopPage.tsx 抽出（v5.2 重写：白色背景+无滚动条；v5.4 flex 居中消白边）。
  * 调用浏览器原生 requestFullscreen 进入真全屏，白底铺满；左右键/点击两侧/圆点指示器翻页；
- * UI 控制条 3 秒自动隐藏；iframe srcDoc 经 injectPreviewMode 注入预览降级脚本。
+ * iframe srcDoc 经 injectPreviewMode 注入预览降级脚本。
+ *
+ * 【P1-01 体验修复】放映控制条原 bottom:24 常驻居中、3 秒淡出但 mousemove 又弹回，
+ *   课件底部若有按钮/答题区会被压住。本次两处改进：
+ *   ① 控制条整体下移贴底（bottom:8）+ 透明度降一档，减少遮挡面积；
+ *   ② 新增「手动隐藏」——点控制条上的「∨」收起后进入 controlsHidden 态，此后 mousemove
+ *      不再自动弹出（flashUI 在隐藏态短路），屏幕底缘出现半透明小把手「⌃」点击才唤回。
+ *
+ * 【P1-02 体验修复·定稿做法】当前页号只存本组件 curPage 一处（单一真相源），
+ *   父组件不再每次翻页回写（那会形成 state 双源打架，导致点下一页又被旧 prop 拉回）。
+ *   改为退出时经 onClose(finalPage) 把最终停留页一次性回传父组件，父组件据此记住下次初值。
+ *   initialPage 仅作挂载初值，翻页全程父组件不参与，彻底消除翻页回弹。
  */
 import { useState, useEffect, useRef } from 'react'
 import { C, CW_WIDTH, CW_HEIGHT } from './workshopConstants'
@@ -12,14 +23,20 @@ import { injectPreviewMode } from './previewInject'
 export default function SlideshowPlayer({ pages, initialPage, onClose }: {
   pages: { page_number: number; title: string; html_content: string }[]
   initialPage: number
-  onClose: () => void
+  // P1-02: 退出时回传「当前停留页」给父组件（可选参数），父组件据此记住下次初值；
+  //   不传参时父组件按各自逻辑处理（保持兼容）。翻页过程中绝不回调，避免双源打架。
+  onClose: (finalPage?: number) => void
 }) {
   const [curPage, setCurPage] = useState(initialPage)
   const [showUI, setShowUI] = useState(true)
+  // P1-01: 手动隐藏控制条态——true 时 mousemove 不再自动弹出控制条，只能点底缘把手唤回
+  const [controlsHidden, setControlsHidden] = useState(false)
   // v5.2: 使用innerWidth/innerHeight作为默认值，全屏后切换为screen尺寸
   const [containerSize, setContainerSize] = useState({ w: window.innerWidth, h: window.innerHeight })
   const uiTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const boxRef = useRef<HTMLDivElement>(null)
+  // P1-02: 用 ref 始终持有「最新当前页」，供 onClose 与全屏退出回调读取（闭包不会读到旧值）
+  const curPageRef = useRef(initialPage)
 
   const data = pages.find(p => p.page_number === curPage)
   const idx = pages.findIndex(p => p.page_number === curPage)
@@ -29,13 +46,22 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
   // v0.41: 注入预览降级脚本
   const previewHtml = data ? injectPreviewMode(data.html_content) : ''
 
+  // P1-02: 统一翻页入口——只改本组件 state（单一真相源）+ 同步刷新 ref，不回调父组件
+  const gotoPage = (pn: number) => {
+    setCurPage(pn)
+    curPageRef.current = pn
+  }
+  // P1-02: 统一退出入口——退出时把最新当前页一次性回传父组件
+  const doClose = () => { onClose(curPageRef.current) }
+
   // 请求浏览器全屏API
   useEffect(() => {
     const el = boxRef.current
     if (el?.requestFullscreen) el.requestFullscreen().catch(() => {})
     const onFs = () => {
       if (!document.fullscreenElement) {
-        onClose()
+        // 浏览器退出全屏（ESC/系统手势）→ 走统一退出，回传当前页
+        doClose()
       } else {
         // 全屏后延迟获取准确尺寸
         requestAnimationFrame(() => {
@@ -50,7 +76,8 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
       document.removeEventListener('fullscreenchange', onFs)
       if (document.fullscreenElement) document.exitFullscreen().catch(() => {})
     }
-  }, [onClose])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // 监听resize事件，实时更新容器尺寸
   useEffect(() => {
@@ -69,17 +96,20 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
   // 键盘导航
   useEffect(() => {
     const fn = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { onClose(); return }
-      if ((e.key === 'ArrowLeft' || e.key === 'PageUp') && hasPrev) setCurPage(pages[idx - 1].page_number)
-      if ((e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') && hasNext) { e.preventDefault(); setCurPage(pages[idx + 1].page_number) }
+      if (e.key === 'Escape') { doClose(); return }
+      if ((e.key === 'ArrowLeft' || e.key === 'PageUp') && hasPrev) gotoPage(pages[idx - 1].page_number)
+      if ((e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') && hasNext) { e.preventDefault(); gotoPage(pages[idx + 1].page_number) }
       flashUI()
     }
     window.addEventListener('keydown', fn)
     return () => window.removeEventListener('keydown', fn)
-  }, [curPage, idx, hasPrev, hasNext, pages, onClose])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [curPage, idx, hasPrev, hasNext, pages])
 
   // UI自动隐藏定时器
+  // P1-01: controlsHidden 为 true 时直接短路——手动收起后不再因 mousemove/翻页自动弹出
   const flashUI = () => {
+    if (controlsHidden) return
     setShowUI(true)
     if (uiTimer.current) clearTimeout(uiTimer.current)
     uiTimer.current = setTimeout(() => setShowUI(false), 3000)
@@ -88,6 +118,19 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
     uiTimer.current = setTimeout(() => setShowUI(false), 3000)
     return () => { if (uiTimer.current) clearTimeout(uiTimer.current) }
   }, [])
+
+  // P1-01: 手动收起控制条——清掉自动隐藏定时器，进入隐藏态，mousemove 不再唤起
+  const hideControls = () => {
+    if (uiTimer.current) clearTimeout(uiTimer.current)
+    setControlsHidden(true)
+    setShowUI(false)
+  }
+  // P1-01: 点底缘把手唤回控制条——退出隐藏态并显示（不自动再隐藏，让老师自己决定）
+  const showControls = () => {
+    setControlsHidden(false)
+    setShowUI(true)
+    if (uiTimer.current) clearTimeout(uiTimer.current)
+  }
 
   if (!data) return null
 
@@ -101,8 +144,8 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
         const r = boxRef.current?.getBoundingClientRect()
         if (!r) return
         const x = e.clientX - r.left
-        if (x < r.width * 0.25 && hasPrev) setCurPage(pages[idx - 1].page_number)
-        else if (x > r.width * 0.75 && hasNext) setCurPage(pages[idx + 1].page_number)
+        if (x < r.width * 0.25 && hasPrev) gotoPage(pages[idx - 1].page_number)
+        else if (x > r.width * 0.75 && hasNext) gotoPage(pages[idx + 1].page_number)
         flashUI()
       }}
       style={{
@@ -134,17 +177,32 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
 
       {/* v5.2: 去掉了手动绘制的黑色填充div，白色背景自然融合 */}
 
-      {/* 底部控制条（自动隐藏） */}
-      <div style={{ position: 'absolute', inset: 0, zIndex: 2, pointerEvents: 'none', opacity: showUI ? 1 : 0, transition: 'opacity 400ms' }}>
+      {/* P1-01: 底缘唤回把手——仅在控制条被手动收起后出现，点击恢复控制条；
+          半透明贴底居中，不挡内容，只占一个小圆角条 */}
+      {controlsHidden && (
+        <div style={{ position: 'absolute', inset: 0, zIndex: 3, pointerEvents: 'none' }}>
+          <button onClick={e => { e.stopPropagation(); showControls() }}
+            style={{
+              position: 'absolute', bottom: 6, left: '50%', transform: 'translateX(-50%)',
+              pointerEvents: 'auto', cursor: 'pointer',
+              padding: '2px 18px', borderRadius: 999, border: 'none',
+              background: 'rgba(0,0,0,0.35)', color: 'rgba(255,255,255,0.85)',
+              fontSize: 14, lineHeight: 1.4, backdropFilter: 'blur(8px)',
+            }} title="显示控制条">⌃</button>
+        </div>
+      )}
+
+      {/* 底部控制条（自动隐藏 / 可手动收起）：P1-01 整体下移贴底 bottom:8 + 透明度降一档 */}
+      <div style={{ position: 'absolute', inset: 0, zIndex: 2, pointerEvents: 'none', opacity: (showUI && !controlsHidden) ? 1 : 0, transition: 'opacity 400ms' }}>
         <div style={{
-          position: 'absolute', bottom: 24, left: '50%', transform: 'translateX(-50%)',
+          position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)',
           display: 'flex', alignItems: 'center', gap: 10,
-          padding: '10px 20px', borderRadius: 999,
-          background: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(12px)',
-          pointerEvents: 'auto',
+          padding: '8px 16px', borderRadius: 999,
+          background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(12px)',  /* P1-01: 0.65→0.5 透明度降一档 */
+          pointerEvents: (showUI && !controlsHidden) ? 'auto' : 'none',
         }}>
           {/* 上一页按钮 */}
-          <button onClick={e => { e.stopPropagation(); if (hasPrev) setCurPage(pages[idx - 1].page_number) }}
+          <button onClick={e => { e.stopPropagation(); if (hasPrev) gotoPage(pages[idx - 1].page_number) }}
             style={{ width: 36, height: 36, borderRadius: '50%', border: 'none',
               background: hasPrev ? 'rgba(255,255,255,0.15)' : 'transparent',
               color: hasPrev ? '#fff' : 'rgba(255,255,255,0.2)',
@@ -155,7 +213,7 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
           {/* 页面圆点指示器 */}
           <div style={{ display: 'flex', gap: 5, padding: '0 8px' }}>
             {pages.map(p => (
-              <button key={p.page_number} onClick={e => { e.stopPropagation(); setCurPage(p.page_number) }}
+              <button key={p.page_number} onClick={e => { e.stopPropagation(); gotoPage(p.page_number) }}
                 style={{
                   width: p.page_number === curPage ? 28 : 10, height: 10, borderRadius: 5,
                   border: 'none', cursor: 'pointer', transition: 'all 250ms',
@@ -166,7 +224,7 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
           </div>
 
           {/* 下一页按钮 */}
-          <button onClick={e => { e.stopPropagation(); if (hasNext) setCurPage(pages[idx + 1].page_number) }}
+          <button onClick={e => { e.stopPropagation(); if (hasNext) gotoPage(pages[idx + 1].page_number) }}
             style={{ width: 36, height: 36, borderRadius: '50%', border: 'none',
               background: hasNext ? 'rgba(255,255,255,0.15)' : 'transparent',
               color: hasNext ? '#fff' : 'rgba(255,255,255,0.2)',
@@ -179,8 +237,16 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
             {curPage} / {pages.length}
           </div>
 
+          {/* P1-01: 手动隐藏控制条按钮——收起后讲底部交互页不再被挡 */}
+          <button onClick={e => { e.stopPropagation(); hideControls() }}
+            style={{ width: 36, height: 36, borderRadius: '50%', border: 'none',
+              background: 'rgba(255,255,255,0.12)', color: '#fff',
+              fontSize: 16, cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }} title="隐藏控制条（不再自动弹出）">∨</button>
+
           {/* 退出按钮 */}
-          <button onClick={e => { e.stopPropagation(); onClose() }}
+          <button onClick={e => { e.stopPropagation(); doClose() }}
             style={{ width: 36, height: 36, borderRadius: '50%', border: 'none',
               background: 'rgba(255,255,255,0.12)', color: '#fff',
               fontSize: 18, cursor: 'pointer',

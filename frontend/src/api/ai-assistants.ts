@@ -14,24 +14,27 @@
  *
  * 适用角色与权限:
  *   - admin           : 可创建/编辑/删除 system 助手 + 自己的 personal
- *   - senior_operator : 可创建/编辑/删除 本校 group 助手 + 自己的 personal
- *   - operator/viewer : 仅可创建/编辑/删除 自己的 personal
- *   - 所有人均可查看:system + 本校 group + 自己的 personal
+ *   - senior_operator : 可创建/编辑/删除 全校级 group 助手 + 自己的 personal
+ *   - operator/viewer : 自己的 personal + 作为教研组 lead/backbone 时可发教研组级 group
+ *   - 所有人均可查看:system + 本校全校级 group + 所属教研组级 group + 自己的 personal
  *
  * 响应格式说明:
  *   - client.ts 的响应拦截器已处理 code !== 0 的错误(抛出 Error)
  *   - 本文件所有 API 函数可直接返回 res.data.data,无需再判断 code
  *
+ * 里程碑一(教研组级分享打通)改动:
+ *   - CreateAIAssistantRequest 新增 group_id(发布教研组级助手时指定目标组)
+ *   - 新增 getMyPublishGroups():拉取"我能发布到的教研组 + 可发布档位标志"
+ *
  * v114 Batch 2 第 1 轮(2026-04-20):
  *   文件末尾追加 designChat SSE 函数 + 配套类型,对接后端
  *   POST /api/v1/ai-assistants/design/chat(对话式创作)
- *   仿 api/annotations.ts 的 aiFixAnnotation 样板编写
  */
 import client from './client'
 
 // ==================== 常量:来源与场景 ====================
 
-/** 助手来源:system=系统预置 / group=教研员本校 / personal=个人私有 */
+/** 助手来源:system=系统预置 / group=教研组或本校 / personal=个人私有 */
 export type AssistantSource = 'system' | 'group' | 'personal'
 
 /** 助手适用场景:对应后端 models.SceneXxx 常量 */
@@ -74,7 +77,7 @@ export const ASSISTANT_SOURCE_EMOJI: Record<AssistantSource, string> = {
  *
  * 与详情(AIAssistant)的差异:
  *   - scenes 已解析为字符串数组(详情里是 JSONB 字符串)
- *   - 附带展示辅助字段(creator_name/school_name/source_label)
+ *   - 附带展示辅助字段(creator_name/school_name/source_label/group_name)
  *   - 附带权限计算字段(can_edit/can_delete)
  *   - 附带当前场景匹配字段(is_default_here)
  */
@@ -108,6 +111,12 @@ export interface AIAssistantListItem {
   // 归属展示
   creator_name: string       // 创建者姓名(system 助手可能为空)
   school_name: string        // 学校名称(group 助手时有值)
+
+  // 里程碑一新增:教研组归属
+  //   group_id 非空 = 教研组级助手, group_name 为该教研组名称
+  //   group_id 为空 = 全校级或非 group 助手, group_name 为空串
+  group_id: string | null
+  group_name: string
 
   // 时间
   created_at: string | null
@@ -174,10 +183,13 @@ export interface AIAssistant {
  *
  * source 字段前端可以不传,后端会根据当前用户角色自动决定:
  *   - admin          → system
- *   - senior_operator → 前端指定 'group' / 'personal'(默认 personal)
- *   - operator/viewer → personal(不可改)
+ *   - senior_operator → 前端指定 'group'(全校级) / 'personal'(默认 personal)
+ *   - operator/viewer → personal;若是某教研组 lead/backbone,可传 'group'+group_id 发教研组级
  *
- * 前端仅当 senior_operator 创建本校助手时才传 source='group'
+ * group_id(里程碑一新增):
+ *   - 发布教研组级助手时传目标教研组 ID(后端校验当前用户是否为该组 lead/backbone)
+ *   - 为空且 source='group':发布全校级助手(仅 senior_operator/admin)
+ *   - source='personal' 时忽略
  */
 export interface CreateAIAssistantRequest {
   name: string
@@ -189,6 +201,7 @@ export interface CreateAIAssistantRequest {
   grade_range?: string
   scenes: AssistantScene[]       // 至少 1 个场景
   forked_from?: string | null
+  group_id?: string              // 里程碑一:教研组级助手的目标组 ID
 }
 
 /**
@@ -206,6 +219,34 @@ export interface UpdateAIAssistantRequest {
   grade_range?: string
   scenes: AssistantScene[]
   is_active?: boolean
+}
+
+// ==================== 类型定义:我能发布的教研组(里程碑一) ====================
+
+/**
+ * 我能发布到的单个教研组(对应后端 models.PublishTargetGroup)
+ */
+export interface PublishGroup {
+  id: string            // 教研组 ID(发布教研组级助手时作为 group_id 传回)
+  name: string          // 教研组名称(如"英语教研组")
+  school_name: string   // 所属学校名称(辅助展示)
+  role: string          // 当前用户在此组的角色:lead / backbone
+}
+
+/**
+ * GET /ai-assistants/my-groups 响应(对应后端 MyPublishGroups)
+ *
+ * 供"存为助手"弹窗按身份动态展示货架:
+ *   - groups:            可发布教研组级助手的目标组(担任 lead/backbone 的组)
+ *   - can_publish_group: 是否能发教研组级助手(groups 非空即 true)
+ *   - can_publish_school:是否能发全校级助手(senior_operator / admin)
+ *   - can_publish_system:是否能发系统级助手(仅 admin)
+ */
+export interface MyPublishGroupsResponse {
+  groups: PublishGroup[]
+  can_publish_group: boolean
+  can_publish_school: boolean
+  can_publish_system: boolean
 }
 
 // ==================== 类型定义:列表查询参数 ====================
@@ -229,7 +270,8 @@ export interface ListAssistantsParams {
  *
  * 可见性规则(后端实现):
  *   - system 助手:所有人可见
- *   - group 助手:仅本校教师可见(通过 teaching_group_members 判定)
+ *   - 教研组级 group 助手:仅所属教研组成员可见
+ *   - 全校级 group 助手:本校教师可见
  *   - personal 助手:仅创建者可见
  *
  * 典型调用示例:
@@ -246,6 +288,24 @@ export async function listAssistants(params?: ListAssistantsParams): Promise<AIA
   const qs = query.toString()
   const url = `/ai-assistants${qs ? '?' + qs : ''}`
   const res = await client.get<{ code: number; data: AIAssistantListResponse }>(url)
+  return res.data.data!
+}
+
+// ==================== API:我能发布的教研组(里程碑一) ====================
+
+/**
+ * 拉取"我能发布到的教研组 + 可发布档位标志"
+ *
+ * 供"存为助手"弹窗在打开时调用,据返回的标志位与 groups 动态展示货架:
+ *   - 普通老师(不在任何组当 lead/backbone): groups 空 + 三个标志全 false → 仅"只给我自己用"
+ *   - 组长/骨干: groups 非空 + can_publish_group=true → 多出"发布到教研组"+ 组下拉
+ *   - 校管: can_publish_school=true → 多出"推荐给全校老师"
+ *   - admin: can_publish_system=true → 多出"全平台通用"
+ *
+ * 任何登录用户都可调用,无越权风险(只返回你自己能发布的范围)
+ */
+export async function getMyPublishGroups(): Promise<MyPublishGroupsResponse> {
+  const res = await client.get<{ code: number; data: MyPublishGroupsResponse }>('/ai-assistants/my-groups')
   return res.data.data!
 }
 
@@ -268,14 +328,14 @@ export async function getAssistant(id: string): Promise<AIAssistant> {
 /**
  * 创建助手
  *
- * 后端会根据当前用户角色自动决定 source:
+ * 后端会根据当前用户角色 + 教研组身份自动决定 source 与归属:
  *   - admin 不指定 source 时默认 'system'
- *   - senior_operator 默认 'personal',若想创建本校助手需显式传 source='group'
- *   - 其他角色强制为 'personal'
+ *   - senior_operator 默认 'personal',传 source='group'(不带 group_id)发全校级
+ *   - 教研组 lead/backbone 传 source='group'+group_id 发教研组级
  *
  * 用户可见错误:
- *   - 400: 名称/提示词/场景缺失,或场景代码无效
- *   - 403: 角色不允许创建该 source 的助手
+ *   - 400: 名称/提示词/场景缺失,或场景代码无效,或全校级未绑定学校
+ *   - 403: 角色不允许创建该 source 的助手,或无权在该教研组发布
  */
 export async function createAssistant(req: CreateAIAssistantRequest): Promise<AIAssistant> {
   const res = await client.post<{ code: number; data: AIAssistant }>('/ai-assistants', req)
@@ -289,7 +349,8 @@ export async function createAssistant(req: CreateAIAssistantRequest): Promise<AI
  *
  * 权限要求:
  *   - system 助手:仅 admin 可编辑
- *   - group 助手:仅本校 senior_operator 可编辑
+ *   - 教研组级 group 助手:创建者本人 / 该组组长 / admin 可编辑
+ *   - 全校级 group 助手:创建者本人(校管) / admin 可编辑
  *   - personal 助手:仅创建者可编辑
  *
  * 返回 void,前端需要最新数据时应重新调用 getAssistant(id)
@@ -314,7 +375,7 @@ export async function deleteAssistant(id: string): Promise<void> {
 // ==================== API:Fork(复制到我的) ====================
 
 /**
- * 将系统/本校助手复制一份到"我的"
+ * 将系统/本校/本组助手复制一份到"我的"
  *
  * 复制后:
  *   - source = 'personal'(强制)
@@ -324,7 +385,7 @@ export async function deleteAssistant(id: string): Promise<void> {
  *   - forked_from 记录原助手 ID,便于追溯
  *
  * 典型场景:
- *   老师看到系统助手好用,点"复制到我的"后在自己的副本里做个性化调整
+ *   组员看到本组助手好用但想个性化 → 复制到我的后在自己的副本里改,原版不动
  */
 export async function forkAssistant(sourceId: string): Promise<AIAssistant> {
   const res = await client.post<{ code: number; data: AIAssistant }>(`/ai-assistants/${sourceId}/fork`)

@@ -22,20 +22,20 @@ package handlers
 //   - 进入 AI 调用后切换 SSE Header,逐 chunk 推送,最后以 done 事件收尾
 
 import (
-        "encoding/json"
-        "errors"
-        "fmt"
-        "net/http"
-        "strings"
-        "time"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
 
-        "tedna/internal/ai"
-        "tedna/internal/config"
-        "tedna/internal/logger"
-        "tedna/internal/middleware"
-        "tedna/internal/repository"
-        "tedna/internal/services"
-        "tedna/internal/utils"
+	"tedna/internal/ai"
+	"tedna/internal/config"
+	"tedna/internal/logger"
+	"tedna/internal/middleware"
+	"tedna/internal/repository"
+	"tedna/internal/services"
+	"tedna/internal/utils"
 )
 
 // reviewAILog 审核员AI辅助处理器模块级日志器
@@ -44,17 +44,17 @@ var reviewAILog = logger.WithModule("review_ai_handler")
 // ReviewAIHandler 审核员AI辅助处理器
 // v110 改动:持有 assistantService 以支持 assistant_id 参数
 type ReviewAIHandler struct {
-        cfg              *config.Config
-        assistantService *services.AIAssistantService
+	cfg              *config.Config
+	assistantService *services.AIAssistantService
 }
 
 // NewReviewAIHandler 创建审核员AI辅助处理器
 // v110 改动:签名变化,新增 assistantService 依赖
 func NewReviewAIHandler(cfg *config.Config, assistantService *services.AIAssistantService) *ReviewAIHandler {
-        return &ReviewAIHandler{
-                cfg:              cfg,
-                assistantService: assistantService,
-        }
+	return &ReviewAIHandler{
+		cfg:              cfg,
+		assistantService: assistantService,
+	}
 }
 
 // ==================== 硬编码默认 Prompt(未选择助手时使用) ====================
@@ -88,26 +88,26 @@ const reviewChatDefaultPrompt = `你是一位经验丰富的教研员,正在协�
 // writeReviewAISSEEvent 向客户端写入一条 SSE 事件
 // 与 annotation_handler.writeAnnotationSSEEvent 结构一致,便于前端统一消费
 func writeReviewAISSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string, data interface{}) {
-        jsonData, err := json.Marshal(data)
-        if err != nil {
-                return
-        }
-        fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, string(jsonData))
-        flusher.Flush()
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, string(jsonData))
+	flusher.Flush()
 }
 
 // prepareSSEResponse 将响应切换为 SSE 流式模式,返回 flusher(不支持时返回 nil)
 func prepareSSEResponse(w http.ResponseWriter) http.Flusher {
-        flusher, ok := w.(http.Flusher)
-        if !ok {
-                return nil
-        }
-        w.Header().Set("Content-Type", "text/event-stream")
-        w.Header().Set("Cache-Control", "no-cache")
-        w.Header().Set("Connection", "keep-alive")
-        w.Header().Set("Access-Control-Allow-Origin", "*")
-        w.Header().Set("X-Accel-Buffering", "no") // 关键:禁用 Nginx 对 SSE 的缓冲
-        return flusher
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return nil
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("X-Accel-Buffering", "no") // 关键:禁用 Nginx 对 SSE 的缓冲
+	return flusher
 }
 
 // ==================== 教案整体概览(流式) ====================
@@ -115,110 +115,114 @@ func prepareSSEResponse(w http.ResponseWriter) http.Flusher {
 // ReviewAIOverviewRequest 生成教案概览请求体
 // v110 新增字段:AssistantID(可选)
 type ReviewAIOverviewRequest struct {
-        PlanMeta    string `json:"plan_meta"`    // 教案基本信息(学科/年级/课题/课时)
-        PlanContent string `json:"plan_content"` // 教案正文内容
-        AssistantID string `json:"assistant_id"` // v110 新增:可选的 AI 助手 ID
+	PlanMeta    string `json:"plan_meta"`    // 教案基本信息(学科/年级/课题/课时)
+	PlanContent string `json:"plan_content"` // 教案正文内容
+	AssistantID string `json:"assistant_id"` // v110 新增:可选的 AI 助手 ID
 }
 
 // Overview POST /lesson-plans/review-ai/overview (SSE)
 // v113 改造:改为 SSE 流式响应,逐 chunk 推送 AI 生成的概览
 func (h *ReviewAIHandler) Overview(w http.ResponseWriter, r *http.Request) {
-        if r.Method != http.MethodPost {
-                utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
-                return
-        }
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
+		return
+	}
 
-        // ========== 前置错误阶段:走普通 JSON 响应 ==========
+	// ========== 前置错误阶段:走普通 JSON 响应 ==========
 
-        // 鉴权
-        claims, ok := middleware.GetClaims(r.Context())
-        if !ok {
-                utils.Unauthorized(w, utils.MsgNotLoggedIn)
-                return
-        }
+	// 鉴权
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		return
+	}
 
-        var req ReviewAIOverviewRequest
-        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-                utils.BadRequest(w, utils.MsgBadRequestBody)
-                return
-        }
-        if strings.TrimSpace(req.PlanContent) == "" {
-                utils.BadRequest(w, "教案内容不能为空")
-                return
-        }
+	var req ReviewAIOverviewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, utils.MsgBadRequestBody)
+		return
+	}
+	if strings.TrimSpace(req.PlanContent) == "" {
+		utils.BadRequest(w, "教案内容不能为空")
+		return
+	}
 
-        // v110 新增:根据 assistant_id 决定 system prompt
-        systemPrompt, err := h.resolveSystemPrompt(r, claims.UserID, claims.Role, req.AssistantID, reviewOverviewDefaultPrompt)
-        if err != nil {
-                utils.BadRequest(w, err.Error())
-                return
-        }
+	// v110 新增:根据 assistant_id 决定 system prompt
+	systemPrompt, err := h.resolveSystemPrompt(r, claims.UserID, claims.Role, req.AssistantID, reviewOverviewDefaultPrompt)
+	if err != nil {
+		utils.BadRequest(w, err.Error())
+		return
+	}
 
-        // 获取AI配置
-        aiCfg, err := ai.GetEffectiveConfig(
-                h.cfg.AESKey, "lesson_plan",
-                h.cfg.AIAPIBaseURL, h.cfg.AIAPIKey, h.cfg.AIDefaultModel,
-        )
-        if err != nil {
-                utils.InternalError(w, "获取AI配置失败")
-                return
-        }
+	// 获取AI配置
+	aiCfg, err := ai.GetEffectiveConfig(
+		h.cfg.AESKey, "lesson_plan",
+		h.cfg.AIAPIBaseURL, h.cfg.AIAPIKey, h.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		utils.InternalError(w, "获取AI配置失败")
+		return
+	}
 
-        userPrompt := fmt.Sprintf(
-                "【教案基本信息】\n%s\n\n【教案正文】\n%s",
-                strings.TrimSpace(req.PlanMeta),
-                strings.TrimSpace(req.PlanContent),
-        )
+	userPrompt := fmt.Sprintf(
+		"【教案基本信息】\n%s\n\n【教案正文】\n%s",
+		strings.TrimSpace(req.PlanMeta),
+		strings.TrimSpace(req.PlanContent),
+	)
 
-        // ========== 流式响应阶段:切换为 SSE ==========
+	// ========== 流式响应阶段:切换为 SSE ==========
 
-        flusher := prepareSSEResponse(w)
-        if flusher == nil {
-                utils.InternalError(w, "不支持流式响应")
-                return
-        }
+	flusher := prepareSSEResponse(w)
+	if flusher == nil {
+		utils.InternalError(w, "不支持流式响应")
+		return
+	}
 
-        // 发送 connected 事件(前端借此知道流已建立)
-        writeReviewAISSEEvent(w, flusher, "connected", map[string]string{
-                "phase": "overview",
-        })
+	// 发送 connected 事件(前端借此知道流已建立)
+	writeReviewAISSEEvent(w, flusher, "connected", map[string]string{
+		"phase": "overview",
+	})
 
-        // 流式调用 AI,逐 token 推送 chunk 事件
-        startTime := time.Now()
-        callResult, callErr := ai.CallAIStream(
-                aiCfg,
-                systemPrompt,
-                userPrompt,
-                func(chunk string) error {
-                        writeReviewAISSEEvent(w, flusher, "chunk", map[string]string{"chunk": chunk})
-                        return nil
-                },
-                nil,
-        )
+	// 流式调用 AI,逐 token 推送 chunk 事件
+	startTime := time.Now()
+	// v198：补操作者 UserID + 所属学校ID，供模型境内/境外分流判定（原 traceCtx=nil，无分流无埋点，一并补齐）
+	uid_ovSchoolID := claims.UserID
+	ovSchoolID, _ := repository.GetSchoolIDByUserID(r.Context(), claims.UserID)
+	ovTraceCtx := &ai.TraceContext{SceneCode: "lesson_plan", UserID: &uid_ovSchoolID, SchoolID: schoolIDPtrH(ovSchoolID)}
+	callResult, callErr := ai.CallAIStream(
+		aiCfg,
+		systemPrompt,
+		userPrompt,
+		func(chunk string) error {
+			writeReviewAISSEEvent(w, flusher, "chunk", map[string]string{"chunk": chunk})
+			return nil
+		},
+		ovTraceCtx,
+	)
 
-        if callErr != nil {
-                reviewAILog.Error("概览AI调用失败",
-                        "user_id", claims.UserID,
-                        "assistant_id", req.AssistantID,
-                        "error", callErr)
-                writeReviewAISSEEvent(w, flusher, "error", map[string]string{
-                        "error": "AI概览生成失败,请稍后重试",
-                })
-                return
-        }
+	if callErr != nil {
+		reviewAILog.Error("概览AI调用失败",
+			"user_id", claims.UserID,
+			"assistant_id", req.AssistantID,
+			"error", callErr)
+		writeReviewAISSEEvent(w, flusher, "error", map[string]string{
+			"error": "AI概览生成失败,请稍后重试",
+		})
+		return
+	}
 
-        latencyMs := time.Since(startTime).Milliseconds()
-        reviewAILog.Info("概览生成完成",
-                "user_id", claims.UserID,
-                "assistant_id", req.AssistantID,
-                "tokens", callResult.TokensUsed,
-                "latency_ms", latencyMs)
+	latencyMs := time.Since(startTime).Milliseconds()
+	reviewAILog.Info("概览生成完成",
+		"user_id", claims.UserID,
+		"assistant_id", req.AssistantID,
+		"tokens", callResult.TokensUsed,
+		"latency_ms", latencyMs)
 
-        // 发送 done 事件,携带完整内容(供前端兜底/记录)
-        writeReviewAISSEEvent(w, flusher, "done", map[string]interface{}{
-                "full_content": callResult.Content,
-                "tokens_used":  callResult.TokensUsed,
-        })
+	// 发送 done 事件,携带完整内容(供前端兜底/记录)
+	writeReviewAISSEEvent(w, flusher, "done", map[string]interface{}{
+		"full_content": callResult.Content,
+		"tokens_used":  callResult.TokensUsed,
+	})
 }
 
 // ==================== 对话式审核(流式) ====================
@@ -226,131 +230,135 @@ func (h *ReviewAIHandler) Overview(w http.ResponseWriter, r *http.Request) {
 // ReviewAIChatRequest 对话式审核请求体
 // v110 新增字段:AssistantID(可选)
 type ReviewAIChatRequest struct {
-        PlanMeta    string              `json:"plan_meta"`    // 教案基本信息
-        PlanContent string              `json:"plan_content"` // 教案正文内容
-        History     []map[string]string `json:"history"`      // 对话历史 [{role,content},...]
-        Message     string              `json:"message"`      // 当前问题
-        AssistantID string              `json:"assistant_id"` // v110 新增:可选的 AI 助手 ID
+	PlanMeta    string              `json:"plan_meta"`    // 教案基本信息
+	PlanContent string              `json:"plan_content"` // 教案正文内容
+	History     []map[string]string `json:"history"`      // 对话历史 [{role,content},...]
+	Message     string              `json:"message"`      // 当前问题
+	AssistantID string              `json:"assistant_id"` // v110 新增:可选的 AI 助手 ID
 }
 
 // Chat POST /lesson-plans/review-ai/chat (SSE)
 // v113 改造:改为 SSE 流式响应,逐 chunk 推送 AI 回答
 func (h *ReviewAIHandler) Chat(w http.ResponseWriter, r *http.Request) {
-        if r.Method != http.MethodPost {
-                utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
-                return
-        }
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
+		return
+	}
 
-        // ========== 前置错误阶段:走普通 JSON 响应 ==========
+	// ========== 前置错误阶段:走普通 JSON 响应 ==========
 
-        // 鉴权
-        claims, ok := middleware.GetClaims(r.Context())
-        if !ok {
-                utils.Unauthorized(w, utils.MsgNotLoggedIn)
-                return
-        }
+	// 鉴权
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		return
+	}
 
-        var req ReviewAIChatRequest
-        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-                utils.BadRequest(w, utils.MsgBadRequestBody)
-                return
-        }
-        if strings.TrimSpace(req.Message) == "" {
-                utils.BadRequest(w, "问题内容不能为空")
-                return
-        }
+	var req ReviewAIChatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, utils.MsgBadRequestBody)
+		return
+	}
+	if strings.TrimSpace(req.Message) == "" {
+		utils.BadRequest(w, "问题内容不能为空")
+		return
+	}
 
-        // v110 新增:根据 assistant_id 决定 system prompt
-        systemPrompt, err := h.resolveSystemPrompt(r, claims.UserID, claims.Role, req.AssistantID, reviewChatDefaultPrompt)
-        if err != nil {
-                utils.BadRequest(w, err.Error())
-                return
-        }
+	// v110 新增:根据 assistant_id 决定 system prompt
+	systemPrompt, err := h.resolveSystemPrompt(r, claims.UserID, claims.Role, req.AssistantID, reviewChatDefaultPrompt)
+	if err != nil {
+		utils.BadRequest(w, err.Error())
+		return
+	}
 
-        // 获取AI配置
-        aiCfg, err := ai.GetEffectiveConfig(
-                h.cfg.AESKey, "lesson_plan",
-                h.cfg.AIAPIBaseURL, h.cfg.AIAPIKey, h.cfg.AIDefaultModel,
-        )
-        if err != nil {
-                utils.InternalError(w, "获取AI配置失败")
-                return
-        }
+	// 获取AI配置
+	aiCfg, err := ai.GetEffectiveConfig(
+		h.cfg.AESKey, "lesson_plan",
+		h.cfg.AIAPIBaseURL, h.cfg.AIAPIKey, h.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		utils.InternalError(w, "获取AI配置失败")
+		return
+	}
 
-        // 构建用户提示词:包含教案全文 + 对话历史 + 当前问题
-        var promptBuilder strings.Builder
-        promptBuilder.WriteString("【我正在评审的教案】\n")
-        promptBuilder.WriteString(strings.TrimSpace(req.PlanMeta))
-        promptBuilder.WriteString("\n\n")
-        promptBuilder.WriteString(strings.TrimSpace(req.PlanContent))
-        promptBuilder.WriteString("\n\n")
+	// 构建用户提示词:包含教案全文 + 对话历史 + 当前问题
+	var promptBuilder strings.Builder
+	promptBuilder.WriteString("【我正在评审的教案】\n")
+	promptBuilder.WriteString(strings.TrimSpace(req.PlanMeta))
+	promptBuilder.WriteString("\n\n")
+	promptBuilder.WriteString(strings.TrimSpace(req.PlanContent))
+	promptBuilder.WriteString("\n\n")
 
-        // 加入对话历史上下文(最近 10 条 = 5 轮)
-        if len(req.History) > 0 {
-                promptBuilder.WriteString("【之前的对话】\n")
-                start := 0
-                if len(req.History) > 10 {
-                        start = len(req.History) - 10
-                }
-                for _, msg := range req.History[start:] {
-                        role := "评审员"
-                        if msg["role"] == "assistant" {
-                                role = "AI助手"
-                        }
-                        promptBuilder.WriteString(fmt.Sprintf("%s:%s\n", role, msg["content"]))
-                }
-                promptBuilder.WriteString("\n")
-        }
+	// 加入对话历史上下文(最近 10 条 = 5 轮)
+	if len(req.History) > 0 {
+		promptBuilder.WriteString("【之前的对话】\n")
+		start := 0
+		if len(req.History) > 10 {
+			start = len(req.History) - 10
+		}
+		for _, msg := range req.History[start:] {
+			role := "评审员"
+			if msg["role"] == "assistant" {
+				role = "AI助手"
+			}
+			promptBuilder.WriteString(fmt.Sprintf("%s:%s\n", role, msg["content"]))
+		}
+		promptBuilder.WriteString("\n")
+	}
 
-        promptBuilder.WriteString("【评审员当前问题】\n")
-        promptBuilder.WriteString(strings.TrimSpace(req.Message))
+	promptBuilder.WriteString("【评审员当前问题】\n")
+	promptBuilder.WriteString(strings.TrimSpace(req.Message))
 
-        // ========== 流式响应阶段:切换为 SSE ==========
+	// ========== 流式响应阶段:切换为 SSE ==========
 
-        flusher := prepareSSEResponse(w)
-        if flusher == nil {
-                utils.InternalError(w, "不支持流式响应")
-                return
-        }
+	flusher := prepareSSEResponse(w)
+	if flusher == nil {
+		utils.InternalError(w, "不支持流式响应")
+		return
+	}
 
-        writeReviewAISSEEvent(w, flusher, "connected", map[string]string{
-                "phase": "chat",
-        })
+	writeReviewAISSEEvent(w, flusher, "connected", map[string]string{
+		"phase": "chat",
+	})
 
-        startTime := time.Now()
-        callResult, callErr := ai.CallAIStream(
-                aiCfg,
-                systemPrompt,
-                promptBuilder.String(),
-                func(chunk string) error {
-                        writeReviewAISSEEvent(w, flusher, "chunk", map[string]string{"chunk": chunk})
-                        return nil
-                },
-                nil,
-        )
+	startTime := time.Now()
+	// v198：补操作者 UserID + 所属学校ID，供模型境内/境外分流判定（原 traceCtx=nil，无分流无埋点，一并补齐）
+	uid_chatSchoolID := claims.UserID
+	chatSchoolID, _ := repository.GetSchoolIDByUserID(r.Context(), claims.UserID)
+	chatTraceCtx := &ai.TraceContext{SceneCode: "lesson_plan", UserID: &uid_chatSchoolID, SchoolID: schoolIDPtrH(chatSchoolID)}
+	callResult, callErr := ai.CallAIStream(
+		aiCfg,
+		systemPrompt,
+		promptBuilder.String(),
+		func(chunk string) error {
+			writeReviewAISSEEvent(w, flusher, "chunk", map[string]string{"chunk": chunk})
+			return nil
+		},
+		chatTraceCtx,
+	)
 
-        if callErr != nil {
-                reviewAILog.Error("对话AI调用失败",
-                        "user_id", claims.UserID,
-                        "assistant_id", req.AssistantID,
-                        "error", callErr)
-                writeReviewAISSEEvent(w, flusher, "error", map[string]string{
-                        "error": "AI回答失败,请稍后重试",
-                })
-                return
-        }
+	if callErr != nil {
+		reviewAILog.Error("对话AI调用失败",
+			"user_id", claims.UserID,
+			"assistant_id", req.AssistantID,
+			"error", callErr)
+		writeReviewAISSEEvent(w, flusher, "error", map[string]string{
+			"error": "AI回答失败,请稍后重试",
+		})
+		return
+	}
 
-        latencyMs := time.Since(startTime).Milliseconds()
-        reviewAILog.Info("对话完成",
-                "user_id", claims.UserID,
-                "assistant_id", req.AssistantID,
-                "tokens", callResult.TokensUsed,
-                "latency_ms", latencyMs)
+	latencyMs := time.Since(startTime).Milliseconds()
+	reviewAILog.Info("对话完成",
+		"user_id", claims.UserID,
+		"assistant_id", req.AssistantID,
+		"tokens", callResult.TokensUsed,
+		"latency_ms", latencyMs)
 
-        writeReviewAISSEEvent(w, flusher, "done", map[string]interface{}{
-                "full_content": callResult.Content,
-                "tokens_used":  callResult.TokensUsed,
-        })
+	writeReviewAISSEEvent(w, flusher, "done", map[string]interface{}{
+		"full_content": callResult.Content,
+		"tokens_used":  callResult.TokensUsed,
+	})
 }
 
 // ==================== 辅助:解析 system prompt ====================
@@ -361,37 +369,46 @@ func (h *ReviewAIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 //
 // 加载失败时返回清晰的用户可见错误;由 caller 决定 HTTP 状态码
 func (h *ReviewAIHandler) resolveSystemPrompt(
-        r *http.Request,
-        userID, role, assistantID, defaultPrompt string,
+	r *http.Request,
+	userID, role, assistantID, defaultPrompt string,
 ) (string, error) {
-        if strings.TrimSpace(assistantID) == "" {
-                return defaultPrompt, nil
-        }
-        if h.assistantService == nil {
-                // 服务未注入的兜底(理论上不会发生)
-                reviewAILog.Warn("AIAssistantService未初始化, 降级使用默认prompt")
-                return defaultPrompt, nil
-        }
+	if strings.TrimSpace(assistantID) == "" {
+		return defaultPrompt, nil
+	}
+	if h.assistantService == nil {
+		// 服务未注入的兜底(理论上不会发生)
+		reviewAILog.Warn("AIAssistantService未初始化, 降级使用默认prompt")
+		return defaultPrompt, nil
+	}
 
-        actor := services.BuildActorFromClaims(r.Context(), userID, role)
-        a, err := h.assistantService.LoadActiveAssistantForUse(r.Context(), actor, assistantID)
-        if err != nil {
-                // 用户友好错误
-                switch {
-                case errors.Is(err, repository.ErrAIAssistantNotFound):
-                        return "", errors.New("选择的 AI 助手不存在")
-                case errors.Is(err, repository.ErrAIAssistantInactive):
-                        return "", errors.New("选择的 AI 助手已停用,请切换其他助手")
-                case errors.Is(err, services.ErrAssistantPermDenied):
-                        return "", errors.New("无权使用该 AI 助手")
-                default:
-                        reviewAILog.Error("加载助手失败", "assistant_id", assistantID, "error", err)
-                        return "", errors.New("加载 AI 助手失败,请稍后重试")
-                }
-        }
-        if strings.TrimSpace(a.FullPrompt) == "" {
-                reviewAILog.Warn("助手full_prompt为空, 降级使用默认prompt", "assistant_id", assistantID)
-                return defaultPrompt, nil
-        }
-        return a.FullPrompt, nil
+	actor := services.BuildActorFromClaims(r.Context(), userID, role)
+	a, err := h.assistantService.LoadActiveAssistantForUse(r.Context(), actor, assistantID)
+	if err != nil {
+		// 用户友好错误
+		switch {
+		case errors.Is(err, repository.ErrAIAssistantNotFound):
+			return "", errors.New("选择的 AI 助手不存在")
+		case errors.Is(err, repository.ErrAIAssistantInactive):
+			return "", errors.New("选择的 AI 助手已停用,请切换其他助手")
+		case errors.Is(err, services.ErrAssistantPermDenied):
+			return "", errors.New("无权使用该 AI 助手")
+		default:
+			reviewAILog.Error("加载助手失败", "assistant_id", assistantID, "error", err)
+			return "", errors.New("加载 AI 助手失败,请稍后重试")
+		}
+	}
+	if strings.TrimSpace(a.FullPrompt) == "" {
+		reviewAILog.Warn("助手full_prompt为空, 降级使用默认prompt", "assistant_id", assistantID)
+		return defaultPrompt, nil
+	}
+	return a.FullPrompt, nil
+}
+
+// schoolIDPtrH 空串转 nil 的小工具（handlers 包内用；与 services.schoolIDPtr 等价，
+// 因跨包不可见故在此另立一个）。空串表示未绑校→返回 nil，供分流 fail-closed 降级境内。
+func schoolIDPtrH(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

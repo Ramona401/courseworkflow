@@ -199,9 +199,14 @@ type CreateRecipeRequest struct {
 // UpdateRecipeRequest 更新配方请求
 // 迭代1新增：LessonStructure + PromptMode
 // 迭代2新增：StagesConfig
+// C-P1-19修复：补 Subject + GradeRange 字段。此前缺这两字段，导致编辑配方时前端传来的
+//   学科/年级在JSON反序列化时被直接丢弃（前端有传、结构体没收），表现为"改了存不进"。
+//   字段名与 CreateRecipeRequest 对齐。
 type UpdateRecipeRequest struct {
 	Name               string   `json:"name"`                // 配方名称（必填）
 	Description        string   `json:"description"`         // 配方说明
+	Subject            string   `json:"subject"`             // 学科（必填）C-P1-19补
+	GradeRange         string   `json:"grade_range"`         // 年级（必填）C-P1-19补
 	ComponentIDs       []string `json:"component_ids"`       // 绑定组件ID列表
 	StudentProfile     string   `json:"student_profile"`     // 学情记录
 	TeachingStyle      string   `json:"teaching_style"`      // 教学风格

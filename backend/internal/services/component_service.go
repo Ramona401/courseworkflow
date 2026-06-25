@@ -406,9 +406,14 @@ activity_design, questioning_strategy, pedagogy, assessment_strategy, cross_subj
 
 	// v89-2：构建真实TraceContext，关联教案ID
 	pid := planID
+	// v198：补操作者(reviewerID)的 UserID 与所属学校ID——本场景原仅填 LessonPlanID，
+	//        连 UserID 都缺；一并补齐，供模型境内/境外分流判定（查不到空串→fail-closed降级境内）。
+	compSchoolID, _ := repository.GetSchoolIDByUserID(ctx, reviewerID)
 	traceCtx := &aiClient.TraceContext{
 		SceneCode:    "scanner", // 萃取属于scanner场景范畴
 		LessonPlanID: &pid,
+		UserID:       &reviewerID,
+		SchoolID:     schoolIDPtr(compSchoolID),
 	}
 
 	result, err := aiClient.CallAI(aiCfg, systemPrompt, userPrompt, traceCtx)

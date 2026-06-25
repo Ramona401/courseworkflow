@@ -3,14 +3,19 @@ package services
 // lesson_plan_gen_service.go — 教案生成核心服务（主文件）
 //
 // v89-3拆分：评审相关逻辑移至lesson_plan_gen_review.go
+// 子轮一·A拆分：阶段化对话的异步流式处理（processChatStageAsync）移至 lesson_plan_gen_chat_async.go。
+// 助手轻量选择入口 Phase 1 拆分：一组纯辅助方法（checkPlanEditable/appendMessage/loadConversation/
+//   resolveTemplateForReview/broadcastError/broadcastSoftRetryNotice/parseAIReply/
+//   appendUnrecognizedTextbookNotice）搬至 lesson_plan_gen_helpers.go，使本主文件回到 600 行红线内。
+//   本次纯位置搬移，逻辑零改动；同时删除无人调用的 GetStageService 死方法。
 //
-// 本文件职责：
-//   1. StartConversation  — 创建教案+阶段初始化+配方上下文注入+发起AI开场白
-//   2. Chat               — 处理教师输入→流式AI回复→SSE逐token推送
-//   3. processChatStageAsync — 阶段模式异步AI流式回复
-//   4. checkAndInsertCoachAdvice — 停滞检测+教练建议插入
-//   5. GetConversation    — 获取教案对话历史
-//   6. 内部辅助方法（checkPlanEditable/appendMessage/broadcastError/parseAIReply等）
+// 本文件职责（核心会话流程）：
+//   1. StartConversation     — 创建教案+阶段初始化+配方上下文注入+发起AI开场白
+//   2. genStageOpeningMessage — 生成首阶段开场白（吃老师×学科助手偏好）
+//   3. Chat                  — 处理教师输入→（异步）流式AI回复（异步体在 lesson_plan_gen_chat_async.go）
+//   4. resolveAssistantPrompt — 解析应注入第4层的助手 full_prompt（偏好→技能路由兜底）
+//   5. GetConversation       — 获取教案对话历史
+//   （纯辅助方法见 lesson_plan_gen_helpers.go）
 //
 // v110(TE-DNA 3.0 P0 STEP 3)改动:
 //   - LessonPlanGenService 新增 assistantService 字段(可选,运行时通过 SetAssistantService 注入)
@@ -20,37 +25,34 @@ package services
 //   - processChatStageAsync 新增 fullGenerate 参数,write 阶段全委托一次性出稿
 //
 // v169改动(多阶段一键生成):
-//   - 全委托从 write 单阶段扩展到 analyze/design/write/revise 四个"写内容"的阶段:
-//       * fullGenerateAnalyzePrompt — 教学分析一键生成(落库走 extractGenericStageFromNatural,宽松)
-//       * fullGenerateDesignPrompt  — 教学设计一键生成(同上)
-//       * fullGenerateWritePrompt   — 教案撰写一键生成(落库走 DetectLessonPlanContent,严格,v168已有)
-//       * fullGenerateRevisePrompt  — 修订定稿一键生成(基于评审建议产出完整教案,落库同 write 严格)
-//   - processChatStageAsync 用 resolveFullGeneratePrompt(stage) 按阶段返回对应指令:
-//       * write 仍保留"已有正文→防重复"三态逻辑(正文为空且 fullGenerate 才注入)
-//       * analyze/design/revise 在 fullGenerate=true 时直接注入各自指令
+//   - 全委托从 write 单阶段扩展到 analyze/design/write/revise 四个"写内容"的阶段
 //   - review 阶段不参与一键生成(推进过去会自动触发评审,无需额外按钮)
-//   - 重要:本批次产出"纯 AI 一次性生成"内容,前端已在二次确认弹窗与产出卡片明确警示
-//     "纯 AI 产出可能有幻觉、与真实学情/教材不符,务必核对"。后端不重复警示,只负责出稿。
 //
-// v172改动(SSE 完成信号治本·修复"一键生成要刷新才出来 / 出来了还显示生成中"):
-//   根因：
-//     1) processChatStageAsync 全程只广播 thinking→chunk→(stage_output)→message_done，
-//        从不广播 done 事件。前端 createLessonPlanSSE 只有收到 done 才会主动 es.close()。
-//        后端不发 done → 这条 SSE HTTP 长连接生成完毕后仍挂着不关，直到被 Nginx/浏览器
-//        超时掐断 → 前端 es.onerror 触发自动重连 → 重连调后端 Subscribe(独占模式) →
-//        关闭正在推送的旧 channel → 后续关键事件(message_done/content_update)被丢弃 →
-//        前端永远收不到收尾事件，但内容其实已落库 → "要刷新才出来"。
-//     2) 前端 fullGenerating 复位只挂在 content_update(只有 write/revise 落库才发)，
-//        analyze/design 阶段不发 content_update → "生成中"永不消失。
-//   修复历程更正（v172 当日回滚）：
-//     起初尝试在 processChatStageAsync 结尾 defer 补发 done 让前端 es.close() 收尾，
-//     但本系统的 SSE 是「整个教案会话共享的一条长连接」，并非「一轮对话一条连接」。
-//     每轮结束就发 done → 前端收到后 es.close() 关掉整条会话连接 →
-//     进入阶段时开场白那一轮发的 done 会把连接关掉，导致随后「一键生成」时
-//     已无活动 SSE 连接接收 chunk（前端 Network 中 stream 连接消失），结果收不到、要刷新才出来。
-//     因此已撤销后端补发 done 的做法：SSE 长连接保持开启、等待后续轮次复用，不再每轮关闭。
-//   最终方案：仅在前端 onMessageDone 里复位「生成中」类状态（fullGenerating 等），
-//     既治「出来了还显示生成中」，又不关闭会话长连接（不影响后续轮次接收推送）。
+// v172改动(SSE 完成信号治本)：
+//   - SSE 是「整个教案会话共享的一条长连接」，不每轮发 done 关连接；
+//     「生成中」状态的复位改由前端 onMessageDone 处理。
+//   - 详细历程见 lesson_plan_gen_chat_async.go 内 processChatStageAsync 的函数注释。
+//
+// v203改动(对话模式配方自动挂载·治本 yingjun 截图九大板块缺失问题)：
+//   - StartConversation 在 req.RecipeID 为空时调 s.ResolveDefaultRecipe（recipe_resolver.go）
+//     按「学校默认配方 → group/school 学科匹配配方 → 空」三级 fail-open 解析并回填 req.RecipeID。
+//   - 回填后下方所有既有 `if req.RecipeID != ""` 分支自动命中，使对话模式与专家模式走完全相同的
+//     下游（lp.RecipeID + recipeStagesConfig + InitStagesForPlan + RecordRecipeUsage），
+//     配方的教案结构/流程/学情风格经 LoadStagePromptContextV2 全量注入，AI 不再是空骨架。
+//   - 显式 recipe_id（专家模式）跳过解析，行为一字不变；解析失败退回纯骨架=改造前现状，零风险。
+//
+// 【技能路由 Phase 1 · 接线步骤2】默认助手解析（风格型技能·替换第4层）：
+//   - resolveAssistantPrompt：当老师【没有】手动传 assistant_id 时，调用 skill_router.go 的
+//     RouteDefaultAssistant，按「当前阶段场景+学科+学段+可见性」自动解析默认助手 ID
+//     （优先级 个人>本校>系统），再走与手动选择【完全相同】的 LoadActiveAssistantForUse 加载路径。
+//   - 静默降级铁律：任何一步失败 / 无可见默认助手 / 路由开关关闭 → 返回空串，沿用阶段原生第4层。
+//
+// 【对话式备课·助手轻量选择入口 Phase 1 · 读路径接入偏好】：
+//   - resolveAssistantPrompt 在「老师没手动传 assistant_id」分支内，先查老师×学科偏好表
+//     (repository.GetPref)，把「助手ID从哪来」从"立即走技能路由"改为"先看老师的显式选择"。
+//   - 解析优先级落地为三态分流（见 resolveAssistantPrompt 函数体注释），RouteDefaultAssistant
+//     由「第一顺位」降为「无偏好记录时的末位兜底」，函数与 flag 均保留(可回滚)。
+//   - 偏好读取走后端(而非前端透传)，保证开场白等不经 chat 请求的路径也吃到偏好(PRD §6.2)。
 
 import (
 	"context"
@@ -81,7 +83,6 @@ var (
 
 // lessonPlanSceneCode 教案生成场景代码，用于从ai_scene_configs获取独立模型配置
 const lessonPlanSceneCode = "lesson_plan"
-
 
 // ==================== 服务结构体 ====================
 
@@ -140,6 +141,23 @@ func (s *LessonPlanGenService) StartConversation(
 		dur = 45
 	}
 
+	// ==================== v203：对话模式配方自动挂载 ====================
+	// 对话模式 handleStart 不传 recipe_id，导致 lp.RecipeID 恒为 nil，配方的教案结构/流程/
+	// 学情风格全部不注入，AI 拿到空骨架（yingjun 截图九大板块缺失的根因）。
+	// 此处在【显式 recipe_id 为空】时，按「学校默认配方 → group/school 学科匹配配方 → 空」
+	// 三级 fail-open 解析（详见 recipe_resolver.go 的 ResolveDefaultRecipe），解析到则回填
+	// req.RecipeID。回填后，本函数下方所有既有 `if req.RecipeID != ""` 分支会自动命中，
+	// 与专家模式走完全相同的下游，无需任何额外接线。
+	// 显式 recipe_id（专家模式）不进此分支，行为一字不变；解析失败退回纯骨架=改造前现状。
+	if strings.TrimSpace(req.RecipeID) == "" {
+		if resolvedRecipeID := s.ResolveDefaultRecipe(ctx, authorID, req.Subject); resolvedRecipeID != "" {
+			req.RecipeID = resolvedRecipeID
+			lpGenLog.Info("对话模式自动挂载配方",
+				"author", authorID, "subject", req.Subject, "topic", req.Topic,
+				"recipe_id", resolvedRecipeID)
+		}
+	}
+
 	title := fmt.Sprintf("%s %s — %s", req.Grade, req.Subject, req.Topic)
 	lp := &models.LessonPlan{
 		Title:           title,
@@ -159,15 +177,15 @@ func (s *LessonPlanGenService) StartConversation(
 		lp.RecipeID = &req.RecipeID
 	}
 
-        // 迭代7B：备课工坊勾选的课本图片ID列表落库（写入 lesson_plans.textbook_page_ids，
-        // 供 LoadStagePromptContextV2 在各阶段提示词中注入课本原文，让 AI 参考真实教材内容）
-        if len(req.TextbookPageIDs) > 0 {
-                if tbIDsJSON, mErr := json.Marshal(req.TextbookPageIDs); mErr == nil {
-                        lp.TextbookPageIDs = string(tbIDsJSON)
-                } else {
-                        lpGenLog.Warn("课本图片ID序列化失败，忽略关联", "error", mErr)
-                }
-        }
+	// 迭代7B：备课工坊勾选的课本图片ID列表落库（写入 lesson_plans.textbook_page_ids，
+	// 供 LoadStagePromptContextV2 在各阶段提示词中注入课本原文，让 AI 参考真实教材内容）
+	if len(req.TextbookPageIDs) > 0 {
+		if tbIDsJSON, mErr := json.Marshal(req.TextbookPageIDs); mErr == nil {
+			lp.TextbookPageIDs = string(tbIDsJSON)
+		} else {
+			lpGenLog.Warn("课本图片ID序列化失败，忽略关联", "error", mErr)
+		}
+	}
 
 	if err := repository.CreateLessonPlan(ctx, lp); err != nil {
 		return nil, nil, fmt.Errorf("创建教案失败: %w", err)
@@ -195,8 +213,10 @@ func (s *LessonPlanGenService) StartConversation(
 	lpGenLog.Info("阶段初始化成功", "plan_id", lp.ID, "stages_count", len(snapshots), "first_stage", snapshots[0].StageCode)
 
 	// 生成阶段化开场白
+	// 对话式备课·助手轻量选择入口 Phase 1：开场白也吃老师×学科偏好——
+	// genStageOpeningMessage 内部会先解析偏好助手 prompt 并注入第4层（详见该函数）。
 	var openingMsg *models.ConversationMessage
-	openingMsg, err = s.genStageOpeningMessage(ctx, lp, snapshots)
+	openingMsg, err = s.genStageOpeningMessage(ctx, lp, snapshots, authorID)
 	if err != nil {
 		lpGenLog.Warn("阶段开场白生成失败，使用默认开场", "plan_id", lp.ID, "error", err)
 		openingMsg = buildDefaultOpeningMessage(req)
@@ -235,64 +255,29 @@ func (s *LessonPlanGenService) StartConversation(
 	return lp, openingMsg, nil
 }
 
-// appendUnrecognizedTextbookNotice 检查勾选的课本图中有几张未识别文字（OCR 为空），
-// 若有，则在开场白消息末尾拼接一句确定性的点名提醒，让老师明确知道哪些课本无法被参考。
-// 设计要点：
-//   - 纯代码判断 + 字符串拼接，不经过 AI，保证"必然出现、措辞精确"；
-//   - 用图在勾选列表中的序号（第X张）定位，老师在课本区按勾选顺序即可对应；
-//   - 任何异常（无关联/查询失败/全部已识别）都静默返回，不影响开场白。
-func (s *LessonPlanGenService) appendUnrecognizedTextbookNotice(
-	ctx context.Context,
-	req *models.StartConversationRequest,
-	openingMsg *models.ConversationMessage,
-) {
-	if openingMsg == nil || len(req.TextbookPageIDs) == 0 {
-		return
-	}
-
-	pages, err := repository.GetTextbookPagesByIDs(ctx, req.TextbookPageIDs)
-	if err != nil || len(pages) == 0 {
-		return
-	}
-
-	// GetTextbookPagesByIDs 返回顺序按 textbook_name+page_number 排，
-	// 与前端勾选顺序未必一致，这里按返回顺序编号"第X张"，并尽量带上章节/教材名帮助老师定位。
-	var unrecognized []string
-	for i, p := range pages {
-		if strings.TrimSpace(p.OCRText) == "" {
-			label := strings.TrimSpace(p.Chapter)
-			if label == "" {
-				label = strings.TrimSpace(p.TextbookName)
-			}
-			if label == "" {
-				unrecognized = append(unrecognized, fmt.Sprintf("第%d张", i+1))
-			} else {
-				unrecognized = append(unrecognized, fmt.Sprintf("第%d张（%s）", i+1, label))
-			}
-		}
-	}
-
-	if len(unrecognized) == 0 {
-		return
-	}
-
-	notice := fmt.Sprintf(
-		"\n\n---\n📷 **课本识别提醒**：你关联的 %d 张课本图中，%s 尚未成功识别文字，本次备课**无法参考这些页面的内容**。建议返回「课本管理」对这些图重新点击「AI识别」，识别成功后再关联进来。",
-		len(pages), strings.Join(unrecognized, "、"),
-	)
-	openingMsg.Content += notice
-
-	lpGenLog.Info("开场白已拼接未识别课本提醒",
-		"plan_id", req.Topic, "total", len(pages), "unrecognized", len(unrecognized))
-}
-
 // genStageOpeningMessage 阶段模式下生成第一阶段的AI开场白
+//
+// 对话式备课·助手轻量选择入口 Phase 1（本次改动）：
+//   - 新增 authorID 形参，用于解析老师×学科的助手偏好。
+//   - 开场白不再恒走「纯骨架」，而是先调 resolveAssistantPrompt 解析出应注入的助手 full_prompt，
+//     再用 LoadStagePromptContextV2 把它注入第4层 —— 让首阶段开场白也体现老师选定/学科推荐的助手风格。
+//   - 后续阶段开场白走 advanceStageWithComponents→genService.Chat 路径，已天然经过 resolveAssistantPrompt，
+//     无需在此处理；本改动只补齐「首阶段开场白」这一条原本不注入助手的路径。
+//   - 静默降级铁律不变：解析不到助手 / 偏好为空 → assistantPrompt 为空串 → 等价于原纯骨架行为。
 func (s *LessonPlanGenService) genStageOpeningMessage(
 	ctx context.Context,
 	lp *models.LessonPlan,
 	snapshots []models.StageConfigSnapshot,
+	authorID string,
 ) (*models.ConversationMessage, error) {
-	stageSystemPrompt, err := s.stageService.LoadStagePromptContext(ctx, lp, snapshots[0].StageCode)
+	// 解析开场白应注入的助手 prompt（吃老师×学科偏好；解析不到则空串=纯骨架）。
+	// 开场白无"老师当轮发言"，故 resolveAssistantPrompt 的 assistantID 传空，
+	// 走「偏好表 → 学科推荐兜底」链，与对话路径同一套解析逻辑、同一份偏好。
+	assistantPrompt, _ := s.resolveAssistantPrompt(ctx, lp, "", authorID)
+
+	// 用 V2 注入助手 prompt（assistantPrompt 为空时 V2 内部等价于原 V1 纯骨架）。
+	// recentUserText 传空：开场白阶段没有老师发言，第3层组件走保底全量匹配（与原行为一致）。
+	stageSystemPrompt, err := s.stageService.LoadStagePromptContextV2(ctx, lp, snapshots[0].StageCode, assistantPrompt, "")
 	if err != nil {
 		return nil, fmt.Errorf("加载阶段提示词失败: %w", err)
 	}
@@ -311,18 +296,21 @@ func (s *LessonPlanGenService) genStageOpeningMessage(
 	}
 
 	planID := lp.ID
-	authorID := lp.AuthorID
+	openingAuthorID := lp.AuthorID
+	// v197：解析作者所属学校ID，供分流判定境外授权（查不到空串→降级境内）
+	openingSchoolID, _ := repository.GetSchoolIDByUserID(ctx, openingAuthorID)
 	openingTraceCtx := &aiClient.TraceContext{
 		SceneCode:    lessonPlanSceneCode,
 		LessonPlanID: &planID,
-		UserID:       &authorID,
+		UserID:       &openingAuthorID,
+		SchoolID:     schoolIDPtr(openingSchoolID),
 	}
 	result, err := aiClient.CallAI(aiCfg, stageSystemPrompt, userPrompt, openingTraceCtx)
 	if err != nil {
 		return nil, fmt.Errorf("AI开场白生成失败: %w", err)
 	}
 
-	content := strings.TrimSpace(result.Content)
+	content := strings.TrimSpace(StripSuggestedActionsBlock(result.Content))
 
 	return &models.ConversationMessage{
 		ID:        generateMsgID(),
@@ -336,6 +324,8 @@ func (s *LessonPlanGenService) genStageOpeningMessage(
 // ==================== 2. 对话轮次（流式SSE推送）====================
 
 // Chat 处理教师输入，AI生成回复并通过SSE流式推送
+//
+// 异步处理体 processChatStageAsync 已搬至 lesson_plan_gen_chat_async.go（同包，调用方式不变）。
 //
 // v169改动：fullGenerate 不再仅 write 生效，透传给 processChatStageAsync 按阶段判定
 func (s *LessonPlanGenService) Chat(
@@ -373,304 +363,145 @@ func (s *LessonPlanGenService) Chat(
 		lpGenLog.Warn("写入用户消息失败", "plan_id", lp.ID, "error", err)
 	}
 
-	// v110 新增:解析 AI 助手(若前端传了 assistant_id)
-	assistantPrompt := s.resolveAssistantPrompt(ctx, req.AssistantID, callerID)
+	// v110 新增 + 技能路由 Phase 1 + 助手轻量选择入口 Phase 1：解析 AI 助手。
+	// 老师传了 assistant_id → 用指定助手；没传 → 由 resolveAssistantPrompt 内
+	// 「偏好表 → RouteDefaultAssistant 兜底」链自动解析（解析不到则空串=不替换第4层）。
+	// 传入 lp 供偏好查询(lp.Subject)与默认助手解析读取 当前阶段/学科/年级 维度。
+	assistantPrompt, assistantLabel := s.resolveAssistantPrompt(ctx, lp, req.AssistantID, callerID)
 
 	// v168/v169:全委托标志(按阶段在 processChatStageAsync 内判定)
 	fullGenerate := req.FullGenerate
 
+	// 子轮一·B：取本轮客户端轮次序号，透传给异步处理体，使本轮所有 SSE 事件都带上它。
+	turnID := req.ClientTurnID
 	go func() {
 		bgCtx := context.Background()
-		s.processChatStageAsync(bgCtx, lp, userMsg, currentStageMsgs, req, assistantPrompt, fullGenerate)
+		s.processChatStageAsync(bgCtx, lp, userMsg, currentStageMsgs, req, assistantPrompt, assistantLabel, fullGenerate, turnID)
 	}()
 
 	return nil
 }
 
-// resolveAssistantPrompt v110:将 assistant_id 解析为 full_prompt
+// resolveAssistantPrompt 将 assistant_id 解析为 full_prompt
+// （v110 起；技能路由 Phase 1 扩展默认助手解析；助手轻量选择入口 Phase 1 接入老师×学科偏好）
+//
+// 解析优先级（本次改动后的最终形态）：
+//
+// 1）老师手动传了 assistant_id（assistantID 非空）→ 用该指定助手（最高优先，老师对当下最有发言权）。
+// 2）老师没传（assistantID 为空）→ 查老师×学科偏好表 repository.GetPref(callerID, lp.Subject)：
+//
+//	2a）查到记录且 prefID 非空        → 用偏好里的助手（老师之前为该学科选定的）。
+//	2b）查到记录且 prefID == ""       → 老师显式选了「系统默认(纯骨架)」→ 直接返回空串，
+//	                                    【绝不再走 RouteDefaultAssistant 兜底】（尊重显式选择）。
+//	2c）查询出真实 DB 错误            → 记 Warn，降级到步骤3兜底（不阻塞对话）。
+//	2d）无记录（从没选过）            → 落到步骤3兜底。
+//
+// 3）RouteDefaultAssistant（降为末位兜底）按「场景+学科+学段+可见性」自动解析默认助手：
+//
+//	3a）命中 → 用它。
+//	3b）空串 → 返回空串（= 不替换第4层，沿用阶段原生角色，老行为）。
+//
+// 无论走哪条路，拿到最终 assistantID 后都经【同一条】加载路径
+// （LoadActiveAssistantForUse：可见性校验 + is_active 校验 + 使用量埋点）取 full_prompt，
+// 保证手动选择 / 偏好命中 / 默认挂载的加载口径、埋点口径完全一致。
+// 偏好指向的助手若已被删/停用，LoadActiveAssistantForUse 会失败 → 末尾统一降级返回空串（纯骨架），
+// 即「偏好失效后静默退回最朴素状态」，符合 PRD 强默认+逃生口哲学。
+//
+// 静默降级：assistantService 未注入 / 用户反查失败 / 助手加载失败 / full_prompt 为空 /
+// 无可见默认助手 → 一律返回空串，绝不报错给老师、绝不阻塞对话。
 func (s *LessonPlanGenService) resolveAssistantPrompt(
 	ctx context.Context,
+	lp *models.LessonPlan,
 	assistantID string,
 	callerID string,
-) string {
+) (string, string) {
 	assistantID = strings.TrimSpace(assistantID)
-	if assistantID == "" {
-		return ""
-	}
+
+	// assistantService 未注入：手动与默认两条路都无从加载，直接走空串老行为。
 	if s.assistantService == nil {
-		lpGenLog.Warn("Chat 收到 assistant_id 但 assistantService 未注入,降级到默认 prompt",
-			"assistant_id", assistantID)
-		return ""
+		if assistantID != "" {
+			lpGenLog.Warn("Chat 收到 assistant_id 但 assistantService 未注入,降级到默认 prompt",
+				"assistant_id", assistantID)
+		}
+		return "", ""
 	}
 
+	// 构造操作者上下文（一次构造，供默认助手解析与 LoadActiveAssistantForUse 复用）。
+	// 反查用户角色失败则无法判定可见性，安全起见走空串老行为。
 	user, err := repository.FindUserByID(ctx, callerID)
 	if err != nil {
 		lpGenLog.Warn("Chat 加载用户角色失败,降级到默认 prompt",
 			"caller_id", callerID, "error", err)
-		return ""
+		return "", ""
+	}
+	actor := BuildActorFromClaims(ctx, callerID, user.Role)
+
+	// 老师没手动选助手 → 先查老师×学科偏好，再以技能路由兜底。
+	if assistantID == "" {
+		// lp 为空时无法查偏好/解析默认助手（理论上 Chat 与开场白路径 lp 必非空，此为防御）。
+		if lp == nil {
+			return "", ""
+		}
+
+		// —— 步骤2：查老师×学科偏好表（助手轻量选择入口 Phase 1 核心）——
+		prefID, found, perr := repository.GetPref(ctx, callerID, lp.Subject)
+		if perr != nil {
+			// 2c：真实 DB 错误。只 Warn，不阻塞——降级到步骤3技能路由兜底。
+			lpGenLog.Warn("查询老师×学科助手偏好失败,降级到默认助手兜底",
+				"caller_id", callerID, "subject", lp.Subject, "error", perr)
+		} else if found {
+			if strings.TrimSpace(prefID) != "" {
+				// 2a：老师为该学科显式选定了某助手 → 用它（走下方统一加载路径）。
+				assistantID = strings.TrimSpace(prefID)
+				lpGenLog.Info("命中老师×学科助手偏好",
+					"plan_id", lp.ID, "subject", lp.Subject, "stage", lp.CurrentStage,
+					"pref_assistant_id", assistantID)
+			} else {
+				// 2b：老师显式选了「系统默认(纯骨架)」→ 直接返回空串，绝不再走兜底。
+				// 这正是三态语义的关键：显式选系统默认 ≠ 从没选过。
+				lpGenLog.Info("老师×学科偏好为显式系统默认(纯骨架),不挂任何助手",
+					"plan_id", lp.ID, "subject", lp.Subject, "stage", lp.CurrentStage)
+				return "", ""
+			}
+		}
+
+		// —— 步骤3：无偏好命中（无记录 / 偏好查询出错）→ RouteDefaultAssistant 末位兜底 ——
+		// 仅当上面没把 assistantID 赋成偏好助手时才进入（2a 命中则跳过本段）。
+		if assistantID == "" {
+			defaultID := RouteDefaultAssistant(ctx, s.assistantService, actor, lp.CurrentStage, lp.Subject, lp.Grade)
+			if defaultID == "" {
+				// 3b：无可见默认助手 → 不替换第4层，沿用阶段原生角色（与改造前"未选助手"行为一致）。
+				return "", ""
+			}
+			// 3a：技能路由解析到默认助手。
+			assistantID = defaultID
+			lpGenLog.Info("Chat 自动挂载默认助手（技能路由兜底）",
+				"plan_id", lp.ID, "stage", lp.CurrentStage,
+				"default_assistant_id", defaultID)
+		}
 	}
 
-	actor := BuildActorFromClaims(ctx, callerID, user.Role)
+	// 统一加载路径：手动选择 / 偏好命中 / 默认挂载在此汇合。
 	a, err := s.assistantService.LoadActiveAssistantForUse(ctx, actor, assistantID)
 	if err != nil {
 		lpGenLog.Warn("Chat 加载 AI 助手失败,降级到默认 prompt",
 			"assistant_id", assistantID, "caller_id", callerID, "error", err)
-		return ""
+		return "", ""
 	}
 
 	if strings.TrimSpace(a.FullPrompt) == "" {
 		lpGenLog.Warn("Chat 助手 full_prompt 为空,降级到默认 prompt",
 			"assistant_id", assistantID)
-		return ""
+		return "", ""
 	}
 
 	lpGenLog.Info("Chat 使用 AI 助手",
 		"assistant_id", assistantID, "assistant_name", a.Name,
 		"source", a.Source, "prompt_len", len(a.FullPrompt))
-	return a.FullPrompt
+	return a.FullPrompt, a.Name
 }
 
-// ==================== 2.1 阶段化对话（v84分层记忆 + v87教练集成 + v110助手注入 + v168/v169全委托）====================
-
-// processChatStageAsync 阶段模式：异步处理AI流式回复
-//
-// v169改动（多阶段一键生成）：
-//   - write 阶段保留原三态（已有正文→防重复 / 正文空+fullGenerate→全委托 / 其余逐轮）
-//   - analyze/design/revise 阶段：fullGenerate=true 时注入 resolveFullGeneratePrompt 返回的对应指令
-//   - review 阶段：resolveFullGeneratePrompt 返回空，不参与一键生成
-//
-// v172说明（已撤销 done 补发）：
-//   本函数不再补发 done 事件。原因：SSE 是教案会话级共享长连接，发 done 会让前端关闭整条连接，
-//   导致进入阶段的开场白那轮 done 关连接后、随后「一键生成」无连接可收。
-//   「生成中」状态的复位改由前端 onMessageDone 处理，不依赖关闭连接。
-func (s *LessonPlanGenService) processChatStageAsync(
-	ctx context.Context,
-	lp *models.LessonPlan,
-	userMsg *models.ConversationMessage,
-	currentStageMsgs []*models.ConversationMessage,
-	req *models.LessonPlanChatRequest,
-	assistantPrompt string,
-	fullGenerate bool,
-) {
-	planID := lp.ID
-	currentStage := lp.CurrentStage
-
-	// 推送thinking状态
-	GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
-		EventType: models.LPSSEThinking,
-		PlanID:    planID,
-		MessageID: generateMsgID(),
-	})
-
-	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
-	if err != nil {
-		s.broadcastError(planID, "AI配置加载失败: "+err.Error())
-		return
-	}
-
-	// 加载阶段系统提示词(v110:使用 V2 版本支持 assistantPrompt 注入)
-	stageSystemPrompt, err := s.stageService.LoadStagePromptContextV2(ctx, lp, currentStage, assistantPrompt)
-	if err != nil {
-		lpGenLog.Warn("加载阶段提示词失败", "plan_id", planID, "stage", currentStage, "error", err)
-		s.broadcastError(planID, "加载阶段配置失败，请刷新重试")
-		return
-	}
-
-	// 全委托标志：本轮是否实际注入了全委托指令（用于后续跳过停滞检测）
-	fullGenInjected := false
-
-	if currentStage == "write" {
-		// ---------- write 阶段三态处理（v168，保持原逻辑）----------
-		latestLP, freshErr := repository.GetLessonPlanByID(ctx, planID)
-		hasExistingContent := freshErr == nil && len(strings.TrimSpace(latestLP.ContentMarkdown)) > 2000
-
-		switch {
-		case hasExistingContent:
-			// 态a：已有教案内容 → 注入防重复生成指令
-			contentLen := len(latestLP.ContentMarkdown)
-			stageSystemPrompt += fmt.Sprintf(`
-
-== 重要提示（系统级指令，最高优先级）==
-教案正文已经成功生成并保存（共%d字符），右侧面板已经展示给了老师。
-请注意以下规则：
-1. 不要再重新输出完整教案。教案已经保存好了。
-2. 如果老师说"输出""生成""写出来"等话，请告诉老师教案已经生成完毕并显示在右侧面板，问老师是否需要修改某个部分。
-3. 如果老师要求修改教案的某个具体部分，可以针对性地讨论修改方案，但不要输出完整教案。
-4. 你现在的角色是帮助老师确认教案是否满意、讨论是否需要局部调整。
-5. 如果老师确认教案没问题，建议老师点击"完成本阶段"按钮进入下一阶段（AI评审）。`, contentLen)
-
-			lpGenLog.Info("write阶段已有教案内容，注入防重复生成指令",
-				"plan_id", planID, "stage", currentStage, "content_len", contentLen)
-
-		case fullGenerate:
-			// 态b：正文为空 + 老师选择全委托 → 注入全委托一次性出稿指令
-			stageSystemPrompt += fullGenerateWritePrompt
-			fullGenInjected = true
-			lpGenLog.Info("write阶段全委托一键生成，注入全委托出稿指令",
-				"plan_id", planID, "stage", currentStage)
-
-		default:
-			// 态c：原逐轮分段确认逻辑，stageSystemPrompt 不追加
-		}
-	} else if fullGenerate {
-		// ---------- analyze/design/revise 阶段一键生成（v169）----------
-		if fgPrompt := resolveFullGeneratePrompt(currentStage); fgPrompt != "" {
-			stageSystemPrompt += fgPrompt
-			fullGenInjected = true
-			lpGenLog.Info("阶段全委托一键生成，注入全委托指令",
-				"plan_id", planID, "stage", currentStage)
-		} else {
-			lpGenLog.Warn("收到 fullGenerate 但该阶段不支持一键生成，忽略",
-				"plan_id", planID, "stage", currentStage)
-		}
-	}
-
-	// 构建Episodic Memory
-	allOutputs, _ := repository.ListStageOutputs(ctx, planID)
-	var priorOutputs []*models.WorkshopStageOutput
-	for _, out := range allOutputs {
-		if out.StageCode == currentStage {
-			break
-		}
-		priorOutputs = append(priorOutputs, out)
-	}
-	episodicSummary := repository.BuildEpisodicSummaryFromOutputs(priorOutputs)
-
-	// 使用BuildStageChatPromptV2构建分层上下文
-	userPrompt := BuildStageChatPromptV2(lp, currentStageMsgs, episodicSummary, userMsg)
-
-	lpGenLog.Info("v84分层记忆上下文构建完成",
-		"plan_id", planID, "stage", currentStage,
-		"working_msgs", len(currentStageMsgs), "episodic_len", len(episodicSummary),
-		"prior_stages", len(priorOutputs), "assistant_injected", assistantPrompt != "",
-		"full_generate", fullGenerate, "full_gen_injected", fullGenInjected)
-
-	// 流式推送
-	chunkCount := 0
-	var fullContent strings.Builder
-
-	result, err := aiClient.CallAIStream(aiCfg, stageSystemPrompt, userPrompt, func(chunk string) error {
-		if strings.TrimSpace(chunk) == "" {
-			return nil
-		}
-		chunkCount++
-		fullContent.WriteString(chunk)
-
-		GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
-			EventType: models.LPSSEChunk,
-			PlanID:    planID,
-			Chunk:     chunk,
-		})
-		return nil
-	}, &aiClient.TraceContext{
-		SceneCode:    lessonPlanSceneCode,
-		LessonPlanID: &planID,
-		UserID:       &lp.AuthorID,
-	})
-	if err != nil {
-		s.broadcastError(planID, "AI回复失败: "+err.Error())
-		return
-	}
-
-	rawContent := result.Content
-	if rawContent == "" {
-		rawContent = fullContent.String()
-	}
-
-	// 从自然语言中提取结构化数据
-	structuredJSON, narrative, hasContent := ExtractStructuredFromNaturalReply(currentStage, rawContent)
-	if hasContent {
-		if err := s.stageService.SaveStageOutput(ctx, planID, currentStage, structuredJSON, narrative, result.ModelUsed, result.TokensUsed); err != nil {
-			lpGenLog.Warn("保存阶段产出物失败", "plan_id", planID, "stage", currentStage, "error", err)
-		} else {
-			lpGenLog.Info("阶段产出物已保存", "plan_id", planID, "stage", currentStage)
-		}
-
-		// 处理阶段副作用（在lesson_plan_gen_review.go中定义）
-		s.handleStageOutputSideEffects(ctx, planID, lp, currentStage, structuredJSON, rawContent)
-
-		GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
-			EventType: models.LPSSEStageOutput,
-			PlanID:    planID,
-			StageData: &models.StageEventData{
-				StageCode: currentStage,
-				StageName: stageCodeToName(currentStage),
-			},
-		})
-	}
-
-	// 构造AI回复消息并保存
-	aiReply := s.parseAIReply(ctx, rawContent, lp)
-
-	if err := s.appendMessage(ctx, planID, aiReply); err != nil {
-		lpGenLog.Warn("写入AI消息失败", "plan_id", planID, "error", err)
-	}
-
-	GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
-		EventType: models.LPSSEMessageDone,
-		PlanID:    planID,
-		MessageID: aiReply.ID,
-		Message:   aiReply,
-	})
-
-	lpGenLog.Info("AI对话流式回复完成（v84分层记忆+v110助手注入+v168/v169全委托）",
-		"plan_id", planID, "stage", currentStage,
-		"tokens", result.TokensUsed, "latency_ms", result.LatencyMs,
-		"chunks", chunkCount, "has_content", hasContent,
-		"working_msgs", len(currentStageMsgs),
-		"assistant_injected", assistantPrompt != "",
-		"full_generate", fullGenerate)
-
-	// v87：对话完成后异步检测停滞，插入教练建议
-	// v168/v169：全委托一次性出稿不需要停滞检测（本就是一次性完成），跳过避免误插建议
-	//
-	if !fullGenInjected {
-		go s.checkAndInsertCoachAdvice(ctx, planID, currentStage)
-	}
-}
-
-// ==================== v87：停滞检测+教练建议插入 ====================
-
-// checkAndInsertCoachAdvice 对话完成后检测停滞，插入教练建议
-func (s *LessonPlanGenService) checkAndInsertCoachAdvice(ctx context.Context, planID string, stageCode string) {
-	time.Sleep(500 * time.Millisecond)
-
-	stagnation := DetectStagnation(ctx, planID, stageCode)
-	if stagnation == nil || !stagnation.IsStagnant {
-		return
-	}
-
-	suggestion := GenerateCoachSuggestion(stagnation)
-	if suggestion == "" {
-		return
-	}
-
-	coachMsg := &models.ConversationMessage{
-		ID:        generateMsgID(),
-		Role:      models.ConvRoleAssistant,
-		Type:      models.ConvMsgTypeText,
-		Content:   suggestion,
-		CreatedAt: time.Now(),
-	}
-
-	if err := s.appendMessage(ctx, planID, coachMsg); err != nil {
-		lpGenLog.Warn("v87教练建议-写入消息失败", "plan_id", planID, "error", err)
-		return
-	}
-
-	GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
-		EventType: models.LPSSEMessageDone,
-		PlanID:    planID,
-		MessageID: coachMsg.ID,
-		Message:   coachMsg,
-	})
-
-	lpGenLog.Info("v87教练建议已插入",
-		"plan_id", planID, "stage", stageCode,
-		"user_rounds", stagnation.ConsecutiveRounds)
-}
-
-// ==================== 5. 获取对话历史 ====================
+// ==================== 3. 获取对话历史 ====================
 
 // GetConversation 获取教案对话历史
 func (s *LessonPlanGenService) GetConversation(
@@ -691,81 +522,11 @@ func (s *LessonPlanGenService) GetConversation(
 	return s.loadConversation(ctx, planID)
 }
 
-// ==================== 内部辅助方法 ====================
-
-// checkPlanEditable 检查教案是否存在、归属正确、且处于可编辑状态
-func (s *LessonPlanGenService) checkPlanEditable(ctx context.Context, planID string, callerID string) (*models.LessonPlan, error) {
-	lp, err := repository.GetLessonPlanByID(ctx, planID)
-	if err != nil {
-		if errors.Is(err, repository.ErrLessonPlanNotFound) {
-			return nil, ErrLPGenPlanNotFound
-		}
-		return nil, err
+// schoolIDPtr 把学校ID字符串转为 *string：空串→nil（fail-closed，分流按未授权处理），
+// 非空→指向该值。供备课各路径构造 TraceContext.SchoolID 复用。
+func schoolIDPtr(s string) *string {
+	if s == "" {
+		return nil
 	}
-	if lp.AuthorID != callerID {
-		return nil, ErrLPGenUnauthorized
-	}
-	if lp.Status != models.LPStatusDraft &&
-		lp.Status != models.LPStatusPublishedPersonal &&
-		lp.Status != models.LPStatusRevision &&
-		lp.Status != models.LPStatusDeveloping {
-		return nil, ErrLPGenNotEditable
-	}
-	return lp, nil
-}
-
-// appendMessage 追加消息到教案对话历史
-func (s *LessonPlanGenService) appendMessage(ctx context.Context, planID string, msg *models.ConversationMessage) error {
-	return repository.AppendConversationMessage(ctx, planID, msg)
-}
-
-// loadConversation 加载教案全量对话历史（前端展示用，不用于AI上下文）
-func (s *LessonPlanGenService) loadConversation(ctx context.Context, planID string) ([]*models.ConversationMessage, error) {
-	return repository.GetConversationLog(ctx, planID)
-}
-
-// resolveTemplateForReview 解析评审模板
-func (s *LessonPlanGenService) resolveTemplateForReview(ctx context.Context, subject string) (systemPrompt string, reviewRules string) {
-	return buildReviewSystemPrompt(subject), buildDefaultReviewRules(subject)
-}
-
-// broadcastError 通过SSE推送错误消息给前端
-func (s *LessonPlanGenService) broadcastError(planID string, msg string) {
-	GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
-		EventType: models.LPSSEError,
-		PlanID:    planID,
-		Error:     msg,
-	})
-}
-
-// parseAIReply 解析AI回复，判断消息类型（普通文本/教案内容/组件推荐）
-func (s *LessonPlanGenService) parseAIReply(ctx context.Context, content string, lp *models.LessonPlan) *models.ConversationMessage {
-	msg := &models.ConversationMessage{
-		ID:        generateMsgID(),
-		Role:      models.ConvRoleAssistant,
-		CreatedAt: time.Now(),
-	}
-
-	if strings.Contains(content, "## 教学目标") || strings.Contains(content, "# 教案") {
-		msg.Type = models.ConvMsgTypeContent
-		msg.Content = content
-		return msg
-	}
-
-	if strings.Contains(content, "【推荐组件】") || strings.Contains(content, "推荐以下教学方案") {
-		msg.Type = models.ConvMsgTypeComponents
-		msg.Content = cleanComponentMarkers(content)
-		groups, _ := repository.MatchComponents(ctx, &models.MatchComponentsRequest{
-			Subject:       lp.Subject,
-			GradeRange:    lp.Grade,
-			InjectionMode: "recommend",
-			Limit:         3,
-		})
-		msg.Components = convertGroupsToConvComponents(groups)
-		return msg
-	}
-
-	msg.Type = models.ConvMsgTypeText
-	msg.Content = content
-	return msg
+	return &s
 }

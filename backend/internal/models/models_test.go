@@ -89,8 +89,8 @@ func TestSceneGroupMap_Completeness(t *testing.T) {
 		if !ok || group == "" {
 			t.Errorf("场景 %q 在SceneGroupMap中无分组", code)
 		}
-		if group != "pipeline" && group != "lesson_plan" && group != "courseware" {
-			t.Errorf("场景 %q 分组 %q 不在合法范围(pipeline/lesson_plan/courseware)", code, group)
+		if group != "pipeline" && group != "lesson_plan" && group != "courseware" && group != "knowledge_base" {
+			t.Errorf("场景 %q 分组 %q 不在合法范围(pipeline/lesson_plan/courseware/knowledge_base)", code, group)
 		}
 	}
 }

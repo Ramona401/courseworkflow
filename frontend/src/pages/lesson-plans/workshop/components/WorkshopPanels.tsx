@@ -2,30 +2,33 @@
  * WorkshopPanels.tsx — 备课工坊各面板子组件
  *
  * 组件列表：
- *   StartForm         — 首屏备课表单（v4：课本图片选择+上传引导）
+ *   StartForm         — 首屏备课表单
  *   AIBubble          — AI消息气泡（支持Markdown+组件选择）
  *   UserBubble        — 用户消息气泡
  *   ThinkingIndicator — AI思考中动画
  *   ReviewPanel       — AI评审结果面板
  *
- * 迭代8变更：
- *   - 移除 StageGateModal（阶段切换弹窗已迁移到 WorkshopTransitionComponents.tsx）
- *
- * v169变更（评审"有分无内容"治本·前端双保险）：
- *   - ReviewPanel 新增维度评分展示（之前只有 summary/good_points/improvements，
- *     dimensions 数据存在却没渲染）
- *   - 渲染前清洗脏数据（防历史坏数据）：
- *       a) 过滤掉 name 为表头行（"评审维度/维度/评分/简短评语"等）的脏维度
- *       b) 剥离 name/code 里的 Markdown 粗体星号（"**T1-教学目标**" → "T1-教学目标"）
- *   - 这是与后端 workshop_stage_extract.go 同样清洗逻辑的前端兜底，
- *     即便老教案的 ai_review_result 里残留脏维度，前端也不会显示出来
+ * v203变更（专家模式首屏简化）：
+ *   - StartForm 从双栏布局（左基本信息+右320px黄色配方面板）改为单栏布局
+ *   - 配方选择从整版面板改为与对话模式一致的下拉选择器
+ *   - 复用 getAvailableRecipes API（按用户可见性+学科过滤，学校>教研组>个人排序）
+ *   - 去掉"当前学科/全部配方"切换器、去掉"新建配方"入口（需要的去配方管理页）
+ *   - 保留课本图片区域不变
  */
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { ConversationMessage, AIReviewResult, ConvComponent } from '@/api/lesson-plans'
-import { getRecipes, type RecipeListItem } from '@/api/recipes'
+import { getAvailableRecipes, type RecipeListItem } from '@/api/recipes'
 import { getTextbooks, triggerTextbookOCR, type TextbookListItem } from '@/api/textbooks'
 import { C, SUBJECTS, GRADES, renderMarkdown } from './workshopConstants'
+
+// ==================== 配方 scope 徽标配置（与对话模式共用同一套配色） ====================
+
+const RECIPE_SCOPE_BADGE: Record<string, { label: string; color: string; bg: string }> = {
+  school:   { label: '学校', color: '#166534', bg: '#DCFCE7' },
+  group:    { label: '教研组', color: '#1E40AF', bg: '#DBEAFE' },
+  personal: { label: '个人', color: '#6B7280', bg: '#F3F4F6' },
+}
 
 // ==================== 首屏备课表单 ====================
 
@@ -36,11 +39,12 @@ interface StartFormProps {
 
 export function StartForm({ onStart, loading }: StartFormProps) {
   const [subject, setSubject]   = useState('AI')
-  const [grade, setGrade]       = useState('七年级')
+  const [grade, setGrade]       = useState('一年级')
   const [topic, setTopic]       = useState('')
   const [duration, setDuration] = useState(45)
   const navigate = useNavigate()
 
+  // v203 简化：配方用 getAvailableRecipes（按用户可见性+学科，学校>教研组>个人排序）
   const [recipes, setRecipes]             = useState<RecipeListItem[]>([])
   const [recipesLoading, setRecipesLoad]  = useState(false)
   const [selectedRecipeId, setSelectedId] = useState<string | null>(null)
@@ -49,28 +53,25 @@ export function StartForm({ onStart, loading }: StartFormProps) {
   const [textbooksLoading, setTextbooksLoad]  = useState(false)
   const [textbooksLoaded, setTextbooksLoaded] = useState(false)
   const [selectedTextbookIds, setSelectedTBIds] = useState<Set<string>>(new Set())
-  // 迭代7B：勾选未识别课本图时即触发 OCR，下面两个集合驱动卡片"识别中/识别失败"状态显示
-  const [ocrInProgress, setOcrInProgress] = useState<Set<string>>(new Set())  // 正在识别中的图ID
-  const [ocrFailed, setOcrFailed]         = useState<Set<string>>(new Set())  // 识别失败的图ID
+  const [ocrInProgress, setOcrInProgress] = useState<Set<string>>(new Set())
+  const [ocrFailed, setOcrFailed]         = useState<Set<string>>(new Set())
 
-  // v104修复：配方列表不再精确过滤grade_range（会导致新建配方看不见）
-  // 改为只按学科过滤，加载更多配方（limit:50），并支持"全部"/"当前学科"切换
-  const [recipeFilter, setRecipeFilter] = useState<'subject' | 'all'>('subject')
-
+  // v203 简化：按学科拉可见配方（复用对话模式同一 API），学科切换时重拉并清空已选
   useEffect(() => {
-    const loadRecipes = async () => {
-      setRecipesLoad(true)
-      try {
-        const params: Record<string, string> = { limit: '50' }
-        if (recipeFilter === 'subject' && subject) params.subject = subject
-        const resp = await getRecipes(params)
-        setRecipes(resp.recipes || [])
-        setSelectedId(null)
-      } catch { setRecipes([]) }
-      finally { setRecipesLoad(false) }
-    }
-    loadRecipes()
-  }, [subject, grade, recipeFilter])
+    let cancelled = false
+    setRecipesLoad(true)
+    getAvailableRecipes(subject)
+      .then(resp => {
+        if (cancelled) return
+        const list = resp.recipes || []
+        setRecipes(list)
+        // 学科切换时：已选配方若不在新列表里则清空
+        setSelectedId(prev => prev && list.some(r => r.id === prev) ? prev : null)
+      })
+      .catch(() => { if (!cancelled) setRecipes([]) })
+      .finally(() => { if (!cancelled) setRecipesLoad(false) })
+    return () => { cancelled = true }
+  }, [subject])
 
   useEffect(() => {
     const loadTextbooks = async () => {
@@ -85,24 +86,13 @@ export function StartForm({ onStart, loading }: StartFormProps) {
     loadTextbooks()
   }, [subject, grade])
 
-  // 迭代7B：勾选课本图。若勾选的是"未识别"图（has_ocr=false），自动触发该图 OCR，
-  // 转圈等识别完——成功则该图后续可被备课参考，失败则标红但仍保留勾选（老师可能仍想关联）。
-  // 取消勾选只移除选中态，不影响已在进行的识别。
   const toggleTextbook = (id: string) => {
-    // 修复：先用当前状态算出"本次是新勾选还是取消勾选"，
-    // setState updater 只做纯粹的选中态切换（不含任何副作用——React StrictMode 下
-    // updater 会被执行两次用于探测副作用，把 OCR 触发放进 updater 会导致勾选不生效）。
     const willSelect = !selectedTextbookIds.has(id)
     setSelectedTBIds(prev => {
       const n = new Set(prev)
-      if (n.has(id)) {
-        n.delete(id)
-      } else {
-        n.add(id)
-      }
+      if (n.has(id)) { n.delete(id) } else { n.add(id) }
       return n
     })
-    // 副作用单独在 updater 之外执行：新勾选 + 该图未识别 + 当前没在识别中 → 触发一次 OCR
     if (willSelect) {
       const tb = textbooks.find(t => t.id === id)
       if (tb && !tb.has_ocr && !ocrInProgress.has(id)) {
@@ -111,14 +101,11 @@ export function StartForm({ onStart, loading }: StartFormProps) {
     }
   }
 
-  // maybeTriggerOCR 对单张未识别图触发 AI 识别，识别成功后把该图本地 has_ocr 置 true，
-  // 失败则记入 ocrFailed 集合（卡片标红）。全程更新 ocrInProgress 驱动"识别中"转圈。
   const maybeTriggerOCR = async (id: string) => {
     setOcrInProgress(prev => { const n = new Set(prev); n.add(id); return n })
     setOcrFailed(prev => { const n = new Set(prev); n.delete(id); return n })
     try {
       await triggerTextbookOCR(id)
-      // 识别成功：本地把该图 has_ocr 标记为 true（无需重新拉列表）
       setTextbooks(prev => prev.map(t => t.id === id ? { ...t, has_ocr: true } : t))
     } catch {
       setOcrFailed(prev => { const n = new Set(prev); n.add(id); return n })
@@ -129,7 +116,6 @@ export function StartForm({ onStart, loading }: StartFormProps) {
 
   const handleSubmit = () => {
     if (!topic.trim()) return
-    // 迭代7B：有图正在识别中时不允许开始备课，避免带着"识别中"的半成品状态进去
     if (ocrInProgress.size > 0) return
     onStart(subject, grade, topic.trim(), duration, selectedRecipeId || undefined, selectedTextbookIds.size > 0 ? Array.from(selectedTextbookIds) : undefined)
   }
@@ -145,126 +131,100 @@ export function StartForm({ onStart, loading }: StartFormProps) {
   })
 
   return (
-    <div style={{ maxWidth: '960px', margin: '0 auto', padding: '36px 0' }}>
+    <div style={{ maxWidth: '680px', margin: '0 auto', padding: '36px 0' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
         <span style={{ fontSize: '28px', lineHeight: 1 }}>✨</span>
         <div>
           <h1 style={{ fontSize: '20px', fontWeight: 700, color: C.text, margin: '0 0 2px' }}>开始今天的备课</h1>
-          <p style={{ fontSize: '13px', color: C.textSec, margin: 0 }}>告诉AI你要上什么课，选择配方让AI从第一句话就带着全局知识工作</p>
+          <p style={{ fontSize: '13px', color: C.textSec, margin: 0 }}>告诉AI你要上什么课，选择配方让AI从第一句话就带着教研共识工作</p>
         </div>
       </div>
 
-      <div style={{ display: 'flex', gap: '20px', alignItems: 'flex-start' }}>
-        {/* 左栏：基本信息 */}
-        <div style={{ flex: 1, minWidth: 0, background: C.card, borderRadius: '16px', padding: '28px', boxShadow: '0 4px 24px rgba(0,0,0,0.06)', border: `1px solid ${C.border}` }}>
-          <div style={{ marginBottom: '18px' }}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>学科</label>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-              {SUBJECTS.map(s => <button key={s} onClick={() => setSubject(s)} style={selBtn(subject === s)}>{s}</button>)}
-            </div>
+      {/* 单栏布局（v203 简化：去掉右侧 320px 配方面板） */}
+      <div style={{ background: C.card, borderRadius: '16px', padding: '28px', boxShadow: '0 4px 24px rgba(0,0,0,0.06)', border: `1px solid ${C.border}` }}>
+        <div style={{ marginBottom: '18px' }}>
+          <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>学科</label>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+            {SUBJECTS.map(s => <button key={s} onClick={() => setSubject(s)} style={selBtn(subject === s)}>{s}</button>)}
           </div>
-          <div style={{ marginBottom: '18px' }}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>年级</label>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-              {GRADES.map(g => <button key={g} onClick={() => setGrade(g)} style={selBtn(grade === g)}>{g}</button>)}
-            </div>
+        </div>
+        <div style={{ marginBottom: '18px' }}>
+          <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>年级</label>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+            {GRADES.map(g => <button key={g} onClick={() => setGrade(g)} style={selBtn(grade === g)}>{g}</button>)}
           </div>
-          <div style={{ marginBottom: '18px' }}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>
-              课题 <span style={{ color: C.danger }}>*</span>
-            </label>
-            <input type="text" value={topic} onChange={e => setTopic(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && handleSubmit()}
-              placeholder="例如：认识人工智能、图像识别应用..."
-              style={{ width: '100%', padding: '10px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '15px', color: C.text, outline: 'none', boxSizing: 'border-box', transition: 'border-color 150ms ease' }}
-              onFocus={e => { e.target.style.borderColor = C.primary }}
-              onBlur={e  => { e.target.style.borderColor = C.border }} />
+        </div>
+        <div style={{ marginBottom: '18px' }}>
+          <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>
+            课题 <span style={{ color: C.danger }}>*</span>
+          </label>
+          <input type="text" value={topic} onChange={e => setTopic(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && handleSubmit()}
+            placeholder="例如：认识人工智能、图像识别应用..."
+            style={{ width: '100%', padding: '10px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '15px', color: C.text, outline: 'none', boxSizing: 'border-box', transition: 'border-color 150ms ease' }}
+            onFocus={e => { e.target.style.borderColor = C.primary }}
+            onBlur={e  => { e.target.style.borderColor = C.border }} />
+        </div>
+        <div style={{ marginBottom: '18px' }}>
+          <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>课时时长</label>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            {[40, 45, 50, 60].map(d => <button key={d} onClick={() => setDuration(d)} style={selBtn(duration === d)}>{d}分钟</button>)}
           </div>
-          <div style={{ marginBottom: '24px' }}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>课时时长</label>
-            <div style={{ display: 'flex', gap: '8px' }}>
-              {[40, 45, 50, 60].map(d => <button key={d} onClick={() => setDuration(d)} style={selBtn(duration === d)}>{d}分钟</button>)}
-            </div>
-          </div>
-          <button onClick={handleSubmit} disabled={!topic.trim() || loading || ocrInProgress.size > 0}
-            style={{ width: '100%', padding: '14px', borderRadius: '10px', border: 'none', background: (!topic.trim() || loading || ocrInProgress.size > 0) ? '#E5E7EB' : C.primary, color: (!topic.trim() || loading || ocrInProgress.size > 0) ? C.textMuted : '#fff', fontSize: '16px', fontWeight: 600, cursor: (!topic.trim() || loading || ocrInProgress.size > 0) ? 'not-allowed' : 'pointer', transition: 'all 200ms ease' }}>
-            {ocrInProgress.size > 0 ? `课本识别中（${ocrInProgress.size}）请稍候...` : loading ? '正在准备备课环境...' : selectedRecipeId ? '📦 带配方开始备课 →' : '开始备课 →'}
-          </button>
-          {selectedRecipe && (
-            <div style={{ marginTop: '12px', padding: '10px 12px', background: 'rgba(79,123,232,0.06)', borderRadius: '8px', fontSize: '12px', color: C.primary, lineHeight: 1.6 }}>
-              ✅ 已选「{selectedRecipe.name}」— {selectedRecipe.component_count}个组件 · v{selectedRecipe.version}
-            </div>
-          )}
-          {selectedTextbookIds.size > 0 && (
-            <div style={{ marginTop: '8px', padding: '10px 12px', background: 'rgba(16,185,129,0.06)', borderRadius: '8px', fontSize: '12px', color: '#166534', lineHeight: 1.6 }}>
-              📷 已关联 {selectedTextbookIds.size} 张课本图片，AI会参考课本原文
-            </div>
-          )}
         </div>
 
-        {/* 右栏：配方选择 */}
-        <div style={{ width: '320px', flexShrink: 0, background: '#FFFBEB', borderRadius: '16px', padding: '24px', border: '1px solid #FDE68A', boxShadow: '0 4px 24px rgba(0,0,0,0.04)' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-            <label style={{ fontSize: '15px', fontWeight: 600, color: C.text }}>📦 备课配方</label>
-            <button onClick={() => navigate('/lesson-plans/recipes/new', { state: { from: '/lesson-plans' } })} style={{ fontSize: '12px', color: C.primary, background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}>
-              + 新建
+        {/* v203 简化：配方下拉（与对话模式一致的交互，复用 getAvailableRecipes） */}
+        {recipes.length > 0 && (
+          <div style={{ marginBottom: '18px' }}>
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>📦 备课配方（选填）</label>
+            <select value={selectedRecipeId || ''} onChange={e => setSelectedId(e.target.value || null)} disabled={recipesLoading}
+              style={{ width: '100%', padding: '11px 14px', borderRadius: '10px', border: `1.5px solid ${selectedRecipeId ? '#F59E0B' : C.border}`, fontSize: '14px', color: selectedRecipeId ? C.text : C.textMuted, background: C.card, cursor: 'pointer', outline: 'none', boxSizing: 'border-box', transition: 'border-color 150ms ease' }}>
+              <option value="">不使用配方（AI用系统预置骨架）</option>
+              {recipes.map(r => {
+                const badge = RECIPE_SCOPE_BADGE[r.scope] || RECIPE_SCOPE_BADGE.personal
+                return (
+                  <option key={r.id} value={r.id}>
+                    [{badge.label}] {r.name} · {r.component_count}组件 · 用{r.use_count}次
+                  </option>
+                )
+              })}
+            </select>
+            {selectedRecipe && (
+              <div style={{ marginTop: '8px', padding: '8px 12px', background: '#FFFBEB', borderRadius: '8px', border: '1px solid #FDE68A', fontSize: '12px', color: '#92400E', lineHeight: 1.6 }}>
+                ✅ 已选「{selectedRecipe.name}」— {selectedRecipe.description || '教案结构+流程+学情由此配方定义'}
+              </div>
+            )}
+            {!selectedRecipeId && (
+              <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px', lineHeight: 1.5 }}>
+                💡 不选配方时，AI助手的指引（含结构）将作为唯一个性化来源
+              </div>
+            )}
+          </div>
+        )}
+        {recipes.length === 0 && !recipesLoading && (
+          <div style={{ marginBottom: '18px', padding: '12px 14px', background: 'rgba(79,123,232,0.04)', borderRadius: '10px', border: '1px dashed rgba(79,123,232,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ fontSize: '13px', color: C.textSec, lineHeight: 1.6 }}>
+              📦 暂无「{subject}」学科的可用配方 — AI将使用系统预置骨架
+            </div>
+            <button onClick={() => navigate('/lesson-plans/recipes')} style={{ padding: '6px 12px', borderRadius: '8px', border: 'none', background: C.primary, color: '#fff', fontSize: '12px', fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>
+              去配方管理
             </button>
           </div>
-          <p style={{ fontSize: '12px', color: '#92400E', margin: '0 0 8px', lineHeight: 1.5 }}>
-            选配方后AI自动带入学情、风格等知识
-          </p>
-          {/* v104：学科/全部切换，解决配方看不见的问题 */}
-          <div style={{ display: 'flex', gap: '4px', marginBottom: '10px' }}>
-            <button
-              onClick={() => setRecipeFilter('subject')}
-              style={{ flex: 1, padding: '4px 0', borderRadius: '6px', border: `1px solid ${recipeFilter === 'subject' ? C.primary : C.border}`, background: recipeFilter === 'subject' ? C.primaryLight : 'transparent', fontSize: '12px', color: recipeFilter === 'subject' ? C.primary : C.textSec, cursor: 'pointer', fontWeight: recipeFilter === 'subject' ? 600 : 400 }}
-            >当前学科</button>
-            <button
-              onClick={() => setRecipeFilter('all')}
-              style={{ flex: 1, padding: '4px 0', borderRadius: '6px', border: `1px solid ${recipeFilter === 'all' ? C.primary : C.border}`, background: recipeFilter === 'all' ? C.primaryLight : 'transparent', fontSize: '12px', color: recipeFilter === 'all' ? C.primary : C.textSec, cursor: 'pointer', fontWeight: recipeFilter === 'all' ? 600 : 400 }}
-            >全部配方</button>
+        )}
+
+        <button onClick={handleSubmit} disabled={!topic.trim() || loading || ocrInProgress.size > 0}
+          style={{ width: '100%', padding: '14px', borderRadius: '10px', border: 'none', background: (!topic.trim() || loading || ocrInProgress.size > 0) ? '#E5E7EB' : C.primary, color: (!topic.trim() || loading || ocrInProgress.size > 0) ? C.textMuted : '#fff', fontSize: '16px', fontWeight: 600, cursor: (!topic.trim() || loading || ocrInProgress.size > 0) ? 'not-allowed' : 'pointer', transition: 'all 200ms ease' }}>
+          {ocrInProgress.size > 0 ? `课本识别中（${ocrInProgress.size}）请稍候...` : loading ? '正在准备备课环境...' : selectedRecipeId ? '📦 带配方开始备课 →' : '开始备课 →'}
+        </button>
+        {selectedTextbookIds.size > 0 && (
+          <div style={{ marginTop: '8px', padding: '10px 12px', background: 'rgba(16,185,129,0.06)', borderRadius: '8px', fontSize: '12px', color: '#166534', lineHeight: 1.6 }}>
+            📷 已关联 {selectedTextbookIds.size} 张课本图片，AI会参考课本原文
           </div>
-          {recipesLoading ? (
-            <div style={{ fontSize: '13px', color: C.textMuted, padding: '20px 0', textAlign: 'center' }}>加载中...</div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '380px', overflowY: 'auto' }}>
-              <button onClick={() => setSelectedId(null)} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 12px', borderRadius: '10px', textAlign: 'left', width: '100%', border: `1px solid ${selectedRecipeId === null ? C.primary : C.border}`, background: selectedRecipeId === null ? C.primaryLight : '#fff', cursor: 'pointer', transition: 'all 150ms ease' }}>
-                <div style={{ width: '16px', height: '16px', borderRadius: '50%', border: `2px solid ${selectedRecipeId === null ? C.primary : C.border}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                  {selectedRecipeId === null && <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: C.primary }} />}
-                </div>
-                <span style={{ fontSize: '13px', color: selectedRecipeId === null ? C.primary : C.textSec, fontWeight: selectedRecipeId === null ? 600 : 400 }}>不使用配方</span>
-              </button>
-              {recipes.map(r => (
-                <button key={r.id} onClick={() => setSelectedId(r.id)} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 12px', borderRadius: '10px', textAlign: 'left', width: '100%', border: `1px solid ${selectedRecipeId === r.id ? C.primary : C.border}`, background: selectedRecipeId === r.id ? C.primaryLight : '#fff', cursor: 'pointer', transition: 'all 150ms ease' }}>
-                  <div style={{ width: '16px', height: '16px', borderRadius: '50%', border: `2px solid ${selectedRecipeId === r.id ? C.primary : C.border}`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    {selectedRecipeId === r.id && <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: C.primary }} />}
-                  </div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: '13px', fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.name}</div>
-                    <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '2px' }}>{r.component_count}个组件 · 用{r.use_count}次</div>
-                  </div>
-                </button>
-              ))}
-              {recipes.length === 0 && !recipesLoading && (
-                <div style={{ fontSize: '13px', color: C.textMuted, padding: '16px 0', textAlign: 'center', lineHeight: 1.6 }}>
-                  {recipeFilter === 'subject' ? `暂无「${subject}」学科配方` : '暂无配方'}<br />
-                  <button onClick={() => setRecipeFilter('all')} style={{ color: C.primary, background: 'none', border: 'none', cursor: 'pointer', fontSize: '12px', textDecoration: 'underline', padding: 0, marginTop: '4px' }}>
-                    查看全部配方
-                  </button>
-                  <span style={{ color: C.textMuted, fontSize: '12px' }}> 或 </span>
-                  <button onClick={() => navigate('/lesson-plans/recipes/new', { state: { from: '/lesson-plans' } })} style={{ color: C.primary, background: 'none', border: 'none', cursor: 'pointer', fontSize: '12px', textDecoration: 'underline', padding: 0 }}>
-                    新建配方
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
+        )}
       </div>
 
-      {/* 课本图片区域 */}
+      {/* 课本图片区域（完整保留，逻辑不动） */}
       {textbooksLoaded && textbooks.length > 0 && (
-        <div style={{ maxWidth: '960px', margin: '16px auto 0', background: '#F0FDF4', borderRadius: '12px', padding: '16px 20px', border: '1px solid #BBF7D0' }}>
+        <div style={{ maxWidth: '680px', margin: '16px auto 0', background: '#F0FDF4', borderRadius: '12px', padding: '16px 20px', border: '1px solid #BBF7D0' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
             <div style={{ fontSize: '14px', fontWeight: 600, color: '#166534' }}>
               📷 关联课本图片 <span style={{ fontSize: '12px', fontWeight: 400, color: '#6B7280' }}>（已选 {selectedTextbookIds.size} 张）</span>
@@ -276,14 +236,10 @@ export function StartForm({ onStart, loading }: StartFormProps) {
               const checked = selectedTextbookIds.has(tb.id)
               return (
                 <div key={tb.id} onClick={() => toggleTextbook(tb.id)} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 10px', borderRadius: '8px', cursor: 'pointer', background: checked ? 'rgba(79,123,232,0.08)' : '#fff', border: checked ? '1px solid #4F7BE8' : '1px solid #E5E7EB', fontSize: '12px', color: '#1F2937', transition: 'all 150ms ease', userSelect: 'none' }}>
-                  {/* 修复：原来用 <label> 包 <input>，点击 label 浏览器会原生再切换 input 并二次触发 onClick，
-                      导致 toggleTextbook 被调用两次（勾上又立即取消）→ 看起来"点不动"。
-                      改用 <div> + 纯展示 checkbox（readOnly + pointerEvents:none），点击只走我们自己的 onClick 一次。 */}
                   <input type="checkbox" checked={checked} readOnly style={{ accentColor: '#4F7BE8', pointerEvents: 'none' }} />
                   <img src={tb.image_url} alt="" style={{ width: '28px', height: '28px', objectFit: 'cover', borderRadius: '4px' }} onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
                   <div style={{ maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {tb.chapter || tb.textbook_name}
-                    {/* 迭代7B：识别状态优先级 识别中 > 失败 > 已识别；都没有则不显示徽标（即未识别未勾选） */}
                     {ocrInProgress.has(tb.id)
                       ? <span style={{ marginLeft: '4px', color: '#F59E0B', fontSize: '10px' }}>⏳识别中…</span>
                       : ocrFailed.has(tb.id)
@@ -299,7 +255,7 @@ export function StartForm({ onStart, loading }: StartFormProps) {
         </div>
       )}
       {textbooksLoaded && textbooks.length === 0 && !textbooksLoading && (
-        <div style={{ maxWidth: '960px', margin: '16px auto 0', borderRadius: '12px', padding: '16px 20px', background: 'rgba(79,123,232,0.04)', border: '1px dashed rgba(79,123,232,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ maxWidth: '680px', margin: '16px auto 0', borderRadius: '12px', padding: '16px 20px', background: 'rgba(79,123,232,0.04)', border: '1px dashed rgba(79,123,232,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
             <span style={{ fontSize: '24px' }}>📷</span>
             <div>
@@ -313,7 +269,7 @@ export function StartForm({ onStart, loading }: StartFormProps) {
         </div>
       )}
       {textbooksLoading && (
-        <div style={{ maxWidth: '960px', margin: '16px auto 0', textAlign: 'center', fontSize: '12px', color: C.textMuted }}>加载课本图片...</div>
+        <div style={{ maxWidth: '680px', margin: '16px auto 0', textAlign: 'center', fontSize: '12px', color: C.textMuted }}>加载课本图片...</div>
       )}
 
       {/* 快捷入口 */}
@@ -429,12 +385,9 @@ export function ThinkingIndicator() {
 
 // ==================== AI评审面板 ====================
 
-// v169：维度脏数据清洗 —— 与后端 workshop_stage_extract.go 同样逻辑的前端兜底
-// 剥离粗体星号
 function stripBoldFE(s: unknown): string {
   return String(s ?? '').replace(/\*/g, '').trim()
 }
-// 判定是否为表头脏行（应过滤掉）
 function isHeaderDimFE(name: string): boolean {
   if (!name) return true
   const headers = ['评审维度', '维度', '评分', '简短评语', '评语', '得分', '分数']
@@ -452,13 +405,12 @@ interface ReviewPanelProps {
   review: AIReviewResult
   onApply: (ids?: string[]) => void
   applying: boolean
-  isStageMode?: boolean  // 阶段模式下隐藏一键应用（避免与阶段流程冲突）
+  isStageMode?: boolean
 }
 
 export function ReviewPanel({ review, onApply, applying, isStageMode = false }: ReviewPanelProps) {
   const isGood = review.total_score >= 8.5
 
-  // v169：清洗维度数据（过滤表头脏行 + 剥星号），防历史坏数据显示出来
   const rawDims = (review as unknown as { dimensions?: ReviewDimension[] }).dimensions
   const cleanDims: ReviewDimension[] = Array.isArray(rawDims)
     ? rawDims
@@ -483,7 +435,6 @@ export function ReviewPanel({ review, onApply, applying, isStageMode = false }: 
         </div>
       </div>
 
-      {/* v169新增：各维度评分条 */}
       {cleanDims.length > 0 && (
         <div style={{ marginBottom: '16px' }}>
           <div style={{ fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>📊 各维度评分</div>
@@ -533,7 +484,6 @@ export function ReviewPanel({ review, onApply, applying, isStageMode = false }: 
           ))}
         </div>
       )}
-      {/* 阶段模式下隐藏一键应用：修改应通过修订定稿阶段的对话完成 */}
       {!isStageMode && (
         <button onClick={() => onApply()} disabled={applying} style={{ width: '100%', padding: '10px', borderRadius: '8px', border: 'none', background: applying ? '#E5E7EB' : C.primary, color: applying ? C.textMuted : '#fff', fontSize: '13px', fontWeight: 600, cursor: applying ? 'not-allowed' : 'pointer' }}>
           {applying ? '应用中...' : '✨ 一键应用全部建议'}

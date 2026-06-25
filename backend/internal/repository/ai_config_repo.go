@@ -56,7 +56,7 @@ func GetConfigByKey(key string) (*models.AIConfig, error) {
 	return c, nil
 }
 
-// UpdateConfigValue 更新单条配置的值
+// UpdateConfigValue 更新单条配置的值（仅UPDATE，键不存在返回ErrConfigNotFound）
 func UpdateConfigValue(key string, value string, updatedBy string) error {
 	ctx := context.Background()
 	cmdTag, err := database.DB.Exec(ctx,
@@ -71,6 +71,25 @@ func UpdateConfigValue(key string, value string, updatedBy string) error {
 	return nil
 }
 
+// UpsertConfigValue 插入或更新单条配置（S-V1.5新增）
+// 与UpdateConfigValue的区别：键不存在时自动INSERT，供动态新增配置键（如TTS provider族键）使用。
+// id列用gen_random_uuid()生成（PostgreSQL 13+内置函数，本库PG16）。
+func UpsertConfigValue(key string, value string, description string, updatedBy string) error {
+	ctx := context.Background()
+	_, err := database.DB.Exec(ctx,
+		`INSERT INTO ai_configs (id, config_key, config_value, description, updated_by, updated_at)
+		 VALUES (gen_random_uuid(), $1, $2, $3, $4, NOW())
+		 ON CONFLICT (config_key) DO UPDATE
+		 SET config_value = EXCLUDED.config_value,
+		     updated_by = EXCLUDED.updated_by,
+		     updated_at = NOW()`,
+		key, value, description, updatedBy)
+	if err != nil {
+		return fmt.Errorf("写入配置 %s 失败: %w", key, err)
+	}
+	return nil
+}
+
 // ==================== 场景配置数据访问 ====================
 
 // GetAllSceneConfigs 获取所有场景配置（v85：新增fallback_models列）
@@ -78,8 +97,8 @@ func GetAllSceneConfigs() ([]*models.AISceneConfig, error) {
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
 		`SELECT id, scene_code, model, temperature, max_tokens,
-			system_prompt_id, is_active, updated_by, updated_at,
-			fallback_models
+		        system_prompt_id, is_active, updated_by, updated_at,
+		        fallback_models
 		 FROM ai_scene_configs ORDER BY scene_code`)
 	if err != nil {
 		return nil, fmt.Errorf("查询场景配置失败: %w", err)
@@ -110,8 +129,8 @@ func GetSceneConfigByCode(code string) (*models.AISceneConfig, error) {
 	var fallbackRaw []byte // JSONB原始字节
 	err := database.DB.QueryRow(ctx,
 		`SELECT id, scene_code, model, temperature, max_tokens,
-			system_prompt_id, is_active, updated_by, updated_at,
-			fallback_models
+		        system_prompt_id, is_active, updated_by, updated_at,
+		        fallback_models
 		 FROM ai_scene_configs WHERE scene_code = $1`, code).Scan(
 		&s.ID, &s.SceneCode, &s.Model, &s.Temperature,
 		&s.MaxTokens, &s.SystemPromptID, &s.IsActive, &s.UpdatedBy, &s.UpdatedAt,

@@ -374,3 +374,102 @@ func extractCWPageActionPath(path string, action string) (string, int) {
 	}
 	return coursewareID, num
 }
+
+// ==================== 页面级版本与回退（新增） ====================
+
+// ListPageVersions GET /api/v1/coursewares/{id}/pages/{num}/versions
+// 返回该页的版本列表（按 version_no 倒序，最新在前；轻量，不含 html_content）。
+// 每条附来源中文标签 source_label，前端直接显示。
+func (h *CoursewareGenHandler) ListPageVersions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+	coursewareID, pageNum := extractCWPageVersionsPath(r.URL.Path)
+	if coursewareID == "" || pageNum <= 0 {
+		utils.BadRequest(w, "路径格式错误")
+		return
+	}
+	items, err := h.genService.ListCWPageVersions(r.Context(), coursewareID, claims.UserID, pageNum)
+	if err != nil {
+		utils.InternalError(w, err.Error())
+		return
+	}
+	// 组装返回：版本基础字段 + 来源中文标签
+	list := make([]map[string]interface{}, 0, len(items))
+	for _, it := range items {
+		label := models.CWPageVersionSourceNameMap[it.Source]
+		if label == "" {
+			label = it.Source
+		}
+		list = append(list, map[string]interface{}{
+			"id":           it.ID,
+			"version_no":   it.VersionNo,
+			"source":       it.Source,
+			"source_label": label,
+			"note":         it.Note,
+			"created_at":   it.CreatedAt,
+		})
+	}
+	utils.Success(w, map[string]interface{}{
+		"page_number": pageNum,
+		"versions":    list,
+		"total":       len(list),
+	})
+}
+
+// RollbackPage POST /api/v1/coursewares/{id}/pages/{num}/rollback
+// 请求体: { "version_id": "xxx" }
+// 回退该页到指定历史版本，返回回退后的完整 HTML。回退前会把当前版本另存为 rollback 版（可逆）。
+func (h *CoursewareGenHandler) RollbackPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+	coursewareID, pageNum := extractCWPageRollbackPath(r.URL.Path)
+	if coursewareID == "" || pageNum <= 0 {
+		utils.BadRequest(w, "路径格式错误")
+		return
+	}
+	var req struct {
+		VersionID string `json:"version_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+	if strings.TrimSpace(req.VersionID) == "" {
+		utils.BadRequest(w, "缺少目标版本ID")
+		return
+	}
+	result, err := h.genService.RollbackCWPage(r.Context(), coursewareID, claims.UserID, pageNum, strings.TrimSpace(req.VersionID))
+	if err != nil {
+		utils.InternalError(w, err.Error())
+		return
+	}
+	utils.Success(w, map[string]interface{}{
+		"page_number":  pageNum,
+		"html_content": result,
+		"message":      fmt.Sprintf("第%d页已回退", pageNum),
+	})
+}
+
+// extractCWPageVersionsPath 从 /api/v1/coursewares/{id}/pages/{num}/versions 提取课件ID和页码
+func extractCWPageVersionsPath(path string) (string, int) {
+	return extractCWPageActionPath(path, "/versions")
+}
+
+// extractCWPageRollbackPath 从 /api/v1/coursewares/{id}/pages/{num}/rollback 提取课件ID和页码
+func extractCWPageRollbackPath(path string) (string, int) {
+	return extractCWPageActionPath(path, "/rollback")
+}

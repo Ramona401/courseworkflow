@@ -83,13 +83,44 @@ export interface AssistantDesignerPanelProps {
    */
   initialDraft: string
   /**
-   * 用户点"应用到编辑"按钮时回调
+   * 用户点"应用"按钮时回调
    * 参数:AI 生成的最新 draft(完整 prompt 字符串)
-   * 父组件(Modal)收到后应:
-   *   1. 把 draft 写入 fullPrompt state
-   *   2. 自动切回"📝 手动编辑"Tab(本版本 Modal 默认行为)
+   * 不同宿主对这个回调的处理不同:
+   *   - AssistantEditModal(弹窗里):把 draft 写入 fullPrompt state + 切回手动编辑 Tab
+   *   - MyAssistantsPage(独立页面):打开"存为我的助手"确认弹窗,落库 personal 助手
    */
   onApplyDraft: (draft: string) => void
+  /**
+   * 可选:应用按钮的文案。
+   * 不传时默认"✓ 应用到编辑"(弹窗宿主语境);
+   * 独立页面宿主可传"✓ 存为我的助手"。
+   */
+  applyButtonLabel?: string
+  /**
+   * 可选:应用按钮下方的一行小字说明。
+   * 不传时默认"应用后自动切到手动编辑 Tab,可继续微调"(弹窗宿主语境);
+   * 独立页面宿主可传自己的说明(如"保存后可在下方助手列表里看到")。
+   */
+  applyHintText?: string
+  /**
+   * 可选:外部注入到输入框的文字(MyAssistantsPage"丢给AI分析"用)。
+   * 父组件每次想把某段文字灌进输入框时,改变这个值(用带时间戳的对象包裹或直接换字符串)。
+   * 本组件监听其变化,非空时写入 input state 并聚焦输入框,等待老师补充后发送。
+   * 弹窗宿主不传,行为完全不变。
+   */
+  injectedInput?: string
+  /**
+   * 可选:高度占满父容器(画布模式)。
+   * 不传/false:沿用写死的 480px(弹窗宿主语境,行为不变);
+   * true:height 改 100%,跟随父容器撑满(独立页面画布语境)。
+   */
+  fillHeight?: boolean
+  /**
+   * 可选:允许折叠草稿区(画布模式)。
+   * 不传/false:草稿区常驻右侧(弹窗宿主语境,行为不变);
+   * true:对话区头部出现折叠按钮,折叠时草稿区隐藏、对话独占全宽。
+   */
+  collapsibleDraft?: boolean
 }
 
 /* ==================== 内部类型 ==================== */
@@ -112,7 +143,7 @@ interface ChatMessage {
 /* ==================== 主组件 ==================== */
 
 export default function AssistantDesignerPanel(props: AssistantDesignerPanelProps) {
-  const { subject, grade, scenes, initialDraft, onApplyDraft } = props
+  const { subject, grade, scenes, initialDraft, onApplyDraft, applyButtonLabel, applyHintText, injectedInput, fillHeight, collapsibleDraft } = props
 
   // ==================== state ====================
   const [messages, setMessages]       = useState<ChatMessage[]>([])
@@ -121,6 +152,7 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
   const [statusTip, setStatusTip]     = useState('')          // "🔍 AI 正在查组件库..." 之类瞬时提示
   const [localDraft, setLocalDraft]   = useState(initialDraft)// AI 生成的草稿,独立于 Modal 的 fullPrompt
   const [errorMsg, setErrorMsg]       = useState('')          // 顶部错误横幅
+  const [draftCollapsed, setDraftCollapsed] = useState(false)  // 草稿区折叠态(仅 collapsibleDraft 时有意义)
 
   // ==================== ref ====================
   const connRef  = useRef<DesignChatSSEConnection | null>(null)  // 当前 SSE 连接句柄
@@ -140,6 +172,18 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
       connRef.current = null
     }
   }, [])
+
+  // ==================== 外部注入输入框文字(MyAssistantsPage"丢给AI分析") ====================
+  // 父组件改变 injectedInput 时,把文字灌进输入框并聚焦,等老师补充后发送。
+  // 仅在非流式态生效(流式中不打断);弹窗宿主不传此 prop,此 effect 不产生任何动作。
+  useEffect(() => {
+    if (!injectedInput) return
+    if (isStreaming) return
+    setInput(injectedInput)
+    setTimeout(() => inputRef.current?.focus(), 50)
+    // 依赖只放 injectedInput:父组件每次注入都应传"新的引用/新值"以触发
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [injectedInput])
 
   // ==================== 发送消息 ====================
   const handleSend = useCallback(() => {
@@ -219,12 +263,14 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
           setLocalDraft(draft)
         },
         onDone: (reply, draft /* referenced 当前版本暂不消费 */) => {
-          // 用完整 reply 替换(保险,避免 chunk 拼接漏字)
+          // 用完整 reply 替换:流式 chunk 拼接的是 AI 原始 JSON 文本(含 action/updated_draft 等),
+          // done 的 reply 才是后端解析出的干净对话文本,故只要 reply 非空就无条件覆盖,
+          // 绝不能按长度判断(干净 reply 通常比那坨 JSON 短,旧的长度门槛会导致脏 JSON 残留)。
           setMessages(prev => {
             if (prev.length === 0) return prev
             const next = [...prev]
             const last = next[next.length - 1]
-            if (last.role === 'assistant' && reply && reply.length >= last.content.length) {
+            if (last.role === 'assistant' && reply) {
               next[next.length - 1] = { ...last, content: reply }
             }
             return next
@@ -298,14 +344,14 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
       style={{
         display: 'flex',
         gap: '12px',
-        height: '480px',
-        minHeight: '480px',
+        height: fillHeight ? '100%' : '480px',
+        minHeight: fillHeight ? '0' : '480px',
       }}
     >
-      {/* ==================== 左列:对话区(55%) ==================== */}
+      {/* ==================== 左列:对话区(55%,草稿折叠时占满) ==================== */}
       <div
         style={{
-          flex: '1 1 55%',
+          flex: (collapsibleDraft && draftCollapsed) ? '1 1 100%' : '1 1 55%',
           display: 'flex',
           flexDirection: 'column',
           background: C.card,
@@ -330,20 +376,40 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
           <span style={{ fontSize: '12px', fontWeight: 700, color: C.primary }}>
             💬 和 AI 聊着做助手
           </span>
-          <button
-            onClick={handleClearChat}
-            disabled={isStreaming || messages.length === 0}
-            style={{
-              background: 'none',
-              border: 'none',
-              fontSize: '11px',
-              color: isStreaming || messages.length === 0 ? C.textMuted : C.textSec,
-              cursor: isStreaming || messages.length === 0 ? 'not-allowed' : 'pointer',
-              padding: '2px 6px',
-            }}
-          >
-            🗑 清空对话
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            {/* 画布模式:草稿折叠/展开切换(仅 collapsibleDraft 时显示) */}
+            {collapsibleDraft && (
+              <button
+                onClick={() => setDraftCollapsed(v => !v)}
+                style={{
+                  background: draftCollapsed ? C.primaryLight : 'none',
+                  border: `1px solid ${draftCollapsed ? C.primary : C.border}`,
+                  borderRadius: '6px',
+                  fontSize: '11px',
+                  color: C.primary,
+                  cursor: 'pointer',
+                  padding: '2px 8px',
+                }}
+                title={draftCollapsed ? '展开草稿预览' : '收起草稿,对话占满'}
+              >
+                {draftCollapsed ? `📝 展开草稿(${localDraft.length}字)` : '◀ 收起草稿'}
+              </button>
+            )}
+            <button
+              onClick={handleClearChat}
+              disabled={isStreaming || messages.length === 0}
+              style={{
+                background: 'none',
+                border: 'none',
+                fontSize: '11px',
+                color: isStreaming || messages.length === 0 ? C.textMuted : C.textSec,
+                cursor: isStreaming || messages.length === 0 ? 'not-allowed' : 'pointer',
+                padding: '2px 6px',
+              }}
+            >
+              🗑 清空对话
+            </button>
+          </div>
         </div>
 
         {/* 消息列表 */}
@@ -664,11 +730,11 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
         </div>
       </div>
 
-      {/* ==================== 右列:草稿预览(45%) ==================== */}
+      {/* ==================== 右列:草稿预览(45%,collapsibleDraft 折叠时隐藏) ==================== */}
       <div
         style={{
+          display: (collapsibleDraft && draftCollapsed) ? 'none' : 'flex',
           flex: '1 1 45%',
-          display: 'flex',
           flexDirection: 'column',
           background: C.card,
           borderRadius: '10px',
@@ -760,7 +826,7 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
               cursor: !localDraft.trim() || isStreaming ? 'not-allowed' : 'pointer',
             }}
           >
-            {isStreaming ? '⏳ AI 生成中...' : '✓ 应用到编辑'}
+            {isStreaming ? '⏳ AI 生成中...' : (applyButtonLabel || '✓ 应用到编辑')}
           </button>
           <div
             style={{
@@ -771,7 +837,7 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
               lineHeight: 1.5,
             }}
           >
-            应用后自动切到手动编辑 Tab,可继续微调
+            {applyHintText || '应用后自动切到手动编辑 Tab,可继续微调'}
           </div>
         </div>
       </div>

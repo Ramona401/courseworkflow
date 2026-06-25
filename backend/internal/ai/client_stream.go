@@ -17,6 +17,9 @@ package ai
 //   注意：一旦某个模型的流式连接建立成功并开始推送数据，就不再fallback。
 //
 // v92重构：从原client.go拆分为独立文件
+//
+// v197新增：流式入口接入境内/境外模型分流（applyModelPolicy），
+//   未授权学校的境外模型与境外fallback一律降级境内（qwen-max/豆包）。
 
 import (
 	"bufio"
@@ -100,6 +103,14 @@ func CallAIStream(
 	if allowed, errMsg := invokeCreditCheck(traceCtx); !allowed {
 		return nil, fmt.Errorf(errMsg)
 	}
+
+	// v197新增：模型境内/境外分流——按学校授权策略原地改写 cfg.Model 与 FallbackModels
+	// 必须在下方构建 modelsToTry 之前调用，主模型与fallback链一并境内化
+	applyModelPolicy(cfg, traceCtx)
+
+	// v197修复：分流可能整通道切换 cfg.APIBaseURL（境内化到dashscope），
+	// endpoint 在分流前已用旧base算过，此处必须用改写后的base重算，否则把境内key发到境外网关致401
+	endpoint = strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
 
 	// -------- 构建模型尝试列表：主模型 + fallback模型 --------
 	type modelAttempt struct {

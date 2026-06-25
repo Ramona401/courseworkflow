@@ -142,7 +142,7 @@ func TestSelectPromptVariant_EmptyMode(t *testing.T) {
 func TestBuildDialogueGuidelines_AllStages(t *testing.T) {
 	stages := []string{"analyze", "design", "write", "review", "revise", "custom_stage"}
 	for _, code := range stages {
-		result := buildDialogueGuidelines(code)
+		result := buildDialogueGuidelines(code, "")
 		if result == "" {
 			t.Errorf("阶段%q应返回非空对话规范", code)
 		}
@@ -156,14 +156,14 @@ func TestBuildDialogueGuidelines_AllStages(t *testing.T) {
 }
 
 func TestBuildDialogueGuidelines_WriteSpecial(t *testing.T) {
-	result := buildDialogueGuidelines("write")
+	result := buildDialogueGuidelines("write", "")
 	if !strings.Contains(result, "分段确认") {
 		t.Error("write阶段应包含分段确认机制")
 	}
 }
 
 func TestBuildDialogueGuidelines_ReviewSpecial(t *testing.T) {
-	result := buildDialogueGuidelines("review")
+	result := buildDialogueGuidelines("review", "")
 	if !strings.Contains(result, "评审") {
 		t.Error("review阶段应包含评审相关规范")
 	}
@@ -370,12 +370,12 @@ func TestBuildStageChatPromptV2_WithEpisodicMemory(t *testing.T) {
 }
 
 func TestBuildStageChatPromptV2_WithLongContent(t *testing.T) {
-	longContent := strings.Repeat("教案内容", 1000)
+	longContent := strings.Repeat("教案内容", 1750)
 	lp := &models.LessonPlan{Subject: "语文", Grade: "一年级", Topic: "识字", DurationMinutes: 40, ContentMarkdown: longContent}
 	userMsg := &models.ConversationMessage{Content: "请优化"}
 	result := BuildStageChatPromptV2(lp, nil, "", userMsg)
-	if !strings.Contains(result, "已截断") {
-		t.Error("超长内容应被截断并标记")
+	if !strings.Contains(result, "...") {
+		t.Error("超长内容(>6000 rune)应被截断并以 ... 标记")
 	}
 }
 

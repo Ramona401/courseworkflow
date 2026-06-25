@@ -510,3 +510,65 @@ export async function batchCreateAdminUsers(
   )
   return res.data.data!
 }
+
+
+// ==================== 学校境外模型授权策略 API（批二新增，admin专属）====================
+// 后端路由：/api/v1/admin/school-model-policies（adminOnly）
+//   GET    /school-model-policies            列出全部已登记策略的学校
+//   GET    /school-model-policies/{schoolID} 查单校当前策略
+//   PUT    /school-model-policies/{schoolID} 授权/取消授权（body: {overseas_enabled, note}）
+//   DELETE /school-model-policies/{schoolID} 删除记录（=回到默认境内）
+// 业务：默认所有学校只能用境内模型(qwen-max)；仅被授权的学校放行境外模型(claude/gemini等)。
+
+/** 学校授权策略列表项（后端 SchoolModelPolicyItem） */
+export interface SchoolModelPolicyItem {
+  school_id: string
+  school_name: string          // JOIN organizations 填学校名
+  overseas_enabled: boolean    // 是否授权境外模型
+  note: string                 // 备注
+  granted_by_name: string      // 授权人显示名（可空时为空串）
+  created_at: string
+  updated_at: string
+}
+
+/** 单校策略视图（后端 smpPolicyView），无记录时 has_record=false 表默认境内 */
+export interface SchoolModelPolicyView {
+  school_id: string
+  overseas_enabled: boolean
+  note: string
+  has_record: boolean          // false=该校从未登记策略（=默认境内）
+}
+
+/** 列出全部已登记策略的学校 */
+export async function getSchoolModelPolicies(): Promise<SchoolModelPolicyItem[]> {
+  const res = await client.get<{ code: number; data: { items: SchoolModelPolicyItem[]; total: number } }>(
+    '/admin/school-model-policies'
+  )
+  return res.data.data?.items ?? []
+}
+
+/** 查单个学校的当前策略（无记录返回默认境内态 has_record=false） */
+export async function getSchoolModelPolicy(schoolId: string): Promise<SchoolModelPolicyView> {
+  const res = await client.get<{ code: number; data: SchoolModelPolicyView }>(
+    `/admin/school-model-policies/${schoolId}`
+  )
+  return res.data.data!
+}
+
+/** 授权/取消授权某学校走境外模型（overseas_enabled + 可选 note）
+ *  分流模块对「学校是否授权」是每次实时查库，无缓存，保存后即时生效 */
+export async function setSchoolModelPolicy(
+  schoolId: string,
+  data: { overseas_enabled: boolean; note?: string }
+): Promise<SchoolModelPolicyView> {
+  const res = await client.put<{ code: number; data: SchoolModelPolicyView }>(
+    `/admin/school-model-policies/${schoolId}`,
+    { overseas_enabled: data.overseas_enabled, note: data.note ?? '' }
+  )
+  return res.data.data!
+}
+
+/** 删除某学校策略记录（=回到默认境内） */
+export async function deleteSchoolModelPolicy(schoolId: string): Promise<void> {
+  await client.delete(`/admin/school-model-policies/${schoolId}`)
+}

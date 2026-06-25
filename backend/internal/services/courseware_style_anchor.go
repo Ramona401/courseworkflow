@@ -75,7 +75,9 @@ func (s *CoursewareAssetService) ExtractVAOCIFromImageURL(ctx context.Context, i
 
 	// 3. 多模态调用：把公网图URL作为 imageDataURI 传入（CallAIMultimodal 支持URL）
 	//    注意：VAOCI 提取依赖读图，多模态失败不降级纯文本（无意义），直接返回错误
-	traceCtx := &ai.TraceContext{SceneCode: sceneCWMediaPrompt, UserID: &userID}
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（VAOCI多模态读图提取，走CallAIMultimodal分流，操作者=userID）
+	vaociSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
+	traceCtx := &ai.TraceContext{SceneCode: sceneCWMediaPrompt, UserID: &userID, SchoolID: schoolIDPtr(vaociSchoolID)}
 	result, aiErr := ai.CallAIMultimodal(aiCfg, sysPrompt.Content, vaociExtractUserText, imageURL, traceCtx)
 	if aiErr != nil {
 		return "", fmt.Errorf("多模态读图提取VAOCI失败: %w", aiErr)

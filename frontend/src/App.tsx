@@ -4,6 +4,27 @@
  * 改动：所有页面组件改为 React.lazy 动态导入，按路由懒加载。
  * 效果：首屏只加载当前路由的 chunk，其他路由按需加载。
  *
+ * v194+优先级2新增（备课配方权限收敛 · Harness 生产者/消费者分离）：
+ *   - /lesson-plans/recipes 及其子路由（wizard / wizard/:id / new / :id/edit）全部叠加
+ *     RoleGuard roles=['admin','senior_operator']。
+ *     定位：配方创建/管理是生产端，归管理员/教研员；普通老师是消费端，
+ *     在备课起步（StartForm）选用现成配方即可，不接触配方管理界面。
+ *   - 与 LPSidebar 菜单 roles 白名单配套（光藏入口不够，必须守卫路由防直接敲 URL 越权）。
+ *   - 不影响 StartForm 选用现成配方的能力（那是 WorkshopPanels 内的消费端，本次不碰）。
+ *
+ * 【配方搭建一页化 · 批次4】配方编辑入口从旧单页编辑器迁移到分步向导：
+ *   - 新增 recipes/wizard/:id 路由挂 RecipeWizardPage（编辑态，与 /wizard 新建态共用同一组件，
+ *     靠 useParams 读 :id 区分；批次1 早已写好编辑态逻辑，本批挂上路由后方可验收）。
+ *   - 旧路由改重定向（防存量书签/外链 404）：recipes/new → /wizard（静态）；
+ *     recipes/:id/edit → /wizard/:id（动态，经 EditRedirect 用 useParams 取 :id 再 Navigate）。
+ *   - 【清backlog】旧单页编辑器 RecipeEditorPage 已无路由指向，其 lazy import 与文件本次一并删除。
+ *   - 四条 recipes 路由 RoleGuard 角色限制不变（admin/senior_operator）。
+ *
+ * v194+优先级2新增（组件管理权限收敛）：
+ *   - /lesson-plans/components 路由叠加 RoleGuard roles=['admin','senior_operator']。
+ *     与 LPSidebar 菜单项 roles 白名单配套（光藏入口不够，必须守卫路由防直接敲 URL 越权），
+ *     范式与 stages-config（菜单 roles + 路由 RoleGuard）一致。
+ *
  * v172新增：ModuleGuard 门户板块守卫
  *   - 给 /workflow（课件审核）加一层组织板块开关守卫
  *   - 即便登录用户直接敲 URL，所属学校未开通该板块也会被重定向回首页
@@ -13,7 +34,7 @@
  *   - /admin 路由 RoleGuard 角色白名单加入 region_admin，
  *     使区域管理员可进入统一用户管理中心（数据由后端 ResolveDataScope 收窄到辖区）
  *
- * 合并重构改动（本次，废弃 SchoolAdminPage 并轨）：
+ * 合并重构改动（废弃 SchoolAdminPage 并轨）：
  *   - /school-admin 路由不再渲染 SchoolAdminPage，改为 <Navigate to="/admin" replace/>
  *     （senior_operator 统一走 /admin 本校视角；保留旧路径重定向，防止存量书签/链接 404）。
  *   - 移除 SchoolAdminPage 的 lazy import（其文件将在后续清理批次删除）。
@@ -24,6 +45,13 @@
  *     不出现在 PortalPage 入口卡片（隐藏功能），仅授权人员经直接 URL 访问。
  *     真正的访问拦截靠后端 RequireKBAuthorized 白名单中间件，前端守卫仅做体验优化不是安全边界。
  *
+ * 迭代3.5 Phase A 新增（对话式备课工坊骨架）：
+ *   - /lesson-plans index 路由从直接渲染 WorkshopPage 改为渲染 WorkshopModeRouter，
+ *     由其按「URL ?mode= > 教案级记忆 > 全局偏好 > 默认值」决定渲染对话模式或专家模式。
+ *   - WorkshopPage 自身零改动（专家模式永久保留）；ConversationModePage 为新增对话模式页面。
+ *   - WorkshopModeRouter 内部静态引入两个页面（两者同属 index 路由 chunk，按需加载边界不变）。
+ *   - 全局回退：workshop/conversation/workshopMode.ts 的 DEFAULT_WORKSHOP_MODE 改 'expert' 一行。
+ *
  * 分包策略（Vite 自动按 dynamic import 边界拆分）：
  *   - 主 chunk：路由框架 + 布局组件 + 守卫
  *   - 课件审核板块 chunk
@@ -32,7 +60,7 @@
  *   - admin/配置类 chunk
  *   - 各独立页面各自 chunk
  */
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useParams } from 'react-router-dom'
 import { Suspense, lazy, Component, type ReactNode, type ErrorInfo } from 'react'
 import { AuthContext } from '@/store/auth'
 import { useAuth } from '@/store/auth'
@@ -59,7 +87,9 @@ const ReviewCenterPage = lazy(() => import('@/pages/review/ReviewCenterPage'))
 const SettingsPage = lazy(() => import('@/pages/settings/SettingsPage'))
 
 /* ==================== 教案系统（懒加载） ==================== */
-const WorkshopPage = lazy(() => import('@/pages/lesson-plans/workshop/WorkshopPage'))
+/* 迭代3.5 Phase A：index 路由改挂模式路由器（内部含 WorkshopPage 与 ConversationModePage） */
+const WorkshopModeRouter = lazy(() => import('@/pages/lesson-plans/workshop/WorkshopModeRouter'))
+const MyAssistantsPage = lazy(() => import('@/pages/lesson-plans/my-assistants/MyAssistantsPage'))
 const MyPlansPage = lazy(() => import('@/pages/lesson-plans/my-plans/MyPlansPage'))
 const LibraryPage = lazy(() => import('@/pages/lesson-plans/library/LibraryPage'))
 const ComponentsPage = lazy(() => import('@/pages/lesson-plans/components/ComponentsPage'))
@@ -71,11 +101,11 @@ const ReviewV2DashboardPage = lazy(() => import('@/pages/lesson-plans/review-v2/
 const TokenDashboardPage = lazy(() => import('@/pages/tokens/TokenDashboardPage'))
 const ReviewWorkbenchPage = lazy(() => import('@/pages/lesson-plans/review/ReviewWorkbenchPage'))
 const RecipesPage = lazy(() => import('@/pages/lesson-plans/recipes/RecipesPage'))
-const RecipeEditorPage = lazy(() => import('@/pages/lesson-plans/recipes/RecipeEditorPage'))
 const RecipeWizardPage = lazy(() => import('@/pages/lesson-plans/recipes/RecipeWizardPage'))
 const StagesConfigPage = lazy(() => import('@/pages/lesson-plans/stages-config/StagesConfigPage'))
 const AssessmentPage = lazy(() => import('@/pages/lesson-plans/assessment/AssessmentPage'))
 const TextbooksPage = lazy(() => import('@/pages/lesson-plans/textbooks/TextbooksPage'))
+const MyTeachingResourcesPage = lazy(() => import('@/pages/lesson-plans/resources/MyTeachingResourcesPage'))
 
 /* ==================== 课件工坊（懒加载） ==================== */
 const CoursewareListPage = lazy(() => import('@/pages/courseware/CoursewareListPage'))
@@ -179,6 +209,18 @@ function RoleGuard({ children, roles }: { children: React.ReactNode; roles: stri
 }
 
 /**
+ * EditRedirect — 配方旧编辑路由 recipes/:id/edit 的动态重定向（批次4）
+ *   React Router v6 的 <Navigate to> 不会自动替换路径参数，故用 useParams 取出当前 :id，
+ *   再重定向到分步向导编辑态 /lesson-plans/recipes/wizard/:id（replace 不留历史）。
+ *   缺 id 兜底回配方列表，避免拼出畸形 URL。
+ */
+function EditRedirect() {
+  const { id } = useParams<{ id: string }>()
+  if (!id) return <Navigate to="/lesson-plans/recipes" replace />
+  return <Navigate to={`/lesson-plans/recipes/wizard/${id}`} replace />
+}
+
+/**
  * ModuleGuard 门户板块守卫（v172）
  * 校验用户所属组织是否开通了指定板块（portal_modules[moduleKey]）。
  * 规则：
@@ -269,23 +311,39 @@ export default function App() {
             } />
 
             <Route path="/lesson-plans" element={<AuthGuard><LPLayout /></AuthGuard>}>
-              <Route index element={<WorkshopPage />} />
+              {/* 迭代3.5 Phase A：index 改挂模式路由器（对话模式/专家模式按偏好分发） */}
+              <Route index element={<WorkshopModeRouter />} />
+              {/* 提示词工坊 阶段A：我的 AI 助手（对话式造助手 + 现成助手复用） */}
+              <Route path="my-assistants"   element={<MyAssistantsPage />} />
               <Route path="my-plans"         element={<MyPlansPage />} />
               <Route path="library"          element={<LibraryPage />} />
               <Route path="plans/:id"        element={<PlanDetailPage />} />
               <Route path="review"           element={<ReviewCenterLPPage />} />
               <Route path="review-v2"        element={<ReviewV2DashboardPage />} />
               <Route path="tokens"           element={<TokenDashboardPage />} />
-              <Route path="components"       element={<ComponentsPage />} />
+              {/* 优先级2：组件管理收敛为 admin + senior_operator（菜单 roles + 此处 RoleGuard 双重保护） */}
+              <Route path="components"       element={<RoleGuard roles={['admin','senior_operator']}><ComponentsPage /></RoleGuard>} />
               <Route path="templates"        element={<TemplatesPage />} />
               <Route path="templates/:id"    element={<TemplateEditorPage />} />
-              <Route path="recipes"          element={<RecipesPage />} />
-              <Route path="recipes/wizard"   element={<RecipeWizardPage />} />
-              <Route path="recipes/new"      element={<RecipeEditorPage />} />
-              <Route path="recipes/:id/edit" element={<RecipeEditorPage />} />
+              {/* 优先级2 + 配方搭建一页化批次4：备课配方收敛为 admin + senior_operator（生产端）。
+                  路由全守卫，防直接敲 URL。消费端（StartForm 选用现成配方）在 WorkshopPanels 内，不受本守卫影响。
+                  编辑入口已从旧单页编辑器迁移到分步向导：
+                    recipes/wizard       新建（无 id）
+                    recipes/wizard/:id   编辑（有 id，与新建共用 RecipeWizardPage，useParams 区分）
+                    recipes/new          → 重定向 /wizard（旧路由兜底）
+                    recipes/:id/edit     → 经 EditRedirect 动态重定向 /wizard/:id（旧路由兜底）
+                  【清backlog】旧单页编辑器 RecipeEditorPage 文件与其 lazy import 已删除。 */}
+              <Route path="recipes"            element={<RoleGuard roles={['admin','senior_operator']}><RecipesPage /></RoleGuard>} />
+              <Route path="recipes/wizard"     element={<RoleGuard roles={['admin','senior_operator']}><RecipeWizardPage /></RoleGuard>} />
+              <Route path="recipes/wizard/:id" element={<RoleGuard roles={['admin','senior_operator']}><RecipeWizardPage /></RoleGuard>} />
+              <Route path="recipes/new"        element={<RoleGuard roles={['admin','senior_operator']}><Navigate to="/lesson-plans/recipes/wizard" replace /></RoleGuard>} />
+              <Route path="recipes/:id/edit"   element={<RoleGuard roles={['admin','senior_operator']}><EditRedirect /></RoleGuard>} />
               <Route path="stages-config"    element={<RoleGuard roles={['admin']}><StagesConfigPage /></RoleGuard>} />
               <Route path="assessment"       element={<AssessmentPage />} />
               <Route path="textbooks"        element={<TextbooksPage />} />
+              <Route path="resources" element={<RoleGuard roles={['admin','senior_operator','operator']}><MyTeachingResourcesPage /></RoleGuard>} />
+              {/* 旧路径重定向，防存量书签 404 */}
+              <Route path="course-outlines" element={<Navigate to="/lesson-plans/resources" replace />} />
             </Route>
 
             <Route path="*" element={<Navigate to="/" replace />} />

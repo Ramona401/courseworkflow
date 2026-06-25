@@ -10,6 +10,16 @@
  *   - parseInline 升级:用统一正则切分粗体/图片/链接,顺序判断避免误匹配
  *     (! 前缀的图片必须先于普通链接判断)
  *   - 不破坏既有功能:标题/列表/粗体/分割线一切照旧
+ *
+ * D-P1-18(表格) 改动:
+ *   - renderMarkdown 新增 GFM 表格支持。含表格的教案此前因解析器不识别表格语法,
+ *     "| 列1 | 列2 |" 会被当成普通段落原样显示成竖线文本。
+ *   - 识别规则:某行形如 "| ... |"(或不带首尾竖线的 "a | b | c"),且【下一行】是
+ *     分隔行 "|---|---|"(单元格内容仅 - : 空格),则从当前行起前瞻收集所有连续的
+ *     表格行,整体渲染成 <table>:首行为表头(<th>),分隔行后的为数据行(<td>)。
+ *   - 单元格内容仍走 parseInline,故表格内可有粗体/链接/行内图片。
+ *   - 因表格是跨多行的块,主循环由 for...of 改为带索引的 while,以支持前瞻与跳行;
+ *     其余所有分支(图片/分割线/标题/列表/段落)逻辑逐字保留不变。
  */
 import type { LessonPlanStatus } from '@/api/lesson-plans'
 
@@ -91,6 +101,30 @@ export function fmtDate(iso: string): string {
   } catch { return iso }
 }
 
+// D-P1-18: 判断一行是否像表格行（含至少一个竖线分隔，且不是分割线 ---）
+function isTableRowLine(t: string): boolean {
+  if (!t.includes('|')) return false
+  if (/^---+$/.test(t)) return false  // 纯分割线不算
+  return true
+}
+
+// D-P1-18: 判断一行是否为表格分隔行（|---|:--:|--- 这类，单元格只含 - : 空格）
+function isTableSeparatorLine(t: string): boolean {
+  if (!t.includes('|') && !t.includes('-')) return false
+  const cells = splitTableCells(t)
+  if (cells.length === 0) return false
+  // 每个单元格必须是 仅由 - : 空格 组成，且至少含一个 -
+  return cells.every(c => /^:?-+:?$/.test(c.trim())) && cells.some(c => c.includes('-'))
+}
+
+// D-P1-18: 切分一行表格单元格——去掉首尾竖线后按 | 切，trim 每格
+function splitTableCells(line: string): string[] {
+  let s = line.trim()
+  if (s.startsWith('|')) s = s.slice(1)
+  if (s.endsWith('|')) s = s.slice(0, -1)
+  return s.split('|').map(c => c.trim())
+}
+
 /**
  * 轻量Markdown渲染器
  * v124 支持的语法:
@@ -99,6 +133,7 @@ export function fmtDate(iso: string): string {
  *     - / 1.    列表
  *     ---       分割线
  *     ![alt](url)  整行图片 → 居中大图+图注 (v124 新增)
+ *     | a | b |    表格(配 |---| 分隔行) (D-P1-18 新增)
  *   行内(在 parseInline 中处理):
  *     **粗体**
  *     ![alt](url)  行内小图 (v124 新增)
@@ -170,9 +205,61 @@ export function renderMarkdown(text: string): React.ReactNode {
     listItems = []; listType = null
   }
 
-  for (const line of lines) {
+  // D-P1-18: 渲染一张表格——headerCells 表头，rows 各数据行单元格数组
+  const renderTable = (headerCells: string[], rows: string[][]): React.ReactNode => {
+    const cols = headerCells.length
+    return (
+      <div key={key++} style={{ overflowX: 'auto', margin: '12px 0' }}>
+        <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: '14px' }}>
+          <thead>
+            <tr>
+              {headerCells.map((h, i) => (
+                <th key={i} style={{ border: `1px solid ${C.borderHover}`, background: C.primaryLight, color: C.text, fontWeight: 700, padding: '8px 10px', textAlign: 'left', whiteSpace: 'nowrap' }}>
+                  {parseInline(h)}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, ri) => (
+              <tr key={ri} style={{ background: ri % 2 === 1 ? C.bg : C.card }}>
+                {/* 补齐/截断到表头列数，避免某行单元格数不一致导致错位 */}
+                {Array.from({ length: cols }).map((_, ci) => (
+                  <td key={ci} style={{ border: `1px solid ${C.border}`, color: C.text, padding: '8px 10px', lineHeight: 1.6, verticalAlign: 'top' }}>
+                    {parseInline(r[ci] ?? '')}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+
+  // D-P1-18: 主循环改为带索引的 while，以支持表格块的前瞻收集与跳行
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
     const t = line.trim()
-    if (!t) { flushList(); continue }
+    if (!t) { flushList(); i++; continue }
+
+    // ==================== D-P1-18: 表格块（当前行像表格行 且 下一行是分隔行）====================
+    if (isTableRowLine(t) && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1].trim())) {
+      flushList()
+      const headerCells = splitTableCells(t)
+      const rows: string[][] = []
+      let j = i + 2  // 跳过表头行 + 分隔行，从数据行开始
+      while (j < lines.length) {
+        const rt = lines[j].trim()
+        if (!isTableRowLine(rt)) break  // 遇到非表格行，表格结束
+        rows.push(splitTableCells(rt))
+        j++
+      }
+      nodes.push(renderTable(headerCells, rows))
+      i = j  // 跳过整个表格块
+      continue
+    }
 
     // ==================== v124: 整行只有图片 → 居中块级大图 ====================
     const imgOnly = t.match(/^!\[([^\]]*)\]\(([^)]+)\)$/)
@@ -221,30 +308,31 @@ export function renderMarkdown(text: string): React.ReactNode {
           )}
         </div>
       )
-      continue
+      i++; continue
     }
 
     // 分割线
     if (/^---+$/.test(t)) {
       flushList()
       nodes.push(<hr key={key++} style={{ border: 'none', borderTop: `1px solid ${C.border}`, margin: '10px 0' }} />)
-      continue
+      i++; continue
     }
     // 标题
     const h3 = t.match(/^###\s+(.+)/)
-    if (h3) { flushList(); nodes.push(<div key={key++} style={{ fontSize: '14px', fontWeight: 700, color: C.text, margin: '10px 0 4px' }}>{parseInline(h3[1])}</div>); continue }
+    if (h3) { flushList(); nodes.push(<div key={key++} style={{ fontSize: '14px', fontWeight: 700, color: C.text, margin: '10px 0 4px' }}>{parseInline(h3[1])}</div>); i++; continue }
     const h2 = t.match(/^##\s+(.+)/)
-    if (h2) { flushList(); nodes.push(<div key={key++} style={{ fontSize: '15px', fontWeight: 700, color: C.text, margin: '12px 0 4px' }}>{parseInline(h2[1])}</div>); continue }
+    if (h2) { flushList(); nodes.push(<div key={key++} style={{ fontSize: '15px', fontWeight: 700, color: C.text, margin: '12px 0 4px' }}>{parseInline(h2[1])}</div>); i++; continue }
     const h1 = t.match(/^#\s+(.+)/)
-    if (h1) { flushList(); nodes.push(<div key={key++} style={{ fontSize: '16px', fontWeight: 700, color: C.text, margin: '14px 0 6px' }}>{parseInline(h1[1])}</div>); continue }
+    if (h1) { flushList(); nodes.push(<div key={key++} style={{ fontSize: '16px', fontWeight: 700, color: C.text, margin: '14px 0 6px' }}>{parseInline(h1[1])}</div>); i++; continue }
     // 列表
     const ul = t.match(/^[-*]\s+(.+)/)
-    if (ul) { if (listType !== 'ul') { flushList(); listType = 'ul' }; listItems.push(<li key={key++} style={{ fontSize: '14px', color: C.text, lineHeight: 1.7, marginBottom: '2px' }}>{parseInline(ul[1])}</li>); continue }
+    if (ul) { if (listType !== 'ul') { flushList(); listType = 'ul' }; listItems.push(<li key={key++} style={{ fontSize: '14px', color: C.text, lineHeight: 1.7, marginBottom: '2px' }}>{parseInline(ul[1])}</li>); i++; continue }
     const ol = t.match(/^\d+\.\s+(.+)/)
-    if (ol) { if (listType !== 'ol') { flushList(); listType = 'ol' }; listItems.push(<li key={key++} style={{ fontSize: '14px', color: C.text, lineHeight: 1.7, marginBottom: '2px' }}>{parseInline(ol[1])}</li>); continue }
+    if (ol) { if (listType !== 'ol') { flushList(); listType = 'ol' }; listItems.push(<li key={key++} style={{ fontSize: '14px', color: C.text, lineHeight: 1.7, marginBottom: '2px' }}>{parseInline(ol[1])}</li>); i++; continue }
     // 普通段落
     flushList()
     nodes.push(<div key={key++} style={{ fontSize: '15px', color: C.text, lineHeight: 1.7, marginBottom: '2px' }}>{parseInline(t)}</div>)
+    i++
   }
   flushList()
   return <>{nodes}</>

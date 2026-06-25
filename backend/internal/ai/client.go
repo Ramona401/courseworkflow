@@ -307,6 +307,13 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 		return nil, fmt.Errorf(errMsg)
 	}
 
+	// 模型境内/境外分流：按学校授权策略原地改写 cfg.Model 与 FallbackModels
+	// 未授权学校（含无 SchoolID）一律降级境内模型（qwen-max/豆包）
+	applyModelPolicy(cfg, traceCtx)
+
+	// v197修复：分流可能整通道切换 cfg.APIBaseURL，endpoint 须在分流后重算，否则境内key发到境外网关致401
+	endpoint = strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
+
 	// -------- 第1阶段：主模型调用（带完整重试）--------
 	primaryModel := cfg.Model
 	result, err := callAIWithRetries(cfg, primaryModel, messages, endpoint, MaxRetries)

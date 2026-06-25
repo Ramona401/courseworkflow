@@ -228,6 +228,35 @@ export async function advancedConcatCWVideos(
   return extractData(resp)
 }
 
+// ==================== S-V1 配音混入成片 ====================
+
+/** S-V1: 配音混音响应（后端 MixNarrationResponse） */
+export interface MixNarrationResponse {
+  asset_id: string
+  url: string
+  duration: string
+  narration_count: number
+  skipped_count: number
+  message: string
+}
+
+/** S-V1: 把字幕轨中已生成的TTS配音按时间轴混入指定视频，产出新视频资产 */
+export async function mixNarrationCWVideo(
+  coursewareId: string,
+  assetId: string,
+  subtitleId: string,
+  gain?: number,
+): Promise<MixNarrationResponse> {
+  const body: Record<string, unknown> = { asset_id: assetId, subtitle_id: subtitleId }
+  if (gain && gain !== 1.0) body.gain = gain
+  const resp = await apiClient.post(
+    `/coursewares/${coursewareId}/videos/mix-narration`,
+    body,
+    { timeout: 180000 }, // 混音含ffmpeg处理，给足3分钟
+  )
+  return extractData(resp)
+}
+
 // ==================== v0.42.4 视频静音 + 音轨分离 ====================
 
 /** v0.42.4: 视频静音（去除音轨，生成新的静音视频） */

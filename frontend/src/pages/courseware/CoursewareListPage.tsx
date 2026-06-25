@@ -1,7 +1,12 @@
 /**
  * 课件工坊列表页 — CoursewareListPage v4.1
  *
- * v4.1 变更（本次）：
+ * v202 学科统一（本次）：
+ *   SUBJECTS 三端（备课工坊/配方向导/课件工坊）统一为同一份 17 学科清单。
+ *   课件工坊原有 15 学科补「政治」与「劳动」、'信息科技'保持不变（本就对齐课标库），
+ *   并按统一顺序重排（'道德与法治'用全称对齐后端 SubjectCodeMap）。
+ *
+ * v4.1 变更：
  *   - 删除按钮对所有状态的课件都可见（此前仅 draft 草稿才显示删除按钮，
  *     导致"方案编辑中/风格选择中/课件生成中"等中间状态无法删除）。
  *     删除前仍走 window.confirm 二次确认（见 handleDelete）。
@@ -44,10 +49,12 @@ const SOURCE_CONFIG: Record<string, { label: string; color: string; bg: string; 
   '3d_single':  { label: '3D互动', color: '#DC2626', bg: '#FEE2E2', emoji: '🎮' },
 }
 
-// 学科列表（与备课工坊一致）
+// 学科列表（与备课工坊/配方向导统一为同一份 17 学科）
+// v202 学科统一：补「政治」「劳动」，'信息科技'保持对齐课标库，'道德与法治'用全称对齐后端编码表。
 const SUBJECTS = [
-  '语文', '数学', '英语', '物理', '化学', '生物', '历史', '地理', '政治',
-  '信息科技', '人工智能', '科学', '音乐', '美术', '体育',
+  '语文', '数学', '英语', '人工智能', '物理', '化学', '生物',
+  '历史', '地理', '政治', '信息科技', '科学',
+  '道德与法治', '音乐', '美术', '体育', '劳动',
 ]
 
 interface LPItem { id: string; title: string; subject: string; grade: string; status: string }
@@ -68,6 +75,8 @@ export default function CoursewareListPage() {
   const [plans, setPlans] = useState<LPItem[]>([])
   const [plansLoading, setPlansLoading] = useState(false)
   const [selectedPlanId, setSelectedPlanId] = useState('')
+  // P2-02: 从教案创建弹窗的搜索关键词（按 名称/学科/年级 模糊过滤教案列表）
+  const [planSearch, setPlanSearch] = useState('')
 
   // 从主题创建相关
   const [topicSubject, setTopicSubject] = useState('')
@@ -120,6 +129,7 @@ export default function CoursewareListPage() {
     setShowCreate(true)
     setCreateMode('select')
     setSelectedPlanId('')
+    setPlanSearch('')  // P2-02: 每次开弹窗清空教案搜索词
     setTopicSubject(''); setTopicGrade(''); setTopicName(''); setTopicNotes(''); setTopicKPCodes([])
     setPptFile(null); setPptSubject(''); setPptGrade(''); setPptTitle('')
     setDocFile(null); setDocSubject(''); setDocGrade(''); setDocTitle('')
@@ -398,6 +408,15 @@ export default function CoursewareListPage() {
                 <div style={{ fontSize: '18px', fontWeight: 700, color: C.textPrimary }}>📝 从教案创建</div>
               </div>
               <div style={{ fontSize: '14px', color: C.textSecondary, marginBottom: '16px' }}>选择一份已完成的教案，AI将基于教案内容自动生成课件</div>
+              {/* P2-02: 教案搜索框——按 名称/学科/年级 模糊过滤；仅在有教案且非加载态时显示 */}
+              {!plansLoading && plans.length > 0 && (
+                <input
+                  value={planSearch}
+                  onChange={e => setPlanSearch(e.target.value)}
+                  placeholder="🔍 搜索教案（名称 / 学科 / 年级）"
+                  style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box', marginBottom: '12px' }}
+                />
+              )}
               {plansLoading ? (
                 <div style={{ textAlign: 'center', padding: '40px 0', color: C.textMuted }}>加载教案列表...</div>
               ) : plans.length === 0 ? (
@@ -405,9 +424,25 @@ export default function CoursewareListPage() {
                   <div style={{ fontSize: '14px', color: C.textSecondary }}>没有可用的教案</div>
                   <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '6px' }}>请先在备课工坊完成教案开发</div>
                 </div>
-              ) : (
+              ) : (() => {
+                // P2-02: 按搜索词过滤——名称/学科/年级任一命中即保留；空搜索词=全部
+                const kw = planSearch.trim().toLowerCase()
+                const plansFiltered = kw
+                  ? plans.filter(p =>
+                      (p.title || '').toLowerCase().includes(kw) ||
+                      (p.subject || '').toLowerCase().includes(kw) ||
+                      (p.grade || '').toLowerCase().includes(kw))
+                  : plans
+                if (plansFiltered.length === 0) {
+                  return (
+                    <div style={{ textAlign: 'center', padding: '32px 0', color: C.textMuted, fontSize: '13px', marginBottom: '12px' }}>
+                      未找到匹配「{planSearch}」的教案，换个关键词试试
+                    </div>
+                  )
+                }
+                return (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '300px', overflow: 'auto', marginBottom: '20px' }}>
-                  {plans.map(p => (
+                  {plansFiltered.map(p => (
                     <div key={p.id} onClick={() => setSelectedPlanId(p.id)} style={{
                       padding: '14px 16px', borderRadius: '10px', cursor: 'pointer',
                       border: `2px solid ${selectedPlanId === p.id ? C.primary : C.border}`,
@@ -421,7 +456,8 @@ export default function CoursewareListPage() {
                     </div>
                   ))}
                 </div>
-              )}
+                )
+              })()}
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
                 <button onClick={() => setCreateMode('select')} style={{ ...btnBase, border: `1px solid ${C.border}`, background: 'transparent', color: C.textSecondary }}>返回</button>
                 <button onClick={handleCreateFromPlan} disabled={!selectedPlanId || creating} style={{

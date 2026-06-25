@@ -52,6 +52,7 @@ export type {
   LPSSEEvent,
   ExtractionListItem,
   ExtractionListResponse,
+  SuggestedAction,
   SSEConnectionState,
   SSEConnection,
 } from './lesson-plans.types'
@@ -87,6 +88,7 @@ import type {
   ExtractionHint,
   LPSSEEvent,
   ExtractionListResponse,
+  SuggestedAction,
   SSEConnectionState,
   SSEConnection,
 } from './lesson-plans.types'
@@ -399,16 +401,22 @@ export function createLessonPlanSSE(
   planId: string,
   token: string,
   handlers: {
-    onThinking?: () => void
-    onChunk?: (chunk: string) => void
-    onMessageDone?: (msg: ConversationMessage) => void
+    // 子轮二(B2):chat 主轮次相关事件透出 clientTurnId(后端 client_turn_id),
+    // useConversationSSE 据此过滤"过期轮次"的迟到回复。系统旁路事件该值为空串。
+    onThinking?: (clientTurnId?: string) => void
+    onChunk?: (chunk: string, clientTurnId?: string) => void
+    onMessageDone?: (msg: ConversationMessage, clientTurnId?: string, assistantLabel?: string) => void
     onContentUpdate?: (content: string) => void
     onReviewDone?: (review: AIReviewResult) => void
     onExtractionHint?: (hint: ExtractionHint) => void
     onStageStarted?: (data: StageEventData) => void
     onStageComplete?: (data: StageEventData) => void
     onStageOutput?: (data: StageEventData) => void
-    onError?: (error: string) => void
+    /** 迭代3.5 B-2:建议芯片事件回调(后端解析到合法芯片块才广播;无芯片/解析失败时无此事件) */
+    onSuggestedActions?: (actions: SuggestedAction[], clientTurnId?: string) => void
+    /** 子轮二(重试可见性):空流自动重试时后端广播,content 为提示文案,clientTurnId 为本轮序号 */
+    onRetryNotice?: (content: string, clientTurnId?: string) => void
+    onError?: (error: string, clientTurnId?: string) => void
     onDone?: () => void
     onConnectionStateChange?: (state: SSEConnectionState) => void
     onReconnected?: () => void
@@ -430,21 +438,24 @@ export function createLessonPlanSSE(
       isFirstConnect = false
     })
 
-    es.addEventListener('thinking', () => {
-      handlers.onThinking?.()
+    es.addEventListener('thinking', (e: MessageEvent) => {
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        handlers.onThinking?.(event.client_turn_id)
+      } catch { handlers.onThinking?.() }
     })
 
     es.addEventListener('chunk', (e: MessageEvent) => {
       try {
         const event: LPSSEEvent = JSON.parse(e.data)
-        if (event.chunk) handlers.onChunk?.(event.chunk)
+        if (event.chunk) handlers.onChunk?.(event.chunk, event.client_turn_id)
       } catch { /* 忽略解析错误 */ }
     })
 
     es.addEventListener('message_done', (e: MessageEvent) => {
       try {
         const event: LPSSEEvent = JSON.parse(e.data)
-        if (event.message) handlers.onMessageDone?.(event.message)
+        if (event.message) handlers.onMessageDone?.(event.message, event.client_turn_id, event.assistant_label)
       } catch { /* 忽略解析错误 */ }
     })
 
@@ -490,12 +501,31 @@ export function createLessonPlanSSE(
       } catch { /* 忽略解析错误 */ }
     })
 
+    // 迭代3.5 B-2:建议芯片事件 —— 后端在主 message_done 广播之后单独广播(仅当AI输出了合法芯片块)
+    // 协议安全底线:无芯片/解析失败时后端不发本事件;前端解析失败或空数组也静默忽略,芯片是增强、缺了不阻塞
+    es.addEventListener('suggested_actions', (e: MessageEvent) => {
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        if (event.suggested_actions && event.suggested_actions.length > 0) {
+          handlers.onSuggestedActions?.(event.suggested_actions, event.client_turn_id)
+        }
+      } catch { /* 忽略解析错误 */ }
+    })
+
+    // 子轮二(重试可见性):空流自动重试时后端广播,把"思考中"换成"正在重试…"
+    es.addEventListener('retry_notice', (e: MessageEvent) => {
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        if (event.content) handlers.onRetryNotice?.(event.content, event.client_turn_id)
+      } catch { /* 忽略解析错误 */ }
+    })
+
     es.addEventListener('error', (e: MessageEvent) => {
       if (!e.data) return
       try {
         const event: LPSSEEvent = JSON.parse(e.data)
         if (event.error) {
-          handlers.onError?.(event.error)
+          handlers.onError?.(event.error, event.client_turn_id)
         }
       } catch { /* 静默忽略 */ }
     })
@@ -605,14 +635,14 @@ export async function getStageRecommendedComponents(planId: string, stageCode: s
 }
 
 /** 进入下一阶段(可指定目标阶段,迭代12:支持传入选中组件ID) */
-export async function advanceStage(planId: string, targetStageCode?: string, selectedComponentIds?: string[]) {
+export async function advanceStage(planId: string, targetStageCode?: string, selectedComponentIds?: string[], silentEval?: boolean) {
   const body: Record<string, unknown> = {
     target_stage_code: targetStageCode || '',
   }
   if (selectedComponentIds && selectedComponentIds.length > 0) {
     body.selected_component_ids = selectedComponentIds
   }
-  const resp = await apiClient.post(`/lesson-plans/plans/${planId}/stages/advance`, body)
+  const resp = await apiClient.post(`/lesson-plans/plans/${planId}/stages/advance${silentEval ? '?silent_eval=1' : ''}`, body)
   return resp.data.data as { stage_code: string; stage_name: string }
 }
 

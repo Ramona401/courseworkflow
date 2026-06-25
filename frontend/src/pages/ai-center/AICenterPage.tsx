@@ -6,6 +6,7 @@
  *   - 降级模型选择器 → components/FallbackModelsPicker.tsx
  *   - 场景配置Tab → components/SceneConfigPanel.tsx
  *   - 本文件保留：主页面框架 + 状态管理 + 连接配置Tab
+ * S-V1.5b：连接配置Tab新增TTS语音合成配置卡片 → components/TTSConfigCard.tsx
  */
 import { useState, useEffect, useCallback } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
@@ -18,6 +19,10 @@ import type { GlobalConfig, SceneConfig, UpdateSceneConfigRequest } from '@/api/
 import { AI_PROVIDERS, C, Toast, ProviderItem, ModelSelect } from './components/AICenterConstants'
 import type { AIProvider } from './components/AICenterConstants'
 import SceneConfigPanel from './components/SceneConfigPanel'
+import TTSConfigCard from './components/TTSConfigCard'
+import DomesticGatewayCard from './components/DomesticGatewayCard'
+import GatewayNamingCard from './components/GatewayNamingCard'
+import ModelAliasCard from './components/ModelAliasCard'
 
 export default function AICenterPage() {
   const navigate = useNavigate()
@@ -295,8 +300,13 @@ export default function AICenterPage() {
             ))}
           </div>
 
-          {/* Tab: 连接配置 */}
+          {/* Tab: 连接配置（文本AI主配置卡片 + TTS语音合成卡片） */}
           {activeTab === 'connection' && (
+            <>
+            {/* 批三-1：网关命名卡片（对外展示名，置于连接配置Tab最顶部） */}
+            <GatewayNamingCard showToast={showToast} />
+            {/* 批三-2：模型别名映射管理卡片 */}
+            <ModelAliasCard showToast={showToast} />
             <div style={{ background: C.card, borderRadius: '16px', border: `1px solid ${C.border}`, boxShadow: '0 2px 8px rgba(0,0,0,0.04)' }}>
               <div style={{ padding: '18px 24px', borderBottom: `1px solid ${C.border}` }}>
                 <div style={{ fontSize: '15px', fontWeight: 600, color: C.text }}>API 连接配置</div>
@@ -437,6 +447,12 @@ export default function AICenterPage() {
                 </div>
               </div>
             </div>
+
+            {/* S-V1.5b：TTS语音合成配置卡片（独立组件，复用页面Toast通道） */}
+            {/* 批一：境内文本网关配置卡片（双网关分流降级通道，置于TTS卡片之前） */}
+            <DomesticGatewayCard showToast={showToast} />
+            <TTSConfigCard showToast={showToast} />
+            </>
           )}
 
           {/* Tab: 场景配置（使用拆分后的SceneConfigPanel组件）*/}

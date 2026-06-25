@@ -113,7 +113,43 @@ func registerAdminRoutes(
                 methodNotAllowedJSON(w, "未知的教研组子路径")
         }), authMW, adminOrSchoolAdmin))
 
-        // ==================== 角色权限管理(admin only 专属)====================
+        // ==================== 学校境外模型授权策略(admin only 专属·批二)====================
+	// 平台级境外放行,不下放给 senior/region_admin。默认所有学校境内,仅 admin 显式授权某校走境外。
+	// GET    /api/v1/admin/school-model-policies            — 列出全部已授权/已登记学校
+	// GET    /api/v1/admin/school-model-policies/{schoolID} — 查单校当前策略(无记录返默认境内)
+	// PUT    /api/v1/admin/school-model-policies/{schoolID} — 授权/取消授权(body:{overseas_enabled,note})
+	// DELETE /api/v1/admin/school-model-policies/{schoolID} — 删除记录(=回到默认境内)
+	smpHandler := handlers.NewSchoolModelPolicyHandler()
+	mux.Handle("/api/v1/admin/school-model-policies",
+		middleware.Chain(http.HandlerFunc(smpHandler.ListPolicies), authMW, adminOnly))
+	mux.Handle("/api/v1/admin/school-model-policies/",
+		middleware.Chain(http.HandlerFunc(smpHandler.HandlePolicyByID), authMW, adminOnly))
+
+	// ==================== 双网关展示名(对外可读别名·admin only·批三-1)====================
+	// 给境外/境内两网关各起业务展示名,供配置界面与将来老师侧渲染读取(老师侧公开读接口在批三-3接)。
+	// GET /api/v1/admin/gateway-naming — 查看两网关展示名
+	// PUT /api/v1/admin/gateway-naming — 更新(overseas_label/domestic_label,留空不修改)
+	gnHandler := handlers.NewGatewayNamingHandler()
+	mux.Handle("/api/v1/admin/gateway-naming",
+		middleware.Chain(http.HandlerFunc(gnHandler.HandleGatewayNaming), authMW, adminOnly))
+
+	// ==================== 模型别名映射规则(对外可读别名·admin only·批三-2)====================
+	// 真实模型名→业务别名映射(exact精确/prefix前缀,精确优先)。老师侧据此渲染替换在批三-3接。
+	// GET/POST   /api/v1/admin/model-alias/rules        — 列表/新增规则
+	// PUT/DELETE /api/v1/admin/model-alias/rules/{id}   — 更新/删除规则
+	// GET/PUT    /api/v1/admin/model-alias/fallback     — 查/改兜底别名
+	// POST       /api/v1/admin/model-alias/preview      — 预览(输入模型名→返回别名,自测)
+	maHandler := handlers.NewModelAliasHandler()
+	mux.Handle("/api/v1/admin/model-alias/rules",
+		middleware.Chain(http.HandlerFunc(maHandler.HandleRules), authMW, adminOnly))
+	mux.Handle("/api/v1/admin/model-alias/rules/",
+		middleware.Chain(http.HandlerFunc(maHandler.HandleRuleByID), authMW, adminOnly))
+	mux.Handle("/api/v1/admin/model-alias/fallback",
+		middleware.Chain(http.HandlerFunc(maHandler.HandleFallback), authMW, adminOnly))
+	mux.Handle("/api/v1/admin/model-alias/preview",
+		middleware.Chain(http.HandlerFunc(maHandler.PreviewAlias), authMW, adminOnly))
+
+	// ==================== 角色权限管理(admin only 专属)====================
 
         mux.Handle("/api/v1/admin/roles", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
                 switch r.Method {

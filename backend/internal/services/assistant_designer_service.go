@@ -46,18 +46,26 @@ package services
 //      在 JSON 格式硬性约束段明确要求 reply_text / updated_draft 的文本值里,
 //      所有引用/强调一律使用中文引号「」或书名号《》,不要用英文双引号 "。
 //      这是源头预防,LLM 遵守度有限,所以必须搭配策略 4 才保险。
+//
+// v194 (组件中文名 bug 根治 + 语义级实时组件推荐):
+//   - 修复 A:ComponentBrief 的 JSON tag 与前端 DesignerComponentBrief 对齐——Name 的 tag
+//     改回 "name"、补 LibraryName 字段(tag "library_name"),组装时塞 fc.LibraryName。
+//     老 bug 是 tag 不一致致前端读到 undefined 回退显示 library_type(code),非后端填错值。
+//   - 修复 B:语义级实时组件推荐。召回池放大(6/类),扁平化后用老师当轮发言复用同包
+//     skill_router 的词法精排零件(extractRerankKeywords/scoreCandidateLexical)取全局 Top-4,
+//     无发言/全 0 分时按原序保底。细节见 parse 文件与 AOCI 索引 v194 条目。
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"strings"
+        "context"
+        "encoding/json"
+        "fmt"
+        "strings"
 
-	"tedna/internal/ai"
-	"tedna/internal/logger"
-	"tedna/internal/models"
-	"tedna/internal/repository"
-	"tedna/internal/utils"
+        "tedna/internal/ai"
+        "tedna/internal/logger"
+        "tedna/internal/models"
+        "tedna/internal/repository"
+        "tedna/internal/utils"
 )
 
 // designerLog 模块级结构化日志器
@@ -210,50 +218,66 @@ JSON 格式的硬性约束(务必遵守):
 
 // DesignerContext 每次对话的上下文(从 Modal 透传过来)
 type DesignerContext struct {
-	Subject      string   // Modal 选的学科(可空=不限)
-	Grade        string   // Modal 选的年级(可空=不限)
-	Scenes       []string // Modal 勾选的适用场景(影响查库 library_type 推断)
-	CurrentDraft string   // 当前已有的 full_prompt 草稿(首次对话可空)
+        Subject      string   // Modal 选的学科(可空=不限)
+        Grade        string   // Modal 选的年级(可空=不限)
+        Scenes       []string // Modal 勾选的适用场景(影响查库 library_type 推断)
+        CurrentDraft string   // 当前已有的 full_prompt 草稿(首次对话可空)
 }
 
 // DesignerMessage 对话历史中的一条消息
 type DesignerMessage struct {
-	Role    string `json:"role"`    // user | assistant
-	Content string `json:"content"` // 老师的原话或 AI 的 reply_text
+        Role    string `json:"role"`    // user | assistant
+        Content string `json:"content"` // 老师的原话或 AI 的 reply_text
 }
 
 // AIDesignerDecision AI 第一阶段返回的结构化决策(从响应 JSON 中解析)
 type AIDesignerDecision struct {
-	Action       string                 `json:"action"` // search_components | draft_directly | clarify
-	QueryParams  map[string]interface{} `json:"query_params"`
-	ReplyText    string                 `json:"reply_text"`
-	UpdatedDraft string                 `json:"updated_draft"`
+        Action       string                 `json:"action"` // search_components | draft_directly | clarify
+        QueryParams  map[string]interface{} `json:"query_params"`
+        ReplyText    string                 `json:"reply_text"`
+        UpdatedDraft string                 `json:"updated_draft"`
 }
 
 // ComponentBrief 组件的简要信息(推给前端展示"引用了哪些组件")
-// Subject/Grade 这两字段由 DesignerContext 统一注入,因为 MatchedComponent 本身没有这俩字段
+//
+// v194 数据契约修复:字段 JSON tag 必须与前端 DesignerComponentBrief 严格一致——
+// 前端期望 {id, name, library_type, library_name},SSE handler 的 OnComponents
+// 直接 json.Marshal 推送,字段名完全照下方 tag 走。任何一处 tag 与前端对不上,
+// 前端就会读到 undefined 并回退显示成 library_type(code),这正是老 bug 的根因。
+//
+//   - Name        → tag "name"        :组件真实中文标题(取自 MatchedComponent.DisplayLabel)
+//   - LibraryName → tag "library_name":组件所属库的中文名(取自 group.LibraryName,
+//                    如"常见设计缺陷库";扁平化时由 flattenMatchedGroups 从 group 带出)
+//   - LibraryType → tag "library_type":库类型 code(如 design_defect),前端在 library_name
+//                    缺失时才回退显示它,正常情况下只用作内部标识
+//
+// Subject/Grade 这两字段由 DesignerContext 统一注入,因为 MatchedComponent 本身没有这俩字段。
 type ComponentBrief struct {
-	ID          string `json:"id"`
-	Name        string `json:"display_label"`
-	LibraryType string `json:"library_type"`
-	Subject     string `json:"subject"`
-	Grade       string `json:"grade_range"`
+        ID          string `json:"id"`
+        Name        string `json:"name"`
+        LibraryType string `json:"library_type"`
+        LibraryName string `json:"library_name"`
+        Subject     string `json:"subject"`
+        Grade       string `json:"grade_range"`
 }
 
 // DesignerStreamCallbacks SSE 流式回调定义(handler 层会包装成 SSE 事件)
 type DesignerStreamCallbacks struct {
-	OnSearching  func(reason string)                                   // AI 决定调库时
-	OnComponents func(briefs []*ComponentBrief)                        // 查到组件后
-	OnChunk      func(text string)                                     // AI 最终回复的流式文本
-	OnDone       func(reply string, draft string, referenced []string) // 完成
-	OnError      func(err string)
+        OnSearching  func(reason string)                                   // AI 决定调库时
+        OnComponents func(briefs []*ComponentBrief)                        // 查到组件后
+        OnChunk      func(text string)                                     // AI 最终回复的流式文本
+        OnDone       func(reply string, draft string, referenced []string) // 完成
+        OnError      func(err string)
 }
 
-// flatComponent 扁平化后的组件包装(把父 group 的 LibraryType 合并进来)
+// flatComponent 扁平化后的组件包装(把父 group 的 LibraryType / LibraryName 合并进来)
+//
+// v194 说明:LibraryName 在此早已存在(由 flattenMatchedGroups 从 group.LibraryName 填充),
+// 老 bug 只是组装 ComponentBrief 时漏了把它塞进去,且 brief 字段 tag 写错。本次一并修正。
 type flatComponent struct {
-	LibraryType string
-	LibraryName string
-	Data        *models.MatchedComponent
+        LibraryType string
+        LibraryName string
+        Data        *models.MatchedComponent
 }
 
 // ============================================================================
@@ -261,19 +285,19 @@ type flatComponent struct {
 // ============================================================================
 
 type AssistantDesignerService struct {
-	aesKey       string
-	apiBaseURL   string
-	apiKey       string
-	defaultModel string
+        aesKey       string
+        apiBaseURL   string
+        apiKey       string
+        defaultModel string
 }
 
 func NewAssistantDesignerService(aesKey, apiBaseURL, apiKey, defaultModel string) *AssistantDesignerService {
-	return &AssistantDesignerService{
-		aesKey:       aesKey,
-		apiBaseURL:   apiBaseURL,
-		apiKey:       apiKey,
-		defaultModel: defaultModel,
-	}
+        return &AssistantDesignerService{
+                aesKey:       aesKey,
+                apiBaseURL:   apiBaseURL,
+                apiKey:       apiKey,
+                defaultModel: defaultModel,
+        }
 }
 
 // ============================================================================
@@ -281,63 +305,63 @@ func NewAssistantDesignerService(aesKey, apiBaseURL, apiKey, defaultModel string
 // ============================================================================
 
 func (s *AssistantDesignerService) DesignChat(
-	ctx context.Context,
-	userMessage string,
-	history []DesignerMessage,
-	dCtx *DesignerContext,
-	callbacks *DesignerStreamCallbacks,
+        ctx context.Context,
+        userMessage string,
+        history []DesignerMessage,
+        dCtx *DesignerContext,
+        callbacks *DesignerStreamCallbacks,
 ) error {
-	if strings.TrimSpace(userMessage) == "" {
-		return fmt.Errorf("老师消息不能为空")
-	}
-	if callbacks == nil {
-		return fmt.Errorf("缺少流式回调")
-	}
+        if strings.TrimSpace(userMessage) == "" {
+                return fmt.Errorf("老师消息不能为空")
+        }
+        if callbacks == nil {
+                return fmt.Errorf("缺少流式回调")
+        }
 
-	// ------- 获取 AI 配置 -------
-	// v114 修复 1:从 lesson_plan 独立到 assistant_designer 场景
-	// 管理员可在 AI 管理中心前端单独调 Designer 的模型/温度/降级链
-	aiCfg, err := ai.GetEffectiveConfig(
-		s.aesKey, models.SceneAssistantDesigner,
-		s.apiBaseURL, s.apiKey, s.defaultModel,
-	)
-	if err != nil {
-		return fmt.Errorf("获取 AI 配置失败: %w", err)
-	}
+        // ------- 获取 AI 配置 -------
+        // v114 修复 1:从 lesson_plan 独立到 assistant_designer 场景
+        // 管理员可在 AI 管理中心前端单独调 Designer 的模型/温度/降级链
+        aiCfg, err := ai.GetEffectiveConfig(
+                s.aesKey, models.SceneAssistantDesigner,
+                s.apiBaseURL, s.apiKey, s.defaultModel,
+        )
+        if err != nil {
+                return fmt.Errorf("获取 AI 配置失败: %w", err)
+        }
 
-	// ------- 阶段 1:非流式获取 AI 决策 -------
-	stage1UserPrompt := s.buildUserPrompt(userMessage, history, dCtx, nil)
+        // ------- 阶段 1:非流式获取 AI 决策 -------
+        stage1UserPrompt := s.buildUserPrompt(userMessage, history, dCtx, nil)
 
-	decisionResult, err := ai.CallAI(aiCfg, designerMetaPrompt, stage1UserPrompt, nil)
-	if err != nil {
-		return fmt.Errorf("AI 决策调用失败: %w", err)
-	}
+        decisionResult, err := ai.CallAI(aiCfg, designerMetaPrompt, stage1UserPrompt, nil)
+        if err != nil {
+                return fmt.Errorf("AI 决策调用失败: %w", err)
+        }
 
-	decision, parseErr := parseAIDecision(decisionResult.Content)
-	if parseErr != nil {
-		designerLog.Warn("决策JSON解析失败，降级为直接回复",
-			"error", parseErr,
-			"raw", utils.SafeTruncate(decisionResult.Content, 300))
-		decision = &AIDesignerDecision{
-			Action:    "clarify",
-			ReplyText: "我暂时没能理解这轮对话,麻烦您换种说法?",
-		}
-	}
+        decision, parseErr := parseAIDecision(decisionResult.Content)
+        if parseErr != nil {
+                designerLog.Warn("决策JSON解析失败，降级为直接回复",
+                        "error", parseErr,
+                        "raw", utils.SafeTruncate(decisionResult.Content, 300))
+                decision = &AIDesignerDecision{
+                        Action:    "clarify",
+                        ReplyText: "我暂时没能理解这轮对话,麻烦您换种说法?",
+                }
+        }
 
-	// ------- 分支处理 -------
-	switch decision.Action {
-	case "search_components":
-		return s.handleSearchAndDraft(ctx, aiCfg, userMessage, history, dCtx, decision, callbacks)
-	case "draft_directly", "clarify":
-		return s.handleDirectReply(decision, callbacks)
-	default:
-		designerLog.Warn("未知action，降级为clarify",
-			"action", decision.Action)
-		return s.handleDirectReply(&AIDesignerDecision{
-			Action:    "clarify",
-			ReplyText: decision.ReplyText,
-		}, callbacks)
-	}
+        // ------- 分支处理 -------
+        switch decision.Action {
+        case "search_components":
+                return s.handleSearchAndDraft(ctx, aiCfg, userMessage, history, dCtx, decision, callbacks)
+        case "draft_directly", "clarify":
+                return s.handleDirectReply(decision, callbacks)
+        default:
+                designerLog.Warn("未知action，降级为clarify",
+                        "action", decision.Action)
+                return s.handleDirectReply(&AIDesignerDecision{
+                        Action:    "clarify",
+                        ReplyText: decision.ReplyText,
+                }, callbacks)
+        }
 }
 
 // ============================================================================
@@ -345,54 +369,62 @@ func (s *AssistantDesignerService) DesignChat(
 // ============================================================================
 
 func (s *AssistantDesignerService) handleSearchAndDraft(
-	ctx context.Context,
-	aiCfg *ai.EffectiveConfig,
-	userMessage string,
-	history []DesignerMessage,
-	dCtx *DesignerContext,
-	decision *AIDesignerDecision,
-	callbacks *DesignerStreamCallbacks,
+        ctx context.Context,
+        aiCfg *ai.EffectiveConfig,
+        userMessage string,
+        history []DesignerMessage,
+        dCtx *DesignerContext,
+        decision *AIDesignerDecision,
+        callbacks *DesignerStreamCallbacks,
 ) error {
-	reason, _ := decision.QueryParams["reason"].(string)
-	if reason == "" {
-		reason = "正在查找相关教学组件作为参考..."
-	}
-	callbacks.OnSearching(reason)
+        reason, _ := decision.QueryParams["reason"].(string)
+        if reason == "" {
+                reason = "正在查找相关教学组件作为参考..."
+        }
+        callbacks.OnSearching(reason)
 
-	matchReq := buildMatchRequestFromParams(decision.QueryParams, dCtx)
-	groups, err := repository.MatchComponents(ctx, matchReq)
-	if err != nil {
-		designerLog.Warn("查库失败，降级为直接起草",
-			"error", err)
-		return s.handleDirectReply(&AIDesignerDecision{
-			Action:       "draft_directly",
-			ReplyText:    decision.ReplyText + "\n\n(组件库查询失败,我先基于常识起草一版。)",
-			UpdatedDraft: decision.UpdatedDraft,
-		}, callbacks)
-	}
+        matchReq := buildMatchRequestFromParams(decision.QueryParams, dCtx)
+        groups, err := repository.MatchComponents(ctx, matchReq)
+        if err != nil {
+                designerLog.Warn("查库失败，降级为直接起草",
+                        "error", err)
+                return s.handleDirectReply(&AIDesignerDecision{
+                        Action:       "draft_directly",
+                        ReplyText:    decision.ReplyText + "\n\n(组件库查询失败,我先基于常识起草一版。)",
+                        UpdatedDraft: decision.UpdatedDraft,
+                }, callbacks)
+        }
 
-	flatComponents := flattenMatchedGroups(groups, 8)
-	briefs := make([]*ComponentBrief, 0, len(flatComponents))
-	for _, fc := range flatComponents {
-		briefs = append(briefs, &ComponentBrief{
-			ID:          fc.Data.ID,
-			Name:        fc.Data.DisplayLabel,
-			LibraryType: fc.LibraryType,
-			Subject:     dCtx.Subject,
-			Grade:       dCtx.Grade,
-		})
-	}
-	callbacks.OnComponents(briefs)
+        // v194 修复 B:语义级实时组件推荐(词法精排)
+        // 老路径:flattenMatchedGroups(groups, 8) 直接按硬筛原序取前 8 条,不看老师在聊什么。
+        // 新路径:召回池已在 buildMatchRequestFromParams 放大到 6/类(给精排留候选),
+        //   这里先全部扁平化,再用老师当轮发言(userMessage)做词法精排,跨类目取全局 Top-4。
+        //   无发言 / 全 0 分 / 候选不足时自动按原序保底(等价老行为),绝不报错绝不阻塞。
+        flatAll := flattenMatchedGroups(groups, 0) // n=0 表示不截断,先全收进来供精排
+        flatComponents := rerankFlatComponentsForDesigner(flatAll, userMessage, designerInjectTopN)
 
-	componentContext := buildComponentContext(flatComponents, dCtx)
+        briefs := make([]*ComponentBrief, 0, len(flatComponents))
+        for _, fc := range flatComponents {
+                briefs = append(briefs, &ComponentBrief{
+                        ID:          fc.Data.ID,
+                        Name:        fc.Data.DisplayLabel,
+                        LibraryType: fc.LibraryType,
+                        LibraryName: fc.LibraryName, // v194:补上库中文名,前端显示"库名 · 组件标题"
+                        Subject:     dCtx.Subject,
+                        Grade:       dCtx.Grade,
+                })
+        }
+        callbacks.OnComponents(briefs)
 
-	stage2UserPrompt := s.buildUserPrompt(userMessage, history, dCtx, &stage2Extra{
-		SearchReason:     reason,
-		ComponentContext: componentContext,
-		Stage1Decision:   decision.ReplyText,
-	})
+        componentContext := buildComponentContext(flatComponents, dCtx)
 
-	return s.callAIStreamAndEmit(aiCfg, stage2UserPrompt, briefs, callbacks)
+        stage2UserPrompt := s.buildUserPrompt(userMessage, history, dCtx, &stage2Extra{
+                SearchReason:     reason,
+                ComponentContext: componentContext,
+                Stage1Decision:   decision.ReplyText,
+        })
+
+        return s.callAIStreamAndEmit(aiCfg, stage2UserPrompt, briefs, callbacks)
 }
 
 // ============================================================================
@@ -403,28 +435,28 @@ func (s *AssistantDesignerService) handleSearchAndDraft(
 // AI 偶发会把整个 JSON 回复塞进 reply_text 字段,导致外层看起来正常但内容是 JSON。
 // 触发条件严格:TrimSpace 后以 "{" 开头 + 含 "reply_text" 字段 + Unmarshal 成功且内层非空。
 func (s *AssistantDesignerService) handleDirectReply(
-	decision *AIDesignerDecision,
-	callbacks *DesignerStreamCallbacks,
+        decision *AIDesignerDecision,
+        callbacks *DesignerStreamCallbacks,
 ) error {
-	innerText := strings.TrimSpace(decision.ReplyText)
-	if strings.HasPrefix(innerText, "{") && strings.Contains(innerText, "\"reply_text\"") {
-		var inner AIDesignerDecision
-		if err := json.Unmarshal([]byte(innerText), &inner); err == nil && strings.TrimSpace(inner.ReplyText) != "" {
-			designerLog.Info("检测到双层JSON嵌套，已提取内层字段",
-				"outer_len", len(innerText))
-			decision.ReplyText = inner.ReplyText
-			if strings.TrimSpace(decision.UpdatedDraft) == "" && strings.TrimSpace(inner.UpdatedDraft) != "" {
-				decision.UpdatedDraft = inner.UpdatedDraft
-			}
-		}
-	}
+        innerText := strings.TrimSpace(decision.ReplyText)
+        if strings.HasPrefix(innerText, "{") && strings.Contains(innerText, "\"reply_text\"") {
+                var inner AIDesignerDecision
+                if err := json.Unmarshal([]byte(innerText), &inner); err == nil && strings.TrimSpace(inner.ReplyText) != "" {
+                        designerLog.Info("检测到双层JSON嵌套，已提取内层字段",
+                                "outer_len", len(innerText))
+                        decision.ReplyText = inner.ReplyText
+                        if strings.TrimSpace(decision.UpdatedDraft) == "" && strings.TrimSpace(inner.UpdatedDraft) != "" {
+                                decision.UpdatedDraft = inner.UpdatedDraft
+                        }
+                }
+        }
 
-	if decision.ReplyText == "" {
-		decision.ReplyText = "我暂时没有想法,要不您再多说一点?"
-	}
-	callbacks.OnChunk(decision.ReplyText)
-	callbacks.OnDone(decision.ReplyText, decision.UpdatedDraft, nil)
-	return nil
+        if decision.ReplyText == "" {
+                decision.ReplyText = "我暂时没有想法,要不您再多说一点?"
+        }
+        callbacks.OnChunk(decision.ReplyText)
+        callbacks.OnDone(decision.ReplyText, decision.UpdatedDraft, nil)
+        return nil
 }
 
 // ============================================================================
@@ -432,57 +464,57 @@ func (s *AssistantDesignerService) handleDirectReply(
 // ============================================================================
 
 func (s *AssistantDesignerService) callAIStreamAndEmit(
-	aiCfg *ai.EffectiveConfig,
-	userPrompt string,
-	briefs []*ComponentBrief,
-	callbacks *DesignerStreamCallbacks,
+        aiCfg *ai.EffectiveConfig,
+        userPrompt string,
+        briefs []*ComponentBrief,
+        callbacks *DesignerStreamCallbacks,
 ) error {
-	var accumulated strings.Builder
-	_, err := ai.CallAIStream(
-		aiCfg,
-		designerMetaPrompt,
-		userPrompt,
-		func(chunk string) error {
-			accumulated.WriteString(chunk)
-			callbacks.OnChunk(chunk)
-			return nil
-		},
-		nil,
-	)
+        var accumulated strings.Builder
+        _, err := ai.CallAIStream(
+                aiCfg,
+                designerMetaPrompt,
+                userPrompt,
+                func(chunk string) error {
+                        accumulated.WriteString(chunk)
+                        callbacks.OnChunk(chunk)
+                        return nil
+                },
+                nil,
+        )
 
-	if err != nil {
-		callbacks.OnError(fmt.Sprintf("AI 流式调用失败: %v", err))
-		return err
-	}
+        if err != nil {
+                callbacks.OnError(fmt.Sprintf("AI 流式调用失败: %v", err))
+                return err
+        }
 
-	fullText := accumulated.String()
-	finalDecision, parseErr := parseAIDecision(fullText)
-	if parseErr != nil {
-		designerLog.Warn("阶段2 JSON解析失败，原文作为回复",
-			"error", parseErr)
-		callbacks.OnDone(fullText, "", nil)
-		return nil
-	}
+        fullText := accumulated.String()
+        finalDecision, parseErr := parseAIDecision(fullText)
+        if parseErr != nil {
+                designerLog.Warn("阶段2 JSON解析失败，原文作为回复",
+                        "error", parseErr)
+                callbacks.OnDone(fullText, "", nil)
+                return nil
+        }
 
-	// v114 修复 A 延伸:阶段 2 也做一次双层 JSON 兜底
-	innerText := strings.TrimSpace(finalDecision.ReplyText)
-	if strings.HasPrefix(innerText, "{") && strings.Contains(innerText, "\"reply_text\"") {
-		var inner AIDesignerDecision
-		if err := json.Unmarshal([]byte(innerText), &inner); err == nil && strings.TrimSpace(inner.ReplyText) != "" {
-			designerLog.Info("阶段2检测到双层JSON，已提取内层")
-			finalDecision.ReplyText = inner.ReplyText
-			if strings.TrimSpace(finalDecision.UpdatedDraft) == "" && strings.TrimSpace(inner.UpdatedDraft) != "" {
-				finalDecision.UpdatedDraft = inner.UpdatedDraft
-			}
-		}
-	}
+        // v114 修复 A 延伸:阶段 2 也做一次双层 JSON 兜底
+        innerText := strings.TrimSpace(finalDecision.ReplyText)
+        if strings.HasPrefix(innerText, "{") && strings.Contains(innerText, "\"reply_text\"") {
+                var inner AIDesignerDecision
+                if err := json.Unmarshal([]byte(innerText), &inner); err == nil && strings.TrimSpace(inner.ReplyText) != "" {
+                        designerLog.Info("阶段2检测到双层JSON，已提取内层")
+                        finalDecision.ReplyText = inner.ReplyText
+                        if strings.TrimSpace(finalDecision.UpdatedDraft) == "" && strings.TrimSpace(inner.UpdatedDraft) != "" {
+                                finalDecision.UpdatedDraft = inner.UpdatedDraft
+                        }
+                }
+        }
 
-	refIDs := make([]string, 0, len(briefs))
-	for _, b := range briefs {
-		refIDs = append(refIDs, b.ID)
-	}
-	callbacks.OnDone(finalDecision.ReplyText, finalDecision.UpdatedDraft, refIDs)
-	return nil
+        refIDs := make([]string, 0, len(briefs))
+        for _, b := range briefs {
+                refIDs = append(refIDs, b.ID)
+        }
+        callbacks.OnDone(finalDecision.ReplyText, finalDecision.UpdatedDraft, refIDs)
+        return nil
 }
 
 // ============================================================================
@@ -490,74 +522,78 @@ func (s *AssistantDesignerService) callAIStreamAndEmit(
 // ============================================================================
 
 type stage2Extra struct {
-	SearchReason     string
-	ComponentContext string
-	Stage1Decision   string
+        SearchReason     string
+        ComponentContext string
+        Stage1Decision   string
 }
 
 func (s *AssistantDesignerService) buildUserPrompt(
-	userMessage string,
-	history []DesignerMessage,
-	dCtx *DesignerContext,
-	extra *stage2Extra,
+        userMessage string,
+        history []DesignerMessage,
+        dCtx *DesignerContext,
+        extra *stage2Extra,
 ) string {
-	var b strings.Builder
+        var b strings.Builder
 
-	b.WriteString("# 当前 Modal 上下文\n")
-	b.WriteString(fmt.Sprintf("- 学科:%s\n", defaultStr(dCtx.Subject, "(未指定)")))
-	b.WriteString(fmt.Sprintf("- 年级:%s\n", defaultStr(dCtx.Grade, "(未指定)")))
-	if len(dCtx.Scenes) > 0 {
-		b.WriteString(fmt.Sprintf("- 适用场景:%s\n", strings.Join(dCtx.Scenes, ", ")))
-	} else {
-		b.WriteString("- 适用场景:(老师尚未勾选)\n")
-	}
-	b.WriteString("\n")
+        b.WriteString("# 当前 Modal 上下文\n")
+        b.WriteString(fmt.Sprintf("- 学科:%s\n", defaultStr(dCtx.Subject, "(未指定)")))
+        b.WriteString(fmt.Sprintf("- 年级:%s\n", defaultStr(dCtx.Grade, "(未指定)")))
+        if len(dCtx.Scenes) > 0 {
+                b.WriteString(fmt.Sprintf("- 适用场景:%s\n", strings.Join(dCtx.Scenes, ", ")))
+        } else {
+                b.WriteString("- 适用场景:(老师尚未勾选)\n")
+        }
+        b.WriteString("\n")
 
-	if strings.TrimSpace(dCtx.CurrentDraft) != "" {
-		b.WriteString("# 当前草稿\n")
-		b.WriteString("```\n")
-		b.WriteString(utils.SafeTruncate(dCtx.CurrentDraft, 3000))
-		b.WriteString("\n```\n\n")
-	}
+        if strings.TrimSpace(dCtx.CurrentDraft) != "" {
+                b.WriteString("# 当前草稿\n")
+                b.WriteString("```\n")
+                b.WriteString(utils.SafeTruncate(dCtx.CurrentDraft, 3000))
+                b.WriteString("\n```\n\n")
+        }
 
-	if len(history) > 0 {
-		b.WriteString("# 之前的对话\n")
-		start := 0
-		if len(history) > 10 {
-			start = len(history) - 10
-		}
-		for _, msg := range history[start:] {
-			role := "老师"
-			if msg.Role == "assistant" {
-				role = "你"
-			}
-			b.WriteString(fmt.Sprintf("%s:%s\n", role, msg.Content))
-		}
-		b.WriteString("\n")
-	}
+        if len(history) > 0 {
+                b.WriteString("# 之前的对话\n")
+                start := 0
+                if len(history) > 10 {
+                        start = len(history) - 10
+                }
+                for _, msg := range history[start:] {
+                        role := "老师"
+                        if msg.Role == "assistant" {
+                                role = "你"
+                        }
+                        b.WriteString(fmt.Sprintf("%s:%s\n", role, msg.Content))
+                }
+                b.WriteString("\n")
+        }
 
-	if extra != nil {
-		b.WriteString("# 你之前的判断\n")
-		b.WriteString(extra.Stage1Decision)
-		b.WriteString("\n\n")
+        if extra != nil {
+                b.WriteString("# 你之前的判断\n")
+                b.WriteString(extra.Stage1Decision)
+                b.WriteString("\n\n")
 
-		b.WriteString("# 你刚从组件库查到的参考资料\n")
-		b.WriteString(fmt.Sprintf("查询意图:%s\n\n", extra.SearchReason))
-		b.WriteString(extra.ComponentContext)
-		b.WriteString("\n")
+                b.WriteString("# 你刚从组件库查到的参考资料\n")
+                b.WriteString(fmt.Sprintf("查询意图:%s\n\n", extra.SearchReason))
+                b.WriteString(extra.ComponentContext)
+                b.WriteString("\n")
 
-		b.WriteString("# 现在\n")
-		b.WriteString("基于上述组件参考,请写出一版高密度、有具体场景感、引用了上述组件关键点的 system prompt 草稿。严格按 Meta-Prompt 里的 JSON 格式返回,action 写 draft_directly,updated_draft 放完整草稿。\n")
-		b.WriteString("注意:reply_text 用自然语言说明你做了什么(用「」引号,不要用英文 \" 引号);updated_draft 放草稿全文。两个字段不要互相重复或嵌套 JSON。\n\n")
-	}
+                b.WriteString("# 现在\n")
+                b.WriteString("基于上述组件参考,请写出一版高密度、有具体场景感、引用了上述组件关键点的 system prompt 草稿。严格按 Meta-Prompt 里的 JSON 格式返回,action 写 draft_directly,updated_draft 放完整草稿。\n")
+                b.WriteString("注意:reply_text 用自然语言说明你做了什么(用「」引号,不要用英文 \" 引号);updated_draft 放草稿全文。两个字段不要互相重复或嵌套 JSON。\n\n")
+        }
 
-	b.WriteString("# 老师本轮消息\n")
-	b.WriteString(userMessage)
+        b.WriteString("# 老师本轮消息\n")
+        b.WriteString(userMessage)
 
-	return b.String()
+        return b.String()
 }
 
 // ============================================================================
 // parseAIDecision - 四重鲁棒性兜底
 // 已拆分到 assistant_designer_parse.go
+//
+// v194 新增的语义精排辅助 rerankFlatComponentsForDesigner、注入条数常量
+// designerInjectTopN、召回池放大,也都在 assistant_designer_parse.go 内,
+// 以护住本文件 600 行红线。
 // ============================================================================

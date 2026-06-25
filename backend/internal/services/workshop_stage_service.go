@@ -17,6 +17,13 @@ package services
 //   - 原 LoadStagePromptContext 保持签名不变,内部转调 V2 传空 assistantPrompt
 //   - V2 调用 BuildStageSystemPromptV2 透传助手 prompt,用于替换第4层阶段角色
 //   - 其他层(配方/产出物/组件/教案结构/对话规范)完全保留,不受助手影响
+// 大单元备课·批次二改动（本次）:
+//   - LoadStagePromptContextV2 在课本注入层之后、课程大纲注入层之前，
+//     新增「单元方案注入层」：老师显式挂载的 active 单元方案，五阶段全程注入。
+//   - 课程大纲注入层开头加「让位」判断：若本教案已成功注入 active 单元方案，
+//     则 analyze/design 两阶段不再注入课程大纲（有大单元就不要大纲——Yuhan 决策）。
+//   - 单元方案的「按ID取+拼块」逻辑：GetUnitPlanByID + 校验 Status==active + BuildUnitPlanContext，
+//     拼块函数在 unit_plan_match.go。显式挂载无需匹配/打分，任何缺失都静默跳过不阻断。
 
 import (
 	"context"
@@ -50,6 +57,17 @@ var autoTriggerStages = map[string]string{
 	"revise": "我们进入修订定稿阶段了。请先简要介绍你是谁、你拿到了评审报告中的哪些改进建议，然后告诉我接下来你会怎么帮我修订教案。用友好的口吻，不超过200字。",
 }
 
+// autoTriggerStagesLean 对话模式专用的精简触发消息（无缝衔接：不重新自我介绍、不复述路线图）。
+// design/write/review/revise 均提供对话模式版；review 版在“查有无完整教案再评审”的功能检查之外，补上对话模式包装（必须以「我们进入…阶段了。」开头，否则触发消息会原文漏成气泡）。
+// 必须与 autoTriggerStages 一样以「我们进入X阶段了。」开头，以便前端 renderMessages 与
+// isStageAutoTriggerContent 统一按「我们进入…阶段了。」过滤隐藏（专家模式原触发同样命中）。
+var autoTriggerStagesLean = map[string]string{
+	"design": "我们进入教学设计阶段了。【系统提示·对话模式】你和老师是一段不间断的连续对话，老师看不到任何阶段切换，绝不能重新自我介绍、绝不能复述流程路线图。你的上文里已经带着教学分析阶段定下的结论——学情、这节课学什么、教学重难点、以及老师已经选定的教学方向。请先读懂这些已定结论，开场第一句只用半句话点出前面已经定下的方向以示承接，然后立刻推进到本阶段真正该做的事：和老师一起把这节课的课堂环节和活动一步步排出来。特别注意：分析阶段已经定过的方向，绝不能再当成没决定的问题重新问一遍（例如再问偏体验还是偏概念、侧重赏析还是读写结合这类——已经定了，再问就是失忆，老师会很反感）。可参考的开场：既然前面定了走某某方向，我先把这节课的环节骨架搭出来——你看是先定导入，还是先敲核心活动？不超过90字。",
+	"write":  "我们进入教案撰写阶段了。【系统提示·对话模式】你和老师是一段不间断的连续对话，老师看不到任何阶段切换，绝不能重新自我介绍、绝不能复述流程路线图。上文教学设计阶段刚刚已经把课堂环节框架和活动安排列清楚了，所以：绝不能再把这些环节逐条罗列/复述一遍（老师刚看过、会嫌啰嗦），也不要再要求老师把框架确认一遍，更不要再宣告一次“进入撰写/去写完整教案”。开场只用半句话承接（如“好，框架都齐了，这就开始落笔”），然后用一句话把写法选择交给老师——是一个环节一个环节地写、每写一两个环节就停下等他确认，还是一次性出完整正文（下面会给到“逐环节写”和“一键写出完整正文”两枚芯片，你不必自己造芯片）。不要自作主张直接开始写正文。不超过80字。",
+	"review": "我们进入评审阶段了。【系统提示·对话模式】你和老师是一段不间断的连续对话，老师看不到任何阶段切换，绝不能重新自我介绍、绝不能复述流程路线图，尤其绝不能把这条系统指令原文复述或念出来。请你先在心里核对上文里到底有没有一份完整的教案正文（要有成型的教学目标、教学过程或各环节、作业等，而不是只有讨论、开场白或环节大纲）。若还没有完整教案，就只用一句话提醒老师：现在还没有可评审的教案正文，需要先回到「教案撰写」阶段把完整教案生成出来，并且绝不能编造评分。若已有完整教案，则不必寒暄，直接开始全面专业评审，输出评审报告（含各维度评分与改进建议）。",
+	"revise": "我们进入修订定稿阶段了。【系统提示·对话模式】你和老师是一段不间断的连续对话，老师看不到任何阶段切换，绝不能重新自我介绍、绝不能复述流程路线图。你的上文里已经带着AI评审阶段给出的评审意见和改进建议。请先读懂，开场第一句只用半句话点出评审里最关键的那条改进建议以示承接，然后推进到修订该做的事。可参考的开场：评审里最该改的是某某，我先按这条来调整，可以吗？还是你想先改别的？不超过90字。",
+}
+
 // ==================== 服务结构体 ====================
 
 // WorkshopStageService 阶段化备课工坊服务
@@ -59,7 +77,7 @@ type WorkshopStageService struct {
 	genService    interface {
 		Chat(ctx context.Context, req *models.LessonPlanChatRequest, callerID string) error
 	}
-	aesKey string // v87新增：AES密钥（用于LLM教练评估获取AI配置）
+	aesKey          string           // v87新增：AES密钥（用于LLM教练评估获取AI配置）
 	textbookService *TextbookService // 迭代7B：课本服务（用于在阶段提示词注入课本原文），由 routes 层注入，可为 nil
 }
 
@@ -182,15 +200,25 @@ func (s *WorkshopStageService) GetStageOutput(ctx context.Context, lessonPlanID 
 // ==================== 4. 进入下一阶段 ====================
 
 func (s *WorkshopStageService) AdvanceStage(ctx context.Context, lessonPlanID string, targetStageCode string, callerID string) (*models.StageConfigSnapshot, error) {
-	return s.advanceStageWithComponents(ctx, lessonPlanID, targetStageCode, callerID, nil)
+	return s.advanceStageWithComponents(ctx, lessonPlanID, targetStageCode, callerID, nil, false)
+}
+
+// AdvanceStageSilent 进入下一阶段（对话模式专用：跳过阶段质量教练过程打分）
+//
+// 与 AdvanceStageWithComponents 唯一区别：skipQualityEval=true，本次推进不触发
+// asyncLLMEvaluateAndBroadcast 过程评估。对话模式（ConversationModePage）推进走此方法；
+// 专家模式（WorkshopPage）仍走 AdvanceStage / AdvanceStageWithComponents，过程评估不变。
+// selectedComponentIDs 仍照常透传给下一阶段。
+func (s *WorkshopStageService) AdvanceStageSilent(ctx context.Context, lessonPlanID string, targetStageCode string, callerID string, selectedComponentIDs []string) (*models.StageConfigSnapshot, error) {
+	return s.advanceStageWithComponents(ctx, lessonPlanID, targetStageCode, callerID, selectedComponentIDs, true)
 }
 
 // AdvanceStageWithComponents 进入下一阶段（带用户选中的组件ID）
 func (s *WorkshopStageService) AdvanceStageWithComponents(ctx context.Context, lessonPlanID string, targetStageCode string, callerID string, selectedComponentIDs []string) (*models.StageConfigSnapshot, error) {
-	return s.advanceStageWithComponents(ctx, lessonPlanID, targetStageCode, callerID, selectedComponentIDs)
+	return s.advanceStageWithComponents(ctx, lessonPlanID, targetStageCode, callerID, selectedComponentIDs, false)
 }
 
-func (s *WorkshopStageService) advanceStageWithComponents(ctx context.Context, lessonPlanID string, targetStageCode string, callerID string, selectedComponentIDs []string) (*models.StageConfigSnapshot, error) {
+func (s *WorkshopStageService) advanceStageWithComponents(ctx context.Context, lessonPlanID string, targetStageCode string, callerID string, selectedComponentIDs []string, skipQualityEval bool) (*models.StageConfigSnapshot, error) {
 	lp, err := repository.GetLessonPlanByID(ctx, lessonPlanID)
 	if err != nil {
 		return nil, err
@@ -217,7 +245,7 @@ func (s *WorkshopStageService) advanceStageWithComponents(ctx context.Context, l
 
 	// v87新增：阶段过渡前异步调用LLM评估产出物质量
 	// 评估结果通过SSE推送给前端（建议性质，不阻塞阶段过渡）
-	if s.aesKey != "" {
+	if s.aesKey != "" && !skipQualityEval && s.leavingStageHasSubstantiveContent(ctx, lessonPlanID) {
 		go s.asyncLLMEvaluateAndBroadcast(ctx, lessonPlanID, lp.CurrentStage)
 	}
 
@@ -262,7 +290,12 @@ func (s *WorkshopStageService) advanceStageWithComponents(ctx context.Context, l
 
 	// 自动触发AI开场白
 	if triggerMsg, needsTrigger := autoTriggerStages[targetStage.StageCode]; needsTrigger && s.genService != nil {
-		wsLog.Info("自动触发阶段AI开场白", "plan_id", lessonPlanID, "stage", targetStage.StageCode)
+		if skipQualityEval {
+			if leanMsg, ok := autoTriggerStagesLean[targetStage.StageCode]; ok {
+				triggerMsg = leanMsg
+			}
+		}
+		wsLog.Info("自动触发阶段AI开场白", "plan_id", lessonPlanID, "stage", targetStage.StageCode, "lean", skipQualityEval)
 		go func() {
 			time.Sleep(100 * time.Millisecond)
 			bgCtx := context.Background()
@@ -513,7 +546,7 @@ func (s *WorkshopStageService) SaveStageOutput(ctx context.Context, lessonPlanID
 //
 // v110 改造:内部转调 V2,传空 assistantPrompt 走原行为
 func (s *WorkshopStageService) LoadStagePromptContext(ctx context.Context, lp *models.LessonPlan, stageCode string) (string, error) {
-	return s.LoadStagePromptContextV2(ctx, lp, stageCode, "")
+	return s.LoadStagePromptContextV2(ctx, lp, stageCode, "", "")
 }
 
 // LoadStagePromptContextV2 v110(TE-DNA 3.0 P0 STEP 3)新增:支持 AI 助手 full_prompt 注入的版本
@@ -525,11 +558,17 @@ func (s *WorkshopStageService) LoadStagePromptContext(ctx context.Context, lp *m
 // 调用场景:
 //   - StartConversation 开场白路径:恒定传空(老师还没机会选助手)
 //   - processChatStageAsync 对话路径:老师选中助手时传 full_prompt,否则传空
+//
+// 大单元备课·批次二（本次新增两层外挂注入，均在 basePrompt 拼好之后、return 之前）：
+//   - 单元方案注入层（五阶段全程）：老师显式挂载的 active 单元方案，整段注入并标记 unitPlanInjected。
+//   - 课程大纲注入层（仅 analyze/design）：在原有基础上加「让位」判断——
+//     若已注入 active 单元方案（unitPlanInjected=true），则跳过课程大纲（有大单元就不要大纲）。
 func (s *WorkshopStageService) LoadStagePromptContextV2(
 	ctx context.Context,
 	lp *models.LessonPlan,
 	stageCode string,
 	assistantPrompt string,
+	recentUserText string, // 技能路由 Phase1:透传给 BuildStageSystemPromptV2 第3层精排;空串→保底
 ) (string, error) {
 	// 判断是否为自定义阶段(来自配方 recipe_stages 表)
 	isCustomStage := false
@@ -617,6 +656,7 @@ func (s *WorkshopStageService) LoadStagePromptContextV2(
 		ctx, stage, recipe, priorOutputs,
 		lp.Subject, lp.Grade, promptMode, lessonStructure, selectedCompIDs,
 		assistantPrompt,
+		recentUserText,
 	)
 
 	// 迭代7B：注入老师勾选的课本原文（新增一层，置于系统提示词末尾）
@@ -639,6 +679,76 @@ func (s *WorkshopStageService) LoadStagePromptContextV2(
 		// 这条 Warn 会在日志里立刻暴露，不必再靠老师反馈"AI说看不到课本"才发现。
 		wsLog.Warn("应注入课本但课本服务未注入（textbookService==nil），本次跳过课本原文注入",
 			"plan_id", lp.ID, "stage", stageCode, "textbook_page_ids", lp.TextbookPageIDs)
+	}
+
+	// 单元方案注入层（大单元备课·批次二·注入）——置于课本层之后、课程大纲层之前。
+	//
+	// 与课程大纲的区别：单元方案是老师「显式挂载」的（lesson_plans.unit_plan_id），
+	// 是「这堂课所属大单元的纲」，五个阶段（analyze/design/write/review/revise）全程注入，
+	// 不做任何匹配/打分（显式挂载无需匹配，直接按挂载的 ID 取那一份）。
+	//
+	// 注入成功后置 unitPlanInjected=true，供下方课程大纲层做「让位」判断
+	// （有大单元就不要大纲——Yuhan 决策）。
+	//
+	// 任何缺失（未挂载/取不到/非 active/拼块为空）都静默跳过，记 Info/Warn，绝不阻断备课。
+	unitPlanInjected := false
+	if lp.UnitPlanID != nil && strings.TrimSpace(*lp.UnitPlanID) != "" {
+		up, upErr := repository.GetUnitPlanByID(ctx, *lp.UnitPlanID)
+		if upErr != nil {
+			// 取不到（已被物理删除等）：无外键约束设计的预期情形，静默跳过。
+			wsLog.Warn("已挂载单元方案但查询失败，跳过单元方案注入",
+				"plan_id", lp.ID, "stage", stageCode, "unit_plan_id", *lp.UnitPlanID, "error", upErr)
+		} else if up.Status != models.UnitPlanStatusActive {
+			// 挂载的单元方案不是 active（草稿未定稿 / 已归档软删）：不注入半成品或已删方案。
+			wsLog.Info("已挂载单元方案但非 active 状态，跳过单元方案注入",
+				"plan_id", lp.ID, "stage", stageCode, "unit_plan_id", *lp.UnitPlanID, "status", up.Status)
+		} else if upContext := BuildUnitPlanContext(up); strings.TrimSpace(upContext) != "" {
+			// active 且拼块非空：五阶段全程注入，并标记已注入（供大纲层让位）。
+			basePrompt += upContext
+			unitPlanInjected = true
+			wsLog.Info("已注入单元方案上下文（大单元，五阶段全程）",
+				"plan_id", lp.ID, "stage", stageCode,
+				"unit_plan_id", up.ID, "unit", up.Unit, "unit_theme", up.UnitTheme)
+		}
+	}
+
+	// 课程大纲注入（大单元备课能力·批次一·注入）
+	// 仅在「教学分析 analyze」「教学设计 design」两阶段注入——撰写/评审/修订不需要全册大纲，省 token 又不干扰。
+	// 匹配：按学科粗筛同学科 active 大纲，再用「学段范围覆盖」打分取最贴合一份；一份都没命中 → 静默跳过
+	//（正常单课备课，不报错不提示，符合"没匹配上就不注入"的设计）。
+	//
+	// 大单元备课·批次二「让位」：若本教案已成功注入 active 单元方案（unitPlanInjected=true），
+	// 则 analyze/design 两阶段不再注入课程大纲——有大单元就不要大纲（Yuhan 决策）。
+	// 单元方案是更具体的「本课所属大单元的纲」，与册级大纲并存会冗余且抢 token，故让位。
+	if (stageCode == "analyze" || stageCode == "design") && !unitPlanInjected {
+		if strings.TrimSpace(lp.Subject) != "" && strings.TrimSpace(lp.Grade) != "" {
+			candidates, coErr := repository.ListActiveOutlinesBySubject(ctx, lp.Subject)
+			if coErr != nil {
+				wsLog.Warn("查询课程大纲候选失败，跳过大纲注入",
+					"plan_id", lp.ID, "stage", stageCode, "subject", lp.Subject, "error", coErr)
+			} else if hits := MatchOutlines(lp.Grade, candidates); len(hits) > 0 {
+				// 多份全注入（Yuhan 决策）：年级集合与教案相交的大纲全部拼入。
+				// 学段写法的教案（如"小学低段"）会命中多个年级的多份大纲；
+				// 具体年级教案（如"一年级"）通常只命中该年级的上下册。
+				if outlineCtx := BuildCourseOutlinesContext(hits); strings.TrimSpace(outlineCtx) != "" {
+					basePrompt += outlineCtx
+					// 收集命中大纲的标题，便于日志核对"到底注入了哪几份"
+					hitTitles := make([]string, 0, len(hits))
+					for _, h := range hits {
+						hitTitles = append(hitTitles, h.Title)
+					}
+					wsLog.Info("已注入课程大纲上下文（多份）",
+						"plan_id", lp.ID, "stage", stageCode,
+						"subject", lp.Subject, "plan_grade", lp.Grade,
+						"outline_count", len(hits),
+						"outline_titles", strings.Join(hitTitles, " | "))
+				}
+			}
+		}
+	} else if (stageCode == "analyze" || stageCode == "design") && unitPlanInjected {
+		// 让位日志：明确记录"因已注入单元方案而跳过课程大纲"，便于核对优先级生效。
+		wsLog.Info("已注入单元方案，课程大纲让位（本阶段不注入大纲）",
+			"plan_id", lp.ID, "stage", stageCode)
 	}
 
 	return basePrompt, nil
@@ -743,4 +853,37 @@ func (s *WorkshopStageService) resolveStages(lp *models.LessonPlan) ([]models.St
 		return nil, -1, fmt.Errorf("当前阶段 %s 不在配置中", lp.CurrentStage)
 	}
 	return snapshots, currentIdx, nil
+}
+
+// ==================== 第一刀新增：空阶段守门小助手 ====================
+
+// leavingStageHasSubstantiveContent 判断“正在离开的阶段”是否有老师的真实发言。
+// 排除系统自动注入的阶段开场白触发消息（以 user 角色落库、但非老师真实输入）。
+// 没有真实发言 = 空阶段 = 不评，避免给只有开场白的阶段甩 0 分。必须在 current_stage
+// 翻页之前调用——此刻 GetCurrentStageMessages 返回的正是“离开阶段”的消息。
+// 读取出错时保守返回 true（宁可评、不漏评）。
+func (s *WorkshopStageService) leavingStageHasSubstantiveContent(ctx context.Context, lessonPlanID string) bool {
+	msgs, err := repository.GetCurrentStageMessages(ctx, lessonPlanID)
+	if err != nil {
+		return true
+	}
+	for _, m := range msgs {
+		if m.Role == "user" && !isStageAutoTriggerContent(m.Content) {
+			return true
+		}
+	}
+	return false
+}
+
+// isStageAutoTriggerContent 是否为系统自动注入的阶段开场白触发消息（与前端
+// renderMessages 过滤口径一致）。这些消息驱动 AI 开场白，但不是老师真实输入。
+func isStageAutoTriggerContent(content string) bool {
+	c := strings.TrimSpace(content)
+	if strings.HasPrefix(c, "我们进入") && strings.Contains(c, "阶段了。") {
+		return true
+	}
+	if strings.HasPrefix(c, "请先检查上一阶段") {
+		return true
+	}
+	return false
 }

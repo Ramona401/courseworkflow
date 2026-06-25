@@ -203,6 +203,8 @@ export default function WorkshopPage() {
   // v88:SSE连接引用改为SSEConnection类型(支持close方法)
   const sseRef         = useRef<SSEConnection | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  // B-P1-22: 可滚动消息容器ref——滚动前据此判断用户是否贴近底部，决定是否自动跟随
+  const messagesScrollRef = useRef<HTMLDivElement>(null)
   // v88:保存planId的ref,供重连回调使用(避免闭包捕获旧值)
   const planIdRef = useRef<string | null>(null)
 
@@ -229,7 +231,11 @@ export default function WorkshopPage() {
   }, [plan])
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    // B-P1-22: 自由滚动——仅当用户当前贴近底部(容差120px)时才自动跟随到最新；
+    // 用户主动往上翻看历史时不再被流式输出强拽回底部。
+    const el = messagesScrollRef.current
+    const nearBottom = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 120)
+    if (nearBottom) messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isThinking, streaming?.content])
 
   useEffect(() => { return () => { sseRef.current?.close() } }, [])
@@ -1112,7 +1118,7 @@ export default function WorkshopPage() {
           )
         })()}
 
-        <div style={{ flex: 1, overflowY: 'auto', padding: '20px 24px', display: 'flex', flexDirection: 'column' }}>
+        <div ref={messagesScrollRef} style={{ flex: 1, overflowY: 'auto', padding: '20px 24px', display: 'flex', flexDirection: 'column' }}>
                     {/* v124: 图片插入引导条 */}
           {!imageTipDismissed && (
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 16px', marginBottom: '12px', background: 'linear-gradient(135deg, rgba(79,123,232,0.06), rgba(16,185,129,0.06))', borderRadius: '10px', border: '1px solid rgba(79,123,232,0.15)', fontSize: '13px', color: '#374151', alignSelf: 'stretch' }}>

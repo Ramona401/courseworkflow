@@ -5,8 +5,13 @@
  * 区别于 SlideshowPlayer 的纯放映：本组件顶部有 60px 工具栏（翻页/代码切换/复制/放映/退出），
  * 内容区 flex 居中 + 缩放层 transformOrigin:center 消除左侧亚像素白边。
  * iframe srcDoc 经 injectPreviewMode 注入预览降级脚本。
+ *
+ * 【P1-02 体验修复·定稿做法】当前页号只存本组件 curPageNum 一处（单一真相源），
+ *   父组件不再每次翻页回写（双源打架会导致翻页回弹）。改为退出时经 onClose(finalPage)
+ *   一次性回传当前停留页；切到放映时经 onSlideshow(pn) 带上当前页。
+ *   工具栏在顶部、不遮挡课件，故不做放映态那种「手动隐藏控制条」处理。
  */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { CW_WIDTH, CW_HEIGHT } from './workshopConstants'
 import { injectPreviewMode } from './previewInject'
 
@@ -15,11 +20,14 @@ export default function CWFullscreenPreview({ pages, initialPageNum, codeView, o
   initialPageNum: number
   codeView: boolean
   onToggleCode: () => void
-  onClose: () => void
+  // P1-02: 退出时回传「当前停留页」给父组件（可选参数），翻页过程中绝不回调
+  onClose: (finalPage?: number) => void
   onSlideshow: (pn: number) => void
 }) {
   const [curPageNum, setCurPageNum] = useState(initialPageNum)
   const [viewSize, setViewSize] = useState({ w: window.innerWidth, h: window.innerHeight })
+  // P1-02: ref 始终持有最新当前页，供退出回调读取（闭包不读旧值）
+  const curPageRef = useRef(initialPageNum)
 
   const idx = pages.findIndex(p => p.page_number === curPageNum)
   const page = pages[idx] || pages[0]
@@ -31,6 +39,14 @@ export default function CWFullscreenPreview({ pages, initialPageNum, codeView, o
   const hasPrev = idx > 0
   const hasNext = idx < pages.length - 1
 
+  // P1-02: 统一翻页入口——只改本组件 state（单一真相源）+ 同步刷新 ref，不回调父组件
+  const gotoPage = (pn: number) => {
+    setCurPageNum(pn)
+    curPageRef.current = pn
+  }
+  // P1-02: 统一退出入口——退出时把最新当前页一次性回传父组件
+  const doClose = () => { onClose(curPageRef.current) }
+
   // 响应窗口resize
   useEffect(() => {
     const fn = () => setViewSize({ w: window.innerWidth, h: window.innerHeight })
@@ -41,13 +57,14 @@ export default function CWFullscreenPreview({ pages, initialPageNum, codeView, o
   // 键盘导航：左右箭头翻页 + ESC退出
   useEffect(() => {
     const fn = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { onClose(); return }
-      if (e.key === 'ArrowLeft' && hasPrev) setCurPageNum(pages[idx - 1].page_number)
-      if (e.key === 'ArrowRight' && hasNext) setCurPageNum(pages[idx + 1].page_number)
+      if (e.key === 'Escape') { doClose(); return }
+      if (e.key === 'ArrowLeft' && hasPrev) gotoPage(pages[idx - 1].page_number)
+      if (e.key === 'ArrowRight' && hasNext) gotoPage(pages[idx + 1].page_number)
     }
     window.addEventListener('keydown', fn)
     return () => window.removeEventListener('keydown', fn)
-  }, [idx, hasPrev, hasNext, pages, onClose])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idx, hasPrev, hasNext, pages])
 
   // 缩放计算：工具栏高度60px，内容区占满剩余空间
   // v5.4: 只算 scale，居中交给外层 flex（不再手动算 ox/oy 偏移，避免亚像素白边）
@@ -61,15 +78,15 @@ export default function CWFullscreenPreview({ pages, initialPageNum, codeView, o
     <div style={{ position: 'fixed', inset: 0, zIndex: 99998, background: '#fff', display: 'flex', flexDirection: 'column' }}>
       {/* 工具栏 */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 20px', background: 'rgba(255,255,255,0.95)', borderBottom: '1px solid rgba(0,0,0,0.08)', flexShrink: 0, height: toolbarH, boxSizing: 'border-box' }}>
-        <button onClick={() => hasPrev && setCurPageNum(pages[idx - 1].page_number)} disabled={!hasPrev} style={{ ...tbtn, opacity: hasPrev ? 1 : 0.3, cursor: hasPrev ? 'pointer' : 'not-allowed' }}>‹</button>
+        <button onClick={() => hasPrev && gotoPage(pages[idx - 1].page_number)} disabled={!hasPrev} style={{ ...tbtn, opacity: hasPrev ? 1 : 0.3, cursor: hasPrev ? 'pointer' : 'not-allowed' }}>‹</button>
         <span style={{ fontSize: 14, fontWeight: 600, color: '#1F2937' }}>P{page?.page_number} — {page?.title}</span>
         <span style={{ fontSize: 12, color: '#9CA3AF' }}>{(idx >= 0 ? idx : 0) + 1}/{pages.length}</span>
-        <button onClick={() => hasNext && setCurPageNum(pages[idx + 1].page_number)} disabled={!hasNext} style={{ ...tbtn, opacity: hasNext ? 1 : 0.3, cursor: hasNext ? 'pointer' : 'not-allowed' }}>›</button>
+        <button onClick={() => hasNext && gotoPage(pages[idx + 1].page_number)} disabled={!hasNext} style={{ ...tbtn, opacity: hasNext ? 1 : 0.3, cursor: hasNext ? 'pointer' : 'not-allowed' }}>›</button>
         <div style={{ flex: 1 }} />
         <button onClick={onToggleCode} style={{ ...tbtn, border: `1px solid ${codeView ? '#7C3AED' : '#E5E7EB'}`, background: codeView ? 'rgba(124,58,237,0.06)' : '#fff', color: codeView ? '#7C3AED' : '#6B7280' }}>{codeView ? '📺 预览' : '💻 代码'}</button>
         <button onClick={() => { navigator.clipboard.writeText(html).then(() => alert('已复制')).catch(() => {}) }} style={tbtn}>📋 复制</button>
         <button onClick={() => onSlideshow(page?.page_number || 1)} style={{ ...tbtn, border: '1px solid #F59E0B', background: 'rgba(245,158,11,0.06)', color: '#F59E0B' }}>🖥️ 放映</button>
-        <button onClick={onClose} style={tbtn}>✕ 退出</button>
+        <button onClick={doClose} style={tbtn}>✕ 退出</button>
       </div>
       {/* 内容区：v5.4 改为 flex 居中，缩放层 transformOrigin:center，消除左侧白边 */}
       <div style={{ flex: 1, overflow: 'hidden', position: 'relative', background: codeView ? '#1e1e1e' : '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
