@@ -176,6 +176,22 @@ func registerCoursewareRoutes(
 	// 字体F1: 字体方案列表(5套系统预设常量, 登录即可)
 	mux.Handle("/api/v1/courseware-fonts", middleware.Chain(http.HandlerFunc(fontHandler.ListSchemes), authMW))
 
+	// ==================== S-V1.5: TTS语音合成配置(admin专属) ====================
+	// GET/PUT /api/v1/admin/tts-config — 查看/更新TTS provider与火山v3鉴权
+	// POST    /api/v1/admin/tts-config/test — 服务端直连合成测试音频验证链路
+	ttsCfgHandler := handlers.NewTTSConfigHandler()
+	mux.Handle("/api/v1/admin/tts-config", middleware.Chain(http.HandlerFunc(ttsCfgHandler.HandleTTSConfig), authMW, adminOnly))
+	mux.Handle("/api/v1/admin/tts-config/test", middleware.Chain(http.HandlerFunc(ttsCfgHandler.TestTTS), authMW, adminOnly))
+
+		// ==================== 批一: 境内文本网关(双网关分流的降级通道)连接配置(admin专属) ====================
+		// GET/PUT /api/v1/admin/domestic-gateway      — 查看/更新 domestic_text_base_url/key_enc/model 三键
+		// POST    /api/v1/admin/domestic-gateway/test — 服务端直连 dashscope 发一句测试请求验证境内链路
+		// PUT 成功后 handler 内调 ai.InvalidateDomesticChannelCache() 让 5 分钟缓存即时失效
+		dgHandler := handlers.NewDomesticGatewayHandler()
+		mux.Handle("/api/v1/admin/domestic-gateway", middleware.Chain(http.HandlerFunc(dgHandler.HandleDomesticGateway), authMW, adminOnly))
+		mux.Handle("/api/v1/admin/domestic-gateway/test", middleware.Chain(http.HandlerFunc(dgHandler.TestDomesticGateway), authMW, adminOnly))
+		// 查询境内网关可用模型（GET，admin专属）：用三键调 dashscope /models 列真实模型名
+		mux.Handle("/api/v1/admin/domestic-gateway/models", middleware.Chain(http.HandlerFunc(dgHandler.ListDomesticModels), authMW, adminOnly))
 	// ==================== v136: 方案结构预设(登录即可) ====================
 	mux.Handle("/api/v1/courseware-presets", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cwHandler.GetSchemePresets(w, r)
@@ -271,6 +287,12 @@ func dispatchCoursewareSubRoutes(w http.ResponseWriter, r *http.Request, h *hand
 	// 离线打包下载: /api/v1/coursewares/{id}/export-bundle
 	if strings.HasSuffix(path, "/export-bundle") {
 		h.ExportBundle(w, r)
+		return
+	}
+	// S-V1 配音混入成片: /api/v1/coursewares/{id}/videos/mix-narration
+	// 把字幕轨中已生成的TTS配音按时间轴混入指定视频（迭代3.5子专项S）
+	if strings.HasSuffix(path, "/videos/mix-narration") {
+		videoEditH.MixNarration(w, r)
 		return
 	}
 	// v0.42.1 高级视频拼接: /api/v1/coursewares/{id}/videos/advanced-concat
@@ -426,6 +448,20 @@ func dispatchCoursewareSubRoutes(w http.ResponseWriter, r *http.Request, h *hand
 		idxH.RefineIndex(w, r)
 		return
 	}
+	// 课件↔教案对齐报告：查询（GET）/ 手动重算（POST）
+	if strings.HasSuffix(path, "/alignment-report") {
+		idxH.GetAlignmentReport(w, r)
+		return
+	}
+	// 断裂B: 取课件关联教案正文（对照抽屉）
+	if strings.HasSuffix(path, "/lesson-plan-content") {
+		idxH.GetLessonPlanContent(w, r)
+		return
+	}
+	if strings.HasSuffix(path, "/recheck-alignment") {
+		idxH.RecheckAlignment(w, r)
+		return
+	}
 	if strings.HasSuffix(path, "/rollback-status") {
 		h.RollbackStatus(w, r)
 		return
@@ -504,6 +540,17 @@ func dispatchCoursewareSubRoutes(w http.ResponseWriter, r *http.Request, h *hand
 	}
 	if strings.Contains(path, "/pages/") && strings.HasSuffix(path, "/refine") {
 		genH.RefinePage(w, r)
+		return
+	}
+	// 页面级版本与回退：版本列表（GET）/api/v1/coursewares/{id}/pages/{num}/versions
+	//   必须在通用 /pages/ 分支之前匹配（GET 带 /pages/，否则会落到只认 PUT/DELETE 的通用分支返回 405）
+	if strings.Contains(path, "/pages/") && strings.HasSuffix(path, "/versions") {
+		genH.ListPageVersions(w, r)
+		return
+	}
+	// 页面级版本与回退：回退到指定版本（POST）/api/v1/coursewares/{id}/pages/{num}/rollback
+	if strings.Contains(path, "/pages/") && strings.HasSuffix(path, "/rollback") {
+		genH.RollbackPage(w, r)
 		return
 	}
 	if strings.Contains(path, "/pages/") {

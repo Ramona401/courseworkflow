@@ -570,3 +570,90 @@ export function extractData<T>(resp: { data?: { code?: number; data?: T } }): T 
   if (d && d.code === 0 && d.data !== undefined) return d.data
   throw new Error('接口返回异常')
 }
+
+// ==================== 页面级版本与回退类型（新增） ====================
+
+/**
+ * 课件页面 html_content 版本快照列表项（对应后端 ListPageVersions 返回的单条）
+ * 轻量：不含 html_content（列表只展示元信息，回退时按 id 让后端取完整 HTML）。
+ * 来源 source 的中文标签由后端直接给出 source_label（如 "🎨 微调前"），前端无需再映射。
+ */
+export interface PageVersionEntry {
+  id: string            // 版本快照ID（回退时传给后端定位目标版本）
+  version_no: number    // 该页第几版（每页独立从1递增，倒序展示最新在前）
+  source: string        // 来源枚举原始值：refine/regenerate/rollback/...
+  source_label: string  // 来源中文标签（后端已附，如 "🎨 微调前" "🔄 重生前" "↩️ 回退前"）
+  note: string          // 备注（微调指令/重生说明/回退说明，可能为空串）
+  created_at: string    // 存版时间（ISO字符串）
+}
+
+// ==================== 课件↔教案对齐报告类型 ====================
+
+/** 对齐：单个教学环节的覆盖情况 */
+export interface AlignmentCoverageItem {
+  plan_segment: string                          // 教案里的环节名（如"情境导入""新知讲解"）
+  status: 'covered' | 'partial' | 'missing'     // 覆盖状态
+  page_nums: number[]                           // 对应课件页码（missing 时为空数组）
+  note: string                                  // 简短说明
+}
+
+/** 对齐：课件方案中新增的、教案没有的内容 */
+export interface AlignmentAdditionItem {
+  page_num: number
+  desc: string
+}
+
+/** 对齐：教学意图偏移 */
+export interface AlignmentIntentShiftItem {
+  page_num: number
+  plan_intent: string      // 教案对应环节的目标
+  scheme_purpose: string   // 课件这一页的目的
+  note: string             // 偏移点说明
+}
+
+/** 对齐：完整结构化分析结果（落在 report_json 内，前端解析渲染） */
+export interface AlignmentResultJSON {
+  overall: 'aligned' | 'minor' | 'major'
+  summary: string
+  coverage: AlignmentCoverageItem[]
+  additions: AlignmentAdditionItem[]
+  intent_shifts: AlignmentIntentShiftItem[]
+}
+
+/** 对齐报告主记录（对应后端 CoursewareAlignmentReport） */
+export interface CoursewareAlignmentReport {
+  id: string
+  courseware_id: string
+  lesson_plan_id: string | null
+  overall: 'aligned' | 'minor' | 'major' | 'failed'
+  summary: string
+  report_json: string        // 完整 JSON 文本，前端 JSON.parse 为 AlignmentResultJSON
+  status: 'generating' | 'done' | 'failed'
+  error_message: string
+  model_used: string
+  tokens_used: number
+  page_count: number
+  created_at: string | null
+  updated_at: string | null
+}
+
+/** 对齐报告查询响应（has_report=false 时不显示对齐卡片） */
+export interface AlignmentReportResponse {
+  has_report: boolean
+  report: CoursewareAlignmentReport | null
+}
+
+/** 对齐整体结论 UI 配置 */
+export const CW_ALIGNMENT_OVERALL_CONFIG: Record<string, { label: string; color: string; bg: string; emoji: string }> = {
+  aligned: { label: '已对齐', color: '#059669', bg: '#D1FAE5', emoji: '✅' },
+  minor:   { label: '小幅偏差', color: '#D97706', bg: '#FEF3C7', emoji: '⚠️' },
+  major:   { label: '需注意', color: '#DC2626', bg: '#FEE2E2', emoji: '❗' },
+  failed:  { label: '校验失败', color: '#6B7280', bg: '#F3F4F6', emoji: '⚪' },
+}
+
+/** 对齐覆盖状态 UI 配置 */
+export const CW_ALIGNMENT_COVERAGE_CONFIG: Record<string, { label: string; color: string; bg: string; emoji: string }> = {
+  covered: { label: '已覆盖', color: '#059669', bg: '#D1FAE5', emoji: '✅' },
+  partial: { label: '部分覆盖', color: '#D97706', bg: '#FEF3C7', emoji: '◐' },
+  missing: { label: '未覆盖', color: '#DC2626', bg: '#FEE2E2', emoji: '✕' },
+}

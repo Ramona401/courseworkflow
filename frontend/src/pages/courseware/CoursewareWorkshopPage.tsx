@@ -1,58 +1,59 @@
 /**
- * 课件工坊主页面 — CoursewareWorkshopPage.tsx
+ * 课件工坊主页面 — CoursewareWorkshopPage.tsx（批次5b-2模块化拆分后·编排壳）
  *
  * 六步向导主页面（生成方案→确认方案→选风格→确认导航栏→批量生成→确认提交）。
  *
- * 【模块化拆分】本文件原 1877 行，已将以下无状态/独立部分抽到 components/courseware-workshop/：
- *   - workshopConstants.ts : C(配色) / CW_WIDTH / CW_HEIGHT / CW_IMG_STYLES(图片风格快选) /
- *                            STEPS(六步定义) / statusToStep(status→step 映射)
- *   - previewInject.ts     : PREVIEW_INJECT_SCRIPT / injectPreviewMode(iframe 预览降级注入)
- *   - CWFullscreenPreview.tsx : 带工具栏的全屏预览组件
- *   - SlideshowPlayer.tsx     : 全屏幻灯片放映组件
- * 主组件逻辑与交互完全不变，仅改为 import 上述模块。
+ * 【模块化拆分史】原1877行：
+ *   - W1/W2/W3批次：常量(workshopConstants)/预览注入(previewInject)/全屏预览/放映/
+ *     多媒体管理(MediaManagerPanel)/单页微调(RefinePanel)/外观(AppearancePanel)/
+ *     模板保存(TemplateSavePanel)已陆续抽出；
+ *   - 批次5b-2：再抽 PagePreviewBlock(胶片条+页预览+MsgBar) / SchemeSteps(Step0+1) /
+ *     NavConfirmStep(Step3)，并剪除W1/W2搬家后遗留的死导入，本文件回到600行红线内。
+ *
+ * 本文件保留职责（编排壳）：
+ *   - 路由/课件加载(loadCourseware)/局部刷新(refreshPagesOnly)/步骤状态机；
+ *   - 风格锚点设/清（顶部锚点条与MediaManagerPanel共用，必须留在页面级）；
+ *   - Step2选风格、Step4批量生成（SSE并发收尾口径+断线重连补齐）、Step5工作台六Tab；
+ *   - 全屏预览/放映两弹窗与共享SSE句柄(sseRef)的生命周期。
  *
  * 关键设计（保留供理解）：
- *   - buildPreviewNum 是 Step5 唯一选中页真相源；多媒体管理已整体迁入
- *     MediaManagerPanel.tsx（批次W1），以 pageNum 接收选中页，内部自动拉取本页媒体防串页。
+ *   - buildPreviewNum 是 Step5 唯一选中页真相源；pages 是方案页面真相源；
+ *     previewPages/generatedPages 由 loadCourseware 恢复、SSE 增量更新。
  *   - source_type==='3d_single' 时早返回走 ThreeDSingleView，不走标准六步。
- *   - 图片配图建议/批量生成/视频编辑等逻辑见 MediaManagerPanel.tsx。
- *   - 单页微调/重生已迁入 RefinePanel.tsx（批次W2），保存模板迁入 TemplateSavePanel.tsx。
  *   - 批量生成支持中断续传（跳过已生成页）。
- *   - 「☁️云盘」上传成功写 public_oss_url；删除已上云资产弹强警告确认。
+ *
+ * 【P1-02 体验修复·解读A单一真相源·定稿】
+ *   "退出全屏/放映后停留当前页" 采用解读A：全屏里翻到哪页，退出后整个工作台就停在哪页。
+ *   实现关键——子组件退出时经 onClose(finalPage) 回传最终页，父组件把它直接写进
+ *   buildPreviewNum（Step5 选中页的唯一真相源），而非写进 fullscreenPageNum/slideshowInitPage
+ *   这两个"开窗初值"中间态。于是列表高亮、页预览、下次再开全屏全部自动同步到该页，
+ *   一处真相、永不打架。fullscreenPageNum/slideshowInitPage 仅作"开窗那一刻喂初值"用，
+ *   始终由 buildPreviewNum 派生，不再各记各的（早期各记各的导致回写被开窗值反复覆盖）。
+ *   翻页全程子组件不回写父组件，杜绝翻页回弹。
  */
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
-  getCourseware, getCoursewarePages, generateCWIndex, generateCWIndexFromTopic, subscribeCWIndexSSE,
-  confirmCWIndex, generateCWPreview, saveCWNavTemplate,
-  generateCWPages, CW_STATUS_CONFIG, refineNav, refinePage, cancelGenerate,
-  generateCWIndexFromPPT,
-  generateCWIndexFromDoc,
-  rollbackCWStatus, refineCWIndex, getSchemePresets, saveAsMyTemplate,
-  generateCWImage, uploadCWImage, listPageAssets, deleteCWAsset, insertImageToPage,
-  advancedConcatCWVideos, uploadCWVideo, uploadAssetToOSS, regenerateCWPage,
-  suggestImagePrompt, getStoredImageSuggestions,
-  setStyleAnchor, clearStyleAnchor,
+  getCourseware, getCoursewarePages, subscribeCWIndexSSE,
+  generateCWPages, CW_STATUS_CONFIG, cancelGenerate,
+  rollbackCWStatus, setStyleAnchor, clearStyleAnchor,
 } from '@/api/coursewares'
-import type { SchemePreset, ImagePromptSuggestion } from '@/api/coursewares'
 import type { CoursewareDetail, CoursewarePage } from '@/api/coursewares'
-import IndexEditor from './components/IndexEditor'
 import StyleSelector from './components/StyleSelector'
 import { useAuth } from '@/store/auth'
-import VideoEditorModal from './components/VideoEditorModal'
 import ThreeDSingleView from './components/ThreeDSingleView'
-// 模块化拆分：常量/注入/两个预览组件抽到 courseware-workshop 子目录
-import { C, CW_WIDTH, CW_HEIGHT, CW_IMG_STYLES, STEPS, statusToStep } from './components/courseware-workshop/workshopConstants'
-import { injectPreviewMode } from './components/courseware-workshop/previewInject'
+import { C, STEPS, statusToStep } from './components/courseware-workshop/workshopConstants'
 import CWFullscreenPreview from './components/courseware-workshop/CWFullscreenPreview'
 import SlideshowPlayer from './components/courseware-workshop/SlideshowPlayer'
-import VideoStoryboardPanel from './components/VideoStoryboardPanel'
-import BackgroundPicker from './components/courseware-workshop/BackgroundPicker'
-import FontPicker from './components/courseware-workshop/FontPicker'
 import MediaManagerPanel from './components/courseware-workshop/MediaManagerPanel'
 import RefinePanel from './components/courseware-workshop/RefinePanel'
 import AppearancePanel from './components/courseware-workshop/AppearancePanel'
 import TemplateSavePanel from './components/courseware-workshop/TemplateSavePanel'
+import PagePreviewBlock, { MsgBar } from './components/courseware-workshop/PagePreviewBlock'
+import type { PageItem } from './components/courseware-workshop/PagePreviewBlock'
+import SchemeSteps from './components/courseware-workshop/SchemeSteps'
+import LessonPlanRefDrawer from './components/courseware-workshop/LessonPlanRefDrawer'
+import NavConfirmStep from './components/courseware-workshop/NavConfirmStep'
 
 // ==================== 主组件 ====================
 export default function CoursewareWorkshopPage() {
@@ -72,47 +73,32 @@ export default function CoursewareWorkshopPage() {
     setMaxStepReached(prev => Math.max(prev, step))
   }
   const [pages, setPages] = useState<CoursewarePage[]>([])
-  const [generating, setGenerating] = useState(false)
-  const [sseMessage, setSseMessage] = useState('')
-  const [confirming, setConfirming] = useState(false)
 
-  // Step 3: 预览生成状态（P0-1: 只有1页封面预览）
-  const [previewGenRunning, setPreviewGenRunning] = useState(false)
-  const [previewGenMessage, setPreviewGenMessage] = useState('')
-  const [previewPages, setPreviewPages] = useState<{ page_number: number; title: string; html_content: string }[]>([])
-  const [navSaving, setNavSaving] = useState(false)
-
-  // P0-2: 导航栏微调状态
-  const [navRefineInput, setNavRefineInput] = useState('')
-  const [navRefining, setNavRefining] = useState(false)
+  // Step 3 数据真相源：封面预览页（loadCourseware恢复时填充，生成逻辑在NavConfirmStep内）
+  const [previewPages, setPreviewPages] = useState<PageItem[]>([])
 
   // Step 4: 批量生成状态
   const [buildRunning, setBuildRunning] = useState(false)
   const [buildMessage, setBuildMessage] = useState('')
   const [buildProgress, setBuildProgress] = useState({ current: 0, total: 0 })
-  const [generatedPages, setGeneratedPages] = useState<{ page_number: number; title: string; html_content: string }[]>([])
+  const [generatedPages, setGeneratedPages] = useState<PageItem[]>([])
   const [buildPreviewNum, setBuildPreviewNum] = useState(0)
 
-  // 批次W2: 页面微调状态/逻辑已迁入 RefinePanel.tsx; 模板保存已迁入 TemplateSavePanel.tsx
+  // 批次W2: 页面微调/模板保存已迁入 RefinePanel/TemplateSavePanel
+  // 批次5b-2: Step0/1方案状态迁入 SchemeSteps; Step3封面生成状态迁入 NavConfirmStep
 
-  // v136: 方案预设+AI修改方案+回退
-  const [presets, setPresets] = useState<SchemePreset[]>([])
-  const [selectedPreset, setSelectedPreset] = useState('auto')
-  const [refineFeedback, setRefineFeedback] = useState('')
-  const [refining, setRefining] = useState(false)
+  // v136: 步骤回退运行态
   const [rollingBack, setRollingBack] = useState(false)
 
-  // v137: 源代码查看状态
-  const [codeViewPageNum, setCodeViewPageNum] = useState(0)
   // v137: 全屏预览状态（带工具栏，非放映模式）
+  // P1-02解读A: fullscreenPageNum/slideshowInitPage 仅作"开窗那一刻喂给子组件的初值"，
+  //   退出后真相回写到 buildPreviewNum；这两个 state 由 buildPreviewNum 在开窗时派生。
   const [fullscreenOpen, setFullscreenOpen] = useState(false)
   const [fullscreenPageNum, setFullscreenPageNum] = useState(1)
   const [fullscreenCodeView, setFullscreenCodeView] = useState(false)
 
-
   const [slideshowOpen, setSlideshowOpen] = useState(false)
   const [slideshowInitPage, setSlideshowInitPage] = useState(1)
-  // 批次W1: 多媒体管理的全部状态/effect/处理函数已整体迁入 MediaManagerPanel.tsx
   // 批次W2: Step5工作台Tab(默认「页面微调」=最高频动作; 图片/视频两Tab共用MediaManagerPanel实例)
   const [wsTab, setWsTab] = useState<'refine' | 'background' | 'font' | 'image' | 'video' | 'template'>('refine')  // W3: 背景/字体独立Tab
 
@@ -149,19 +135,10 @@ export default function CoursewareWorkshopPage() {
     } finally { setAnchorClearing(false) }
   }
 
+  // 全工坊共享的单一SSE连接句柄（方案/封面/批量三场景轮流持有，卸载统一关闭）
   const sseRef = useRef<{ close: () => void } | null>(null)
 
-
-  
-
-
-
   useEffect(() => { if (id) loadCourseware(); return () => { sseRef.current?.close() } }, [id])
-
-  // v136: 加载方案预设
-  useEffect(() => {
-    getSchemePresets().then(p => setPresets(p)).catch(() => {})
-  }, [])
 
   const loadCourseware = useCallback(async () => {
     if (!id) return; setLoading(true)
@@ -178,7 +155,7 @@ export default function CoursewareWorkshopPage() {
         if (pp.length > 0) setPreviewPages(pp)
         setGeneratedPages(gp)
         if (buildPreviewNum === 0 && gp.length > 0) {
-          // v0.42.13 中断态默认预览“最后一张已生成页”，避免误以为从第1页重做；全部完成才默认第1页便于从头审阅
+          // v0.42.13 中断态默认预览"最后一张已生成页"，避免误以为从第1页重做；全部完成才默认第1页便于从头审阅
           const cwAllDone = gp.length >= (d.pages || []).length
           setBuildPreviewNum(cwAllDone ? gp[0].page_number : gp[gp.length - 1].page_number)
         }
@@ -217,118 +194,7 @@ export default function CoursewareWorkshopPage() {
     finally { setRollingBack(false) }
   }
 
-  // v136: AI修改方案
-  const handleRefineIndex = async () => {
-    if (!id || !refineFeedback.trim() || refining) return
-    setRefining(true); setSseMessage('正在根据意见修改方案...')
-    try {
-      await refineCWIndex(id, refineFeedback.trim())
-      sseRef.current?.close()
-      sseRef.current = subscribeCWIndexSSE(id, {
-        onConnected: () => setSseMessage('已连接，AI正在修改方案...'),
-        onIndexStart: d => setSseMessage(String((d as Record<string, unknown>).message || '')),
-        onIndexProgress: d => setSseMessage(String((d as Record<string, unknown>).message || '')),
-        onIndexPage: page => setPages(prev => {
-          const next = prev.some(p => p.page_number === page.page_number)
-            ? prev.map(p => p.page_number === page.page_number ? page : p)
-            : [...prev, page]
-          return next.slice().sort((a, b) => a.page_number - b.page_number)
-        }),
-        onIndexDone: d => { setSseMessage('\u2705 ' + d.message); setRefining(false); setRefineFeedback(''); loadCourseware() },
-        onError: d => { setSseMessage('\u274c ' + d.message); setRefining(false) },
-      })
-    } catch { setSseMessage('\u274c 启动失败'); setRefining(false) }
-  }
-
-  // Step 0: 生成方案
-  const handleGenerate = async () => {
-    if (!id) return; setGenerating(true); setSseMessage('正在启动...'); setPages([])
-    try {
-      if (courseware?.source_type === 'topic_direct') {
-        await generateCWIndexFromTopic(id, {
-          subject: courseware.subject,
-          grade: courseware.grade,
-          topic: courseware.title,
-          preset: selectedPreset,
-        })
-      } else if (courseware?.source_type === 'ppt_upload') {
-        await generateCWIndexFromPPT(id, selectedPreset)
-      } else if (courseware?.source_type === 'doc_upload') {
-        await generateCWIndexFromDoc(id, selectedPreset)
-      } else {
-        await generateCWIndex(id, selectedPreset)
-      }
-      sseRef.current?.close()
-      sseRef.current = subscribeCWIndexSSE(id, {
-        onConnected: () => setSseMessage('已连接，正在分析教案...'),
-        onIndexStart: d => setSseMessage(String((d as Record<string, unknown>).message || '')),
-        onIndexProgress: d => setSseMessage(String((d as Record<string, unknown>).message || '')),
-        onIndexPage: page => setPages(prev => {
-          const next = prev.some(p => p.page_number === page.page_number)
-            ? prev.map(p => p.page_number === page.page_number ? page : p)
-            : [...prev, page]
-          return next.slice().sort((a, b) => a.page_number - b.page_number)
-        }),
-        onIndexDone: d => { setSseMessage(`✅ ${d.message}`); setGenerating(false); goToStep(1); loadCourseware() },
-        onError: d => { setSseMessage(`❌ ${d.message}`); setGenerating(false) },
-      })
-    } catch { setSseMessage('❌ 启动失败'); setGenerating(false) }
-  }
-  useEffect(() => {
-    if (!generating || !id) return
-    const t = setInterval(async () => { try { const d = await getCourseware(id); if (d.status !== 'draft' && d.status !== 'indexing') { setGenerating(false); setCourseware(d); setPages(d.pages || []); goToStep(1); setSseMessage('✅ 完成'); sseRef.current?.close() } } catch {} }, 10000)
-    return () => clearInterval(t)
-  }, [generating, id])
-
-  const handleConfirm = async () => {
-    if (!id || !pages.length) return; setConfirming(true)
-    try { await confirmCWIndex(id); goToStep(2); loadCourseware() } catch { alert('确认失败') } finally { setConfirming(false) }
-  }
   const handleStyleConfirmed = () => { goToStep(3); loadCourseware() }
-
-  // Step 3: 生成预览页（P0-1: 仅封面1页）
-  const handleGenPreview = async () => {
-    if (!id) return; setPreviewGenRunning(true); setPreviewGenMessage('正在启动...'); setPreviewPages([])
-    try {
-      await generateCWPreview(id); sseRef.current?.close()
-      sseRef.current = subscribeCWIndexSSE(id, {
-        onConnected: () => setPreviewGenMessage('已连接...'),
-        onGenStart: d => setPreviewGenMessage(d.message),
-        onGenProgress: d => setPreviewGenMessage(d.message),
-        onGenPage: d => { setPreviewPages(p => [...p, { page_number: d.page_number, title: d.title, html_content: d.html_content }]) },
-        onGenDone: d => { setPreviewGenRunning(false); if (d.fail_count > 0) { setPreviewGenMessage(`❌ ${d.message}`) } else { setPreviewGenMessage(`✅ ${d.message}`); loadCourseware() } },
-        onError: d => { setPreviewGenMessage(`❌ ${d.message}`); setPreviewGenRunning(false) },
-      })
-    } catch { setPreviewGenMessage('❌ 启动失败'); setPreviewGenRunning(false) }
-  }
-
-  // Step 3: 确认导航栏（P0-1: 传"auto"让后端自动提取）
-  const handleSaveNav = async () => {
-    if (!id || previewPages.length === 0) return
-    setNavSaving(true)
-    try {
-      await saveCWNavTemplate(id, 'auto')
-      goToStep(4)
-      loadCourseware()
-    } catch (e) { alert('保存导航栏失败: ' + (e instanceof Error ? e.message : '未知错误')) } finally { setNavSaving(false) }
-  }
-
-  // P0-2: 导航栏AI微调
-  const handleRefineNav = async () => {
-    if (!id || !navRefineInput.trim()) return
-    setNavRefining(true)
-    try {
-      await refineNav(id, navRefineInput.trim())
-      await loadCourseware()
-      setNavRefineInput('')
-      setPreviewGenMessage('\u2705 导航栏微调完成')
-    } catch (e) { setPreviewGenMessage('\u274c 微调失败: ' + (e instanceof Error ? e.message : '未知错误')) } finally { setNavRefining(false) }
-  }
-
-
-
-
-
 
   // Step 4: 批量生成剩余页
   const handleBuildStart = async () => {
@@ -422,10 +288,36 @@ export default function CoursewareWorkshopPage() {
     }
   }
 
+  // P1-02解读A: 开放映时——用传入页 / 列表选中页(buildPreviewNum) 派生初值喂给子组件
   const openSlideshow = (pn?: number) => {
     const allPages = generatedPages.length > 0 ? generatedPages : previewPages
     setSlideshowInitPage(pn || buildPreviewNum || allPages[0]?.page_number || 1)
     setSlideshowOpen(true)
+  }
+
+  // v137: 全屏预览入口（PagePreviewBlock 的「🔍 全屏预览」按钮回调）
+  //   P1-02解读A: pn 来自列表选中页，作为开窗初值喂给子组件
+  const handleFullscreen = (pn: number) => {
+    setFullscreenPageNum(pn); setFullscreenOpen(true); setFullscreenCodeView(false)
+  }
+
+  // P1-02解读A: 全屏预览退出——把子组件回传的最终页写进 buildPreviewNum（唯一真相源），
+  //   于是列表高亮/页预览/下次开窗初值全部同步到该页；同时同步 fullscreenPageNum 保持初值一致。
+  const handleFullscreenClose = (finalPage?: number) => {
+    if (typeof finalPage === 'number') {
+      setBuildPreviewNum(finalPage)
+      setFullscreenPageNum(finalPage)
+    }
+    setFullscreenOpen(false)
+  }
+
+  // P1-02解读A: 放映退出——同上，回传最终页写进 buildPreviewNum 唯一真相源
+  const handleSlideshowClose = (finalPage?: number) => {
+    if (typeof finalPage === 'number') {
+      setBuildPreviewNum(finalPage)
+      setSlideshowInitPage(finalPage)
+    }
+    setSlideshowOpen(false)
   }
 
   if (loading) return <div style={{ textAlign: 'center', padding: '80px 0', color: C.textMuted }}><div style={{ fontSize: 40, marginBottom: 12 }}>🎨</div>加载中...</div>
@@ -439,74 +331,6 @@ export default function CoursewareWorkshopPage() {
   }
 
   const sc = CW_STATUS_CONFIG[courseware.status] || { label: courseware.status, color: '#6B7280', bg: '#F3F4F6' }
-  const containerWidth = 912
-  const previewScale = containerWidth / CW_WIDTH
-
-  const msgBar = (msg: string) => msg ? <div style={{ padding: '12px 16px', borderRadius: 8, marginBottom: 16, background: msg.startsWith('❌') ? '#FEE2E2' : msg.startsWith('✅') ? '#D1FAE5' : msg.startsWith('⚠️') ? '#FEF3C7' : '#EFF6FF', color: msg.startsWith('❌') ? '#DC2626' : msg.startsWith('✅') ? '#059669' : msg.startsWith('⚠️') ? '#D97706' : '#2563EB', fontSize: 14 }}>{msg}</div> : null
-
-  // v0.41: renderPagePreview 中的 iframe srcDoc 统一注入预览降级
-  const renderPagePreview = (pageList: { page_number: number; title: string; html_content: string }[], currentNum: number, setCurrentNum: (n: number) => void, showSlideshow: boolean) => {
-    const activePage = currentNum > 0 ? currentNum : (pageList[0]?.page_number || 0)
-    const html = pageList.find(p => p.page_number === activePage)?.html_content || ''
-    const previewHtml = injectPreviewMode(html)
-    return <>
-      {pageList.length > 0 && (
-        <div style={{ marginBottom: 20 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-            <div style={{ fontSize: 14, fontWeight: 600, color: C.textPrimary }}>📄 已生成 {pageList.length} 页</div>
-            {showSlideshow && <button onClick={() => openSlideshow()} style={{ padding: '6px 14px', borderRadius: 8, border: `1px solid ${C.primary}`, background: C.primaryBg, color: C.primary, fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>🖥️ 全屏放映</button>}
-          </div>
-          {/* W3: 胶片条——单行横向滚动, 页数再多也只占一行高度(PPT/Canva同款导航模式) */}
-          <div style={{ display: 'flex', gap: 6, flexWrap: 'nowrap', overflowX: 'auto', paddingBottom: 6 }}>
-            {pageList.map(gp => (
-              <button key={gp.page_number} onClick={() => setCurrentNum(gp.page_number)} title={'P' + gp.page_number + ' ' + gp.title} style={{
-                padding: '6px 10px', borderRadius: 8, cursor: 'pointer', flexShrink: 0, whiteSpace: 'nowrap',
-                border: `2px solid ${activePage === gp.page_number ? C.primary : C.border}`,
-                background: activePage === gp.page_number ? C.primaryBg : C.white,
-                color: activePage === gp.page_number ? C.primary : C.textPrimary,
-                fontSize: 12, fontWeight: activePage === gp.page_number ? 600 : 400, transition: 'all 200ms',
-              }}>
-                <span style={{ fontWeight: 700 }}>P{gp.page_number}</span>
-                <span style={{ marginLeft: 5, color: C.textSecondary, fontSize: 11 }}>{gp.title.length > 6 ? gp.title.slice(0, 6) + '…' : gp.title}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-      {html && (
-        <div style={{ marginBottom: 20 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-            <div style={{ fontSize: 14, fontWeight: 600, color: C.textPrimary }}>{codeViewPageNum === activePage ? '💻' : '📺'} 第 {activePage} 页{codeViewPageNum === activePage ? '源代码' : '预览'}</div>
-            <div style={{ display: 'flex', gap: 6 }}>
-              <button onClick={() => { if (codeViewPageNum === activePage) setCodeViewPageNum(0); else setCodeViewPageNum(activePage) }} style={{ padding: '4px 10px', borderRadius: 6, border: `1px solid ${codeViewPageNum === activePage ? '#7C3AED' : C.border}`, background: codeViewPageNum === activePage ? 'rgba(124,58,237,0.06)' : 'transparent', color: codeViewPageNum === activePage ? '#7C3AED' : C.textSecondary, fontSize: 12, cursor: 'pointer' }}>{codeViewPageNum === activePage ? '📺 预览' : '💻 源代码'}</button>
-              <button onClick={() => { navigator.clipboard.writeText(html).then(() => alert('源代码已复制到剪贴板')).catch(() => {}) }} style={{ padding: '4px 10px', borderRadius: 6, border: `1px solid ${C.border}`, background: 'transparent', color: C.textSecondary, fontSize: 12, cursor: 'pointer' }}>📋 复制代码</button>
-              <button onClick={() => { setFullscreenPageNum(activePage); setFullscreenOpen(true); setFullscreenCodeView(false) }} style={{ padding: '4px 10px', borderRadius: 6, border: `1px solid ${C.border}`, background: 'transparent', color: C.textSecondary, fontSize: 12, cursor: 'pointer' }}>🔍 全屏预览</button>
-              <button onClick={() => openSlideshow(activePage)} style={{ padding: '4px 10px', borderRadius: 6, border: `1px solid ${C.border}`, background: 'transparent', color: C.textSecondary, fontSize: 12, cursor: 'pointer' }}>🖥️ 放映</button>
-            </div>
-          </div>
-          {codeViewPageNum === activePage ? (
-            <div style={{ width: '100%', maxHeight: 500, overflow: 'auto', borderRadius: 14, border: `1px solid ${C.border}`, background: '#1e1e1e', fontFamily: 'Monaco, Consolas, "Courier New", monospace', fontSize: 12, lineHeight: 1.7 }}>
-              <table style={{ borderCollapse: 'collapse', width: '100%' }}><tbody>
-                {html.split('\n').map((line: string, i: number) => (
-                  <tr key={i}>
-                    <td style={{ width: 50, minWidth: 50, textAlign: 'right', padding: '0 10px 0 8px', color: '#858585', userSelect: 'none', verticalAlign: 'top', borderRight: '1px solid #333', whiteSpace: 'nowrap' }}>{i + 1}</td>
-                    <td style={{ padding: '0 12px', color: '#d4d4d4', whiteSpace: 'pre', wordBreak: 'break-all' }}>{line || ' '}</td>
-                  </tr>
-                ))}
-              </tbody></table>
-            </div>
-          ) : (
-            <div onClick={() => openSlideshow(activePage)} style={{
-              width: '100%', height: Math.ceil(CW_HEIGHT * previewScale), position: 'relative', overflow: 'hidden',
-              borderRadius: 14, border: `1px solid ${C.border}`, background: '#f8fafc', cursor: 'pointer',
-            }}>
-              <iframe srcDoc={previewHtml} scrolling="no" style={{ width: CW_WIDTH, height: CW_HEIGHT, border: 'none', pointerEvents: 'none', transform: `scale(${previewScale})`, transformOrigin: 'top left', position: 'absolute', top: 0, left: 0, overflow: 'hidden' }} sandbox="allow-scripts" title={`预览-P${activePage}`} />
-            </div>
-          )}
-        </div>
-      )}
-    </>
-  }
 
   const allSlideshowPages = generatedPages.length > 0 ? generatedPages : previewPages
   // v0.42.12 续生成统计：基于完整页面列表 pages 计算已生成/剩余页数
@@ -565,69 +389,21 @@ export default function CoursewareWorkshopPage() {
       {/* 内容区 */}
       <div style={{ background: C.white, borderRadius: 12, border: `1px solid ${C.border}`, padding: 24, minHeight: 400 }}>
 
-        {/* Step 0: AI生成方案 */}
-        {activeStep === 0 && <div>
-          <h3 style={{ fontSize: 18, fontWeight: 600, color: C.textPrimary, margin: '0 0 8px' }}>🤖 AI生成课件方案</h3>
-          <p style={{ fontSize: 14, color: C.textSecondary, margin: '0 0 20px' }}>AI将分析教案内容，自动为每页设计方案。</p>
-          {/* v136: 方案结构预设选择 */}
-          {presets.length > 0 && !generating && (
-            <div style={{ marginBottom: 20 }}>
-              <div style={{ fontSize: 14, fontWeight: 600, color: C.textPrimary, marginBottom: 10 }}>选择课件结构预设</div>
-              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                {presets.map(p => (
-                  <button key={p.key} onClick={() => setSelectedPreset(p.key)}
-                    style={{
-                      flex: '1 1 200px', maxWidth: 240, padding: '12px 16px', borderRadius: 10, cursor: 'pointer',
-                      border: `2px solid ${selectedPreset === p.key ? C.primary : C.border}`,
-                      background: selectedPreset === p.key ? C.primaryBg : C.white,
-                      textAlign: 'left', transition: 'all 200ms',
-                    }}>
-                    <div style={{ fontSize: 20, marginBottom: 4 }}>{p.emoji}</div>
-                    <div style={{ fontSize: 14, fontWeight: 600, color: selectedPreset === p.key ? C.primary : C.textPrimary }}>{p.name}</div>
-                    <div style={{ fontSize: 12, color: C.textSecondary, marginTop: 2 }}>{p.description}</div>
-                    <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }}>{p.page_range}</div>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-          {msgBar(sseMessage)}
-          {generating && pages.length > 0 && <div style={{ marginBottom: 16 }}><div style={{ fontSize: 13, color: C.textMuted, marginBottom: 8 }}>已生成 {pages.length} 页方案...</div><IndexEditor coursewareId={id!} pages={pages} onPagesChange={setPages} isAdmin={isAdmin} indexOverview={courseware?.index_overview} /></div>}
-          <button onClick={handleGenerate} disabled={generating} style={{ padding: '12px 32px', borderRadius: 10, border: 'none', background: generating ? '#E5E7EB' : 'linear-gradient(135deg, #F59E0B, #EF4444)', color: generating ? '#9CA3AF' : '#fff', fontSize: 15, fontWeight: 600, cursor: generating ? 'default' : 'pointer', boxShadow: generating ? 'none' : '0 4px 16px rgba(245,158,11,0.3)' }}>
-            {generating ? '⏳ 生成中...' : pages.length > 0 ? '🔄 重新生成' : '🤖 开始AI生成方案'}
-          </button>
-          {!generating && pages.length > 0 && <button onClick={() => goToStep(1)} style={{ marginLeft: 12, padding: '12px 24px', borderRadius: 10, border: `1px solid ${C.primary}`, background: C.primaryBg, color: C.primary, fontSize: 15, fontWeight: 600, cursor: 'pointer' }}>✏️ 确认方案 →</button>}
-        </div>}
-
-        {/* Step 1: 确认方案 */}
-        {activeStep === 1 && <div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-            <div><h3 style={{ fontSize: 18, fontWeight: 600, color: C.textPrimary, margin: 0 }}>✏️ 确认方案</h3><p style={{ fontSize: 13, color: C.textSecondary, margin: '4px 0 0' }}>确认每页内容，可调整顺序或修改细节</p></div>
-            <div style={{ display: 'flex', gap: 10 }}>
-              <button onClick={() => goToStep(0)} style={{ padding: '8px 16px', borderRadius: 8, border: `1px solid ${C.border}`, background: 'transparent', color: C.textSecondary, fontSize: 13, cursor: 'pointer' }}>← 重新生成</button>
-              <button onClick={handleConfirm} disabled={confirming || !pages.length} style={{ padding: '8px 20px', borderRadius: 8, border: 'none', background: pages.length ? 'linear-gradient(135deg, #F59E0B, #EF4444)' : '#E5E7EB', color: pages.length ? '#fff' : '#9CA3AF', fontSize: 14, fontWeight: 600, cursor: pages.length && !confirming ? 'pointer' : 'default' }}>{confirming ? '确认中...' : '确认方案，选择风格 →'}</button>
-            </div>
-          </div>
-          <IndexEditor coursewareId={id!} pages={pages} onPagesChange={setPages} isAdmin={isAdmin} indexOverview={courseware?.index_overview} />
-          {/* v136: AI修改方案输入区 */}
-          {pages.length > 0 && !refining && (
-            <div style={{ marginTop: 16, padding: '16px', borderRadius: 10, border: '1px solid ' + C.border, background: '#FAFAFA' }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 8 }}>🤖 对整体方案不满意？输入修改意见让AI重新调整</div>
-              <div style={{ display: 'flex', gap: 10 }}>
-                <input value={refineFeedback} onChange={e => setRefineFeedback(e.target.value)}
-                  placeholder="例如：小学生不需要学习目标页、增加互动练习、减少纯文字页面..."
-                  onKeyDown={e => { if (e.key === 'Enter' && refineFeedback.trim()) handleRefineIndex() }}
-                  style={{ flex: 1, padding: '10px 14px', borderRadius: 8, border: '1px solid ' + C.border, fontSize: 14, outline: 'none' }} />
-                <button onClick={handleRefineIndex} disabled={!refineFeedback.trim()}
-                  style={{ padding: '10px 20px', borderRadius: 8, border: 'none', background: refineFeedback.trim() ? '#7C3AED' : '#E5E7EB', color: refineFeedback.trim() ? '#fff' : '#9CA3AF', fontSize: 14, fontWeight: 600, cursor: refineFeedback.trim() ? 'pointer' : 'default', whiteSpace: 'nowrap' }}>
-                  🤖 AI修改方案
-                </button>
-              </div>
-            </div>
-          )}
-          {refining && <div style={{ marginTop: 16, textAlign: 'center', padding: 20, color: C.textMuted, fontSize: 14 }}><div style={{ fontSize: 32, marginBottom: 8 }}>🤖</div>AI正在根据您的意见修改方案，请稍候...</div>}
-          {msgBar(sseMessage)}
-        </div>}
+        {/* Step 0+1: 生成方案+确认方案（批次5b-2拆出为 SchemeSteps） */}
+        {(activeStep === 0 || activeStep === 1) && (
+          <SchemeSteps
+            coursewareId={id!}
+            courseware={courseware}
+            isAdmin={isAdmin}
+            activeStep={activeStep}
+            pages={pages}
+            setPages={setPages}
+            sseRef={sseRef}
+            goToStep={goToStep}
+            loadCourseware={loadCourseware}
+            onCoursewareUpdate={setCourseware}
+          />
+        )}
 
         {/* Step 2: 选择风格 */}
         {activeStep === 2 && courseware && <div>
@@ -638,63 +414,22 @@ export default function CoursewareWorkshopPage() {
           <StyleSelector courseware={courseware} coursewareId={id!} onStyleConfirmed={handleStyleConfirmed} />
         </div>}
 
-        {/* Step 3: 确认导航栏（P0-1: 只生成1页封面预览） */}
-        {activeStep === 3 && <div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-            <div><h3 style={{ fontSize: 18, fontWeight: 600, color: C.textPrimary, margin: 0 }}>🧭 确认导航栏样式</h3><p style={{ fontSize: 13, color: C.textSecondary, margin: '4px 0 0' }}>AI先生成封面页，请确认顶部导航栏是否满意</p></div>
-            {!previewGenRunning && <button onClick={() => goToStep(2)} style={{ padding: '8px 16px', borderRadius: 8, border: `1px solid ${C.border}`, background: 'transparent', color: C.textSecondary, fontSize: 13, cursor: 'pointer' }}>← 返回选择风格</button>}
-          </div>
-
-          {msgBar(previewGenMessage)}
-
-          {/* P0-1: 只展示1页封面预览 */}
-          {previewPages.length > 0 && renderPagePreview(previewPages, previewPages[0]?.page_number || 1, () => {}, false)}
-
-          {/* 操作按钮 */}
-          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-            {!previewGenRunning && previewPages.length === 0 && (
-              <button onClick={handleGenPreview} style={{ padding: '14px 36px', borderRadius: 10, border: 'none', background: 'linear-gradient(135deg, #F59E0B, #EF4444)', color: '#fff', fontSize: 16, fontWeight: 600, cursor: 'pointer', boxShadow: '0 4px 16px rgba(245,158,11,0.3)' }}>🧭 生成封面预览页</button>
-            )}
-            {!previewGenRunning && previewPages.length > 0 && <>
-              <button onClick={handleGenPreview} style={{ padding: '10px 24px', borderRadius: 8, border: `1px solid ${C.primary}`, background: C.primaryBg, color: C.primary, fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>🔄 重新生成预览</button>
-              <button onClick={handleSaveNav} disabled={navSaving} style={{ padding: '10px 24px', borderRadius: 8, border: 'none', background: 'linear-gradient(135deg, #059669, #10B981)', color: '#fff', fontSize: 14, fontWeight: 600, cursor: navSaving ? 'default' : 'pointer', boxShadow: '0 2px 8px rgba(5,150,105,0.3)' }}>
-                {navSaving ? '保存中...' : '✅ 导航栏样式满意，开始批量生成 →'}
-              </button>
-            </>}
-            {previewGenRunning && <div style={{ textAlign: 'center', padding: 20, color: C.textMuted, fontSize: 14, width: '100%' }}><div style={{ fontSize: 32, marginBottom: 8 }}>🧭</div>AI正在生成封面预览页，请稍候...</div>}
-          </div>
-
-          {/* 提示信息 */}
-          {previewPages.length > 0 && !previewGenRunning && (
-            <div style={{ marginTop: 16, padding: '12px 16px', borderRadius: 8, background: '#EFF6FF', color: '#2563EB', fontSize: 13 }}>
-              💡 请仔细查看封面页的导航栏样式（顶部Logo、机构名、页码位置和颜色）。确认满意后点击"开始批量生成"，后续所有页面将自动使用完全相同的导航栏。
-            </div>
-          )}
-
-          {/* 批次2（背景图库）：选背景秒换封面（零token零等待），后续批量生成的内页自动带内页底纹 */}
-          {previewPages.length > 0 && !previewGenRunning && (
-            <AppearancePanel coursewareId={id!} onSwapped={refreshPagesOnly} disabled={buildRunning}
-              cwTitle={courseware.title} cwSubject={courseware.subject} cwGrade={courseware.grade} />
-          )}
-
-          {/* P0-2: 导航栏AI微调输入区 */}
-          {previewPages.length > 0 && !previewGenRunning && (
-            <div style={{ marginTop: 16, padding: '16px', borderRadius: 10, border: `1px solid ${C.border}`, background: '#FAFAFA' }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 8 }}>🎨 导航栏不满意？输入修改意见让AI微调</div>
-              <div style={{ display: 'flex', gap: 10 }}>
-                <input value={navRefineInput} onChange={e => setNavRefineInput(e.target.value)}
-                  placeholder="例如：Logo再大一点、页码改成右对齐、背景色改为深蓝..."
-                  onKeyDown={e => { if (e.key === 'Enter' && !navRefining) handleRefineNav() }}
-                  style={{ flex: 1, padding: '10px 14px', borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 14, outline: 'none' }}
-                  disabled={navRefining} />
-                <button onClick={handleRefineNav} disabled={navRefining || !navRefineInput.trim()}
-                  style={{ padding: '10px 20px', borderRadius: 8, border: 'none', background: navRefineInput.trim() && !navRefining ? '#7C3AED' : '#E5E7EB', color: navRefineInput.trim() && !navRefining ? '#fff' : '#9CA3AF', fontSize: 14, fontWeight: 600, cursor: navRefineInput.trim() && !navRefining ? 'pointer' : 'default', whiteSpace: 'nowrap' }}>
-                  {navRefining ? '⏳ 微调中...' : '🎨 AI微调'}
-                </button>
-              </div>
-            </div>
-          )}
-        </div>}
+        {/* Step 3: 确认导航栏（批次5b-2拆出为 NavConfirmStep） */}
+        {activeStep === 3 && (
+          <NavConfirmStep
+            coursewareId={id!}
+            courseware={courseware}
+            previewPages={previewPages}
+            setPreviewPages={setPreviewPages}
+            buildRunning={buildRunning}
+            sseRef={sseRef}
+            goToStep={goToStep}
+            loadCourseware={loadCourseware}
+            refreshPagesOnly={refreshPagesOnly}
+            onSlideshow={openSlideshow}
+            onFullscreen={handleFullscreen}
+          />
+        )}
 
         {/* Step 4: 批量生成剩余页 */}
         {activeStep === 4 && <div>
@@ -702,7 +437,7 @@ export default function CoursewareWorkshopPage() {
             <div><h3 style={{ fontSize: 18, fontWeight: 600, color: C.textPrimary, margin: 0 }}>⚡ 批量生成课件</h3><p style={{ fontSize: 13, color: C.textSecondary, margin: '4px 0 0' }}>使用已确认的导航栏样式，逐页生成剩余课件</p></div>
             {!buildRunning && <button onClick={() => goToStep(3)} style={{ padding: '8px 16px', borderRadius: 8, border: `1px solid ${C.border}`, background: 'transparent', color: C.textSecondary, fontSize: 13, cursor: 'pointer' }}>← 返回确认导航栏</button>}
           </div>
-          {msgBar(buildMessage)}
+          <MsgBar msg={buildMessage} />
           {batchTotal > 0 && <div style={{ marginBottom: 20 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, color: C.textSecondary, marginBottom: 6 }}>
               <span>{cwInterrupted ? '续传进度（已完成页不会重做）' : '生成进度（多页同时进行）'}</span>
@@ -710,7 +445,7 @@ export default function CoursewareWorkshopPage() {
             </div>
             <div style={{ height: 8, borderRadius: 4, background: '#F3F4F6', overflow: 'hidden' }}><div style={{ height: '100%', borderRadius: 4, transition: 'width 500ms', width: `${batchPercent}%`, background: 'linear-gradient(90deg, #F59E0B, #EF4444)' }} /></div>
           </div>}
-          {renderPagePreview(generatedPages, buildPreviewNum, setBuildPreviewNum, true)}
+          <PagePreviewBlock pages={generatedPages} currentNum={buildPreviewNum} onSelectPage={setBuildPreviewNum} showSlideshow onSlideshow={openSlideshow} onFullscreen={handleFullscreen} />
           {/* v0.42.12 续生成提示条：检测到上次生成被中断（已生成部分页但仍有剩余） */}
           {!buildRunning && cwInterrupted && (
             <div style={{ padding: '12px 16px', borderRadius: 8, marginBottom: 14, background: '#FEF3C7', color: '#92400E', fontSize: 14, lineHeight: 1.6 }}>
@@ -750,11 +485,7 @@ export default function CoursewareWorkshopPage() {
             </div>
             <button onClick={() => goToStep(4)} style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid ' + C.border, background: 'transparent', color: C.textSecondary, fontSize: 13, cursor: 'pointer' }}>← 返回重新生成</button>
           </div>
-          {renderPagePreview(generatedPages, buildPreviewNum, setBuildPreviewNum, true)}
-          
-
-
-
+          <PagePreviewBlock pages={generatedPages} currentNum={buildPreviewNum} onSelectPage={setBuildPreviewNum} showSlideshow onSlideshow={openSlideshow} onFullscreen={handleFullscreen} />
 
           {/* 批次W2: Step5工作台Tab——预览区下方收纳全部工具, 页面高度恒定; 默认「页面微调」(最高频) */}
           {generatedPages.length > 0 && <>
@@ -791,19 +522,22 @@ export default function CoursewareWorkshopPage() {
         </div>}
       </div>
 
-      {/* v137: 全屏预览（带工具栏+键盘导航+resize响应） */}
+      {/* v137: 全屏预览（带工具栏+键盘导航+resize响应）
+          P1-02解读A: onClose 退出时把当前页回写进 buildPreviewNum 唯一真相源，列表/预览/下次开窗全同步 */}
       {fullscreenOpen && allSlideshowPages.length > 0 && <CWFullscreenPreview
         pages={allSlideshowPages}
         initialPageNum={fullscreenPageNum}
         codeView={fullscreenCodeView}
         onToggleCode={() => setFullscreenCodeView(!fullscreenCodeView)}
-        onClose={() => setFullscreenOpen(false)}
-        onSlideshow={(pn) => { setFullscreenOpen(false); setSlideshowInitPage(pn); setSlideshowOpen(true) }}
+        onClose={handleFullscreenClose}
+        onSlideshow={(pn) => { setBuildPreviewNum(pn); setFullscreenPageNum(pn); setFullscreenOpen(false); setSlideshowInitPage(pn); setSlideshowOpen(true) }}
       />}
 
-      {slideshowOpen && allSlideshowPages.length > 0 && <SlideshowPlayer pages={allSlideshowPages} initialPage={slideshowInitPage} onClose={() => setSlideshowOpen(false)} />}
+      {/* P1-02解读A: onClose 退出时把当前页回写进 buildPreviewNum 唯一真相源 */}
+      {slideshowOpen && allSlideshowPages.length > 0 && <SlideshowPlayer pages={allSlideshowPages} initialPage={slideshowInitPage} onClose={handleSlideshowClose} />}
 
-      {/* 批次W1: 视频编辑器弹窗已随多媒体逻辑迁入 MediaManagerPanel */}
+      {/* 断裂B: 原教案对照抽屉——仅在批量生成(4)/工作台(5)阶段提供，方便对照教案开发课件 */}
+      {(activeStep === 4 || activeStep >= 5) && <LessonPlanRefDrawer coursewareId={id!} />}
 
     </div>
   )

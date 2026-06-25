@@ -13,7 +13,8 @@ import type {
   CWComponentListItem, CWComponentFull, CoursewareTemplate, SeedResult,
   CWSSECallbacks, SchemePreset, RefineSSECallbacks, ExtractSSECallbacks,
   RefineHistoryEntry, PublishTargetsResponse,
-  CurriculumKPResponse,
+  CurriculumKPResponse, PageVersionEntry,
+  AlignmentReportResponse,
 } from './coursewares.types'
 
 // ==================== 课件CRUD ====================
@@ -187,6 +188,38 @@ export async function regenerateCWPage(
     `/coursewares/${coursewareId}/pages/${pageNumber}/regenerate`,
     {},
     { timeout: 120000 }, // 单页重生需调用大模型，2分钟超时
+  )
+  return extractData(resp)
+}
+
+// ==================== 页面级版本与回退（新增） ====================
+
+/**
+ * 页面级版本：获取某页的版本快照列表（轻量，不含 html_content，按 version_no 倒序，最新在前）。
+ * 每条含后端已附的来源中文标签 source_label，前端直接展示。
+ * 接口：GET /api/v1/coursewares/{id}/pages/{num}/versions
+ */
+export async function listPageVersions(
+  coursewareId: string,
+  pageNumber: number,
+): Promise<{ page_number: number; versions: PageVersionEntry[]; total: number }> {
+  const resp = await apiClient.get(`/coursewares/${coursewareId}/pages/${pageNumber}/versions`)
+  return extractData(resp)
+}
+
+/**
+ * 页面级版本：回退某页到指定历史版本，返回回退后的完整 HTML。
+ * 后端在写回目标版本前，会先把【当前】内容另存为一个 rollback 版本，故回退本身可逆。
+ * 接口：POST /api/v1/coursewares/{id}/pages/{num}/rollback   body: { version_id }
+ */
+export async function rollbackPage(
+  coursewareId: string,
+  pageNumber: number,
+  versionId: string,
+): Promise<{ page_number: number; html_content: string; message: string }> {
+  const resp = await apiClient.post(
+    `/coursewares/${coursewareId}/pages/${pageNumber}/rollback`,
+    { version_id: versionId },
   )
   return extractData(resp)
 }
@@ -643,5 +676,45 @@ export async function getCurriculumKnowledgePoints(
   const params: Record<string, string | number> = { subject }
   if (grade && grade > 0) params.grade = grade
   const resp = await apiClient.get('/curriculum/knowledge-points', { params })
+  return extractData(resp)
+}
+
+// ==================== 课件↔教案对齐报告 ====================
+
+/**
+ * 查询课件↔教案对齐报告。
+ * 前端 Step1（确认方案）加载时调用；若返回 report.status==='generating' 则短轮询。
+ * has_report=false 表示非教案来源或从未校验，前端不显示对齐卡片。
+ */
+export async function getAlignmentReport(coursewareId: string): Promise<AlignmentReportResponse> {
+  const resp = await apiClient.get(`/coursewares/${coursewareId}/alignment-report`)
+  return extractData(resp)
+}
+
+/**
+ * 手动触发对齐重算（老师改完方案后主动重新校验）。
+ * 立即返回，校验异步进行；调用方随后短轮询 getAlignmentReport 直到 done/failed。
+ */
+export async function recheckAlignment(coursewareId: string): Promise<void> {
+  await apiClient.post(`/coursewares/${coursewareId}/recheck-alignment`)
+}
+
+
+// ==================== 断裂B: 课件关联教案正文（对照抽屉） ====================
+
+/** 课件关联教案正文响应 */
+export interface CoursewareLessonPlanContent {
+  has_lesson_plan: boolean
+  title: string
+  content: string
+}
+
+/**
+ * 取课件关联教案的纯文本正文（供 Step4/Step5 工作台"原教案对照抽屉"展示）。
+ * 后端复用教案正文提取优先级链，对话生成型教案也能拿到正文。
+ * has_lesson_plan=false 表示非教案来源/无关联教案，前端不显示抽屉入口。
+ */
+export async function getCoursewareLessonPlanContent(coursewareId: string): Promise<CoursewareLessonPlanContent> {
+  const resp = await apiClient.get(`/coursewares/${coursewareId}/lesson-plan-content`)
   return extractData(resp)
 }
