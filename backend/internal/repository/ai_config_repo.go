@@ -20,10 +20,18 @@ var (
 // ==================== 全局配置数据访问 ====================
 
 // GetAllConfigs 获取所有全局配置项
+//
+// 【健壮性说明】ai_configs 是一张键值对表，除 AI 配置本身外，其它功能模块
+// （如积分自动分配开关 token_auto_allocation_enabled）也会借用本表存开关，
+// 这些外部写入可能不填 description 列导致 DB 存 NULL。而 AIConfig.Description
+// 字段是值类型 string，无法容纳 NULL，直接 Scan 会报
+// "cannot scan NULL into *string" 使整批查询崩溃、AI 配置页面读不出来。
+// 因此 SELECT 层用 COALESCE(description, '') 把 NULL 归一为空串，
+// 无论该列存 NULL 还是空串都能安全扫入 string，永不再崩。
 func GetAllConfigs() ([]*models.AIConfig, error) {
 	ctx := context.Background()
 	rows, err := database.DB.Query(ctx,
-		`SELECT id, config_key, config_value, description, updated_by, updated_at
+		`SELECT id, config_key, config_value, COALESCE(description, ''), updated_by, updated_at
 		 FROM ai_configs ORDER BY config_key`)
 	if err != nil {
 		return nil, fmt.Errorf("查询全局配置失败: %w", err)
@@ -43,11 +51,12 @@ func GetAllConfigs() ([]*models.AIConfig, error) {
 }
 
 // GetConfigByKey 根据键名获取单条配置
+// SELECT 同样用 COALESCE(description, '') 防 NULL 扫描崩溃（理由同 GetAllConfigs）
 func GetConfigByKey(key string) (*models.AIConfig, error) {
 	ctx := context.Background()
 	c := &models.AIConfig{}
 	err := database.DB.QueryRow(ctx,
-		`SELECT id, config_key, config_value, description, updated_by, updated_at
+		`SELECT id, config_key, config_value, COALESCE(description, ''), updated_by, updated_at
 		 FROM ai_configs WHERE config_key = $1`, key).Scan(
 		&c.ID, &c.ConfigKey, &c.ConfigValue, &c.Description, &c.UpdatedBy, &c.UpdatedAt)
 	if err != nil {

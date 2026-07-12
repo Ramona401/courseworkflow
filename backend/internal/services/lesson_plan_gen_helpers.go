@@ -6,6 +6,14 @@ package services
 // 本次为纯位置搬移，逻辑零改动；所有方法仍挂在 *LessonPlanGenService 接收器上、仍属 services 包，
 // 调用方与行为完全不变。
 //
+// 积分硬闸 batch (2026-07-04) 新增两个辅助：
+//   - isCreditGateError        — 识别积分守卫拦截类错误（按守卫三种拒绝文案匹配）
+//   - broadcastCreditGateNotice — 积分拦截专用友好消息（守卫原话直达老师）
+//   背景：积分硬闸上线后实测发现，守卫拦截（"积分余额不足…"）被空流软兜底包装成
+//   "网络打了个盹，请重试"，老师看不到真话、反复重试徒劳（实测截图三连撞）。
+//   本组辅助配合 lesson_plan_gen_chat_async.go 的短路逻辑：积分类错误不重试、
+//   不进软兜底，改走本提示——守卫文案原样展示 + 明确的下一步指引。
+//
 // 本文件方法清单：
 //   - appendUnrecognizedTextbookNotice — 开场白末尾拼接「未识别课本」确定性提醒
 //   - checkPlanEditable                — 教案存在性/归属/可编辑状态校验
@@ -14,6 +22,8 @@ package services
 //   - resolveTemplateForReview         — 解析评审模板（系统提示词 + 评审规则）
 //   - broadcastError                   — SSE 推送错误消息
 //   - broadcastSoftRetryNotice         — 空流软兜底：友好消息替代开发者报错
+//   - isCreditGateError                — 积分守卫拦截类错误识别（积分硬闸 batch）
+//   - broadcastCreditGateNotice        — 积分拦截专用友好消息（积分硬闸 batch）
 //   - parseAIReply                     — 解析 AI 回复类型（文本/教案内容/组件推荐）
 
 import (
@@ -149,6 +159,50 @@ func (s *LessonPlanGenService) broadcastSoftRetryNotice(ctx context.Context, pla
 		ClientTurnID: turnID,
 		MessageID:    softMsg.ID,
 		Message:      softMsg,
+	})
+}
+
+// isCreditGateError 判断错误是否为积分守卫拦截类错误（积分硬闸 batch 新增）
+//
+// 守卫（token_guard.CheckBalance）的三种拒绝文案是判断依据：
+//   "积分余额不足，请联系学校管理员分配积分" / "积分账户未开通，请联系系统管理员" /
+//   "积分账户已冻结，请联系系统管理员"。
+// CallAI/CallAIStream 被拦时把守卫 Message 原样包成 error 返回，
+// 故用「积分余额不足 / 积分账户」两个关键词做包含匹配即可覆盖全部三种，
+// 且不会误伤网络类错误（那些文案里不含"积分"）。
+func isCreditGateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "积分余额不足") || strings.Contains(msg, "积分账户")
+}
+
+// broadcastCreditGateNotice 积分拦截专用友好消息（积分硬闸 batch 新增）
+//
+// 与 broadcastSoftRetryNotice 同款形态（assistant 消息落库 + message_done 下发，
+// 不触发红色错误样式），但内容是守卫拒绝原话 + 明确的下一步指引——
+// 让老师第一眼知道"是积分没了，不是网络坏了"，不再徒劳重试。
+// guardMsg 传守卫原话（即被拦 error 的 Error() 文本），保证提示与守卫口径一字不差。
+func (s *LessonPlanGenService) broadcastCreditGateNotice(ctx context.Context, planID string, turnID string, guardMsg string) {
+	display := "⚠️ " + strings.TrimSpace(guardMsg) + "。积分到账后回到这里接着聊就行——本页内容都还在，不会丢。"
+	gateMsg := &models.ConversationMessage{
+		ID:        generateMsgID(),
+		Role:      models.ConvRoleAssistant,
+		Type:      models.ConvMsgTypeText,
+		Content:   display,
+		CreatedAt: time.Now(),
+		Metadata:  map[string]interface{}{"credit_gate": true},
+	}
+	if err := s.appendMessage(ctx, planID, gateMsg); err != nil {
+		lpGenLog.Warn("积分拦截提示写入失败", "plan_id", planID, "error", err)
+	}
+	GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
+		EventType:    models.LPSSEMessageDone,
+		PlanID:       planID,
+		ClientTurnID: turnID,
+		MessageID:    gateMsg.ID,
+		Message:      gateMsg,
 	})
 }
 

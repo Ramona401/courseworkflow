@@ -17,14 +17,16 @@ interface Props {
   cwGrade?: string
   /** both=背景+字体堆叠(默认, Step3用) / background=仅背景 / font=仅字体(Step5两个Tab分别用) */
   mode?: 'both' | 'background' | 'font'
+  /** 当前选中的页码（传入后BackgroundPicker显示页级背景区块） */
+  pageNum?: number
 }
 
-export default function AppearancePanel({ coursewareId, onSwapped, disabled = false, cwTitle = '', cwSubject = '', cwGrade = '', mode = 'both' }: Props) {
+export default function AppearancePanel({ coursewareId, onSwapped, disabled = false, cwTitle = '', cwSubject = '', cwGrade = '', mode = 'both', pageNum }: Props) {
   return (
     <>
       {(mode === 'both' || mode === 'background') && (
         <BackgroundPicker coursewareId={coursewareId} onSwapped={onSwapped} disabled={disabled}
-          cwTitle={cwTitle} cwSubject={cwSubject} cwGrade={cwGrade} />
+          cwTitle={cwTitle} cwSubject={cwSubject} cwGrade={cwGrade} pageNum={pageNum} />
       )}
       {(mode === 'both' || mode === 'font') && (
         <FontPicker coursewareId={coursewareId} onSwapped={onSwapped} disabled={disabled} />

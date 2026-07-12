@@ -2,6 +2,15 @@ package services
 
 // organization_service.go — 组织与教研组管理业务逻辑层
 //
+// 账户与权限修复批改动（B10 + Logo移除链路② + 教研组缺省保留）：
+//   1) UpdateOrganization："settings / status 缺省保留现值"（B10，根治禁用/启用抹掉
+//      学校 portal_modules、编辑已禁用组织被静默启用两个数据损坏缺陷）；
+//   2) UpdateOrganization：处理 req.ClearLogo（Logo移除链路②）——常规字段更新成功后
+//      调 repository.UpdateOrganizationLogo(id, "") 清空 logo_url，根治"移除Logo只清
+//      前端state、从不落库"的假移除；
+//   3) UpdateTeachingGroup：与组织侧同口径的"settings / status 缺省保留现值"
+//      （教研组编辑弹窗从不传这两字段，repo 全量覆盖+空值兜底会抹 settings/误启用）。
+//
 // 组织列表越权修复（Phase 6 验收期补漏）：
 //   ListOrganizations / ListTeachingGroups 新增 scope DataScope 参数，按调用者数据范围过滤：
 //     - admin           → 全量（scope.IsAdmin）
@@ -199,10 +208,45 @@ func (s *OrganizationService) UpdateOrganization(ctx context.Context, id string,
 	if nameExists {
 		return ErrOrgNameExists
 	}
+
+	// ==================== B10 修复：settings / status 缺省保留现值 ====================
+	// repository.UpdateOrganization 的 SQL 是四列(name/admin_user_id/settings/status)无条件全量覆盖，
+	// 且对空串强制兜底（settings空→"{}"、status空→"active"），造成两个真实数据损坏缺陷：
+	//   ① "禁用/启用"按钮只传 name/admin_user_id/status 不传 settings，一次点击就把学校
+	//      settings 里的 portal_modules（门户板块开关）等配置整体抹成 "{}"；
+	//      编辑"区域"弹窗同理不传 settings（板块配置区仅 school+edit 显示），保存即抹掉区域 settings。
+	//   ② 编辑弹窗不传 status，保存一个"已禁用"的组织会被强制置回 "active"（静默重新启用）。
+	// 修法（service 层缺省回填，不动 repo SQL 与请求模型，语义收敛为部分更新）：
+	//   - req.Settings 为空串 → 视为"本次不修改"，回填 existing.Settings。
+	//     真要清空须显式传 "{}"（前端编辑学校时始终传完整合并后的 settings，不受影响）。
+	//   - req.Status 为空串 → 视为"本次不修改"，回填 existing.Status。
+	//     禁用/启用按钮显式传 active/disabled，行为不变。
+	if strings.TrimSpace(req.Settings) == "" {
+		req.Settings = existing.Settings
+	}
+	if strings.TrimSpace(req.Status) == "" {
+		req.Status = existing.Status
+	}
+
 	if err := repository.UpdateOrganization(ctx, id, req); err != nil {
 		orgLog.Error("更新组织失败", "org_id", id, "error", err)
 		return err
 	}
+
+	// ==================== Logo 移除链路②：处理 clear_logo ====================
+	// 背景：编辑弹窗"移除Logo"此前只清前端本地 state，请求体没有 logo 字段，
+	// 后端无从得知"用户想删掉 Logo"，移除从不落库（假移除）。
+	// 语义：req.ClearLogo=true → 常规字段更新成功后，清空 organizations.logo_url。
+	// 放在常规更新之后：若常规更新失败（如重名），Logo 保持不动，语义完整。
+	// Logo 上传走独立上传接口（同样写 logo_url 列），与本分支互不干扰。
+	if req.ClearLogo {
+		if err := repository.UpdateOrganizationLogo(ctx, id, ""); err != nil {
+			orgLog.Error("清除组织Logo失败", "org_id", id, "error", err)
+			return err
+		}
+		orgLog.Info("清除组织Logo成功", "org_id", id)
+	}
+
 	orgLog.Info("更新组织成功", "org_id", id, "name", req.Name)
 	return nil
 }
@@ -285,7 +329,7 @@ func (s *OrganizationService) CreateTeachingGroup(ctx context.Context, req *mode
 // 规则：
 //   - scope.IsAdmin → 不过滤，按 schoolID（可空）正常查询
 //   - 否则：要求 schoolID 非空且在 scope 可见学校集（SchoolIDs；senior 额外不放区域，
-//           因为教研组只挂学校，区域不直接拥有教研组）内；不满足 → 返回空列表（越权/未指定学校）
+//     因为教研组只挂学校，区域不直接拥有教研组）内；不满足 → 返回空列表（越权/未指定学校）
 func (s *OrganizationService) ListTeachingGroups(ctx context.Context, schoolID string, scope DataScope) (*models.TeachingGroupListResponse, error) {
 	// admin：原逻辑，全量或按 schoolID 过滤
 	if scope.IsAdmin {
@@ -403,6 +447,17 @@ func (s *OrganizationService) UpdateTeachingGroup(ctx context.Context, id string
 		return ErrGroupNameExists
 	}
 
+	// ==================== 教研组 settings / status 缺省保留现值（与组织侧 B10 同口径）====================
+	// 教研组编辑弹窗（GroupFormModal）从不提交 settings/status 两字段；
+	// 若 repo 层为全量覆盖+空值兜底，则编辑一次即抹掉教研组 settings、并把已禁用组静默置回 active。
+	// 修法同组织侧：空串视为"本次不修改"，回填库中现值（existing 本就为名称查重而获取，零额外查询）。
+	if strings.TrimSpace(req.Settings) == "" {
+		req.Settings = existing.Settings
+	}
+	if strings.TrimSpace(req.Status) == "" {
+		req.Status = existing.Status
+	}
+
 	if err := repository.UpdateTeachingGroup(ctx, id, req); err != nil {
 		orgLog.Error("更新教研组失败", "group_id", id, "error", err)
 		return err
@@ -427,7 +482,9 @@ func (s *OrganizationService) DeleteTeachingGroup(ctx context.Context, id string
 
 // AddGroupMember 添加教研组成员
 // v122 方案B 改动: 成功后顺便 upsert school_members(保险机制)
-//   语义: 加入本校教研组 = 本校成员
+//
+//	语义: 加入本校教研组 = 本校成员
+//
 // v109 原改动: 角色校验允许 'lead'
 func (s *OrganizationService) AddGroupMember(ctx context.Context, groupID string, req *models.AddGroupMemberRequest) error {
 	if req.UserID == "" {

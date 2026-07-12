@@ -54,7 +54,7 @@ export default function NavConfirmStep({ coursewareId, courseware, previewPages,
         onConnected: () => setPreviewGenMessage('已连接...'),
         onGenStart: d => setPreviewGenMessage(d.message),
         onGenProgress: d => setPreviewGenMessage(d.message),
-        onGenPage: d => { setPreviewPages(p => [...p, { page_number: d.page_number, title: d.title, html_content: d.html_content }]) },
+        onGenPage: d => { setPreviewPages(p => [...p, { id: d.page_id, page_number: d.page_number, title: d.title, html_content: d.html_content }]) },
         onGenDone: d => { setPreviewGenRunning(false); if (d.fail_count > 0) { setPreviewGenMessage(`❌ ${d.message}`) } else { setPreviewGenMessage(`✅ ${d.message}`); loadCourseware() } },
         onError: d => { setPreviewGenMessage(`❌ ${d.message}`); setPreviewGenRunning(false) },
       })

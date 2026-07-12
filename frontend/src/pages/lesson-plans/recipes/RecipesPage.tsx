@@ -3,6 +3,9 @@
  *
  * Phase 7A：基础配方卡片列表
  * 迭代6：新增"配方市场"Tab + 配方卡片统计按钮 + 排行榜视图
+ * 共享修复：配方卡片新增「🔗 共享」按钮（仅作者本人可见），
+ *   打开 ShareRecipeModal 把个人配方设置成教研组/学校配方——
+ *   解决教研组长/学校管理员反馈的"只能设置个人配方，设置不了学校配方"。
  *
  * 两个Tab：
  *   1. 我的配方：个人配方+共享给我的配方（原有功能）
@@ -16,6 +19,7 @@ import {
   type RecipeListItem, type MarketRecipeItem,
 } from '@/api/recipes'
 import RecipeStatsModal from './components/RecipeStatsModal'
+import ShareRecipeModal from './components/ShareRecipeModal'
 import { SUBJECTS } from '@/pages/lesson-plans/workshop/components/workshopConstants'
 
 /* ==================== 颜色常量 ==================== */
@@ -63,9 +67,10 @@ const btnBase: React.CSSProperties = {
 }
 
 /* ==================== 配方卡片（我的配方Tab） ==================== */
-function RecipeCard({ recipe, isOwner, onEdit, onFork, onDelete, onStats, loadingId }: {
+function RecipeCard({ recipe, isOwner, onEdit, onFork, onDelete, onStats, onShare, loadingId }: {
   recipe: RecipeListItem; isOwner: boolean; onEdit: (id: string) => void; onFork: (id: string) => void
-  onDelete: (id: string, name: string) => void; onStats: (id: string, name: string) => void; loadingId: string | null
+  onDelete: (id: string, name: string) => void; onStats: (id: string, name: string) => void
+  onShare: (recipe: RecipeListItem) => void; loadingId: string | null
 }) {
   const [hovered, setHovered] = useState(false)
   const isLoading = loadingId === recipe.id
@@ -97,9 +102,10 @@ function RecipeCard({ recipe, isOwner, onEdit, onFork, onDelete, onStats, loadin
       )}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingTop: '12px', borderTop: `1px solid ${C.border}`, gap: '12px', flexWrap: 'wrap' }}>
         <span style={{ fontSize: '12px', color: C.textMuted, flexShrink: 0 }}>更新于 {fmt(recipe.updated_at)}</span>
-        <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
           {isLoading ? <span style={{ fontSize: '12px', color: C.primary }}>处理中...</span> : <>
             {isOwner && <button onClick={() => onStats(recipe.id, recipe.name)} style={{ ...btnBase, background: 'rgba(245,158,11,0.08)', color: C.accent }}>📊 统计</button>}
+            {isOwner && <button onClick={() => onShare(recipe)} style={{ ...btnBase, background: 'rgba(14,165,233,0.08)', color: '#0EA5E9' }}>🔗 共享</button>}
             {isOwner && <button onClick={() => onEdit(recipe.id)} style={{ ...btnBase, background: C.primary, color: '#fff' }}>✏️ 编辑</button>}
             <button onClick={() => onFork(recipe.id)} style={{ ...btnBase, background: 'transparent', border: `1px solid ${C.border}`, color: C.textSec }}>🔀 Fork</button>
             {isOwner && <button onClick={() => onDelete(recipe.id, recipe.name)} style={{ ...btnBase, background: 'transparent', border: '1px solid #FEE2E2', color: C.danger }}>删除</button>}
@@ -200,6 +206,8 @@ export default function RecipesPage() {
   const [loadingId, setLoadingId] = useState<string | null>(null)
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null)
   const [statsModal, setStatsModal] = useState<{ id: string; name: string } | null>(null)
+  // 共享弹窗状态：保存当前要共享的配方（含 id/name/当前 scope）
+  const [shareModal, setShareModal] = useState<{ id: string; name: string; scope: string } | null>(null)
 
   const showToast = (msg: string, type: 'success' | 'error' = 'success') => { setToast({ msg, type }); setTimeout(() => setToast(null), 3000) }
 
@@ -247,6 +255,12 @@ export default function RecipesPage() {
     try { await deleteRecipe(id); showToast('已删除'); await loadRecipes() }
     catch (e: unknown) { showToast(e instanceof Error ? e.message : '删除失败', 'error') }
     finally { setLoadingId(null) }
+  }
+  // 共享成功回调：刷新列表 + 提示
+  const handleShared = async (scope: 'group' | 'school') => {
+    setShareModal(null)
+    showToast(scope === 'school' ? '已共享给全校老师 ✓' : '已共享到教研组 ✓')
+    await loadRecipes()
   }
 
   // Tab样式
@@ -301,7 +315,7 @@ export default function RecipesPage() {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: '16px' }}>
             {loading && Array.from({ length: 6 }).map((_, i) => <SkeletonCard key={i} />)}
             {!loading && recipes.map(r => (
-              <RecipeCard key={r.id} recipe={r} isOwner={user?.id === r.author_id} onEdit={handleEdit} onFork={handleFork} onDelete={handleDelete} onStats={(id, name) => setStatsModal({ id, name })} loadingId={loadingId} />
+              <RecipeCard key={r.id} recipe={r} isOwner={user?.id === r.author_id} onEdit={handleEdit} onFork={handleFork} onDelete={handleDelete} onStats={(id, name) => setStatsModal({ id, name })} onShare={(rec) => setShareModal({ id: rec.id, name: rec.name, scope: rec.scope })} loadingId={loadingId} />
             ))}
             {!loading && recipes.length === 0 && (
               <div style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '80px 40px', background: C.card, borderRadius: '12px', border: `1px solid ${C.border}` }}>
@@ -362,6 +376,18 @@ export default function RecipesPage() {
 
       {/* 统计弹窗（迭代6） */}
       {statsModal && <RecipeStatsModal recipeId={statsModal.id} recipeName={statsModal.name} onClose={() => setStatsModal(null)} />}
+
+      {/* 共享弹窗 */}
+      {shareModal && (
+        <ShareRecipeModal
+          open={true}
+          recipeId={shareModal.id}
+          recipeName={shareModal.name}
+          currentScope={shareModal.scope}
+          onClose={() => setShareModal(null)}
+          onShared={handleShared}
+        />
+      )}
 
       {/* Toast */}
       {toast && (

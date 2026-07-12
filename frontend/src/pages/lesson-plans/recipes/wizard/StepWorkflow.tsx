@@ -19,6 +19,12 @@
  *   - 说明本步骤（备课流程=AI 陪你把教案做出来的工作阶段）与上一步
  *     （教案结构=成品教案长什么样的板块格式）的区别，二者老师易混。仅文案，逻辑零改动。
  *
+ * BugFix（自定义阶段提示词无法保存）：
+ *   openEditStageModal 原先把 system_prompt / prompt_variants / output_format 写死为空串，
+ *   因 CustomStageResponse 当时只回 has_prompt，拿不到提示词原文；编辑弹窗显示空，
+ *   老师若未重填就保存 → 空串覆盖数据库已存提示词，表现为"提示词无法保存"。
+ *   后端已补全文字段返回，此处改用 cs 的真实值回填（缺字段兜底空/{}）。
+ *
  * 设计目标：
  *   - 默认已是5阶段全开，大多数老师直接跳过即可
  *   - 高级用户可微调阶段顺序、启用状态、添加自定义阶段
@@ -171,13 +177,15 @@ export default function StepWorkflow({ formData, updateForm, recipeId }: StepWor
     if (!cs) return
     setStageModalMode('edit')
     setEditingStageCode(stageCode)
+    // BugFix：用后端返回的真实提示词全文回填，缺字段兜底空/{}，
+    //   不再写死空串（此前空串会在保存时覆盖数据库已存提示词）
     setEditingStageData({
       stage_code: cs.stage_code,
       stage_name: cs.stage_name,
       ai_role: cs.ai_role,
-      system_prompt: '',
-      prompt_variants: '{}',
-      output_format: '{}',
+      system_prompt: cs.system_prompt || '',
+      prompt_variants: cs.prompt_variants || '{}',
+      output_format: cs.output_format || '{}',
       gate_mode: cs.gate_mode,
       skippable: cs.skippable,
     })

@@ -356,6 +356,10 @@ export interface LessonPlanChatRequest {
    *  后端原样回带到该轮所有 SSE 事件的 client_turn_id，前端据此丢弃"过期轮次"的迟到回复。
    *  不传时后端行为不变(回带空串，前端不过滤)。 */
   client_turn_id?: string
+  /** 参考资料附件(PDF/Word)：老师上传的会话级参考资料"最终注入文本"。
+   *  短文档=浏览器端提取的原文，长文档=经 /ref-material/compress 压缩的结构化要点。
+   *  每轮 chat 携带，后端拼成"参考资料"块注入 system prompt。空/不传时行为不变、不落库。 */
+  ref_material?: string
 }
 
 export interface ApplyAISuggestionsRequest {

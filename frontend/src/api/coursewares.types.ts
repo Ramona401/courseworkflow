@@ -5,6 +5,13 @@
  * 不含任何运行时请求逻辑，供 coursewares.core.ts / coursewares.media.ts 及
  * 业务组件统一 import。对外经桶文件 coursewares.ts 用 `export *` 透出，
  * 既有 `import { X } from '@/api/coursewares'` 路径完全不变。
+ *
+ * 阶段1（课件审核与协作·发布与共享）变更：
+ *   - CoursewareListItem 补 publish_state/publish_state_name/review_level/code_share_scope
+ *     四字段（后端"我的课件"列表已返回，供前端展示发布徽章 + 代码范围）。
+ *   - CoursewareDetail 同步补上述发布字段（详情页用）。
+ *   - 新增 SharedCoursewareListItem / SharedCoursewareListResponse（共享课件库列表）。
+ *   - 新增发布态 / 代码开放范围两套 UI 常量（与后端 CWPublish* / CWCodeShare* 口径对齐）。
  */
 
 // ==================== 课件主体类型 ====================
@@ -23,6 +30,11 @@ export interface CoursewareListItem {
   pipeline_id: string | null
   source_type: string        // v0.42: 来源类型
   source_name: string        // v0.42: 来源类型中文名
+  // ---- 阶段1：发布/共享维度（后端"我的课件"列表已返回，供发布徽章 + 代码范围展示）----
+  publish_state: string        // 发布态：private/published_personal/submitted/approved/published_shared/revision
+  publish_state_name: string   // 发布态中文名
+  review_level: number         // 审核层级进度：0未提交/1=L1通过/2=L2通过
+  code_share_scope: string     // 源代码开放范围：none/group/school/region/public
   created_at: string
   updated_at: string
 }
@@ -58,6 +70,16 @@ export interface CoursewareDetail {
   style_anchor_vaoci: string            // 锚点VAOCI索引文本，空=未设
   style_anchor_url: string              // 锚点图公网URL（轮3：跨页显示缩略图，优先OSS地址）
   kp_codes?: string                     // 课程知识库轮：本课件绑定的课标知识点编码数组JSON文本（如 ["MATH-G3-GM-001"]），空/缺=未绑定
+  // ---- 阶段1：发布/审核维度（详情页展示发布徽章 / 代码范围 / 审核进度）----
+  publish_state?: string         // 发布态
+  publish_state_name?: string    // 发布态中文名
+  review_level?: number          // 审核层级进度
+  review_school_id?: string | null // 提交审核时的作者学校ID（可空）
+  code_share_scope?: string      // 源代码开放范围
+  // ---- 阶段4：集体备课维度（详情页展示集体备课徽章、判断可否发起/微调）----
+  collab_state?: string          // 集体备课态：idle 未集体备课 / in_session 集体备课中
+  collab_member_count?: number   // 阶段4治本补丁：集体备课在场参与者数。仅 in_session 且 >0 才算真会话，
+                                 //   避免作者忘记结束导致空会话仍显示误导横幅/提示条/红点
   pages: CoursewarePage[]
   created_at: string
   updated_at: string
@@ -85,6 +107,38 @@ export interface CoursewarePage {
   status: string
   created_at: string
   updated_at: string
+}
+
+// ==================== 阶段1：共享课件库类型 ====================
+
+/**
+ * 共享课件库列表单条（对应后端 SharedCoursewareListItem）
+ * 列出他人共享给"我"（同校/同组）的课件，带作者名、学校名，
+ * 以及"当前登录者能否复制此课件源码"的 can_copy 标记（前端据此显隐"复制到我的"按钮）。
+ */
+export interface SharedCoursewareListItem {
+  id: string
+  title: string
+  subject: string
+  grade: string
+  page_count: number
+  source_type: string
+  source_name: string
+  author_id: string          // 作者用户ID
+  author_name: string        // 作者显示名
+  school_name: string        // 作者所属学校名
+  publish_state: string      // 发布态（共享库里通常为 published_shared）
+  publish_state_name: string
+  code_share_scope: string   // 源代码开放范围
+  can_copy: boolean          // 当前登录者能否复制源码（后端按 code_share_scope + 归属关系裁决）
+  created_at: string
+  updated_at: string
+}
+
+/** 共享课件库列表响应 */
+export interface SharedCoursewareListResponse {
+  coursewares: SharedCoursewareListItem[]
+  total: number
 }
 
 // ==================== 组件库类型 ====================
@@ -292,6 +346,45 @@ export interface CWSSECallbacks {
   // P2：SSE 断线自动重连成功后回调（首次连接不触发）。
   //   业务层据此重新拉取课件最新状态 + 页面列表，补齐断线期间漏收的已生成页，根治"假死"。
   onReconnected?: () => void
+  // ==================== 全自动装配事件（assembly_*，后端 courseware_auto_assembly_service 广播）====================
+  // 与 gen_* 系列并列的独立事件族。全自动/中间档两种交付模式共用，靠 data.skip_video 区分。
+  // 后端配图/视频两个「阶段进度」事件（assembly_page_image / assembly_page_video）在前端合并到
+  //   onAssemblyPageMedia 一个回调——二者前端都只是「更新某页某阶段的进行中文案」，无需分开处理。
+  /** 装配开始：总页数、待生成HTML页数、配图流水线页数、并发数、是否跳过视频、开场文案 */
+  onAssemblyStart?: (data: {
+    courseware_id: string; total_pages: number; html_pending: number
+    image_pipeline: number; html_concurrency: number; image_concurrency: number
+    skip_video: boolean; message: string
+  }) => void
+  /** 某页 HTML 已生成落库（进度视图据此把该页标为「HTML✓、配图中」，并可即时预览该页HTML） */
+  onAssemblyPageHtml?: (data: {
+    page_number: number; page_id: string; title: string
+    html_content: string; message: string
+  }) => void
+  /** 某页 HTML 生成失败（该页不再进入配图流水线；进度视图标红该页HTML阶段） */
+  onAssemblyProgress?: (data: {
+    page_number: number; page_title: string; stage: string
+    error: string; message: string
+  }) => void
+  /** 某页配图/视频链的阶段性进度（stage: image_prompt/image_gen/image_fuse/video_storyboard；仅更新文案） */
+  onAssemblyPageMedia?: (data: {
+    page_number: number; stage: string; message: string
+  }) => void
+  /** 某页装配完成（配图/视频最终结果；进度视图据此定格该页三态图标） */
+  onAssemblyPageDone?: (data: {
+    page_number: number; page_id: string; title: string
+    image_ok: boolean; image_skipped: boolean
+    video_ok: boolean; video_skipped: boolean; message: string
+  }) => void
+  /** 全部装配完成（各维度成功/失败/跳过计数 + 总耗时 + 错误清单；进度视图收尾展示汇总） */
+  onAssemblyDone?: (data: {
+    courseware_id: string; skip_video: boolean
+    html_success: number; html_fail: number
+    image_success: number; image_fail: number; image_skip: number
+    video_success: number; video_skip: number
+    total_pages: number; elapsed_ms: number
+    errors?: string[]; message: string
+  }) => void
 }
 
 // ==================== 多媒体资产类型 ====================
@@ -507,6 +600,40 @@ export const CW_STATUS_CONFIG: Record<string, { label: string; color: string; bg
   in_pipeline: { label: '审核中',     color: '#4F46E5', bg: '#E0E7FF' },
 }
 
+/**
+ * 阶段1：发布态 UI 配置（前端发布徽章用，与后端 CWPublishStateNameMap 口径对齐）
+ * private 私有不显徽章（默认态无需提示），其余态显彩色徽章。
+ */
+export const CW_PUBLISH_STATE_CONFIG: Record<string, { label: string; color: string; bg: string }> = {
+  private:            { label: '私有',     color: '#6B7280', bg: '#F3F4F6' },
+  published_personal: { label: '个人发布', color: '#0891B2', bg: '#CFFAFE' },
+  submitted:          { label: '审核中',   color: '#D97706', bg: '#FEF3C7' },
+  approved:           { label: '审核通过', color: '#059669', bg: '#D1FAE5' },
+  published_shared:   { label: '已共享',   color: '#059669', bg: '#D1FAE5' },
+  revision:           { label: '已退回',   color: '#DC2626', bg: '#FEE2E2' },
+}
+
+/**
+ * 阶段1：源代码开放范围 UI 配置（前端代码范围选择器 / 共享卡片标签用）
+ * 与后端 CWCodeShareScopeNameMap 一一对应。
+ */
+export const CW_CODE_SHARE_SCOPE_CONFIG: Record<string, { label: string; short: string; color: string; bg: string }> = {
+  none:   { label: '不开放源码',     short: '🔒 源码不开放', color: '#6B7280', bg: '#F3F4F6' },
+  group:  { label: '本教研组可复制', short: '👥 本组可复制', color: '#2563EB', bg: '#DBEAFE' },
+  school: { label: '本校可复制',     short: '🏫 本校可复制', color: '#7C3AED', bg: '#EDE9FE' },
+  region: { label: '本区域可复制',   short: '🗺 区域可复制', color: '#0891B2', bg: '#CFFAFE' },
+  public: { label: '所有人可复制',   short: '🌐 公开可复制', color: '#059669', bg: '#D1FAE5' },
+}
+
+/** 代码开放范围下拉选项顺序（none 默认居首） */
+export const CW_CODE_SHARE_SCOPE_OPTIONS: { value: string; label: string }[] = [
+  { value: 'none',   label: '🔒 不开放源码（仅可看/放映，不可复制）' },
+  { value: 'group',  label: '👥 本教研组可复制源码' },
+  { value: 'school', label: '🏫 本校可复制源码' },
+  { value: 'region', label: '🗺 本区域可复制源码' },
+  { value: 'public', label: '🌐 所有可见者均可复制源码' },
+]
+
 /** 组件类型配色 */
 export const CW_COMP_TYPE_CONFIG: Record<string, { label: string; color: string; bg: string }> = {
   layout:      { label: '布局模板',   color: '#2563EB', bg: '#DBEAFE' },
@@ -571,7 +698,7 @@ export function extractData<T>(resp: { data?: { code?: number; data?: T } }): T 
   throw new Error('接口返回异常')
 }
 
-// ==================== 页面级版本与回退类型（新增） ====================
+// ==================== 页面级版本与回退类型 ====================
 
 /**
  * 课件页面 html_content 版本快照列表项（对应后端 ListPageVersions 返回的单条）

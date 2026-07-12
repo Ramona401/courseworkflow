@@ -1,18 +1,22 @@
 /**
- * 教案系统布局组件 — LPLayout v5.4
+ * 教案系统布局组件 — LPLayout v5.5
  *
+ * v5.5变更（超管收口）：下拉菜单里"AI 管理中心 / AI 调用统计"两个敏感入口
+ *   叠加 is_super 判断——仅超级管理员（is_super=true 的 admin）可见，二线管理员隐藏。
+ *   "用户管理"入口不收口（二线管理员仍需管用户/组织/基础数据）。
  * v5.4变更：修复 header JSX 结构损坏（去掉多余的 logo img）
  * v5.3变更：pageTitles 增加备课配方相关路径
  * v5.2变更：下拉菜单新增"用户管理"入口（admin专属）
  * v110新增：下拉菜单新增"学校管理"入口（senior_operator专属）
  * Phase6.2新增：区域管理员（region_admin）下拉菜单“用户管理”入口（指向 /admin，不含学校管理）
- * 合并重构（本次）：删除 senior_operator 的“学校管理→/school-admin”入口，
+ * 合并重构：删除 senior_operator 的“学校管理→/school-admin”入口，
  *   统一走“用户管理→/admin”（/admin 已支持 senior 本校视角，含批量导入）。
  */
 import { useState, useRef, useEffect } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import LPSidebar from './LPSidebar'
+import NotificationBell from '@/components/NotificationBell'
 import { getMyTokenAccount } from '@/api/tokens'
 
 const pageTitles: Record<string, string> = {
@@ -64,6 +68,10 @@ function UserMenu() {
   const [open, setOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
   const [tokenBalance, setTokenBalance] = useState<number | null>(null)
+
+  // 超管收口：仅超级管理员可见 AI 管理中心 / AI 调用统计两个敏感入口。
+  // is_super 缺省（undefined/老缓存）按非超管兜底，收紧方向不误放行。
+  const isSuper = user?.role === 'admin' && user?.is_super === true
 
   // v128.1：加载个人积分余额
   useEffect(() => {
@@ -130,12 +138,17 @@ function UserMenu() {
 
           <div style={{ padding: '6px' }}>
             <LPMenuItem icon="👤" label="个人中心" onClick={() => go('/account', '/lesson-plans')} />
-            {/* admin 专属功能 */}
+            {/* admin 专属功能。用户管理不收口；AI 管理中心 / AI 调用统计仅超管可见 */}
             {user?.role === 'admin' && (
               <>
                 <LPMenuItem icon="👥" label="用户管理" onClick={() => go('/admin', '/lesson-plans')} highlight />
-                <LPMenuItem icon="🤖" label="AI 管理中心" onClick={() => go('/ai-center', '/lesson-plans')} />
-                <LPMenuItem icon="📊" label="AI 调用统计" onClick={() => go('/ai-traces', '/lesson-plans')} />
+                {/* 超管收口：二线管理员（is_super=false）不显示以下两项 */}
+                {isSuper && (
+                  <>
+                    <LPMenuItem icon="🤖" label="AI 管理中心" onClick={() => go('/ai-center', '/lesson-plans')} />
+                    <LPMenuItem icon="📊" label="AI 调用统计" onClick={() => go('/ai-traces', '/lesson-plans')} />
+                  </>
+                )}
               </>
             )}
             {/* region_admin 专属：区域用户管理（指向 /admin，不含学校管理） */}
@@ -192,6 +205,7 @@ export default function LPLayout() {
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <header style={{ height: '64px', position: 'relative', zIndex: 50, background: 'rgba(255,255,255,0.85)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)', borderBottom: '1px solid rgba(0,0,0,0.05)', display: 'flex', alignItems: 'center', padding: '0 32px', flexShrink: 0 }}>
           <h2 style={{ flex: 1, fontSize: '20px', fontWeight: 600, color: '#1F2937', margin: 0, letterSpacing: '-0.3px' }}>{pageTitle}</h2>
+          <NotificationBell />
           <UserMenu />
         </header>
         <main style={{ flex: 1, overflowY: 'auto', padding: '28px 32px' }}>

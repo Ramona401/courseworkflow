@@ -1,18 +1,22 @@
 /**
- * 主布局组件 — 课件审核系统 v6.1
+ * 主布局组件 — 课件审核系统 v6.2
  *
+ * v6.2变更（超管收口）：下拉菜单里"AI 管理中心 / AI 调用统计"两个敏感入口
+ *   叠加 is_super 判断——仅超级管理员（is_super=true 的 admin）可见，二线管理员隐藏。
+ *   "用户管理"入口不收口（二线管理员仍需管用户/组织/基础数据）。
  * v6.1变更：修复 header 缩进（去掉多余的 logo img）
  * v6.0 改版：与备课工坊 LPLayout 视觉风格统一
  * v110新增：学校管理员下拉菜单入口（senior_operator专属）
  * Phase6.2新增：区域管理员（region_admin）下拉菜单“用户管理”入口（指向 /admin）
  *   - region_admin 不提供“学校管理”（那是单校 /school-admin，区域管理员管辖多校走 /admin）
- * 合并重构（本次）：删除 senior_operator 的“学校管理→/school-admin”入口，
+ * 合并重构：删除 senior_operator 的“学校管理→/school-admin”入口，
  *   统一走“用户管理→/admin”（/admin 已支持 senior 本校视角，含批量导入）。
  */
 import { useState, useRef, useEffect } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import Sidebar from './Sidebar'
+import NotificationBell from '@/components/NotificationBell'
 
 const pageTitles: Record<string, string> = {
   '/':               '仪表盘',
@@ -59,6 +63,10 @@ function UserMenu() {
   const navigate = useNavigate()
   const [open, setOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+
+  // 超管收口：仅超级管理员可见 AI 管理中心 / AI 调用统计两个敏感入口。
+  // is_super 缺省（undefined/老缓存）按非超管兜底，收紧方向不误放行。
+  const isSuper = user?.role === 'admin' && user?.is_super === true
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -114,12 +122,17 @@ function UserMenu() {
 
           <div style={{ padding: '6px' }}>
             <DropdownItem icon="👤" label="个人中心" onClick={() => go('/account', '/workflow')} />
-            {/* admin 专属功能 */}
+            {/* admin 专属功能。用户管理不收口；AI 管理中心 / AI 调用统计仅超管可见 */}
             {user?.role === 'admin' && (
               <>
                 <DropdownItem icon="👥" label="用户管理" onClick={() => go('/admin', '/workflow')} highlight />
-                <DropdownItem icon="🤖" label="AI 管理中心" onClick={() => go('/ai-center', '/workflow')} />
-                <DropdownItem icon="📊" label="AI 调用统计" onClick={() => go('/ai-traces', '/workflow')} />
+                {/* 超管收口：二线管理员（is_super=false）不显示以下两项 */}
+                {isSuper && (
+                  <>
+                    <DropdownItem icon="🤖" label="AI 管理中心" onClick={() => go('/ai-center', '/workflow')} />
+                    <DropdownItem icon="📊" label="AI 调用统计" onClick={() => go('/ai-traces', '/workflow')} />
+                  </>
+                )}
               </>
             )}
             {/* region_admin 专属：区域用户管理（指向 /admin，不含学校管理） */}
@@ -178,6 +191,7 @@ export default function MainLayout() {
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <header style={{ height: '64px', position: 'relative', zIndex: 50, background: 'rgba(255,255,255,0.85)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)', borderBottom: '1px solid rgba(0,0,0,0.05)', display: 'flex', alignItems: 'center', padding: '0 32px', flexShrink: 0 }}>
           <h2 style={{ flex: 1, fontSize: '20px', fontWeight: 600, color: '#1F2937', margin: 0, letterSpacing: '-0.3px' }}>{pageTitle}</h2>
+          <NotificationBell />
           <UserMenu />
         </header>
         <main style={{ flex: 1, overflowY: 'auto', padding: '28px 32px' }}>

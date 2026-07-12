@@ -30,6 +30,43 @@ export interface ChangePasswordRequest {
   new_password: string
 }
 
+// ==================== 组织归属类型（个人中心「我的组织」Tab） ====================
+
+/**
+ * 我所属的单个学校（来自 school_members 直接成员名单）
+ * region_* 可能为空串（学校未挂区域）
+ */
+export interface UserOrgSchoolItem {
+  school_id: string
+  school_name: string
+  region_id: string
+  region_name: string
+  source: string          // 入校来源（group_member/admin_create/...）
+  is_school_admin: boolean // 我是否为该校的学校管理员
+}
+
+/**
+ * 我所在的单个教研组（含我在该组的角色 + 该组所属学校/区域）
+ * my_role: member=普通成员 / backbone=骨干教师 / lead=教研组长
+ */
+export interface UserOrgGroupItem {
+  group_id: string
+  group_name: string
+  subject: string
+  grade_range: string
+  my_role: string
+  school_id: string
+  school_name: string
+  region_id: string
+  region_name: string
+}
+
+/** 个人组织归属聚合结果 */
+export interface UserOrganizationProfile {
+  schools: UserOrgSchoolItem[]
+  groups: UserOrgGroupItem[]
+}
+
 // ==================== API 函数 ====================
 
 /** 获取当前用户个人信息 */
@@ -57,5 +94,14 @@ export async function changePassword(
     '/account/password',
     req
   )
+  return res.data.data!
+}
+
+/**
+ * 获取当前用户的组织归属（区域/学校/教研组 + 我在各组的职位角色）
+ * 只查自己（后端从 JWT 取 userID），登录即可。
+ */
+export async function getMyOrganization(): Promise<UserOrganizationProfile> {
+  const res = await client.get<{ code: number; data: UserOrganizationProfile }>('/account/organization')
   return res.data.data!
 }

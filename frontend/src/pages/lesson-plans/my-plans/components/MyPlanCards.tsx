@@ -125,7 +125,7 @@ export function ActionButtons({ plan, onAction, loadingId }: ActionButtonsProps)
   if (['draft', 'published_personal', 'revision'].includes(plan.status)) {
     actions.push({
       label: '删除', style: dangerBtn, action: 'delete',
-      confirm: `确定删除教案「${plan.title}」吗？此操作不可恢复。`,
+      confirm: `确定删除教案「${plan.title}」吗？移入回收站后30天内可恢复，过期将自动永久删除。`,
     })
   }
 

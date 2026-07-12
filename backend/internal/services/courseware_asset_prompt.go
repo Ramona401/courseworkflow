@@ -19,13 +19,22 @@ package services
 //   - 视频 JSON 解析加固：先剥 ```json 围栏再做花括号提取，减少静默退化(cwParseVideoStoryboardsJSON)
 //   - 图片多提示词：新增 ImagePromptItem + cwParseImagePromptsJSON，解析 AI 输出的 JSON 数组；
 //     非数组/解析失败时兜底为单条；上限 cwMaxImagePrompts 条防发散。
+//   - 【多占位漏写修复(本轮)】三管齐下解决"一页 N 个 <img> 占位却只出少于 N 条提示词"：
+//       ① 截断上限 cwImagePromptHTMLLimit 8000 → 24000，覆盖生产可见的 13806/15707 等长页；
+//       ② cwExtractPageBodyHTML 截断前先 cwStripSVGBlocks 剥掉体量最大的 <svg> 块，
+//          避免 SVG 路径数据把靠后的 <img> 占位挤出截断区而丢失；
+//       ③ buildImagePromptUserInputFromHTML 用 cwCountImgPlaceholders 在【剥SVG后、截断前】的原始 HTML 上
+//          精确数出"内容配图占位数 N"（自动排除 Logo），经 cwBuildImgCountConstraint 作为硬约束注入用户输入，
+//          把"应有几张"从 AI 主观判断变成后端下发的确定值；SuggestImagePrompt 解析后比对条数是否 = N，不符记 Warn。
+//     以上占位计数/剥SVG/约束文案在同 package 的 courseware_asset_prompt_imgcount.go。
 //   - 风格锚点联动(图片轮)：写图片提示词时，若课件已设风格锚点，向 AI 输入注入三段上下文——
 //       ①【已锚定视觉风格（最高优先级）】：从锚点 VAOCI 切出 A 属性段，要求 AI 严格采用该风格、
 //          禁止自创"扁平插画"等冲突风格词（修复"皮克斯锚点却写出插画风"的根因：此前漏注入 A 段）；
-//       ②【已锚定人物形象】：从锚点 VAOCI 切出 C 角色段，告知 AI 人物外貌已统一、提示词里不要再堆砌详细人物外貌；
+//       ②【已锚定人物形象】：从锚点 VAOCI 切出 C 角色段，告知 AI"若本页出现人物则沿用统一外貌"——
+//          但明确"是否出现人物由本页内容决定"，事物/示意图页(叶片、地图、光合作用等)就画事物本身、不强行加人；
 //       ③【锚点图参考提示词】：锚点图当初的生成提示词(generation_prompt 非空时)，供 AI 参考画风措辞。
 //     未设锚点则三段都不注入，AI 按 prompt_courseware_image_prompt 的"未锚定"分支自行决定画风与人物外貌。
-//   - 风格锚点联动(视频轮,本轮)：buildMediaPromptUserInput 同样在课件已设锚点时注入上述三段(措辞按视频物料调整)，
+//   - 风格锚点联动(视频轮)：buildMediaPromptUserInput 同样在课件已设锚点时注入上述三段(措辞按视频物料调整)，
 //     供 prompt_courseware_video_prompt v2 据此约束：首帧图(storyboard_prompt)严守锚定风格、人物外貌留白；
 //     图生视频(video_prompt)只描述运镜动作、不重述风格人物(首帧已锁，重述反干扰)；台词(narration)不受影响。
 //     视频两步法的风格人物一致性在"首帧图"环节用图生图锁定，故 video 段不必再背风格约束。
@@ -54,7 +63,10 @@ const cwMaxVideoStoryboards = 4
 // ImagePromptItem 单条配图提示词(一张图)
 type ImagePromptItem struct {
 	Caption string `json:"caption"` // 该图用途的简短说明(8-20字,供前端区分多条分别对应什么)
-	Prompt  string `json:"prompt"`  // 该图的详细中文生图提示词正文(150-300字)
+	Prompt  string `json:"prompt"`
+	// Size AI建议的图片尺寸（豆包合法档位：横 2560x1440 / 竖 1440x2560 / 方 1920x1920）；
+	// 为空时由装配链回退默认 2560x1440。用于按占位形状做比例适配。json解析自动接住。
+	Size string `json:"size,omitempty"` // 该图的详细中文生图提示词正文(150-300字)
 }
 
 // VideoStoryboardItem 单个分镜的三件物料(本轮: 视频提示词由单组改为按分镜数组返回)
@@ -66,11 +78,15 @@ type VideoStoryboardItem struct {
 }
 
 // cwImagePromptHTMLLimit 喂给 AI 的页面主体 HTML 字符上限(防 SVG 巨型路径等爆 token)
-const cwImagePromptHTMLLimit = 8000
+//
+// 从 8000 提到 24000：生产多图页普遍超 8000(可见 13806/15707)，旧上限会截掉靠后的 <img> 占位致漏写。
+// 已在 cwExtractPageBodyHTML 里"截断前先剥 SVG"进一步压缩体量，24000 足以覆盖复杂长页。
+const cwImagePromptHTMLLimit = 24000
 
 // cwExtractPageBodyHTML 提取页面主体 HTML 供 AI 分析图片占位:
 //   - 去掉所有 <style>...</style> 与 <script>...</script> 块(动画CSS/JS 对"找图片占位"无意义且占大量 token)
-//   - 超过 cwImagePromptHTMLLimit 字符则截断(SVG 手绘页可能极长, 找占位无需读完整路径数据)
+//   - 去掉所有 <svg>...</svg> 块(SVG 自绘图形不是真实图片占位, 且路径数据极长会把靠后的 <img> 挤出截断区)
+//   - 超过 cwImagePromptHTMLLimit 字符则截断(仍超长的页找占位无需读完整内容)
 //   - 不剥导航栏(几百字符无妨, AI 不会把导航 Logo 当图片占位), 保持实现简单可靠
 func cwExtractPageBodyHTML(html string) string {
 	html = strings.TrimSpace(html)
@@ -81,6 +97,8 @@ func cwExtractPageBodyHTML(html string) string {
 	html = cwStripTagBlock(html, "style")
 	// 去 <script>...</script>
 	html = cwStripTagBlock(html, "script")
+	// 去 <svg>...</svg>（截断前先剥，防 SVG 路径数据把 <img> 占位挤出截断区）
+	html = cwStripSVGBlocks(html)
 	html = strings.TrimSpace(html)
 	// 截断超长
 	r := []rune(html)
@@ -216,27 +234,38 @@ func cwExtractVAOCICharSection(vaoci string) string {
 
 // buildImagePromptUserInputFromHTML 图片专用: 校验权限, 喂"页面主体 HTML"为主 + 少量方案语义辅助。
 //
+// 返回值：(用户输入文本, 检测到的内容配图占位数, error)。占位数供 SuggestImagePrompt 解析后校验条数。
+//
 //	配图提示词依据【当前页 HTML 实际的图片占位】(<img> 标签/明确的图片占位容器)产出:
 //	有占位才给提示词, SVG/CSS 自绘图形不算占位, 无占位则 AI 返回空数组。
 //	方案字段(标题/目的/摘要)仅作语义辅助, 帮 AI 理解每个占位该配什么图。
+//
+//	数量硬约束(本轮)：对【剥SVG后、截断前】的原始 HTML 用 cwCountImgPlaceholders 数出内容配图占位数 N，
+//	  经 cwBuildImgCountConstraint 注入用户输入末尾，明确要求 AI 输出数组长度恰好 = N，杜绝多占位漏写。
+//	  计数排除机构 Logo(<img src 含 courseware-logos/)，与老师"这一页要配几张内容图"的直觉一致。
 //
 //	风格锚点联动(图片轮)：课件已设锚点时，按优先级注入三段——
 //	  ①【已锚定视觉风格（最高优先级）】(A 属性段) — 强压制画风，放在最显眼处；
 //	  ②【已锚定人物形象】(C 角色段) — 人物外貌留白交给图生图；
 //	  ③【锚点图参考提示词】(锚点图 generation_prompt 非空时) — 参考画风措辞。
 //	系统提示词 v5 据这三段决定"严格采用锚定风格 / 不写详细人物外貌 / 参考锚点画风措辞"。
-func (s *CoursewareAssetService) buildImagePromptUserInputFromHTML(ctx context.Context, coursewareID string, pageNum int, userID string) (string, error) {
+func (s *CoursewareAssetService) buildImagePromptUserInputFromHTML(ctx context.Context, coursewareID string, pageNum int, userID string) (string, int, error) {
 	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
 	if err != nil {
-		return "", fmt.Errorf("课件不存在: %w", err)
+		return "", 0, fmt.Errorf("课件不存在: %w", err)
 	}
 	if cw.UserID != userID {
-		return "", fmt.Errorf("无权操作此课件")
+		return "", 0, fmt.Errorf("无权操作此课件")
 	}
 	page, err := repository.GetCoursewarePageByNumber(ctx, coursewareID, pageNum)
 	if err != nil {
-		return "", fmt.Errorf("页面不存在: 课件=%s 页码=%d", coursewareID, pageNum)
+		return "", 0, fmt.Errorf("页面不存在: 课件=%s 页码=%d", coursewareID, pageNum)
 	}
+
+	// 先在【剥SVG后、尚未截断】的原始 HTML 上精确数占位，保证计数不受截断影响、不被 SVG 干扰。
+	// 顺序必须是先剥 SVG 再数：SVG 内不含 <img>，剥不剥不影响计数，但与喂给 AI 的正文同源更一致。
+	rawForCount := cwStripSVGBlocks(page.HTMLContent)
+	imgCount := cwCountImgPlaceholders(rawForCount)
 
 	var b strings.Builder
 	b.WriteString("## 课件整体信息\n")
@@ -258,8 +287,11 @@ func (s *CoursewareAssetService) buildImagePromptUserInputFromHTML(ctx context.C
 		// ② 已锚定人物形象：从锚点 VAOCI 切出 C 角色段
 		if charSec := cwExtractVAOCICharSection(cw.StyleAnchorVAOCI); charSec != "" {
 			b.WriteString("\n## 已锚定人物形象（来自风格锚点）\n")
-			b.WriteString("本套课件已统一以下角色的固定外貌，后续配图会用锚点图做图生图保持人物一致。\n")
-			b.WriteString("请按系统提示词的【人物形象处理规则】：提示词里不要再堆砌详细的人物外貌描述，只点名角色并着重描述其在本页的动作/表情/场景/构图。\n")
+			b.WriteString("本套课件设定了以下统一角色形象，供【本页画面确实需要出现人物时】保持外貌一致（会用锚点图做图生图锁定）。\n")
+			b.WriteString("【重要·是否出现人物由本页内容决定，不得强行加人】：先判断本页配图主体到底是什么——\n")
+			b.WriteString("  · 若本页确实以人物/角色为主体（如情境对话、人物示范动作），则沿用下方锚定角色，提示词里不要再堆砌详细外貌，只点名角色并着重描述其在本页的动作/表情/场景/构图；\n")
+			b.WriteString("  · 若本页主体是事物、自然对象、器材、图表或示意图（如叶片、细胞、地图、实验装置、光合作用流程等），则【就画该事物本身，不要塞入任何人物】，忠实呈现学科内容即可；\n")
+			b.WriteString("  人物一致性是【若出现则须一致】的可选约束，绝不是【每页都必须有人物】的硬要求。\n")
 			b.WriteString(fmt.Sprintf("已锚定角色形象：%s\n", charSec))
 		}
 		// ③ 锚点图参考提示词：取锚点资产的 generation_prompt(非空才注入；手动上传图为空串自动跳过)
@@ -293,8 +325,11 @@ func (s *CoursewareAssetService) buildImagePromptUserInputFromHTML(ctx context.C
 		b.WriteString(body)
 		b.WriteString("\n```\n")
 	}
+	// 数量硬约束：把后端数出的确切占位数下发给 AI，要求逐一对应、数组长度恰好等于 N。
+	// n<=0（无真实占位）时返回空串，交由系统提示词的"无占位返回空数组"分支处理。
+	b.WriteString(cwBuildImgCountConstraint(imgCount))
 	b.WriteString("\n请严格按系统提示词的规则, 仅为 HTML 中真实存在的图片占位产出提示词; 无图片占位则返回空数组。")
-	return b.String(), nil
+	return b.String(), imgCount, nil
 }
 
 // buildMediaPromptUserInput 校验权限并把本页方案+课件信息拼成喂给 AI 的用户输入（视频物料专用）
@@ -342,8 +377,11 @@ func (s *CoursewareAssetService) buildMediaPromptUserInput(ctx context.Context, 
 		// ② 已锚定人物形象：从锚点 VAOCI 切出 C 角色段，供首帧图人物外貌留白
 		if charSec := cwExtractVAOCICharSection(cw.StyleAnchorVAOCI); charSec != "" {
 			b.WriteString("\n## 已锚定人物形象（来自风格锚点）\n")
-			b.WriteString("本套课件已统一以下角色的固定外貌，视频会用首帧图做图生视频保持人物一致。\n")
-			b.WriteString("请按系统提示词的【人物形象处理规则】：storyboard_prompt 不要堆砌详细的人物外貌描述，只点名角色并着重描述其在首帧中的动作/表情/场景/构图。\n")
+			b.WriteString("本套课件设定了以下统一角色形象，供【本镜画面确实需要出现人物时】保持外貌一致（首帧图做图生视频锁定）。\n")
+			b.WriteString("【重要·是否出现人物由本页内容决定，不得强行加人】：先判断本镜画面主体到底是什么——\n")
+			b.WriteString("  · 若本镜确实以人物/角色为主体，则沿用下方锚定角色，storyboard_prompt 不要堆砌详细外貌，只点名角色并着重描述其在首帧中的动作/表情/场景/构图；\n")
+			b.WriteString("  · 若本镜主体是事物、自然对象、器材、图表或示意图（如叶片、细胞、地图、实验装置、光合作用流程等），则【就画该事物本身，不要塞入任何人物】，忠实呈现学科内容即可；\n")
+			b.WriteString("  人物一致性是【若出现则须一致】的可选约束，绝不是【每镜都必须有人物】的硬要求。\n")
 			b.WriteString(fmt.Sprintf("已锚定角色形象：%s\n", charSec))
 		}
 		// ③ 锚点图参考提示词：取锚点资产的 generation_prompt(非空才注入；手动上传图为空串自动跳过)
@@ -382,9 +420,12 @@ func (s *CoursewareAssetService) buildMediaPromptUserInput(ctx context.Context, 
 // SuggestImagePrompt 生成【一条或多条】详细、可控的生图提示词
 // AI 读本页配图需求自主判断该页要几张图(1-cwMaxImagePrompts 条)，每条含 caption + prompt。
 // 解析失败兜底为单条(整段当 prompt)；始终保证返回至少一条非空提示词，否则报错。
+//
+// 数量校验(本轮)：拿到后端数出的占位数 imgCount 后，与 AI 实际返回条数比对，不一致记 Warn 便于追踪
+// "多占位漏写"是否复发；数量吻合记 Info。校验只记日志不阻断（AI 少写仍返回已有的，好过整体失败）。
 func (s *CoursewareAssetService) SuggestImagePrompt(ctx context.Context, coursewareID string, pageNum int, userID string) ([]ImagePromptItem, error) {
 	// 配图提示词依据【当前页 HTML 实际图片占位】(有占位才给, 无占位 AI 返回空数组)
-	userInput, err := s.buildImagePromptUserInputFromHTML(ctx, coursewareID, pageNum, userID)
+	userInput, imgCount, err := s.buildImagePromptUserInputFromHTML(ctx, coursewareID, pageNum, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -418,7 +459,17 @@ func (s *CoursewareAssetService) SuggestImagePrompt(ctx context.Context, coursew
 	if len(items) == 0 {
 		return nil, fmt.Errorf("AI未返回有效提示词")
 	}
-	cwAssetLog.Info("AI配图提示词生成成功", "courseware_id", coursewareID, "page_number", pageNum, "count", len(items))
+	// 数量校验：占位数与返回条数不一致时记 Warn（多占位漏写复发的信号），一致记 Info。
+	// 仅当 imgCount>=1 时校验（imgCount==0 即无真实占位，AI 返回空数组是预期，已被上面兜底逻辑覆盖）。
+	if imgCount >= 1 && len(items) != imgCount {
+		cwAssetLog.Warn("AI配图提示词条数与占位数不一致",
+			"courseware_id", coursewareID, "page_number", pageNum,
+			"expected_placeholders", imgCount, "got_prompts", len(items))
+	} else {
+		cwAssetLog.Info("AI配图提示词生成成功",
+			"courseware_id", coursewareID, "page_number", pageNum,
+			"placeholders", imgCount, "count", len(items))
+	}
 	return items, nil
 }
 
@@ -577,6 +628,7 @@ func cwParseImagePromptsJSON(raw string) []ImagePromptItem {
 		out = append(out, ImagePromptItem{
 			Caption: strings.TrimSpace(it.Caption),
 			Prompt:  p,
+			Size:    strings.TrimSpace(it.Size),
 		})
 		if len(out) >= cwMaxImagePrompts {
 			break // 工程护栏：最多 cwMaxImagePrompts 条

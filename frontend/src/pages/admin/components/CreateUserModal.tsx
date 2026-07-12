@@ -2,9 +2,16 @@
  * CreateUserModal.tsx — 新建用户弹窗
  * 字段:登录用户名 / 显示名称 / 初始密码 / 系统角色
  *
+ * 归属治理批C（任命唯一事实源）改动:
+ *   - admin 的可创建角色去掉 senior_operator（region_admin/district_inspector 原本就不在）——
+ *     学校管理员/区域管理员为任命制身份,不允许建号直接授予:先建教师账号(或选已有账号),
+ *     再到「组织架构→对应卡片→🛡️ 管理员」任命,B13 会自动同步升级其系统身份。
+ *     后端 user_service.validateCreateUserReq 有同口径校验兜底(防绕过前端直连 API)。
+ *   - admin 视角新增引导提示框说明上述流程。
+ *
  * v122 改动(AdminPage 权限统一):
  *   - 角色下拉按登录者角色过滤:
- *     * admin 可创建任意角色
+ *     * admin 可创建 系统管理员/骨干教师/普通教师(批C后)
  *     * senior_operator 只能创建 operator / viewer(不能创建 admin 或其他学校管理员)
  *   - 默认选中 operator(最常用的骨干教师角色)
  *
@@ -16,7 +23,7 @@
 import { useState, useMemo } from 'react'
 import { createAdminUser } from '@/api/admin'
 import { useAuth } from '@/store/auth'
-import { C, ROLE_OPTIONS } from './adminConstants'
+import { C, ROLE_OPTIONS, APPOINTMENT_ONLY_ROLES } from './adminConstants'
 
 interface CreateUserModalProps {
   onClose: () => void
@@ -32,13 +39,11 @@ export function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
   const [error, setError]   = useState('')
 
   // v122:按登录者角色过滤可创建的角色选项
-  // admin 可创建所有角色,senior_operator 只能创建 operator/viewer
-  // region_admin/其他角色不在此返回任何选项(无 create 权限)
+  // 批C:任命制身份(senior_operator/region_admin)一律不可建号直接授予,district_inspector 沿旧规则由 admin 统一开通渠道之外也不提供
   const availableRoles = useMemo(() => {
-    // 去掉“全部角色”占位项；同时排除“区域管理员/区域教研员”——
-    // 这两个区域级账号由系统管理员统一开通,不在普通新建用户下拉里提供
+    // 去掉“全部角色”占位项 + 区域教研员 + 任命制身份(学校管理员/区域管理员)
     const allRoles = ROLE_OPTIONS.filter(
-      r => r.value && r.value !== 'region_admin' && r.value !== 'district_inspector'
+      r => r.value && r.value !== 'district_inspector' && !APPOINTMENT_ONLY_ROLES.includes(r.value)
     )
     if (user?.role === 'admin') {
       return allRoles
@@ -106,6 +111,13 @@ export function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
             </div>
           )}
 
+          {/* 批C:admin 的任命制身份引导提示 */}
+          {user?.role === 'admin' && (
+            <div style={{ padding: '10px 14px', borderRadius: '8px', marginBottom: '16px', background: C.warningLight, color: C.warning, fontSize: '12px', lineHeight: 1.6 }}>
+              💡 学校管理员 / 区域管理员为<b>任命制身份</b>,不在此创建:请先建教师账号(或使用已有账号),再到「组织架构」对应学校/区域卡片的「🛡️ 管理员」面板任命,系统将自动升级其身份。
+            </div>
+          )}
+
           {/* 防御提示:无可创建角色 */}
           {noCreatableRole && (
             <div style={{ padding: '10px 14px', borderRadius: '8px', marginBottom: '16px', background: C.warningLight, color: C.warning, fontSize: '12px', lineHeight: 1.6 }}>
@@ -129,7 +141,7 @@ export function CreateUserModal({ onClose, onCreated }: CreateUserModalProps) {
             </div>
           ))}
 
-          {/* 角色选择(v122:按登录者角色过滤) */}
+          {/* 角色选择(v122:按登录者角色过滤;批C:任命制身份已剔除) */}
           <div style={{ marginBottom: '20px' }}>
             <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '6px' }}>系统角色</label>
             <select

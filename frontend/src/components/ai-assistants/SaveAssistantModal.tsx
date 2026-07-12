@@ -4,7 +4,7 @@
  * 角色:
  *   老师/教研员/管理员在 MyAssistantsPage 里和 AI 聊出一版 full_prompt 草稿后,
  *   点"存为我的助手",弹出本弹窗做最后确认——填名称 + 选「存到谁的货架」+
- *   勾选适用场景 + 确认学科,然后落库。
+ *   (共享货架时)选「分享策略」+ 勾选适用场景 + 确认学科,然后落库。
  *
  * ════════════ 身份分层(里程碑一:教研组级分享打通) ════════════
  *   同一份草稿,不同身份能把它"摆到不同的货架上"。货架不再按 userRole 静态判断,
@@ -17,12 +17,22 @@
  *   靠 group_id 是否携带区分(后端 service 据此落库 + 判可见)。
  *   组员想改组助手 → fork 成自己的 personal 再改,原版不动(本弹窗不涉及编辑)。
  *
+ * ════════════ 分享策略(share_policy,本次新增) ════════════
+ *   决定"别人拿到这个共享助手后,能不能复制带走、能不能改":
+ *     🤝 仅可用(use_only,默认): 别人只能用,不能复制带走,也不能改(保护标准与产权)
+ *     🔓 可复制(open):          别人可以用,也可以复制一份到自己名下修改
+ *     🔒 仅自己(locked):        只有你自己能看到和使用(挂共享位但实际私有)
+ *   ⚠ 仅当选了【共享货架】(教研组/全校/系统)时才显示此选择器——
+ *     个人货架(personal)只有自己看得到,谈"能不能被别人复制/改"无意义,故隐藏保持极简。
+ *   选"可复制"时下方弹黄色提醒,确保发布者明确知道自己在开放复制。
+ *   提交:personal 货架不传 share_policy(后端兜底 use_only);共享货架传用户所选。
+ *
  * 为什么单独成文件:
  *   MyAssistantsPage 主体已含「对话组合器 + 相关助手侧栏」两大块,逼近 600 行红线。
  *   把这个确认弹窗抽出来,主页面与本弹窗都稳在红线内,且弹窗逻辑内聚便于单独维护。
  *
  * 设计要点(对齐 Yuhan 拍板):
- *   - 不让老师面对"一堆选项框"。普通老师只问三件事:名字、场景、学科(货架对其隐藏)。
+ *   - 不让老师面对"一堆选项框"。普通老师只问三件事:名字、场景、学科(货架与策略对其隐藏)。
  *   - 货架文案说人话:不写 personal/group/system,写"只给我自己用 / 发布到教研组 / 推荐给全校老师 / 全平台通用"。
  *   - 学科默认 = 老师在页面顶部选的"我主要教"学科(defaultSubject),可改但通常不用动。
  *   - emoji/description 不在这里问——给默认值(emoji 🤖, description 空),想精修去助手编辑弹窗。
@@ -39,12 +49,18 @@
  */
 
 import { useState, useEffect } from 'react'
+import { DEFAULT_SUBJECTS } from '@/constants/subjects'
 import {
   createAssistant,
   getMyPublishGroups,
   ASSISTANT_SCENE_LABELS,
+  SHARE_POLICY_LABELS,
+  SHARE_POLICY_EMOJI,
+  SHARE_POLICY_HINTS,
+  DEFAULT_SHARE_POLICY,
   type AssistantScene,
   type AssistantSource,
+  type AssistantSharePolicy,
   type CreateAIAssistantRequest,
   type PublishGroup,
 } from '@/api/ai-assistants'
@@ -66,11 +82,7 @@ const C = {
 }
 
 /** 学科可选项(与 AssistantEditModal 的 SUBJECTS 保持一致,避免循环依赖写死) */
-const SUBJECTS = [
-  '', // 空=不限
-  '人工智能', '语文', '数学', '英语', '物理', '化学', '生物',
-  '历史', '地理', '政治', '科学', '信息科技', '技术', '综合实践',
-]
+const SUBJECTS = ['', ...DEFAULT_SUBJECTS]  // 空=不限；单一真相源（方案甲，v231）
 
 /** 工坊全部场景(defaultScene 为空时的兜底默认勾选——覆盖备课全链路 5 阶段) */
 const WORKSHOP_SCENES: AssistantScene[] = [
@@ -79,6 +91,9 @@ const WORKSHOP_SCENES: AssistantScene[] = [
 
 /** prompt 长度上限(与后端 maxAssistantPromptLen 对齐) */
 const MAX_PROMPT_LEN = 128 * 1024
+
+/** 分享策略选择器里展示的三档顺序(默认 use_only 居首,最保护) */
+const SHARE_POLICY_ORDER: AssistantSharePolicy[] = ['use_only', 'open', 'locked']
 
 /* ==================== 货架(shelf)定义 ==================== */
 //
@@ -123,6 +138,11 @@ function shelfToSourceAndGroup(
   }
 }
 
+/** 是否为"共享货架"(非 personal)——只有共享货架才显示分享策略选择器 */
+function isSharedShelf(shelf: ShelfKey): boolean {
+  return shelf !== 'personal'
+}
+
 /* ==================== Props 类型 ==================== */
 
 export interface SaveAssistantModalProps {
@@ -151,6 +171,7 @@ export default function SaveAssistantModal(props: SaveAssistantModalProps) {
   const [subject, setSubject] = useState('')
   const [scenes, setScenes]   = useState<AssistantScene[]>([])
   const [shelf, setShelf]     = useState<ShelfKey>('personal') // 货架:默认存为我的
+  const [sharePolicy, setSharePolicy] = useState<AssistantSharePolicy>(DEFAULT_SHARE_POLICY) // 分享策略:默认仅可用
   const [saving, setSaving]   = useState(false)
   const [err, setErr]         = useState<string | null>(null)
 
@@ -162,6 +183,8 @@ export default function SaveAssistantModal(props: SaveAssistantModalProps) {
 
   // 是否需要显示货架选择(只有可选 >1 个时才显示;普通老师只有 personal 不显示)
   const showShelfPicker = shelfKeys.length > 1
+  // 是否显示分享策略选择器(仅当选了共享货架时;personal 货架无意义不显示)
+  const showPolicyPicker = isSharedShelf(shelf)
 
   // ==================== open 时初始化表单 + 拉取可发布范围 ====================
   useEffect(() => {
@@ -170,7 +193,8 @@ export default function SaveAssistantModal(props: SaveAssistantModalProps) {
     setName('')
     setSubject(defaultSubject || '')
     setScenes(defaultScene ? [defaultScene] : [...WORKSHOP_SCENES])
-    setShelf('personal')          // 货架默认 personal(无论什么身份,默认"先存给自己"最安全)
+    setShelf('personal')              // 货架默认 personal(无论什么身份,默认"先存给自己"最安全)
+    setSharePolicy(DEFAULT_SHARE_POLICY) // 策略默认仅可用(最保护)
     setSelectedGroupID('')
     setErr(null)
     setSaving(false)
@@ -256,6 +280,8 @@ export default function SaveAssistantModal(props: SaveAssistantModalProps) {
         grade_range: '',
         scenes,
         ...(groupID ? { group_id: groupID } : {}), // 仅教研组级携带 group_id
+        // 分享策略:仅共享货架携带用户所选;personal 不传,后端兜底 use_only
+        ...(isSharedShelf(finalShelf) ? { share_policy: sharePolicy } : {}),
       }
       const created = await createAssistant(req)
       onSaved(created.id, (created.source as AssistantSource) || source)
@@ -403,6 +429,64 @@ export default function SaveAssistantModal(props: SaveAssistantModalProps) {
           {loadingScope && !showShelfPicker && (
             <div style={{ marginBottom: '16px', fontSize: '12px', color: C.textMuted }}>
               正在确认你的发布范围…
+            </div>
+          )}
+
+          {/* ==================== 分享策略选择器(仅共享货架显示) ==================== */}
+          {showPolicyPicker && (
+            <div style={{ marginBottom: '16px' }}>
+              <label style={labelStyle}>
+                别人能怎么用 <span style={{ color: C.danger }}>*</span>
+                <span style={{ color: C.textMuted, fontWeight: 400 }}> (决定别人能不能复制、能不能改)</span>
+              </label>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '4px' }}>
+                {SHARE_POLICY_ORDER.map(p => {
+                  const checked = sharePolicy === p
+                  return (
+                    <label
+                      key={p}
+                      style={{
+                        display: 'flex', alignItems: 'flex-start', gap: '8px',
+                        padding: '10px 12px', borderRadius: '8px',
+                        border: `1.5px solid ${checked ? C.accent : C.border}`,
+                        background: checked ? 'rgba(245,158,11,0.06)' : '#fff',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <input
+                        type="radio"
+                        name="share_policy"
+                        checked={checked}
+                        onChange={() => setSharePolicy(p)}
+                        style={{ cursor: 'pointer', accentColor: C.accent, marginTop: '2px' }}
+                      />
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: '13px', fontWeight: 600, color: C.text }}>
+                          {SHARE_POLICY_EMOJI[p]} {SHARE_POLICY_LABELS[p]}
+                          {p === DEFAULT_SHARE_POLICY && (
+                            <span style={{ fontSize: '10px', fontWeight: 400, color: C.textMuted }}> (默认 · 推荐)</span>
+                          )}
+                        </div>
+                        <div style={{ fontSize: '11px', color: C.textSec, marginTop: '2px', lineHeight: 1.5 }}>
+                          {SHARE_POLICY_HINTS[p]}
+                        </div>
+                      </div>
+                    </label>
+                  )
+                })}
+              </div>
+
+              {/* 选"可复制"时的黄色提醒:确保发布者明确知道自己在开放复制 */}
+              {sharePolicy === 'open' && (
+                <div style={{
+                  marginTop: '8px', padding: '9px 12px', borderRadius: '8px',
+                  background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)',
+                  color: '#92400E', fontSize: '12px', lineHeight: 1.6,
+                }}>
+                  ⚠️ 选了「可复制」后,任何能看到这个助手的老师都可以复制一份带走并自行修改。
+                  如果这是你想保护的标准或产权,建议改回「仅可用」。
+                </div>
+              )}
             </div>
           )}
 

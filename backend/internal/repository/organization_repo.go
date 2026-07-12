@@ -75,26 +75,80 @@ func GetOrganizationByID(ctx context.Context, id string) (*models.Organization, 
 }
 
 // GetSchoolByAdminUserID 根据学校管理员用户ID获取其管理的学校
+//
 // 规则：仅返回 type='school' 的组织；若无则返回 ErrOrgNotFound
+//
+// ⚠ B1 修复（第二学校管理员"未关联学校"根治）：
+//
+//	本函数是"用户→所属学校"反查的权威入口，被 13+ 处调用（token scope / data_scope /
+//	课件与教案多级审核 / 课程大纲 / 单元方案 / 模板发布 / admin_handler / AI助手 全链路）。
+//	历史实现只查 organizations.admin_user_id 单字段——而该字段只存"首个/主"学校管理员，
+//	一个学校任命的第二个 school_admin 只写进了 organization_admins 表、不进单字段，
+//	于是第二校管在此反查落空，连锁表现为：登录后"未关联学校"、进课程大纲被提示"不是学校
+//	管理员"、积分 scope 收窄空集、模板发布/课件 L2 审核失效等。
+//
+//	修法（两级 fail-open 查找链，语义与 token/data_scope 的 school 解析一致）：
+//	  ① 先查 organizations.admin_user_id 单字段（旧口径，命中即返，行为与历史完全一致，
+//	     对已工作的首个校管零影响）。
+//	  ② 单字段查不到时，兜底查 organization_admins(role_type='school_admin')，
+//	     JOIN organizations 取该用户被任命管理的 type='school' 组织。
+//	     多个学校时按 created_at 升序取第一个（与"首个校管"直觉一致，且此场景极罕见——
+//	     同一 school_admin 被任命管理多所学校非常规用法）。
+//	  ③ 两级都无 → ErrOrgNotFound（语义不变，调用方错误处理链一字不动）。
+//
+//	为什么改这一处即修全链：所有依赖"用户是不是某校管理员/属于哪个校"的判断都汇到本函数，
+//	补上多管理员表这条链，第二校管在全部下游链路上一次性复活，无需逐个调用点改动。
 func GetSchoolByAdminUserID(ctx context.Context, adminUserID string) (*models.Organization, error) {
+	if adminUserID == "" {
+		return nil, ErrOrgNotFound
+	}
+
 	org := &models.Organization{}
-	query := `
+
+	// ① 旧口径：organizations.admin_user_id 单字段（主/首个学校管理员）
+	singleFieldQuery := `
 		SELECT id, name, type, parent_id, admin_user_id, settings, COALESCE(logo_url,''), status, created_at, updated_at
 		FROM organizations
 		WHERE admin_user_id = $1 AND type = 'school'
 		LIMIT 1
 	`
-	err := database.DB.QueryRow(ctx, query, adminUserID).Scan(
+	err := database.DB.QueryRow(ctx, singleFieldQuery, adminUserID).Scan(
 		&org.ID, &org.Name, &org.Type, &org.ParentID, &org.AdminUserID,
 		&org.Settings, &org.LogoURL, &org.Status, &org.CreatedAt, &org.UpdatedAt,
 	)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrOrgNotFound
-		}
+	if err == nil {
+		return org, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		// 真正的 DB 异常直接上抛（不是"查无此人"，不进兜底）
 		return nil, fmt.Errorf("查询学校管理员所属学校失败: %w", err)
 	}
-	return org, nil
+
+	// ② 兜底：organization_admins 多管理员表（第二/后续学校管理员在此）
+	//   role_type='school_admin' 且组织为 type='school'，JOIN 取组织全字段。
+	//   多校时按 created_at 升序取首个（与"首个校管"直觉一致）。
+	multiAdminQuery := `
+		SELECT o.id, o.name, o.type, o.parent_id, o.admin_user_id, o.settings,
+		       COALESCE(o.logo_url,''), o.status, o.created_at, o.updated_at
+		FROM organization_admins oa
+		JOIN organizations o ON o.id = oa.org_id
+		WHERE oa.user_id = $1 AND oa.role_type = 'school_admin' AND o.type = 'school'
+		ORDER BY oa.created_at ASC
+		LIMIT 1
+	`
+	org2 := &models.Organization{}
+	err2 := database.DB.QueryRow(ctx, multiAdminQuery, adminUserID).Scan(
+		&org2.ID, &org2.Name, &org2.Type, &org2.ParentID, &org2.AdminUserID,
+		&org2.Settings, &org2.LogoURL, &org2.Status, &org2.CreatedAt, &org2.UpdatedAt,
+	)
+	if err2 == nil {
+		return org2, nil
+	}
+	if errors.Is(err2, pgx.ErrNoRows) {
+		// 两级都查不到 → 语义不变，返回 ErrOrgNotFound
+		return nil, ErrOrgNotFound
+	}
+	return nil, fmt.Errorf("查询学校管理员所属学校(多管理员兜底)失败: %w", err2)
 }
 
 func ListOrganizations(ctx context.Context, orgType string, parentID string) ([]*models.OrganizationListItem, error) {
@@ -227,6 +281,44 @@ func GetSchoolsByRegion(ctx context.Context, regionID string) ([]*models.Organiz
 	return orgs, nil
 }
 
+// ListExistingActiveSchoolIDs 跨校批量导入校验用：
+//
+// 给定一批 school_id，一次性查库返回其中【真实存在且 type='school' 且 status='active'】的 id 集合。
+//
+// 用途：
+//
+//	跨区域多校批量导入时，Excel 每行自带 school_id（前端由"学校名→ID"反查填入）。
+//	service 层在逐行建用户前，先把表里去重后的所有 school_id 传入本函数拿到"有效集合"，
+//	再逐行用内存集合判定（O(1)），避免每行单独查库，也挡住前端伪造/失效的 school_id
+//	往不存在的学校塞人。
+//
+// 实现：单条 id = ANY($1) 查询，只回真实命中的有效学校 id。
+// 入参空切片 → 直接返回空 map（不查库）。返回 map[string]bool，存在即 true，便于调用方判存。
+func ListExistingActiveSchoolIDs(ctx context.Context, schoolIDs []string) (map[string]bool, error) {
+	result := make(map[string]bool)
+	if len(schoolIDs) == 0 {
+		return result, nil
+	}
+	rows, err := database.DB.Query(ctx, `
+		SELECT id FROM organizations
+		WHERE id = ANY($1) AND type = 'school' AND status = 'active'
+	`, schoolIDs)
+	if err != nil {
+		return nil, fmt.Errorf("批量校验学校ID失败: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			result[id] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历有效学校ID结果失败: %w", err)
+	}
+	return result, nil
+}
+
 // ==================== 迭代一 新增：组织树递归查询 ====================
 
 // ListDescendantSchoolIDs 递归查询某区域树下的所有学校ID（WITH RECURSIVE）
@@ -328,7 +420,9 @@ func parsePortalModulesFromSettings(settings string) map[string]bool {
 // GetUserPortalModules 获取用户所属组织的门户板块可见性配置
 //
 // 查找链路与 GetUserOrgLogo 一致：
-//   school_members → 学校 → 学校 settings；school_members 查不到则教研组兜底反查学校
+//
+//	school_members → 学校 → 学校 settings；school_members 查不到则教研组兜底反查学校
+//
 // 解析学校 settings 里的 portal_modules；未绑定任何组织 / 查不到 → 返回全开
 //
 // 注意：admin 的"全开"由 auth_service 层兜底，不在此函数处理（此函数只管按组织配置返回）
@@ -407,10 +501,11 @@ func RemoveSchoolMember(ctx context.Context, schoolID string, userID string) err
 // 同时兜底查 teaching_group_members，防止回填遗漏或新加入教研组但 school_members 漏写
 //
 // 注意（迭代一说明）：
-//   本函数保留教研组兜底，服务于"学校管理员校验本校成员、放行管理操作"等 6 处既有调用点
-//   （宁可多放行本校的人，也别漏掉只在教研组的人）。行为与历史一致，不改。
-//   而"数据隔离/防跨校越权"场景（教案/审核隔离）应改用下方 IsUserInSchoolStrict（无兜底），
-//   两者命名即表达语义差异，杜绝再次误用。
+//
+//	本函数保留教研组兜底，服务于"学校管理员校验本校成员、放行管理操作"等 6 处既有调用点
+//	（宁可多放行本校的人，也别漏掉只在教研组的人）。行为与历史一致，不改。
+//	而"数据隔离/防跨校越权"场景（教案/审核隔离）应改用下方 IsUserInSchoolStrict（无兜底），
+//	两者命名即表达语义差异，杜绝再次误用。
 func IsUserInSchool(ctx context.Context, userID string, schoolID string) (bool, error) {
 	var count int
 	// 主判：school_members
@@ -443,8 +538,9 @@ func IsUserInSchool(ctx context.Context, userID string, schoolID string) (bool, 
 //   - IsUserInSchoolStrict：只认 school_members（严格，给"数据隔离/防跨校越权"用）
 //
 // 设计动机（P0-02 根治）：
-//   P0-02 漏洞的根源是"数据隔离误用了带兜底的归属判断"——只要加个教研组就能看跨校教案。
-//   严格版只认 school_members 这一唯一权威归属来源，加教研组也无法越权看跨校数据。
+//
+//	P0-02 漏洞的根源是"数据隔离误用了带兜底的归属判断"——只要加个教研组就能看跨校教案。
+//	严格版只认 school_members 这一唯一权威归属来源，加教研组也无法越权看跨校数据。
 //
 // 用途：Phase 4 教案/审核数据隔离收口时使用；以及任何需要严格归属判断的新场景。
 func IsUserInSchoolStrict(ctx context.Context, userID string, schoolID string) (bool, error) {

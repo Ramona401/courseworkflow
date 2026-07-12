@@ -633,3 +633,167 @@ func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }
+
+// ==================== 音频裁剪（课件音频剪辑器专用） ====================
+
+// TrimAudioRequest 音频裁剪请求
+type TrimAudioRequest struct {
+	CoursewareID string  // 课件ID
+	AssetID      string  // 原音频资产ID
+	StartSec     float64 // 起始秒数（如 1.5）
+	EndSec       float64 // 结束秒数（如 30.0）
+	UserID       string  // 操作者ID
+}
+
+// TrimAudioResponse 音频裁剪响应
+type TrimAudioResponse struct {
+	AssetID  string `json:"asset_id"`  // 新生成的裁剪音频资产ID
+	URL      string `json:"url"`       // 裁剪后音频URL
+	Duration string `json:"duration"`  // 裁剪后时长
+	FileName string `json:"file_name"` // 存储文件名
+	FileSize int64  `json:"file_size"` // 文件大小（字节）
+	MimeType string `json:"mime_type"` // MIME类型
+	Message  string `json:"message"`   // 提示信息
+}
+
+// TrimAudio 音频裁剪——截取指定起止时间段，生成新的音频资产
+//
+// 与TrimVideo完全同架构：
+//   1. 校验参数（起止时间、最短0.5秒）
+//   2. 校验课件权限
+//   3. 获取原音频文件磁盘路径
+//   4. FFmpeg -ss -t -c copy 不重编码裁剪
+//   5. 用ffprobe探测裁剪后时长
+//   6. 新资产写入数据库
+//
+// 输出保存到 /uploads/courseware-assets/{courseware_id}/audios/ 与上传目录一致
+// 保留原始格式（mp3/wav/ogg/aac/flac/m4a），-c copy不重编码速度极快
+func (s *VideoEditService) TrimAudio(ctx context.Context, req *TrimAudioRequest) (*TrimAudioResponse, error) {
+	// 1. 校验参数
+	if req.StartSec < 0 {
+		return nil, fmt.Errorf("起始时间不能为负数")
+	}
+	if req.EndSec <= req.StartSec {
+		return nil, fmt.Errorf("结束时间必须大于起始时间")
+	}
+	if req.EndSec-req.StartSec < 0.5 {
+		return nil, fmt.Errorf("裁剪后时长至少0.5秒")
+	}
+
+	// 2. 校验课件权限
+	cw, err := repository.GetCoursewareByID(ctx, req.CoursewareID)
+	if err != nil {
+		return nil, fmt.Errorf("课件不存在: %w", err)
+	}
+	if cw.UserID != req.UserID {
+		return nil, fmt.Errorf("无权操作此课件")
+	}
+
+	// 3. 获取原音频文件路径
+	asset, err := repository.GetCWAssetByID(ctx, req.AssetID)
+	if err != nil {
+		return nil, fmt.Errorf("音频资产不存在: %w", err)
+	}
+	if asset.AssetType != models.CWAssetTypeAudio {
+		return nil, fmt.Errorf("该资产不是音频类型")
+	}
+	if asset.CoursewareID != req.CoursewareID {
+		return nil, fmt.Errorf("资产不属于此课件")
+	}
+
+	// 从 oss_url（实际是本地路径如 /uploads/courseware-assets/xxx/audios/yyy.mp3）解析磁盘全路径
+	sourcePath := ""
+	if asset.OssURL != "" && strings.HasPrefix(asset.OssURL, CWAssetURLPrefix) {
+		relativePath := asset.OssURL[len(CWAssetURLPrefix):]
+		sourcePath = filepath.Join(CWAssetUploadDir, relativePath)
+	}
+	if sourcePath == "" || !fileExists(sourcePath) {
+		return nil, fmt.Errorf("原音频文件不存在")
+	}
+
+	// 推断输出扩展名：保留原始格式（从源文件扩展名取）
+	srcExt := strings.ToLower(filepath.Ext(sourcePath))
+	if srcExt == "" {
+		srcExt = ".mp3" // 兜底
+	}
+	// 推断MIME类型
+	mimeType := "audio/mpeg"
+	switch srcExt {
+	case ".wav":
+		mimeType = "audio/wav"
+	case ".ogg":
+		mimeType = "audio/ogg"
+	case ".aac":
+		mimeType = "audio/aac"
+	case ".flac":
+		mimeType = "audio/flac"
+	case ".m4a":
+		mimeType = "audio/x-m4a"
+	}
+
+	// 4. 输出文件路径（存到 audios/ 子目录，与上传音频目录一致）
+	outputDir := filepath.Join(CWAssetUploadDir, req.CoursewareID, "audios")
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return nil, fmt.Errorf("创建输出目录失败: %w", err)
+	}
+	outputName := fmt.Sprintf("%d_trim_%.0f-%.0f%s", time.Now().UnixMilli(), req.StartSec, req.EndSec, srcExt)
+	outputPath := filepath.Join(outputDir, outputName)
+
+	// 5. 执行FFmpeg裁剪（-c copy不重编码，速度极快）
+	duration := req.EndSec - req.StartSec
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-y",
+		"-ss", fmt.Sprintf("%.3f", req.StartSec),
+		"-i", sourcePath,
+		"-t", fmt.Sprintf("%.3f", duration),
+		"-c", "copy",
+		outputPath,
+	)
+	output, cmdErr := cmd.CombinedOutput()
+	if cmdErr != nil {
+		videoEditLog.Error("FFmpeg音频裁剪失败", "error", cmdErr, "output", string(output))
+		return nil, fmt.Errorf("音频裁剪失败: %w", cmdErr)
+	}
+
+	// 6. 获取输出文件信息
+	actualDuration := getVideoDuration(outputPath) // ffprobe对音频同样适用
+	var fileSize int64
+	if fi, statErr := os.Stat(outputPath); statErr == nil {
+		fileSize = fi.Size()
+	}
+
+	// 7. 写入数据库
+	localURL := CWAssetURLPrefix + filepath.Join(req.CoursewareID, "audios", outputName)
+	newAsset := &models.CoursewareAsset{
+		CoursewareID:     req.CoursewareID,
+		PlaceholderID:    "",
+		AssetType:        models.CWAssetTypeAudio,
+		GenerationPrompt: fmt.Sprintf("裁剪 %.1fs-%.1fs", req.StartSec, req.EndSec),
+		OssURL:           localURL,
+		FileSize:         fileSize,
+		MimeType:         mimeType,
+		Status:           models.CWAssetStatusUploaded,
+	}
+	if err := repository.CreateCWAsset(ctx, newAsset); err != nil {
+		return nil, fmt.Errorf("记录裁剪音频失败: %w", err)
+	}
+
+	videoEditLog.Info("音频裁剪完成",
+		"source_asset", req.AssetID,
+		"new_asset", newAsset.ID,
+		"start", req.StartSec,
+		"end", req.EndSec,
+		"duration", actualDuration,
+		"file_size", fileSize,
+	)
+
+	return &TrimAudioResponse{
+		AssetID:  newAsset.ID,
+		URL:      localURL,
+		Duration: actualDuration,
+		FileName: outputName,
+		FileSize: fileSize,
+		MimeType: mimeType,
+		Message:  fmt.Sprintf("裁剪完成，截取 %.1f-%.1f 秒，时长%s", req.StartSec, req.EndSec, actualDuration),
+	}, nil
+}

@@ -9,6 +9,7 @@ import (
 
 // User 用户模型，对应数据库 users 表
 // v64(迭代3)新增：TeachingProfile 字段（JSONB，教学风格前测结果）
+// 超管收口新增：IsSuper 字段（is_super 列，超级管理员标记位）
 type User struct {
 	ID           string `json:"id"`
 	Username     string `json:"username"`
@@ -23,6 +24,13 @@ type User struct {
 	UpdatedAt   *time.Time `json:"updated_at"`
 	// v64新增：教学风格前测结果（JSONB，可能为NULL）
 	TeachingProfileJSON *string `json:"-"`
+	// 超管收口新增：超级管理员标记位（is_super 列，默认 false）
+	//   - true：真超管，可访问模型配置/积分/AI统计/审计日志等敏感入口
+	//   - false：二线管理员（仍是 admin 角色），只能管基础数据/用户/组织架构，
+	//            碰不到上述敏感入口（前端隐藏 + 后端 superAdminOnly 中间件双重收口）
+	// 注意：is_super 与 role 是正交的两个维度——is_super 只在 role=admin 时才有意义，
+	//       它把"全能 admin"细分为"超管 admin(true)"与"二线 admin(false)"。
+	IsSuper bool `json:"is_super"`
 }
 
 // ==================== 门户板块常量（v172新增：组织级板块可见性开关） ====================
@@ -68,6 +76,9 @@ type UserInfo struct {
 	OrgLogoURL         string          `json:"org_logo_url"`   // 用户所属组织的Logo URL（学校>区域>空）
 	OrgName            string          `json:"org_name"`       // 用户所属组织名称
 	PortalModules      map[string]bool `json:"portal_modules"` // v172新增：门户板块可见性（三个key各true/false）
+	// 超管收口新增：超级管理员标记位，透传给前端用于敏感入口显隐
+	// 前端据此隐藏"模型配置/积分/AI统计/审计日志"入口（二线 admin 拿到 false）
+	IsSuper bool `json:"is_super"`
 }
 
 // ToUserInfo 将 User 转换为 UserInfo
@@ -85,6 +96,8 @@ func (u *User) ToUserInfo() *UserInfo {
 		HasTeachingProfile: u.TeachingProfileJSON != nil,
 		// PortalModules 默认全开，由 auth_service 填充时根据组织配置/角色覆盖
 		PortalModules: DefaultPortalModules(),
+		// 超管标记位原样透传（数据库真值，前端据此收口敏感入口）
+		IsSuper: u.IsSuper,
 	}
 }
 
@@ -206,6 +219,27 @@ var SchoolAdminCreatableRoles = []string{RoleOperator, RoleViewer}
 // IsSchoolAdminCreatableRole 校验学校管理员可创建的角色
 func IsSchoolAdminCreatableRole(role string) bool {
 	for _, r := range SchoolAdminCreatableRoles {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
+// ==================== 任命制身份（归属治理批C）====================
+//
+// 不变式：users.role 出现下列身份 ⇔ organization_admins（或 organizations.admin_user_id）
+// 存在该用户的对应任命。这两个身份是"任命的影子"，不允许独立存在：
+//   - 获得：仅可经「组织架构→🛡️管理员」任命（B13 任命自动升级身份）；
+//   - 失去：末个任命被移除时自动降级为骨干教师（批C，organization_admin_service）；
+//   - 建号/编辑用户不得直接授予或改动（user_service 校验拒绝并给出任命引导）。
+
+// AppointmentOnlyRoles 仅可经组织任命获得的管理身份
+var AppointmentOnlyRoles = []string{RoleRegionAdmin, RoleSeniorOperator}
+
+// IsAppointmentOnlyRole 判断某角色是否为任命制身份
+func IsAppointmentOnlyRole(role string) bool {
+	for _, r := range AppointmentOnlyRoles {
 		if r == role {
 			return true
 		}

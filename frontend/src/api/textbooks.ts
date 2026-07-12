@@ -2,6 +2,10 @@
  * textbooks.ts — 课本上传API封装
  *
  * 迭代7新增：课本图片上传/列表/详情/更新/删除/OCR识别
+ *
+ * v231新增：教材照片归档维度扩展
+ *   - 列表项/详情类型新增 semester(学期) + unit(单元) 字段
+ *   - getTextbooks 查询参数支持 semester/unit 筛选（通过 Record 透传）
  */
 import apiClient from './client'
 
@@ -12,6 +16,8 @@ export interface TextbookListItem {
   id: string
   subject: string
   grade_range: string
+  semester: string // 学期（v231新增，如"上册"/"下册"）
+  unit: string     // 单元（v231新增，如"第三单元"）
   textbook_name: string
   chapter: string
   page_number: number
@@ -34,6 +40,8 @@ export interface TextbookDetail {
   id: string
   subject: string
   grade_range: string
+  semester: string // 学期（v231新增）
+  unit: string     // 单元（v231新增）
   textbook_name: string
   chapter: string
   page_number: number
@@ -74,7 +82,10 @@ export async function uploadTextbook(formData: FormData) {
   return data.data as { id: string; file_name: string; file_size: number; image_url: string }
 }
 
-/** 查询课本页面列表 */
+/**
+ * 查询课本页面列表
+ * 支持的筛选参数：subject/grade_range/semester/unit/textbook_name/scope/limit/offset
+ */
 export async function getTextbooks(params?: Record<string, string | number>) {
   const { data } = await apiClient.get('/lesson-plans/textbooks', { params })
   return data.data as TextbookListResponse

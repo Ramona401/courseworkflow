@@ -19,6 +19,11 @@ package handlers
 // 错误处理:
 //   - 鉴权失败 / 请求体格式错误:走普通 JSON 400/401(非 SSE)
 //   - 进入 SSE 后的错误走 error 事件
+//
+// 积分硬闸 batch (2026-07-04):
+//   DesignChat 调用补传 claims.UserID(服务层据此构造带 UserID 的 traceCtx,
+//   修复设计器两阶段 AI 调用 traceCtx=nil 的积分旁路:0积分照用/不扣费/不留痕)。
+//   服务层阶段1失败现已回调 OnError,积分拦截文案经 error 事件直达前端。
 
 import (
 	"encoding/json"
@@ -49,12 +54,12 @@ func NewAssistantDesignerHandler(ds *services.AssistantDesignerService) *Assista
 
 // DesignChatRequest 对话式创作请求
 type DesignChatRequest struct {
-	Message      string                       `json:"message"`       // 老师本轮消息
-	History      []services.DesignerMessage   `json:"history"`       // 对话历史(可空)
-	Subject      string                       `json:"subject"`       // Modal 当前学科
-	Grade        string                       `json:"grade"`         // Modal 当前年级
-	Scenes       []string                     `json:"scenes"`        // Modal 勾选的场景
-	CurrentDraft string                       `json:"current_draft"` // 当前草稿(可空)
+	Message      string                     `json:"message"`       // 老师本轮消息
+	History      []services.DesignerMessage `json:"history"`       // 对话历史(可空)
+	Subject      string                     `json:"subject"`       // Modal 当前学科
+	Grade        string                     `json:"grade"`         // Modal 当前年级
+	Scenes       []string                   `json:"scenes"`        // Modal 勾选的场景
+	CurrentDraft string                     `json:"current_draft"` // 当前草稿(可空)
 }
 
 // ==================== SSE 工具函数 ====================
@@ -190,8 +195,10 @@ func (h *AssistantDesignerHandler) Chat(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// ========== 调用 Service ==========
+	// 积分硬闸 batch:补传 claims.UserID(认证中间件保证非空),
+	// 服务层据此构造 traceCtx,积分守卫/扣费/trace 全部归位。
 
-	if err := h.designerService.DesignChat(r.Context(), req.Message, req.History, dCtx, callbacks); err != nil {
+	if err := h.designerService.DesignChat(r.Context(), claims.UserID, req.Message, req.History, dCtx, callbacks); err != nil {
 		// 此时已经进入 SSE 模式,错误已通过 OnError 回调推给前端,这里只记日志
 		log.Printf("[designer chat] DesignChat 失败: user=%s err=%v", claims.UserID, err)
 	}

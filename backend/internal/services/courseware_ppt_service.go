@@ -411,7 +411,7 @@ func (s *CoursewarePPTService) extractTextFromXML(f *zip.File) (string, error) {
 //  1. 读取已存储的PPT文件 → 解析内容
 //  2. 构建PPT内容提示词 → 调AI生成方案JSON
 //  3. 写入数据库并SSE广播
-func (s *CoursewarePPTService) GenerateIndexFromPPT(ctx context.Context, coursewareID string, userID string, preset string) error {
+func (s *CoursewarePPTService) GenerateIndexFromPPT(ctx context.Context, coursewareID string, userID string, preset string, customHint string) error {
 	// ---- 1. 获取课件信息 ----
 	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
 	if err != nil {
@@ -462,7 +462,7 @@ func (s *CoursewarePPTService) GenerateIndexFromPPT(ctx context.Context, coursew
 	})
 
 	// ---- 4. 构建提示词（PPT内容作为上下文） ----
-	userPrompt := s.buildPPTIndexPrompt(cw, extractResult, preset)
+	userPrompt := s.buildPPTIndexPrompt(cw, extractResult, preset, customHint)
 
 	// ---- 5. 加载提示词模板 ----
 	schemePrompt, sErr := repository.GetCurrentPromptByKey("prompt_courseware_scheme")
@@ -599,7 +599,7 @@ func (s *CoursewarePPTService) GenerateIndexFromPPT(ctx context.Context, coursew
 // ==================== 提示词构建 ====================
 
 // buildPPTIndexPrompt 构建PPT内容→课件方案的提示词
-func (s *CoursewarePPTService) buildPPTIndexPrompt(cw *models.Courseware, ppt *PPTExtractResult, preset string) string {
+func (s *CoursewarePPTService) buildPPTIndexPrompt(cw *models.Courseware, ppt *PPTExtractResult, preset string, customHint string) string {
 	var sb strings.Builder
 	sb.WriteString("你是K12课件规划专家。\n")
 	sb.WriteString("用户提供了一份PPT演示文稿的内容（逐页文本），\n")
@@ -629,13 +629,10 @@ func (s *CoursewarePPTService) buildPPTIndexPrompt(cw *models.Courseware, ppt *P
 	}
 
 	// 注入方案结构预设
-	if preset != "" {
-		presetObj := models.GetSchemePresetByKey(preset)
-		if presetObj != nil && presetObj.PromptHint != "" {
-			sb.WriteString("\n")
-			sb.WriteString(presetObj.PromptHint)
-			sb.WriteString("\n")
-		}
+	if hint := models.ResolveSchemePromptHint(preset, customHint); hint != "" {
+		sb.WriteString("\n")
+		sb.WriteString(hint)
+		sb.WriteString("\n")
 	}
 
 	sb.WriteString("\n## 转化原则\n")

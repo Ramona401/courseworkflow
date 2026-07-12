@@ -314,6 +314,34 @@ export async function uploadCWVideo(
   return extractData(resp)
 }
 
+// ==================== 音频手动上传 ====================
+
+/** 手动上传音频文件到课件(mp3/wav/ogg/aac/flac/m4a ≤20MB) */
+export async function uploadCWAudio(
+  coursewareId: string,
+  pageNumber: number,
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<{ asset_id: string; url: string; file_name: string; file_size: number; mime_type: string }> {
+  const formData = new FormData()
+  formData.append('file', file)
+  const resp = await apiClient.post(
+    `/coursewares/${coursewareId}/pages/${pageNumber}/upload-audio`,
+    formData,
+    {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
+      onUploadProgress: (e) => {
+        if (onProgress && e.total) {
+          const pct = Math.round((e.loaded / e.total) * 100)
+          onProgress(Math.min(100, pct))
+        }
+      },
+    },
+  )
+  return extractData(resp)
+}
+
 // ==================== v0.42.5 视频编辑器草稿(服务器端多版本) ====================
 
 export async function listVideoDrafts(coursewareId: string): Promise<{ drafts: VideoDraftItem[]; total: number }> {
@@ -523,4 +551,35 @@ export async function downloadCoursewareBundle(coursewareId: string, title?: str
   a.click()
   document.body.removeChild(a)
   URL.revokeObjectURL(url)
+}
+
+// ==================== 音频裁剪（课件音频剪辑器专用） ====================
+
+/** 音频裁剪响应 */
+export interface TrimAudioResponse {
+  asset_id: string
+  url: string
+  duration: string
+  file_name: string
+  file_size: number
+  mime_type: string
+  message: string
+}
+
+/**
+ * 音频裁剪：截取指定起止时间段，后端FFmpeg -c copy不重编码裁剪，生成新音频资产
+ * 路由: POST /api/v1/coursewares/{id}/videos/trim-audio
+ */
+export async function trimCWAudio(
+  coursewareId: string,
+  assetId: string,
+  startSec: number,
+  endSec: number,
+): Promise<TrimAudioResponse> {
+  const resp = await apiClient.post(
+    `/coursewares/${coursewareId}/videos/trim-audio`,
+    { asset_id: assetId, start_sec: startSec, end_sec: endSec },
+    { timeout: 60000 },
+  )
+  return extractData(resp)
 }

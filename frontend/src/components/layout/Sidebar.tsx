@@ -34,7 +34,7 @@ interface MenuItem {
  *
  * 说明：
  *   - 「用户管理」和「AI 配置」已移除，统一走顶部Header下拉的新版入口
- *   - 「提示词管理」保留：管理 Pipeline 各步骤专属提示词，课件审核系统专属
+ *   - 「提示词管理」已移出：迁至独立全屏页 /prompts，入口在首页管理卡片（admin only）
  *   - 「外部数据配置」保留：管理 OSS 等外部数据源，课件审核系统专属
  *   - 其余菜单均为课件审核核心流程功能
  */
@@ -70,14 +70,6 @@ const menuItems: MenuItem[] = [
     path: '/workflow/review',
     description: '课件质量审核与定稿',
     roles: ['admin', 'senior_operator', 'operator'],
-  },
-  {
-    key: 'prompts',
-    label: '提示词管理',
-    icon: '💬',
-    path: '/workflow/prompts',
-    description: 'Pipeline 各步骤提示词版本管理',
-    roles: ['admin'],
   },
   {
     key: 'external-data',

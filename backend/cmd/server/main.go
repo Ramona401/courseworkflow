@@ -34,12 +34,21 @@ func main() {
 	mux := routes.Setup(cfg)
 
 	// 4. 创建 HTTP 服务器
+	//
+	// v0.43.1 修复（大文件上传超时）:
+	//   原 ReadTimeout=30s 限制的是"读完整个请求体"的总时长,
+	//   导致 22MB+ 的 PPT/Word 上传在网络稍慢时 30 秒内读不完被服务端直接掐断,
+	//   表现为前端"上传解析中…"卡死、Nginx access log 记 499(客户端超时断开)。
+	//   改用 ReadHeaderTimeout=30s —— 只限制"读完 HTTP 请求头"的时长(防慢连接攻击),
+	//   请求体(大文件)的读取不再受 30 秒上限约束,大上传可正常传完。
+	//   这是 Go 官方推荐的大上传处理方式,既解除上传超时又保留对慢攻击的防护。
+	//   WriteTimeout/IdleTimeout 维持不变。
 	srv := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      mux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 600 * time.Second, // AI 调用可能很长，与Nginx proxy_read_timeout对齐
-		IdleTimeout:  120 * time.Second,
+		Addr:              ":" + cfg.Port,
+		Handler:           mux,
+		ReadHeaderTimeout: 30 * time.Second,  // 仅限读请求头,大文件请求体上传不受限
+		WriteTimeout:      600 * time.Second, // AI 调用可能很长，与Nginx proxy_read_timeout对齐
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// 5. 优雅关闭：监听 SIGTERM/SIGINT
@@ -62,7 +71,7 @@ func main() {
 	log.Info("TE-DNA 2.0 服务启动",
 		"port", cfg.Port,
 		"version", config.AppVersion,
-		"read_timeout", "30s",
+		"read_header_timeout", "30s",
 		"write_timeout", "600s",
 	)
 

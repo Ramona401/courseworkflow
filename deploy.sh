@@ -1,16 +1,35 @@
 #!/bin/bash
 # ============================================================================
-# TE-DNA 2.0 一键部署脚本（日常迭代版 v3）
+# TE-DNA 2.0 一键部署脚本（日常迭代版 v3.3）
 # ----------------------------------------------------------------------------
 # 适用环境：阿里云 ECS Ubuntu 24.04 (47.86.248.255)
 # 架构：Go 后端 (:8080, systemd) + React 前端 (Nginx 静态) + PostgreSQL 16
 # 域名：https://workflow.pkuailab.com
+# ----------------------------------------------------------------------------
+# v3.3 变更(2026-07-12)：新增可选前端体积与懒加载防回归检查。
+#   - 使用 RUN_BUNDLE_CHECK=1 显式开启，默认快速部署行为不变。
+#   - 开启后在正式Vite构建前执行 npm run check:bundle。
+#   - 检查课件工坊与学科工具体积预算、两级懒加载边界、
+#     11个工具弹窗动态入口及地理/生命科学/物理/化学模板隔离。
+#   - 检查脚本使用Vite内存构建，不覆盖正式frontend/dist。
+#   - 任一硬性检查失败都会阻断部署，避免大型模板重新回流主资源。
+# ----------------------------------------------------------------------------
+# v3.2 变更(2026-07-04)：编译步骤末尾新增“清理 server.new.* 中转遗留”逻辑。
+#   背景：编译产物先写到 server.new.<时间戳> 再原子 mv 成 server；若部署中途
+#   某步失败触发 set -e 提前退出，该中转文件不会被 mv 掉，日积月累堆成几十个
+#   十几 M 的二进制垃圾（本次清理掉 37 个），既占磁盘又污染代码索引工具。
+#   本版在编译成功后清理历史遗留的 server.new.*（严格排除本次刚编译的产物，
+#   保证第 5 步 mv 不受影响）。
+# ----------------------------------------------------------------------------
+# v3.1 变更(2026-07-02)：集成测试调用前 source backend/.env（set -a 自动导出），
+#   修复此前 go test 进程拿不到数据库连接等环境变量导致集成测试整批失败的问题。
 # ----------------------------------------------------------------------------
 # 默认行为（快速模式，预计 1-2 分钟完成）：
 #   ✅ 数据库备份        ✅ Go 编译         ✅ 前端 Vite 构建
 #   ✅ 健康检查+自动回滚  ✅ 端点冒烟测试    ✅ 二进制原子替换
 #   ❌ 跳过 golangci-lint ❌ 跳过 ESLint    ❌ 跳过单元+集成测试
 #   ❌ 不跑 npm audit（npmmirror 环境不支持）
+#   ❌ 默认不跑前端体积防回归检查（RUN_BUNDLE_CHECK=1时开启并阻断）
 #
 # 使用方法：
 #   bash /www/wwwroot/tedna/deploy.sh                     # 日常快速部署
@@ -18,6 +37,8 @@
 #   SKIP_FRONTEND=1  bash /www/wwwroot/tedna/deploy.sh    # 仅后端更新
 #   RUN_LINT=1       bash /www/wwwroot/tedna/deploy.sh    # 额外跑 lint（不阻塞）
 #   RUN_TESTS=1      bash /www/wwwroot/tedna/deploy.sh    # 额外跑测试（阻塞）
+#   RUN_BUNDLE_CHECK=1 bash /www/wwwroot/tedna/deploy.sh    # 额外跑前端体积与懒加载检查（阻塞）
+#   RUN_BUNDLE_CHECK=1 SKIP_BACKEND=1 bash /www/wwwroot/tedna/deploy.sh  # 纯前端部署并执行体积检查
 #   RUN_LINT=1 RUN_TESTS=1 bash /www/wwwroot/tedna/deploy.sh  # 发版前完整验证
 #
 # 其他开关：
@@ -56,7 +77,7 @@ echo "时间:     $(date '+%Y-%m-%d %H:%M:%S')"
 echo "操作员:   $(whoami)@$(hostname)"
 echo "提交版本: $(cd $PROJECT_ROOT && git rev-parse --short HEAD 2>/dev/null || echo '非 git 仓库')"
 echo "时间戳:   $TIMESTAMP"
-echo "模式:     $([ "$RUN_LINT" = "1" ] && echo -n '含Lint ' )$([ "$RUN_TESTS" = "1" ] && echo -n '含测试 ' )$([ "$RUN_LINT" != "1" ] && [ "$RUN_TESTS" != "1" ] && echo -n '快速模式 ')"
+echo "模式:     $([ "$RUN_LINT" = "1" ] && echo -n '含Lint ' )$([ "$RUN_TESTS" = "1" ] && echo -n '含测试 ' )$([ "$RUN_BUNDLE_CHECK" = "1" ] && echo -n '含体积检查 ' )$([ "$RUN_LINT" != "1" ] && [ "$RUN_TESTS" != "1" ] && [ "$RUN_BUNDLE_CHECK" != "1" ] && echo -n '快速模式 ')"
 echo ""
 
 # ============================================================================
@@ -168,6 +189,13 @@ else
         INTEG_LOG="$DEPLOY_LOG_DIR/go-integ-test_${TIMESTAMP}.log"
         if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$DB_TEST_NAME"; then
             echo "       运行集成测试（真实数据库 $DB_TEST_NAME）..."
+            # ---- 修复(2026-07-02)：集成测试前加载 backend/.env 环境变量 ----
+            # 说明：单元测试不连库可裸跑，但集成测试进程要读数据库连接串、密钥等配置；
+            #       此前未 source .env 导致 go test 拿不到环境变量，集成测试整批失败。
+            # set -a 使 source 进来的变量自动 export 传给子进程(go test)，用完 set +a 关闭。
+            set -a
+            . "$BACKEND_DIR/.env"
+            set +a
             if go test -count=1 -timeout 10m ./internal/integration/... > "$INTEG_LOG" 2>&1; then
                 INTEG_PASS=$(grep -c "^ok" "$INTEG_LOG" || true)
                 echo "       ✅ 集成测试通过 ($INTEG_PASS 个包)"
@@ -211,6 +239,17 @@ else
 
     # 清理：最近 5 份旧二进制备份
     ls -t "${BIN_PATH}.backup."* 2>/dev/null | tail -n +6 | xargs -r rm -f
+
+    # ---- v3.2 新增：清理 server.new.* 中转遗留 ----
+    # 背景：server.new.<时间戳> 是编译产物的临时中转文件，正常会在第 5 步被 mv 成
+    #   server；但若部署中途失败(健康检查超时/前端构建失败等)触发 set -e 提前退出，
+    #   该中转文件就残留在磁盘上，日积月累堆成几十个十几 M 的二进制垃圾，既占磁盘
+    #   又撑爆代码索引工具(单文件超限)。此处清理历史遗留，保留 0 份。
+    # 安全：严格用 grep -v 排除本次刚编译好的 BIN_TMP，绝不删除本次产物，
+    #   保证第 5 步的 mv "$BIN_TMP" "$BIN_PATH" 不受影响。
+    ls -t "${BIN_PATH}.new."* 2>/dev/null | grep -vF "$BIN_TMP" | xargs -r rm -f
+    STALE_KEPT=$(ls "${BIN_PATH}.new."* 2>/dev/null | grep -vF "$BIN_TMP" | wc -l)
+    echo "       ✅ 已清理 server.new.* 中转遗留（残留 $STALE_KEPT 份）"
 fi
 
 # ============================================================================
@@ -239,9 +278,28 @@ else
         echo "       ✅ node_modules 已是最新"
     fi
 
+    # ---- 可选：前端体积与懒加载防回归检查（阻断）----
+    # 默认关闭；发版前或重要前端改造时使用 RUN_BUNDLE_CHECK=1 显式开启。
+    # check:bundle 内部执行 TypeScript 编译和 Vite 内存生产构建，
+    # 不写入正式 dist；任一硬性体积预算或动态加载边界失败均阻断部署。
+    if [ "$RUN_BUNDLE_CHECK" = "1" ]; then
+        echo "   3.2 前端体积与懒加载防回归检查（RUN_BUNDLE_CHECK=1，失败会阻断部署）"
+        BUNDLE_CHECK_LOG="$DEPLOY_LOG_DIR/bundle-check_${TIMESTAMP}.log"
+
+        if npm run check:bundle > "$BUNDLE_CHECK_LOG" 2>&1; then
+            echo "       ✅ 前端体积与懒加载防回归检查通过"
+        else
+            echo "       ❌ 前端体积与懒加载防回归检查失败（已阻断部署）:"
+            cat "$BUNDLE_CHECK_LOG"
+            false
+        fi
+    else
+        echo "   3.2 ⏭ 跳过前端体积防回归检查（默认，可用 RUN_BUNDLE_CHECK=1 开启）"
+    fi
+
     # ---- 可选：ESLint ----
     if [ "$RUN_LINT" = "1" ]; then
-        echo "   3.2 ESLint 检查（RUN_LINT=1）"
+        echo "   3.3 ESLint 检查（RUN_LINT=1）"
         ESLINT_LOG="$DEPLOY_LOG_DIR/eslint_${TIMESTAMP}.log"
         if npm run lint > "$ESLINT_LOG" 2>&1; then
             echo "       ✅ ESLint 通过"
@@ -251,11 +309,11 @@ else
             echo "       ...完整日志: $ESLINT_LOG"
         fi
     else
-        echo "   3.2 ⏭ 跳过 ESLint（默认）"
+        echo "   3.3 ⏭ 跳过 ESLint（默认）"
     fi
 
     # ---- 必做：Vite 构建 ----
-    echo "   3.3 Vite 生产构建"
+    echo "   3.4 Vite 生产构建"
     if [ -d "$FRONTEND_DIST" ]; then
         DIST_BACKUP="$FRONTEND_DIR/dist.backup.${TIMESTAMP}"
         cp -r "$FRONTEND_DIST" "$DIST_BACKUP"

@@ -196,3 +196,35 @@ func (s *TokenService) doAlertCheck() {
 		"warn_count", warnCount,
 		"urgent_count", urgentCount)
 }
+
+// ==================== 月初补足（Token 自动分配·规则D）====================
+
+// StartMonthEndTopUpScheduler 启动"月初补足"定时任务（2026-07-04 新增）
+//
+// 每月1号凌晨04:30执行 RunMonthEndTopUp：把所有 active 个人账户补足到100
+// （余额≥100不动，<100补足，受每月500上限与学校池余额约束）。
+//
+// 时点选择：放在月度自动充值（1号04:00）之后30分钟。这样若某账户既配了
+//
+//	monthly_quota 又需补足，先充值、后补足，顺序合理，且两任务错峰不争抢。
+//
+// 范式与 StartMonthlyQuotaScheduler 完全一致（time.Sleep 单 goroutine 循环）。
+// 全局开关 token_auto_allocation_enabled 的判断在 RunMonthEndTopUp 内部完成，
+// 关闭时任务照常唤醒但直接跳过，无副作用。
+func (s *TokenService) StartMonthEndTopUpScheduler() {
+	go func() {
+		for {
+			now := time.Now()
+			// 下一个月1号 04:30
+			nextMonth := time.Date(now.Year(), now.Month()+1, 1, 4, 30, 0, 0, now.Location())
+			sleepDuration := nextMonth.Sub(now)
+
+			tokenSchedLog.Info("月初补足 下次执行",
+				"next_run", nextMonth.Format("2006-01-02 15:04:05"),
+				"sleep", sleepDuration.Round(time.Minute))
+
+			time.Sleep(sleepDuration)
+			RunMonthEndTopUp(context.Background())
+		}
+	}()
+}

@@ -1,3 +1,4 @@
+import { DEFAULT_SUBJECTS } from '@/constants/subjects'
 /**
  * wizardConstants.tsx — 配方向导共享常量、样式、类型定义
  *
@@ -43,11 +44,7 @@ export const C = {
 /* ==================== 学科和年级选项 ==================== */
 // v202 学科统一：三端统一为同一份 17 学科；'信息技术'→'信息科技'对齐课标库；
 //   新增 科学/道德与法治/音乐/美术/体育/劳动（'道德与法治'用全称对齐后端编码表）。
-export const SUBJECTS = [
-  '语文', '数学', '英语', '人工智能', '物理', '化学', '生物',
-  '历史', '地理', '政治', '信息科技', '科学',
-  '道德与法治', '音乐', '美术', '体育', '劳动',
-]
+export const SUBJECTS = [...DEFAULT_SUBJECTS]  // 单一真相源：见 @/constants/subjects（方案甲，v231）
 
 export const GRADES = [
   '七年级', '八年级', '九年级', '高一', '高二', '高三',

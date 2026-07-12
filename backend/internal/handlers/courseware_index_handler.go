@@ -99,7 +99,7 @@ func (h *CoursewareIndexHandler) GenerateIndex(w http.ResponseWriter, r *http.Re
         go func() {
                 time.Sleep(800 * time.Millisecond)
                 asyncCtx := context.Background()
-                if err := h.indexService.GenerateIndex(asyncCtx, id, userID, ""); err != nil {
+                if err := h.indexService.GenerateIndex(asyncCtx, id, userID, "", ""); err != nil {
                         fmt.Printf("[courseware_index_handler] 索引生成失败: courseware=%s err=%v\n", id, err)
                 }
         }()
@@ -340,6 +340,7 @@ func (h *CoursewareIndexHandler) GenerateIndexFromTopic(w http.ResponseWriter, r
                 PageRange  string `json:"page_range"`
                 ExtraNotes string `json:"extra_notes"`
                 Preset     string `json:"preset"`
+		CustomPromptHint string `json:"custom_prompt_hint"`
         }
         if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
                 utils.BadRequest(w, "请求参数格式错误")
@@ -367,7 +368,7 @@ func (h *CoursewareIndexHandler) GenerateIndexFromTopic(w http.ResponseWriter, r
         go func() {
                 time.Sleep(800 * time.Millisecond)
                 ctx := context.Background()
-                if err := h.indexService.GenerateIndexFromTopic(ctx, id, claims.UserID, req, reqBody.Preset); err != nil {
+                if err := h.indexService.GenerateIndexFromTopic(ctx, id, claims.UserID, req, reqBody.Preset, reqBody.CustomPromptHint); err != nil {
                         _ = err
                 }
         }()
@@ -401,16 +402,18 @@ func (h *CoursewareIndexHandler) GenerateIndexWithPreset(w http.ResponseWriter, 
         // 解析可选的preset参数
         var reqBody struct {
                 Preset string `json:"preset"`
+		CustomPromptHint string `json:"custom_prompt_hint"`
         }
         // 请求体可能为空（兼容旧前端），解析失败不报错
         _ = json.NewDecoder(r.Body).Decode(&reqBody)
 
         userID := claims.UserID
         preset := reqBody.Preset
+	customHint := reqBody.CustomPromptHint
         go func() {
                 time.Sleep(800 * time.Millisecond)
                 asyncCtx := context.Background()
-                if err := h.indexService.GenerateIndex(asyncCtx, id, userID, preset); err != nil {
+                if err := h.indexService.GenerateIndex(asyncCtx, id, userID, preset, customHint); err != nil {
                         fmt.Printf("[courseware_index_handler] 索引生成失败: courseware=%s err=%v\n", id, err)
                 }
         }()
@@ -492,16 +495,18 @@ func (h *CoursewareIndexHandler) GenerateIndexFromPPT(w http.ResponseWriter, r *
         // 解析可选preset参数
         var reqBody struct {
                 Preset string `json:"preset"`
+		CustomPromptHint string `json:"custom_prompt_hint"`
         }
         _ = json.NewDecoder(r.Body).Decode(&reqBody)
 
         userID := claims.UserID
         preset := reqBody.Preset
+	customHint := reqBody.CustomPromptHint
 
         go func() {
                 time.Sleep(800 * time.Millisecond)
                 ctx := context.Background()
-                if err := h.pptService.GenerateIndexFromPPT(ctx, id, userID, preset); err != nil {
+                if err := h.pptService.GenerateIndexFromPPT(ctx, id, userID, preset, customHint); err != nil {
                         fmt.Printf("[courseware_index_handler] PPT索引生成失败: courseware=%s err=%v\n", id, err)
                 }
         }()
@@ -669,16 +674,18 @@ func (h *CoursewareIndexHandler) GenerateIndexFromDoc(w http.ResponseWriter, r *
 
         var reqBody struct {
                 Preset string `json:"preset"`
+		CustomPromptHint string `json:"custom_prompt_hint"`
         }
         _ = json.NewDecoder(r.Body).Decode(&reqBody)
 
         userID := claims.UserID
         preset := reqBody.Preset
+	customHint := reqBody.CustomPromptHint
 
         go func() {
                 time.Sleep(800 * time.Millisecond)
                 ctx := context.Background()
-                if err := h.pptService.GenerateIndexFromDoc(ctx, id, userID, preset); err != nil {
+                if err := h.pptService.GenerateIndexFromDoc(ctx, id, userID, preset, customHint); err != nil {
                         fmt.Printf("[courseware_index_handler] Doc索引生成失败: courseware=%s err=%v\n", id, err)
                 }
         }()
@@ -719,6 +726,20 @@ func (h *CoursewareIndexHandler) GetLessonPlanContent(w http.ResponseWriter, r *
                 utils.InternalError(w, "课件不存在: "+err.Error())
                 return
         }
+	// doc_upload 来源：无关联教案记录，但上传的 Word 往往本身就是教案原文——
+	// 老师同样需要对照抽屉。直接读取上传的 docx 完整原文返回（不截断、不走规整缓存，
+	// 对照要看的是老师自己上传的原文而非 AI 规整版）。title 用课件标题加来源标注。
+	// 读取失败/文件缺失/空内容时静默落回下方 has_lesson_plan=false 的原有行为，零回归。
+	if cw.SourceType == models.CWSourceDocUpload {
+		if docText := services.ExtractDocUploadFullText(cw); docText != "" {
+			utils.Success(w, map[string]interface{}{
+				"has_lesson_plan": true,
+				"title":           cw.Title + "（上传文档原文）",
+				"content":         docText,
+			})
+			return
+		}
+	}
         // 非教案来源 / 未关联教案：无对照内容
         if cw.LessonPlanID == nil || *cw.LessonPlanID == "" {
                 utils.Success(w, map[string]interface{}{

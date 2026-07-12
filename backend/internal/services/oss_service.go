@@ -269,6 +269,14 @@ func (s *OSSService) UploadAssetToOSS(localURL string) (string, error) {
 		contentType = "audio/mpeg"
 	case ".wav":
 		contentType = "audio/wav"
+	case ".ogg":
+		contentType = "audio/ogg"
+	case ".aac":
+		contentType = "audio/aac"
+	case ".flac":
+		contentType = "audio/x-flac"
+	case ".m4a":
+		contentType = "audio/x-m4a"
 	}
 
 	return s.UploadFileToOSS(localPath, ossKey, contentType)

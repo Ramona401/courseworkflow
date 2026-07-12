@@ -452,36 +452,74 @@ func TestIsValidScope(t *testing.T) {
 }
 
 // ==================== prompt.go 测试 ====================
+//
+// v2 治理改造后：key 校验已从静态白名单（ValidPromptKeys / IsValidPromptKey）
+// 改为 DB 动态校验（service 层 repository.PromptKeyExists），故原
+// TestIsValidPromptKey 已随白名单删除而移除。
+// 名称/描述映射的完整性改以「已登记分档全集 PromptCategoryMap」为基准校验——
+// 该 map 是当前代码显式登记的 28 个 key，也是危险分档的权威来源。
 
-// TestIsValidPromptKey 测试提示词标识校验
-func TestIsValidPromptKey(t *testing.T) {
-	for _, k := range ValidPromptKeys {
-		if !IsValidPromptKey(k) {
-			t.Errorf("提示词标识 %q 应该有效", k)
-		}
+// TestPromptCategoryMap_ValidValues 测试危险分档映射的值均为合法档位
+func TestPromptCategoryMap_ValidValues(t *testing.T) {
+	if len(PromptCategoryMap) == 0 {
+		t.Fatal("PromptCategoryMap 不应为空")
 	}
-	if IsValidPromptKey("") || IsValidPromptKey("prompt_z") || IsValidPromptKey("Prompt_A") {
-		t.Error("空字符串/prompt_z/Prompt_A不应该有效")
+	for key, cat := range PromptCategoryMap {
+		if cat != PromptCategoryHigh && cat != PromptCategoryMid && cat != PromptCategoryKB {
+			t.Errorf("提示词 %q 的分档 %q 不在合法范围(high/mid/kb)", key, cat)
+		}
 	}
 }
 
-// TestPromptNameMap_Completeness 测试提示词名称映射完整性
+// TestPromptNameMap_Completeness 测试已登记的每个 key 都有中文名
 func TestPromptNameMap_Completeness(t *testing.T) {
-	for _, k := range ValidPromptKeys {
-		name, ok := PromptNameMap[k]
-		if !ok || name == "" {
-			t.Errorf("提示词 %q 在PromptNameMap中无中文名称", k)
+	for key := range PromptCategoryMap {
+		name := GetPromptName(key)
+		if name == "" {
+			t.Errorf("提示词 %q 中文名为空", key)
+		}
+		// 已登记 key 应命中 PromptNameMap（而非回退为 key 本身）
+		if _, ok := PromptNameMap[key]; !ok {
+			t.Errorf("已登记分档的提示词 %q 缺少 PromptNameMap 中文名条目", key)
 		}
 	}
 }
 
-// TestPromptDescriptionMap_Completeness 测试提示词描述映射完整性
+// TestPromptDescriptionMap_Completeness 测试已登记的每个 key 都有用途描述
 func TestPromptDescriptionMap_Completeness(t *testing.T) {
-	for _, k := range ValidPromptKeys {
-		desc, ok := PromptDescriptionMap[k]
-		if !ok || desc == "" {
-			t.Errorf("提示词 %q 在PromptDescriptionMap中无描述", k)
+	for key := range PromptCategoryMap {
+		desc := GetPromptDescription(key)
+		if desc == "" {
+			t.Errorf("提示词 %q 描述为空", key)
 		}
+		// 已登记 key 应命中 PromptDescriptionMap（而非回退为通用文案）
+		if _, ok := PromptDescriptionMap[key]; !ok {
+			t.Errorf("已登记分档的提示词 %q 缺少 PromptDescriptionMap 描述条目", key)
+		}
+	}
+}
+
+// TestGetPromptCategory_Fallback 测试未登记 key 的分档兜底为 mid（中危）
+func TestGetPromptCategory_Fallback(t *testing.T) {
+	// 未登记的假想 key 应兜底为中危
+	if got := GetPromptCategory("prompt_never_registered_xyz"); got != PromptCategoryMid {
+		t.Errorf("未登记 key 分档应兜底为 mid, 实际 %q", got)
+	}
+	// 已登记的高危 key 应准确返回 high
+	if got := GetPromptCategory("prompt_courseware_generate"); got != PromptCategoryHigh {
+		t.Errorf("prompt_courseware_generate 分档应为 high, 实际 %q", got)
+	}
+	// 已登记的知识库 key 应准确返回 kb
+	if got := GetPromptCategory("prompt_curriculum_index"); got != PromptCategoryKB {
+		t.Errorf("prompt_curriculum_index 分档应为 kb, 实际 %q", got)
+	}
+}
+
+// TestGetPromptName_Fallback 测试未登记 key 的中文名回退为 key 本身
+func TestGetPromptName_Fallback(t *testing.T) {
+	key := "prompt_never_registered_xyz"
+	if got := GetPromptName(key); got != key {
+		t.Errorf("未登记 key 中文名应回退为 key 本身 %q, 实际 %q", key, got)
 	}
 }
 

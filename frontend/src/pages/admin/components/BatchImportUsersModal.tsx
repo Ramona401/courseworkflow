@@ -1,12 +1,26 @@
 /**
- * BatchImportUsersModal.tsx — 批量导入教师弹窗（Phase 6.4 / 合并重构改）
+ * BatchImportUsersModal.tsx — 批量导入教师弹窗（Phase 6.4 / 合并重构 / 角色批次入口改）
  *
  * 设计目标（面向不懂技术的老师）：
  *   全程只接触 Excel，三步走——下载 Excel 模板 → 在 Excel 里填 → 上传 Excel。
  *
- * 合并重构改动（本次）：
+ * 【本次改动：角色批次入口】（与系统操作员确认）
+ *   背景：同事反馈「Excel 里没有角色，担心搞错」。讨论后确定的最优解不是把角色塞进
+ *   Excel 让老师逐行填（易错、需数据验证、移动端兼容差），而是——
+ *     · Excel 永远保持干净三列（用户名 / 姓名 / 密码），角色不进表；
+ *     · 角色由「这一批是哪类账号」在上传前明确选定，整批统一。
+ *   因此把原来朴素的「统一角色下拉」升级为醒目的【角色批次卡片】：
+ *     [ 骨干教师批次(operator) ]　[ 普通教师批次(viewer) ]
+ *   选哪张卡，这一整批就全部建为该角色，文案明确强调「本批将全部建为 XX」。
+ *   这等价于「每个角色一张表分开传」，但无需维护多份模板文件，体验更省事更不易错。
+ *
+ *   ⚠️ 角色范围：批量导入后端白名单只允许 operator(骨干教师) / viewer(普通教师) 两类，
+ *   刻意不含 senior_operator / region_admin / admin 等带权限角色——管理员账号应由
+ *   系统管理员在「新建用户」入口逐个单独创建，不走批量（安全设计，后端二次强制）。
+ *
+ * 合并重构改动（此前）：
  *   - 批量接口统一走 admin 的 batchCreateAdminUsers（/api/v1/admin/users/batch）。
- *   - 新增 props：
+ *   - props：
  *       * mode='admin'：系统管理员视角——弹窗内顶部显示「目标学校」下拉（必选），
  *         选项来自 schools；提交时随请求体带 school_id。未选学校则拦截提示。
  *       * mode='self' ：学校管理员(senior)视角——不显示学校下拉，
@@ -19,7 +33,7 @@
  *   - 提交 batchCreateAdminUsers（整批回滚 + 行号失败明细）：
  *       success=true  → 成功提示后回调刷新+关闭；
  *       success=false → 把后端 failures 按行号合并回预览表逐行红字，改完可重传。
- *   - 角色为批次级统一角色（operator/viewer）。
+ *   - 角色为批次级统一角色（operator/viewer），由角色批次卡片选定。
  *
  * Excel 模板列：登录用户名 | 教师姓名 | 初始密码（按列位置映射，首行表头自动跳过）。
  */
@@ -57,20 +71,44 @@ interface PreviewRow {
 }
 
 // ==================== Excel 模板列定义 ====================
+// 模板保持干净三列，角色不进 Excel（由角色批次卡片在上传前选定）
 const TEMPLATE_HEADERS = ['登录用户名', '教师姓名', '初始密码']
 const TEMPLATE_SAMPLE = [
   ['teacher01', '张老师', '123456'],
   ['teacher02', '李老师', '123456'],
 ]
 
-/** 角色选项（仅 operator / viewer，与后端白名单一致） */
-const BATCH_ROLE_OPTIONS = [
-  { value: 'operator', label: '骨干教师（operator）' },
-  { value: 'viewer', label: '普通教师（viewer）' },
-] as const
+// ==================== 角色批次定义 ====================
+// 与后端批量白名单一致：仅 operator / viewer 两类。
+// 管理员等带权限角色不走批量（应在「新建用户」逐个单独建）。
+type BatchRoleValue = 'operator' | 'viewer'
+interface RoleBatchDef {
+  value: BatchRoleValue
+  title: string            // 卡片主标题
+  subtitle: string         // 卡片副标题（角色英文名，给懂的人对照）
+  desc: string             // 一句话说明这类账号是什么
+  emoji: string
+}
+const ROLE_BATCHES: RoleBatchDef[] = [
+  {
+    value: 'operator',
+    title: '骨干教师',
+    subtitle: 'operator',
+    desc: '可备课、可参与教研组管理等',
+    emoji: '⭐',
+  },
+  {
+    value: 'viewer',
+    title: '普通教师',
+    subtitle: 'viewer',
+    desc: '可备课、查看共享内容',
+    emoji: '👤',
+  },
+]
 
 export function BatchImportUsersModal({ onClose, onImported, mode, schools = [] }: BatchImportUsersModalProps) {
-  const [role, setRole] = useState<'operator' | 'viewer'>('operator')
+  // 角色批次：默认普通教师（最常见、最小权限，更安全的默认）
+  const [role, setRole] = useState<BatchRoleValue>('viewer')
   // admin 模式：弹窗内选中的目标学校 id（self 模式不使用）
   const [selectedSchoolId, setSelectedSchoolId] = useState('')
   const [rows, setRows] = useState<PreviewRow[]>([])
@@ -81,6 +119,9 @@ export function BatchImportUsersModal({ onClose, onImported, mode, schools = [] 
   const [error, setError] = useState('')
   const [doneMsg, setDoneMsg] = useState('')
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+
+  // 当前选中角色批次的展示信息（用于各处文案）
+  const currentRole = ROLE_BATCHES.find(r => r.value === role) ?? ROLE_BATCHES[1]
 
   // ==================== 本地预校验 ====================
   const validateRows = useCallback((raw: { username: string; displayName: string; password: string }[]): PreviewRow[] => {
@@ -196,6 +237,7 @@ export function BatchImportUsersModal({ onClose, onImported, mode, schools = [] 
     try {
       // 合并重构：统一走 /admin/users/batch
       // admin 模式带 school_id（弹窗内所选）；self 模式不带，后端强制本校
+      // role 取自上方选定的角色批次，整批统一
       const { batchCreateAdminUsers } = await import('@/api/admin')
       const result = await batchCreateAdminUsers({
         role,
@@ -207,7 +249,7 @@ export function BatchImportUsersModal({ onClose, onImported, mode, schools = [] 
         })),
       })
       if (result.success) {
-        setDoneMsg(`✓ 成功导入 ${result.created_count} 位教师`)
+        setDoneMsg(`✓ 成功导入 ${result.created_count} 位${currentRole.title}`)
         setTimeout(() => { onImported(result.created_count); onClose() }, 900)
       } else {
         const failMap = new Map<number, string>()
@@ -220,7 +262,7 @@ export function BatchImportUsersModal({ onClose, onImported, mode, schools = [] 
     } finally {
       setSubmitting(false)
     }
-  }, [rows, role, localErrorCount, needSchool, selectedSchoolId, onImported, onClose])
+  }, [rows, role, currentRole.title, localErrorCount, needSchool, selectedSchoolId, onImported, onClose])
 
   // ==================== 渲染 ====================
   return (
@@ -247,7 +289,7 @@ export function BatchImportUsersModal({ onClose, onImported, mode, schools = [] 
             <div style={{ fontWeight: 700, marginBottom: '4px' }}>操作三步：</div>
             ① 点下方「下载 Excel 模板」，用 Excel/WPS 打开<br />
             ② 照着示例填写：每行一位教师，三列分别是 <b>登录用户名 / 教师姓名 / 初始密码</b><br />
-            ③ 保存后，把这个 Excel 文件上传回来即可（无需另存为其他格式）
+            ③ 选好「这一批是哪类账号」，再把填好的 Excel 上传回来即可
           </div>
 
           {/* 全局错误 / 成功提示 */}
@@ -282,20 +324,50 @@ export function BatchImportUsersModal({ onClose, onImported, mode, schools = [] 
             </div>
           )}
 
-          {/* 批次角色选择 */}
-          <div style={{ marginBottom: '16px' }}>
-            <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '6px' }}>
-              本批教师统一角色
+          {/* ========== 角色批次选择（卡片式，替代原朴素下拉） ========== */}
+          <div style={{ marginBottom: '18px' }}>
+            <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>
+              这一批是哪类账号？<span style={{ color: C.danger }}>*</span>
             </label>
-            <select
-              value={role}
-              onChange={e => setRole(e.target.value as 'operator' | 'viewer')}
-              disabled={submitting}
-              style={{ width: '100%', padding: '10px 14px', borderRadius: '10px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box', background: C.white }}>
-              {BATCH_ROLE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-            </select>
-            <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '6px' }}>
-              💡 整批教师共用此角色。若需混合角色，请分两批导入。
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+              {ROLE_BATCHES.map(rb => {
+                const active = role === rb.value
+                return (
+                  <button
+                    key={rb.value}
+                    type="button"
+                    onClick={() => { if (!submitting) setRole(rb.value) }}
+                    disabled={submitting}
+                    style={{
+                      textAlign: 'left',
+                      padding: '14px 16px',
+                      borderRadius: '12px',
+                      border: active ? `2px solid ${C.primary}` : `1px solid ${C.border}`,
+                      background: active ? C.primaryLight : C.white,
+                      cursor: submitting ? 'not-allowed' : 'pointer',
+                      transition: 'all 0.15s',
+                      boxShadow: active ? `0 2px 8px ${C.primaryLight}` : 'none',
+                    }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                      <span style={{ fontSize: '18px' }}>{rb.emoji}</span>
+                      <span style={{ fontSize: '14px', fontWeight: 700, color: active ? C.primary : C.text }}>
+                        {rb.title}
+                      </span>
+                      <span style={{ fontSize: '11px', color: C.textMuted, fontFamily: 'monospace' }}>
+                        {rb.subtitle}
+                      </span>
+                      {active && <span style={{ marginLeft: 'auto', fontSize: '13px', color: C.primary, fontWeight: 700 }}>✓</span>}
+                    </div>
+                    <div style={{ fontSize: '11px', color: C.textSec, lineHeight: 1.5 }}>
+                      {rb.desc}
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
+            <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '8px', lineHeight: 1.6 }}>
+              💡 本批 <b style={{ color: C.primary }}>全部</b> 建为「{currentRole.title}」。若要导入另一类账号，请填一张新表分批导入。<br />
+              管理员等带权限的账号请在「新建用户」里单独创建，不通过批量导入。
             </div>
           </div>
 
@@ -330,8 +402,12 @@ export function BatchImportUsersModal({ onClose, onImported, mode, schools = [] 
           {/* 预览表 */}
           {rows.length > 0 && (
             <div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px', flexWrap: 'wrap' }}>
                 <span style={{ fontSize: '13px', fontWeight: 600, color: C.text }}>预览（共 {rows.length} 行）</span>
+                {/* 角色批次提示标签，让操作员在提交前再次确认这一批的角色 */}
+                <span style={{ fontSize: '12px', fontWeight: 600, color: C.primary, background: C.primaryLight, padding: '2px 10px', borderRadius: '999px' }}>
+                  {currentRole.emoji} 本批角色：{currentRole.title}
+                </span>
                 {localErrorCount > 0
                   ? <span style={{ fontSize: '12px', color: C.danger }}>⚠️ {localErrorCount} 行有问题，需修正</span>
                   : <span style={{ fontSize: '12px', color: C.success }}>✓ 校验通过，可提交</span>}
@@ -376,7 +452,7 @@ export function BatchImportUsersModal({ onClose, onImported, mode, schools = [] 
               color: '#fff', fontSize: '14px', fontWeight: 600,
               cursor: canSubmit ? 'pointer' : 'not-allowed',
             }}>
-            {submitting ? '导入中...' : needSchool && !selectedSchoolId ? '请先选择目标学校' : rows.length > 0 ? `确认导入 ${rows.length} 位教师` : '请先上传名单'}
+            {submitting ? '导入中...' : needSchool && !selectedSchoolId ? '请先选择目标学校' : rows.length > 0 ? `确认导入 ${rows.length} 位${currentRole.title}` : '请先上传名单'}
           </button>
         </div>
       </div>

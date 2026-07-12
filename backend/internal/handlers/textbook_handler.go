@@ -9,6 +9,10 @@ package handlers
 //   PUT    /api/v1/lesson-plans/textbooks/{id}        — 更新元数据
 //   DELETE /api/v1/lesson-plans/textbooks/{id}        — 删除
 //   POST   /api/v1/lesson-plans/textbooks/{id}/ocr    — 触发AI OCR识别
+//
+// v231新增：教材照片归档维度扩展
+//   - 上传读取表单的 semester(学期) + unit(单元)
+//   - 列表查询接收 semester/unit 两个筛选参数并透传给 service
 
 import (
 	"encoding/json"
@@ -58,11 +62,13 @@ func (h *TextbookHandler) UploadTextbook(w http.ResponseWriter, r *http.Request)
 	}
 	defer file.Close()
 
-	// 从表单字段构建请求
+	// 从表单字段构建请求（v231：新增 semester 学期 + unit 单元）
 	pageNumber, _ := strconv.Atoi(r.FormValue("page_number"))
 	req := &models.UploadTextbookRequest{
 		Subject:      r.FormValue("subject"),
 		GradeRange:   r.FormValue("grade_range"),
+		Semester:     r.FormValue("semester"),
+		Unit:         r.FormValue("unit"),
 		TextbookName: r.FormValue("textbook_name"),
 		Chapter:      r.FormValue("chapter"),
 		PageNumber:   pageNumber,
@@ -89,6 +95,7 @@ func (h *TextbookHandler) UploadTextbook(w http.ResponseWriter, r *http.Request)
 // ==================== 列表查询 ====================
 
 // ListTextbooks GET /api/v1/lesson-plans/textbooks
+// v231：新增 semester(学期) + unit(单元) 两个筛选参数
 func (h *TextbookHandler) ListTextbooks(w http.ResponseWriter, r *http.Request) {
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
@@ -99,12 +106,14 @@ func (h *TextbookHandler) ListTextbooks(w http.ResponseWriter, r *http.Request) 
 	q := r.URL.Query()
 	subject := q.Get("subject")
 	gradeRange := q.Get("grade_range")
+	semester := q.Get("semester")
+	unit := q.Get("unit")
 	textbookName := q.Get("textbook_name")
 	scope := q.Get("scope")
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	offset, _ := strconv.Atoi(q.Get("offset"))
 
-	resp, err := h.tbService.ListTextbookPages(r.Context(), claims.UserID, subject, gradeRange, textbookName, scope, limit, offset)
+	resp, err := h.tbService.ListTextbookPages(r.Context(), claims.UserID, subject, gradeRange, semester, unit, textbookName, scope, limit, offset)
 	if err != nil {
 		utils.InternalError(w, "查询课本列表失败")
 		return

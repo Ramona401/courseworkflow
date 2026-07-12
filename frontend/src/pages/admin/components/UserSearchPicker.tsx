@@ -1,6 +1,13 @@
 /**
  * UserSearchPicker.tsx — 通用用户搜索选择器
  * 输入关键词实时搜索，下拉选中后显示已选用户
+ *
+ * B13改动（任命即同步身份）：
+ *   onChange 新增可选第三参 role（选中用户的系统身份），供 OrgAdminsPanel
+ *   判定"是否可同步升级"（仅 operator/viewer 起步）与展示当前身份徽章。
+ *   第三参可选——既有调用方（OrgFormModal 等）的两参回调 (id, name) => void
+ *   可直接赋给三参可选签名，零改动兼容；清空选择时不传第三参。
+ *   搜索结果行的 RoleBadge 展示为既有功能，未改动。
  */
 import { useState, useCallback, useRef } from 'react'
 import { getAdminUsers } from '@/api/admin'
@@ -12,7 +19,8 @@ interface UserSearchPickerProps {
   label: string
   value: string
   valueName: string
-  onChange: (id: string, name: string) => void
+  /** B13：第三参为选中用户的系统身份（清空时为 undefined），旧两参回调兼容 */
+  onChange: (id: string, name: string, role?: string) => void
   placeholder?: string
 }
 
@@ -42,8 +50,9 @@ export function UserSearchPicker({
     timer.current = setTimeout(() => search(v), 350)
   }
 
+  // B13：选中时把该用户的系统身份作为第三参透传给调用方
   const handleSelect = (u: AdminUserListItem) => {
-    onChange(u.id, u.display_name || u.username)
+    onChange(u.id, u.display_name || u.username, u.role)
     setKw(''); setResults([]); setOpen(false)
   }
 

@@ -10,9 +10,16 @@
  *   - 本文件                      : 编排壳——共享状态(mediaAssets/消息条/参考图/
  *                                  弹窗/编辑器)+单张生成+手动上传+S-V2导出链
  *
- * 与父组件(CoursewareWorkshopPage)的接缝（仅风格锚点，与拆分前一致）：
- *   - 锚点设/清要更新父级 courseware 状态，故 handleSetAnchor/handleClearAnchor
- *     留在父级经 onSetAnchor/onClearAnchor 传入；提示经 notify 路由回本面板消息条。
+ * 批次5c（按钮风格优先修复，2026-07-03）：风格快选从"末尾追加描述短语"改为
+ * "置顶硬约束前缀块"。
+ *
+ * 批次5d（视频手动上传入口，2026-07-07）：在视频 Tab 增加与图片 Tab 对称的
+ * "📤 手动上传视频"区块。
+ *
+ * 批次1a（学科工具收编，2026-07-08）：原批次5e加入的 formula/music 两 Tab 及更早的
+ * stroke Tab 整体迁出到 SubjectToolsPanel.tsx（Step5「🧪学科工具」聚合宫格），
+ * 本面板 mediaTab 收窄回 image|video|audio 三值——媒体面板只管"资产"
+ * （有列表有云盘），学科面板只管"组件"（编辑器→AI融入页面）。
  *
  * S-V2：onExport 三步串行链（advancedConcat → burnIn可选 → mixNarration可选），
  * 每步失败自动降级保留上一步可用成片，与三选项导出弹窗配套。
@@ -23,53 +30,72 @@ import {
   advancedConcatCWVideos, uploadCWVideo, burnInSubtitle,
 } from '@/api/coursewares'
 import type { CoursewareAsset, CoursewareDetail } from '@/api/coursewares'
-import { mixNarrationCWVideo } from '@/api/coursewares.media'
+import { mixNarrationCWVideo, uploadCWAudio } from '@/api/coursewares.media'
 import { C, CW_IMG_STYLES } from './workshopConstants'
 import VideoStoryboardPanel from '../VideoStoryboardPanel'
 import VideoEditorModal from '../VideoEditorModal'
 import DangerConfirmModal from './DangerConfirmModal'
 import MediaImageSuggestPanel from './MediaImageSuggestPanel'
-import { ImageAssetList, VideoAssetList } from './MediaAssetCards'
+import { ImageAssetList, VideoAssetList, AudioAssetList } from './MediaAssetCards'
 import { makeAsset } from './makeAsset'
+import AudioEditorModal from '../audio-editor/AudioEditorModal'
+
+// ==================== 批次5c: 按钮风格优先——纯函数工具 ====================
+
+const buildStylePrefix = (desc: string): string =>
+  '【整体画风·最高优先级】' + desc + '。全图必须统一采用本段画风；下文若出现任何其他画风描述（绘本、水彩、扁平、手绘、写实等），一律忽略，禁止混合画风。\n'
+
+const stripAIStyleTail = (text: string): { base: string; tail: string } => {
+  const m = text.match(/(整体画风[：:][^\n]*)\s*$/)
+  if (m && typeof m.index === 'number') {
+    return { base: text.slice(0, m.index).trimEnd(), tail: m[1].trim() }
+  }
+  return { base: text, tail: '' }
+}
+
+// ==================== 批次5d: 视频上传辅助常量 ====================
+
+/** 视频允许的 MIME 类型白名单（与后端 cwVideoAllowedMimeTypes 对齐） */
+const VIDEO_ACCEPT = 'video/mp4,video/webm,video/quicktime,video/x-msvideo,.mp4,.webm,.mov,.avi'
+/** 视频最大文件大小 50MB（与后端 CWVideoMaxSize 对齐） */
+const VIDEO_MAX_SIZE = 50 * 1024 * 1024
 
 interface Props {
   coursewareId: string
-  /** 当前选中页（父级 buildPreviewNum 的只读别名，批次4b口径) */
   pageNum: number
-  /** 父级课件对象（读 style_anchor_* 锚点字段） */
   courseware: CoursewareDetail
-  /** 正在设为锚点的资产ID（''=空闲，父级状态） */
   anchorSetting: string
-  /** 正在清除锚点（父级状态） */
   anchorClearing: boolean
-  /** 设为锚点（父级实现：多模态提取VAOCI并落库；notify把提示路由回本面板消息条） */
   onSetAnchor: (assetId: string, notify: (msg: string) => void) => void
-  /** 清除锚点（父级实现，带confirm；notify同上） */
   onClearAnchor: (notify: (msg: string) => void) => void
-  /** W2: 图片/视频, 由Step5工作台顶级Tab控制(两Tab渲染同一组件实例, 切换不丢状态) */
-  mediaTab: 'image' | 'video'
+  /** 批次1a: stroke/formula/music 已迁出到 SubjectToolsPanel，收窄回三值 */
+  mediaTab: 'image' | 'video' | 'audio'
+  onPageUpdated?: (pageNum: number, html: string) => void
 }
 
 export default function MediaManagerPanel({ coursewareId, pageNum, courseware, anchorSetting, anchorClearing, onSetAnchor, onClearAnchor, mediaTab }: Props) {
-  // ==================== 共享状态（资产列表/消息条/单张生成/参考图/弹窗/编辑器） ====================
+  // ==================== 共享状态 ====================
   const [mediaAssets, setMediaAssets] = useState<CoursewareAsset[]>([])
   const [mediaGenPrompt, setMediaGenPrompt] = useState('')
   const [mediaSize, setMediaSize] = useState('1920x1920')
   const [mediaGenerating, setMediaGenerating] = useState(false)
   const [mediaMessage, setMediaMessage] = useState('')
   const [mediaPreviewUrl, setMediaPreviewUrl] = useState('')
-  const [mediaRefUrl, setMediaRefUrl] = useState('')  // 参考图URL（图生图）
+  const [mediaRefUrl, setMediaRefUrl] = useState('')
   const [mediaStyleKey, setMediaStyleKey] = useState('')
-  // 遗留项②：显式记住上次追加的风格后缀确切文本，剥离时直接 replace 该串
-  const [styleSuffixText, setStyleSuffixText] = useState('')
+  const [stylePrefixText, setStylePrefixText] = useState('')
+  const [strippedStyleTail, setStrippedStyleTail] = useState('')
   const [editorOpen, setEditorOpen] = useState(false)
   const [editorExporting, setEditorExporting] = useState(false)
-  // 批次5a: 危险删除红色确认弹窗——待删除资产(null=未弹) + 删除请求进行中标志
   const [deleteTarget, setDeleteTarget] = useState<CoursewareAsset | null>(null)
   const [deleting, setDeleting] = useState(false)
+  // 批次5d: 视频手动上传进度
+  const [videoUploadProgress, setVideoUploadProgress] = useState(0)
+  const [videoUploading, setVideoUploading] = useState(false)
+  // 音频剪辑器状态
+  const [audioEditorAsset, setAudioEditorAsset] = useState<CoursewareAsset | null>(null)
 
   // ==================== 共享effect ====================
-  // 选中页变化时, 自动拉取当前页媒体资产并清空旧的（批次4b：切页即换页媒体, 防串页）
   useEffect(() => {
     if (!coursewareId || pageNum <= 0) { setMediaAssets([]); return }
     let cancelled = false
@@ -80,31 +106,43 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
     return () => { cancelled = true }
   }, [coursewareId, pageNum])
 
-  // 切页或切 Tab 时清空生成框 + 参考图 + 风格选中(防串页残留)；建议列表的清空在子面板内
   useEffect(() => {
-    setMediaGenPrompt(''); setMediaRefUrl(''); setMediaStyleKey('')
+    setMediaGenPrompt(''); setMediaRefUrl(''); setMediaStyleKey(''); setStylePrefixText(''); setStrippedStyleTail('')
   }, [pageNum, mediaTab])
 
   // ==================== 共享处理函数 ====================
-  // 风格快选: 点风格把其描述作为后缀融入生成框(同风格再点=取消; 换风格=替换旧后缀)
   const toggleImgStyle = (key: string) => {
     const next = CW_IMG_STYLES.find(s => s.key === key)
-    setMediaGenPrompt(prev => {
-      let base = prev
-      if (styleSuffixText) {
-        if (base.includes('，' + styleSuffixText)) base = base.replace('，' + styleSuffixText, '')
-        else if (base.includes(styleSuffixText)) base = base.replace(styleSuffixText, '')
-        base = base.replace(/[，,\s]+$/, '')
+    const canceling = key === mediaStyleKey
+    let base = mediaGenPrompt
+    if (stylePrefixText) {
+      if (base.startsWith(stylePrefixText)) base = base.slice(stylePrefixText.length)
+      else if (base.includes(stylePrefixText)) base = base.replace(stylePrefixText, '')
+    }
+    base = base.replace(/^\s+/, '')
+    if (canceling) {
+      if (strippedStyleTail) {
+        base = base ? base.trimEnd() + '\n' + strippedStyleTail : strippedStyleTail
       }
-      if (key === mediaStyleKey) { setStyleSuffixText(''); return base }
-      const desc = next ? next.desc : ''
-      setStyleSuffixText(desc)
-      return base ? base + '，' + desc : desc
-    })
-    setMediaStyleKey(key === mediaStyleKey ? '' : key)
+      setStylePrefixText('')
+      setStrippedStyleTail('')
+      setMediaGenPrompt(base)
+      setMediaStyleKey('')
+      return
+    }
+    if (!strippedStyleTail) {
+      const stripped = stripAIStyleTail(base)
+      if (stripped.tail) {
+        base = stripped.base
+        setStrippedStyleTail(stripped.tail)
+      }
+    }
+    const prefix = next ? buildStylePrefix(next.desc) : ''
+    setStylePrefixText(prefix)
+    setMediaGenPrompt(prefix + base)
+    setMediaStyleKey(key)
   }
 
-  // 批次5a: 红色弹窗「确认删除」回调——真正执行删除请求
   const handleConfirmDelete = async () => {
     if (!coursewareId || !deleteTarget || deleting) return
     setDeleting(true)
@@ -120,14 +158,48 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
     }
   }
 
-  // 批次5a: 按待删资产组装弹窗警告文案——已上云资产给最强警告（删云盘副本+引用断链+不可恢复）
   const buildDeleteWarning = (asset: CoursewareAsset): string => {
-    const noun = asset.asset_type === 'video' ? '这个视频' : '这张图片'
-    const effect = asset.asset_type === 'video' ? '视频将无法播放' : '图片将无法显示'
+    const noun = asset.asset_type === 'video' ? '这个视频' : asset.asset_type === 'audio' ? '这个音频' : '这张图片'
+    const effect = asset.asset_type === 'video' ? '视频将无法播放' : asset.asset_type === 'audio' ? '音频将无法播放' : '图片将无法显示'
     if (asset.public_oss_url) {
       return '⚠️ ' + noun + '已上传云盘。\n删除将同时移除云盘副本——若课件页面中已使用该云盘链接，' + effect + '。\n此操作不可恢复，确定删除？'
     }
     return '确定删除' + noun + '？删除后不可恢复。'
+  }
+
+  // 批次5d: 视频手动上传处理函数
+  const handleUploadVideo = () => {
+    if (videoUploading || !coursewareId || pageNum <= 0) return
+    const inp = document.createElement('input')
+    inp.type = 'file'
+    inp.accept = VIDEO_ACCEPT
+    inp.onchange = async (ev) => {
+      const f = (ev.target as HTMLInputElement).files?.[0]
+      if (!f) return
+      if (f.size > VIDEO_MAX_SIZE) {
+        setMediaMessage('❌ 视频文件不能超过50MB，当前文件 ' + (f.size / (1024 * 1024)).toFixed(1) + 'MB')
+        return
+      }
+      setVideoUploading(true)
+      setVideoUploadProgress(0)
+      setMediaMessage('⏳ 正在上传视频...')
+      try {
+        const res = await uploadCWVideo(coursewareId, pageNum, f, (pct) => {
+          setVideoUploadProgress(pct)
+        })
+        setMediaMessage('✅ 视频上传成功！')
+        setMediaAssets(prev => [makeAsset(coursewareId, {
+          id: res.asset_id, oss_url: res.url, asset_type: 'video',
+          generation_prompt: f.name, file_size: res.file_size, mime_type: res.mime_type,
+        }), ...prev])
+      } catch (e) {
+        setMediaMessage('❌ 视频上传失败: ' + (e instanceof Error ? e.message : '未知错误'))
+      } finally {
+        setVideoUploading(false)
+        setVideoUploadProgress(0)
+      }
+    }
+    inp.click()
   }
 
   // ==================== JSX ====================
@@ -135,31 +207,18 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
     <div style={{ marginTop: 16, padding: 20, borderRadius: 12, border: '1px solid ' + C.border, background: '#FAFAFA' }}>
       <div style={{ fontSize: 15, fontWeight: 600, color: C.textPrimary, marginBottom: 12 }}>🖼️ 多媒体管理</div>
 
-      {/* 媒体管理跟随上方大预览框选中页（批次4b口径） */}
+      {/* 媒体管理跟随上方大预览框选中页 */}
       <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16, alignItems: 'center' }}>
         <span style={{ padding: '10px 14px', borderRadius: 8, background: C.primaryBg, color: C.primary, fontSize: 14, fontWeight: 600, whiteSpace: 'nowrap' }}>
-          正在管理：第 {pageNum || '—'} 页的{mediaTab === 'video' ? '视频' : '图片'}
+          正在管理：第 {pageNum || '—'} 页的{mediaTab === 'video' ? '视频' : mediaTab === 'audio' ? '音频' : '图片'}
         </span>
-        {pageNum > 0 && (
-          <button
-            onClick={async () => {
-              if (!coursewareId || pageNum <= 0) return
-              try {
-                const res = await listPageAssets(coursewareId, pageNum)
-                setMediaAssets(res.assets || [])
-              } catch { setMediaAssets([]) }
-            }}
-            style={{ padding: '10px 16px', borderRadius: 8, border: '1px solid ' + C.border, background: '#fff', color: C.textSecondary, fontSize: 13, cursor: 'pointer' }}
-          >
-            🔄 刷新列表
-          </button>
-        )}
         <span style={{ fontSize: 12, color: C.textMuted }}>（切换上方预览页即可管理对应页的媒体）</span>
       </div>
 
+      {/* ==================== 图片Tab ==================== */}
       {pageNum > 0 && mediaTab === 'image' && (
         <>
-        {/* 每页图列表顶部常驻锚点缩略图条——锚点是课件级，从 courseware 直接读，跨页无需请求 */}
+        {/* 锚点缩略图条 */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, padding: '8px 12px', borderRadius: 10, background: courseware.style_anchor_asset_id ? 'rgba(245,158,11,0.07)' : '#FAFAFA', border: '1px solid ' + (courseware.style_anchor_asset_id ? 'rgba(245,158,11,0.3)' : C.border) }}>
           {courseware.style_anchor_asset_id ? (
             <>
@@ -181,26 +240,33 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
             </div>
           )}
         </div>
-        {/* 上半: 左右两栏 —— 左=AI配图建议(子面板自含), 右=生成图片(含风格快选) */}
-        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
 
-          {/* 左栏: AI 配图建议（批次5b拆出为独立面板） */}
+        {/* 上半: 左右两栏 —— 左=AI配图建议, 右=生成图片 */}
+        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
           <MediaImageSuggestPanel
             coursewareId={coursewareId}
             pageNum={pageNum}
             active={mediaTab === 'image' && pageNum > 0}
             defaultSize={mediaSize}
             busyExternal={mediaGenerating}
-            onFillPrompt={(prompt, size) => { setMediaGenPrompt(prompt); setMediaSize(size) }}
+            onFillPrompt={(prompt, size) => {
+              if (stylePrefixText) {
+                const stripped = stripAIStyleTail(prompt)
+                setStrippedStyleTail(stripped.tail)
+                setMediaGenPrompt(stylePrefixText + stripped.base)
+              } else {
+                setStrippedStyleTail('')
+                setMediaGenPrompt(prompt)
+              }
+              setMediaSize(size)
+            }}
             onAssetCreated={(asset) => setMediaAssets(prev => [asset, ...prev])}
             notify={setMediaMessage}
           />
 
-          {/* 右栏: 生成图片(风格快选 + 生成框 + 尺寸 + 参考图 + 生成按钮) */}
+          {/* 右栏: 生成图片 */}
           <div style={{ flex: '1 1 320px', padding: 16, borderRadius: 10, border: '1px solid ' + C.border, background: '#fff' }}>
             <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 8 }}>🤖 生成图片</div>
-
-            {/* 风格快选: 已设锚点时禁用（优先级 锚点 > 快选预设） */}
             <div style={{ marginBottom: 8 }}>
               {courseware.style_anchor_asset_id ? (
                 <div style={{ padding: '8px 12px', borderRadius: 8, background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', fontSize: 11, color: '#B45309', lineHeight: 1.6 }}>
@@ -208,7 +274,7 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
                 </div>
               ) : (
                 <>
-                  <div style={{ fontSize: 11, color: '#6B7280', marginBottom: 6 }}>🎨 画面风格（点选融入提示词，让出图更好看）:</div>
+                  <div style={{ fontSize: 11, color: '#6B7280', marginBottom: 6 }}>🎨 画面风格（点选后置顶为最高优先级画风，覆盖提示词里的其他画风描述）:</div>
                   <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                     {CW_IMG_STYLES.map(s => {
                       const on = mediaStyleKey === s.key
@@ -223,20 +289,13 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
                 </>
               )}
             </div>
-
-            <textarea
-              value={mediaGenPrompt}
-              onChange={e => setMediaGenPrompt(e.target.value)}
+            <textarea value={mediaGenPrompt} onChange={e => setMediaGenPrompt(e.target.value)}
               placeholder="从左侧建议点「→ 填入右侧」，或在此手动描述要生成的图片；可点上方风格按钮美化"
-              rows={5}
-              style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: '1px solid ' + C.border, fontSize: 13, resize: 'vertical', outline: 'none', boxSizing: 'border-box' }}
-              disabled={mediaGenerating}
-            />
+              rows={5} style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: '1px solid ' + C.border, fontSize: 13, resize: 'vertical', outline: 'none', boxSizing: 'border-box' }} disabled={mediaGenerating} />
             <div style={{ marginTop: 8 }}>
               <span style={{ fontSize: 12, color: '#6B7280', marginRight: 8 }}>图片比例:</span>
               <select value={mediaSize} onChange={e => setMediaSize(e.target.value)}
-                style={{ padding: '6px 10px', borderRadius: 6, border: '1px solid #E5E7EB', fontSize: 12 }}
-                disabled={mediaGenerating}>
+                style={{ padding: '6px 10px', borderRadius: 6, border: '1px solid #E5E7EB', fontSize: 12 }} disabled={mediaGenerating}>
                 <option value="1920x1920">1:1 正方形</option>
                 <option value="2560x1440">16:9 宽屏</option>
                 <option value="3072x1280">2.4:1 超宽</option>
@@ -291,7 +350,7 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
           </div>
         </div>
 
-        {/* 下半: 手动上传(通栏) */}
+        {/* 下半: 手动上传图片(通栏) */}
         <div style={{ marginTop: 16, padding: 16, borderRadius: 10, border: '1px solid ' + C.border, background: '#fff' }}>
           <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 8 }}>📤 手动上传图片</div>
           <div style={{ padding: '20px 16px', borderRadius: 8, border: '2px dashed ' + C.border, textAlign: 'center', cursor: 'pointer', background: '#FAFAFA' }}
@@ -305,54 +364,147 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
         </>
       )}
 
-      {/* 提示消息 */}
+      {/* 图片提示消息 */}
       {mediaTab === 'image' && mediaMessage && <div style={{ marginTop: 12, padding: '10px 14px', borderRadius: 8, background: mediaMessage.startsWith('❌') ? '#FEE2E2' : '#D1FAE5', color: mediaMessage.startsWith('❌') ? '#DC2626' : '#059669', fontSize: 13 }}>{mediaMessage}</div>}
 
-      {/* 已上传图片列表（批次5b拆出为 ImageAssetList） */}
+      {/* 图片列表 */}
       {(mediaAssets.filter(a => a.asset_type === 'image').length > 0 || courseware.style_anchor_asset_id) && mediaTab === 'image' && (
         <ImageAssetList
-          coursewareId={coursewareId}
-          pageNum={pageNum}
-          assets={mediaAssets}
-          courseware={courseware}
-          anchorSetting={anchorSetting}
-          anchorClearing={anchorClearing}
+          coursewareId={coursewareId} pageNum={pageNum} assets={mediaAssets} courseware={courseware}
+          anchorSetting={anchorSetting} anchorClearing={anchorClearing}
           onSetAnchor={(assetId) => onSetAnchor(assetId, setMediaMessage)}
           onClearAnchor={() => onClearAnchor(setMediaMessage)}
-          onPreview={setMediaPreviewUrl}
-          onPickRef={setMediaRefUrl}
+          onPreview={setMediaPreviewUrl} onPickRef={setMediaRefUrl}
           onAssetUpdated={(updated) => setMediaAssets(prev => prev.map(a => a.id === updated.id ? updated : a))}
-          onDeleteRequest={setDeleteTarget}
-          notify={setMediaMessage}
+          onDeleteRequest={setDeleteTarget} notify={setMediaMessage}
         />
       )}
+
+      {/* ==================== 视频Tab：AI分镜 → 视频列表 → 手动上传 ==================== */}
 
       {/* 视频生成区: VideoStoryboardPanel(AI分镜两步法) */}
       {mediaTab === 'video' && pageNum > 0 && (
         <VideoStoryboardPanel
-          coursewareId={coursewareId}
-          pageNum={pageNum}
+          coursewareId={coursewareId} pageNum={pageNum}
           styleAnchorAssetId={courseware.style_anchor_asset_id}
           onAssetCreated={(asset) => setMediaAssets(prev => prev.some(a => a.id === asset.id) ? prev : [asset, ...prev])}
           onPreviewImage={(url) => setMediaPreviewUrl(url)}
         />
       )}
 
-      {/* 视频列表 + 编辑器入口（批次5b拆出为 VideoAssetList） */}
+      {/* 视频列表 + 编辑器入口 */}
       {mediaTab === 'video' && pageNum > 0 && mediaAssets.filter(a => a.asset_type === 'video').length > 0 && (
         <VideoAssetList
-          coursewareId={coursewareId}
-          pageNum={pageNum}
-          assets={mediaAssets}
+          coursewareId={coursewareId} pageNum={pageNum} assets={mediaAssets}
           onOpenEditor={() => setEditorOpen(true)}
           onAssetUpdated={(updated) => setMediaAssets(prev => prev.map(a => a.id === updated.id ? updated : a))}
-          onDeleteRequest={setDeleteTarget}
-          notify={setMediaMessage}
+          onDeleteRequest={setDeleteTarget} notify={setMediaMessage}
         />
       )}
 
-      {/* 视频Tab下也展示提示消息 */}
+      {/* 批次5d: 视频手动上传区块 */}
+      {mediaTab === 'video' && pageNum > 0 && (
+        <div style={{ marginTop: 16, padding: 16, borderRadius: 10, border: '1px solid ' + C.border, background: '#fff' }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: '#7C3AED', marginBottom: 8 }}>📤 手动上传视频</div>
+          <div
+            style={{
+              padding: '20px 16px', borderRadius: 8,
+              border: '2px dashed ' + (videoUploading ? '#7C3AED' : C.border),
+              textAlign: 'center',
+              cursor: videoUploading ? 'default' : 'pointer',
+              background: videoUploading ? 'rgba(124,58,237,0.04)' : '#FAFAFA',
+            }}
+            onClick={handleUploadVideo}
+          >
+            {videoUploading ? (
+              <>
+                <div style={{ fontSize: 14, marginBottom: 8, color: '#7C3AED', fontWeight: 600 }}>
+                  ⏳ 上传中 {videoUploadProgress}%
+                </div>
+                <div style={{ width: '100%', height: 8, borderRadius: 4, background: '#E5E7EB', overflow: 'hidden' }}>
+                  <div style={{
+                    width: videoUploadProgress + '%', height: '100%', borderRadius: 4,
+                    background: 'linear-gradient(90deg, #7C3AED, #6D28D9)',
+                    transition: 'width 0.3s ease',
+                  }} />
+                </div>
+                <div style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>请稍候，大文件上传可能需要一些时间...</div>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: 28, marginBottom: 6 }}>🎬</div>
+                <div style={{ fontSize: 13, color: C.textSecondary }}>点击选择视频文件</div>
+                <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }}>支持 MP4/WebM/MOV/AVI，最大50MB</div>
+              </>
+            )}
+          </div>
+          <div style={{ marginTop: 10, padding: '8px 12px', borderRadius: 8, background: 'rgba(124,58,237,0.04)', border: '1px solid rgba(124,58,237,0.15)', fontSize: 12, color: '#6D28D9', lineHeight: 1.6 }}>
+            💡 上传的视频会出现在上方列表中，可直接上云获取链接，也可以点「🎬 打开视频编辑器」进行裁剪、拼接、加字幕等操作。
+          </div>
+        </div>
+      )}
+
+      {/* 视频提示消息 */}
       {mediaTab === 'video' && mediaMessage && <div style={{ marginTop: 12, padding: '10px 14px', borderRadius: 8, background: mediaMessage.startsWith('❌') ? '#FEE2E2' : '#D1FAE5', color: mediaMessage.startsWith('❌') ? '#DC2626' : '#059669', fontSize: 13 }}>{mediaMessage}</div>}
+
+      {/* ==================== 音频Tab：上传 + 列表 ==================== */}
+      {mediaTab === 'audio' && pageNum > 0 && (
+        <>
+          <div style={{ padding: 16, borderRadius: 10, border: '1px solid ' + C.border, background: '#fff' }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: '#0891B2', marginBottom: 8 }}>🎵 上传音频</div>
+            <div style={{ padding: '20px 16px', borderRadius: 8, border: '2px dashed ' + C.border, textAlign: 'center', cursor: mediaGenerating ? 'default' : 'pointer', background: '#F0FDFA' }}
+              onClick={() => {
+                if (mediaGenerating) return
+                const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'audio/*'
+                inp.onchange = async (ev) => {
+                  const f = (ev.target as HTMLInputElement).files?.[0]
+                  if (!f || !coursewareId) return
+                  if (f.size > 20 * 1024 * 1024) { setMediaMessage('❌ 音频文件不能超过20MB'); return }
+                  setMediaGenerating(true); setMediaMessage('⏳ 上传音频中...')
+                  try {
+                    const res = await uploadCWAudio(coursewareId, pageNum, f)
+                    setMediaMessage('✅ 音频上传成功！上云后可复制链接在微调中使用')
+                    setMediaAssets(prev => [makeAsset(coursewareId, { id: res.asset_id, oss_url: res.url, asset_type: 'audio', file_size: res.file_size, mime_type: res.mime_type }), ...prev])
+                  } catch (e) { setMediaMessage('❌ 上传失败: ' + (e instanceof Error ? e.message : '未知错误')) }
+                  finally { setMediaGenerating(false) }
+                }; inp.click()
+              }}
+            >
+              <div style={{ fontSize: 28, marginBottom: 6 }}>🎵</div>
+              <div style={{ fontSize: 13, color: '#0891B2' }}>点击选择音频文件</div>
+              <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }}>支持 MP3/WAV/OGG/AAC/FLAC/M4A，最大20MB</div>
+            </div>
+            <div style={{ marginTop: 10, padding: '10px 14px', borderRadius: 8, background: '#ECFDF5', border: '1px solid #A7F3D0', fontSize: 12, color: '#047857', lineHeight: 1.6 }}>
+              💡 <b>使用方法：</b>上传音频 → 点「☁️上云」获取公网链接 → 复制链接 → 在微调指令中告诉AI把音频嵌入课件
+              <br />示例微调指令：「在第3页添加一个音频播放器，音频地址是 [粘贴链接]」
+            </div>
+          </div>
+          <AudioAssetList
+            coursewareId={coursewareId} pageNum={pageNum} assets={mediaAssets}
+            onAssetUpdated={(updated) => setMediaAssets(prev => prev.map(a => a.id === updated.id ? updated : a))}
+            onDeleteRequest={setDeleteTarget} notify={setMediaMessage}
+            onEditAudio={setAudioEditorAsset}
+          />
+        </>
+      )}
+
+      {/* 音频剪辑器弹窗 */}
+      {audioEditorAsset && (
+        <AudioEditorModal
+          audio={audioEditorAsset}
+          coursewareId={coursewareId}
+          pageNum={pageNum}
+          onClose={() => setAudioEditorAsset(null)}
+          onExported={(newAsset) => {
+            setMediaAssets(prev => [newAsset, ...prev])
+            setMediaMessage('✅ 音频裁剪完成，新音频已添加到列表')
+            setAudioEditorAsset(null)
+          }}
+        />
+      )}
+
+      {/* 音频提示消息 */}
+      {mediaTab === 'audio' && mediaMessage && <div style={{ marginTop: 12, padding: '10px 14px', borderRadius: 8, background: mediaMessage.startsWith('❌') ? '#FEE2E2' : '#D1FAE5', color: mediaMessage.startsWith('❌') ? '#DC2626' : '#059669', fontSize: 13 }}>{mediaMessage}</div>}
 
       {/* 图片大图预览弹窗 */}
       {mediaPreviewUrl && (
@@ -362,10 +514,10 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
         </div>
       )}
 
-      {/* 批次5a: 危险删除红色确认弹窗——替代原生 window.confirm（已上云资产强警告 + 图片带缩略图） */}
+      {/* 危险删除红色确认弹窗 */}
       {deleteTarget && (
         <DangerConfirmModal
-          title={deleteTarget.asset_type === 'video' ? '🗑 删除视频' : '🗑 删除图片'}
+          title={deleteTarget.asset_type === 'video' ? '🗑 删除视频' : deleteTarget.asset_type === 'audio' ? '🗑 删除音频' : '🗑 删除图片'}
           message={buildDeleteWarning(deleteTarget)}
           confirmText={deleting ? '删除中...' : '确认删除'}
           busy={deleting}
@@ -375,13 +527,12 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
         />
       )}
 
-      {/* 视频编辑器弹窗（类剪映多片段时间轴编辑；fixed定位，渲染位置不影响视觉） */}
+      {/* 视频编辑器弹窗 */}
       {editorOpen && (
         <VideoEditorModal
           coursewareId={coursewareId}
           videos={mediaAssets.filter(a => a.asset_type === 'video' && a.oss_url).map(a => ({
-            id: a.id,
-            url: a.oss_url,
+            id: a.id, url: a.oss_url,
             label: a.generation_prompt || a.oss_url.split('/').pop()?.slice(0, 30) || '视频',
           }))}
           exporting={editorExporting}
@@ -400,18 +551,13 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
             if (!coursewareId || editorExporting) return
             setEditorExporting(true); setMediaMessage('')
             try {
-              // ===== S-V2 三步串行导出链: 拼接 → 烧录字幕(可选) → 混入配音(可选) =====
-              // 每个可选步骤失败只记入failNotes降级继续，始终保留最近一步可用成片。
-
-              // 第一步: FFmpeg 高级拼接出基础成片（必做，失败则整体失败走外层catch）
               const res = await advancedConcatCWVideos(coursewareId, clips)
               let finalAssetId = res.asset_id
               let finalUrl = res.url
-              let withSubtitle = false   // 字幕烧录是否成功
-              let withNarration = false  // 配音混音是否成功
+              let withSubtitle = false
+              let withNarration = false
               const failNotes: string[] = []
 
-              // 第二步: 硬字幕烧录（可选）——在拼接成片上重编码烧录
               if (options?.burnSubtitle && options.subtitleId) {
                 setMediaMessage('⏳ 成片已生成，正在烧录字幕（需重编码视频，约1-2分钟）...')
                 try {
@@ -424,7 +570,6 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
                 }
               }
 
-              // 第三步: TTS配音混音（可选）——在最新可用成片上按时间轴混入旁白
               if (options?.mixNarration && options.subtitleId) {
                 setMediaMessage('⏳ 正在合成配音...')
                 try {
@@ -437,7 +582,6 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
                 }
               }
 
-              // 组装产物标签与结果提示
               const featTags = [withSubtitle ? '含字幕' : '', withNarration ? '含配音' : ''].filter(Boolean)
               const finalPrompt = '编辑导出' + (featTags.length > 0 ? '(' + featTags.join('+') + ')' : '') + ' ' + clips.length + '个片段'
               const finalMsg = failNotes.length > 0

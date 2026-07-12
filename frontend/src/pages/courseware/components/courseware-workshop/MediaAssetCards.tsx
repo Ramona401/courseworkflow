@@ -309,3 +309,50 @@ export function VideoAssetList({ coursewareId, pageNum, assets, onOpenEditor, on
     </div>
   )
 }
+
+
+/** 本页音频列表——上传后上云获取公网链接复制到微调使用 */
+export function AudioAssetList({ coursewareId, pageNum, assets, onAssetUpdated, onDeleteRequest, notify, onEditAudio }: {
+  coursewareId: string
+  pageNum: number
+  assets: CoursewareAsset[]
+  onAssetUpdated: (asset: CoursewareAsset) => void
+  onDeleteRequest: (asset: CoursewareAsset) => void
+  notify: (msg: string) => void
+  onEditAudio?: (asset: CoursewareAsset) => void
+}) {
+  const audios = assets.filter(a => a.asset_type === 'audio')
+  if (audios.length === 0) return null
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: '#0891B2', marginBottom: 8 }}>🎵 第 {pageNum} 页的音频（{audios.length}个）</div>
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+        {audios.map(asset => (
+          <div key={asset.id} style={{ width: 280, borderRadius: 10, border: '1px solid ' + C.border, overflow: 'hidden', background: '#fff' }}>
+            <div style={{ padding: '12px 14px', background: '#F0FDFA' }}>
+              <audio src={asset.oss_url} controls style={{ width: '100%', height: 36 }} />
+            </div>
+            <div style={{ padding: '8px 10px' }}>
+              <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 4 }}>
+                📤 {asset.oss_url.split('/').pop()?.slice(0, 30) || '音频文件'}
+                {asset.public_oss_url ? ' · ☁️已上云' : ''}
+              </div>
+              <div style={{ fontSize: 10, color: '#9CA3AF', marginBottom: 6 }}>
+                {asset.file_size > 0 ? (asset.file_size / (1024 * 1024)).toFixed(1) + ' MB' : ''}
+                {asset.mime_type ? ' · ' + asset.mime_type.split('/')[1]?.toUpperCase() : ''}
+              </div>
+              <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                {onEditAudio && <button onClick={() => onEditAudio(asset)}
+                  style={{ padding: '3px 8px', borderRadius: 5, border: '1px solid #0891B2', background: 'rgba(8,145,178,0.06)', color: '#0891B2', fontSize: 10, cursor: 'pointer' }}>✂️ 剪辑</button>}
+                <QuickAssetActions asset={asset} small isImage={false} notify={notify} />
+                <CloudActions coursewareId={coursewareId} asset={asset} small onAssetUpdated={onAssetUpdated} notify={notify} />
+                <button onClick={() => onDeleteRequest(asset)}
+                  style={{ padding: '3px 8px', borderRadius: 5, border: '1px solid #EF4444', background: 'rgba(239,68,68,0.06)', color: '#EF4444', fontSize: 10, cursor: 'pointer' }}>删除</button>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}

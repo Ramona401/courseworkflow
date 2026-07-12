@@ -17,6 +17,14 @@ import (
 //   - ListCoursewares: 适配可空 lesson_plan_id，新增 source_type 读取
 // 风格锚点轮1变更：
 //   - GetCoursewareByID: 再扩展2列 style_anchor_asset_id/style_anchor_vaoci（共22列），供前端读当前锚点
+// 阶段1（课件审核与协作·发布与共享）变更：
+//   - GetCoursewareByID: 再扩展4列 publish_state/review_level/review_school_id/code_share_scope（共26列）
+//   - ListCoursewares: SELECT 带上 publish_state/review_level/code_share_scope，供"我的课件"列表显示发布徽章
+//   - 新增 UpdateCoursewarePublishState（写发布态+审核层级+学校ID）/ UpdateCoursewareCodeShareScope（写代码范围）
+//   - 新增 ListSharedCoursewares（共享课件库查询，按作者白名单+学科筛选，关联作者名/学校名）
+// 回收站迭代变更：
+//   - DeleteCourseware: 由物理删除改为软删除（UPDATE SET deleted_at）
+//   - GetCoursewareByID/ListCoursewares/ListSharedCoursewares: 查询加 deleted_at IS NULL 过滤
 
 // CreateCourseware 创建课件记录
 // v0.42: lesson_plan_id 改为可空，新增 source_type 参数
@@ -43,6 +51,8 @@ RETURNING id, created_at, updated_at`
 // GetCoursewareByID 根据ID获取课件详情
 // v0.42: 扩展到 20 列，含 source_type/source_file_path/edu_module_id/published_version
 // 风格锚点轮1: 再加 style_anchor_asset_id/style_anchor_vaoci 两列（共22列）
+// 阶段1: 再加 publish_state/review_level/review_school_id/code_share_scope 四列（共26列）
+// 回收站迭代: WHERE 加 deleted_at IS NULL 排除已软删课件
 func GetCoursewareByID(ctx context.Context, id string) (*models.Courseware, error) {
 	sql := `SELECT id, lesson_plan_id, user_id, title, subject, grade, status,
 COALESCE(style_config::text, ''), page_count, COALESCE(index_overview, ''),
@@ -51,8 +61,11 @@ pipeline_id, COALESCE(source_type, 'lesson_plan'), COALESCE(source_file_path, ''
 COALESCE(edu_module_id, ''), COALESCE(published_version, 0),
 style_anchor_asset_id, COALESCE(style_anchor_vaoci, ''),
 COALESCE(kp_codes::text, ''),
+COALESCE(publish_state, 'private'), COALESCE(review_level, 0),
+review_school_id, COALESCE(code_share_scope, 'none'),
+COALESCE(collab_state, 'idle'),
 created_at, updated_at
-FROM coursewares WHERE id = $1`
+FROM coursewares WHERE id = $1 AND deleted_at IS NULL`
 	cw := &models.Courseware{}
 	err := database.DB.QueryRow(ctx, sql, id).Scan(
 		&cw.ID, &cw.LessonPlanID, &cw.UserID, &cw.Title, &cw.Subject, &cw.Grade,
@@ -62,6 +75,9 @@ FROM coursewares WHERE id = $1`
 		&cw.EduModuleID, &cw.PublishedVersion,
 		&cw.StyleAnchorAssetID, &cw.StyleAnchorVAOCI,
 		&cw.KPCodes,
+		&cw.PublishState, &cw.ReviewLevel,
+		&cw.ReviewSchoolID, &cw.CodeShareScope,
+		&cw.CollabState,
 		&cw.CreatedAt, &cw.UpdatedAt,
 	)
 	if err != nil {
@@ -70,10 +86,12 @@ FROM coursewares WHERE id = $1`
 	return cw, nil
 }
 
-// ListCoursewares 查询课件列表
+// ListCoursewares 查询课件列表（"我的课件"——硬绑当前用户）
 // v0.42: 适配可空 lesson_plan_id，新增 source_type 读取
+// 阶段1: SELECT 带上 publish_state/review_level/code_share_scope，列表显示发布徽章
+// 回收站迭代: 初始条件加 c.deleted_at IS NULL 排除已软删课件
 func ListCoursewares(ctx context.Context, userID string, status string, subject string, limit int, offset int) ([]*models.CoursewareListItem, int, error) {
-	conditions := []string{"c.user_id = $1"}
+	conditions := []string{"c.user_id = $1", "c.deleted_at IS NULL"}
 	args := []interface{}{userID}
 	argIdx := 2
 
@@ -97,8 +115,10 @@ func ListCoursewares(ctx context.Context, userID string, status string, subject 
 	}
 
 	// v0.42: LEFT JOIN lesson_plans（lesson_plan_id 可空时 lp.title 为 NULL → COALESCE 兜底）
+	// 阶段1: 末尾增 publish_state/review_level/code_share_scope 三列
 	listSQL := fmt.Sprintf(`SELECT c.id, c.lesson_plan_id, COALESCE(lp.title, ''), c.title, c.subject, c.grade,
 c.status, c.page_count, c.pipeline_id, COALESCE(c.source_type, 'lesson_plan'),
+COALESCE(c.publish_state, 'private'), COALESCE(c.review_level, 0), COALESCE(c.code_share_scope, 'none'),
 c.created_at, c.updated_at
 FROM coursewares c
 LEFT JOIN lesson_plans lp ON lp.id = c.lesson_plan_id
@@ -120,12 +140,115 @@ LIMIT $%d OFFSET $%d`, whereClause, argIdx, argIdx+1)
 			&item.ID, &item.LessonPlanID, &item.LessonPlanTitle, &item.Title,
 			&item.Subject, &item.Grade, &item.Status, &item.PageCount,
 			&item.PipelineID, &item.SourceType,
+			&item.PublishState, &item.ReviewLevel, &item.CodeShareScope,
 			&item.CreatedAt, &item.UpdatedAt,
 		); err != nil {
 			return nil, 0, fmt.Errorf("扫描课件列表行失败: %w", err)
 		}
 		item.StatusName = models.CoursewareStatusNameMap[item.Status]
 		item.SourceName = models.CWSourceNameMap[item.SourceType]
+		item.PublishStateName = models.CWPublishStateNameMap[item.PublishState]
+		items = append(items, item)
+	}
+	return items, total, nil
+}
+
+// ListSharedCoursewares 查询共享课件库（阶段1新增）
+//
+// 设计（对齐教案库 ListLessonPlans 范式）：repo 只负责"按作者白名单 + 可选学科筛选"查询，
+// "谁可见（同校/同组）"的归属解析在 service 层算好 visibleAuthorIDs 白名单再传进来，
+// repo 不碰组织关系，职责清晰。
+//
+// 参数：
+//
+//	visibleAuthorIDs — 当前登录者可见的作者用户ID白名单（service 层按同校/同组解析）。
+//	                   传 nil 表示"不限作者"（仅 admin 等全局可见者），传空切片表示"看不到任何"（fail-closed）。
+//	subject          — 可选学科筛选（空串=不筛）
+//	limit/offset     — 分页
+//
+// 只列 publish_state='published_shared' 的课件，按 updated_at 倒序。
+// 关联 users 取作者显示名，关联 school_members→organizations 取作者学校名（取一条，无则空）。
+// 回收站迭代: 初始条件加 c.deleted_at IS NULL 排除已软删课件
+func ListSharedCoursewares(ctx context.Context, visibleAuthorIDs []string, subject string, limit int, offset int) ([]*models.SharedCoursewareListItem, int, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+
+	conditions := []string{"c.publish_state = 'published_shared'", "c.deleted_at IS NULL"}
+	args := []interface{}{}
+	argIdx := 1
+
+	// 作者白名单三态：
+	//   nil        → 不加作者条件（全局可见，仅 admin）
+	//   非nil空切片 → 注入恒假条件（看不到任何，fail-closed）
+	//   非空        → c.user_id = ANY($n)
+	if visibleAuthorIDs != nil {
+		if len(visibleAuthorIDs) == 0 {
+			conditions = append(conditions, "1 = 0")
+		} else {
+			conditions = append(conditions, fmt.Sprintf("c.user_id = ANY($%d)", argIdx))
+			args = append(args, visibleAuthorIDs)
+			argIdx++
+		}
+	}
+
+	if subject != "" {
+		conditions = append(conditions, fmt.Sprintf("c.subject = $%d", argIdx))
+		args = append(args, subject)
+		argIdx++
+	}
+
+	whereClause := strings.Join(conditions, " AND ")
+
+	countSQL := fmt.Sprintf("SELECT COUNT(*) FROM coursewares c WHERE %s", whereClause)
+	var total int
+	if err := database.DB.QueryRow(ctx, countSQL, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("查询共享课件总数失败: %w", err)
+	}
+
+	// 作者学校名用 LATERAL 子查询取一条（school_members→organizations，type=school 且 active）
+	listSQL := fmt.Sprintf(`SELECT c.id, c.title, c.subject, c.grade, c.page_count,
+COALESCE(c.source_type, 'lesson_plan'),
+c.user_id, COALESCE(u.display_name, u.username, ''),
+COALESCE(sch.name, ''),
+COALESCE(c.publish_state, 'private'), COALESCE(c.code_share_scope, 'none'),
+c.created_at, c.updated_at
+FROM coursewares c
+LEFT JOIN users u ON u.id = c.user_id
+LEFT JOIN LATERAL (
+    SELECT o.name
+    FROM school_members sm
+    JOIN organizations o ON o.id = sm.school_id AND o.status = 'active'
+    WHERE sm.user_id = c.user_id
+    LIMIT 1
+) sch ON true
+WHERE %s
+ORDER BY c.updated_at DESC
+LIMIT $%d OFFSET $%d`, whereClause, argIdx, argIdx+1)
+	args = append(args, limit, offset)
+
+	rows, err := database.DB.Query(ctx, listSQL, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("查询共享课件列表失败: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.SharedCoursewareListItem
+	for rows.Next() {
+		item := &models.SharedCoursewareListItem{}
+		if err := rows.Scan(
+			&item.ID, &item.Title, &item.Subject, &item.Grade, &item.PageCount,
+			&item.SourceType,
+			&item.AuthorID, &item.AuthorName,
+			&item.SchoolName,
+			&item.PublishState, &item.CodeShareScope,
+			&item.CreatedAt, &item.UpdatedAt,
+		); err != nil {
+			return nil, 0, fmt.Errorf("扫描共享课件行失败: %w", err)
+		}
+		item.SourceName = models.CWSourceNameMap[item.SourceType]
+		item.PublishStateName = models.CWPublishStateNameMap[item.PublishState]
+		// CanCopy 由 service 层按 code_share_scope + 归属关系裁决，repo 不算
 		items = append(items, item)
 	}
 	return items, total, nil
@@ -137,6 +260,60 @@ func UpdateCoursewareStatus(ctx context.Context, id string, status string) error
 	tag, err := database.DB.Exec(ctx, sql, status, time.Now(), id)
 	if err != nil {
 		return fmt.Errorf("更新课件状态失败: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("课件不存在: %s", id)
+	}
+	return nil
+}
+
+// UpdateCoursewarePublishState 更新课件发布态 + 审核层级 + 审核学校ID（阶段1新增）
+//
+// 三者一起更新，因为它们在发布/审核流转中经常同步变化（如提交审核时
+// publish_state→submitted、review_school_id→作者学校；审核通过时 review_level→1/2）。
+//
+// 参数：
+//
+//	publishState   — 目标发布态（service 层已校验合法性）
+//	reviewLevel    — 审核层级进度（0/1/2）
+//	reviewSchoolID — 审核学校ID指针，nil=写 NULL（未提交/已撤回时清空）
+func UpdateCoursewarePublishState(ctx context.Context, id string, publishState string, reviewLevel int, reviewSchoolID *string) error {
+	var schoolArg interface{}
+	if reviewSchoolID != nil && *reviewSchoolID != "" {
+		schoolArg = *reviewSchoolID
+	}
+	sql := `UPDATE coursewares SET publish_state = $1, review_level = $2, review_school_id = $3, updated_at = $4 WHERE id = $5`
+	tag, err := database.DB.Exec(ctx, sql, publishState, reviewLevel, schoolArg, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("更新课件发布态失败: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("课件不存在: %s", id)
+	}
+	return nil
+}
+
+// UpdateCoursewareCodeShareScope 更新课件源代码开放范围（阶段1新增，产权分级）
+func UpdateCoursewareCodeShareScope(ctx context.Context, id string, codeShareScope string) error {
+	sql := `UPDATE coursewares SET code_share_scope = $1, updated_at = $2 WHERE id = $3`
+	tag, err := database.DB.Exec(ctx, sql, codeShareScope, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("更新课件代码开放范围失败: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("课件不存在: %s", id)
+	}
+	return nil
+}
+
+// UpdateCoursewareCollabState 更新课件集体备课态（阶段4新增）
+// state 必须是 idle / in_session（service 层已用 models.IsValidCollabState 校验）。
+// 与 status/publish_state 正交，仅写 collab_state 一列，不触碰其他维度。
+func UpdateCoursewareCollabState(ctx context.Context, id string, state string) error {
+	sql := `UPDATE coursewares SET collab_state = $1, updated_at = $2 WHERE id = $3`
+	tag, err := database.DB.Exec(ctx, sql, state, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("更新课件集体备课态失败: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("课件不存在: %s", id)
@@ -200,9 +377,12 @@ func UpdateCoursewarePipelineID(ctx context.Context, id string, pipelineID strin
 	return err
 }
 
-// DeleteCourseware 删除课件（状态校验已上移到 service 层；此处仅按 id 删除，关联子表由 DB 外键 CASCADE 自动清理）
+// DeleteCourseware 删除课件（软删除：设置 deleted_at 时间戳，不物理删除）
+// 软删除后课件在列表/详情/共享库中均不可见，但数据保留在数据库中可通过回收站恢复。
+// 30天后由定时任务 PurgeExpiredTrash 自动物理清理。
+// 状态校验已上移到 service 层；此处仅按 id 做软删除。
 func DeleteCourseware(ctx context.Context, id string) error {
-	sql := `DELETE FROM coursewares WHERE id = $1`
+	sql := `UPDATE coursewares SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1 AND deleted_at IS NULL`
 	tag, err := database.DB.Exec(ctx, sql, id)
 	if err != nil {
 		return fmt.Errorf("删除课件失败: %w", err)
@@ -221,10 +401,10 @@ func ListUserLogoURLs(ctx context.Context, userID string, limit int) ([]string, 
 		limit = 20
 	}
 	sql := `SELECT logo_url FROM coursewares
-		WHERE user_id = $1 AND COALESCE(logo_url, '') <> ''
-		GROUP BY logo_url
-		ORDER BY MAX(updated_at) DESC
-		LIMIT $2`
+                WHERE user_id = $1 AND COALESCE(logo_url, '') <> ''
+                GROUP BY logo_url
+                ORDER BY MAX(updated_at) DESC
+                LIMIT $2`
 	rows, err := database.DB.Query(ctx, sql, userID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询历史Logo失败: %w", err)
@@ -247,9 +427,9 @@ func ListUserLogoURLs(ctx context.Context, userID string, limit int) ([]string, 
 // 返回受影响行数（即有多少个课件用过这个 Logo）
 func DeleteUserLogoURL(ctx context.Context, userID string, logoURL string) (int64, error) {
 	sql := `UPDATE coursewares SET logo_url = '',
-		style_config = CASE WHEN style_config IS NULL THEN style_config ELSE style_config - 'logo_url' END,
-		updated_at = $1
-		WHERE user_id = $2 AND logo_url = $3`
+                style_config = CASE WHEN style_config IS NULL THEN style_config ELSE style_config - 'logo_url' END,
+                updated_at = $1
+                WHERE user_id = $2 AND logo_url = $3`
 	tag, err := database.DB.Exec(ctx, sql, time.Now(), userID, logoURL)
 	if err != nil {
 		return 0, fmt.Errorf("删除历史Logo失败: %w", err)
@@ -369,17 +549,6 @@ WHERE courseware_id = $9 AND page_number = $10`
 }
 
 // UpdateCWPageIndexFields 仅回填单页的 AOCI 索引列（page_index + 三个 idx 冗余列）
-//
-// v0.44 新增：用于「后台异步补索引」与「夜间索引轮询」。
-// 严格只更新索引相关4列，绝不触碰 title/purpose/content_summary 等用户方案字段，
-// 也不动 html_content / status，避免误伤已生成的方案与课件内容。
-//
-// 参数：
-//
-//	pageIndex —— 层1风格的 AOCI 压缩索引原文（PAGE:..|KT:..|CG:..|IL:..|VF:.. + [K][A][I][R][C] 语义行）
-//	cg        —— 认知层次 1-6（idx_cognitive_level）
-//	il        —— 交互复杂度 1-5（idx_interaction_level）
-//	vf        —— 视觉形式编码（idx_visual_format，如 TH/IT/DG...）
 func UpdateCWPageIndexFields(ctx context.Context, coursewareID string, pageNumber int, pageIndex string, cg int, il int, vf string) error {
 	sql := `UPDATE courseware_pages SET page_index = $1,
 idx_cognitive_level = $2, idx_interaction_level = $3, idx_visual_format = $4,
@@ -391,8 +560,6 @@ WHERE courseware_id = $6 AND page_number = $7`
 	if err != nil {
 		return fmt.Errorf("回填课件页面索引列失败(courseware=%s page=%d): %w", coursewareID, pageNumber, err)
 	}
-	// 注意：不校验 RowsAffected==0 —— 后台/夜间回填时该页可能已被删除（老师改了方案），
-	// 此时静默跳过即可，不应视为错误中断整批回填。
 	return nil
 }
 
@@ -441,12 +608,9 @@ func CountCoursewarePages(ctx context.Context, coursewareID string) (int, error)
 	return count, err
 }
 
-// ==================== 风格锚点字段更新（VAOCI 课程级风格一致性，轮1新增）====================
-// 说明：设/查/清锚点的完整业务接口在轮2实现，本轮先提供底层DB写入函数，
-//       供轮2的 service 层调用。查锚点直接复用 GetCoursewareByID（已含两列）。
+// ==================== 风格锚点字段更新 ====================
 
 // UpdateCoursewareStyleAnchor 设置课件风格锚点（写入资产ID + VAOCI索引文本）
-// assetID 指向 courseware_assets.id；vaoci 为多模态AI读图提取的VAOCI索引文本
 func UpdateCoursewareStyleAnchor(ctx context.Context, id string, assetID string, vaoci string) error {
 	sql := `UPDATE coursewares SET style_anchor_asset_id = $1, style_anchor_vaoci = $2, updated_at = $3 WHERE id = $4`
 	tag, err := database.DB.Exec(ctx, sql, assetID, vaoci, time.Now(), id)
@@ -469,8 +633,6 @@ func ClearCoursewareStyleAnchor(ctx context.Context, id string) error {
 // ==================== 课程知识库轮：kp_codes 写入 ====================
 
 // UpdateCoursewareKPCodes 写入课件勾选的课标知识点编码数组（JSON文本）
-// kpCodesJSON 为 JSON 数组文本（如 `["MATH-G3-NA-001","MATH-G3-GG-002"]`）；
-// 空串时写 NULL（nullIfEmpty 处理），语义=未勾选。供"从主题创建"勾选后持久化。
 func UpdateCoursewareKPCodes(ctx context.Context, id string, kpCodesJSON string) error {
 	sql := `UPDATE coursewares SET kp_codes = $1::jsonb, updated_at = $2 WHERE id = $3`
 	_, err := database.DB.Exec(ctx, sql, nullIfEmpty(kpCodesJSON), time.Now(), id)

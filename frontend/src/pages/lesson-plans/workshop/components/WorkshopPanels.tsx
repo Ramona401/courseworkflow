@@ -20,6 +20,7 @@ import { useNavigate } from 'react-router-dom'
 import type { ConversationMessage, AIReviewResult, ConvComponent } from '@/api/lesson-plans'
 import { getAvailableRecipes, type RecipeListItem } from '@/api/recipes'
 import { getTextbooks, triggerTextbookOCR, type TextbookListItem } from '@/api/textbooks'
+import { getAvailablePublishers, publisherLabel } from '@/api/course-outlines'
 import { C, SUBJECTS, GRADES, renderMarkdown } from './workshopConstants'
 
 // ==================== 配方 scope 徽标配置（与对话模式共用同一套配色） ====================
@@ -33,7 +34,7 @@ const RECIPE_SCOPE_BADGE: Record<string, { label: string; color: string; bg: str
 // ==================== 首屏备课表单 ====================
 
 interface StartFormProps {
-  onStart: (subject: string, grade: string, topic: string, duration: number, recipeId?: string, textbookPageIds?: string[]) => void
+  onStart: (subject: string, grade: string, topic: string, duration: number, recipeId?: string, textbookPageIds?: string[], coursePublisher?: string | null) => void
   loading: boolean
 }
 
@@ -42,6 +43,10 @@ export function StartForm({ onStart, loading }: StartFormProps) {
   const [grade, setGrade]       = useState('一年级')
   const [topic, setTopic]       = useState('')
   const [duration, setDuration] = useState(45)
+  // 教材版本（专家模式起步选）：三态 null=不关联/''=通用版/具名=该版本
+  const [coursePublisher, setCoursePublisher] = useState<string | null>(null)
+  const [coursePublishers, setCoursePublishers] = useState<string[]>([])
+  const [coursePubLoading, setCoursePubLoading] = useState(false)
   const navigate = useNavigate()
 
   // v203 简化：配方用 getAvailableRecipes（按用户可见性+学科，学校>教研组>个人排序）
@@ -86,6 +91,28 @@ export function StartForm({ onStart, loading }: StartFormProps) {
     loadTextbooks()
   }, [subject, grade])
 
+  // 教材版本下拉：按学科+年级拉该学科年级真实存在大纲的可选版本（与对话模式同款）。
+  // 有大纲→默认选中第一个版本（可改可清）；无大纲→不显示、coursePublisher 置 null（不关联）。
+  useEffect(() => {
+    let cancelled = false
+    if (!subject || !grade) { setCoursePublishers([]); setCoursePublisher(null); return }
+    setCoursePubLoading(true)
+    getAvailablePublishers(subject, grade)
+      .then(list => {
+        if (cancelled) return
+        const pubs = list || []
+        setCoursePublishers(pubs)
+        if (pubs.length === 0) {
+          setCoursePublisher(null)
+        } else {
+          setCoursePublisher(prev => (prev !== null && pubs.includes(prev)) ? prev : pubs[0])
+        }
+      })
+      .catch(() => { if (!cancelled) { setCoursePublishers([]); setCoursePublisher(null) } })
+      .finally(() => { if (!cancelled) setCoursePubLoading(false) })
+    return () => { cancelled = true }
+  }, [subject, grade])
+
   const toggleTextbook = (id: string) => {
     const willSelect = !selectedTextbookIds.has(id)
     setSelectedTBIds(prev => {
@@ -117,7 +144,7 @@ export function StartForm({ onStart, loading }: StartFormProps) {
   const handleSubmit = () => {
     if (!topic.trim()) return
     if (ocrInProgress.size > 0) return
-    onStart(subject, grade, topic.trim(), duration, selectedRecipeId || undefined, selectedTextbookIds.size > 0 ? Array.from(selectedTextbookIds) : undefined)
+    onStart(subject, grade, topic.trim(), duration, selectedRecipeId || undefined, selectedTextbookIds.size > 0 ? Array.from(selectedTextbookIds) : undefined, coursePublisher)
   }
 
   const selectedRecipe = recipes.find(r => r.id === selectedRecipeId)
@@ -208,6 +235,32 @@ export function StartForm({ onStart, loading }: StartFormProps) {
             <button onClick={() => navigate('/lesson-plans/recipes')} style={{ padding: '6px 12px', borderRadius: '8px', border: 'none', background: C.primary, color: '#fff', fontSize: '12px', fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>
               去配方管理
             </button>
+          </div>
+        )}
+
+        {/* 教材版本（选填）——仅当本学科本年级真实有大纲时才显示 */}
+        {coursePublishers.length > 0 && (
+          <div style={{ marginBottom: '18px' }}>
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>📚 教材版本</label>
+            <select
+              value={coursePublisher === null ? '__none__' : coursePublisher}
+              onChange={e => setCoursePublisher(e.target.value === '__none__' ? null : e.target.value)}
+              disabled={coursePubLoading}
+              style={{ width: '100%', padding: '11px 14px', borderRadius: '10px', border: `1.5px solid ${coursePublisher !== null ? '#8B5CF6' : C.border}`, fontSize: '14px', color: coursePublisher !== null ? C.text : C.textMuted, background: C.card, cursor: 'pointer', outline: 'none', boxSizing: 'border-box', transition: 'border-color 150ms ease' }}>
+              {coursePublishers.map(p => (
+                <option key={p || '__generic__'} value={p}>{publisherLabel(p)}</option>
+              ))}
+              <option value="__none__">不关联大纲（本节课不注入大纲）</option>
+            </select>
+            {coursePublisher !== null ? (
+              <div style={{ fontSize: '11px', color: '#7C3AED', marginTop: '6px', lineHeight: 1.5 }}>
+                ✓ 备课时将注入「{publisherLabel(coursePublisher)}」这版的课程大纲
+              </div>
+            ) : (
+              <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px', lineHeight: 1.5 }}>
+                💡 当前不关联大纲；如需对齐教材，请在上方选择你所用的版本
+              </div>
+            )}
           </div>
         )}
 

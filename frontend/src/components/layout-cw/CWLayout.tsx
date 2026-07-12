@@ -1,16 +1,20 @@
 /**
- * 课件工坊布局组件 — CWLayout v1.0
+ * 课件工坊布局组件 — CWLayout v1.1
  *
+ * v1.1变更（超管收口）：下拉菜单里"AI 管理中心 / AI 调用统计"两个敏感入口
+ *   叠加 is_super 判断——仅超级管理员（is_super=true 的 admin）可见，二线管理员隐藏。
+ *   "用户管理"入口不收口（二线管理员仍需管用户/组织/基础数据）。
  * 与 LPLayout 结构完全一致，独立的布局和侧边栏
  * 课件工坊作为第三大板块，拥有独立入口
  * Phase6.2新增：区域管理员（region_admin）下拉菜单“用户管理”入口（指向 /admin，不含学校管理）
- * 合并重构（本次）：删除 senior_operator 的“学校管理→/school-admin”入口，
+ * 合并重构：删除 senior_operator 的“学校管理→/school-admin”入口，
  *   统一走“用户管理→/admin”（/admin 已支持 senior 本校视角，含批量导入）。
  */
 import { useState, useRef, useEffect } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import CWSidebar from './CWSidebar'
+import NotificationBell from '@/components/NotificationBell'
 
 /* ==================== 页面标题映射 ==================== */
 const pageTitles: Record<string, string> = {
@@ -55,6 +59,10 @@ function CWUserMenu() {
   const [open, setOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
 
+  // 超管收口：仅超级管理员可见 AI 管理中心 / AI 调用统计两个敏感入口。
+  // is_super 缺省（undefined/老缓存）按非超管兜底，收紧方向不误放行。
+  const isSuper = user?.role === 'admin' && user?.is_super === true
+
   useEffect(() => {
     function handleClick(e: MouseEvent) {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) setOpen(false)
@@ -89,12 +97,17 @@ function CWUserMenu() {
           </div>
           <div style={{ padding: '6px' }}>
             <CWMenuItem icon="👤" label="个人中心" onClick={() => go('/account')} />
-            {/* admin 专属功能 */}
+            {/* admin 专属功能。用户管理不收口；AI 管理中心 / AI 调用统计仅超管可见 */}
             {user?.role === 'admin' && (
               <>
                 <CWMenuItem icon="👥" label="用户管理" onClick={() => go('/admin')} highlight />
-                <CWMenuItem icon="🤖" label="AI 管理中心" onClick={() => go('/ai-center')} />
-                <CWMenuItem icon="📊" label="AI 调用统计" onClick={() => go('/ai-traces')} />
+                {/* 超管收口：二线管理员（is_super=false）不显示以下两项 */}
+                {isSuper && (
+                  <>
+                    <CWMenuItem icon="🤖" label="AI 管理中心" onClick={() => go('/ai-center')} />
+                    <CWMenuItem icon="📊" label="AI 调用统计" onClick={() => go('/ai-traces')} />
+                  </>
+                )}
               </>
             )}
             {/* region_admin 专属：区域用户管理（指向 /admin，不含学校管理） */}
@@ -147,6 +160,7 @@ export default function CWLayout() {
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <header style={{ height: '64px', position: 'relative', zIndex: 50, background: 'rgba(255,255,255,0.85)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)', borderBottom: '1px solid rgba(0,0,0,0.05)', display: 'flex', alignItems: 'center', padding: '0 32px', flexShrink: 0 }}>
           <h2 style={{ flex: 1, fontSize: '20px', fontWeight: 600, color: '#1F2937', margin: 0, letterSpacing: '-0.3px' }}>{pageTitle}</h2>
+          <NotificationBell />
           <CWUserMenu />
         </header>
         <main style={{ flex: 1, overflowY: 'auto', padding: '28px 32px' }}>

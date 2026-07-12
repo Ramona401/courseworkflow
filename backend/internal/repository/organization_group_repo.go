@@ -418,3 +418,27 @@ func ListMyLeadOrBackboneGroups(ctx context.Context, userID string) ([]models.Pu
 	}
 	return groups, nil
 }
+
+// ListTeachingGroupMemberIDs 列出某教研组的全体成员 user_id（阶段1·课件共享可见性用）
+//
+// 用途：课件共享库判定"与作者同教研组"的可见性/复制权时，需要某组全体成员的 user_id 集合。
+// 返回 user_id 字符串切片（无成员时返回空切片，非 nil），DB 异常返回 error。
+// 与 admin_repo.go 中既有 `SELECT user_id FROM teaching_group_members WHERE group_id=$1` 口径一致。
+func ListTeachingGroupMemberIDs(ctx context.Context, groupID string) ([]string, error) {
+	rows, err := database.DB.Query(ctx,
+		`SELECT user_id::text FROM teaching_group_members WHERE group_id = $1`, groupID)
+	if err != nil {
+		return nil, fmt.Errorf("查询教研组成员失败: %w", err)
+	}
+	defer rows.Close()
+
+	ids := make([]string, 0)
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err != nil {
+			return nil, fmt.Errorf("扫描教研组成员行失败: %w", err)
+		}
+		ids = append(ids, uid)
+	}
+	return ids, nil
+}

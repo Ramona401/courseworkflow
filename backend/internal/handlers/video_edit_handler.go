@@ -326,6 +326,59 @@ func (h *VideoEditHandler) MixNarration(w http.ResponseWriter, r *http.Request) 
 	utils.Success(w, resp)
 }
 
+
+// ==================== 音频裁剪（课件音频剪辑器专用） ====================
+
+// TrimAudio POST /api/v1/coursewares/{id}/videos/trim-audio
+// 请求体: { "asset_id": "uuid", "start_sec": 1.5, "end_sec": 30.0 }
+// 裁剪指定音频资产的起止时间段，生成新的音频资产（不重编码，速度极快）
+func (h *VideoEditHandler) TrimAudio(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	cwID := extractVideoEditCoursewareID(r.URL.Path, "/videos/trim-audio")
+	if cwID == "" {
+		utils.BadRequest(w, "路径参数错误")
+		return
+	}
+
+	var req struct {
+		AssetID  string  `json:"asset_id"`
+		StartSec float64 `json:"start_sec"`
+		EndSec   float64 `json:"end_sec"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, "请求参数格式错误")
+		return
+	}
+	if req.AssetID == "" {
+		utils.BadRequest(w, "asset_id不能为空")
+		return
+	}
+
+	svcReq := &services.TrimAudioRequest{
+		CoursewareID: cwID,
+		AssetID:      req.AssetID,
+		StartSec:     req.StartSec,
+		EndSec:       req.EndSec,
+		UserID:       claims.UserID,
+	}
+
+	resp, err := h.editService.TrimAudio(r.Context(), svcReq)
+	if err != nil {
+		utils.InternalError(w, err.Error())
+		return
+	}
+	utils.Success(w, resp)
+}
+
 // ==================== 路径解析 ====================
 
 // extractVideoEditCoursewareID 从 /api/v1/coursewares/{id}/videos/{action} 提取课件ID

@@ -6,6 +6,13 @@ package repository
 //   - ListPendingReviewsL1All：admin全量查所有L1待审核（不限教研组）
 //   - ListReviewedRecords：已审核记录列表（按级别+审核员+决策类型过滤）
 //   - GetReviewStats：admin统计不限reviewer_id
+//
+// 方案B改动（2026-07-03，学校管理员审核盲区修复）：
+//   - GetReviewStats 签名新增 schoolID 参数（senior_operator 本校口径），待审计数改为
+//     fail-closed——同时堵住历史统计泄漏：旧实现里"非 admin 且无教研组"的 L1、以及
+//     所有非 admin 的 L2，都落到无过滤的全局计数（学校管理员统计卡显示全系统待审数）。
+//   - 新增"按学校查 L1 待审"的 ListPendingReviewsL1BySchool 在独立文件
+//     review_v2_repo_school.go（主文件控制在 600 行红线内）。
 
 import (
 	"context"
@@ -468,30 +475,60 @@ func UpsertReviewFlowConfig(ctx context.Context, schoolID string, req *models.Up
 // GetReviewStats 获取审核统计
 //
 // v127.2 修复：isAdmin=true 时"已审核/已通过/已退回"不限 reviewer_id
-func GetReviewStats(ctx context.Context, reviewerID string, level int, isAdmin bool, groupIDs []string) (*models.ReviewStatsResponse, error) {
+//
+// 方案B改造（2026-07-03，同时堵住历史统计泄漏，口径对齐课件侧 B3 修复）：
+//   签名新增 schoolID 参数（senior_operator 本校口径）。待审核数（TotalPending）
+//   按以下优先级装配，口径与该角色的待审列表严格一致：
+//     1. isAdmin=true              → L1/L2 全局计数（其它级别如 L3 计 0，L3 待审走 inspection 统计）；
+//     2. level=L1 且 schoolID 非空  → 按教研组所属学校计数（senior 本校，对应 ListPendingReviewsL1BySchool）；
+//     3. level=L1 且 groupIDs 非空  → 按教研组计数（lead/backbone 组内口径，对应 ListPendingReviewsL1）；
+//     4. level=L2 且 schoolID 非空  → 按 review_school_id 计数（senior 本校，对应其 L2 待审列表）；
+//     5. 以上皆不匹配              → 计 0（fail-closed，绝不退化为全局）。
+//   ⚠ 历史泄漏（本次堵住）：旧实现里"非 admin 且无教研组"的 L1、以及所有非 admin 的 L2，
+//     都落到无过滤的全局计数——学校管理员统计卡显示的是全系统待审数，与其列表不一致。
+//   已审核/已通过/已退回三项为"审核员个人产出"口径：admin 全局、非 admin 本人 reviewer_id，维持不变。
+func GetReviewStats(ctx context.Context, reviewerID string, level int, isAdmin bool, groupIDs []string, schoolID string) (*models.ReviewStatsResponse, error) {
 	stats := &models.ReviewStatsResponse{}
 
-	// 待审核数：按级别查
-	// v127.3: 非admin的L1统计限定到自己的教研组，避免统计数字和列表不一致
-	if level == models.ReviewLevelL1 && !isAdmin && len(groupIDs) > 0 {
-		// 非admin：只统计自己教研组内的L1待审核
+	// ---------- 待审核数（口径与列表一致，fail-closed）----------
+	if isAdmin {
+		// admin：L1/L2 全局计数（保持原查询条件逐字不变）
+		if level == models.ReviewLevelL1 {
+			_ = database.DB.QueryRow(ctx,
+				`SELECT COUNT(*) FROM lesson_plans
+				 WHERE status = 'submitted' AND review_level = 0 AND group_id IS NOT NULL`,
+			).Scan(&stats.TotalPending)
+		} else if level == models.ReviewLevelL2 {
+			_ = database.DB.QueryRow(ctx,
+				`SELECT COUNT(*) FROM lesson_plans
+				 WHERE status = 'submitted' AND review_level = 1`,
+			).Scan(&stats.TotalPending)
+		}
+	} else if level == models.ReviewLevelL1 && schoolID != "" {
+		// senior 本校 L1：JOIN teaching_groups 过滤学校（与 ListPendingReviewsL1BySchool 严格同口径）
+		_ = database.DB.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM lesson_plans lp
+			JOIN teaching_groups tg ON tg.id = lp.group_id
+			WHERE lp.status = 'submitted' AND lp.review_level = 0 AND tg.school_id = $1
+		`, schoolID).Scan(&stats.TotalPending)
+	} else if level == models.ReviewLevelL1 && len(groupIDs) > 0 {
+		// lead/backbone 的 L1：只统计自己教研组内的待审核（与 ListPendingReviewsL1 同口径）
 		inClause, args := buildInClause(groupIDs, 1)
 		q := fmt.Sprintf(`SELECT COUNT(*) FROM lesson_plans
 			WHERE status = 'submitted' AND review_level = 0 AND group_id IN (%s)`, inClause)
 		_ = database.DB.QueryRow(ctx, q, args...).Scan(&stats.TotalPending)
-	} else if level == models.ReviewLevelL1 {
-		// admin：全局L1待审核
+	} else if level == models.ReviewLevelL2 && schoolID != "" {
+		// senior 本校 L2：按 review_school_id（与其 L2 待审列表同口径）
 		_ = database.DB.QueryRow(ctx,
 			`SELECT COUNT(*) FROM lesson_plans
-			 WHERE status = 'submitted' AND review_level = 0 AND group_id IS NOT NULL`,
-		).Scan(&stats.TotalPending)
-	} else if level == models.ReviewLevelL2 {
-		_ = database.DB.QueryRow(ctx,
-			`SELECT COUNT(*) FROM lesson_plans
-			 WHERE status = 'submitted' AND review_level = 1`,
+			 WHERE status = 'submitted' AND review_level = 1 AND review_school_id = $1`,
+			schoolID,
 		).Scan(&stats.TotalPending)
 	}
+	// 以上分支均不匹配（非 admin、无教研组、无学校口径）→ TotalPending 保持 0（fail-closed）
 
+	// ---------- 已审核/已通过/已退回（审核员个人产出口径，原逻辑不变）----------
 	if isAdmin {
 		// admin看全局统计
 		_ = database.DB.QueryRow(ctx,

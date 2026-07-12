@@ -97,7 +97,7 @@ func (h *TeacherAssistantPrefHandler) GetPref(w http.ResponseWriter, r *http.Req
 			// 助手轻量选择入口 Phase 1 小优化:回填助手真名,供前端指示器直接展示。
 			// 查名失败(如助手已被删/停用)不阻塞,留空由前端 fallback 文案兜底。
 			actor := services.BuildActorFromClaims(r.Context(), claims.UserID, claims.Role)
-			if a, aerr := h.assistantService.GetAssistant(r.Context(), actor, trimmed); aerr == nil && a != nil {
+			if a, aerr := h.assistantService.GetAssistant(r.Context(), actor, trimmed, false); aerr == nil && a != nil { // false:只取助手名,无需原文
 				resp.AssistantName = a.Name
 			}
 		}
@@ -134,7 +134,7 @@ func (h *TeacherAssistantPrefHandler) PutPref(w http.ResponseWriter, r *http.Req
 	// 空串是合法的「显式系统默认」,无需校验,直接落库。
 	if assistantID != "" {
 		actor := services.BuildActorFromClaims(r.Context(), claims.UserID, claims.Role)
-		if _, err := h.assistantService.GetAssistant(r.Context(), actor, assistantID); err != nil {
+		if _, err := h.assistantService.GetAssistant(r.Context(), actor, assistantID, false); err != nil { // false:仅校验存在+可见,无需原文
 			// 助手不存在 / 无权查看 → 视为非法选择,不写脏数据。
 			utils.BadRequest(w, "选择的助手不存在或当前账号无权使用")
 			return

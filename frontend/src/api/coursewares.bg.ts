@@ -137,3 +137,37 @@ export async function promoteBackgroundSet(setId: string): Promise<CWBackgroundS
   const resp = await apiClient.post('/courseware-backgrounds/' + setId + '/promote', {})
   return extractData(resp)
 }
+
+// ==================== 页级背景覆盖（单页蒙版控制 + 单页背景图） ====================
+
+/** 页级背景设置 */
+export interface PageBgSetting {
+  page_bg_url: string       // 该页专属背景图URL（空=跟随课件级）
+  page_bg_opacity: number | null  // 蒙版透明度 0.0~1.0（null=跟随默认）
+  page_bg_mode: string      // default=跟随默认 / custom=自定义透明度 / none=无蒙版
+}
+
+/** 页级背景设置请求 */
+export interface SetPageBgRequest {
+  url?: string              // 页级背景图URL（空/不传=仅改蒙版模式不换图）
+  opacity?: number | null   // 蒙版透明度（null=跟随默认）
+  mode: string              // default/custom/none
+}
+
+/** 查询单页背景设置 */
+export async function getPageBackground(coursewareId: string, pageNum: number): Promise<PageBgSetting> {
+  const resp = await apiClient.get(`/coursewares/${coursewareId}/pages/${pageNum}/page-bg`)
+  return extractData(resp)
+}
+
+/** 设置单页背景（上传图+蒙版模式+透明度）并秒换该页 */
+export async function setPageBackground(coursewareId: string, pageNum: number, req: SetPageBgRequest): Promise<Record<string, unknown>> {
+  const resp = await apiClient.put(`/coursewares/${coursewareId}/pages/${pageNum}/page-bg`, req, { timeout: 30000 })
+  return extractData(resp)
+}
+
+/** 清除单页背景覆盖（回退到跟随课件级） */
+export async function clearPageBackground(coursewareId: string, pageNum: number): Promise<Record<string, unknown>> {
+  const resp = await apiClient.delete(`/coursewares/${coursewareId}/pages/${pageNum}/page-bg`, { timeout: 30000 })
+  return extractData(resp)
+}

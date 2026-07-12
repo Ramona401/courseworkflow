@@ -29,6 +29,19 @@
  * v114 Batch 2 第 1 轮(2026-04-20):
  *   文件末尾追加 designChat SSE 函数 + 配套类型,对接后端
  *   POST /api/v1/ai-assistants/design/chat(对话式创作)
+ *
+ * ──────────────────────────────────────────────────────────────────────
+ * share_policy(分享权限策略,本次新增)前端契约:
+ *   后端给每个助手新增 share_policy 字段(open / use_only / locked):
+ *     open      可用 + 可复制(谁能看到就能 fork 带走并改)
+ *     use_only  仅可用(作者未开放复制,别人只能用,不能 fork、不能改)
+ *     locked    仅自己(只有作者本人/admin 可见可用)
+ *   配套字段:
+ *     - AIAssistant.share_policy / AIAssistantListItem.share_policy(展示徽章)
+ *     - AIAssistantListItem.can_fork(后端算好的"当前用户能否复制",前端据此显隐复制按钮)
+ *     - CreateAIAssistantRequest.share_policy / UpdateAIAssistantRequest.share_policy(发布/编辑时设置)
+ *   类型 AssistantSharePolicy + 标签 SHARE_POLICY_LABELS / SHARE_POLICY_HINTS 供 UI 复用。
+ * ──────────────────────────────────────────────────────────────────────
  */
 import client from './client'
 
@@ -70,6 +83,48 @@ export const ASSISTANT_SOURCE_EMOJI: Record<AssistantSource, string> = {
   personal: '👤',
 }
 
+// ==================== 常量:分享权限策略(share_policy,本次新增) ====================
+
+/**
+ * 助手分享权限策略(对应后端 models.SharePolicyXxx 常量)
+ *   open      可用 + 可复制(谁能看到就能 fork 带走并改)
+ *   use_only  仅可用(作者未开放复制,别人只能用,不能 fork、不能被非维护者改)
+ *   locked    仅自己(只有作者本人/admin 可见可用,最严)
+ */
+export type AssistantSharePolicy = 'open' | 'use_only' | 'locked'
+
+/** share_policy 中文短标签(徽章用) */
+export const SHARE_POLICY_LABELS: Record<AssistantSharePolicy, string> = {
+  open: '可复制',
+  use_only: '仅可用',
+  locked: '仅自己',
+}
+
+/** share_policy 对应 emoji(徽章/选择器用) */
+export const SHARE_POLICY_EMOJI: Record<AssistantSharePolicy, string> = {
+  open: '🔓',
+  use_only: '🤝',
+  locked: '🔒',
+}
+
+/** share_policy 一句话说明(发布/编辑选择器里给用户看的提示) */
+export const SHARE_POLICY_HINTS: Record<AssistantSharePolicy, string> = {
+  open: '别人可以使用,也可以复制一份到自己名下修改',
+  use_only: '别人只能使用,不能复制带走,也不能修改(保护你的标准与产权)',
+  locked: '只有你自己能看到和使用,相当于私有(挂在共享位但不外露)',
+}
+
+/**
+ * 默认 share_policy(与后端 DB 默认值、service 兜底值一致)
+ * 新建助手时若用户不显式选择,前端表单初值用此值。
+ */
+export const DEFAULT_SHARE_POLICY: AssistantSharePolicy = 'use_only'
+
+/** 校验任意字符串是否为合法 share_policy(防御性) */
+export function isValidSharePolicy(p: string | null | undefined): p is AssistantSharePolicy {
+  return p === 'open' || p === 'use_only' || p === 'locked'
+}
+
 // ==================== 类型定义:列表项 ====================
 
 /**
@@ -78,8 +133,9 @@ export const ASSISTANT_SOURCE_EMOJI: Record<AssistantSource, string> = {
  * 与详情(AIAssistant)的差异:
  *   - scenes 已解析为字符串数组(详情里是 JSONB 字符串)
  *   - 附带展示辅助字段(creator_name/school_name/source_label/group_name)
- *   - 附带权限计算字段(can_edit/can_delete)
+ *   - 附带权限计算字段(can_edit/can_delete/can_fork)
  *   - 附带当前场景匹配字段(is_default_here)
+ *   - 附带 share_policy(分享权限策略,展示徽章用)
  */
 export interface AIAssistantListItem {
   id: string
@@ -107,6 +163,18 @@ export interface AIAssistantListItem {
   // 当前用户的权限
   can_edit: boolean
   can_delete: boolean
+  // can_fork:后端算好的"当前用户能否把该助手复制到我的"(本次新增)
+  //   = 可见 && (share_policy=open || 自己是属主 || admin)
+  //   前端据此显隐"复制到我的"按钮;最终拦截仍在后端 ForkAssistant
+  can_fork: boolean
+
+  // can_view_prompt:后端算好的"当前用户能否查看该助手的 full_prompt 原文"(本次新增,产权保护)
+  //   = 与编辑权限同款闸门(admin / 属主 / open可见者 / 本组组长)
+  //   前端据此显隐"丢给 AI 分析"按钮(分析=取原文注入对话);最终拦截在后端 GetAssistant
+  can_view_prompt: boolean
+
+  // share_policy:分享权限策略(本次新增,展示徽章用)
+  share_policy: AssistantSharePolicy
 
   // 归属展示
   creator_name: string       // 创建者姓名(system 助手可能为空)
@@ -149,6 +217,14 @@ export interface AIAssistant {
   organization_id: string | null
   group_id: string | null
 
+  // share_policy:分享权限策略(本次新增)
+  share_policy: AssistantSharePolicy
+
+  // prompt_protected:full_prompt 是否被后端保护性置空(本次新增,产权保护)
+  //   true = 当前用户无权查看原文(use_only/locked 且非 admin/属主/组长),full_prompt 已被置空
+  //   前端拿到 true 时应提示"作者未开放原文",不要把空 prompt 当作真实内容使用
+  prompt_protected?: boolean
+
   // 核心内容
   full_prompt: string
   knowledge_refs: string       // JSONB 字符串:引用的组件/教案 ID 数组
@@ -190,6 +266,9 @@ export interface AIAssistant {
  *   - 发布教研组级助手时传目标教研组 ID(后端校验当前用户是否为该组 lead/backbone)
  *   - 为空且 source='group':发布全校级助手(仅 senior_operator/admin)
  *   - source='personal' 时忽略
+ *
+ * share_policy(本次新增):
+ *   - 发布时选择 open / use_only / locked;不传则后端兜底为默认 use_only
  */
 export interface CreateAIAssistantRequest {
   name: string
@@ -202,6 +281,7 @@ export interface CreateAIAssistantRequest {
   scenes: AssistantScene[]       // 至少 1 个场景
   forked_from?: string | null
   group_id?: string              // 里程碑一:教研组级助手的目标组 ID
+  share_policy?: AssistantSharePolicy // 本次新增:分享权限策略(不传后端兜底 use_only)
 }
 
 /**
@@ -209,6 +289,7 @@ export interface CreateAIAssistantRequest {
  *
  * 不允许改 source/归属,后端会忽略这些字段
  * is_active 可空,不传表示保持现状
+ * share_policy 可空(本次新增):不传=保持原值;传则更新(后端校验合法性)
  */
 export interface UpdateAIAssistantRequest {
   name: string
@@ -219,6 +300,7 @@ export interface UpdateAIAssistantRequest {
   grade_range?: string
   scenes: AssistantScene[]
   is_active?: boolean
+  share_policy?: AssistantSharePolicy // 本次新增:不传=不改,传则更新
 }
 
 // ==================== 类型定义:我能发布的教研组(里程碑一) ====================
@@ -273,6 +355,7 @@ export interface ListAssistantsParams {
  *   - 教研组级 group 助手:仅所属教研组成员可见
  *   - 全校级 group 助手:本校教师可见
  *   - personal 助手:仅创建者可见
+ *   - locked 助手:仅作者本人/admin 可见(share_policy 收紧)
  *
  * 典型调用示例:
  *   评审工作台 Selector:listAssistants({scene: 'review_workbench'})
@@ -333,8 +416,10 @@ export async function getAssistant(id: string): Promise<AIAssistant> {
  *   - senior_operator 默认 'personal',传 source='group'(不带 group_id)发全校级
  *   - 教研组 lead/backbone 传 source='group'+group_id 发教研组级
  *
+ * share_policy 不传时后端兜底为 use_only。
+ *
  * 用户可见错误:
- *   - 400: 名称/提示词/场景缺失,或场景代码无效,或全校级未绑定学校
+ *   - 400: 名称/提示词/场景缺失,或场景代码无效,或全校级未绑定学校,或 share_policy 非法
  *   - 403: 角色不允许创建该 source 的助手,或无权在该教研组发布
  */
 export async function createAssistant(req: CreateAIAssistantRequest): Promise<AIAssistant> {
@@ -350,8 +435,11 @@ export async function createAssistant(req: CreateAIAssistantRequest): Promise<AI
  * 权限要求:
  *   - system 助手:仅 admin 可编辑
  *   - 教研组级 group 助手:创建者本人 / 该组组长 / admin 可编辑
+ *     (use_only 不阻止组长维护;locked 仅属主可编辑)
  *   - 全校级 group 助手:创建者本人(校管) / admin 可编辑
  *   - personal 助手:仅创建者可编辑
+ *
+ * share_policy 不传=不改;传则更新(后端校验合法性,非法返 400)
  *
  * 返回 void,前端需要最新数据时应重新调用 getAssistant(id)
  */
@@ -379,13 +467,19 @@ export async function deleteAssistant(id: string): Promise<void> {
  *
  * 复制后:
  *   - source = 'personal'(强制)
+ *   - share_policy = 'use_only'(副本默认保护,不继承原 policy)
  *   - created_by = 当前用户
  *   - name 末尾自动追加"(我的副本)"
  *   - full_prompt / scenes 原样复制
  *   - forked_from 记录原助手 ID,便于追溯
  *
+ * share_policy 拦截(后端):
+ *   - 原助手 share_policy=use_only/locked 且当前用户非属主非 admin → 返回 403
+ *     (作者设了"仅可用",别人只能用不能复制带走)
+ *   - 前端应在列表项 can_fork=false 时隐藏复制按钮,避免用户点了才报错
+ *
  * 典型场景:
- *   组员看到本组助手好用但想个性化 → 复制到我的后在自己的副本里改,原版不动
+ *   组员看到本组助手好用且作者开放了复制 → 复制到我的后在自己的副本里改,原版不动
  */
 export async function forkAssistant(sourceId: string): Promise<AIAssistant> {
   const res = await client.post<{ code: number; data: AIAssistant }>(`/ai-assistants/${sourceId}/fork`)

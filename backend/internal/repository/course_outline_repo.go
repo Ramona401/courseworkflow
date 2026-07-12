@@ -1,10 +1,13 @@
 package repository
 
-// course_outline_repo.go — 课程大纲数据访问（大单元备课能力·批次一）
+// course_outline_repo.go — 课程大纲数据访问（大单元备课能力·批次一 + 教材版本增强）
 //
 // 操作 course_outlines 表。pgx/v5 写法、错误处理风格对齐 curriculum_repo.go。
 // content 字段存原文整块，本层不做任何解析。
 // 列表查询 LEFT JOIN 回填归属名称（教研组名 / 学校名）与建立者显示名。
+//
+// publisher（教材版本）：空串=通用/不限版本；CRUD 全程读写本列，
+// 注入匹配候选(ListActiveOutlinesBySubject)也带出本列，由 service 层按版本筛选。
 
 import (
 	"context"
@@ -20,14 +23,14 @@ import (
 var ErrCourseOutlineNotFound = errors.New("课程大纲不存在")
 
 // courseOutlineSelectColumns 单条查询统一列（与 scanCourseOutline 对齐）
-const courseOutlineSelectColumns = `id, scope, scope_target_id, subject, grade, volume, title,
+const courseOutlineSelectColumns = `id, scope, scope_target_id, subject, grade, volume, publisher, title,
 content, COALESCE(source_file_path,''), source_type, created_by, status, created_at, updated_at`
 
 // scanCourseOutline 统一扫描单条大纲
 func scanCourseOutline(row pgx.Row) (*models.CourseOutline, error) {
 	o := &models.CourseOutline{}
 	err := row.Scan(
-		&o.ID, &o.Scope, &o.ScopeTargetID, &o.Subject, &o.Grade, &o.Volume, &o.Title,
+		&o.ID, &o.Scope, &o.ScopeTargetID, &o.Subject, &o.Grade, &o.Volume, &o.Publisher, &o.Title,
 		&o.Content, &o.SourceFilePath, &o.SourceType, &o.CreatedBy, &o.Status,
 		&o.CreatedAt, &o.UpdatedAt,
 	)
@@ -48,12 +51,12 @@ func CreateCourseOutline(ctx context.Context, o *models.CourseOutline) error {
 	}
 	err := database.DB.QueryRow(ctx, `
 		INSERT INTO course_outlines
-		  (scope, scope_target_id, subject, grade, volume, title, content,
+		  (scope, scope_target_id, subject, grade, volume, publisher, title, content,
 		   source_file_path, source_type, created_by, status)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active')
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active')
 		RETURNING id, created_at, updated_at
 	`,
-		o.Scope, o.ScopeTargetID, o.Subject, o.Grade, o.Volume, o.Title, o.Content,
+		o.Scope, o.ScopeTargetID, o.Subject, o.Grade, o.Volume, o.Publisher, o.Title, o.Content,
 		nullIfEmptyStr(o.SourceFilePath), sourceType, o.CreatedBy,
 	).Scan(&o.ID, &o.CreatedAt, &o.UpdatedAt)
 	if err != nil {
@@ -88,7 +91,7 @@ func ListCourseOutlines(ctx context.Context, scopeIsAdmin bool, groupIDs []strin
 		                  WHEN 'school' THEN org.name
 		                  WHEN 'system' THEN '全局（所有学校通用）'
 		                END, '') AS scope_name,
-		       co.subject, co.grade, co.volume, co.title,
+		       co.subject, co.grade, co.volume, co.publisher, co.title,
 		       COALESCE(u.display_name, '') AS creator_name,
 		       co.updated_at
 		FROM course_outlines co
@@ -121,7 +124,7 @@ func ListCourseOutlines(ctx context.Context, scopeIsAdmin bool, groupIDs []strin
 		it := &models.CourseOutlineListItem{}
 		if err := rows.Scan(
 			&it.ID, &it.Scope, &it.ScopeTargetID, &it.ScopeName,
-			&it.Subject, &it.Grade, &it.Volume, &it.Title,
+			&it.Subject, &it.Grade, &it.Volume, &it.Publisher, &it.Title,
 			&it.CreatorName, &it.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("扫描课程大纲列表行失败: %w", err)
@@ -134,13 +137,13 @@ func ListCourseOutlines(ctx context.Context, scopeIsAdmin bool, groupIDs []strin
 	return items, nil
 }
 
-// UpdateCourseOutline 更新大纲内容（学科/年级/册次/标题/正文全量更新）
+// UpdateCourseOutline 更新大纲内容（学科/年级/册次/版本/标题/正文全量更新）
 func UpdateCourseOutline(ctx context.Context, id string, req *models.UpdateCourseOutlineRequest) error {
 	result, err := database.DB.Exec(ctx, `
 		UPDATE course_outlines
-		SET subject = $1, grade = $2, volume = $3, title = $4, content = $5, updated_at = now()
-		WHERE id = $6 AND status = 'active'
-	`, req.Subject, req.Grade, req.Volume, req.Title, req.Content, id)
+		SET subject = $1, grade = $2, volume = $3, publisher = $4, title = $5, content = $6, updated_at = now()
+		WHERE id = $7 AND status = 'active'
+	`, req.Subject, req.Grade, req.Volume, req.Publisher, req.Title, req.Content, id)
 	if err != nil {
 		return fmt.Errorf("更新课程大纲失败: %w", err)
 	}
@@ -168,9 +171,10 @@ func DeleteCourseOutline(ctx context.Context, id string) error {
 
 // ListActiveOutlinesBySubject 查某学科下所有 active 大纲（供注入时打分匹配）
 //
-// 不在 SQL 里做年级/学段过滤——年级写法五花八门（"小学低段"/"三年级"/"小学一至六年级"），
-// SQL 等值匹配会漏。改为 SQL 只按学科粗筛，捞回同学科全部 active 大纲（含全局/学校/教研组），
-// 交给 service 层的「学段归一化打分」函数挑最贴合的一份。
+// 不在 SQL 里做年级/学段/版本过滤——年级写法五花八门（"小学低段"/"三年级"/"小学一至六年级"），
+// SQL 等值匹配会漏；版本筛选也交给 service 层（空版本=通用要兜底命中）。
+// 改为 SQL 只按学科粗筛，捞回同学科全部 active 大纲（含全局/学校/教研组），
+// 交给 service 层的「学段归一化打分 + 版本筛选」函数挑最贴合的一份。
 // 同学科大纲通常很少，全捞回内存打分开销可忽略。按 updated_at 倒序便于同分取最新。
 func ListActiveOutlinesBySubject(ctx context.Context, subject string) ([]*models.CourseOutline, error) {
 	sql := `SELECT ` + courseOutlineSelectColumns + `
@@ -187,7 +191,7 @@ func ListActiveOutlinesBySubject(ctx context.Context, subject string) ([]*models
 	for rows.Next() {
 		o := &models.CourseOutline{}
 		if err := rows.Scan(
-			&o.ID, &o.Scope, &o.ScopeTargetID, &o.Subject, &o.Grade, &o.Volume, &o.Title,
+			&o.ID, &o.Scope, &o.ScopeTargetID, &o.Subject, &o.Grade, &o.Volume, &o.Publisher, &o.Title,
 			&o.Content, &o.SourceFilePath, &o.SourceType, &o.CreatedBy, &o.Status,
 			&o.CreatedAt, &o.UpdatedAt,
 		); err != nil {

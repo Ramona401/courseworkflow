@@ -6,6 +6,14 @@ package models
 // 它是一份"料"（备课资料），落在「我的备课资料 → 单元方案」Tab；二期再注入到各课时备课。
 // 权限/可见性与 course_outlines 同构：写=组长(lead/backbone)+校管(senior_operator)+admin，读=全员。
 // scope 三级：group 教研组 / school 学校 / system 全局（admin，所有学校通用，scope_target_id 用全零占位）。
+//
+// v233 新增（课程大纲教材版本绑定，对齐备课工坊）：
+//   UnitPlan / StartUnitPlanRequest 各新增 CourseOutlinePublisher *string 字段，
+//   落 unit_plans.course_outline_publisher 列，三态语义与 lesson_plans 侧完全一致：
+//     nil（列为 NULL）    = 未关联大纲 —— 对话时不注入任何课程大纲（含存量老数据，零回归）
+//     ""（列为空串）      = 通用/不限版本 —— 只注入 publisher 为空串的大纲
+//     "人教版" 等具名版本 = 只注入该版本大纲（零跨版本兜底，对不上就不注入）
+//   替代旧的"MatchBestOutline 自动学段打分取一份"注入逻辑（一标多本时可能注入错版本教材）。
 
 import (
 	"encoding/json"
@@ -54,6 +62,14 @@ type UnitPlan struct {
 	Status          string    `json:"status"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
+
+	// CourseOutlinePublisher 选定的课程大纲教材版本（三态，v233 新增）。
+	// 语义与 lesson_plans.course_outline_publisher 完全对齐：
+	//   nil    = 未关联大纲（AI 对话时不注入任何课程大纲；存量老数据均为此态，零回归）
+	//   ""     = 通用/不限版本（只注入 publisher 为空串的大纲）
+	//   "人教版" 等具名 = 只注入该版本大纲（零跨版本兜底）
+	// JSON 序列化为 null / "" / "人教版"，前端据此展示"未关联/通用版/具名版本"三态。
+	CourseOutlinePublisher *string `json:"course_outline_publisher"`
 }
 
 // UnitPlanMessage 单元备课对话的一条消息（存 conversation_log jsonb 数组元素）
@@ -102,6 +118,13 @@ type StartUnitPlanRequest struct {
 	Volume        string `json:"volume"`          // 可选（册次）
 	Unit          string `json:"unit"`            // 必填（第几单元/单元名）
 	Title         string `json:"title"`           // 可选，缺省后端拼
+
+	// CourseOutlinePublisher 可选：选定课程大纲教材版本（三态，v233 新增）。
+	//   前端不传 / 传 null → 解码为 nil = 不关联大纲（老客户端天然兼容）
+	//   传 ""              → 通用/不限版本
+	//   传 "人教版" 等具名  → 该版本精确匹配注入
+	// 会话建立时定版落库；Chat 每轮 buildSystemPrompt 重读该列天然生效。
+	CourseOutlinePublisher *string `json:"course_outline_publisher"`
 }
 
 // UnitPlanChatRequest 单元备课对话一轮

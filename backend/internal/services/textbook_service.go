@@ -3,6 +3,10 @@ package services
 // textbook_service.go — 课本页面图片业务逻辑层
 //
 // 迭代7新增：课本图片上传+列表+详情+删除+OCR识别+共享
+//
+// v231新增：教材照片归档维度扩展
+//   - UploadTextbookPage 落库时带 Semester(学期) + Unit(单元) 两字段
+//   - ListTextbookPages 签名新增 semester/unit 两个筛选参数并透传给 repository
 
 import (
 	"context"
@@ -156,10 +160,12 @@ func (s *TextbookService) UploadTextbookPage(ctx context.Context, file multipart
 	// 存储路径使用相对路径（subDir/storedName）
 	relativePath := filepath.Join(subDir, storedName)
 
-	// 写入数据库
+	// 写入数据库（v231：带上 Semester 学期 + Unit 单元 两个归档字段）
 	page := &models.TextbookPage{
 		Subject:      req.Subject,
 		GradeRange:   req.GradeRange,
+		Semester:     strings.TrimSpace(req.Semester),
+		Unit:         strings.TrimSpace(req.Unit),
 		TextbookName: req.TextbookName,
 		Chapter:      req.Chapter,
 		PageNumber:   req.PageNumber,
@@ -182,6 +188,8 @@ func (s *TextbookService) UploadTextbookPage(ctx context.Context, file multipart
 	tbLog.Info("课本图片上传成功",
 		"id", page.ID,
 		"textbook", req.TextbookName,
+		"semester", req.Semester,
+		"unit", req.Unit,
 		"file", header.Filename,
 		"size", written,
 		"uploader", callerID,
@@ -216,8 +224,9 @@ func (s *TextbookService) GetTextbookPage(ctx context.Context, id string) (*mode
 }
 
 // ListTextbookPages 查询课本页面列表
-func (s *TextbookService) ListTextbookPages(ctx context.Context, callerID string, subject string, gradeRange string, textbookName string, scope string, limit int, offset int) (*models.TextbookListResponse, error) {
-	items, total, err := repository.ListTextbookPages(ctx, callerID, subject, gradeRange, textbookName, scope, limit, offset)
+// v231：新增 semester(学期) + unit(单元) 两个筛选参数，透传给 repository
+func (s *TextbookService) ListTextbookPages(ctx context.Context, callerID string, subject string, gradeRange string, semester string, unit string, textbookName string, scope string, limit int, offset int) (*models.TextbookListResponse, error) {
+	items, total, err := repository.ListTextbookPages(ctx, callerID, subject, gradeRange, semester, unit, textbookName, scope, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -269,6 +278,7 @@ func (s *TextbookService) DeleteTextbookPage(ctx context.Context, id string, cal
 //   - 删除"公式用LaTeX输出"要求
 //   - 分数一律用 a/b 纯文本(如 1/2)、带分数用 "1又3/4"，上下标用自然语言或纯文本
 //   - 明令禁止输出 LaTeX、\frac、$...$、HTML标签、代码块
+//
 // 表格仍用Markdown表格(前端renderMarkdown支持/将支持，不冲突)。
 func (s *TextbookService) RecognizeTextbookPage(ctx context.Context, id string, callerID string) (string, error) {
 	page, err := repository.GetTextbookPageByID(ctx, id)

@@ -1,41 +1,34 @@
 /**
  * MyAssistantsPage.tsx — 我的 AI 助手 / 提示词工坊主页面(阶段A · 对话画布版)
  *
- * ════════════════════════════════════════════════════════════════════════
- * 设计理念(对齐 Yuhan 拍板 — 顶级 Harness):
- *   这个页面就是一块"对话画布"。老师造助手时,注意力全在对话上,
- *   其他一切(现成助手列表、草稿)都是"可召唤、用完即收"的辅助,不跟对话抢地盘。
- *   - 对话区占满主体(designer fillHeight + collapsibleDraft)
- *   - 现成助手收进右侧"侧滑抽屉",默认关闭,点按钮才滑出
- *   - 草稿可一键收起,让对话独占全宽
- * ════════════════════════════════════════════════════════════════════════
+ * 设计理念(Yuhan 拍板):页面是一块"对话画布"。造助手时注意力全在对话上,
+ *   现成助手收进右侧侧滑抽屉(默认关,点按钮滑出),草稿可一键收起让对话独占全宽。
  *
- * ════════════ 三种造助手的路径(都汇到 SaveAssistantModal 落库) ════════════
- *   1. 跟 AI 聊着造        —— 对话画布主流程
- *   2. 挑现成助手"丢给 AI 分析" —— 抽屉里取 full_prompt 注入对话,让 AI 帮想还能补什么
- *   3. 粘贴已有提示词      —— 「✍️ 粘贴提示词」,可直接存 或 丢给 AI 润色
+ * 三种造助手路径(都汇到 SaveAssistantModal 落库):
+ *   1. 跟 AI 聊着造(对话画布主流程)
+ *   2. 挑现成助手"丢给 AI 分析"(抽屉取 full_prompt 注入对话)
+ *   3. 粘贴已有提示词(PastePromptModal,可直接存或丢给 AI 润色)
  *
- * ════════════ 身份分层 + 标杆化(沿用) ════════════
- *   - 顶部按角色一句话提示(老师/教研员/admin 不同)
- *   - 存助手货架选择在 SaveAssistantModal(老师无选项保持极简)
- *   - 抽屉里"🏫 本校推荐"置顶强调;普通老师且本校有 group 助手时,顶部给温和提示条
+ * 助手管理(本次新增,配合 share_policy 全套):
+ *   抽屉卡片 DrawerAssistantCard 现支持 ✏️编辑 / 🗑️删除 / ➕复制(按 can_fork 显隐):
+ *     - 编辑:打开 AssistantEditModal(edit 模式),保存后刷新列表
+ *     - 删除:window.confirm 二次确认后调 deleteAssistant,刷新列表
+ *     - 复制:按后端下发的 can_fork 显隐(作者设 use_only/locked 则隐藏)
+ *   can_edit/can_delete/can_fork 全由后端按当前用户算好,前端只按布尔显隐,最终拦截在后端。
  *
- * 复用既有资产:
- *   - AssistantDesignerPanel(injectedInput/fillHeight/collapsibleDraft)
- *   - SaveAssistantModal(userRole 货架选择)
- *   - PastePromptModal(粘贴入口,双出口)
- *   - listAssistants / getAssistant / forkAssistant
- *   - useAuth(取角色)
+ * 重构:DrawerAssistantCard + miniBtn 抽至 ./DrawerAssistantCard.tsx,控制本文件行数。
  *
  * 职责边界:本页只造助手/管助手;"用助手"在备课工坊。故抽屉卡片不放"用这个→跳工坊"。
  */
 
 import { useState, useEffect, useCallback } from 'react'
+import { DEFAULT_SUBJECTS } from '@/constants/subjects'
 import { useAuth } from '@/store/auth'
 import {
   listAssistants,
   getAssistant,
   forkAssistant,
+  deleteAssistant,
   ASSISTANT_SOURCE_LABELS,
   ASSISTANT_SOURCE_EMOJI,
   type AIAssistantListItem,
@@ -45,6 +38,8 @@ import {
 import AssistantDesignerPanel from '@/components/ai-assistants/AssistantDesignerPanel'
 import SaveAssistantModal from '@/components/ai-assistants/SaveAssistantModal'
 import PastePromptModal from '@/components/ai-assistants/PastePromptModal'
+import AssistantEditModal from '@/components/ai-assistants/AssistantEditModal'
+import DrawerAssistantCard, { miniBtn } from './DrawerAssistantCard'
 
 /* ==================== 样式常量(与助手系列组件保持一致) ==================== */
 const C = {
@@ -60,20 +55,14 @@ const C = {
   card:           '#FFFFFF',
   border:         '#F3F4F6',
   borderMid:      '#E5E7EB',
-  systemAccent:   '#4F7BE8',
   groupAccent:    '#F59E0B',
-  personalAccent: '#10B981',
 }
 
 /** localStorage key:记住老师的主教学科 */
 const LS_KEY = 'tedna_my_assistants_subject'
 
 /** 学科可选项(与 SaveAssistantModal/AssistantEditModal 保持一致) */
-const SUBJECTS = [
-  '', // 空=不限
-  '人工智能', '语文', '数学', '英语', '物理', '化学', '生物',
-  '历史', '地理', '政治', '科学', '信息科技', '技术', '综合实践',
-]
+const SUBJECTS = ['', ...DEFAULT_SUBJECTS]  // 空=不限；单一真相源（方案甲，v231）
 
 /** 工坊全部场景(透传给 designer 作默认,让 AI 按全链路推断组件) */
 const WORKSHOP_SCENES: AssistantScene[] = [
@@ -89,103 +78,6 @@ function roleHint(role: string | undefined): string {
     return '和 AI 聊一聊就能造助手。你可以只给自己用,也可以发布为「本校推荐」,给全校老师定标杆。'
   }
   return '和 AI 聊一聊,就能造出懂你的备课助手。想参考现成的,点右上角「现成助手」。'
-}
-
-/* ==================== 子组件:抽屉里单张"现成助手"紧凑卡片 ==================== */
-
-interface DrawerCardProps {
-  item: AIAssistantListItem
-  forking: boolean
-  analyzing: boolean
-  highlight?: boolean
-  onAnalyze: () => void
-  onFork: () => void
-}
-
-function DrawerAssistantCard({ item, forking, analyzing, highlight, onAnalyze, onFork }: DrawerCardProps) {
-  const [expanded, setExpanded] = useState(false)
-  const accent =
-    item.source === 'system'   ? C.systemAccent :
-    item.source === 'group'    ? C.groupAccent  :
-                                 C.personalAccent
-
-  return (
-    <div style={{
-      padding: '9px 11px', borderRadius: '8px',
-      border: `1px solid ${highlight ? `${accent}66` : C.border}`,
-      borderLeft: `3px solid ${accent}`,
-      background: highlight ? `${accent}0D` : '#fff',
-      marginBottom: '7px',
-    }}>
-      {/* 标题行(紧凑:名字 + 来源徽章) */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '5px', flexWrap: 'wrap' }}>
-        <span style={{ fontSize: '12.5px', fontWeight: 600, color: C.text }}>
-          {item.avatar_emoji} {item.name}
-        </span>
-        <span style={{
-          padding: '1px 5px', borderRadius: '4px', fontSize: '9.5px', fontWeight: 600,
-          background: `${accent}1A`, color: accent,
-        }}>
-          {ASSISTANT_SOURCE_EMOJI[item.source]} {ASSISTANT_SOURCE_LABELS[item.source]}
-        </span>
-        {item.subject && (
-          <span style={{ fontSize: '9.5px', color: C.textMuted }}>📚 {item.subject}</span>
-        )}
-      </div>
-
-      {/* 描述(默认折叠成1行,点展开看全) */}
-      {item.description && (
-        <div
-          style={{
-            fontSize: '11px', color: C.textSec, marginTop: '4px', lineHeight: 1.55,
-            overflow: 'hidden',
-            display: '-webkit-box',
-            WebkitLineClamp: expanded ? 99 : 1,
-            WebkitBoxOrient: 'vertical' as const,
-            cursor: 'pointer',
-          }}
-          onClick={() => setExpanded(v => !v)}
-          title={expanded ? '点击收起' : '点击展开'}
-        >
-          {item.description}
-        </div>
-      )}
-
-      {/* 操作行 */}
-      <div style={{ display: 'flex', gap: '6px', marginTop: '7px', flexWrap: 'wrap' }}>
-        <button
-          onClick={onAnalyze}
-          disabled={analyzing}
-          style={miniBtn(C.accent, analyzing)}
-          title="把这个助手的完整设定丢给左侧 AI,让它帮你分析、讨论你可以从哪些角度补充"
-        >{analyzing ? '读取中…' : '🔍 丢给 AI 分析'}</button>
-        {/* 系统/本校助手可复制到我的;个人助手已是自己的 */}
-        {item.source !== 'personal' ? (
-          <button
-            onClick={onFork}
-            disabled={forking}
-            style={miniBtn(C.primary, forking)}
-          >{forking ? '复制中…' : '➕ 复制到我的'}</button>
-        ) : (
-          <span style={{ fontSize: '10px', color: C.textMuted, alignSelf: 'center' }}>
-            ✓ 已是你的
-          </span>
-        )}
-      </div>
-    </div>
-  )
-}
-
-/** 小按钮样式 */
-function miniBtn(color: string, disabled?: boolean): React.CSSProperties {
-  return {
-    padding: '3px 9px', borderRadius: '5px',
-    border: `1px solid ${color}`, background: '#fff', color,
-    fontSize: '11px', fontWeight: 500,
-    cursor: disabled ? 'not-allowed' : 'pointer',
-    opacity: disabled ? 0.5 : 1,
-    whiteSpace: 'nowrap',
-  }
 }
 
 /* ==================== 主页面 ==================== */
@@ -209,6 +101,7 @@ export default function MyAssistantsPage() {
   const [listErr, setListErr]     = useState<string | null>(null)
   const [forkingId, setForkingId]   = useState<string | null>(null)
   const [analyzingId, setAnalyzingId] = useState<string | null>(null)
+  const [deletingId, setDeletingId]   = useState<string | null>(null)
 
   // ==================== 抽屉开关 ====================
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -222,6 +115,9 @@ export default function MyAssistantsPage() {
 
   // ==================== 粘贴提示词弹窗 ====================
   const [pasteOpen, setPasteOpen] = useState(false)
+
+  // ==================== 编辑助手弹窗(本次新增) ====================
+  const [editId, setEditId] = useState<string | null>(null)
 
   // ==================== 顶部横幅 ====================
   const [banner, setBanner] = useState<string | null>(null)
@@ -295,6 +191,13 @@ export default function MyAssistantsPage() {
     setAnalyzingId(item.id)
     try {
       const full = await getAssistant(item.id)
+      // 产权保护防御:若后端判定当前用户无权看原文(prompt_protected),full_prompt 已被置空。
+      //   正常情况下 can_view_prompt=false 时分析按钮已隐藏,不会走到这里;此处为双保险,
+      //   避免把空 prompt 丢给 AI,改为友好提示。
+      if (full.prompt_protected) {
+        setBanner('⚠️ 作者把「' + item.name + '」设为「仅可用」,未开放提示词原文,无法丢给 AI 分析。你仍可在备课工坊直接使用它。')
+        return
+      }
       const prompt = full.full_prompt || '(这个助手没有可读的设定内容)'
       const guide =
         `我想参考「${item.name}」这个助手,造一个类似的。\n\n` +
@@ -308,6 +211,35 @@ export default function MyAssistantsPage() {
       setAnalyzingId(null)
     }
   }, [analyzingId, injectToCanvas])
+
+  // ==================== 编辑助手:打开编辑弹窗 ====================
+  const handleEdit = useCallback((item: AIAssistantListItem) => {
+    setEditId(item.id)
+  }, [])
+
+  // ==================== 编辑保存成功:关弹窗 + 刷新 ====================
+  const handleEditSaved = useCallback(() => {
+    setEditId(null)
+    setBanner('✅ 助手已更新')
+    loadRelated()
+  }, [loadRelated])
+
+  // ==================== 删除助手:二次确认后删除 ====================
+  const handleDelete = useCallback(async (item: AIAssistantListItem) => {
+    if (deletingId) return
+    const ok = window.confirm(`确定删除助手「${item.name}」吗?\n此操作不可恢复。`)
+    if (!ok) return
+    setDeletingId(item.id)
+    try {
+      await deleteAssistant(item.id)
+      setBanner(`✅ 已删除「${item.name}」`)
+      await loadRelated()
+    } catch (e) {
+      setBanner(`⚠️ 删除失败:${e instanceof Error ? e.message : '请重试'}`)
+    } finally {
+      setDeletingId(null)
+    }
+  }, [deletingId, loadRelated])
 
   // ==================== 粘贴提示词:出口1 直接保存 ====================
   const handlePasteSaveDirect = useCallback((text: string) => {
@@ -330,6 +262,13 @@ export default function MyAssistantsPage() {
   for (const a of related) grouped[a.source].push(a)
   const groupCount = grouped.group.length
   const totalCount = related.length
+
+  // 本校推荐助手里,当前用户实际能做什么(供提示条/抽屉说明按权限动态措辞):
+  //   groupAnalyzable=有能"丢给 AI 分析"的(can_view_prompt,即能看原文)
+  //   groupForkable  =有能"复制到我的"的(can_fork)
+  //   都为 false 说明这批助手对当前用户都是"仅可用",措辞应改为"备课时直接选用"而非"复制来改"
+  const groupAnalyzable = grouped.group.some(a => a.can_view_prompt)
+  const groupForkable   = grouped.group.some(a => a.can_fork)
 
   // 抽屉内分组顺序:本校推荐(标杆)置顶 → 我的 → 系统
   const DISPLAY_ORDER: AssistantSource[] = ['group', 'personal', 'system']
@@ -388,14 +327,26 @@ export default function MyAssistantsPage() {
       </div>
 
       {/* 标杆提示条:仅普通老师 + 本校有 group 助手时显示 */}
+      {/*   文案随当前用户对这批助手的实际权限动态变化,避免"怂恿用户做现在做不了的事": */}
+      {/*     有能复制/分析的 → 提"复制来改、丢给 AI 分析";都只能用 → 提"备课时直接选用" */}
       {groupCount > 0 && role !== 'senior_operator' && role !== 'admin' && (
         <div style={{
           padding: '9px 14px', borderRadius: '10px',
           background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)',
           color: '#92400E', fontSize: '12.5px', lineHeight: 1.6, flexShrink: 0,
         }}>
-          💡 你们教研组已沉淀 <b>{groupCount}</b> 个「本校推荐」助手。造之前不妨点右上角「现成助手」看看——
-          能直接用、复制来改,或<b>丢给 AI 帮你分析还能补充什么</b>。
+          {(groupForkable || groupAnalyzable) ? (
+            <>
+              💡 你们教研组已沉淀 <b>{groupCount}</b> 个「本校推荐」助手。造之前不妨点右上角「现成助手」看看——
+              {groupForkable && '能直接用、复制来改,'}
+              {groupAnalyzable && <>或<b>丢给 AI 帮你分析还能补充什么</b></>}。
+            </>
+          ) : (
+            <>
+              💡 你们教研组已准备了 <b>{groupCount}</b> 个「本校推荐」助手,
+              <b>备课时可以直接选用</b>。点右上角「现成助手」可以先看看它们。
+            </>
+          )}
         </div>
       )}
 
@@ -475,8 +426,7 @@ export default function MyAssistantsPage() {
           padding: '10px 18px', fontSize: '11px', color: C.textSec, lineHeight: 1.6,
           background: C.bg, borderBottom: `1px solid ${C.border}`, flexShrink: 0,
         }}>
-          挑一个现成的助手,可<b style={{ color: C.accent }}>🔍 丢给左侧 AI 分析</b>(让它帮你想还能补什么)、
-          <b style={{ color: C.primary }}>➕ 复制到我的</b>再改,或点描述展开细看。
+          这里是可以参考、选用的助手。每个助手下方会列出可用的操作,备课时也能直接在工坊里选用它们。点描述可展开细看。
         </div>
 
         <div style={{ flex: 1, overflow: 'auto', padding: '12px 14px' }}>
@@ -529,9 +479,12 @@ export default function MyAssistantsPage() {
                         item={item}
                         forking={forkingId === item.id}
                         analyzing={analyzingId === item.id}
+                        deleting={deletingId === item.id}
                         highlight={isBenchmark}
                         onAnalyze={() => handleAnalyze(item)}
                         onFork={() => handleFork(item)}
+                        onEdit={() => handleEdit(item)}
+                        onDelete={() => handleDelete(item)}
                       />
                     ))}
                   </div>
@@ -550,6 +503,15 @@ export default function MyAssistantsPage() {
         defaultSubject={subject}
         onClose={() => setSaveOpen(false)}
         onSaved={handleSaved}
+      />
+
+      {/* ==================== 编辑助手弹窗 ==================== */}
+      <AssistantEditModal
+        open={editId !== null}
+        mode="edit"
+        assistantId={editId || undefined}
+        onClose={() => setEditId(null)}
+        onSaved={handleEditSaved}
       />
 
       {/* ==================== 粘贴提示词弹窗 ==================== */}

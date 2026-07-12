@@ -64,6 +64,10 @@ const (
 	AllocationTypeManual  = "manual"  // 手动分配
 	AllocationTypeMonthly = "monthly" // 月度自动
 	AllocationTypeInitial = "initial" // 初始分配
+	// 自动补（用完自动补 / 月底补足机制，2026-07-04 新增）：
+	//   老师余额见底或月底不足 100 时，从本校学校账户自动补足到 100。
+	//   与 monthly 一同计入"当月已领"，受每月上限 500 约束。
+	AllocationTypeAuto = "auto"
 )
 
 // ==================== 采购类型常量 ====================
@@ -370,12 +374,12 @@ const (
 //
 // 金额统一用 credits_consumed 汇总（已验证全表 credits 与 amount 一致且非零）。
 type ConsumptionSummaryRow struct {
-	Key      string  `json:"key"`       // 维度键（学校ID/user_id/模型名/场景码/日期）
-	Label    string  `json:"label"`     // 展示名（中文/友好名）
-	Credits  float64 `json:"credits"`   // 该维度消费积分合计（credits_consumed SUM）
-	CostUSD  float64 `json:"cost_usd"`  // 该维度美元成本合计（前端按角色显隐：仅admin看）
-	Calls    int     `json:"calls"`     // 该维度调用次数（COUNT）
-	Percent  float64 `json:"percent"`   // 占总积分的百分比（0-100，后端算好）
+	Key     string  `json:"key"`      // 维度键（学校ID/user_id/模型名/场景码/日期）
+	Label   string  `json:"label"`    // 展示名（中文/友好名）
+	Credits float64 `json:"credits"`  // 该维度消费积分合计（credits_consumed SUM）
+	CostUSD float64 `json:"cost_usd"` // 该维度美元成本合计（前端按角色显隐：仅admin看）
+	Calls   int     `json:"calls"`    // 该维度调用次数（COUNT）
+	Percent float64 `json:"percent"`  // 占总积分的百分比（0-100，后端算好）
 }
 
 // ConsumptionSummaryResponse 汇总报告响应
@@ -383,13 +387,13 @@ type ConsumptionSummaryRow struct {
 // 返回某一维度的完整排行 + 总计。前端据此渲染排行榜（school/user/model/scene）
 // 或柱状图（time）。total 三项是该 scope 范围内的总和（用于占比分母与总览卡片）。
 type ConsumptionSummaryResponse struct {
-	Dimension    string                   `json:"dimension"`     // 回显维度
-	From         string                   `json:"from"`          // 回显时间范围起（空=不限）
-	To           string                   `json:"to"`            // 回显时间范围止（空=不限）
-	TotalCredits float64                  `json:"total_credits"` // scope内总消费积分
-	TotalCostUSD float64                  `json:"total_cost_usd"` // scope内总成本USD
-	TotalCalls   int                      `json:"total_calls"`   // scope内总调用次数
-	Rows         []*ConsumptionSummaryRow `json:"rows"`          // 排行/趋势数据
+	Dimension    string                   `json:"dimension"`               // 回显维度
+	From         string                   `json:"from"`                    // 回显时间范围起（空=不限）
+	To           string                   `json:"to"`                      // 回显时间范围止（空=不限）
+	TotalCredits float64                  `json:"total_credits"`           // scope内总消费积分
+	TotalCostUSD float64                  `json:"total_cost_usd"`          // scope内总成本USD
+	TotalCalls   int                      `json:"total_calls"`             // scope内总调用次数
+	Rows         []*ConsumptionSummaryRow `json:"rows"`                    // 排行/趋势数据
 	ScopeBlocked bool                     `json:"scope_blocked,omitempty"` // 范围被收窄为空集
 	ScopeMessage string                   `json:"scope_message,omitempty"` // 收窄原因
 }

@@ -258,7 +258,7 @@ func extractDocParagraphs(data []byte) []string {
 }
 
 // GenerateIndexFromDoc 从Word文档内容生成课件索引
-func (s *CoursewarePPTService) GenerateIndexFromDoc(ctx context.Context, coursewareID string, userID string, preset string) error {
+func (s *CoursewarePPTService) GenerateIndexFromDoc(ctx context.Context, coursewareID string, userID string, preset string, customHint string) error {
 	// ---- 1. 获取课件信息 ----
 	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
 	if err != nil {
@@ -309,7 +309,7 @@ func (s *CoursewarePPTService) GenerateIndexFromDoc(ctx context.Context, coursew
 	})
 
 	// ---- 4. 构建提示词 ----
-	userPrompt := s.buildDocIndexPrompt(cw, extractResult, preset)
+	userPrompt := s.buildDocIndexPrompt(cw, extractResult, preset, customHint)
 
 	// ---- 5. 加载系统提示词 ----
 	schemePrompt, sErr := repository.GetCurrentPromptByKey("prompt_courseware_scheme")
@@ -490,7 +490,7 @@ func cwGradeSegment(grade string) string {
 
 // buildDocIndexPrompt 构建Word文档→课件方案的提示词
 // v0.43: 补齐页数下限/区间约束 + 结构骨架 + 禁止概括成数页的硬约束
-func (s *CoursewarePPTService) buildDocIndexPrompt(cw *models.Courseware, doc *DocExtractResult, preset string) string {
+func (s *CoursewarePPTService) buildDocIndexPrompt(cw *models.Courseware, doc *DocExtractResult, preset string, customHint string) string {
 	var sb strings.Builder
 	sb.WriteString("你是K12课件规划专家。\n")
 	sb.WriteString("用户提供了一份教案文档的完整内容，\n")
@@ -511,13 +511,10 @@ func (s *CoursewarePPTService) buildDocIndexPrompt(cw *models.Courseware, doc *D
 	sb.WriteString(fullText)
 
 	// 注入预设
-	if preset != "" {
-		presetObj := models.GetSchemePresetByKey(preset)
-		if presetObj != nil && presetObj.PromptHint != "" {
-			sb.WriteString("\n\n")
-			sb.WriteString(presetObj.PromptHint)
-			sb.WriteString("\n")
-		}
+	if hint := models.ResolveSchemePromptHint(preset, customHint); hint != "" {
+		sb.WriteString("\n")
+		sb.WriteString(hint)
+		sb.WriteString("\n")
 	}
 
 	// ---- 关键修复：明确页数下限/区间，防止长教案被概括成1页 ----

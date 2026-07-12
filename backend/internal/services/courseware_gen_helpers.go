@@ -11,6 +11,7 @@ package services
 //   - ReplaceNavPageNumbers：页码占位符替换
 //   - buildPreviewUserPrompt / buildBatchUserPrompt：AI提示词构建
 //   - appendStyleConfig / appendMatchedComponents：提示词片段追加
+//   - appendRichnessGuidance：内容丰富度+概要忠实展开 硬指令注入
 //   - matchComponentsForPage：组件匹配
 //   - extractHTMLFromAIOutput / cwGenStripCodeFences：HTML提取
 //   - parseStyleConfig / loadTemplateInfo / defaultTemplateInfo：风格配置
@@ -21,6 +22,21 @@ package services
 // 批次3小修5：appendSamplePageReference 背景措辞改为来源感知——
 //   老师在图库选了背景时，不再出现"必须沿用样例官方背景图"的矛盾指令，
 //   样例参考bullet与【本页背景(硬性要求)】段均按实际背景来源动态措辞。
+//
+// 内容丰富度改造：新增 appendRichnessGuidance，把"内容丰富度"(estimated_complexity)
+//   与"内容概要"(content_summary)两个老师可控信号，翻译成喂给AI的人话硬指令。
+//
+// 教案原文校准改造：两个 build 函数(buildPreviewUserPrompt/buildBatchUserPrompt)
+//   新增 lessonContext 参数(教案全文，入口一次性取好传入)。函数内部对每页调
+//   extractPageRelevantLessonSection 做按页定向匹配，再经 appendLessonPlanCalibration
+//   把"与本页最相关的教案原文片段"作为事实校准锚注入提示词，令生成/重生的页面忠实教案、不脑补。
+//   lessonContext 为空(非教案来源/取数失败)时不注入，行为与改造前完全一致，零回归。
+//   取数与定向匹配逻辑见独立文件 courseware_gen_lesson_context.go。
+//
+// ★双cw-page封面守卫（本次修复，根治"导航栏被撑成1080满屏遮罩"反复横跳）：
+//   normalizeRootCanvas 遇到含 <!-- NAV_END --> 的双层封面结构直接原样返回，
+//   不再强改第一个div(导航栏)的尺寸。使自动生成/微调/重生/背景秒换四条路径行为统一，
+//   彻底消除"改一边坏一边"。详见 normalizeRootCanvas 函数注释。
 
 import (
 	"context"
@@ -39,9 +55,8 @@ import (
 // 导航栏模板中的 {{PAGE_NUM}} / {{TOTAL_PAGES}} 替换为实际页码
 // AI生成的内容区可能是完整的<div>（含最外层），也可能只是内容区片段
 func (s *CoursewareGenService) assembleFullPage(contentHTML string, navTemplate string, pageNum int, totalPages int, tplInfo *cwTemplateInfo) string {
-	// 替换导航栏中的页码占位符
-	nav := strings.ReplaceAll(navTemplate, "{{PAGE_NUM}}", fmt.Sprintf("%d", pageNum))
-	nav = strings.ReplaceAll(nav, "{{TOTAL_PAGES}}", fmt.Sprintf("%d", totalPages))
+	// 导航栏模板不含页码（保存时已剥除），此处由后端确定性追加页码div到导航栏末尾
+	nav := injectPageNumIntoNav(navTemplate, pageNum, totalPages)
 
 	// 构建CSS变量字符串
 	cssVars := s.buildCSSVarsString(tplInfo)
@@ -93,7 +108,26 @@ var (
 //
 // 只动第一个 <div 开标签，正文一律不碰；非<div开头或无法解析时原样返回。
 // 用于：assembleFullPage（批量生成+单页重生）与 RefinePage（单页微调）。
+//
+// ★双cw-page封面页守卫（本次修复，根治「导航栏被撑成1080满屏遮罩」反复横跳）：
+//
+//	含 <!-- NAV_END --> 的HTML是「导航栏div(第一个) + 内容div(第二个)」两层平级结构，
+//	是页面作者刻意设计的双层封面。本函数只认"第一个<div>"当根容器，会把导航栏div的
+//	height 用 enforceCanvasDecls 强改成 1080px；导航栏div自带 position:absolute +
+//	z-index:100 + 不透明背景，被撑成 1080px 后变成一整块满屏遮罩，盖住内容div全部正文
+//	（表现为"封面导航栏被改到全屏高、正文都在却完全看不见"）。这类双层结构的两个div尺寸
+//	AI已各自写对（导航栏≈80px + 内容1080px），画布闸门根本不该碰第一个div，故直接原样返回。
+//
+//	此守卫让自动生成(assembleFullPage) / 微调(RefinePage) / 重生(RegenerateSinglePage) /
+//	背景秒换(swapInjectedBackground) 四条路径对双cw-page结构的处理完全统一——此前各调用方
+//	各自用 Contains(NAV_END) 打补丁绕过本函数，微调路径漏打就"改一边坏一边"；现一处根治，
+//	各处原有的 NAV_END 判断降为幂等无害的冗余保险，不再此消彼长。
 func normalizeRootCanvas(html string) string {
+	// 双cw-page封面页（含 NAV_END）：两层平级结构，不动第一个div尺寸，原样返回。
+	if strings.Contains(html, "<!-- NAV_END -->") {
+		return html
+	}
+
 	trimmed := strings.TrimSpace(html)
 	if !strings.HasPrefix(strings.ToLower(trimmed), "<div") {
 		return html
@@ -201,8 +235,8 @@ func ExtractNavByMarkers(html string) string {
 	startIdx := strings.Index(html, startMarker)
 	endIdx := strings.Index(html, endMarker)
 
+	// 情况1（标准）：两个标记都存在，精确提取标记之间的内容
 	if startIdx >= 0 && endIdx > startIdx {
-		// 精确提取标记之间的内容
 		navContent := html[startIdx+len(startMarker) : endIdx]
 		navContent = strings.TrimSpace(navContent)
 		if navContent != "" {
@@ -210,16 +244,181 @@ func ExtractNavByMarkers(html string) string {
 		}
 	}
 
-	// 兜底：找第一个高度80px的div（兼容AI偶尔忘记标记的情况）
+	// 情况2（常见AI遗漏）：只有 NAV_END 没有 NAV_START
+	// AI经常忘记写 NAV_START 但写了 NAV_END，此时导航栏80px bar是从HTML开头到 NAV_END 之间的内容。
+	// 从HTML开头向后找第一个含 height:80 或 height: 80 的<div>，提取该完整div作为导航栏。
+	if startIdx < 0 && endIdx > 0 {
+		cwGenLog.Warn("只找到NAV_END未找到NAV_START，尝试从HTML开头提取80px导航栏div")
+		navFromTop := extractNavBarFromTopToEnd(html, endIdx)
+		if navFromTop != "" {
+			return navFromTop
+		}
+	}
+
+	// 情况3：两个标记都没找到，走兜底提取
 	cwGenLog.Warn("未找到NAV_START/NAV_END标记，尝试兜底提取导航栏")
 	return extractNavFallback(html)
 }
 
-// extractNavFallback 兜底导航栏提取：找最外层div的第一个子元素（高度约80px）
+// extractNavBarFromTopToEnd 从HTML开头到 endIdx 范围内，提取包含 height:80px 的完整导航栏div。
+//
+// 策略：在 [0, endIdx] 范围内找第一个含 "height:80" 或 "height: 80" 的 <div 开标签，
+// 然后按div层级配对找到其闭合 </div>，提取该完整div块（含开闭标签）。
+// 这精确覆盖"AI写了完整80px导航栏但忘写 NAV_START"的常见情况。
+func extractNavBarFromTopToEnd(html string, endIdx int) string {
+	if endIdx <= 0 || endIdx > len(html) {
+		return ""
+	}
+	region := html[:endIdx]
+	lowerRegion := strings.ToLower(region)
+
+	// 找包含 height:80 的 <div 起始位置（80px的导航栏标志）
+	// 同时兼容 "height:80px" 和 "height: 80px" 两种写法
+	heightIdx := -1
+	for _, pattern := range []string{"height:80", "height: 80"} {
+		idx := strings.Index(lowerRegion, pattern)
+		if idx >= 0 && (heightIdx < 0 || idx < heightIdx) {
+			heightIdx = idx
+		}
+	}
+	if heightIdx < 0 {
+		return "" // 无80px高度的div，无法识别导航栏
+	}
+
+	// 从 heightIdx 向前回溯找最近的 "<div"
+	beforeHeight := lowerRegion[:heightIdx]
+	divOpenStart := strings.LastIndex(beforeHeight, "<div")
+	if divOpenStart < 0 {
+		return ""
+	}
+
+	// 找该 <div 的开标签结束位置 '>'
+	gt := strings.Index(html[divOpenStart:], ">")
+	if gt < 0 {
+		return ""
+	}
+	openTagEnd := divOpenStart + gt + 1
+
+	// 从开标签结束位置开始，按div层级配对找闭合 </div>
+	depth := 0
+	i := openTagEnd
+	n := len(html)
+	for i < n {
+		// 找下一个 <div 或 </div>
+		nextOpen := strings.Index(strings.ToLower(html[i:]), "<div")
+		nextClose := strings.Index(strings.ToLower(html[i:]), "</div>")
+
+		if nextClose < 0 {
+			break // 无更多 </div>，无法配对
+		}
+		closeAbs := i + nextClose
+
+		// 检查是否有内嵌 <div 在此 </div> 之前
+		if nextOpen >= 0 {
+			openAbs := i + nextOpen
+			// 校验是真正的 <div（后跟空白或>，排除 <divx）
+			isReal := false
+			after := openAbs + 4
+			if after < n {
+				c := html[after]
+				if c == ' ' || c == '>' || c == '\t' || c == '\n' || c == '\r' || c == '/' {
+					isReal = true
+				}
+			}
+			if isReal && openAbs < closeAbs {
+				depth++
+				i = openAbs + 4
+				continue
+			}
+		}
+
+		// 处理 </div>
+		if depth == 0 {
+			// 找到导航栏div的闭合标签
+			fullNav := strings.TrimSpace(html[divOpenStart : closeAbs+6]) // 6 = len("</div>")
+			if fullNav != "" {
+				cwGenLog.Info("从HTML开头成功提取80px导航栏div", "nav_len", len(fullNav))
+				return fullNav
+			}
+			break
+		}
+		depth--
+		i = closeAbs + 6
+	}
+
+	return ""
+}
+
+// extractNavFallback 兜底导航栏提取（NAV_START/NAV_END均不存在时的最后手段）。
+//
+// 策略优先级：
+//   1. 优先找包含 "height:80" 或 "height: 80" 的 <div>（80px高度是导航栏的标志特征），
+//      提取该完整div块；
+//   2. 找不到80px div时，回退为找最外层div的第一个子div（兼容非标准导航栏高度的罕见情况）。
 func extractNavFallback(html string) string {
-	// 简单策略：找到第一个包含 height:80px 或 height: 80px 的div块
-	// 先找最外层div的开标签结束位置
-	outerDivStart := strings.Index(html, "<div")
+	lowerHTML := strings.ToLower(html)
+
+	// ---- 策略1：找包含 height:80 的 <div>（导航栏标志） ----
+	heightIdx := -1
+	for _, pattern := range []string{"height:80", "height: 80"} {
+		idx := strings.Index(lowerHTML, pattern)
+		if idx >= 0 && (heightIdx < 0 || idx < heightIdx) {
+			heightIdx = idx
+		}
+	}
+	if heightIdx >= 0 {
+		// 从 heightIdx 向前回溯找最近的 "<div"
+		beforeHeight := lowerHTML[:heightIdx]
+		divStart := strings.LastIndex(beforeHeight, "<div")
+		if divStart >= 0 {
+			gt := strings.Index(html[divStart:], ">")
+			if gt >= 0 {
+				inner := divStart + gt + 1
+				// 按div层级配对找闭合 </div>
+				depth := 0
+				i := inner
+				n := len(html)
+				for i < n {
+					nextOpen := strings.Index(lowerHTML[i:], "<div")
+					nextClose := strings.Index(lowerHTML[i:], "</div>")
+					if nextClose < 0 {
+						break
+					}
+					closeAbs := i + nextClose
+					if nextOpen >= 0 {
+						openAbs := i + nextOpen
+						isReal := false
+						after := openAbs + 4
+						if after < n {
+							c := html[after]
+							if c == ' ' || c == '>' || c == '\t' || c == '\n' || c == '\r' || c == '/' {
+								isReal = true
+							}
+						}
+						if isReal && openAbs < closeAbs {
+							depth++
+							i = openAbs + 4
+							continue
+						}
+					}
+					if depth == 0 {
+						result := strings.TrimSpace(html[divStart : closeAbs+6])
+						if result != "" {
+							cwGenLog.Info("兜底提取导航栏成功(80px特征匹配)", "nav_len", len(result))
+							return result
+						}
+						break
+					}
+					depth--
+					i = closeAbs + 6
+				}
+			}
+		}
+	}
+
+	// ---- 策略2：回退为找最外层div的第一个子div（兼容非标准导航栏） ----
+	cwGenLog.Warn("未找到80px导航栏特征，回退为提取最外层div的第一个子div")
+	outerDivStart := strings.Index(lowerHTML, "<div")
 	if outerDivStart < 0 {
 		return ""
 	}
@@ -230,47 +429,173 @@ func extractNavFallback(html string) string {
 	afterOuterOpen := outerDivStart + firstGT + 1
 
 	// 在外层div内部找第一个子div
-	innerContent := html[afterOuterOpen:]
+	innerContent := lowerHTML[afterOuterOpen:]
 	childDivStart := strings.Index(innerContent, "<div")
 	if childDivStart < 0 {
 		return ""
 	}
+	childAbsStart := afterOuterOpen + childDivStart
 
-	// 提取这个子div的完整HTML（简单的标签匹配）
-	childHTML := innerContent[childDivStart:]
+	// 提取这个子div的完整HTML（标签配对）
+	childGT := strings.Index(html[childAbsStart:], ">")
+	if childGT < 0 {
+		return ""
+	}
+	childInner := childAbsStart + childGT + 1
 	depth := 0
-	i := 0
-	for i < len(childHTML) {
-		if strings.HasPrefix(childHTML[i:], "<div") {
-			depth++
-			i += 4
-		} else if strings.HasPrefix(childHTML[i:], "</div>") {
-			depth--
-			if depth == 0 {
-				return strings.TrimSpace(childHTML[:i+6])
-			}
-			i += 6
-		} else {
-			i++
+	i := childInner
+	n := len(html)
+	for i < n {
+		nextOpen := strings.Index(lowerHTML[i:], "<div")
+		nextClose := strings.Index(lowerHTML[i:], "</div>")
+		if nextClose < 0 {
+			break
 		}
+		closeAbs := i + nextClose
+		if nextOpen >= 0 {
+			openAbs := i + nextOpen
+			isReal := false
+			after := openAbs + 4
+			if after < n {
+				c := html[after]
+				if c == ' ' || c == '>' || c == '\t' || c == '\n' || c == '\r' || c == '/' {
+					isReal = true
+				}
+			}
+			if isReal && openAbs < closeAbs {
+				depth++
+				i = openAbs + 4
+				continue
+			}
+		}
+		if depth == 0 {
+			result := strings.TrimSpace(html[childAbsStart : closeAbs+6])
+			if result != "" {
+				return result
+			}
+			break
+		}
+		depth--
+		i = closeAbs + 6
 	}
 	return ""
 }
 
+// cwNavURLGuardRe 匹配导航栏HTML里的"URL上下文"，用于页码替换前的整体保护：
+//   - src="..."/src='...'（如 Logo <img>）
+//   - href="..."/href='...'
+//   - url(...)（CSS background 等）
+//
+// 这些区间内部若含 "数字 / 数字" 形态（例如图片路径 .../763 / 242453....png），
+// 绝不能被当成页码替换。故先整体挖出占位、替换页码后再原样还原。
+var cwNavURLGuardRe = regexp.MustCompile(`(?is)(?:src|href)\s*=\s*"[^"]*"|(?:src|href)\s*=\s*'[^']*'|url\([^)]*\)`)
+
+// cwNavPageNumRe 定义在 courseware_page_resync.go 中（同包共用，此处不重复定义）
+
 // ReplaceNavPageNumbers P0-1: 将导航栏HTML中的硬编码页码替换为占位符
 // 匹配模式："数字 / 数字" → "{{PAGE_NUM}} / {{TOTAL_PAGES}}"
 // 例如："1 / 15" → "{{PAGE_NUM}} / {{TOTAL_PAGES}}"
+//
+// 修复（防误伤Logo URL）：旧实现直接对整段HTML做"数字/数字"全局替换，
+//   会把 <img src="/uploads/.../763 / 242453....png"> 这类图片路径里的数字串
+//   误当页码替换成占位符，导致Logo URL被写坏、图片彻底裂掉（手动批量与全自动装配同源中招）。
+//   现改为：先用 cwNavURLGuardRe 把所有 src/href/url() 的URL上下文整体挖出、以不可见占位符替换保护，
+//   仅对剩余文本（真正的页码显示区）做替换，最后把被保护的URL原样还原。
+//   对"页码在正文文本、Logo URL在属性里"这一稳定结构，替换精准且零副作用。
 func ReplaceNavPageNumbers(navHTML string) string {
-	// 匹配 "数字 / 数字" 或 "数字/数字" 模式（页码显示）
-	re := regexp.MustCompile(`(\d{1,3})\s*/\s*(\d{1,3})`)
-	result := re.ReplaceAllString(navHTML, "{{PAGE_NUM}} / {{TOTAL_PAGES}}")
-	return result
+	// 兼容旧调用名：内部转调 StripNavPageNumbers（从导航栏中剥除页码元素）
+	// 页码改由 injectPageNumIntoNav 在拼接时后端确定性追加，不再做占位符替换
+	return StripNavPageNumbers(navHTML)
+}
+
+// ==================== 内容丰富度 + 概要忠实展开 硬指令注入 ====================
+
+// cwRichnessDetailSummaryRunes 判定"概要写得详细"的字符数阈值（rune计数）。
+// 经验值：AI在确认方案阶段自动生成的概要普遍 60~90 字，老师手动写详细时往往超过 100 字。
+// 超过此阈值或概要含明显分点符号时，视为"老师有意写详尽"，要求AI逐点忠实展开。
+const cwRichnessDetailSummaryRunes = 100
+
+// cwSummaryHasBulletPoints 判定概要里是否含"分点/列举"特征（顿号、分号、序号、换行项目符号等）。
+// 含分点说明老师把这页拆成了多个要点，AI应逐点展开而非合并成一段。
+func cwSummaryHasBulletPoints(summary string) bool {
+	// 常见分点标志：中文顿号/分号、阿拉伯数字编号、圆点、破折号列举、换行
+	markers := []string{"、", "；", ";", "\n", "①", "②", "③", "1.", "2.", "3.", "1、", "2、", "•", "- ", "—"}
+	hit := 0
+	for _, m := range markers {
+		if strings.Contains(summary, m) {
+			hit++
+		}
+	}
+	// 命中两类及以上分点标志，或单一标志出现多次，才算"有结构的分点"，避免一句话里偶含顿号误判
+	if hit >= 2 {
+		return true
+	}
+	return strings.Count(summary, "、")+strings.Count(summary, "；")+strings.Count(summary, "\n") >= 2
+}
+
+// appendRichnessGuidance 把"内容丰富度"(estimated_complexity)与"内容概要详略"翻译成
+// 喂给AI的人话硬指令，追加到提示词末尾的"本页方案"之后、生成指令之前。
+//
+// 设计目标：
+//   - 让老师在"确认方案"里把某页设为"充实"时，该页生成内容确实更丰富（多分点、多举例、信息密度高）；
+//     设为"精简"时该页提炼要点、适度留白——令"想让哪页详细就设哪页充实"成立。
+//   - 让老师把概要写得详尽（>阈值或含分点）时，AI严格逐点展开，不再把详尽概要一扫而过。
+//
+// 安全性：纯追加文本，不改任何既有逻辑；complexity 越界时按"适中"兜底，绝不报错。
+// estimated_complexity 映射（与前端"内容丰富度"三档对齐）：
+//
+//	2 = 精简（🌱）、3 = 适中（📖）、5 = 充实（🎯）；1/4 等中间值按就近档位归并。
+func (s *CoursewareGenService) appendRichnessGuidance(sb *strings.Builder, page *models.CoursewarePage) {
+	if page == nil {
+		return
+	}
+
+	sb.WriteString("## 内容丰富度（硬性要求，决定本页信息量）\n")
+
+	// ---- 1. 按复杂度档位给出"丰富度"硬指令 ----
+	// 归档：>=4 视为充实，==3 视为适中，<=2 视为精简；0/越界按适中兜底。
+	c := page.EstimatedComplexity
+	switch {
+	case c >= 4:
+		// 充实档（🎯）：要求充分展开、铺满内容区
+		sb.WriteString("本页定位为「充实页」（老师指定为重点页，要内容丰富）。请充分展开本页内容：\n")
+		sb.WriteString("- 把上方【本页方案】的每个要点都展开讲透，能分点的尽量分点，能举例的多举贴近学生生活的实例；\n")
+		sb.WriteString("- 信息密度要高，用多张要点卡片 / 图文分区 / 步骤拆解把内容区（约1792×952px）充分铺满，避免大片空白；\n")
+		sb.WriteString("- 在不破坏文字铁律（不溢出、不切字、字号不低于下限）的前提下，宁可内容更丰富也不要单薄。\n")
+	case c == 3:
+		// 适中档（📖）：标准图文讲解
+		sb.WriteString("本页定位为「适中页」。请做标准的图文讲解：\n")
+		sb.WriteString("- 把【本页方案】的核心内容讲清楚，配合要点卡片或图文混排，结构清晰；\n")
+		sb.WriteString("- 内容量适中，既不堆砌也不单薄，自然铺排即可。\n")
+	default:
+		// 精简档（🌱，c<=2 或越界兜底）：提炼要点、留白呼吸
+		sb.WriteString("本页定位为「精简页」。请做克制精炼的表达：\n")
+		sb.WriteString("- 只提炼【本页方案】里最核心的要点，用简洁的标题+少量要点呈现；\n")
+		sb.WriteString("- 适度留白、给画面呼吸感，不要为了填满而硬塞内容。\n")
+	}
+
+	// ---- 2. 概要详略感知：概要写得详尽时，强制逐点忠实展开 ----
+	summary := strings.TrimSpace(page.ContentSummary)
+	if summary != "" {
+		detailed := len([]rune(summary)) >= cwRichnessDetailSummaryRunes || cwSummaryHasBulletPoints(summary)
+		if detailed {
+			sb.WriteString("- 注意：本页【内容概要】写得较为详尽，这是老师对本页的明确要求。")
+			sb.WriteString("请严格按概要逐点充分落实，不得简化、跳过或合并要点；概要提到的每个点都要在页面上有对应呈现。\n")
+		}
+	}
+
+	sb.WriteString("\n")
 }
 
 // ==================== 预览模式提示词构建 ====================
 
 // buildPreviewUserPrompt 构建预览模式的AI用户提示词
 // 预览模式：AI自由生成导航栏（用NAV标记包裹），生成完整页面
+//
+// 教案原文校准改造（本次）：新增 lessonContext 参数（教案全文，入口取一次传入）。
+//
+//	函数内对本页做 extractPageRelevantLessonSection 定向匹配，再 appendLessonPlanCalibration 注入。
+//	lessonContext 为空(非教案来源/取数失败)时不注入，行为与改造前一致。
 func (s *CoursewareGenService) buildPreviewUserPrompt(
 	page *models.CoursewarePage,
 	pageNum int, totalPages int,
@@ -278,6 +603,7 @@ func (s *CoursewareGenService) buildPreviewUserPrompt(
 	logoURL string, orgName string,
 	matchedComps []*models.MatchedCWComponent,
 	cw *models.Courseware,
+	lessonContext string,
 ) string {
 	var sb strings.Builder
 
@@ -301,6 +627,17 @@ func (s *CoursewareGenService) buildPreviewUserPrompt(
 	}
 	sb.WriteString(fmt.Sprintf("- 预估复杂度：%d/5\n", page.EstimatedComplexity))
 	sb.WriteString("\n")
+
+	// 教案原文校准（本次新增）：按页定向匹配教案相关片段，作为事实来源注入
+	s.appendLessonPlanCalibration(&sb, extractPageRelevantLessonSection(lessonContext, page))
+
+	// 阶段一（跨页共享案例一致性）：注入课件级共享案例清单，令 P5/P6 等多页共用的一套案例
+	//   （如"6个点子"）对所有页逐字相同，消除各页自行现编案例的自由度。
+	//   共享案例段在此现算(纯字符串)，非枚举型教案识别不到则不注入，行为不变、零回归。
+	s.appendSharedExampleCalibration(&sb, lessonContext)
+
+	// 内容丰富度 + 概要忠实展开 硬指令
+	s.appendRichnessGuidance(&sb, page)
 
 	// 封面页提示
 	sb.WriteString("⚠️ 这是封面页（第1页），请生成大标题居中的封面设计，突出课件标题、学科年级和机构品牌。\n\n")
@@ -344,6 +681,11 @@ func (s *CoursewareGenService) buildPreviewUserPrompt(
 
 // buildBatchUserPrompt 构建批量生成模式的AI用户提示词
 // 批量模式：AI只生成内容区HTML（不含导航栏），后端自动拼接导航栏
+//
+// 教案原文校准改造（本次）：新增 lessonContext 参数（教案全文，入口取一次传入）。
+//
+//	函数内对本页做 extractPageRelevantLessonSection 定向匹配，再 appendLessonPlanCalibration 注入。
+//	lessonContext 为空(非教案来源/取数失败)时不注入，行为与改造前一致。
 func (s *CoursewareGenService) buildBatchUserPrompt(
 	page *models.CoursewarePage,
 	pageNum int, totalPages int,
@@ -351,6 +693,7 @@ func (s *CoursewareGenService) buildBatchUserPrompt(
 	logoURL string, orgName string,
 	matchedComps []*models.MatchedCWComponent,
 	cw *models.Courseware,
+	lessonContext string,
 ) string {
 	var sb strings.Builder
 
@@ -374,6 +717,17 @@ func (s *CoursewareGenService) buildBatchUserPrompt(
 	}
 	sb.WriteString(fmt.Sprintf("- 预估复杂度：%d/5\n", page.EstimatedComplexity))
 	sb.WriteString("\n")
+
+	// 教案原文校准（本次新增）：按页定向匹配教案相关片段，作为事实来源注入
+	s.appendLessonPlanCalibration(&sb, extractPageRelevantLessonSection(lessonContext, page))
+
+	// 阶段一（跨页共享案例一致性）：注入课件级共享案例清单，令 P5/P6 等多页共用的一套案例
+	//   （如"6个点子"）对所有页逐字相同，消除各页自行现编案例的自由度。
+	//   共享案例段在此现算(纯字符串)，非枚举型教案识别不到则不注入，行为不变、零回归。
+	s.appendSharedExampleCalibration(&sb, lessonContext)
+
+	// 内容丰富度 + 概要忠实展开 硬指令
+	s.appendRichnessGuidance(&sb, page)
 
 	// 页面位置提示
 	if pageNum == 2 {
@@ -541,8 +895,6 @@ func (s *CoursewareGenService) appendSamplePageReference(
 	sb.WriteString("\n\x60\x60\x60\n\n")
 
 	// 背景硬约束（来源感知）：三级优先级——老师图库选择 > 模板样例提取 > 无。
-	// 把背景从"AI建议"升级为明示的硬性要求，并告知后端 applyTemplateBackground 会兜底强制注入，
-	// AI据此按"内容压在背景图上"的前提设计半透明卡片+backdrop-filter，避免注入后可读性冲突。
 	bgDecls := userBgDecls
 	bgSource := "老师在背景图库中为本课件选定的背景图"
 	if bgDecls == "" {
@@ -610,7 +962,7 @@ func extractSampleBackgroundDecls(samplePages []string, pageNum int) string {
 	return strings.Join(out, ";")
 }
 
-// applyTemplateBackground 后端兜底：把模板官方背景声明强制注入页面根容器。
+// applyTemplateBackgroundOnly 后端兜底：把模板官方背景声明强制注入页面根容器。
 //
 // 背景（本次修复的根因）：系统提示词明确指令"背景色:var(--cw-bg)"+"不依赖外部资源"，
 // AI严格服从，导致样例参考里建议性的"可沿用背景图"被无视。本函数把背景从"AI建议"
@@ -630,7 +982,20 @@ func (s *CoursewareGenService) applyTemplateBackgroundOnly(html string, tplInfo 
 		return html
 	}
 	// 批次1三级优先级：老师图库选择(课件级) > 模板自带背景(样例提取) > 无
-	bgDecls := resolveUserBgDecls(tplInfo, pageNum)
+	// 四级优先级：页级覆盖 > 老师图库选择(课件级) > 模板自带背景(样例提取) > 无
+	courseLevelDecls := resolveUserBgDecls(tplInfo, pageNum)
+	bgDecls := ""
+	// 第零级：页级背景覆盖（老师给某页单独设了背景或蒙版模式）
+	if tplInfo.PageBgSettings != nil {
+		if pageBg, ok := tplInfo.PageBgSettings[pageNum]; ok {
+			bgDecls = resolvePageBgDecls(pageBg, pageNum, courseLevelDecls)
+		}
+	}
+	// 第一级：课件级图库选择
+	if bgDecls == "" {
+		bgDecls = courseLevelDecls
+	}
+	// 第二级：模板自带背景(样例提取)
 	if bgDecls == "" {
 		bgDecls = extractSampleBackgroundDecls(tplInfo.SamplePages, pageNum)
 	}
@@ -640,6 +1005,40 @@ func (s *CoursewareGenService) applyTemplateBackgroundOnly(html string, tplInfo 
 	if strings.Contains(html, "TEDNA-TPL-BG") {
 		return html // 已注入过，幂等跳过
 	}
+	// 先构建注入用的 <style> 标签（声明加 !important 压过内联样式）
+	var parts []string
+	for _, d := range strings.Split(bgDecls, ";") {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			parts = append(parts, d+" !important")
+		}
+	}
+	// 选择器 .cw-page:last-of-type 与秒换 buildBgStyleTag 完全一致:双cw-page封面只命中内容div,单页命中唯一div,零回归
+	styleTag := "<style>/* TEDNA-TPL-BG 模板官方背景兜底注入 */.cw-page:last-of-type{" + strings.Join(parts, ";") + "}</style>"
+
+	// ★双cw-page封面(含 NAV_END:导航栏div + 内容div)——跳过 normalizeRootCanvas。
+	// 根因修复：normalizeRootCanvas 只认"第一个div"当根容器，会把导航栏div的 height
+	// 用 enforceCanvasDecls 强改成 1080px。导航栏div自带 position:absolute + z-index:100
+	// + 不透明背景，被撑成 1080px 后就变成一整块满屏遮罩，盖住下面内容div的全部正文
+	// （表现为"首页导航栏被改到全屏高"）。与背景秒换 swapInjectedBackground 路径B 口径一致：
+	// 含 NAV_END 时不动任何div尺寸，直接把 <style> 注入到第一个div开标签之后即可
+	// （<style>为全局CSS，注入位置无所谓；选择器 :last-of-type 精准命中内容div）。
+	// 注：normalizeRootCanvas 现已自带 NAV_END 守卫（原样返回），此处判断成为幂等冗余保险，
+	//     两处一致、互不冲突，保留以维持注入位置逻辑清晰。
+	if strings.Contains(html, "<!-- NAV_END -->") {
+		t := strings.TrimSpace(html)
+		if !strings.HasPrefix(strings.ToLower(t), "<div") {
+			return html
+		}
+		gt := strings.Index(t, ">")
+		if gt < 0 {
+			return html
+		}
+		cwGenLog.Info("模板官方背景已兜底注入(双cw-page封面,跳过画布闸门防撑坏导航栏)", "page_num", pageNum)
+		return t[:gt+1] + styleTag + t[gt+1:]
+	}
+
+	// 单cw-page普通页：维持原逻辑——过 normalizeRootCanvas 画布闸门规范根容器后再注入。
 	out := normalizeRootCanvas(html)
 	trimmed := strings.TrimSpace(out)
 	if !strings.HasPrefix(strings.ToLower(trimmed), "<div") {
@@ -649,14 +1048,6 @@ func (s *CoursewareGenService) applyTemplateBackgroundOnly(html string, tplInfo 
 	if gt < 0 {
 		return html
 	}
-	var parts []string
-	for _, d := range strings.Split(bgDecls, ";") {
-		d = strings.TrimSpace(d)
-		if d != "" {
-			parts = append(parts, d+" !important")
-		}
-	}
-	styleTag := "<style>/* TEDNA-TPL-BG 模板官方背景兜底注入 */.cw-page{" + strings.Join(parts, ";") + "}</style>"
 	cwGenLog.Info("模板官方背景已兜底注入", "page_num", pageNum)
 	return trimmed[:gt+1] + styleTag + trimmed[gt+1:]
 }
@@ -722,8 +1113,6 @@ func (s *CoursewareGenService) extractHTMLFromAIOutput(aiOutput string) string {
 	}
 
 	// 截断到最后一个 </div>，剥掉 AI 在 HTML 之后追加的解释文字 / 代码围栏残留
-	// 修复：微调时 AI 常在 HTML 后补一句"我已经改好了…"或再贴一段代码围栏，
-	// 旧逻辑取 text[divStart:] 直到字符串末尾，导致这些尾巴被当作页面内容存库并渲染到预览。
 	if last := strings.LastIndex(htmlPart, "</div>"); last >= 0 {
 		htmlPart = htmlPart[:last+len("</div>")]
 	}
@@ -784,7 +1173,6 @@ func (s *CoursewareGenService) loadTemplateInfo(ctx context.Context, templateID 
 		_ = json.Unmarshal([]byte(tpl.ColorScheme), &info.ColorScheme)
 	}
 	// 任务2（分页参考注入）：解析模板样例页数组，供生成提示词按页型注入官方样例参考。
-	// 解析失败不致命——SamplePages 留空时 appendSamplePageReference 静默跳过，行为退回旧版。
 	if tpl.SamplePages != "" {
 		_ = json.Unmarshal([]byte(tpl.SamplePages), &info.SamplePages)
 	}

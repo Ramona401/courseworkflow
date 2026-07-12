@@ -10,10 +10,13 @@
  *   父组件不再每次翻页回写（双源打架会导致翻页回弹）。改为退出时经 onClose(finalPage)
  *   一次性回传当前停留页；切到放映时经 onSlideshow(pn) 带上当前页。
  *   工具栏在顶部、不遮挡课件，故不做放映态那种「手动隐藏控制条」处理。
+ *
+ * 【v5.5 焦点穿透修复】用户点击课件互动元素后焦点进入 iframe，键盘翻页失效。
+ *   修复：监听来自 iframe 的 postMessage 导航按键转发消息，在父窗口执行翻页/退出。
  */
 import { useState, useEffect, useRef } from 'react'
 import { CW_WIDTH, CW_HEIGHT } from './workshopConstants'
-import { injectPreviewMode } from './previewInject'
+import { injectPreviewMode, NAV_KEY_MSG_TYPE } from './previewInject'
 
 export default function CWFullscreenPreview({ pages, initialPageNum, codeView, onToggleCode, onClose, onSlideshow }: {
   pages: { page_number: number; title: string; html_content: string }[]
@@ -57,12 +60,38 @@ export default function CWFullscreenPreview({ pages, initialPageNum, codeView, o
   // 键盘导航：左右箭头翻页 + ESC退出
   useEffect(() => {
     const fn = (e: KeyboardEvent) => {
+      // v5.5: 如果焦点在输入框内，不处理（全屏预览场景通常不会有，但防御性编码）
+      const tag = (e.target as HTMLElement)?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
       if (e.key === 'Escape') { doClose(); return }
       if (e.key === 'ArrowLeft' && hasPrev) gotoPage(pages[idx - 1].page_number)
       if (e.key === 'ArrowRight' && hasNext) gotoPage(pages[idx + 1].page_number)
     }
     window.addEventListener('keydown', fn)
     return () => window.removeEventListener('keydown', fn)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idx, hasPrev, hasNext, pages])
+
+  // 【v5.5 焦点穿透修复】监听来自 iframe 的 postMessage 导航按键转发
+  // iframe 内用户点击互动元素后焦点被 iframe 捕获，keydown 不再冒泡到父 window，
+  // 但 previewInject.ts 注入的脚本会把导航按键经 postMessage 转发到这里。
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      // 校验消息格式：必须是来自 iframe 的导航按键转发
+      if (!e.data || e.data.type !== NAV_KEY_MSG_TYPE) return
+      const key = e.data.key as string
+      if (!key) return
+
+      if (key === 'Escape') { doClose(); return }
+      if (key === 'ArrowLeft' && hasPrev) {
+        gotoPage(pages[idx - 1].page_number)
+      }
+      if (key === 'ArrowRight' && hasNext) {
+        gotoPage(pages[idx + 1].page_number)
+      }
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [idx, hasPrev, hasNext, pages])
 

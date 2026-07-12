@@ -13,6 +13,15 @@
  *   GET /api/v1/unit-plans/mountable[?subject=xxx]   可被教案挂载的单元方案（只列 active）→ {unit_plans,total}
  *   PUT /api/v1/lesson-plans/plans/{id}/unit-plan    教案挂载/解除单元方案（体 {unit_plan_id}，空串=解除）
  *
+ * v233 新增（课程大纲教材版本绑定，对齐备课工坊）：
+ *   StartUnitPlanRequest / UnitPlanDetail 各增加 course_outline_publisher 三态字段，
+ *   语义与教案侧 course_outline_publisher 完全一致：
+ *     - 不传 / null   → 不关联大纲（AI 对话时不注入任何课程大纲；存量老会话均为此态）
+ *     - ''（空串）    → 通用/不限版本（只注入 publisher 为空串的大纲）
+ *     - '人教版' 等具名 → 只注入该版本大纲（后端零跨版本兜底，对不上就不注入）
+ *   会话建立时定版落库，后端每轮对话重读该列注入，中途不可改版（需换版请新建会话）。
+ *   可选版本列表由 course-outlines.ts 的 getAvailablePublishers(subject, grade) 提供。
+ *
  * 归属选择器复用 ai-assistants 的 getMyPublishGroups()。
  * 拦截器已处理 code!==0 抛错，本文件直接取 data.data。AI 调用接口超时放宽到 180s。
  */
@@ -60,6 +69,14 @@ export interface UnitPlanDetail {
   created_by: string
   created_at: string
   updated_at: string
+  /**
+   * 本会话选定的课程大纲教材版本（三态，v233 新增）：
+   *   null      = 未关联大纲（对话不注入任何课程大纲；存量老会话均为此态）
+   *   ''        = 通用/不限版本（只注入 publisher 为空串的大纲）
+   *   '人教版'  = 具名版本（只注入该版本大纲，零跨版本兜底）
+   * 展示时请用 course-outlines.ts 的 publisherLabel() 把空串转成"通用 / 不限版本"文案。
+   */
+  course_outline_publisher: string | null
 }
 
 export interface StartUnitPlanRequest {
@@ -70,6 +87,12 @@ export interface StartUnitPlanRequest {
   volume: string
   unit: string
   title?: string
+  /**
+   * 可选：选定课程大纲教材版本（三态，v233 新增）。
+   *   不传 / null → 不关联大纲；'' → 通用版；'人教版' 等 → 该版本精确匹配注入。
+   * 会话建立时定版，中途不可改（需换版请新建会话）。
+   */
+  course_outline_publisher?: string | null
 }
 
 export interface SaveUnitPlanRequest {

@@ -36,6 +36,9 @@ import {
   type StageProgressItem,
 } from '@/api/lesson-plans'
 import { updatePlanUnitPlan } from '@/api/unit-plans'
+import { updatePlanTextbooks } from '@/api/lesson-plan-textbooks'
+import { updatePlanClassProfile } from '@/api/lesson-plan-class-profiles'
+import { setLessonPlanCourseOutlinePublisher } from '@/api/course-outlines'
 import { C, SUBJECTS, GRADES, STAGE_CODE_NAME, type StreamingState } from '../components/workshopConstants'
 import { AIBubble, UserBubble, ThinkingIndicator } from '../components/WorkshopPanels'
 import ImportPlanModal from '../components/ImportPlanModal'
@@ -47,6 +50,7 @@ import ConversationTopBar from './ConversationTopBar'
 import ConversationChipRow from './ConversationChipRow'
 import RetryControls from './RetryControls'
 import TextbookAttachModal from './TextbookAttachModal'
+import RefMaterialAttachModal from './RefMaterialAttachModal'
 import { useConversationSSE } from './useConversationSSE'
 import { useRetryLastMessage } from './useRetryLastMessage'
 import { computeVisibleChips, shouldHideHistoryMessage, isFullLessonPlanMessage } from './conversationChips'
@@ -75,8 +79,17 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
   // 大单元挂载（起步选）：首屏「所属单元方案（选填）」下拉选中的方案ID（空串=不关联）。
   // 本页持有，透传首屏；handleStart 建会话后落库，落库成功即清空（临时选择已固化到教案）。
   const [unitPlanId, setUnitPlanId] = useState('')
+  // 班级学情挂载（起步选）：首屏「本班学情（选填）」下拉选中的班级卡ID（空串=不关联）。
+  // 与 unitPlanId 同款：本页持有，透传首屏；handleStart 建会话后落库，落库成功即清空。
+  const [classProfileId, setClassProfileId] = useState('')
+  // 教材版本（起步选）：首屏「教材版本」选择器选定的课程大纲版本。
+  // 三态：null=不关联大纲(不注入)；''=通用/不限版本；'人教版'等=具名版本。
+  // 本页持有，透传首屏；handleStart 建会话后落库，落库成功即重置为 null。
+  const [coursePublisher, setCoursePublisher] = useState<string | null>(null)
   // v203 新增：对话模式首屏配方选择（选了传 recipe_id，没选就不传）
   const [recipeId, setRecipeId] = useState('')
+  // v231 新增：课时时长选择（默认45分钟，小学常见40分钟，老师可在首屏自由选择）
+  const [duration, setDuration] = useState(45)
   const [startLoading, setStartLoading] = useState(false)
   const [showImportModal, setShowImportModal] = useState(false)
 
@@ -101,6 +114,12 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
 
   const [showTextbookModal, setShowTextbookModal] = useState(false)
   const [attachedTextbookIds, setAttachedTextbookIds] = useState<string[]>([])
+
+  // 参考资料附件（会话级，不落库）：注入文本 + 文件名。
+  // refMaterial 用 ref 镜像给 sendChatMessage 闭包读，避免闭包捕获旧 state（同 lastSentComponentIdsRef 思路）。
+  const [showRefModal, setShowRefModal] = useState(false)
+  const [refMaterialName, setRefMaterialName] = useState('')
+  const refMaterialRef = useRef<string>('')
 
   const [stageItems, setStageItems] = useState<StageProgressItem[]>([])
   const [currentStage, setCurrentStage] = useState<string>('')
@@ -276,7 +295,7 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     if (!topic.trim() || startLoading) return
     setStartLoading(true)
     try {
-      const resp = await startConversation({ subject, grade, topic: topic.trim(), duration_minutes: 45, recipe_id: recipeId || undefined })
+      const resp = await startConversation({ subject, grade, topic: topic.trim(), duration_minutes: duration, recipe_id: recipeId || undefined })
       setPlan(resp.plan)
       setMessages([resp.opening_message])
       setPhase('chatting')
@@ -302,7 +321,50 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
           }])
         }
       }
+      // 班级学情挂载（起步选）：若首屏选了班级卡，建会话后立即落库归属。
+      // 独立 try-catch 吞错——挂载失败绝不阻断主流程（教案已建好），失败仅提示一句。
+      // 落库成功后第一条用户消息起，后端注入层在 analyze/design/write 三阶段注入该班级学情。
+      if (classProfileId) {
+        try {
+          await updatePlanClassProfile(resp.plan.id, classProfileId)
+          setMessages(prev => [...prev, {
+            id: `classprofile_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
+            content: '👥 已关联本班学情，接下来我会针对这个班的分层结构与薄弱点，和你一起做差异化的教学设计。',
+            created_at: new Date().toISOString(),
+          }])
+        } catch (cpErr) {
+          console.error('班级学情挂载失败:', cpErr)
+          setMessages(prev => [...prev, {
+            id: `classprofile_err_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
+            content: '⚠️ 本班学情关联未成功，不影响正常备课。如需关联，可稍后重试。',
+            created_at: new Date().toISOString(),
+          }])
+        }
+      }
+      // 教材版本落库（起步选）：仅当老师选定了版本(非 null)才写库。
+      // 独立 try-catch 吞错——失败不阻断主流程。落库成功后 analyze/design 阶段
+      // 注入层据该版本精确匹配注入对应版本大纲（零跨版本兜底）。
+      if (coursePublisher !== null) {
+        try {
+          await setLessonPlanCourseOutlinePublisher(resp.plan.id, coursePublisher)
+          const verName = coursePublisher === '' ? '通用 / 不限版本' : coursePublisher
+          setMessages(prev => [...prev, {
+            id: `coursepub_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
+            content: `📚 已关联「${verName}」课程大纲，接下来我会贴着这版教材的大纲来和你一起备课。`,
+            created_at: new Date().toISOString(),
+          }])
+        } catch (cpubErr) {
+          console.error('教材版本关联失败:', cpubErr)
+          setMessages(prev => [...prev, {
+            id: `coursepub_err_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
+            content: '⚠️ 课程大纲版本关联未成功，不影响正常备课。如需关联，可稍后重试。',
+            created_at: new Date().toISOString(),
+          }])
+        }
+      }
       setUnitPlanId('') // 临时选择已固化到教案，回到首屏应重置
+      setClassProfileId('') // 班级学情同款：临时选择已固化到教案，回到首屏应重置
+      setCoursePublisher(null) // 教材版本同款：临时选择已固化到教案，回到首屏应重置
       connectSSE(resp.plan.id)
       if (resp.plan.current_stage && resp.plan.stage_config) await refreshStages(resp.plan.id)
     } catch (err) {
@@ -356,6 +418,7 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
         assistant_id: null,
         selected_components: componentIds.length > 0 ? componentIds : undefined,
         client_turn_id: turnId,
+        ref_material: refMaterialRef.current || undefined,
       })
       setSelectedComponentIds(new Set())
     } catch (err) {
@@ -386,6 +449,7 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
         assistant_id: null,
         selected_components: componentIds.length > 0 ? componentIds : undefined,
         client_turn_id: turnId,
+        ref_material: refMaterialRef.current || undefined,
       })
     } catch (err) {
       clearTurnTimers()
@@ -429,7 +493,7 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
       }])
       const turnId = nextTurn()
       startTurnTimers()
-      await sendChatMessage(plan.id, { message: meta.trigger, assistant_id: null, full_generate: true, client_turn_id: turnId })
+      await sendChatMessage(plan.id, { message: meta.trigger, assistant_id: null, full_generate: true, client_turn_id: turnId, ref_material: refMaterialRef.current || undefined })
     } catch (err) {
       clearTurnTimers()
       setIsThinking(false); setFullGenerating(false); setSlowHintText('')
@@ -491,6 +555,7 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     }
     if (tool === 'textbook') { setShowTextbookModal(true); return }
     if (tool === 'import') { setShowImportModal(true); return }
+    if (tool === 'ref_material') { console.log('[REF] openTool ref_material 被调用, plan=', !!plan, 'showRefModal将设为true'); setShowRefModal(true); return }
     setMessages(prev => [...prev, {
       id: `tool_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
       content: '🔧 这个能力即将在后续版本接入对话，敬请期待。', created_at: new Date().toISOString(),
@@ -514,9 +579,25 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     setShowComponentsModal(false)
   }
 
-  const handleTextbookAttached = (pageIds: string[]) => {
+  const handleTextbookAttached = async (pageIds: string[]) => {
     setAttachedTextbookIds(pageIds)
     setShowTextbookModal(false)
+    // 课本中途挂载落库：把选中的课本页ID写入 lesson_plans.textbook_page_ids。
+    // 后端注入层每轮对话重读该列，落库后下一条用户消息起自动注入课本OCR文字。
+    // 独立 try-catch 吞错——落库失败仅提示，不阻断对话主流程。
+    if (plan) {
+      try {
+        await updatePlanTextbooks(plan.id, pageIds)
+      } catch (err) {
+        console.error('课本关联落库失败:', err)
+        setMessages(prev => [...prev, {
+          id: `tb_err_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
+          content: '⚠️ 课本关联保存失败，AI可能无法读取课本内容。请重新打开课本面板再试一次。',
+          created_at: new Date().toISOString(),
+        }])
+        return
+      }
+    }
     setMessages(prev => [...prev, {
       id: `tb_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
       content: pageIds.length > 0
@@ -534,6 +615,7 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     }
     if (tool === 'textbook') return { enabled: true, reason: '' }
     if (tool === 'import') return { enabled: true, reason: '' }
+    if (tool === 'ref_material') return { enabled: true, reason: '' }
     return { enabled: false, reason: '即将上线' }
   }
 
@@ -557,9 +639,12 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     setFullGenerating(false); setDynamicChips([]); setSlowHintText('')
     setLiveAssistantLabel('') // 可见性补丁:退出/返回入口时一并清空自动匹配名
     setUnitPlanId('') // 大单元挂载
+    setClassProfileId('') // 班级学情挂载：回到首屏清空上一次的班级学情选择
+    setCoursePublisher(null) // 教材版本：回到首屏清空上一次的版本选择
     setRecipeId('') // 配方选择：回到首屏清空上一次的配方选择:回到首屏清空上一次的单元方案选择
     setSelectedComponentIds(new Set()); setShowComponentsModal(false)
     setShowTextbookModal(false); setAttachedTextbookIds([])
+    setShowRefModal(false); setRefMaterialName(''); refMaterialRef.current = '' // 参考资料附件：退出即清空
     retry.resetStreak(); escalateInsertedRef.current = false; lastSentComponentIdsRef.current = []
     currentTurnRef.current = ''
     setPhase('start')
@@ -615,14 +700,18 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
           subject={subject} setSubject={setSubject}
           grade={grade} setGrade={setGrade}
           topic={topic} setTopic={setTopic}
+          duration={duration} setDuration={setDuration}
           unitPlanId={unitPlanId} setUnitPlanId={setUnitPlanId}
+          classProfileId={classProfileId} setClassProfileId={setClassProfileId}
+          coursePublisher={coursePublisher} setCoursePublisher={setCoursePublisher}
           recipeId={recipeId} setRecipeId={setRecipeId}
           startLoading={startLoading}
           onStart={handleStart}
           onImport={() => setShowImportModal(true)}
           onSwitchMode={onSwitchMode}
         />
-        {showImportModal && <ImportPlanModal onSuccess={handleImportSuccess} onCancel={() => setShowImportModal(false)} />}
+
+      {showImportModal && <ImportPlanModal onSuccess={handleImportSuccess} onCancel={() => setShowImportModal(false)} />}
       </>
     )
   }
@@ -713,6 +802,8 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
               onPublish={handlePublish}
               plusItemAvailability={plusItemAvailability}
               onOpenTool={openTool}
+              refMaterialName={refMaterialName}
+              onClearRefMaterial={() => { refMaterialRef.current = ''; setRefMaterialName('') }}
             />
           </div>
         )}
@@ -752,6 +843,23 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
       )}
 
       {showImportModal && <ImportPlanModal onSuccess={handleImportSuccess} onCancel={() => setShowImportModal(false)} />}
+      {showRefModal && plan && (
+        <RefMaterialAttachModal
+          subject={plan.subject}
+          grade={plan.grade}
+          onAttached={({ text, fileName }) => {
+            refMaterialRef.current = text
+            setRefMaterialName(fileName)
+            setShowRefModal(false)
+            setMessages(prev => [...prev, {
+              id: `ref_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
+              content: `📎 已附参考资料「${fileName}」，从你的下一条消息开始，我会参考其中的知识点和要求。`,
+              created_at: new Date().toISOString(),
+            }])
+          }}
+          onCancel={() => setShowRefModal(false)}
+        />
+      )}
 
       {contentToast && (
         <div style={{ position: 'fixed', bottom: '28px', left: '50%', transform: 'translateX(-50%)', maxWidth: '560px', padding: '12px 22px', borderRadius: '10px', background: 'linear-gradient(135deg, #10B981, #34D399)', color: '#fff', fontSize: '13px', fontWeight: 500, lineHeight: 1.6, boxShadow: '0 6px 24px rgba(16,185,129,0.4)', zIndex: 10000, textAlign: 'center' }}>

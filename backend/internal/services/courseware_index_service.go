@@ -47,285 +47,314 @@ package services
 //     重出方案等所有方案变化路径；alignmentService 内部自判来源（仅 lesson_plan 来源才跑）。
 
 import (
-        "context"
-        "encoding/json"
-        "fmt"
-        "log"
-        "strconv"
-        "strings"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"strconv"
+	"strings"
 
-        "tedna/internal/ai"
-        "tedna/internal/config"
-        "tedna/internal/models"
-        "tedna/internal/repository"
+	"tedna/internal/ai"
+	"tedna/internal/config"
+	"tedna/internal/models"
+	"tedna/internal/repository"
 )
 
 // ==================== 课件索引生成服务 ====================
 
 // CoursewareIndexService 课件索引AI生成服务
 type CoursewareIndexService struct {
-        cfg *config.Config
-        // alignmentService 课件↔教案对齐校验服务（可选注入，nil 时不触发对齐）。
-        // 由 routes.go 经 SetAlignmentService 注入，避免包内构造顺序耦合。
-        alignmentService *CoursewareAlignmentService
+	cfg *config.Config
+	// alignmentService 课件↔教案对齐校验服务（可选注入，nil 时不触发对齐）。
+	// 由 routes.go 经 SetAlignmentService 注入，避免包内构造顺序耦合。
+	alignmentService *CoursewareAlignmentService
+	// normalizeService 教案规整服务（可选注入，nil 时不触发规整）。
+	// 由 routes.go 经 SetNormalizeService 注入，避免包内构造顺序耦合。
+	// 方案落库(saveAndBroadcast)后异步触发教案规整，供后续逐页生成注入。
+	normalizeService *CoursewareLessonNormalizeService
 }
 
 // NewCoursewareIndexService 创建课件索引生成服务
 func NewCoursewareIndexService(cfg *config.Config) *CoursewareIndexService {
-        return &CoursewareIndexService{cfg: cfg}
+	return &CoursewareIndexService{cfg: cfg}
 }
 
 // SetAlignmentService 注入对齐校验服务（在 routes.go 中调用）。
 // 注入后，方案落库（saveAndBroadcast）时会自动异步触发"课件方案↔教案教学意图"对齐校验。
 func (s *CoursewareIndexService) SetAlignmentService(a *CoursewareAlignmentService) {
-        s.alignmentService = a
+	s.alignmentService = a
+}
+
+// SetNormalizeService 注入教案规整服务（在 routes.go 中调用）。
+// 注入后，方案落库(saveAndBroadcast)时会异步触发教案原文规整，
+// 把又长又乱的教案规整成去噪保核、预置清单一字不差的干净教案，存库供逐页生成注入。
+func (s *CoursewareIndexService) SetNormalizeService(n *CoursewareLessonNormalizeService) {
+	s.normalizeService = n
 }
 
 // ==================== 层2 AI输出JSON结构 ====================
 
 // cwSchemeItem 层2 AI返回的单页方案
 type cwSchemeItem struct {
-        PageNumber          int    `json:"page_number"`
-        Title               string `json:"title"`
-        Purpose             string `json:"purpose"`
-        ContentSummary      string `json:"content_summary"`
-        InteractionType     string `json:"interaction_type"`
-        VisualFormat        string `json:"visual_format"`
-        MediaRequirements   string `json:"media_requirements"`
-        EstimatedComplexity int    `json:"estimated_complexity"`
+	PageNumber          int    `json:"page_number"`
+	Title               string `json:"title"`
+	Purpose             string `json:"purpose"`
+	ContentSummary      string `json:"content_summary"`
+	InteractionType     string `json:"interaction_type"`
+	VisualFormat        string `json:"visual_format"`
+	MediaRequirements   string `json:"media_requirements"`
+	EstimatedComplexity int    `json:"estimated_complexity"`
 }
 
 // ==================== 核心方法：生成课件索引（两层AI） ====================
 
 // GenerateIndex 生成课件索引（异步执行，通过SSE推送进度）
-func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID string, userID string, preset string) error {
-        // ---- 1. 获取课件信息 ----
-        cw, err := repository.GetCoursewareByID(ctx, coursewareID)
-        if err != nil {
-                s.broadcastError(coursewareID, "课件不存在: "+err.Error())
-                return fmt.Errorf("课件不存在: %w", err)
-        }
-        if cw.UserID != userID {
-                s.broadcastError(coursewareID, "无权操作此课件")
-                return fmt.Errorf("无权操作此课件")
-        }
-        if cw.Status != models.CoursewareStatusDraft && cw.Status != models.CoursewareStatusIndexing {
-                s.broadcastError(coursewareID, "当前状态不允许生成方案: "+cw.Status)
-                return fmt.Errorf("当前状态不允许生成方案: %s", cw.Status)
-        }
+func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID string, userID string, preset string, customHint string) error {
+	// ---- 1. 获取课件信息 ----
+	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+	if err != nil {
+		s.broadcastError(coursewareID, "课件不存在: "+err.Error())
+		return fmt.Errorf("课件不存在: %w", err)
+	}
+	if cw.UserID != userID {
+		s.broadcastError(coursewareID, "无权操作此课件")
+		return fmt.Errorf("无权操作此课件")
+	}
+	if cw.Status != models.CoursewareStatusDraft && cw.Status != models.CoursewareStatusIndexing {
+		s.broadcastError(coursewareID, "当前状态不允许生成方案: "+cw.Status)
+		return fmt.Errorf("当前状态不允许生成方案: %s", cw.Status)
+	}
 
-        // ---- 2. 获取关联教案全部内容 ----
-        if cw.LessonPlanID == nil || *cw.LessonPlanID == "" {
-                s.broadcastError(coursewareID, "课件未关联教案，无法生成方案")
-                return fmt.Errorf("课件未关联教案")
-        }
-        lp, err := repository.GetLessonPlanByID(ctx, *cw.LessonPlanID)
-        if err != nil {
-                s.broadcastError(coursewareID, "关联教案不存在: "+err.Error())
-                return fmt.Errorf("关联教案不存在: %w", err)
-        }
-        lessonContent := s.extractLessonPlanContent(lp)
-        if len(lessonContent) < 50 {
-                s.broadcastError(coursewareID, "教案内容过少，无法生成课件方案")
-                return fmt.Errorf("教案内容过少")
-        }
+	// ---- 2. 获取关联教案全部内容 ----
+	if cw.LessonPlanID == nil || *cw.LessonPlanID == "" {
+		s.broadcastError(coursewareID, "课件未关联教案，无法生成方案")
+		return fmt.Errorf("课件未关联教案")
+	}
+	lp, err := repository.GetLessonPlanByID(ctx, *cw.LessonPlanID)
+	if err != nil {
+		s.broadcastError(coursewareID, "关联教案不存在: "+err.Error())
+		return fmt.Errorf("关联教案不存在: %w", err)
+	}
+	lessonContent := s.extractLessonPlanContent(lp)
+	if len(lessonContent) < 50 {
+		s.broadcastError(coursewareID, "教案内容过少，无法生成课件方案")
+		return fmt.Errorf("教案内容过少")
+	}
 
-        // ---- 3. 更新课件状态为 indexing ----
-        if cw.Status == models.CoursewareStatusDraft {
-                _ = repository.UpdateCoursewareStatus(ctx, coursewareID, models.CoursewareStatusIndexing)
-        }
+	// ---- 3. 更新课件状态为 indexing ----
+	if cw.Status == models.CoursewareStatusDraft {
+		_ = repository.UpdateCoursewareStatus(ctx, coursewareID, models.CoursewareStatusIndexing)
+	}
 
-        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                EventType: CWSSEIndexStart,
-                Data: map[string]interface{}{
-                        "courseware_id": coursewareID,
-                        "lesson_plan":   lp.Title,
-                        "message":       "正在分析教案内容，生成课件方案...",
-                },
-        })
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEIndexStart,
+		Data: map[string]interface{}{
+			"courseware_id": coursewareID,
+			"lesson_plan":   lp.Title,
+			"message":       "正在分析教案内容，生成课件方案...",
+		},
+	})
 
-        // ==================== 层1：AOCI索引压缩 ====================
+	// ==================== 层1：AOCI索引压缩 ====================
 
-        // ---- 4. 加载层1提示词 ----
-        dictPrompt, err := repository.GetCurrentPromptByKey("prompt_courseware_index")
-        if err != nil {
-                s.broadcastError(coursewareID, "加载索引字典失败: "+err.Error())
-                return fmt.Errorf("加载索引字典失败: %w", err)
-        }
+	// ---- 4. 加载层1提示词 ----
+	dictPrompt, err := repository.GetCurrentPromptByKey("prompt_courseware_index")
+	if err != nil {
+		s.broadcastError(coursewareID, "加载索引字典失败: "+err.Error())
+		return fmt.Errorf("加载索引字典失败: %w", err)
+	}
 
-        // ---- 5. 调用层1 AI（courseware_index场景） ----
-        aiCfg1, err := ai.GetEffectiveConfig(
-                s.cfg.GetAESKey(), "courseware_index",
-                s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
-        )
-        if err != nil {
-                s.broadcastError(coursewareID, "获取AI配置失败: "+err.Error())
-                return fmt.Errorf("获取AI配置失败: %w", err)
-        }
+	// ---- 5. 调用层1 AI（courseware_index场景） ----
+	aiCfg1, err := ai.GetEffectiveConfig(
+		s.cfg.GetAESKey(), "courseware_index",
+		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		s.broadcastError(coursewareID, "获取AI配置失败: "+err.Error())
+		return fmt.Errorf("获取AI配置失败: %w", err)
+	}
 
-        userPrompt1 := s.buildLayer1UserPrompt(lp, lessonContent, preset)
-        // v198：解析操作者所属学校ID，供模型境内/境外分流判定（查不到空串→fail-closed降级境内）
-        gidSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
-        traceCtx1 := &ai.TraceContext{SceneCode: "courseware_index", UserID: &userID, SchoolID: schoolIDPtr(gidSchoolID)}
-        callResult1, err := ai.CallAI(aiCfg1, dictPrompt.Content, userPrompt1, traceCtx1)
-        if err != nil {
-                s.broadcastError(coursewareID, "AI索引压缩失败: "+err.Error())
-                return fmt.Errorf("层1 AI调用失败: %w", err)
-        }
+	userPrompt1 := s.buildLayer1UserPrompt(lp, lessonContent, preset, customHint)
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（查不到空串→fail-closed降级境内）
+	gidSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
+	traceCtx1 := &ai.TraceContext{SceneCode: "courseware_index", UserID: &userID, SchoolID: schoolIDPtr(gidSchoolID)}
+	callResult1, err := ai.CallAI(aiCfg1, dictPrompt.Content, userPrompt1, traceCtx1)
+	if err != nil {
+		s.broadcastError(coursewareID, "AI索引压缩失败: "+err.Error())
+		return fmt.Errorf("层1 AI调用失败: %w", err)
+	}
 
-        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                EventType: CWSSEIndexProgress,
-                Data:      map[string]interface{}{"message": "索引压缩完成，正在生成详细方案..."},
-        })
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEIndexProgress,
+		Data:      map[string]interface{}{"message": "索引压缩完成，正在生成详细方案..."},
+	})
 
-        // ---- 6. 解析层1输出 ----
-        overview, pageText := s.splitOverviewAndPages(callResult1.Content)
-        rawPages, err := s.parseAOCIIndexOutput(pageText)
-        if err != nil {
-                s.broadcastError(coursewareID, "解析索引输出失败: "+err.Error())
-                return fmt.Errorf("解析层1输出失败: %w", err)
-        }
-        if len(rawPages) == 0 {
-                s.broadcastError(coursewareID, "AI未生成任何页面索引")
-                return fmt.Errorf("层1未生成任何页面")
-        }
+	// ---- 6. 解析层1输出 ----
+	overview, pageText := s.splitOverviewAndPages(callResult1.Content)
+	rawPages, err := s.parseAOCIIndexOutput(pageText)
+	if err != nil {
+		s.broadcastError(coursewareID, "解析索引输出失败: "+err.Error())
+		return fmt.Errorf("解析层1输出失败: %w", err)
+	}
+	if len(rawPages) == 0 {
+		s.broadcastError(coursewareID, "AI未生成任何页面索引")
+		return fmt.Errorf("层1未生成任何页面")
+	}
 
-        // ==================== 层2：AI方案翻译 ====================
+	// ==================== 层2：AI方案翻译 ====================
 
-        // ---- 7. 加载层2提示词 ----
-        schemePrompt, err := repository.GetCurrentPromptByKey("prompt_courseware_scheme")
-        if err != nil {
-                // 层2提示词缺失时降级为规则翻译
-                log.Printf("[courseware_index] 层2提示词缺失，降级为规则翻译: %v", err)
-                pages := s.fallbackTranslateToPages(rawPages, coursewareID)
-                return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
-        }
+	// ---- 7. 加载层2提示词 ----
+	schemePrompt, err := repository.GetCurrentPromptByKey("prompt_courseware_scheme")
+	if err != nil {
+		// 层2提示词缺失时降级为规则翻译
+		log.Printf("[courseware_index] 层2提示词缺失，降级为规则翻译: %v", err)
+		pages := s.fallbackTranslateToPages(rawPages, coursewareID)
+		return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
+	}
 
-        // ---- 8. 构建层2输入（将所有页面的AOCI索引拼接） ----
-        var indexBuf strings.Builder
-        indexBuf.WriteString(fmt.Sprintf("课件标题：%s\n学科：%s\n年级：%s\n总页数：%d\n\n", lp.Title, lp.Subject, lp.Grade, len(rawPages)))
-        for _, rp := range rawPages {
-                indexBuf.WriteString(rp.RawIndex)
-                indexBuf.WriteString("\n\n")
-        }
+	// ---- 8. 构建层2输入（将所有页面的AOCI索引拼接） ----
+	var indexBuf strings.Builder
+	indexBuf.WriteString(fmt.Sprintf("课件标题：%s\n学科：%s\n年级：%s\n总页数：%d\n\n", lp.Title, lp.Subject, lp.Grade, len(rawPages)))
+	for _, rp := range rawPages {
+		indexBuf.WriteString(rp.RawIndex)
+		indexBuf.WriteString("\n\n")
+	}
 
-        // ---- 9. 调用层2 AI（scanner场景，Haiku低成本） ----
-        aiCfg2, err := ai.GetEffectiveConfig(
-                s.cfg.GetAESKey(), "scanner",
-                s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
-        )
-        if err != nil {
-                log.Printf("[courseware_index] 层2 AI配置失败，降级规则翻译: %v", err)
-                pages := s.fallbackTranslateToPages(rawPages, coursewareID)
-                return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
-        }
+	// ---- 9. 调用层2 AI（scanner场景，Haiku低成本） ----
+	aiCfg2, err := ai.GetEffectiveConfig(
+		s.cfg.GetAESKey(), "scanner",
+		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		log.Printf("[courseware_index] 层2 AI配置失败，降级规则翻译: %v", err)
+		pages := s.fallbackTranslateToPages(rawPages, coursewareID)
+		return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
+	}
 
-        traceCtx2 := &ai.TraceContext{SceneCode: "scanner", UserID: &userID, SchoolID: schoolIDPtr(gidSchoolID)}
-        callResult2, err := ai.CallAI(aiCfg2, schemePrompt.Content, indexBuf.String(), traceCtx2)
-        if err != nil {
-                log.Printf("[courseware_index] 层2 AI调用失败，降级规则翻译: %v", err)
-                pages := s.fallbackTranslateToPages(rawPages, coursewareID)
-                return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
-        }
+	traceCtx2 := &ai.TraceContext{SceneCode: "scanner", UserID: &userID, SchoolID: schoolIDPtr(gidSchoolID)}
+	callResult2, err := ai.CallAI(aiCfg2, schemePrompt.Content, indexBuf.String(), traceCtx2)
+	if err != nil {
+		log.Printf("[courseware_index] 层2 AI调用失败，降级规则翻译: %v", err)
+		pages := s.fallbackTranslateToPages(rawPages, coursewareID)
+		return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
+	}
 
-        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                EventType: CWSSEIndexProgress,
-                Data:      map[string]interface{}{"message": "方案生成完成，正在整理..."},
-        })
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEIndexProgress,
+		Data:      map[string]interface{}{"message": "方案生成完成，正在整理..."},
+	})
 
-        // ---- 10. 解析层2 JSON输出 ----
-        schemes, err := s.parseSchemeJSON(callResult2.Content)
-        if err != nil {
-                log.Printf("[courseware_index] 层2 JSON解析失败，降级规则翻译: %v", err)
-                pages := s.fallbackTranslateToPages(rawPages, coursewareID)
-                return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
-        }
+	// ---- 10. 解析层2 JSON输出 ----
+	schemes, err := s.parseSchemeJSON(callResult2.Content)
+	if err != nil {
+		log.Printf("[courseware_index] 层2 JSON解析失败，降级规则翻译: %v", err)
+		pages := s.fallbackTranslateToPages(rawPages, coursewareID)
+		return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
+	}
 
-        // ---- 11. 合并层1索引+层2方案 → CoursewarePage ----
-        pages := s.mergeIndexAndScheme(rawPages, schemes, coursewareID)
+	// ---- 11. 合并层1索引+层2方案 → CoursewarePage ----
+	pages := s.mergeIndexAndScheme(rawPages, schemes, coursewareID)
 
-        log.Printf("[courseware_index] 两层AI完成: cw=%s pages=%d overview=%d字 L1=%s/%dtok L2=%s/%dtok",
-                coursewareID, len(pages), len([]rune(overview)),
-                callResult1.ModelUsed, callResult1.TokensUsed,
-                callResult2.ModelUsed, callResult2.TokensUsed)
+	log.Printf("[courseware_index] 两层AI完成: cw=%s pages=%d overview=%d字 L1=%s/%dtok L2=%s/%dtok",
+		coursewareID, len(pages), len([]rune(overview)),
+		callResult1.ModelUsed, callResult1.TokensUsed,
+		callResult2.ModelUsed, callResult2.TokensUsed)
 
-        return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
+	return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
 }
 
 // ==================== 保存并广播（统一出口） ====================
 
 func (s *CoursewareIndexService) saveAndBroadcast(ctx context.Context, coursewareID string, overview string, pages []*models.CoursewarePage) error {
-        // 删除旧页面
-        if err := repository.DeleteAllCoursewarePages(ctx, coursewareID); err != nil {
-                log.Printf("[courseware_index] 删除旧页面失败: %v", err)
-        }
-        // 批量创建新页面
-        if err := repository.BatchCreateCoursewarePages(ctx, pages); err != nil {
-                s.broadcastError(coursewareID, "保存页面失败: "+err.Error())
-                return fmt.Errorf("批量创建页面失败: %w", err)
-        }
-        _ = repository.UpdateCoursewarePageCount(ctx, coursewareID, len(pages))
+	// 删除旧页面
+	if err := repository.DeleteAllCoursewarePages(ctx, coursewareID); err != nil {
+		log.Printf("[courseware_index] 删除旧页面失败: %v", err)
+	}
+	// 批量创建新页面
+	if err := repository.BatchCreateCoursewarePages(ctx, pages); err != nil {
+		s.broadcastError(coursewareID, "保存页面失败: "+err.Error())
+		return fmt.Errorf("批量创建页面失败: %w", err)
+	}
+	_ = repository.UpdateCoursewarePageCount(ctx, coursewareID, len(pages))
 
-        // 保存脉络概述
-        if overview != "" {
-                _ = repository.UpdateCoursewareOverview(ctx, coursewareID, overview)
-        }
+	// 保存脉络概述
+	if overview != "" {
+		_ = repository.UpdateCoursewareOverview(ctx, coursewareID, overview)
+	}
 
-        // 逐页广播
-        for _, page := range pages {
-                GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                        EventType: CWSSEIndexPage, Data: page,
-                })
-        }
+	// 逐页广播
+	for _, page := range pages {
+		GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+			EventType: CWSSEIndexPage, Data: page,
+		})
+	}
 
-        // 广播完成
-        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                EventType: CWSSEIndexDone,
-                Data: map[string]interface{}{
-                        "courseware_id":  coursewareID,
-                        "page_count":     len(pages),
-                        "index_overview": overview,
-                        "message":        fmt.Sprintf("课件方案生成完成，共 %d 页", len(pages)),
-                },
-        })
+	// 广播完成
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEIndexDone,
+		Data: map[string]interface{}{
+			"courseware_id":  coursewareID,
+			"page_count":     len(pages),
+			"index_overview": overview,
+			"message":        fmt.Sprintf("课件方案生成完成，共 %d 页", len(pages)),
+		},
+	})
 
-        // 对齐校验统一触发点：方案落库后异步比对"课件方案↔教案教学意图"。
-        // 覆盖所有让方案变化的路径（首次生成/AI改方案/重出方案都走本函数）。
-        // alignmentService 内部自行判断来源（仅 lesson_plan 来源才跑），非教案来源静默跳过。
-        // 取课件 userID 作为操作者供模型分流；取不到则用空串（service 内按 fail-closed 处理）。
-        if s.alignmentService != nil {
-                alignUserID := ""
-                if cw, e := repository.GetCoursewareByID(ctx, coursewareID); e == nil {
-                        alignUserID = cw.UserID
-                }
-                s.alignmentService.TriggerAlignmentAsync(coursewareID, alignUserID)
-        }
+	// 对齐校验统一触发点：方案落库后异步比对"课件方案↔教案教学意图"。
+	// 覆盖所有让方案变化的路径（首次生成/AI改方案/重出方案都走本函数）。
+	// alignmentService 内部自行判断来源（仅 lesson_plan 来源才跑），非教案来源静默跳过。
+	// 取课件 userID 作为操作者供模型分流；取不到则用空串（service 内按 fail-closed 处理）。
+	if s.alignmentService != nil {
+		alignUserID := ""
+		if cw, e := repository.GetCoursewareByID(ctx, coursewareID); e == nil {
+			alignUserID = cw.UserID
+		}
+		s.alignmentService.TriggerAlignmentAsync(coursewareID, alignUserID)
+	}
 
-        return nil
+	// 教案规整触发点：方案落库后异步规整教案原文，供后续逐页生成注入
+	//（提升课件对教案的还原度、保证跨页共享案例一致）。
+	// best-effort：goroutine 内执行，失败只记日志、绝不阻断建索引与生成；
+	// normalizeService 内部自判来源（仅 lesson_plan/doc_upload 才规整），其余静默跳过。
+	// 用独立 context.Background()：规整是后台任务，需独立于可能随请求结束被取消的 ctx。
+	if s.normalizeService != nil {
+		go func(cwID string) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[courseware_index] 规整触发panic已兜底: %v", r)
+				}
+			}()
+			bgCtx := context.Background()
+			cwForNorm, e := repository.GetCoursewareByID(bgCtx, cwID)
+			if e != nil || cwForNorm == nil {
+				return
+			}
+			_ = s.normalizeService.EnsureNormalized(bgCtx, cwForNorm)
+		}(coursewareID)
+	}
+
+	return nil
 }
 
 // ==================== 层1 提示词构建 ====================
 
-func (s *CoursewareIndexService) buildLayer1UserPrompt(lp *models.LessonPlan, content string, preset string) string {
-        var sb strings.Builder
-        sb.WriteString("请根据以下教案内容，先输出课件脉络概述（OVERVIEW:），再为每一页生成AOCI压缩索引。\n\n")
-        sb.WriteString("## 教案基本信息\n")
-        sb.WriteString(fmt.Sprintf("- 标题：%s\n", lp.Title))
-        sb.WriteString(fmt.Sprintf("- 学科：%s\n", lp.Subject))
-        sb.WriteString(fmt.Sprintf("- 年级：%s\n", lp.Grade))
-        sb.WriteString("\n## 教案完整内容\n\n")
-        sb.WriteString(content)
-        // v136: 注入方案结构预设提示
-        if preset != "" {
-                presetObj := models.GetSchemePresetByKey(preset)
-                if presetObj != nil && presetObj.PromptHint != "" {
-                        sb.WriteString("\n\n")
-                        sb.WriteString(presetObj.PromptHint)
-                        sb.WriteString("\n")
-                }
-        }
-        sb.WriteString("\n\n请严格按照字典格式输出（先OVERVIEW:概述，再PAGE:页面索引，不要任何格式之外的说明文字）：")
-        return sb.String()
+func (s *CoursewareIndexService) buildLayer1UserPrompt(lp *models.LessonPlan, content string, preset string, customHint string) string {
+	var sb strings.Builder
+	sb.WriteString("请根据以下教案内容，先输出课件脉络概述（OVERVIEW:），再为每一页生成AOCI压缩索引。\n\n")
+	sb.WriteString("## 教案基本信息\n")
+	sb.WriteString(fmt.Sprintf("- 标题：%s\n", lp.Title))
+	sb.WriteString(fmt.Sprintf("- 学科：%s\n", lp.Subject))
+	sb.WriteString(fmt.Sprintf("- 年级：%s\n", lp.Grade))
+	sb.WriteString("\n## 教案完整内容\n\n")
+	sb.WriteString(content)
+	// v136: 注入方案结构预设提示（含自定义预设支持）
+	if hint := models.ResolveSchemePromptHint(preset, customHint); hint != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(hint)
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n\n请严格按照字典格式输出（先OVERVIEW:概述，再PAGE:页面索引，不要任何格式之外的说明文字）：")
+	return sb.String()
 }
 
 // ==================== 合并层1索引+层2方案 ====================
@@ -333,107 +362,107 @@ func (s *CoursewareIndexService) buildLayer1UserPrompt(lp *models.LessonPlan, co
 // mergeIndexAndScheme 合并层1的AOCI索引和层2的用户方案为CoursewarePage
 // 按页码对齐：以层1为主骨架，层2方案覆盖用户字段
 func (s *CoursewareIndexService) mergeIndexAndScheme(rawPages []*cwRawPageIndex, schemes []cwSchemeItem, coursewareID string) []*models.CoursewarePage {
-        // 建立层2方案的页码索引
-        schemeMap := make(map[int]*cwSchemeItem)
-        for i := range schemes {
-                schemeMap[schemes[i].PageNumber] = &schemes[i]
-        }
+	// 建立层2方案的页码索引
+	schemeMap := make(map[int]*cwSchemeItem)
+	for i := range schemes {
+		schemeMap[schemes[i].PageNumber] = &schemes[i]
+	}
 
-        var pages []*models.CoursewarePage
-        for _, rp := range rawPages {
-                // 层1基础数据
-                il := cwClamp(rp.IL, 1, 5)
-                cg := cwClamp(rp.CG, 1, 6)
+	var pages []*models.CoursewarePage
+	for _, rp := range rawPages {
+		// 层1基础数据
+		il := cwClamp(rp.IL, 1, 5)
+		cg := cwClamp(rp.CG, 1, 6)
 
-                page := &models.CoursewarePage{
-                        CoursewareID:        coursewareID,
-                        PageNumber:          rp.PageNumber,
-                        PageIndex:           rp.RawIndex,
-                        IdxCognitiveLevel:   cg,
-                        IdxInteractionLevel: il,
-                        IdxVisualFormat:     rp.VF,
-                        Status:              models.CWPageStatusPending,
-                }
+		page := &models.CoursewarePage{
+			CoursewareID:        coursewareID,
+			PageNumber:          rp.PageNumber,
+			PageIndex:           rp.RawIndex,
+			IdxCognitiveLevel:   cg,
+			IdxInteractionLevel: il,
+			IdxVisualFormat:     rp.VF,
+			Status:              models.CWPageStatusPending,
+		}
 
-                // 层2方案覆盖用户字段
-                if sc, ok := schemeMap[rp.PageNumber]; ok {
-                        page.Title = strings.TrimSpace(sc.Title)
-                        page.Purpose = strings.TrimSpace(sc.Purpose)
-                        page.ContentSummary = strings.TrimSpace(sc.ContentSummary)
-                        page.InteractionType = strings.TrimSpace(sc.InteractionType)
-                        page.VisualFormat = strings.TrimSpace(sc.VisualFormat)
-                        page.MediaRequirements = strings.TrimSpace(sc.MediaRequirements)
-                        page.EstimatedComplexity = cwClamp(sc.EstimatedComplexity, 1, 5)
-                } else {
-                        // 层2未覆盖此页，用层1数据兜底
-                        page.Title = rp.Title
-                        page.Purpose = cwJoinNonEmpty("；", "知识目标："+rp.Knowledge, "能力目标："+rp.Ability)
-                        page.ContentSummary = rp.Content
-                        page.InteractionType = cwILToInteractionType[strconv.Itoa(rp.IL)]
-                        page.VisualFormat = cwVFToVisualFormat[rp.VF]
-                        page.EstimatedComplexity = il
-                        if page.InteractionType == "" {
-                                page.InteractionType = "static"
-                        }
-                        if page.VisualFormat == "" {
-                                page.VisualFormat = "text_heavy"
-                        }
-                }
+		// 层2方案覆盖用户字段
+		if sc, ok := schemeMap[rp.PageNumber]; ok {
+			page.Title = strings.TrimSpace(sc.Title)
+			page.Purpose = strings.TrimSpace(sc.Purpose)
+			page.ContentSummary = strings.TrimSpace(sc.ContentSummary)
+			page.InteractionType = strings.TrimSpace(sc.InteractionType)
+			page.VisualFormat = strings.TrimSpace(sc.VisualFormat)
+			page.MediaRequirements = strings.TrimSpace(sc.MediaRequirements)
+			page.EstimatedComplexity = cwClamp(sc.EstimatedComplexity, 1, 5)
+		} else {
+			// 层2未覆盖此页，用层1数据兜底
+			page.Title = rp.Title
+			page.Purpose = cwJoinNonEmpty("；", "知识目标："+rp.Knowledge, "能力目标："+rp.Ability)
+			page.ContentSummary = rp.Content
+			page.InteractionType = cwILToInteractionType[strconv.Itoa(rp.IL)]
+			page.VisualFormat = cwVFToVisualFormat[rp.VF]
+			page.EstimatedComplexity = il
+			if page.InteractionType == "" {
+				page.InteractionType = "static"
+			}
+			if page.VisualFormat == "" {
+				page.VisualFormat = "text_heavy"
+			}
+		}
 
-                pages = append(pages, page)
-        }
-        return pages
+		pages = append(pages, page)
+	}
+	return pages
 }
 
 // ==================== 降级：规则翻译（层2 AI失败时兜底） ====================
 
 var cwVFToVisualFormat = map[string]string{
-        "TH": "text_heavy", "IT": "image_text", "DG": "diagram", "CT": "chart",
-        "TL": "timeline", "CP": "comparison", "GL": "gallery", "FM": "fullscreen_media",
+	"TH": "text_heavy", "IT": "image_text", "DG": "diagram", "CT": "chart",
+	"TL": "timeline", "CP": "comparison", "GL": "gallery", "FM": "fullscreen_media",
 }
 var cwILToInteractionType = map[string]string{
-        "1": "static", "2": "click", "3": "input", "4": "drag", "5": "game",
+	"1": "static", "2": "click", "3": "input", "4": "drag", "5": "game",
 }
 
 func (s *CoursewareIndexService) fallbackTranslateToPages(rawPages []*cwRawPageIndex, coursewareID string) []*models.CoursewarePage {
-        var pages []*models.CoursewarePage
-        for _, rp := range rawPages {
-                il := cwClamp(rp.IL, 1, 5)
-                cg := cwClamp(rp.CG, 1, 6)
+	var pages []*models.CoursewarePage
+	for _, rp := range rawPages {
+		il := cwClamp(rp.IL, 1, 5)
+		cg := cwClamp(rp.CG, 1, 6)
 
-                visualFormat := cwVFToVisualFormat[rp.VF]
-                if visualFormat == "" {
-                        visualFormat = "text_heavy"
-                }
-                interactionType := cwILToInteractionType[strconv.Itoa(rp.IL)]
-                if interactionType == "" {
-                        interactionType = "static"
-                }
+		visualFormat := cwVFToVisualFormat[rp.VF]
+		if visualFormat == "" {
+			visualFormat = "text_heavy"
+		}
+		interactionType := cwILToInteractionType[strconv.Itoa(rp.IL)]
+		if interactionType == "" {
+			interactionType = "static"
+		}
 
-                mediaReq := ""
-                if strings.Contains(rp.Interaction, "视频") || strings.Contains(rp.Interaction, "动画") || rp.TG == "V" {
-                        mediaReq = rp.Interaction
-                }
+		mediaReq := ""
+		if strings.Contains(rp.Interaction, "视频") || strings.Contains(rp.Interaction, "动画") || rp.TG == "V" {
+			mediaReq = rp.Interaction
+		}
 
-                page := &models.CoursewarePage{
-                        CoursewareID:        coursewareID,
-                        PageNumber:          rp.PageNumber,
-                        Title:               rp.Title,
-                        Purpose:             cwJoinNonEmpty("；", "知识目标："+rp.Knowledge, "能力目标："+rp.Ability),
-                        ContentSummary:      rp.Content,
-                        InteractionType:     interactionType,
-                        VisualFormat:        visualFormat,
-                        MediaRequirements:   mediaReq,
-                        EstimatedComplexity: il,
-                        PageIndex:           rp.RawIndex,
-                        IdxCognitiveLevel:   cg,
-                        IdxInteractionLevel: il,
-                        IdxVisualFormat:     rp.VF,
-                        Status:              models.CWPageStatusPending,
-                }
-                pages = append(pages, page)
-        }
-        return pages
+		page := &models.CoursewarePage{
+			CoursewareID:        coursewareID,
+			PageNumber:          rp.PageNumber,
+			Title:               rp.Title,
+			Purpose:             cwJoinNonEmpty("；", "知识目标："+rp.Knowledge, "能力目标："+rp.Ability),
+			ContentSummary:      rp.Content,
+			InteractionType:     interactionType,
+			VisualFormat:        visualFormat,
+			MediaRequirements:   mediaReq,
+			EstimatedComplexity: il,
+			PageIndex:           rp.RawIndex,
+			IdxCognitiveLevel:   cg,
+			IdxInteractionLevel: il,
+			IdxVisualFormat:     rp.VF,
+			Status:              models.CWPageStatusPending,
+		}
+		pages = append(pages, page)
+	}
+	return pages
 }
 
 // ==================== 教案内容提取 ====================
@@ -443,261 +472,261 @@ func (s *CoursewareIndexService) fallbackTranslateToPages(rawPages []*cwRawPageI
 // 本方法保留供本服务与 courseware_index_refine.go 调用，下方 cwConversationMsg /
 // parseConversationLog 为其实现细节（保留不动，亦使 encoding/json 仍被本文件使用）。
 func (s *CoursewareIndexService) extractLessonPlanContent(lp *models.LessonPlan) string {
-        var parts []string
+	var parts []string
 
-        // 优先级1: content_markdown — 教案正文（Fork/导入/手动编辑的教案内容存储在此字段）
-        if lp.ContentMarkdown != "" && len(strings.TrimSpace(lp.ContentMarkdown)) > 50 {
-                parts = append(parts, lp.ContentMarkdown)
-        }
+	// 优先级1: content_markdown — 教案正文（Fork/导入/手动编辑的教案内容存储在此字段）
+	if lp.ContentMarkdown != "" && len(strings.TrimSpace(lp.ContentMarkdown)) > 50 {
+		parts = append(parts, lp.ContentMarkdown)
+	}
 
-        // 优先级2: conversation_log — 对话记录中最长的assistant消息（AI备课工坊生成的教案）
-        if len(parts) == 0 && lp.ConversationLog != "" {
-                messages := s.parseConversationLog(lp.ConversationLog)
-                var longestMsg string
-                for i := len(messages) - 1; i >= 0; i-- {
-                        if messages[i].Role == "assistant" && len(messages[i].Content) > len(longestMsg) {
-                                longestMsg = messages[i].Content
-                        }
-                }
-                if len(longestMsg) > 200 {
-                        parts = append(parts, longestMsg)
-                }
-        }
+	// 优先级2: conversation_log — 对话记录中最长的assistant消息（AI备课工坊生成的教案）
+	if len(parts) == 0 && lp.ConversationLog != "" {
+		messages := s.parseConversationLog(lp.ConversationLog)
+		var longestMsg string
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i].Role == "assistant" && len(messages[i].Content) > len(longestMsg) {
+				longestMsg = messages[i].Content
+			}
+		}
+		if len(longestMsg) > 200 {
+			parts = append(parts, longestMsg)
+		}
+	}
 
-        // 优先级3: ai_review_result — AI评审结果
-        if len(parts) == 0 && lp.AIReviewResult != "" {
-                parts = append(parts, "【AI评审结果】\n"+lp.AIReviewResult)
-        }
+	// 优先级3: ai_review_result — AI评审结果
+	if len(parts) == 0 && lp.AIReviewResult != "" {
+		parts = append(parts, "【AI评审结果】\n"+lp.AIReviewResult)
+	}
 
-        // 优先级4: ai_review_history — 评审历史（最后兜底）
-        if len(parts) == 0 && lp.AIReviewHistory != "" {
-                parts = append(parts, "【教案历史】\n"+lp.AIReviewHistory)
-        }
+	// 优先级4: ai_review_history — 评审历史（最后兜底）
+	if len(parts) == 0 && lp.AIReviewHistory != "" {
+		parts = append(parts, "【教案历史】\n"+lp.AIReviewHistory)
+	}
 
-        return strings.Join(parts, "\n\n---\n\n")
+	return strings.Join(parts, "\n\n---\n\n")
 }
 
 type cwConversationMsg struct {
-        Role    string `json:"role"`
-        Content string `json:"content"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 func (s *CoursewareIndexService) parseConversationLog(logJSON string) []cwConversationMsg {
-        if logJSON == "" || logJSON == "null" || logJSON == "[]" {
-                return nil
-        }
-        var messages []cwConversationMsg
-        if err := json.Unmarshal([]byte(logJSON), &messages); err != nil {
-                log.Printf("[courseware_index] 解析对话日志失败: %v", err)
-                return nil
-        }
-        return messages
+	if logJSON == "" || logJSON == "null" || logJSON == "[]" {
+		return nil
+	}
+	var messages []cwConversationMsg
+	if err := json.Unmarshal([]byte(logJSON), &messages); err != nil {
+		log.Printf("[courseware_index] 解析对话日志失败: %v", err)
+		return nil
+	}
+	return messages
 }
 
 // ==================== 概述与页面分离 ====================
 
 func (s *CoursewareIndexService) splitOverviewAndPages(aiOutput string) (overview string, pageText string) {
-        text := strings.TrimSpace(aiOutput)
-        text = cwStripCodeFences(text)
+	text := strings.TrimSpace(aiOutput)
+	text = cwStripCodeFences(text)
 
-        overviewIdx := strings.Index(text, "OVERVIEW:")
-        pageIdx := strings.Index(text, "PAGE:")
+	overviewIdx := strings.Index(text, "OVERVIEW:")
+	pageIdx := strings.Index(text, "PAGE:")
 
-        if overviewIdx >= 0 && pageIdx > overviewIdx {
-                overviewRaw := text[overviewIdx+len("OVERVIEW:") : pageIdx]
-                overview = strings.TrimSpace(overviewRaw)
-                pageText = strings.TrimSpace(text[pageIdx:])
-        } else if pageIdx >= 0 {
-                pageText = strings.TrimSpace(text[pageIdx:])
-        } else {
-                pageText = text
-        }
-        return
+	if overviewIdx >= 0 && pageIdx > overviewIdx {
+		overviewRaw := text[overviewIdx+len("OVERVIEW:") : pageIdx]
+		overview = strings.TrimSpace(overviewRaw)
+		pageText = strings.TrimSpace(text[pageIdx:])
+	} else if pageIdx >= 0 {
+		pageText = strings.TrimSpace(text[pageIdx:])
+	} else {
+		pageText = text
+	}
+	return
 }
 
 // ==================== 层1：AOCI索引输出解析 ====================
 
 type cwRawPageIndex struct {
-        PageNumber  int
-        Title       string
-        RawIndex    string
-        KT          string
-        CG          int
-        IL          int
-        VF          string
-        TG          string
-        Knowledge   string
-        Ability     string
-        Interaction string
-        Recovery    string
-        Content     string
+	PageNumber  int
+	Title       string
+	RawIndex    string
+	KT          string
+	CG          int
+	IL          int
+	VF          string
+	TG          string
+	Knowledge   string
+	Ability     string
+	Interaction string
+	Recovery    string
+	Content     string
 }
 
 func (s *CoursewareIndexService) parseAOCIIndexOutput(pageText string) ([]*cwRawPageIndex, error) {
-        text := strings.TrimSpace(pageText)
-        if text == "" {
-                return nil, fmt.Errorf("页面索引文本为空")
-        }
-        blocks := cwSplitBlocks(text)
-        if len(blocks) == 0 {
-                return nil, fmt.Errorf("未找到有效的页面索引块")
-        }
+	text := strings.TrimSpace(pageText)
+	if text == "" {
+		return nil, fmt.Errorf("页面索引文本为空")
+	}
+	blocks := cwSplitBlocks(text)
+	if len(blocks) == 0 {
+		return nil, fmt.Errorf("未找到有效的页面索引块")
+	}
 
-        var pages []*cwRawPageIndex
-        for _, block := range blocks {
-                page := s.parseSinglePageBlock(block)
-                if page != nil {
-                        pages = append(pages, page)
-                }
-        }
-        if len(pages) == 0 {
-                return nil, fmt.Errorf("解析后无有效页面（原始块数=%d）", len(blocks))
-        }
-        for i, p := range pages {
-                p.PageNumber = i + 1
-        }
-        return pages, nil
+	var pages []*cwRawPageIndex
+	for _, block := range blocks {
+		page := s.parseSinglePageBlock(block)
+		if page != nil {
+			pages = append(pages, page)
+		}
+	}
+	if len(pages) == 0 {
+		return nil, fmt.Errorf("解析后无有效页面（原始块数=%d）", len(blocks))
+	}
+	for i, p := range pages {
+		p.PageNumber = i + 1
+	}
+	return pages, nil
 }
 
 func (s *CoursewareIndexService) parseSinglePageBlock(block string) *cwRawPageIndex {
-        lines := strings.Split(strings.TrimSpace(block), "\n")
-        if len(lines) < 2 {
-                return nil
-        }
-        page := &cwRawPageIndex{RawIndex: block}
-        for _, line := range lines {
-                line = strings.TrimSpace(line)
-                if line == "" {
-                        continue
-                }
-                if strings.HasPrefix(line, "PAGE:") {
-                        parts := strings.SplitN(line, "|", 2)
-                        pageStr := strings.TrimPrefix(parts[0], "PAGE:")
-                        page.PageNumber, _ = strconv.Atoi(strings.TrimSpace(pageStr))
-                        if len(parts) > 1 && strings.HasPrefix(parts[1], "TT:") {
-                                page.Title = strings.TrimSpace(strings.TrimPrefix(parts[1], "TT:"))
-                        }
-                        continue
-                }
-                if strings.HasPrefix(line, "KT:") && strings.Contains(line, "|") {
-                        s.parseEncodingLine(page, line)
-                        continue
-                }
-                if len(line) >= 3 && line[0] == '[' && line[2] == ']' {
-                        tag := string(line[1])
-                        content := strings.TrimSpace(line[3:])
-                        switch tag {
-                        case "K":
-                                page.Knowledge = content
-                        case "A":
-                                page.Ability = content
-                        case "I":
-                                page.Interaction = content
-                        case "R":
-                                page.Recovery = content
-                        case "C":
-                                page.Content = content
-                        }
-                }
-        }
-        if page.Title == "" && page.Knowledge == "" {
-                return nil
-        }
-        return page
+	lines := strings.Split(strings.TrimSpace(block), "\n")
+	if len(lines) < 2 {
+		return nil
+	}
+	page := &cwRawPageIndex{RawIndex: block}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "PAGE:") {
+			parts := strings.SplitN(line, "|", 2)
+			pageStr := strings.TrimPrefix(parts[0], "PAGE:")
+			page.PageNumber, _ = strconv.Atoi(strings.TrimSpace(pageStr))
+			if len(parts) > 1 && strings.HasPrefix(parts[1], "TT:") {
+				page.Title = strings.TrimSpace(strings.TrimPrefix(parts[1], "TT:"))
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "KT:") && strings.Contains(line, "|") {
+			s.parseEncodingLine(page, line)
+			continue
+		}
+		if len(line) >= 3 && line[0] == '[' && line[2] == ']' {
+			tag := string(line[1])
+			content := strings.TrimSpace(line[3:])
+			switch tag {
+			case "K":
+				page.Knowledge = content
+			case "A":
+				page.Ability = content
+			case "I":
+				page.Interaction = content
+			case "R":
+				page.Recovery = content
+			case "C":
+				page.Content = content
+			}
+		}
+	}
+	if page.Title == "" && page.Knowledge == "" {
+		return nil
+	}
+	return page
 }
 
 func (s *CoursewareIndexService) parseEncodingLine(page *cwRawPageIndex, line string) {
-        for _, part := range strings.Split(line, "|") {
-                kv := strings.SplitN(strings.TrimSpace(part), ":", 2)
-                if len(kv) != 2 {
-                        continue
-                }
-                switch strings.TrimSpace(kv[0]) {
-                case "KT":
-                        page.KT = strings.TrimSpace(kv[1])
-                case "CG":
-                        page.CG, _ = strconv.Atoi(strings.TrimSpace(kv[1]))
-                case "IL":
-                        page.IL, _ = strconv.Atoi(strings.TrimSpace(kv[1]))
-                case "VF":
-                        page.VF = strings.TrimSpace(kv[1])
-                case "TG":
-                        page.TG = strings.TrimSpace(kv[1])
-                }
-        }
+	for _, part := range strings.Split(line, "|") {
+		kv := strings.SplitN(strings.TrimSpace(part), ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		switch strings.TrimSpace(kv[0]) {
+		case "KT":
+			page.KT = strings.TrimSpace(kv[1])
+		case "CG":
+			page.CG, _ = strconv.Atoi(strings.TrimSpace(kv[1]))
+		case "IL":
+			page.IL, _ = strconv.Atoi(strings.TrimSpace(kv[1]))
+		case "VF":
+			page.VF = strings.TrimSpace(kv[1])
+		case "TG":
+			page.TG = strings.TrimSpace(kv[1])
+		}
+	}
 }
 
 // ==================== 辅助函数 ====================
 
 func (s *CoursewareIndexService) broadcastError(coursewareID string, message string) {
-        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                EventType: CWSSEError,
-                Data:      map[string]interface{}{"message": message},
-        })
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEError,
+		Data:      map[string]interface{}{"message": message},
+	})
 }
 
 // cwClamp 数值钳位
 func cwClamp(val, minVal, maxVal int) int {
-        if val < minVal {
-                return minVal
-        }
-        if val > maxVal {
-                return maxVal
-        }
-        return val
+	if val < minVal {
+		return minVal
+	}
+	if val > maxVal {
+		return maxVal
+	}
+	return val
 }
 
 // cwJoinNonEmpty 拼接非空字符串
 func cwJoinNonEmpty(sep string, parts ...string) string {
-        var nonEmpty []string
-        for _, p := range parts {
-                trimmed := strings.TrimSpace(p)
-                // 跳过仅有前缀的空内容（如"知识目标："）
-                if trimmed != "" && !strings.HasSuffix(trimmed, "：") && !strings.HasSuffix(trimmed, ":") {
-                        nonEmpty = append(nonEmpty, trimmed)
-                }
-        }
-        return strings.Join(nonEmpty, sep)
+	var nonEmpty []string
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		// 跳过仅有前缀的空内容（如"知识目标："）
+		if trimmed != "" && !strings.HasSuffix(trimmed, "：") && !strings.HasSuffix(trimmed, ":") {
+			nonEmpty = append(nonEmpty, trimmed)
+		}
+	}
+	return strings.Join(nonEmpty, sep)
 }
 
 // cwStripCodeFences 剥离Markdown代码围栏
 // 注：此函数为跨服务共享公共工具（template_extract_service / template_refine_service
 //
-//      及其测试均依赖），保持在本文件，请勿随意改动其行为。
+//	及其测试均依赖），保持在本文件，请勿随意改动其行为。
 func cwStripCodeFences(text string) string {
-        if strings.HasPrefix(text, "```") {
-                idx := strings.Index(text, "\n")
-                if idx >= 0 {
-                        text = text[idx+1:]
-                }
-        }
-        text = strings.TrimSpace(text)
-        if strings.HasSuffix(text, "```") {
-                text = text[:len(text)-3]
-        }
-        return strings.TrimSpace(text)
+	if strings.HasPrefix(text, "```") {
+		idx := strings.Index(text, "\n")
+		if idx >= 0 {
+			text = text[idx+1:]
+		}
+	}
+	text = strings.TrimSpace(text)
+	if strings.HasSuffix(text, "```") {
+		text = text[:len(text)-3]
+	}
+	return strings.TrimSpace(text)
 }
 
 func cwSplitBlocks(text string) []string {
-        text = strings.ReplaceAll(text, "\r\n", "\n")
-        text = strings.ReplaceAll(text, "\r", "\n")
-        var blocks []string
-        lines := strings.Split(text, "\n")
-        var currentBlock []string
-        for _, line := range lines {
-                trimmed := strings.TrimSpace(line)
-                if strings.HasPrefix(trimmed, "PAGE:") && len(currentBlock) > 0 {
-                        blocks = append(blocks, strings.Join(currentBlock, "\n"))
-                        currentBlock = nil
-                }
-                if trimmed != "" {
-                        currentBlock = append(currentBlock, line)
-                }
-        }
-        if len(currentBlock) > 0 {
-                blocks = append(blocks, strings.Join(currentBlock, "\n"))
-        }
-        return blocks
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	var blocks []string
+	lines := strings.Split(text, "\n")
+	var currentBlock []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "PAGE:") && len(currentBlock) > 0 {
+			blocks = append(blocks, strings.Join(currentBlock, "\n"))
+			currentBlock = nil
+		}
+		if trimmed != "" {
+			currentBlock = append(currentBlock, line)
+		}
+	}
+	if len(currentBlock) > 0 {
+		blocks = append(blocks, strings.Join(currentBlock, "\n"))
+	}
+	return blocks
 }
 
 // cwCleanChinesePunctuation 清理JSON字符串中的中文标点符号
@@ -706,22 +735,22 @@ func cwSplitBlocks(text string) []string {
 //
 // 注：此函数为跨服务共享公共工具（template_extract_service / template_refine_service
 //
-//      及其测试均依赖），保持在本文件，请勿随意改动其行为。
+//	及其测试均依赖），保持在本文件，请勿随意改动其行为。
 func cwCleanChinesePunctuation(s string) string {
-        replacer := strings.NewReplacer(
-                "\u201c", "", "\u201d", "", // 中文双引号 " " → 删除
-                "\u2018", "", "\u2019", "", // 中文单引号 ' ' → 删除
-                "\u3001", ",", "\uff0c", ",", // 顿号、全角逗号
-                "\uff1a", ":", "\uff1b", ";", // 全角冒号、分号
-                "\uff08", "(", "\uff09", ")", // 全角括号
-                "\u300a", "", "\u300b", "", // 书名号 《 》→ 删除
-                "\u3008", "", "\u3009", "", // 尖括号 〈 〉→ 删除
-                "\u2014\u2014", "-", // 破折号 ——
-                "\u2014", "-", // 单个破折号 —
-                "\u2026", "...", // 省略号 …
-                "\uff01", "!", "\uff1f", "?", // 全角感叹号、问号
-        )
-        return replacer.Replace(s)
+	replacer := strings.NewReplacer(
+		"\u201c", "", "\u201d", "", // 中文双引号 " " → 删除
+		"\u2018", "", "\u2019", "", // 中文单引号 ' ' → 删除
+		"\u3001", ",", "\uff0c", ",", // 顿号、全角逗号
+		"\uff1a", ":", "\uff1b", ";", // 全角冒号、分号
+		"\uff08", "(", "\uff09", ")", // 全角括号
+		"\u300a", "", "\u300b", "", // 书名号 《 》→ 删除
+		"\u3008", "", "\u3009", "", // 尖括号 〈 〉→ 删除
+		"\u2014\u2014", "-", // 破折号 ——
+		"\u2014", "-", // 单个破折号 —
+		"\u2026", "...", // 省略号 …
+		"\uff01", "!", "\uff1f", "?", // 全角感叹号、问号
+	)
+	return replacer.Replace(s)
 }
 
 // cwFixJSONQuotes 修复JSON值内部的未转义双引号
@@ -729,50 +758,50 @@ func cwCleanChinesePunctuation(s string) string {
 //
 // 注：此函数为跨服务共享公共工具（template_extract_service / template_refine_service
 //
-//      及其测试均依赖），保持在本文件，请勿随意改动其行为。
+//	及其测试均依赖），保持在本文件，请勿随意改动其行为。
 func cwFixJSONQuotes(s string) string {
-        var result strings.Builder
-        inString := false
-        result.Grow(len(s))
+	var result strings.Builder
+	inString := false
+	result.Grow(len(s))
 
-        for i := 0; i < len(s); i++ {
-                c := s[i]
+	for i := 0; i < len(s); i++ {
+		c := s[i]
 
-                if c == '"' {
-                        if !inString {
-                                // 进入字符串
-                                inString = true
-                                result.WriteByte(c)
-                        } else {
-                                // 在字符串内遇到引号——判断是结束引号还是内嵌引号
-                                // 检查后面的字符：如果是 , : ] } 或空白后跟这些，则是结束引号
-                                isEnd := false
-                                for j := i + 1; j < len(s); j++ {
-                                        next := s[j]
-                                        if next == ' ' || next == '\t' || next == '\n' || next == '\r' {
-                                                continue
-                                        }
-                                        if next == ',' || next == ':' || next == ']' || next == '}' || next == '"' {
-                                                isEnd = true
-                                        }
-                                        break
-                                }
-                                // 检查前面是否是反斜杠转义
-                                if i > 0 && s[i-1] == '\\' {
-                                        result.WriteByte(c)
-                                        continue
-                                }
-                                if isEnd {
-                                        inString = false
-                                        result.WriteByte(c)
-                                } else {
-                                        // 内嵌引号，转义为空（直接删除）
-                                        // 不写入任何东西，等于删除这个引号
-                                }
-                        }
-                } else {
-                        result.WriteByte(c)
-                }
-        }
-        return result.String()
+		if c == '"' {
+			if !inString {
+				// 进入字符串
+				inString = true
+				result.WriteByte(c)
+			} else {
+				// 在字符串内遇到引号——判断是结束引号还是内嵌引号
+				// 检查后面的字符：如果是 , : ] } 或空白后跟这些，则是结束引号
+				isEnd := false
+				for j := i + 1; j < len(s); j++ {
+					next := s[j]
+					if next == ' ' || next == '\t' || next == '\n' || next == '\r' {
+						continue
+					}
+					if next == ',' || next == ':' || next == ']' || next == '}' || next == '"' {
+						isEnd = true
+					}
+					break
+				}
+				// 检查前面是否是反斜杠转义
+				if i > 0 && s[i-1] == '\\' {
+					result.WriteByte(c)
+					continue
+				}
+				if isEnd {
+					inString = false
+					result.WriteByte(c)
+				} else {
+					// 内嵌引号，转义为空（直接删除）
+					// 不写入任何东西，等于删除这个引号
+				}
+			}
+		} else {
+			result.WriteByte(c)
+		}
+	}
+	return result.String()
 }

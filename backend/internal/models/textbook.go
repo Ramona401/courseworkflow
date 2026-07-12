@@ -6,6 +6,11 @@ package models
 //   - TextbookPage 主模型（对应 textbook_pages 表）
 //   - 上传/查询/更新请求响应结构体
 //   - 可见范围常量
+//
+// v231新增：教材照片归档维度扩展
+//   - 新增 Semester（学期，如"上册"/"下册"/"第一学期"）
+//   - 新增 Unit（单元，如"第三单元"，与旧 Chapter 章节并存，独立归档筛选）
+//   两字段均为可选，默认空串；配合前端多选批量上传与年级/学期/单元三维筛选。
 
 import "time"
 
@@ -16,6 +21,8 @@ type TextbookPage struct {
 	ID           string     `json:"id"`            // UUID主键
 	Subject      string     `json:"subject"`       // 学科
 	GradeRange   string     `json:"grade_range"`   // 年级范围
+	Semester     string     `json:"semester"`      // 学期（v231新增，如"上册"/"下册"，可选）
+	Unit         string     `json:"unit"`          // 单元（v231新增，如"第三单元"，可选，与Chapter并存）
 	TextbookName string     `json:"textbook_name"` // 教材名称
 	Chapter      string     `json:"chapter"`       // 章节名称
 	PageNumber   int        `json:"page_number"`   // 页码
@@ -53,6 +60,8 @@ const (
 type UploadTextbookRequest struct {
 	Subject      string `json:"subject"`       // 学科（必填）
 	GradeRange   string `json:"grade_range"`   // 年级（必填）
+	Semester     string `json:"semester"`      // 学期（v231新增，可选）
+	Unit         string `json:"unit"`          // 单元（v231新增，可选）
 	TextbookName string `json:"textbook_name"` // 教材名称（必填）
 	Chapter      string `json:"chapter"`       // 章节（可选）
 	PageNumber   int    `json:"page_number"`   // 页码（可选）
@@ -63,12 +72,14 @@ type UploadTextbookRequest struct {
 
 // UpdateTextbookRequest 更新课本图片元数据
 type UpdateTextbookRequest struct {
-	Chapter      string `json:"chapter"`       // 章节
-	PageNumber   int    `json:"page_number"`   // 页码
-	Description  string `json:"description"`   // 描述
-	Tags         string `json:"tags"`          // 标签JSON
-	Scope        string `json:"scope"`         // 可见范围
-	ScopeRefID   string `json:"scope_ref_id"`  // 范围引用ID
+	Semester    string `json:"semester"`     // 学期（v231新增）
+	Unit        string `json:"unit"`         // 单元（v231新增）
+	Chapter     string `json:"chapter"`      // 章节
+	PageNumber  int    `json:"page_number"`  // 页码
+	Description string `json:"description"`  // 描述
+	Tags        string `json:"tags"`         // 标签JSON
+	Scope       string `json:"scope"`        // 可见范围
+	ScopeRefID  string `json:"scope_ref_id"` // 范围引用ID
 }
 
 // ShareTextbookRequest 共享课本图片
@@ -84,20 +95,22 @@ type TextbookListItem struct {
 	ID           string     `json:"id"`
 	Subject      string     `json:"subject"`
 	GradeRange   string     `json:"grade_range"`
+	Semester     string     `json:"semester"` // 学期（v231新增）
+	Unit         string     `json:"unit"`     // 单元（v231新增）
 	TextbookName string     `json:"textbook_name"`
 	Chapter      string     `json:"chapter"`
 	PageNumber   int        `json:"page_number"`
 	FileName     string     `json:"file_name"`
 	FileSize     int64      `json:"file_size"`
 	MimeType     string     `json:"mime_type"`
-	HasOCR       bool       `json:"has_ocr"`       // 是否已有OCR结果
+	HasOCR       bool       `json:"has_ocr"` // 是否已有OCR结果
 	Description  string     `json:"description"`
 	Scope        string     `json:"scope"`
 	ScopeName    string     `json:"scope_name"`
 	UploadedBy   string     `json:"uploaded_by"`
 	UploaderName string     `json:"uploader_name"` // 上传者显示名
 	UsageCount   int        `json:"usage_count"`
-	ImageURL     string     `json:"image_url"`     // 图片访问URL
+	ImageURL     string     `json:"image_url"` // 图片访问URL
 	CreatedAt    *time.Time `json:"created_at"`
 }
 

@@ -6,11 +6,16 @@
  * 功能：
  *   - 两步流程：第一步填写信息+上传内容，第二步关联课本（可选）
  *   - 支持三种内容来源：粘贴文本 / Word(.docx) / PDF
- *   - Word解析：原生FileReader + JSZip(CDN) + XML解析，零npm依赖
- *   - PDF解析：CDN加载pdf.js，仅支持文字型PDF
+ *   - Word解析：原生FileReader + JSZip + XML解析，零npm依赖
+ *   - PDF解析：运行时加载pdf.js，仅支持文字型PDF
  *   - 课本关联：复用 StartForm 的课本选择逻辑
  *
- * 设计原则：不引入任何新npm包，所有文件解析通过CDN动态加载实现
+ * 自托管说明（批次0b 换源，2026-07-08）：
+ *   JSZip 3.10.1 与 pdf.js 3.11.174 已从 cdnjs.cloudflare.com 迁移为本服务器自托管，
+ *   版本与原 CDN 完全一致，纯换源零行为变化（详见 docExtract.ts 文件头说明，
+ *   两处的库地址在同一批次统一换源）。
+ *
+ * 设计原则：不引入任何新npm包，所有文件解析通过运行时动态加载实现
  */
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -28,6 +33,18 @@ interface ImportPlanModalProps {
 type SourceType = 'paste' | 'docx' | 'pdf'
 type Step = 1 | 2
 
+// ==================== 自托管库地址 ====================
+
+/** 自托管前端库基础地址（原 cdnjs 纯换源，详见文件头"自托管说明"） */
+const LIBS_BASE = 'https://workflow.pkuailab.com/uploads/courseware-assets/libs'
+
+/** JSZip 自托管地址（原 cdnjs jszip@3.10.1） */
+const JSZIP_URL = LIBS_BASE + '/jszip/3.10.1/jszip.min.js'
+
+/** pdf.js 自托管地址（原 cdnjs pdf.js@3.11.174，主库 + worker 两个文件） */
+const PDFJS_URL = LIBS_BASE + '/pdfjs-dist/3.11.174/build/pdf.min.js'
+const PDFJS_WORKER_URL = LIBS_BASE + '/pdfjs-dist/3.11.174/build/pdf.worker.min.js'
+
 // ==================== 样式工具 ====================
 
 const selBtn = (active: boolean): React.CSSProperties => ({
@@ -39,10 +56,10 @@ const selBtn = (active: boolean): React.CSSProperties => ({
   cursor: 'pointer', transition: 'all 150ms ease',
 })
 
-// ==================== CDN加载工具 ====================
+// ==================== 脚本加载工具 ====================
 
 /**
- * loadScript — 运行时动态加载CDN脚本（幂等：已加载则直接resolve）
+ * loadScript — 运行时动态加载脚本（幂等：已加载则直接resolve）
  * 用于按需加载JSZip（Word解析）和pdf.js（PDF解析），不增加初始bundle体积
  */
 function loadScript(src: string, globalKey: string): Promise<void> {
@@ -59,7 +76,7 @@ function loadScript(src: string, globalKey: string): Promise<void> {
     const script = document.createElement('script')
     script.src = src
     script.onload = () => resolve()
-    script.onerror = () => reject(new Error(`CDN加载失败: ${src}`))
+    script.onerror = () => reject(new Error(`脚本加载失败: ${src}`))
     document.head.appendChild(script)
   })
 }
@@ -70,15 +87,12 @@ function loadScript(src: string, globalKey: string): Promise<void> {
  * parseDocxFile — 解析 .docx 文件，提取纯文本
  *
  * .docx 本质是ZIP压缩包，内含 word/document.xml
- * 通过CDN加载JSZip解压后，用DOMParser解析XML提取文字节点
+ * 运行时加载JSZip解压后，用DOMParser解析XML提取文字节点
  * 完全不依赖npm包
  */
 async function parseDocxFile(file: File): Promise<string> {
-  // 加载JSZip（CDN）
-  await loadScript(
-    'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
-    'JSZip'
-  )
+  // 加载JSZip（自托管）
+  await loadScript(JSZIP_URL, 'JSZip')
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const JSZip = (window as any).JSZip
   if (!JSZip) throw new Error('JSZip加载失败')
@@ -114,21 +128,17 @@ async function parseDocxFile(file: File): Promise<string> {
 
 /**
  * parsePdfFile — 解析文字型PDF，提取纯文本
- * 通过CDN加载pdf.js，逐页提取文字内容
+ * 运行时加载pdf.js，逐页提取文字内容
  * 扫描型PDF无法提取（返回空字符串）
  */
 async function parsePdfFile(file: File): Promise<string> {
-  // 加载pdf.js（CDN）
-  await loadScript(
-    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
-    'pdfjsLib'
-  )
+  // 加载pdf.js（自托管）
+  await loadScript(PDFJS_URL, 'pdfjsLib')
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const pdfjsLib = (window as any).pdfjsLib
   if (!pdfjsLib) throw new Error('pdf.js加载失败')
 
-  pdfjsLib.GlobalWorkerOptions.workerSrc =
-    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+  pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL
 
   const arrayBuffer = await file.arrayBuffer()
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
@@ -217,7 +227,7 @@ export default function ImportPlanModal({ onSuccess, onCancel }: ImportPlanModal
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : '未知错误'
-      if (msg.includes('CDN') || msg.includes('加载失败')) {
+      if (msg.includes('加载失败')) {
         setParseError(`解析库加载失败（请检查网络），或改用粘贴文本方式`)
       } else if (sourceType === 'docx') {
         setParseError('Word文档解析失败，请检查文件格式，或改用粘贴文本方式')

@@ -1,6 +1,6 @@
 package services
 
-// course_outline_service.go — 课程大纲业务逻辑（大单元备课能力·批次一）
+// course_outline_service.go — 课程大纲业务逻辑（大单元备课能力·批次一 + 教材版本增强）
 //
 // 职责：
 //   1. 列表：按角色解析可见范围（admin 全量 / 其余按所属教研组 + 本校过滤；全局 system 人人可见）
@@ -10,6 +10,8 @@ package services
 //        lead/backbone    → 仅自己担任组长/骨干的教研组的 group 范围大纲可改
 //        system(全局)      → 仅 admin
 //   3. 创建时校验目标归属合法（不能往不属于自己的组/校建大纲）；system 由后端填占位归属ID
+//   4. 教材版本(publisher)：CRUD 透传，创建/更新写入；新增「按学科+年级查可用版本列表」，
+//      供备课首屏的教材版本选择器使用（只列出该学科年级真实存在大纲的版本）。
 //
 // 复用现有：repository.GetUserTeachingGroups / IsGroupLeadOrBackbone /
 //          GetSchoolByAdminUserID（与 data_scope.go 同口径）。
@@ -17,6 +19,7 @@ package services
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 
 	"tedna/internal/logger"
@@ -65,6 +68,59 @@ func (s *CourseOutlineService) ListOutlines(ctx context.Context, role, userID st
 	return repository.ListCourseOutlines(ctx, false, groupIDs, schoolIDs)
 }
 
+// ListAvailablePublishers 查某学科+年级下「真实存在大纲」的可选教材版本列表
+//
+// 供备课首屏的教材版本选择器使用（Yuhan 决策：首屏选版本，没大纲就不关联）：
+//   - 只返回该学科、且大纲年级与教案年级「学段相交」的大纲所拥有的版本；
+//   - 版本严格去重；空串版本（通用/不限版本）若存在则作为一个独立可选项一并返回；
+//   - 一份相交大纲都没有 → 返回空切片（前端据此不显示版本选择、不关联大纲）。
+//
+// 注意：不做任何跨版本兜底——这里只如实汇报"该学科该年级到底有哪些版本的大纲可用"，
+// 老师选哪个版本，注入层就严格只注入哪个版本（见 course_outline_match.go 的版本过滤）。
+//
+// 返回的字符串切片里，空串("")代表"通用/不限版本"，前端负责把空串显示成"通用/不限版本"。
+func (s *CourseOutlineService) ListAvailablePublishers(ctx context.Context, subject, grade string) ([]string, error) {
+	subject = strings.TrimSpace(subject)
+	grade = strings.TrimSpace(grade)
+	if subject == "" || grade == "" {
+		return []string{}, nil
+	}
+
+	// 按学科粗筛全部 active 大纲，再用与注入同口径的「学段相交」过滤出真正适用本年级的大纲
+	candidates, err := repository.ListActiveOutlinesBySubject(ctx, subject)
+	if err != nil {
+		return nil, err
+	}
+	hits := MatchOutlines(grade, candidates)
+	if len(hits) == 0 {
+		return []string{}, nil
+	}
+
+	// 去重收集版本（含空串=通用）
+	seen := make(map[string]struct{}, len(hits))
+	var publishers []string
+	for _, o := range hits {
+		p := o.Publisher
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		publishers = append(publishers, p)
+	}
+
+	// 稳定排序：空串(通用)永远排最后，其余按字典序，保证前端下拉顺序稳定
+	sort.SliceStable(publishers, func(i, j int) bool {
+		if publishers[i] == "" {
+			return false
+		}
+		if publishers[j] == "" {
+			return true
+		}
+		return publishers[i] < publishers[j]
+	})
+	return publishers, nil
+}
+
 // CreateOutline 创建课程大纲（含字段校验 + 归属合法性校验）
 func (s *CourseOutlineService) CreateOutline(ctx context.Context, role, userID string, req *models.CreateCourseOutlineRequest) (*models.CourseOutline, error) {
 	if !models.IsValidCourseOutlineScope(req.Scope) {
@@ -93,6 +149,7 @@ func (s *CourseOutlineService) CreateOutline(ctx context.Context, role, userID s
 		Subject:       strings.TrimSpace(req.Subject),
 		Grade:         strings.TrimSpace(req.Grade),
 		Volume:        strings.TrimSpace(req.Volume),
+		Publisher:     strings.TrimSpace(req.Publisher), // 教材版本（空=通用/不限版本）
 		Title:         strings.TrimSpace(req.Title),
 		Content:       req.Content,
 		SourceType:    models.CourseOutlineSourcePaste,
@@ -118,6 +175,8 @@ func (s *CourseOutlineService) UpdateOutline(ctx context.Context, role, userID, 
 		strings.TrimSpace(req.Content) == "" {
 		return ErrOutlineFieldRequired
 	}
+	// 版本规范化：去空白后写回（空=通用/不限版本，允许；不强校验是否在预置清单内）
+	req.Publisher = strings.TrimSpace(req.Publisher)
 	return repository.UpdateCourseOutline(ctx, id, req)
 }
 

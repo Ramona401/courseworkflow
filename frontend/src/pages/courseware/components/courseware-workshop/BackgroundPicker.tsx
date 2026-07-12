@@ -17,7 +17,9 @@ import {
   listBackgroundSets, getCWBackground, setCWBackground, clearCWBackground,
   generateBackgroundSet, uploadBackgroundSet, deleteBackgroundSet, promoteBackgroundSet,
   CW_STYLE_CONFIG,
+  getPageBackground, setPageBackground, clearPageBackground,
 } from '@/api/coursewares'
+import type { PageBgSetting } from '@/api/coursewares'
 import type { CWBackgroundSet } from '@/api/coursewares'
 import { useAuth } from '@/store/auth'
 import { C } from './workshopConstants'
@@ -32,6 +34,8 @@ interface Props {
   cwTitle?: string
   cwSubject?: string
   cwGrade?: string
+  /** 当前选中的页码（传入后显示"本页背景"区块，可逐页设蒙版/换背景） */
+  pageNum?: number
 }
 
 /** 小修6：OSS缩略图——追加阿里云图片处理参数，缩略到宽400不再拉原图 */
@@ -47,7 +51,7 @@ const STYLE_LABELS: Record<string, string> = {
   academic: '学术严谨', organic: '自然雅致', immersive: '3D沉浸式',
 }
 
-export default function BackgroundPicker({ coursewareId, onSwapped, disabled = false, cwTitle = '', cwSubject = '', cwGrade = '' }: Props) {
+export default function BackgroundPicker({ coursewareId, onSwapped, disabled = false, cwTitle = '', cwSubject = '', cwGrade = '', pageNum }: Props) {
   const { user } = useAuth()
   const isAdmin = user?.role === 'admin'
 
@@ -404,9 +408,209 @@ export default function BackgroundPicker({ coursewareId, onSwapped, disabled = f
         </div>
       )}
 
+
+      {/* ==================== 页级背景覆盖（蒙版开关 + 单页背景图上传） ==================== */}
+      {pageNum != null && pageNum > 0 && (
+        <PageBgSection coursewareId={coursewareId} pageNum={pageNum} disabled={disabled || busy}
+          onSwapped={onSwapped} setMessage={setMessage} />
+      )}
+
       {message && (
         <div style={{ marginTop: 12, padding: '10px 14px', borderRadius: 8, fontSize: 13, background: message.startsWith('❌') ? '#FEE2E2' : message.startsWith('✅') ? '#D1FAE5' : '#EFF6FF', color: message.startsWith('❌') ? '#DC2626' : message.startsWith('✅') ? '#059669' : '#2563EB' }}>{message}</div>
       )}
+    </div>
+  )
+}
+
+// ==================== 页级背景覆盖子组件 ====================
+
+/** 蒙版模式选项 */
+const BG_MODES = [
+  { key: 'default', label: '🎨 跟随默认', desc: '使用课件级默认蒙版' },
+  { key: 'custom', label: '🎛️ 自定义透明度', desc: '调节蒙版浓淡' },
+  { key: 'none', label: '🖼️ 无蒙版', desc: '纯背景图不加蒙版' },
+] as const
+
+interface PageBgProps {
+  coursewareId: string
+  pageNum: number
+  disabled: boolean
+  onSwapped: () => void
+  setMessage: (msg: string) => void
+}
+
+function PageBgSection({ coursewareId, pageNum, disabled, onSwapped, setMessage }: PageBgProps) {
+  const [setting, setSetting] = useState<PageBgSetting | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [mode, setMode] = useState<string>('default')
+  const [opacity, setOpacity] = useState<number>(0.86)
+  const [pageUrl, setPageUrl] = useState('')
+  const [uploading, setUploading] = useState(false)
+
+  // 加载当前页的背景设置
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    getPageBackground(coursewareId, pageNum)
+      .then(s => {
+        if (cancelled) return
+        setSetting(s)
+        setMode(s.page_bg_mode || 'default')
+        setOpacity(s.page_bg_opacity != null ? s.page_bg_opacity : 0.86)
+        setPageUrl(s.page_bg_url || '')
+      })
+      .catch(() => { if (!cancelled) setMessage('❌ 加载本页背景设置失败') })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [coursewareId, pageNum])
+
+  // 保存页级背景设置
+  const handleSave = async () => {
+    if (saving || disabled) return
+    setSaving(true)
+    try {
+      await setPageBackground(coursewareId, pageNum, {
+        url: pageUrl,
+        mode,
+        opacity: mode === 'custom' ? opacity : (mode === 'none' ? 0 : null),
+      })
+      setMessage('✅ 第' + pageNum + '页背景设置已保存并秒换')
+      onSwapped()
+    } catch (e) {
+      setMessage('❌ 保存失败: ' + (e instanceof Error ? e.message : '未知错误'))
+    } finally { setSaving(false) }
+  }
+
+  // 清除页级设置（回退跟随课件级）
+  const handleClear = async () => {
+    if (saving || disabled) return
+    setSaving(true)
+    try {
+      await clearPageBackground(coursewareId, pageNum)
+      setMode('default')
+      setOpacity(0.86)
+      setPageUrl('')
+      setSetting({ page_bg_url: '', page_bg_opacity: null, page_bg_mode: 'default' })
+      setMessage('✅ 第' + pageNum + '页背景已回退到跟随课件级')
+      onSwapped()
+    } catch (e) {
+      setMessage('❌ 清除失败: ' + (e instanceof Error ? e.message : '未知错误'))
+    } finally { setSaving(false) }
+  }
+
+  // 上传单页背景图（复用课件资产上传端点，取返回的url补全域名作为背景图URL）
+  const handleUploadPageBg = () => {
+    const inp = document.createElement('input')
+    inp.type = 'file'
+    inp.accept = 'image/jpeg,image/png,image/webp'
+    inp.onchange = async (ev) => {
+      const f = (ev.target as HTMLInputElement).files?.[0]
+      if (!f) return
+      if (f.size > 5 * 1024 * 1024) { setMessage('❌ 图片不能超过5MB'); return }
+      setUploading(true)
+      try {
+        // uploadCWImage 返回 { asset_id, url, file_name, file_size, mime_type }
+        // url 是本地路径（如 /uploads/courseware-assets/...），需补全域名
+        const { uploadCWImage } = await import('@/api/coursewares')
+        const res = await uploadCWImage(coursewareId, pageNum, f)
+        if (res && res.url) {
+          const bgUrl = res.url.startsWith('http') ? res.url : 'https://workflow.pkuailab.com' + res.url
+          setPageUrl(bgUrl)
+          setMessage('✅ 图片已上传，点「保存」应用到本页')
+        }
+      } catch (e) {
+        setMessage('❌ 上传失败: ' + (e instanceof Error ? e.message : '未知错误'))
+      } finally { setUploading(false) }
+    }
+    inp.click()
+  }
+
+  const hasPageOverride = setting && (setting.page_bg_url || setting.page_bg_mode !== 'default')
+
+  if (loading) return <div style={{ marginTop: 14, padding: 12, fontSize: 12, color: C.textMuted }}>⏳ 加载第{pageNum}页背景设置...</div>
+
+  return (
+    <div style={{ marginTop: 14, padding: 14, borderRadius: 10, border: '1px solid #A78BFA', background: 'rgba(167,139,250,0.04)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: '#7C3AED' }}>
+          🎛️ 第{pageNum}页背景 {hasPageOverride ? <span style={{ fontSize: 11, color: '#059669', fontWeight: 400 }}>（已单独设置）</span> : <span style={{ fontSize: 11, color: C.textMuted, fontWeight: 400 }}>（跟随课件级）</span>}
+        </div>
+        {hasPageOverride && (
+          <button onClick={handleClear} disabled={saving || disabled}
+            style={{ padding: '4px 12px', borderRadius: 6, border: '1px solid #EF4444', background: 'rgba(239,68,68,0.06)', color: '#EF4444', fontSize: 11, cursor: (saving || disabled) ? 'default' : 'pointer' }}>
+            ↩️ 回退到课件级
+          </button>
+        )}
+      </div>
+
+      {/* 蒙版模式选择 */}
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ fontSize: 12, color: C.textSecondary, marginBottom: 6 }}>蒙版模式：</div>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {BG_MODES.map(m => (
+            <button key={m.key} onClick={() => { if (!disabled) setMode(m.key) }} disabled={disabled}
+              style={{
+                padding: '6px 14px', borderRadius: 8, fontSize: 12, cursor: disabled ? 'default' : 'pointer',
+                border: '1px solid ' + (mode === m.key ? '#7C3AED' : C.border),
+                background: mode === m.key ? 'rgba(124,58,237,0.08)' : '#fff',
+                color: mode === m.key ? '#7C3AED' : C.textSecondary,
+                fontWeight: mode === m.key ? 600 : 400,
+              }}>
+              {m.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* 自定义透明度滑块（仅 custom 模式显示） */}
+      {mode === 'custom' && (
+        <div style={{ marginBottom: 10, padding: '10px 12px', borderRadius: 8, background: 'rgba(124,58,237,0.04)', border: '1px solid rgba(124,58,237,0.15)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+            <span style={{ fontSize: 12, color: '#7C3AED' }}>蒙版透明度</span>
+            <span style={{ fontSize: 12, fontWeight: 600, color: '#7C3AED' }}>{Math.round(opacity * 100)}%</span>
+          </div>
+          <input type="range" min={0} max={100} value={Math.round(opacity * 100)}
+            onChange={e => setOpacity(Number(e.target.value) / 100)}
+            disabled={disabled}
+            style={{ width: '100%', accentColor: '#7C3AED' }} />
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: C.textMuted, marginTop: 2 }}>
+            <span>0% 纯背景图</span>
+            <span>50% 半透明</span>
+            <span>100% 完全遮盖</span>
+          </div>
+        </div>
+      )}
+
+      {/* 单页背景图上传 */}
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ fontSize: 12, color: C.textSecondary, marginBottom: 6 }}>本页专属背景图（可选，留空则使用课件级背景图）：</div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <input value={pageUrl} onChange={e => setPageUrl(e.target.value)} placeholder="背景图URL（留空=跟随课件级背景图）"
+            disabled={disabled} style={{ padding: '6px 10px', borderRadius: 6, border: '1px solid ' + C.border, fontSize: 12, outline: 'none', flex: 1 }} />
+          <button onClick={handleUploadPageBg} disabled={disabled || uploading}
+            style={{ padding: '6px 14px', borderRadius: 6, border: '1px solid #7C3AED', background: 'rgba(124,58,237,0.06)', color: '#7C3AED', fontSize: 12, cursor: (disabled || uploading) ? 'default' : 'pointer', whiteSpace: 'nowrap' }}>
+            {uploading ? '⏳' : '📤 上传'}
+          </button>
+        </div>
+        {pageUrl && (
+          <div style={{ marginTop: 6 }}>
+            <img src={pageUrl.includes('aliyuncs.com') && !pageUrl.includes('?') ? pageUrl + '?x-oss-process=image/resize,w_300' : pageUrl}
+              alt="本页背景预览" style={{ maxWidth: 200, maxHeight: 80, borderRadius: 6, border: '1px solid ' + C.border, objectFit: 'cover' }} />
+          </div>
+        )}
+      </div>
+
+      {/* 保存按钮 */}
+      <button onClick={handleSave} disabled={saving || disabled}
+        style={{
+          padding: '8px 24px', borderRadius: 8, border: 'none', fontSize: 13, fontWeight: 600,
+          background: (saving || disabled) ? '#E5E7EB' : 'linear-gradient(135deg, #7C3AED, #6D28D9)',
+          color: (saving || disabled) ? '#9CA3AF' : '#fff',
+          cursor: (saving || disabled) ? 'default' : 'pointer',
+        }}>
+        {saving ? '⏳ 保存中...' : '💾 保存本页背景设置'}
+      </button>
     </div>
   )
 }

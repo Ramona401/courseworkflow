@@ -27,7 +27,7 @@ import (
 //  2. 用主题信息构建提示词，跳过层1（无教案内容可压缩）
 //  3. 直接调层2 AI生成方案JSON
 //  4. 写入数据库并SSE广播
-func (s *CoursewareIndexService) GenerateIndexFromTopic(ctx context.Context, coursewareID string, userID string, req *models.CreateCoursewareFromTopicRequest, preset string) error {
+func (s *CoursewareIndexService) GenerateIndexFromTopic(ctx context.Context, coursewareID string, userID string, req *models.CreateCoursewareFromTopicRequest, preset string, customHint string) error {
 	// ---- 1. 获取课件信息 ----
 	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
 	if err != nil {
@@ -60,7 +60,7 @@ func (s *CoursewareIndexService) GenerateIndexFromTopic(ctx context.Context, cou
 	// 课程知识库轮：若前端传了知识点编码，先查 curriculum_standards 构建难度适配约束段落
 	// 为空/查询失败/查不到时 constraint 为空串，buildTopicDirectPrompt 退回原有纯主题规划逻辑
 	curriculumConstraint := BuildCurriculumConstraint(ctx, req.KPCodes)
-	userPrompt := s.buildTopicDirectPrompt(req, preset, curriculumConstraint)
+	userPrompt := s.buildTopicDirectPrompt(req, preset, customHint, curriculumConstraint)
 
 	// ---- 4. 加载提示词模板（复用 courseware_scheme 场景） ----
 	schemePrompt, sErr := repository.GetCurrentPromptByKey("prompt_courseware_scheme")
@@ -152,7 +152,7 @@ func (s *CoursewareIndexService) GenerateIndexFromTopic(ctx context.Context, cou
 }
 
 // buildTopicDirectPrompt 构建主题直接生成的用户提示词
-func (s *CoursewareIndexService) buildTopicDirectPrompt(req *models.CreateCoursewareFromTopicRequest, preset string, curriculumConstraint string) string {
+func (s *CoursewareIndexService) buildTopicDirectPrompt(req *models.CreateCoursewareFromTopicRequest, preset string, customHint string, curriculumConstraint string) string {
 	var sb strings.Builder
 	sb.WriteString("你是K12课件规划专家。\n根据以下信息，设计一份完整的课件大纲（每页详细说明）。\n\n")
 	sb.WriteString(fmt.Sprintf("学科: %s\n", req.Subject))
@@ -172,14 +172,11 @@ func (s *CoursewareIndexService) buildTopicDirectPrompt(req *models.CreateCourse
 		sb.WriteString(curriculumConstraint)
 	}
 
-	// 注入方案结构预设
-	if preset != "" {
-		presetObj := models.GetSchemePresetByKey(preset)
-		if presetObj != nil && presetObj.PromptHint != "" {
-			sb.WriteString("\n")
-			sb.WriteString(presetObj.PromptHint)
-			sb.WriteString("\n")
-		}
+	// 注入方案结构预设（含自定义预设支持）
+	if hint := models.ResolveSchemePromptHint(preset, customHint); hint != "" {
+		sb.WriteString("\n")
+		sb.WriteString(hint)
+		sb.WriteString("\n")
 	}
 
 	sb.WriteString("\n请输出JSON数组格式。每个元素包含以下字段：\n")

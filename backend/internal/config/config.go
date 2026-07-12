@@ -49,6 +49,8 @@ type Config struct {
 	// 设为 1 即退化为原串行行为（零风险回滚开关）；
 	// 出现 AI 中转并发配额报错时调小，配额充裕时可调大。
 	CoursewareGenConcurrency int
+	// CoursewareAssemblyImgConcurrency 全自动装配·配图流水线并发数（走图片网关豆包，与HTML生成并发物理隔离）
+	CoursewareAssemblyImgConcurrency int
 }
 
 // Load 从环境变量加载配置
@@ -74,12 +76,17 @@ func Load() *Config {
 
 		// 迭代二Phase1-P1：课件批量生成并发数，默认4
 		CoursewareGenConcurrency: GetIntEnv("COURSEWARE_GEN_CONCURRENCY", 4),
+		CoursewareAssemblyImgConcurrency: GetIntEnv("COURSEWARE_ASSEMBLY_IMG_CONCURRENCY", 2),
 	}
 
 	// 迭代二Phase1-P1：并发数兜底校验——非法值（≤0）一律回退为1（串行），防止信号量容量为0导致死锁
 	if cfg.CoursewareGenConcurrency < 1 {
 		log.Printf("COURSEWARE_GEN_CONCURRENCY 非法值(%d)，已回退为 1（串行）", cfg.CoursewareGenConcurrency)
 		cfg.CoursewareGenConcurrency = 1
+	}
+	if cfg.CoursewareAssemblyImgConcurrency < 1 {
+		log.Printf("COURSEWARE_ASSEMBLY_IMG_CONCURRENCY 非法值(%d)，已回退为 1（串行）", cfg.CoursewareAssemblyImgConcurrency)
+		cfg.CoursewareAssemblyImgConcurrency = 1
 	}
 
 	// 验证必要配置——缺失任何一项均无法安全运行，启动阶段直接退出

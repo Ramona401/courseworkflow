@@ -17,6 +17,19 @@
  * 究极彻底版·A 新增（分配记录 total 精确）：
  *   - getTokenAllocations 的 params 增加 exclude_monthly（为 true 时后端排除月度自充值，
  *     使 items 与 total 一致）。分配记录Tab 传 true。
+ *
+ * T1 区域分配入口 batch 新增：
+ *   - 新增 getMyRegionAccounts：查询"我管辖的区域账户"列表。
+ *     后端数据完全由 TokenScope.AllowedRegionOwnerIDs 驱动（fail-closed），
+ *     有区域管辖任命者（region_admin 或兼任区域管辖的学校管理员）非空，其余角色恒空。
+ *   - 新增类型 MyRegionAccountsResponse（items/total/missing_accounts）。
+ *
+ * 一键分配 batch 新增（本次）：
+ *   - 新增 batchAllocateTokens：POST /tokens/accounts/{id}/batch-allocate。
+ *     每户定额模式（每个目标分同样金额），后端预检余额（不足整体拦截400）+
+ *     逐笔执行收集成败（部分失败恒200，明细在 failures）。
+ *   - 新增类型 BatchAllocateRequest / BatchAllocateFailure / BatchAllocateResult。
+ *     供 BatchAllocateModal（一键分配弹窗）消费。
  */
 import apiClient from './client'
 
@@ -151,6 +164,38 @@ export interface MyTokenAccountResponse {
     status: string
   }
   available_balance?: number
+}
+
+/** 我管辖的区域账户响应（T1 区域分配入口）
+ *  items            仅含请求者自己管辖区域的积分账户（其余角色恒为空）
+ *  missing_accounts 管辖区域中"尚未创建积分账户"的个数（>0 时前端提示联系系统管理员创建） */
+export interface MyRegionAccountsResponse {
+  items: TokenAccountListItem[]
+  total: number
+  missing_accounts: number
+}
+
+// ==================== 一键分配 batch 新增：批量分配类型 ====================
+
+/** 批量分配请求（每户定额：每个目标分同样金额，总额=每户×目标数） */
+export interface BatchAllocateRequest {
+  to_account_ids: string[]  // 目标账户ID列表（勾选的下级账户）
+  amount_each: number       // 每户分配金额
+  memo?: string             // 备注（写入每笔分配流水）
+}
+
+/** 批量分配单笔失败明细 */
+export interface BatchAllocateFailure {
+  to_account_id: string     // 失败的目标账户ID
+  reason: string            // 失败原因（中文可直接展示）
+}
+
+/** 批量分配结果（后端预检失败时整体400不返回本结构；进入逐笔后恒200） */
+export interface BatchAllocateResult {
+  success_count: number     // 成功笔数
+  fail_count: number        // 失败笔数
+  total_allocated: number   // 实际分出总额
+  failures: BatchAllocateFailure[]  // 失败明细（空数组=全部成功）
 }
 
 // ==================== v129新增：积分策略类型 ====================
@@ -308,6 +353,12 @@ export async function getMyTokenAccount() {
   return extractData<MyTokenAccountResponse>(resp)
 }
 
+/** 获取我管辖的区域账户（有区域管辖任命者非空；其余角色后端恒返回空列表，fail-closed） */
+export async function getMyRegionAccounts() {
+  const resp = await apiClient.get('/tokens/my-region-accounts')
+  return extractData<MyRegionAccountsResponse>(resp)
+}
+
 /** 获取概览统计 */
 export async function getTokenOverview() {
   const resp = await apiClient.get('/tokens/overview')
@@ -350,6 +401,14 @@ export async function updateTokenAccountStatus(id: string, status: string) {
 export async function allocateTokens(fromAccountId: string, req: AllocateTokensRequest) {
   const resp = await apiClient.post(`/tokens/accounts/${fromAccountId}/allocate`, req)
   return extractData<{ message: string }>(resp)
+}
+
+/** 批量分配积分（一键分配：每户定额，后端预检余额+逐笔执行收集成败）
+ *  - 预检失败（余额不足/目标超限等）→ 后端400，走catch，一笔未分
+ *  - 进入逐笔后恒200 → 返回 BatchAllocateResult，部分失败明细在 failures */
+export async function batchAllocateTokens(fromAccountId: string, req: BatchAllocateRequest) {
+  const resp = await apiClient.post(`/tokens/accounts/${fromAccountId}/batch-allocate`, req)
+  return extractData<BatchAllocateResult>(resp)
 }
 
 /** 获取分配记录（A：新增 exclude_monthly，为 true 时后端排除月度自充值，total 与显示一致） */

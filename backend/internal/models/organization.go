@@ -102,11 +102,25 @@ type CreateOrganizationRequest struct {
 	AdminUserID *string `json:"admin_user_id"`
 }
 
+// UpdateOrganizationRequest 更新组织请求
+//
+// 账户与权限修复批（Logo 移除链路①）新增 ClearLogo 字段：
+//   - 背景：编辑弹窗"移除Logo"此前只清前端本地 state，请求体没有任何 logo 字段，
+//     后端无从得知"用户想删掉 Logo"，移除从不落库（假移除）。
+//   - 语义：clear_logo=true → organization_service.UpdateOrganization 在常规字段
+//     更新成功后调用 repository.UpdateOrganizationLogo(id, "") 清空 logo_url；
+//     缺省 false → 完全不动 logo_url。Logo 上传仍走独立上传接口，与本字段互不干扰。
+//   - handler 为整体 JSON 绑定后透传 service，无需任何改动（向后兼容）。
+//
+// B10 部分更新语义（见 organization_service.UpdateOrganization）：
+//   - Settings 为空串 → 本次不修改，service 回填库中现值（真要清空须显式传 "{}"）
+//   - Status   为空串 → 本次不修改，service 回填库中现值
 type UpdateOrganizationRequest struct {
 	Name        string  `json:"name"`
 	AdminUserID *string `json:"admin_user_id"`
 	Settings    string  `json:"settings"`
 	Status      string  `json:"status"`
+	ClearLogo   bool    `json:"clear_logo"` // true=清空组织Logo（假移除根治）
 }
 
 // CreateTeachingGroupRequest 创建教研组请求

@@ -48,6 +48,7 @@ import {
 import {
   StartForm, AIBubble, UserBubble, ThinkingIndicator, ReviewPanel,
 } from './components/WorkshopPanels'
+import { setLessonPlanCourseOutlinePublisher } from '@/api/course-outlines'
 import { StageSummaryModal } from './components/StageSummaryModal'
 import { StageTransitionView } from './components/StageTransitionView'
 import { StageSeparatorBubble } from './components/StageSeparatorBubble'
@@ -459,7 +460,7 @@ export default function WorkshopPage() {
     }
   }
 
-  const handleStart = async (subject: string, grade: string, topic: string, duration: number, recipeId?: string, textbookPageIds?: string[]) => {
+  const handleStart = async (subject: string, grade: string, topic: string, duration: number, recipeId?: string, textbookPageIds?: string[], coursePublisher?: string | null) => {
     setStartLoading(true)
     try {
       const req: Record<string, unknown> = { subject, grade, topic, duration_minutes: duration }
@@ -470,6 +471,15 @@ export default function WorkshopPage() {
       setMessages([resp.opening_message])
       setPhase('chatting')
       sessionStorage.setItem('workshop_active_plan_id', resp.plan.id)
+      // 教材版本落库（专家模式起步选）：仅当老师选定版本(非 null/undefined)才写库。
+      // 独立 try-catch 吞错——失败不阻断主流程。落库后 analyze/design 阶段注入层据该版本精确匹配。
+      if (coursePublisher !== null && coursePublisher !== undefined) {
+        try {
+          await setLessonPlanCourseOutlinePublisher(resp.plan.id, coursePublisher)
+        } catch (cpubErr) {
+          console.error('教材版本关联失败:', cpubErr)
+        }
+      }
       connectSSE(resp.plan.id)
       if (resp.plan.current_stage && resp.plan.stage_config) {
         await refreshStages(resp.plan.id)

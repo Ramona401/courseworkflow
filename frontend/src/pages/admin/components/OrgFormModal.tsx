@@ -1,6 +1,16 @@
 /**
  * OrgFormModal.tsx — 区域/学校 新建/编辑弹窗
  *
+ * 账户与权限修复批新增（Logo移除链路③，本次）：
+ *   根治"移除Logo假移除"——此前"移除"按钮只清本地 logoUrl state，保存请求没有任何
+ *   logo 字段，后端无从得知移除意图，刷新后 Logo 依旧存在。本次改动：
+ *     - 新增 clearLogo 状态；编辑模式点"移除" → 清预览 + clearLogo=true；
+ *     - 编辑模式重新上传成功 → clearLogo=false（编辑模式上传是即时落库的，
+ *       防"先移除再上传"在保存时被误清）；
+ *     - 保存时（编辑模式）若 clearLogo 为 true，请求体携带 clear_logo:true，
+ *       后端 UpdateOrganization 在常规更新成功后清空 organizations.logo_url；
+ *     - 创建模式服务器上本无 Logo，"移除"仅清本地预览，不发 clear_logo。
+ *
  * v172新增：编辑学校时，可勾选"门户可见板块"（备课/课件/审核三选项）。
  *   - 仅 school 类型、edit 模式 显示该区块（区域不挂用户，无需配置）
  *   - 打开时调 getAdminOrg(id) 读取该组织完整 settings（列表项不含 settings）
@@ -81,6 +91,8 @@ export function OrgFormModal({
   const [saving, setSaving]       = useState(false)
   const [logoUrl, setLogoUrl]     = useState(initial?.logo_url || '')
   const [logoUploading, setLogoUploading] = useState(false)
+  // Logo移除链路③：待清除标记。编辑模式点"移除"置 true，保存时携带 clear_logo
+  const [clearLogo, setClearLogo] = useState(false)
   const [error, setError]         = useState('')
 
   // v172：门户板块开关相关状态
@@ -146,6 +158,10 @@ export function OrgFormModal({
         // v172：编辑学校时，把板块开关合并进 settings 一并提交
         if (showModuleConfig) {
           req.settings = mergePortalModules(originalSettings, modules)
+        }
+        // Logo移除链路③：用户点过"移除"且未重新上传 → 携带清除标记
+        if (clearLogo) {
+          req.clear_logo = true
         }
         await updateAdminOrg(initial!.id, req)
       }
@@ -239,6 +255,8 @@ export function OrgFormModal({
                           setLogoUploading(true)
                           const result = await uploadOrgLogo(initial.id, file)
                           setLogoUrl(result.url)
+                          // 链路③：重新上传成功（已即时落库）→ 撤销待清除标记，防保存时误清
+                          setClearLogo(false)
                         } catch (err) { setError(err instanceof Error ? err.message : '上传失败') }
                         finally { setLogoUploading(false) }
                       } else {
@@ -252,9 +270,18 @@ export function OrgFormModal({
                     }} />
                 </label>
                 {logoUrl && (
-                  <button onClick={() => setLogoUrl('')} style={{ padding: '4px 10px', borderRadius: '6px', border: `1px solid ${C.border}`, background: 'transparent', fontSize: '12px', color: C.textMuted, cursor: 'pointer' }}>移除</button>
+                  <button onClick={() => {
+                    // 链路③：清预览；编辑模式额外置待清除标记（保存时携带 clear_logo 落库）。
+                    // 创建模式服务器上本无 Logo，仅清本地预览即可。
+                    setLogoUrl('')
+                    if (mode === 'edit') setClearLogo(true)
+                  }} style={{ padding: '4px 10px', borderRadius: '6px', border: `1px solid ${C.border}`, background: 'transparent', fontSize: '12px', color: C.textMuted, cursor: 'pointer' }}>移除</button>
                 )}
               </div>
+              {/* 链路③：待清除状态提示，让用户明白"点保存才真正移除" */}
+              {clearLogo && mode === 'edit' && !logoUrl && (
+                <div style={{ fontSize: '11px', color: C.danger, marginTop: '4px' }}>Logo将在点击"保存"后移除。</div>
+              )}
               <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px' }}>支持JPG/PNG/WEBP/SVG，最大2MB。上传后在课件生成时自动使用。</div>
             </div>
           )}

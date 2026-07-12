@@ -14,6 +14,18 @@ package repository
 //   草稿挂上去备课时不生效（鬼打墙）。挂载选择器的口径必须与注入层焊死一致，
 //   故单独开一个"只列 active"的查询，而不是复用 ListUnitPlans 后在前端过滤——
 //   把"能挂什么"的判断焊在后端，前端无脑列即可。
+//
+// v232修复（保存撞唯一约束）：
+//   FinalizeUnitPlan 保存前先归档同归属+同维度的旧 active 方案，再激活新方案——
+//   "新版覆盖旧版"语义，根治 uq_unit_plans_active 唯一约束冲突(SQLSTATE 23505)。
+//
+// v233 变更（课程大纲教材版本绑定，对齐备课工坊）：
+//   1) unitPlanSelectColumns 与 scanUnitPlan 新增 course_outline_publisher 列——
+//      直接扫进 *string（pgx v5 对指针目标原生支持：列 NULL → nil / 非 NULL → 指向值），
+//      还原三态语义：nil=未关联 / ""=通用版 / 具名=该版本精确匹配；
+//   2) CreateUnitPlanDraft 的 INSERT 新增该列，*string 直接透传（pgx 对 nil 自动写 NULL），
+//      老客户端不传该字段时解码为 nil → 落 NULL，天然兼容零回归。
+//   其余方法与查询保持不变。
 
 import (
 	"context"
@@ -29,17 +41,20 @@ import (
 var ErrUnitPlanNotFound = errors.New("单元方案不存在")
 
 // unitPlanSelectColumns 单条查询统一列（与 scanUnitPlan 对齐）
+// v233：末尾新增 course_outline_publisher（可空，不加 COALESCE——NULL 需保留以还原"未关联"态）
 const unitPlanSelectColumns = `id, scope, scope_target_id, subject, grade, volume, unit, unit_theme,
 title, content, atlas, COALESCE(conversation_log::text,'[]'), source_type, created_by, status,
-created_at, updated_at`
+created_at, updated_at, course_outline_publisher`
 
 // scanUnitPlan 统一扫描单条
+// v233：末尾新增 &p.CourseOutlinePublisher（**string）——pgx v5 原生支持：
+//   列为 NULL → 字段置 nil（未关联大纲）；列非 NULL → 字段指向实际值（""=通用版 / 具名版本）
 func scanUnitPlan(row pgx.Row) (*models.UnitPlan, error) {
 	p := &models.UnitPlan{}
 	err := row.Scan(
 		&p.ID, &p.Scope, &p.ScopeTargetID, &p.Subject, &p.Grade, &p.Volume, &p.Unit, &p.UnitTheme,
 		&p.Title, &p.Content, &p.Atlas, &p.ConversationLog, &p.SourceType, &p.CreatedBy, &p.Status,
-		&p.CreatedAt, &p.UpdatedAt,
+		&p.CreatedAt, &p.UpdatedAt, &p.CourseOutlinePublisher,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -51,6 +66,8 @@ func scanUnitPlan(row pgx.Row) (*models.UnitPlan, error) {
 }
 
 // CreateUnitPlanDraft 建一份草稿（status=draft），回填 id/时间
+// v233：INSERT 新增 course_outline_publisher（$11）——*string 直接透传，
+// nil 写 NULL（未关联/老客户端）、"" 写空串（通用版）、具名写实际值（版本精确匹配）。
 func CreateUnitPlanDraft(ctx context.Context, p *models.UnitPlan) error {
 	sourceType := p.SourceType
 	if sourceType == "" {
@@ -59,12 +76,12 @@ func CreateUnitPlanDraft(ctx context.Context, p *models.UnitPlan) error {
 	err := database.DB.QueryRow(ctx, `
 		INSERT INTO unit_plans
 		  (scope, scope_target_id, subject, grade, volume, unit, unit_theme, title,
-		   source_type, created_by, status)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'draft')
+		   source_type, created_by, course_outline_publisher, status)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'draft')
 		RETURNING id, created_at, updated_at
 	`,
 		p.Scope, p.ScopeTargetID, p.Subject, p.Grade, p.Volume, p.Unit, p.UnitTheme, p.Title,
-		sourceType, p.CreatedBy,
+		sourceType, p.CreatedBy, p.CourseOutlinePublisher,
 	).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("创建单元方案草稿失败: %w", err)
@@ -97,7 +114,38 @@ func AppendUnitPlanMessage(ctx context.Context, id, role, content string) error 
 }
 
 // FinalizeUnitPlan 定稿：写方案/图谱/主题/标题并置 active
+//
+// v232修复（保存撞唯一约束）：
+// 唯一约束 uq_unit_plans_active 保证同归属+学科+年级+册次+单元只有一份 active。
+// 若该组合已有旧 active 方案，先将旧方案归档(archived)再激活新方案——
+// "新版覆盖旧版"语义，符合老师预期（同一个单元只保留最新定稿）。
+// 归档操作按 scope+scope_target_id+subject+grade+volume+unit 精确匹配，
+// 且排除本方案自身（防止自己归档自己）。
 func FinalizeUnitPlan(ctx context.Context, id string, req *models.SaveUnitPlanRequest) error {
+	// 先查出本方案的归属维度，用于定位可能冲突的旧 active 方案
+	var scope, scopeTargetID, subject, grade, volume, unit string
+	lookupErr := database.DB.QueryRow(ctx, `
+		SELECT scope, scope_target_id, subject, grade, volume, unit
+		FROM unit_plans WHERE id = $1
+	`, id).Scan(&scope, &scopeTargetID, &subject, &grade, &volume, &unit)
+	if lookupErr != nil {
+		return fmt.Errorf("查询单元方案归属失败: %w", lookupErr)
+	}
+
+	// 将同归属+同学科+同年级+同册次+同单元的旧 active 方案归档（排除自身）
+	// 归档失败不阻断保存——最坏情况下面 UPDATE 会撞唯一约束，走原有报错
+	_, archiveErr := database.DB.Exec(ctx, `
+		UPDATE unit_plans
+		SET status = 'archived', updated_at = now()
+		WHERE scope = $1 AND scope_target_id = $2
+		  AND subject = $3 AND grade = $4 AND volume = $5 AND unit = $6
+		  AND status = 'active' AND id <> $7
+	`, scope, scopeTargetID, subject, grade, volume, unit, id)
+	if archiveErr != nil {
+		fmt.Printf("[WARN] 归档旧单元方案失败: %v\n", archiveErr)
+	}
+
+	// 激活本方案
 	result, err := database.DB.Exec(ctx, `
 		UPDATE unit_plans
 		SET title = $1, unit_theme = $2, content = $3, atlas = $4,

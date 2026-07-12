@@ -254,6 +254,82 @@ func (h *CoursewareAssetHandler) UploadVideo(w http.ResponseWriter, r *http.Requ
 	utils.Success(w, resp)
 }
 
+// ==================== 手动上传音频 ====================
+
+// UploadAudio POST /api/v1/coursewares/{id}/pages/{num}/upload-audio
+// Content-Type: multipart/form-data
+// 字段: file（音频文件，仅 file 字段）
+// 支持格式: MP3/WAV/OGG/AAC/FLAC/M4A
+// 大小限制: ≤ 20MB
+//
+// 说明:
+//   - 音频上传后加入素材库，老师可上云获取公网链接
+//   - 存储路径: /uploads/courseware-assets/{cwID}/audios/
+//   - 上传成功后写入审计日志（courseware.audio_upload）
+func (h *CoursewareAssetHandler) UploadAudio(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	// 路径解析: 复用图片上传相同的工具函数
+	cwID, pageNum := extractCWAssetPageActionPath(r.URL.Path, "/upload-audio")
+	if cwID == "" || pageNum <= 0 {
+		utils.BadRequest(w, "路径参数错误")
+		return
+	}
+
+	// 音频文件，10MB 内存缓冲（超出部分自动落盘到 /tmp）
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		utils.BadRequest(w, "音频文件解析失败: "+err.Error())
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		utils.BadRequest(w, "缺少文件字段 file")
+		return
+	}
+	defer file.Close()
+
+	originalFilename := header.Filename
+
+	svcReq := &services.UploadAudioAssetRequest{
+		CoursewareID: cwID,
+		PageNumber:   pageNum,
+		UserID:       claims.UserID,
+	}
+
+	resp, err := h.assetService.UploadAudioAsset(r.Context(), svcReq, file, header)
+	if err != nil {
+		utils.InternalError(w, err.Error())
+		return
+	}
+
+	// 上传成功后异步写入审计日志
+	repository.WriteAuditLog(
+		claims.UserID,
+		"courseware.audio_upload",
+		map[string]interface{}{
+			"courseware_id":     cwID,
+			"page_number":       pageNum,
+			"asset_id":          resp.AssetID,
+			"file_size":         resp.FileSize,
+			"mime_type":         resp.MimeType,
+			"original_filename": originalFilename,
+			"stored_filename":   resp.FileName,
+		},
+		repository.GetClientIP(r.RemoteAddr),
+	)
+
+	utils.Success(w, resp)
+}
+
 // ==================== 查询资产列表 ====================
 
 // ListPageAssets GET /api/v1/coursewares/{id}/pages/{num}/assets

@@ -10,6 +10,13 @@ package ai
 //   - image_default_model: 默认模型名
 //
 // 图生图：在请求体中传 image 字段（公网可访问的图片URL），豆包会参考该图生成
+//
+// 【尺寸兜底闸门 v0.42.1】
+//   豆包 Seedream 硬性要求 image size 总像素须 ≥ 3,686,400（约 1920×1920 或等效面积），
+//   低于此值直接返回 HTTP 400 InvalidParameter。历史上全自动装配链曾硬编码 1024×1024、
+//   1280×720 等偏小尺寸导致整批配图失败。为杜绝同类问题复发，本文件在发请求前统一经
+//   normalizeImageSize 校验：凡总像素低于下限的尺寸，按原始宽高比自动放大到达标，任何
+//   调用方（手动生图/装配配图/视频首帧）传偏小尺寸都会被自动纠正，不再整批 400。
 
 import (
 	"bytes"
@@ -18,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,15 +37,25 @@ import (
 // 模块日志
 var imageLog = logger.WithModule("ai_image")
 
+// 豆包 Seedream 尺寸约束常量
+const (
+	// doubaoMinImagePixels 豆包图片生成的最小总像素约束（宽×高须 ≥ 此值，否则 HTTP 400）
+	doubaoMinImagePixels = 3686400
+	// doubaoDefaultSize 未指定尺寸时的默认尺寸（1920×1920 = 3,686,400，正好达标）
+	doubaoDefaultSize = "1920x1920"
+	// doubaoSizeAlign 放大后宽高对齐到该倍数（避免奇数/非对齐尺寸再被拒）
+	doubaoSizeAlign = 8
+)
+
 // ==================== 请求/响应结构体 ====================
 
 // ImageGenerateRequest 图片生成请求（豆包OpenAI兼容格式）
 type ImageGenerateRequest struct {
-	Model  string `json:"model"`            // 模型名
-	Prompt string `json:"prompt"`           // 生成提示词
-	Size   string `json:"size,omitempty"`   // 图片尺寸，默认 1920x1920
-	N      int    `json:"n,omitempty"`      // 生成数量，默认 1
-	Image  string `json:"image,omitempty"`  // 参考图URL（图生图模式，公网可访问）
+	Model  string `json:"model"`           // 模型名
+	Prompt string `json:"prompt"`          // 生成提示词
+	Size   string `json:"size,omitempty"`  // 图片尺寸，默认 1920x1920
+	N      int    `json:"n,omitempty"`     // 生成数量，默认 1
+	Image  string `json:"image,omitempty"` // 参考图URL（图生图模式，公网可访问）
 }
 
 // ImageGenerateResponse 图片生成响应
@@ -67,13 +85,141 @@ type ImageConfig struct {
 	Model      string // 模型名
 }
 
+// ==================== 尺寸兜底闸门 ====================
+
+// normalizeImageSize 校验并纠正图片尺寸，保证总像素满足豆包下限。
+//
+// 逻辑：
+//   1. 空字符串 → 返回默认尺寸 doubaoDefaultSize；
+//   2. 无法解析为 "宽x高"（如 "1024x1024"）→ 记 Warn，返回默认尺寸兜底；
+//   3. 总像素已达标 → 原样返回；
+//   4. 总像素不足 → 按原始宽高比等比放大到刚好达标，宽高对齐到 doubaoSizeAlign 的倍数，
+//      并记一条 INFO 说明"自动放大"，返回纠正后的尺寸。
+//
+// 返回：纠正后的尺寸字符串（形如 "2560x1440"）。永不返回不合法尺寸。
+func normalizeImageSize(size string) string {
+	size = strings.TrimSpace(size)
+	if size == "" {
+		return doubaoDefaultSize
+	}
+
+	w, h, ok := parseSize(size)
+	if !ok || w <= 0 || h <= 0 {
+		imageLog.Warn("图片尺寸无法解析，回退默认尺寸", "raw_size", size, "default", doubaoDefaultSize)
+		return doubaoDefaultSize
+	}
+
+	// 已达标，原样返回
+	if w*h >= doubaoMinImagePixels {
+		return size
+	}
+
+	// 需放大：保持宽高比 r=w/h，令 (w*s)*(h*s) = doubaoMinImagePixels，
+	// 即 s = sqrt(doubaoMinImagePixels / (w*h))；用整数运算避免引入 math 依赖：
+	// 逐步放大直到达标（每次乘以比例并对齐），最多放大一次即可覆盖大多数情况，
+	// 循环仅为对齐后可能仍差一点点的极端情况兜底。
+	origW, origH := w, h
+	for w*h < doubaoMinImagePixels {
+		// 目标缩放因子（放大 1.02 倍冗余，抵消对齐向下取整带来的损耗）
+		// 用整数放大：newArea 需 ≥ 下限，按面积比开方近似
+		scaledW := scaleUpDimension(w, h)
+		scaledH := scaleUpDimension(h, w)
+		if scaledW <= w && scaledH <= h {
+			// 兜底防死循环：直接强制放大到默认尺寸
+			imageLog.Warn("图片尺寸放大异常，强制回退默认尺寸", "raw_size", size, "default", doubaoDefaultSize)
+			return doubaoDefaultSize
+		}
+		w, h = scaledW, scaledH
+	}
+
+	fixed := fmt.Sprintf("%dx%d", w, h)
+	imageLog.Info("图片尺寸低于豆包下限，已自动放大达标",
+		"orig_size", fmt.Sprintf("%dx%d", origW, origH),
+		"orig_pixels", origW*origH,
+		"fixed_size", fixed,
+		"fixed_pixels", w*h,
+		"min_pixels", doubaoMinImagePixels,
+	)
+	return fixed
+}
+
+// parseSize 解析 "宽x高" 字符串（分隔符兼容小写 x 与大写 X）为宽高整数。
+func parseSize(size string) (int, int, bool) {
+	lower := strings.ToLower(size)
+	parts := strings.SplitN(lower, "x", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	w, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	h, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return w, h, true
+}
+
+// scaleUpDimension 把某一维度（dim）按需要放大一档：
+// 目标是让面积达标，这里对单个维度乘以一个足以覆盖面积缺口的因子，并对齐到 doubaoSizeAlign 的倍数。
+// other 为另一维度（用于估算当前面积缺口）。
+func scaleUpDimension(dim, other int) int {
+	if dim <= 0 || other <= 0 {
+		return dim
+	}
+	// 当前面积
+	area := dim * other
+	if area >= doubaoMinImagePixels {
+		return alignUp(dim)
+	}
+	// 面积缺口比例（放大 1.02 倍冗余）：ratio = sqrt(min/area) ≈ 用整数近似
+	// 为避免 math 依赖，用"面积比 * 1.02"的平方根近似：先算 min*10000/area 再开方（整数牛顿法）
+	scaledArea := doubaoMinImagePixels*102/100 + 1
+	ratioX10000 := isqrt(int64(scaledArea) * 10000 / int64(area)) // = sqrt(scaledArea/area)*100
+	if ratioX10000 < 100 {
+		ratioX10000 = 100
+	}
+	newDim := dim * int(ratioX10000) / 100
+	if newDim <= dim {
+		newDim = dim + doubaoSizeAlign
+	}
+	return alignUp(newDim)
+}
+
+// alignUp 把整数向上对齐到 doubaoSizeAlign 的倍数。
+func alignUp(v int) int {
+	if v <= 0 {
+		return doubaoSizeAlign
+	}
+	r := v % doubaoSizeAlign
+	if r == 0 {
+		return v
+	}
+	return v + (doubaoSizeAlign - r)
+}
+
+// isqrt 整数平方根（牛顿迭代），用于避免引入 math 包。返回 floor(sqrt(n))。
+func isqrt(n int64) int64 {
+	if n < 0 {
+		return 0
+	}
+	if n < 2 {
+		return n
+	}
+	x := n
+	y := (x + 1) / 2
+	for y < x {
+		x = y
+		y = (x + n/x) / 2
+	}
+	return x
+}
+
 // ==================== 图片生成核心函数 ====================
 
 // GenerateImage 调用豆包API生成图片（支持图生图）
 // 参数：
 //   - cfg: 图片API配置
 //   - prompt: 生成提示词
-//   - size: 图片尺寸（空则默认1920x1920，总像素需≥3686400）
+//   - size: 图片尺寸（空则默认1920x1920，总像素需≥3686400；低于下限会被 normalizeImageSize 自动放大）
 //   - n: 生成数量（0或1则生成1张，最多4张）
 //   - refImageURL: 参考图URL（空则纯文生图，非空则图生图）
 //   - traceCtx: 追踪上下文（可为nil）
@@ -91,10 +237,9 @@ func GenerateImage(ctx context.Context, cfg *ImageConfig, prompt string, size st
 		return nil, fmt.Errorf("图片生成提示词不能为空")
 	}
 
-	// 默认参数
-	if size == "" {
-		size = "1920x1920"
-	}
+	// 尺寸兜底闸门：空则默认，低于豆包下限则自动放大达标（杜绝 HTTP 400 InvalidParameter）
+	size = normalizeImageSize(size)
+
 	if n <= 0 {
 		n = 1
 	}
@@ -140,7 +285,7 @@ func GenerateImage(ctx context.Context, cfg *ImageConfig, prompt string, size st
 	httpReq.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 
 	// 发送请求（60秒超时）
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: 120 * time.Second}
 	startTime := time.Now()
 	httpResp, err := client.Do(httpReq)
 	latencyMs := time.Since(startTime).Milliseconds()
@@ -204,8 +349,8 @@ func GenerateImage(ctx context.Context, cfg *ImageConfig, prompt string, size st
 	if traceCtx != nil {
 		go func() {
 			emitTrace(
-				traceCtx,  cfg.Model,
-				0, 0, 0,   // tokens（图片生成不计token）
+				traceCtx, cfg.Model,
+				0, 0, 0, // tokens（图片生成不计token）
 				latencyMs, "success", "",
 				len(urls), // outputLength
 				false, false, "",

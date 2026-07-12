@@ -2,6 +2,12 @@ package middleware
 
 // JWT认证中间件 + RBAC权限中间件
 // Phase8日志升级：权限拒绝事件输出结构化日志（级别WARN，含username/role/path等字段）
+//
+// 超管收口新增：SuperAdminOnly 中间件
+//   在 RequireRole("admin") 之上再收一层——不仅要求是 admin 角色，还要求
+//   claims.IsSuper == true。用于保护"模型配置/积分/AI统计/审计日志"等只有真超管
+//   能碰的敏感路由。二线管理员(admin 但 is_super=false)会被本中间件拦下返回 403，
+//   与前端入口隐藏形成双重收口（前端隐藏是体验，本中间件是真墙）。
 
 import (
 	"context"
@@ -104,6 +110,53 @@ func RequireRole(allowedRoles ...string) func(http.Handler) http.Handler {
 			}
 
 			// 3. 角色验证通过，继续处理
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// SuperAdminOnly 超级管理员专属中间件：仅放行 is_super=true 的账号。
+//
+// 用法：SuperAdminOnly()(nextHandler)
+// 必须在 AuthMiddleware 之后使用（依赖上下文中的 claims）。
+//
+// 判定：claims.IsSuper == true 才放行，否则返回 403。
+//   - 真超管(admin 且 is_super=true)：放行；
+//   - 二线管理员(admin 但 is_super=false)：拦下（有 admin 角色但非超管）；
+//   - 其余角色：自然拦下（is_super 恒为 false）。
+//
+// 用于保护"模型配置/积分/AI统计/审计日志"等敏感路由，是这些入口的真实安全边界
+// （前端入口隐藏仅是体验，绕过前端直敲 API 由本中间件兜底拦截）。
+//
+// 存量 token（未带 is_super 字段）解析后 IsSuper 默认 false，会被拦下——
+// 属收紧方向（fail-safe），老超管重新登录换新 token 即恢复访问，绝不会误放行。
+func SuperAdminOnly() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 1. 从上下文获取 claims
+			claims, ok := GetClaims(r.Context())
+			if !ok {
+				utils.Unauthorized(w, "未找到认证信息")
+				return
+			}
+
+			// 2. 仅超管放行
+			if !claims.IsSuper {
+				// WARN级别：非超管尝试访问超管专属入口，属安全事件需关注
+				log.Warn("超管权限拒绝",
+					"username", claims.Username,
+					"user_id", claims.UserID,
+					"role", claims.Role,
+					"is_super", claims.IsSuper,
+					"path", r.URL.Path,
+					"method", r.Method,
+					"remote_addr", r.RemoteAddr,
+				)
+				utils.Forbidden(w, "该功能仅超级管理员可访问")
+				return
+			}
+
+			// 3. 超管验证通过，继续处理
 			next.ServeHTTP(w, r)
 		})
 	}

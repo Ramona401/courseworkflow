@@ -169,6 +169,7 @@ export const PLUS_MENU_ITEMS: PlusMenuItem[] = [
   { tool: 'components', emoji: '🧩', label: '教学组件', desc: '从组件库挑选参考组件加入对话' },
   { tool: 'textbook',   emoji: '📷', label: '课本图片', desc: '让AI贴着课文原文来设计（下一轮生效）' },
   { tool: 'import',     emoji: '📂', label: '导入教案', desc: '上传已有教案，AI评审并改进' },
+  { tool: 'ref_material', emoji: '📎', label: '参考资料', desc: '上传PDF/Word，AI备课时参考（本次对话内有效）' },
 ]
 
 /**

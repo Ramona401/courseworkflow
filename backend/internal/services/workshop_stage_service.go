@@ -726,10 +726,16 @@ func (s *WorkshopStageService) LoadStagePromptContextV2(
 			if coErr != nil {
 				wsLog.Warn("查询课程大纲候选失败，跳过大纲注入",
 					"plan_id", lp.ID, "stage", stageCode, "subject", lp.Subject, "error", coErr)
-			} else if hits := MatchOutlines(lp.Grade, candidates); len(hits) > 0 {
-				// 多份全注入（Yuhan 决策）：年级集合与教案相交的大纲全部拼入。
-				// 学段写法的教案（如"小学低段"）会命中多个年级的多份大纲；
-				// 具体年级教案（如"一年级"）通常只命中该年级的上下册。
+			} else if lp.CourseOutlinePublisher == nil {
+				// 教材版本增强（Yuhan 决策）：大纲注入改为「老师在备课首屏显式选定教材版本」。
+				// CourseOutlinePublisher == nil 表示老师没选版本 / 没关联大纲 → 静默不注入，
+				// 不再像旧逻辑那样自动按学段匹配。没选版本就是不注入，正常单课备课。
+				wsLog.Info("教案未选定课程大纲教材版本，跳过大纲注入",
+					"plan_id", lp.ID, "stage", stageCode, "subject", lp.Subject, "plan_grade", lp.Grade)
+			} else if hits := MatchOutlinesByPublisher(lp.Grade, *lp.CourseOutlinePublisher, candidates); len(hits) > 0 {
+				// 版本精确注入（Yuhan 决策）：只注入 publisher == 老师选定版本 的大纲，零跨版本兜底。
+				// 选定版本下、学段相交命中的大纲多份全注入（同年级上下册等）。
+				// *lp.CourseOutlinePublisher 为空串=老师选了"通用/不限版本"，则精确匹配 publisher 为空串的大纲。
 				if outlineCtx := BuildCourseOutlinesContext(hits); strings.TrimSpace(outlineCtx) != "" {
 					basePrompt += outlineCtx
 					// 收集命中大纲的标题，便于日志核对"到底注入了哪几份"
@@ -751,6 +757,43 @@ func (s *WorkshopStageService) LoadStagePromptContextV2(
 			"plan_id", lp.ID, "stage", stageCode)
 	}
 
+	// 班级学情注入层（差异化教学·批次3·注入）——置于课程大纲层之后、return 之前。
+	//
+	// 与单元方案的区别：班级学情是老师「显式挂载」的（lesson_plans.class_profile_id），
+	// 描述的是这节课要面对的真实学生群体，仅在 analyze / design / write 三阶段注入
+	// （review/revise 是评分与定稿，不需要学情；省 token 又不干扰）。
+	//
+	// 独立不让位（与单元方案/课程大纲维度正交——Yuhan 决策）：本层不读、不改 unitPlanInjected，
+	// 无论单元方案/课程大纲是否注入都照常注入。一节课可以同时挂单元方案 + 班级学情，两者叠加。
+	//
+	// 取数：repository.GetClassProfileByID（静态包级调用，与单元方案层同形态，故两个 wsStage 实例
+	// 天然都注入，无需 Setter）。校验 status==active 且 created_by==教案作者（归属兜底，防越权注入他人卡）。
+	// 拼块函数 BuildClassProfileContext 只用四大段群体结论（合规：个体明细永不进注入链路）。
+	// 任何缺失（未挂载/取不到/非 active/非本人/拼块为空）都静默跳过，记 Info/Warn，绝不阻断备课。
+	if (stageCode == "analyze" || stageCode == "design" || stageCode == "write") &&
+		lp.ClassProfileID != nil && strings.TrimSpace(*lp.ClassProfileID) != "" {
+		cp, cpErr := repository.GetClassProfileByID(ctx, *lp.ClassProfileID)
+		if cpErr != nil {
+			// 取不到（已被软删/物理删除等）：无外键约束设计的预期情形，静默跳过。
+			wsLog.Warn("已挂载班级学情卡但查询失败，跳过班级学情注入",
+				"plan_id", lp.ID, "stage", stageCode, "class_profile_id", *lp.ClassProfileID, "error", cpErr)
+		} else if cp.Status != models.ClassProfileStatusActive {
+			// 已归档（软删）：不注入已删卡。
+			wsLog.Info("已挂载班级学情卡但非 active 状态，跳过班级学情注入",
+				"plan_id", lp.ID, "stage", stageCode, "class_profile_id", *lp.ClassProfileID, "status", cp.Status)
+		} else if cp.CreatedBy != lp.AuthorID {
+			// 归属兜底：只注入教案作者本人的班级卡，绝不注入他人卡（纵深防御，防越权挂载/串台）。
+			wsLog.Warn("挂载的班级学情卡归属与教案作者不一致，跳过班级学情注入",
+				"plan_id", lp.ID, "stage", stageCode, "class_profile_id", *lp.ClassProfileID,
+				"card_owner", cp.CreatedBy, "plan_author", lp.AuthorID)
+		} else if cpContext := BuildClassProfileContext(cp); strings.TrimSpace(cpContext) != "" {
+			// active + 本人 + 拼块非空：analyze/design/write 三阶段注入，独立不让位。
+			basePrompt += cpContext
+			wsLog.Info("已注入班级学情上下文（差异化教学，三阶段 analyze/design/write）",
+				"plan_id", lp.ID, "stage", stageCode,
+				"class_profile_id", cp.ID, "class_name", cp.ClassName)
+		}
+	}
 	return basePrompt, nil
 }
 

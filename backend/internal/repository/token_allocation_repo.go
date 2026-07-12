@@ -24,30 +24,30 @@ package repository
 // 对应数据库表：token_allocations / token_consumption_logs
 
 import (
-        "context"
-        "fmt"
+	"context"
+	"fmt"
 
-        "tedna/internal/database"
-        "tedna/internal/models"
+	"tedna/internal/database"
+	"tedna/internal/models"
 )
 
 // ==================== 分配记录 ====================
 
 // CreateTokenAllocation 创建分配记录
 func CreateTokenAllocation(ctx context.Context, alloc *models.TokenAllocation) error {
-        err := database.DB.QueryRow(ctx, `
+	err := database.DB.QueryRow(ctx, `
                 INSERT INTO token_allocations
                         (from_account_id, to_account_id, amount, allocation_type, memo, operator_id)
                 VALUES ($1, $2, $3, $4, $5, $6)
                 RETURNING id, created_at
         `,
-                alloc.FromAccountID, alloc.ToAccountID, alloc.Amount,
-                alloc.AllocationType, alloc.Memo, alloc.OperatorID,
-        ).Scan(&alloc.ID, &alloc.CreatedAt)
-        if err != nil {
-                return fmt.Errorf("创建分配记录失败: %w", err)
-        }
-        return nil
+		alloc.FromAccountID, alloc.ToAccountID, alloc.Amount,
+		alloc.AllocationType, alloc.Memo, alloc.OperatorID,
+	).Scan(&alloc.ID, &alloc.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("创建分配记录失败: %w", err)
+	}
+	return nil
 }
 
 // ListTokenAllocations 查询分配记录列表（按来源/目标账户筛选 + v172 owner 白名单 + A excludeMonthly）
@@ -59,54 +59,54 @@ func CreateTokenAllocation(ctx context.Context, alloc *models.TokenAllocation) e
 //
 // A：excludeMonthly==true 时加 AND a.allocation_type <> 'monthly'（固定条件，无参数）。
 func ListTokenAllocations(ctx context.Context, fromAccountID string, toAccountID string, excludeMonthly bool, ownerIDs []string, limit int, offset int) ([]*models.AllocationListItem, int, error) {
-        where := "1=1"
-        args := []interface{}{}
-        argIdx := 1
+	where := "1=1"
+	args := []interface{}{}
+	argIdx := 1
 
-        if fromAccountID != "" {
-                where += fmt.Sprintf(" AND a.from_account_id = $%d", argIdx)
-                args = append(args, fromAccountID)
-                argIdx++
-        }
-        if toAccountID != "" {
-                where += fmt.Sprintf(" AND a.to_account_id = $%d", argIdx)
-                args = append(args, toAccountID)
-                argIdx++
-        }
+	if fromAccountID != "" {
+		where += fmt.Sprintf(" AND a.from_account_id = $%d", argIdx)
+		args = append(args, fromAccountID)
+		argIdx++
+	}
+	if toAccountID != "" {
+		where += fmt.Sprintf(" AND a.to_account_id = $%d", argIdx)
+		args = append(args, toAccountID)
+		argIdx++
+	}
 
-        // A：排除月度自充值（固定条件，不含参数、不消耗 argIdx；插在 owner 白名单之前）。
-        if excludeMonthly {
-                where += " AND a.allocation_type <> 'monthly'"
-        }
+	// A：排除月度自充值（固定条件，不含参数、不消耗 argIdx；插在 owner 白名单之前）。
+	if excludeMonthly {
+		where += " AND a.allocation_type <> 'monthly'"
+	}
 
-        // v172 owner_id 白名单：来源或目标账户的 owner 命中即保留
-        if ownerIDs != nil {
-                if len(ownerIDs) == 0 {
-                        where += " AND 1=0"
-                } else {
-                        where += fmt.Sprintf(`
+	// v172 owner_id 白名单：来源或目标账户的 owner 命中即保留
+	if ownerIDs != nil {
+		if len(ownerIDs) == 0 {
+			where += " AND 1=0"
+		} else {
+			where += fmt.Sprintf(`
                                 AND (
                                         a.from_account_id IN (SELECT id FROM token_accounts WHERE owner_id = ANY($%d))
                                         OR a.to_account_id IN (SELECT id FROM token_accounts WHERE owner_id = ANY($%d))
                                 )`, argIdx, argIdx)
-                        args = append(args, ownerIDs)
-                        argIdx++
-                }
-        }
+			args = append(args, ownerIDs)
+			argIdx++
+		}
+	}
 
-        // 统计总数
-        var total int
-        countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM token_allocations a WHERE %s`, where)
-        if err := database.DB.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
-                return nil, 0, fmt.Errorf("统计分配记录数失败: %w", err)
-        }
+	// 统计总数
+	var total int
+	countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM token_allocations a WHERE %s`, where)
+	if err := database.DB.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("统计分配记录数失败: %w", err)
+	}
 
-        if limit <= 0 {
-                limit = 50
-        }
+	if limit <= 0 {
+		limit = 50
+	}
 
-        // 分页查询（关联账户和用户获取名称）
-        listQuery := fmt.Sprintf(`
+	// 分页查询（关联账户和用户获取名称）
+	listQuery := fmt.Sprintf(`
                 SELECT a.id,
                        COALESCE(fa.display_name, '') AS from_account_name,
                        COALESCE(ta.display_name, '') AS to_account_name,
@@ -121,36 +121,36 @@ func ListTokenAllocations(ctx context.Context, fromAccountID string, toAccountID
                 ORDER BY a.created_at DESC
                 LIMIT $%d OFFSET $%d
         `, where, argIdx, argIdx+1)
-        args = append(args, limit, offset)
+	args = append(args, limit, offset)
 
-        rows, err := database.DB.Query(ctx, listQuery, args...)
-        if err != nil {
-                return nil, 0, fmt.Errorf("查询分配记录列表失败: %w", err)
-        }
-        defer rows.Close()
+	rows, err := database.DB.Query(ctx, listQuery, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("查询分配记录列表失败: %w", err)
+	}
+	defer rows.Close()
 
-        var items []*models.AllocationListItem
-        for rows.Next() {
-                item := &models.AllocationListItem{}
-                err := rows.Scan(
-                        &item.ID, &item.FromAccountName, &item.ToAccountName,
-                        &item.Amount, &item.AllocationType, &item.Memo,
-                        &item.OperatorName, &item.CreatedAt,
-                )
-                if err != nil {
-                        return nil, 0, fmt.Errorf("扫描分配记录行失败: %w", err)
-                }
-                items = append(items, item)
-        }
-        return items, total, nil
+	var items []*models.AllocationListItem
+	for rows.Next() {
+		item := &models.AllocationListItem{}
+		err := rows.Scan(
+			&item.ID, &item.FromAccountName, &item.ToAccountName,
+			&item.Amount, &item.AllocationType, &item.Memo,
+			&item.OperatorName, &item.CreatedAt,
+		)
+		if err != nil {
+			return nil, 0, fmt.Errorf("扫描分配记录行失败: %w", err)
+		}
+		items = append(items, item)
+	}
+	return items, total, nil
 }
 
 // ==================== 消费流水 ====================
 
 // CreateTokenConsumptionLog 创建消费流水记录
 func CreateTokenConsumptionLog(ctx context.Context, log *models.TokenConsumptionLog) error {
-        // v129变更：新增9个精确积分计算字段
-        err := database.DB.QueryRow(ctx, `
+	// v129变更：新增9个精确积分计算字段
+	err := database.DB.QueryRow(ctx, `
                 INSERT INTO token_consumption_logs
                         (account_id, user_id, amount, balance_before, balance_after,
                          scene_code, model_used, tokens_used, lesson_plan_id, pipeline_id, memo,
@@ -160,15 +160,15 @@ func CreateTokenConsumptionLog(ctx context.Context, log *models.TokenConsumption
                         $12, $13, $14, $15, $16, $17, $18, $19, $20)
                 RETURNING id, created_at
         `,
-                log.AccountID, log.UserID, log.Amount, log.BalanceBefore, log.BalanceAfter,
-                log.SceneCode, log.ModelUsed, log.TokensUsed, log.LessonPlanID, log.PipelineID, log.Memo,
-                log.InputTokens, log.OutputTokens, log.ModelName, log.Provider,
-                log.CostUSD, log.ExchangeRate, log.Multiplier, log.CreditsConsumed, log.LatencyMs,
-        ).Scan(&log.ID, &log.CreatedAt)
-        if err != nil {
-                return fmt.Errorf("创建消费流水失败: %w", err)
-        }
-        return nil
+		log.AccountID, log.UserID, log.Amount, log.BalanceBefore, log.BalanceAfter,
+		log.SceneCode, log.ModelUsed, log.TokensUsed, log.LessonPlanID, log.PipelineID, log.Memo,
+		log.InputTokens, log.OutputTokens, log.ModelName, log.Provider,
+		log.CostUSD, log.ExchangeRate, log.Multiplier, log.CreditsConsumed, log.LatencyMs,
+	).Scan(&log.ID, &log.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("创建消费流水失败: %w", err)
+	}
+	return nil
 }
 
 // ListTokenConsumptionLogs 查询消费流水列表（支持按账户、用户、场景筛选 + v172 user_id 白名单）
@@ -180,50 +180,50 @@ func CreateTokenConsumptionLog(ctx context.Context, log *models.TokenConsumption
 //
 // 说明：senior_operator 传本校成员 user_id 列表；operator/viewer 传 [自己的user_id]。
 func ListTokenConsumptionLogs(ctx context.Context, accountID string, userID string, sceneCode string, userIDs []string, limit int, offset int) ([]*models.ConsumptionListItem, int, error) {
-        where := "1=1"
-        args := []interface{}{}
-        argIdx := 1
+	where := "1=1"
+	args := []interface{}{}
+	argIdx := 1
 
-        if accountID != "" {
-                where += fmt.Sprintf(" AND cl.account_id = $%d", argIdx)
-                args = append(args, accountID)
-                argIdx++
-        }
-        if userID != "" {
-                where += fmt.Sprintf(" AND cl.user_id = $%d", argIdx)
-                args = append(args, userID)
-                argIdx++
-        }
-        if sceneCode != "" {
-                where += fmt.Sprintf(" AND cl.scene_code = $%d", argIdx)
-                args = append(args, sceneCode)
-                argIdx++
-        }
+	if accountID != "" {
+		where += fmt.Sprintf(" AND cl.account_id = $%d", argIdx)
+		args = append(args, accountID)
+		argIdx++
+	}
+	if userID != "" {
+		where += fmt.Sprintf(" AND cl.user_id = $%d", argIdx)
+		args = append(args, userID)
+		argIdx++
+	}
+	if sceneCode != "" {
+		where += fmt.Sprintf(" AND cl.scene_code = $%d", argIdx)
+		args = append(args, sceneCode)
+		argIdx++
+	}
 
-        // v172 user_id 白名单（安全关键：nil=不过滤；空切片=匹配空集）
-        if userIDs != nil {
-                if len(userIDs) == 0 {
-                        where += " AND 1=0"
-                } else {
-                        where += fmt.Sprintf(" AND cl.user_id = ANY($%d)", argIdx)
-                        args = append(args, userIDs)
-                        argIdx++
-                }
-        }
+	// v172 user_id 白名单（安全关键：nil=不过滤；空切片=匹配空集）
+	if userIDs != nil {
+		if len(userIDs) == 0 {
+			where += " AND 1=0"
+		} else {
+			where += fmt.Sprintf(" AND cl.user_id = ANY($%d)", argIdx)
+			args = append(args, userIDs)
+			argIdx++
+		}
+	}
 
-        // 统计总数
-        var total int
-        countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM token_consumption_logs cl WHERE %s`, where)
-        if err := database.DB.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
-                return nil, 0, fmt.Errorf("统计消费流水数失败: %w", err)
-        }
+	// 统计总数
+	var total int
+	countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM token_consumption_logs cl WHERE %s`, where)
+	if err := database.DB.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("统计消费流水数失败: %w", err)
+	}
 
-        if limit <= 0 {
-                limit = 50
-        }
+	if limit <= 0 {
+		limit = 50
+	}
 
-        // 分页查询（关联账户和用户获取名称）
-        listQuery := fmt.Sprintf(`
+	// 分页查询（关联账户和用户获取名称）
+	listQuery := fmt.Sprintf(`
                 SELECT cl.id,
                        COALESCE(ta.display_name, '') AS account_name,
                        COALESCE(u.display_name, '') AS user_name,
@@ -239,55 +239,55 @@ func ListTokenConsumptionLogs(ctx context.Context, accountID string, userID stri
                 ORDER BY cl.created_at DESC
                 LIMIT $%d OFFSET $%d
         `, where, argIdx, argIdx+1)
-        args = append(args, limit, offset)
+	args = append(args, limit, offset)
 
-        rows, err := database.DB.Query(ctx, listQuery, args...)
-        if err != nil {
-                return nil, 0, fmt.Errorf("查询消费流水列表失败: %w", err)
-        }
-        defer rows.Close()
+	rows, err := database.DB.Query(ctx, listQuery, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("查询消费流水列表失败: %w", err)
+	}
+	defer rows.Close()
 
-        var items []*models.ConsumptionListItem
-        for rows.Next() {
-                item := &models.ConsumptionListItem{}
-                err := rows.Scan(
-                        &item.ID, &item.AccountName, &item.UserName,
-                        &item.Amount, &item.BalanceBefore, &item.BalanceAfter,
-                        &item.SceneCode, &item.ModelUsed, &item.TokensUsed,
-                        &item.Memo, &item.CreatedAt,
-                        &item.InputTokens, &item.OutputTokens, &item.ModelName, &item.Provider,
-                        &item.CostUSD, &item.ExchangeRate, &item.Multiplier, &item.CreditsConsumed, &item.LatencyMs,
-                )
-                if err != nil {
-                        return nil, 0, fmt.Errorf("扫描消费流水行失败: %w", err)
-                }
-                items = append(items, item)
-        }
-        return items, total, nil
+	var items []*models.ConsumptionListItem
+	for rows.Next() {
+		item := &models.ConsumptionListItem{}
+		err := rows.Scan(
+			&item.ID, &item.AccountName, &item.UserName,
+			&item.Amount, &item.BalanceBefore, &item.BalanceAfter,
+			&item.SceneCode, &item.ModelUsed, &item.TokensUsed,
+			&item.Memo, &item.CreatedAt,
+			&item.InputTokens, &item.OutputTokens, &item.ModelName, &item.Provider,
+			&item.CostUSD, &item.ExchangeRate, &item.Multiplier, &item.CreditsConsumed, &item.LatencyMs,
+		)
+		if err != nil {
+			return nil, 0, fmt.Errorf("扫描消费流水行失败: %w", err)
+		}
+		items = append(items, item)
+	}
+	return items, total, nil
 }
 
 // GetUserConsumptionSummary 获取用户消费汇总（今日+本月+总计）
 func GetUserConsumptionSummary(ctx context.Context, accountID string) (todayAmount float64, monthAmount float64, totalAmount float64, err error) {
-        // 今日消费
-        _ = database.DB.QueryRow(ctx,
-                `SELECT COALESCE(SUM(amount),0) FROM token_consumption_logs
+	// 今日消费
+	_ = database.DB.QueryRow(ctx,
+		`SELECT COALESCE(SUM(amount),0) FROM token_consumption_logs
                  WHERE account_id = $1 AND created_at >= CURRENT_DATE`,
-                accountID,
-        ).Scan(&todayAmount)
+		accountID,
+	).Scan(&todayAmount)
 
-        // 本月消费
-        _ = database.DB.QueryRow(ctx,
-                `SELECT COALESCE(SUM(amount),0) FROM token_consumption_logs
+	// 本月消费
+	_ = database.DB.QueryRow(ctx,
+		`SELECT COALESCE(SUM(amount),0) FROM token_consumption_logs
                  WHERE account_id = $1 AND created_at >= date_trunc('month', CURRENT_DATE)`,
-                accountID,
-        ).Scan(&monthAmount)
+		accountID,
+	).Scan(&monthAmount)
 
-        // 总消费
-        _ = database.DB.QueryRow(ctx,
-                `SELECT COALESCE(SUM(amount),0) FROM token_consumption_logs
+	// 总消费
+	_ = database.DB.QueryRow(ctx,
+		`SELECT COALESCE(SUM(amount),0) FROM token_consumption_logs
                  WHERE account_id = $1`,
-                accountID,
-        ).Scan(&totalAmount)
+		accountID,
+	).Scan(&totalAmount)
 
-        return todayAmount, monthAmount, totalAmount, nil
+	return todayAmount, monthAmount, totalAmount, nil
 }

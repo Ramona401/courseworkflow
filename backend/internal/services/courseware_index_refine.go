@@ -158,44 +158,109 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 		return fmt.Errorf("AI未返回有效方案")
 	}
 
-	// ---- 6. 构建新的CoursewarePage列表（尽量保留原有页面的层1索引信息）----
+	// ---- 6. 构建新的CoursewarePage列表（双重保留策略：问题页码集+字段比对）----
+	// 双重保留策略确保最高保留率：
+	//   策略A（优先）：前端修正指令含"⚠️ 【严格要求】仅修改以下页面"时，从中提取问题页码集，
+	//     不在集合中的页直接保留全部旧数据（含HTML），无需字段比对，不受AI微调措辞影响。
+	//   策略B（兜底）：无法提取页码集时（手动输入修改意见等场景），回退到三字段精确比对。
+	// 两策略对问题页的处理相同：用AI新方案字段，但不保留HTML（需重新生成）。
+
+	// 从修正指令中提取问题页码集（前端 buildFixInstruction 格式："仅修改以下页面的方案：P3、P5、P8"）
+	affectedPages := extractAffectedPageNums(feedback)
+	usePageNumStrategy := len(affectedPages) > 0 // 策略A可用
+
 	oldPageMap := make(map[int]*models.CoursewarePage)
 	for _, p := range pages {
 		oldPageMap[p.PageNumber] = p
 	}
 
 	var newPages []*models.CoursewarePage
+	htmlPreserved := 0 // 统计：保留了HTML的页数
+	htmlCleared := 0   // 统计：方案变更需重新生成的页数
 	for _, sc := range schemes {
 		pn := sc.PageNumber
 		if pn <= 0 {
 			pn = len(newPages) + 1
 		}
-		page := &models.CoursewarePage{
-			CoursewareID:        coursewareID,
-			PageNumber:          pn,
-			Title:               strings.TrimSpace(sc.Title),
-			Purpose:             strings.TrimSpace(sc.Purpose),
-			ContentSummary:      strings.TrimSpace(sc.ContentSummary),
-			InteractionType:     strings.TrimSpace(sc.InteractionType),
-			VisualFormat:        strings.TrimSpace(sc.VisualFormat),
-			MediaRequirements:   strings.TrimSpace(sc.MediaRequirements),
-			EstimatedComplexity: cwClamp(sc.EstimatedComplexity, 1, 5),
-			Status:              models.CWPageStatusPending,
+		newTitle := strings.TrimSpace(sc.Title)
+		newPurpose := strings.TrimSpace(sc.Purpose)
+		newSummary := strings.TrimSpace(sc.ContentSummary)
+
+		// 检查旧页是否存在
+		oldPage, hasOld := oldPageMap[pn]
+
+		// 判定该页是否属于"不需要改"——满足任一即为"应保留"：
+		//   策略A：有页码集且该页不在集合中
+		//   策略B：无页码集且三字段精确相同
+		shouldPreserve := false
+		if hasOld && strings.TrimSpace(oldPage.HTMLContent) != "" {
+			if usePageNumStrategy {
+				// 策略A：不在问题页码集中 → 强制保留（AI即使微调了措辞也用旧数据）
+				_, isAffected := affectedPages[pn]
+				shouldPreserve = !isAffected
+			} else {
+				// 策略B兜底：三字段精确比对
+				shouldPreserve = oldPage.Title == newTitle &&
+					oldPage.Purpose == newPurpose &&
+					oldPage.ContentSummary == newSummary
+			}
 		}
-		// 如果原有相同页码的页面有层1索引，保留
-		if oldPage, ok := oldPageMap[pn]; ok {
-			page.PageIndex = oldPage.PageIndex
-			page.IdxCognitiveLevel = oldPage.IdxCognitiveLevel
-			page.IdxInteractionLevel = oldPage.IdxInteractionLevel
-			page.IdxVisualFormat = oldPage.IdxVisualFormat
+
+		if shouldPreserve && hasOld {
+			// 保留旧页全部数据（含HTML、方案字段、状态、元数据）——逐字不动
+			page := &models.CoursewarePage{
+				CoursewareID:        coursewareID,
+				PageNumber:          pn,
+				Title:               oldPage.Title,    // 用旧标题（策略A下AI可能微调了措辞，但该页不在问题集，应保留原样）
+				Purpose:             oldPage.Purpose,
+				ContentSummary:      oldPage.ContentSummary,
+				InteractionType:     oldPage.InteractionType,
+				VisualFormat:        oldPage.VisualFormat,
+				MediaRequirements:   oldPage.MediaRequirements,
+				EstimatedComplexity: oldPage.EstimatedComplexity,
+				Status:              oldPage.Status,
+				HTMLContent:         oldPage.HTMLContent,
+				PageIndex:           oldPage.PageIndex,
+				IdxCognitiveLevel:   oldPage.IdxCognitiveLevel,
+				IdxInteractionLevel: oldPage.IdxInteractionLevel,
+				IdxVisualFormat:     oldPage.IdxVisualFormat,
+				PlaceholderMap:      oldPage.PlaceholderMap,
+				MatchedComponentIDs: oldPage.MatchedComponentIDs,
+			}
+			newPages = append(newPages, page)
+			htmlPreserved++
+		} else {
+			// 新页 或 问题页 或 方案变了的页 → 用AI新方案，不保留HTML
+			page := &models.CoursewarePage{
+				CoursewareID:        coursewareID,
+				PageNumber:          pn,
+				Title:               newTitle,
+				Purpose:             newPurpose,
+				ContentSummary:      newSummary,
+				InteractionType:     strings.TrimSpace(sc.InteractionType),
+				VisualFormat:        strings.TrimSpace(sc.VisualFormat),
+				MediaRequirements:   strings.TrimSpace(sc.MediaRequirements),
+				EstimatedComplexity: cwClamp(sc.EstimatedComplexity, 1, 5),
+				Status:              models.CWPageStatusPending,
+			}
+			// 层1索引仍保留（与方案变更无关）
+			if hasOld {
+				page.PageIndex = oldPage.PageIndex
+				page.IdxCognitiveLevel = oldPage.IdxCognitiveLevel
+				page.IdxInteractionLevel = oldPage.IdxInteractionLevel
+				page.IdxVisualFormat = oldPage.IdxVisualFormat
+				if strings.TrimSpace(oldPage.HTMLContent) != "" {
+					htmlCleared++
+				}
+			}
+			if page.InteractionType == "" {
+				page.InteractionType = "static"
+			}
+			if page.VisualFormat == "" {
+				page.VisualFormat = "text_heavy"
+			}
+			newPages = append(newPages, page)
 		}
-		if page.InteractionType == "" {
-			page.InteractionType = "static"
-		}
-		if page.VisualFormat == "" {
-			page.VisualFormat = "text_heavy"
-		}
-		newPages = append(newPages, page)
 	}
 
 	// 重新编号（确保连续）
@@ -203,11 +268,29 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 		p.PageNumber = i + 1
 	}
 
-	log.Printf("[courseware_index] RefineIndex完成: cw=%s source=%s oldPages=%d newPages=%d model=%s tokens=%d feedback=%s",
-		coursewareID, cw.SourceType, len(pages), len(newPages), callResult.ModelUsed, callResult.TokensUsed, cwTruncate(feedback, 50))
+	log.Printf("[courseware_index] RefineIndex完成: cw=%s source=%s oldPages=%d newPages=%d htmlPreserved=%d htmlCleared=%d pageNumStrategy=%v model=%s tokens=%d feedback=%s",
+		coursewareID, cw.SourceType, len(pages), len(newPages), htmlPreserved, htmlCleared, usePageNumStrategy, callResult.ModelUsed, callResult.TokensUsed, cwTruncate(feedback, 50))
 
 	// ---- 7. 保存并广播（保留原有概述不变）----
-	return s.saveAndBroadcast(ctx, coursewareID, cw.IndexOverview, newPages)
+	if err := s.saveAndBroadcast(ctx, coursewareID, cw.IndexOverview, newPages); err != nil {
+		return err
+	}
+
+	// ---- 8. 状态智能回退：如果有页面HTML被清空（方案变更），需要回退状态让老师重新生成 ----
+	// 规则：只要有任何一页的HTML因方案变更被清空，就把课件status回退到generating
+	//（保留导航栏nav_template_html不丢，老师直接在Step4对变更页重新生成，无需从头来）。
+	// 如果全部页HTML都保留了（方案微调未影响任何页），则不回退，保持原status。
+	if htmlCleared > 0 {
+		prevStatus := cw.Status
+		if err := repository.UpdateCoursewareStatus(ctx, coursewareID, models.CoursewareStatusGenerating); err != nil {
+			log.Printf("[courseware_index] RefineIndex状态回退失败: cw=%s err=%v", coursewareID, err)
+		} else {
+			log.Printf("[courseware_index] RefineIndex状态回退: cw=%s %s→generating (htmlCleared=%d, htmlPreserved=%d)",
+				coursewareID, prevStatus, htmlCleared, htmlPreserved)
+		}
+	}
+
+	return nil
 }
 
 // buildRefineSourceContext 为"修改方案"按课件来源装配 标题/学科/年级 与原文上下文
@@ -348,4 +431,41 @@ func readAllFromReader(rc interface {
 			return buf, nil
 		}
 	}
+}
+
+// extractAffectedPageNums 从修正指令中提取问题页码集合。
+// 前端 buildFixInstruction 格式："仅修改以下页面的方案：P3、P5、P8。"
+// 返回 map[int]struct{} 页码集合，空集合表示未找到（回退策略B）。
+func extractAffectedPageNums(feedback string) map[int]struct{} {
+	result := make(map[int]struct{})
+
+	// 查找"仅修改以下页面"标记
+	marker := "仅修改以下页面"
+	idx := strings.Index(feedback, marker)
+	if idx < 0 {
+		return result
+	}
+
+	// 从标记位置往后取到句号或换行，在这段内找所有 P+数字
+	segment := feedback[idx:]
+	if dotIdx := strings.IndexAny(segment, "。\n"); dotIdx > 0 {
+		segment = segment[:dotIdx]
+	}
+
+	// 提取 P 后面的数字（P3、P5、P8 等）
+	for i := 0; i < len(segment)-1; i++ {
+		if segment[i] == 'P' || segment[i] == 'p' {
+			j := i + 1
+			num := 0
+			for j < len(segment) && segment[j] >= '0' && segment[j] <= '9' {
+				num = num*10 + int(segment[j]-'0')
+				j++
+			}
+			if num > 0 {
+				result[num] = struct{}{}
+			}
+		}
+	}
+
+	return result
 }

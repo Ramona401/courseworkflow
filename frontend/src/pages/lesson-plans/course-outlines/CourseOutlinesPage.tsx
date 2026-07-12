@@ -20,6 +20,9 @@ import {
   deleteCourseOutline,
   type CourseOutlineListItem,
   type CourseOutlineScope,
+  COURSE_OUTLINE_PUBLISHERS,
+  COURSE_OUTLINE_PUBLISHER_GENERIC_LABEL,
+  publisherLabel,
 } from '@/api/course-outlines'
 import { getMyPublishGroups, type PublishGroup } from '@/api/ai-assistants'
 import { useAuth } from '@/store/auth'
@@ -54,12 +57,13 @@ interface FormState {
   subject: string
   grade: string
   volume: string
+  publisher: string           // 教材版本（空串=通用/不限版本）
   title: string
   content: string
 }
 
 const emptyForm: FormState = {
-  scopeKey: '', subject: '', grade: '', volume: '', title: '', content: '',
+  scopeKey: '', subject: '', grade: '', volume: '', publisher: '', title: '', content: '',
 }
 
 /** 全局大纲选项（admin 专属，target 留空由后端填占位ID） */
@@ -152,6 +156,7 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
         subject: d.subject,
         grade: d.grade,
         volume: d.volume,
+        publisher: d.publisher || '',
         title: d.title,
         content: d.content,
       })
@@ -181,6 +186,7 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
           subject: form.subject.trim(),
           grade: form.grade.trim(),
           volume: form.volume.trim(),
+          publisher: form.publisher.trim(),
           title: form.title.trim(),
           content: form.content,
         })
@@ -189,6 +195,7 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
         // 新建：解析 scopeKey（system 的 targetId 为空，后端填占位ID）
         const [scope, targetId] = form.scopeKey.split(':') as [CourseOutlineScope, string]
         await createCourseOutline({
+          publisher: form.publisher.trim(),
           scope,
           scope_target_id: targetId,
           subject: form.subject.trim(),
@@ -280,6 +287,13 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
                   </div>
                   <div style={{ fontSize: 12, color: C.textSecondary, marginTop: 6 }}>
                     {it.subject} · {it.grade} · {it.volume}
+                    <span style={{
+                      marginLeft: 8, padding: '1px 8px', borderRadius: 6, fontSize: 11,
+                      background: it.publisher ? 'rgba(79,123,232,0.10)' : C.borderLight,
+                      color: it.publisher ? C.primary : C.textMuted,
+                    }}>
+                      {publisherLabel(it.publisher || '')}
+                    </span>
                     <span style={{ color: C.textMuted, marginLeft: 10 }}>
                       由 {it.creator_name || '—'} 维护 · 更新于 {fmtDate(it.updated_at)}
                     </span>
@@ -353,6 +367,36 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
                   placeholder="如：下册" style={inputStyle} />
               </Field>
             </div>
+
+            {/* 教材版本：预置下拉 + 可手动输入新版本（一标多本，空=通用/不限版本） */}
+            <Field label="教材版本">
+              <select
+                value={form.publisher === '' || COURSE_OUTLINE_PUBLISHERS.includes(form.publisher) ? form.publisher : '__custom__'}
+                onChange={(e) => {
+                  const v = e.target.value
+                  if (v === '__custom__') {
+                    setForm({ ...form, publisher: COURSE_OUTLINE_PUBLISHERS.includes(form.publisher) ? ' ' : (form.publisher || ' ') })
+                  } else {
+                    setForm({ ...form, publisher: v })
+                  }
+                }}
+                style={inputStyle}
+              >
+                <option value="">{COURSE_OUTLINE_PUBLISHER_GENERIC_LABEL}</option>
+                {COURSE_OUTLINE_PUBLISHERS.map((p) => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
+                <option value="__custom__">➕ 其他版本（手动输入）</option>
+              </select>
+              {form.publisher !== '' && !COURSE_OUTLINE_PUBLISHERS.includes(form.publisher) && (
+                <input
+                  value={form.publisher === ' ' ? '' : form.publisher}
+                  onChange={(e) => setForm({ ...form, publisher: e.target.value })}
+                  placeholder="输入教材版本名，如：冀教版"
+                  style={{ ...inputStyle, marginTop: 8 }}
+                />
+              )}
+            </Field>
 
             <Field label="标题">
               <input value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })}

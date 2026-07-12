@@ -50,6 +50,10 @@ export interface ConversationInputBarProps {
   plusItemAvailability: (tool: string) => { enabled: boolean; reason: string }
   /** 唤起能力（菜单项点击后分发，本组件先收起菜单再回调） */
   onOpenTool: (tool: string) => void
+  /** 参考资料附件文件名（非空时显示参考资料提示条） */
+  refMaterialName?: string
+  /** 移除参考资料附件 */
+  onClearRefMaterial?: () => void
 }
 
 /**
@@ -60,6 +64,7 @@ const ConversationInputBar = forwardRef<ConversationInputBarHandle, Conversation
     const {
       isBusy, placeholder, selectedCount, onClearSelected,
       onSend, hasContent, onPublish, plusItemAvailability, onOpenTool,
+      refMaterialName, onClearRefMaterial,
     } = props
 
     /** 输入框文本（私有状态：发送即清空，退出备课随视图卸载复位） */
@@ -103,6 +108,16 @@ const ConversationInputBar = forwardRef<ConversationInputBarHandle, Conversation
           <div style={{ padding: '7px 18px', background: C.primaryLight, borderTop: `1px solid ${C.border}`, fontSize: '12px', color: C.primary, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
             <span>🧩 已选 {selectedCount} 个教学组件，下一条消息发出时 AI 会一并参考</span>
             <button onClick={onClearSelected} style={{ background: 'none', border: 'none', cursor: 'pointer', color: C.textMuted, fontSize: '12px' }}>清空</button>
+          </div>
+        )}
+
+        {/* 参考资料附件提示条（会话级，AI 每轮参考；点移除即清空） */}
+        {refMaterialName && (
+          <div style={{ padding: '7px 18px', background: 'rgba(129,140,248,0.10)', borderTop: `1px solid ${C.border}`, fontSize: '12px', color: '#6366F1', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>📎 已附参考资料「{refMaterialName}」，AI 每轮回复都会参考</span>
+            {onClearRefMaterial && (
+              <button onClick={onClearRefMaterial} style={{ background: 'none', border: 'none', cursor: 'pointer', color: C.textMuted, fontSize: '12px', flexShrink: 0, marginLeft: '10px' }}>移除</button>
+            )}
           </div>
         )}
 

@@ -1,21 +1,31 @@
 /**
  * 提示词管理 API 封装（P2-3）
- * - 提示词列表：获取所有8个槽位的当前生效版本
+ * - 提示词列表：获取所有槽位的当前生效版本
  * - 提示词详情：获取指定槽位的完整内容
  * - 提示词更新：创建新版本（保留历史版本）
  * - 版本历史：查看指定槽位的所有历史版本
  * - 版本回滚：将指定槽位恢复到历史版本
  * - 仅 admin 可调用
+ *
+ * v2 治理改造：
+ *   PromptInfo 新增 category（危险分档 high/mid/kb）与 description（用途说明）两字段，
+ *   均由后端 toPromptResponse 下发。前端据 category 做红/橙/绿三色标记与差异化二次确认，
+ *   description 取代前端硬编码的旧 PROMPT_DESCRIPTIONS。函数签名与 axios 实现保持不变。
  */
 import client from './client'
 
 // ==================== 类型定义 ====================
 
+/** 危险分档：high=高危(课件生成/渲染,改错崩业务) / mid=中危(默认兜底) / kb=知识库类 */
+export type PromptCategory = 'high' | 'mid' | 'kb'
+
 /** 提示词信息（当前生效版本） */
 export interface PromptInfo {
   id: string              // UUID
-  prompt_key: string      // 提示词标识（prompt_a~f / dict / ability_table）
-  prompt_name: string     // 提示词中文名
+  prompt_key: string      // 提示词标识（prompt_a~g / dict / 课件系列 / 知识库系列 等）
+  prompt_name: string     // 提示词中文名（后端 GetPromptName，未登记回退 key）
+  category: PromptCategory // 危险分档（后端 GetPromptCategory，未登记兜底 mid）
+  description: string     // 用途说明（后端 GetPromptDescription，未登记回退通用文案）
   content: string         // 提示词完整内容
   version: number         // 当前版本号
   content_len: number     // 内容长度（字符数）

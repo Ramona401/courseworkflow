@@ -25,6 +25,29 @@ package services
 //   stripReviewJSONBlock（定义于同包 workshop_stage_extract.go，复用改动B已写好的剥离逻辑），
 //   使 message_done 下发的文本干净。仅 review 阶段生效，其他阶段无 json 块不受影响。
 //
+// v204改动（Harness 输出采集 · 接入 harness_eval_samples）：
+//   在本函数主流程全部完成后（message_done / suggested_actions 广播之后、函数收尾之前），
+//   以【独立 goroutine + best-effort】把本轮的「输入画像 + 输出全文」采集落库，供后台
+//   judge 分析与 admin 标注，驱动 harness 体检与进化。
+//   铁律——采集是旁观者，绝不波及老师备课：
+//     1) 放在主流程末尾，老师该收到的（message_done/芯片）已全部送达后才采集；
+//     2) 独立 goroutine 异步执行，主流程不等待；内层 recover 兜 panic，写失败仅记 Warn；
+//     3) 只读取主流程已算好的值（currentStage/lp/stageSystemPrompt/rawContent/assistantLabel/
+//        result.ModelUsed/lpSchoolID），唯一新增计算是 is_downgraded（查学校境外授权），
+//        且该查询 fail-safe（出错按未降级处理），绝不因采集让对话受任何影响；
+//     4) 存的输出用 rawContent（AI 原始全文，含各围栏块）而非 displayContent——judge 需要
+//        法医级原始证据（如"该出芯片却没出"只能从原始文本判断），不要美化过的展示版。
+//
+// 积分硬闸 batch (2026-07-04)：积分类错误短路。
+//   背景：积分守卫在 CallAIStream 发请求前拦截（"积分余额不足…"），此前该错误
+//   落进"空流自动重试 → 两轮空流软兜底"通道，被包装成"网络打了个盹，请重试"——
+//   老师看不到真话、反复重试徒劳（实测截图三连撞同一句）。
+//   修法：两处判断 isCreditGateError（定义于同包 lesson_plan_gen_helpers.go）：
+//     1) 首轮失败即积分类 → 不重试（守卫是确定性拦截，重试必然再撞）、
+//        不发"正在重试"提示，直接 broadcastCreditGateNotice 把守卫原话推给老师并返回；
+//     2) 重试后仍失败且为积分类（如首轮网络错、重试时撞守卫）→ 同样走积分提示而非软兜底。
+//   非积分类错误的重试/软兜底/硬错误路径逐字保留。
+//
 // 本文件职责：
 //   1. processChatStageAsync     — 阶段模式异步AI流式回复
 //   2. checkAndInsertCoachAdvice — 对话完成后停滞检测+教练建议插入（processChatStageAsync 派生，继承 turnID）
@@ -49,6 +72,10 @@ import (
 // v172说明（已撤销 done 补发）：SSE 是教案会话级共享长连接，发 done 会让前端关闭整条连接，
 //
 //	故不每轮发 done；「生成中」状态复位由前端 onMessageDone 处理。
+// refMaterialInjectMaxRunes 参考资料注入 system prompt 的防御性上限(rune 计)。
+// 前端长文档已压缩,正常远小于此;此处为兜底,防止异常超长文本撑爆上下文。
+const refMaterialInjectMaxRunes = 8000
+
 func (s *LessonPlanGenService) processChatStageAsync(
 	ctx context.Context,
 	lp *models.LessonPlan,
@@ -85,6 +112,21 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		lpGenLog.Warn("加载阶段提示词失败", "plan_id", planID, "stage", currentStage, "error", err)
 		s.broadcastError(planID, turnID, "加载阶段配置失败，请刷新重试")
 		return
+	}
+
+	// ---------- 参考资料附件(PDF/Word)注入 ----------
+	// 老师上传的会话级参考资料，作为背景资料先落位（在写作/全委托块之前）。
+	// 前端已在浏览器端提取(短文档=原文/长文档=压缩要点)，此处仅拼接 + 防御性 rune 截断兜底。
+	// req.RefMaterial 为空(未挂附件)时行为 100% 不变。不落库、不复用。
+	if rm := strings.TrimSpace(req.RefMaterial); rm != "" {
+		if rr := []rune(rm); len(rr) > refMaterialInjectMaxRunes {
+			rm = string(rr[:refMaterialInjectMaxRunes])
+			lpGenLog.Info("参考资料超上限已截断注入", "plan_id", planID, "max_runes", refMaterialInjectMaxRunes)
+		}
+		stageSystemPrompt += "\n\n【备课参考资料（老师上传的附件）】\n" +
+			"以下是老师为本次备课上传的参考资料，请在备课时充分参考其中的知识点、教学要求与重点，" +
+			"但不要照搬，需结合本课实际情况取舍。\n" + rm + "\n"
+		lpGenLog.Info("已注入参考资料附件", "plan_id", planID, "stage", currentStage, "ref_runes", len([]rune(rm)))
 	}
 
 	// 全委托标志：本轮是否实际注入了全委托指令（用于后续跳过停滞检测）
@@ -181,6 +223,16 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		SchoolID:     schoolIDPtr(lpSchoolID),
 	})
 	if err != nil && chunkCount == 0 {
+		// 积分硬闸 batch：积分类错误短路——守卫是确定性拦截（发请求前拒绝），
+		// 重试必然再撞，且"正在重试/网络打盹"的包装会让老师徒劳重试。
+		// 直接把守卫原话以友好消息推给老师并结束本轮。
+		if isCreditGateError(err) {
+			s.broadcastCreditGateNotice(ctx, planID, turnID, err.Error())
+			lpGenLog.Warn("积分守卫拦截本轮对话，已推送积分提示（不重试）",
+				"plan_id", planID, "stage", currentStage, "error", err)
+			return
+		}
+
 		// 空流自动重试一次：仅当"一个字都没流出来"(chunkCount==0)时——干净的空，无半截内容、无重复风险。
 		// 空流多为偶发（撞内容过滤/API打盹），二次请求绝大多数即恢复。
 		lpGenLog.Warn("AI首轮空流，自动重试一次", "plan_id", planID, "stage", currentStage, "error", err)
@@ -209,9 +261,16 @@ func (s *LessonPlanGenService) processChatStageAsync(
 	}
 	if err != nil {
 		if chunkCount == 0 {
-			// 软兜底：两轮都没接上话 → 给老师一句人话（带本轮 turnID）
-			s.broadcastSoftRetryNotice(ctx, planID, turnID)
-			lpGenLog.Warn("AI两轮空流，已软兜底", "plan_id", planID, "stage", currentStage, "error", err)
+			if isCreditGateError(err) {
+				// 积分硬闸 batch：重试路径上撞守卫（如首轮网络错、重试时被拦）→ 同样直达真话
+				s.broadcastCreditGateNotice(ctx, planID, turnID, err.Error())
+				lpGenLog.Warn("积分守卫拦截（重试路径），已推送积分提示",
+					"plan_id", planID, "stage", currentStage, "error", err)
+			} else {
+				// 软兜底：两轮都没接上话 → 给老师一句人话（带本轮 turnID）
+				s.broadcastSoftRetryNotice(ctx, planID, turnID)
+				lpGenLog.Warn("AI两轮空流，已软兜底", "plan_id", planID, "stage", currentStage, "error", err)
+			}
 		} else {
 			// 已有半截内容上屏后才失败：保留原硬错误提示（带本轮 turnID）
 			s.broadcastError(planID, turnID, "AI回复失败: "+err.Error())
@@ -302,6 +361,65 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		"working_msgs", len(currentStageMsgs),
 		"assistant_injected", assistantPrompt != "",
 		"full_generate", fullGenerate)
+
+	// ==================== v204：Harness 输出采集（best-effort，绝不阻塞主流程）====================
+	// 主流程已全部完成（message_done / 芯片均已送达老师），此处把本轮的「输入画像 + 输出全文」
+	// 落库到 harness_eval_samples，供后台 judge 分析与 admin 标注。
+	// 独立 goroutine + recover 兜底 + 写失败仅 Warn——采集的任何问题都不波及老师备课。
+	// 取值全部来自本函数已算好的变量；唯一新增计算是 is_downgraded（查学校境外授权，fail-safe）。
+	// 存输出用 rawContent（AI 原始全文，含各围栏块），judge 需要法医级原始证据。
+	go func(
+		planID, stageCode, authorID, schoolID, assistantID, assistantLabel,
+		modelUsed, sysPrompt, aiRaw string,
+	) {
+		defer func() {
+			if r := recover(); r != nil {
+				lpGenLog.Warn("harness采集 goroutine panic，已兜底忽略",
+					"plan_id", planID, "stage", stageCode, "panic", r)
+			}
+		}()
+
+		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// 计算 is_downgraded：学校未授权境外模型 → 本轮 generator 走境内降级。
+		// fail-safe：schoolID 空或查询出错 → 按"未授权=降级"无法确定时，沿用 IsSchoolOverseasEnabled
+		// 的 fail-closed 语义（出错返 false=未授权），即 is_downgraded=true 偏保守；
+		// 但查询出错本身只记 Warn，绝不让采集失败。
+		isDowngraded := false
+		if enabled, qerr := repository.IsSchoolOverseasEnabled(bgCtx, schoolID); qerr != nil {
+			lpGenLog.Warn("harness采集-查学校境外授权失败，is_downgraded 按未授权(降级)保守处理",
+				"plan_id", planID, "school_id", schoolID, "error", qerr)
+			isDowngraded = true // 查不到授权状态时保守标记为降级（与系统 fail-closed 一致）
+		} else {
+			isDowngraded = !enabled // 已授权=不降级；未授权=降级
+		}
+
+		in := repository.HarnessEvalSampleInput{
+			LessonPlanID:  planID,
+			StageCode:     stageCode,
+			UserID:        authorID,
+			SchoolID:      schoolID,
+			ModelUsed:     modelUsed,
+			IsDowngraded:  isDowngraded,
+			AssistantID:   assistantID,
+			AssistantName: assistantLabel,
+			SystemPrompt:  sysPrompt,
+			AIOutput:      aiRaw,
+		}
+		if err := repository.InsertHarnessEvalSample(bgCtx, in); err != nil {
+			lpGenLog.Warn("harness采集-写入样本失败（不影响主流程）",
+				"plan_id", planID, "stage", stageCode, "error", err)
+			return
+		}
+		lpGenLog.Info("harness采集-样本已落库",
+			"plan_id", planID, "stage", stageCode, "model", modelUsed,
+			"is_downgraded", isDowngraded, "assistant", assistantLabel,
+			"sys_prompt_len", len(sysPrompt), "ai_output_len", len(aiRaw))
+	}(
+		planID, currentStage, lp.AuthorID, lpSchoolID, req.AssistantID, assistantLabel,
+		result.ModelUsed, stageSystemPrompt, rawContent,
+	)
 
 	// v87：对话完成后异步检测停滞，插入教练建议
 	// v168/v169：全委托一次性出稿不需要停滞检测（本就是一次性完成），跳过避免误插建议

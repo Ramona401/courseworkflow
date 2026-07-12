@@ -4,6 +4,32 @@
  * 改动：所有页面组件改为 React.lazy 动态导入，按路由懒加载。
  * 效果：首屏只加载当前路由的 chunk，其他路由按需加载。
  *
+ * 【我的备课资料对普通教师开放】新增（v10.1 配套）：
+ *   - /lesson-plans/resources 及其学生档案子页 resources/class-profiles/:id/students
+ *     两条路由的 RoleGuard 白名单加入 viewer（普通教师）。
+ *     备课基础资料（课程大纲/班级学情/单元方案）对全体教学身份开放；
+ *     建/改权限由各 Tab 内数据（my-groups 归属）+ 后端 service 层兜底。
+ *   - 与 LPSidebar「我的备课资料」菜单 roles 白名单配套（口径必须一致）。
+ *
+ * 【生产端功能与教研组组长绑定】新增（v10.0 配套）：
+ *   - 新增 LeadOrRoleGuard 双通道守卫：「账户身份命中 roles 白名单」或
+ *     「当前用户是任一教研组的组长（lead）」二者满足其一即放行。
+ *   - /lesson-plans/components 与 recipes 系列共 6 条路由由 RoleGuard 换为
+ *     LeadOrRoleGuard（roles 白名单不变，仍为 admin + senior_operator）。
+ *   - 组长判定复用共享 Hook useGroupLead（调 /ai-assistants/my-groups，
+ *     模块级缓存，与 LPSidebar 菜单显隐共用一次请求；判定中显示 PageLoading
+ *     防止误跳首页）。判定口径当前严格绑「组长」，放宽骨干只改 Hook 内一行常量。
+ *   - 背景：200+ 教研员账户为骨干教师（operator）身份，被任命为教研组长后
+ *     自动解锁备课配方/组件管理两个生产端功能，无需升级为学校管理员身份。
+ *   - 后端配方/组件接口本就对所有登录用户放行（管控靠 service 归属校验），
+ *     前端放宽无越权风险。
+ *
+ * 【课件共享课件库独立成栏】新增：
+ *   - 新增 SharedCoursewareLibraryPage（懒加载），挂 /courseware/shared 子路由，
+ *     位于 /courseware 布局下、:id 详情通配之前（避免 shared 被当作课件ID）。
+ *   - 共享课件库从「我的课件」列表页的内嵌 Tab 升级为课件工坊侧边栏独立栏目，
+ *     体验对齐教案库；列表页同步去掉共享 Tab。
+ *
  * v194+优先级2新增（备课配方权限收敛 · Harness 生产者/消费者分离）：
  *   - /lesson-plans/recipes 及其子路由（wizard / wizard/:id / new / :id/edit）全部叠加
  *     RoleGuard roles=['admin','senior_operator']。
@@ -65,6 +91,7 @@ import { Suspense, lazy, Component, type ReactNode, type ErrorInfo } from 'react
 import { AuthContext } from '@/store/auth'
 import { useAuth } from '@/store/auth'
 import { useAuthProvider } from '@/hooks/useAuthProvider'
+import { useGroupLead } from '@/hooks/useGroupLead'
 
 /* ==================== 布局组件（非懒加载，每个板块必须立即可用） ==================== */
 import MainLayout from '@/components/layout/MainLayout'
@@ -104,14 +131,18 @@ const RecipesPage = lazy(() => import('@/pages/lesson-plans/recipes/RecipesPage'
 const RecipeWizardPage = lazy(() => import('@/pages/lesson-plans/recipes/RecipeWizardPage'))
 const StagesConfigPage = lazy(() => import('@/pages/lesson-plans/stages-config/StagesConfigPage'))
 const AssessmentPage = lazy(() => import('@/pages/lesson-plans/assessment/AssessmentPage'))
-const TextbooksPage = lazy(() => import('@/pages/lesson-plans/textbooks/TextbooksPage'))
 const MyTeachingResourcesPage = lazy(() => import('@/pages/lesson-plans/resources/MyTeachingResourcesPage'))
+/* 班级学情 批次2a：学生个体档案独立全屏子页 */
+const ClassStudentsPage = lazy(() => import('@/pages/lesson-plans/resources/class-profiles/ClassStudentsPage'))
 
 /* ==================== 课件工坊（懒加载） ==================== */
 const CoursewareListPage = lazy(() => import('@/pages/courseware/CoursewareListPage'))
+const SharedCoursewareLibraryPage = lazy(() => import('@/pages/courseware/SharedCoursewareLibraryPage'))
 const CWComponentsPage = lazy(() => import('@/pages/courseware/CWComponentsPage'))
 const CWTemplatesPage = lazy(() => import('@/pages/courseware/CWTemplatesPage'))
 const CoursewareWorkshopPage = lazy(() => import('@/pages/courseware/CoursewareWorkshopPage'))
+const CWReviewDashboardPage = lazy(() => import('@/pages/courseware/review/CWReviewDashboardPage'))
+const CWReviewWorkbenchPage = lazy(() => import('@/pages/courseware/review/CWReviewWorkbenchPage'))
 
 /* ==================== 知识库压缩入库系统（隐藏全屏，懒加载） ==================== */
 const KBCurriculumPage = lazy(() => import('@/pages/kb-admin/KBCurriculumPage'))
@@ -121,6 +152,10 @@ const AccountPage = lazy(() => import('@/pages/account/AccountPage'))
 const AICenterPage = lazy(() => import('@/pages/ai-center/AICenterPage'))
 const AITraceDashboardPage = lazy(() => import('@/pages/ai-traces/AITraceDashboardPage'))
 const AdminPage = lazy(() => import('@/pages/admin/AdminPage'))
+/* 基础数据管理（独立全屏页，与 /admin 同级；门户并列卡片入口） */
+const BaseDataPage = lazy(() => import('@/pages/base-data/BaseDataPage'))
+/* 回收站（独立全屏页，懒加载） */
+const TrashPage = lazy(() => import('@/pages/trash/TrashPage'))
 
 /* ==================== 路由加载错误边界 ==================== */
 interface EBProps { children: ReactNode }
@@ -209,6 +244,31 @@ function RoleGuard({ children, roles }: { children: React.ReactNode; roles: stri
 }
 
 /**
+ * LeadOrRoleGuard — 「账户身份白名单 或 教研组组长」双通道守卫（v10.0 配套）
+ *
+ * 放行条件（满足其一即可）：
+ *   1) user.role 命中 roles 白名单（与 RoleGuard 行为一致，零请求即时放行）；
+ *   2) 当前用户是任一教研组的「组长」（lead）——经共享 Hook useGroupLead 判定，
+ *      与 LPSidebar 菜单显隐共用同一次 /ai-assistants/my-groups 请求（模块级缓存）。
+ *
+ * 判定中（checking）显示 PageLoading，避免异步结果未回时被误判非组长跳回首页。
+ * 组长判定失败（网络异常等）fail-closed 跳首页，与改造前行为一致，不产生越权。
+ * 注意：本守卫是体验层收口；配方/组件后端接口本就对登录用户放行（service 归属校验兜底）。
+ */
+function LeadOrRoleGuard({ children, roles }: { children: React.ReactNode; roles: string[] }) {
+  const { user } = useAuth()
+  // 身份是否直接命中白名单（命中则无需组长判定，Hook 传 enabled=false 不发请求）
+  const roleHit = !!user && roles.includes(user.role)
+  // React Hooks 规则：必须无条件调用，靠 enabled 参数控制是否真正发请求
+  const { isLead, checking } = useGroupLead(!!user && !roleHit)
+  if (!user) return <Navigate to="/" replace />
+  if (roleHit) return <>{children}</>
+  if (checking) return <PageLoading />
+  if (isLead) return <>{children}</>
+  return <Navigate to="/" replace />
+}
+
+/**
  * EditRedirect — 配方旧编辑路由 recipes/:id/edit 的动态重定向（批次4）
  *   React Router v6 的 <Navigate to> 不会自动替换路径参数，故用 useParams 取出当前 :id，
  *   再重定向到分步向导编辑态 /lesson-plans/recipes/wizard/:id（replace 不留历史）。
@@ -267,13 +327,40 @@ export default function App() {
             <Route path="/admin" element={
               <AuthGuard><RoleGuard roles={['admin','senior_operator','region_admin']}><AdminPage /></RoleGuard></AuthGuard>
             } />
+            {/* 基础数据管理独立全屏页（/base-data，与 /admin 同级）：
+                admin 与二线管理员（admin2）均可进（role 都是 admin，RoleGuard 放行）。
+                页内含「学科 / 课程大纲」两个并列子 Tab。门户基础数据管理卡片进入。 */}
+            <Route path="/base-data" element={
+              <AuthGuard><RoleGuard roles={['admin']}><BaseDataPage /></RoleGuard></AuthGuard>
+            } />
             <Route path="/ai-traces" element={
               <AuthGuard><RoleGuard roles={['admin']}><AITraceDashboardPage /></RoleGuard></AuthGuard>
             } />
 
+            {/* 提示词管理独立全屏页（治理改造：从 /workflow 子路由挪出，脱离 MainLayout）：
+                admin only。页面自带顶栏（← 返回首页 + 标题），入口经首页"提示词管理"卡片进入。
+                纳管 prompts 表全部 key，按危险分档展示，高危改动需二次键入确认。 */}
+            <Route path="/prompts" element={
+              <AuthGuard><RoleGuard roles={['admin']}><PromptsPage /></RoleGuard></AuthGuard>
+            } />
+
+            {/* 积分管理独立全屏页（从备课工坊挪出，脱离 LPLayout）：
+                只套 AuthGuard 登录即可进，页面内部按角色收窄视图——
+                管理者(admin/senior/region)看全套管理Tab，普通老师看"我的账户/消费"两个Tab。
+                入口：首页"积分管理"卡片(仅管理角色可见) + 右上角用户菜单"我的积分"(所有人)。 */}
+            <Route path="/tokens" element={
+              <AuthGuard><TokenDashboardPage /></AuthGuard>
+            } />
+
             {/* ==================== 知识库压缩入库（隐藏全屏，脱离任何布局；仅授权人员经直接URL访问） ==================== */}
-            {/* 参照 /lesson-plans/review/:id 模式：只套 AuthGuard，不进 Layout，不出现在门户入口卡片。
+            {/* 参照 /lesson-plans/review/:id 模式：只套 AuthGuard，不进 Layout，不出现在 PortalPage 入口卡片。
                 真正的访问拦截靠后端 RequireKBAuthorized 白名单中间件，前端守卫仅体验优化非安全边界。 */}
+
+            {/* ==================== 回收站（独立全屏页，登录即可） ==================== */}
+            <Route path="/trash" element={
+              <AuthGuard><TrashPage /></AuthGuard>
+            } />
+
             <Route path="/kb-admin/curriculum" element={
               <AuthGuard><KBCurriculumPage /></AuthGuard>
             } />
@@ -285,7 +372,6 @@ export default function App() {
               <Route index element={<DashboardPage />} />
               <Route path="users"         element={<RoleGuard roles={['admin']}><UsersPage /></RoleGuard>} />
               <Route path="ai-config"     element={<RoleGuard roles={['admin']}><AIConfigPage /></RoleGuard>} />
-              <Route path="prompts"       element={<RoleGuard roles={['admin']}><PromptsPage /></RoleGuard>} />
               <Route path="external-data" element={<RoleGuard roles={['admin']}><ExternalDataPage /></RoleGuard>} />
               <Route path="courses"       element={<RoleGuard roles={['admin','operator','senior_operator']}><CoursesPage /></RoleGuard>} />
               <Route path="pipelines"     element={<RoleGuard roles={['admin','operator','senior_operator']}><PipelinesPage /></RoleGuard>} />
@@ -298,12 +384,24 @@ export default function App() {
             {/* ==================== 课件工坊 ==================== */}
             <Route path="/courseware" element={<AuthGuard><CWLayout /></AuthGuard>}>
               <Route index element={<CoursewareListPage />} />
+              {/* 共享课件库独立栏目：必须在 :id 详情通配之前，否则 'shared' 会被当作课件ID */}
+              <Route path="shared" element={<SharedCoursewareLibraryPage />} />
+              {/* 阶段3 课件多级审核中心：固定字面量路径，须在 :id 详情通配之前，否则 review 被当作课件ID。
+                  仅套 AuthGuard（CWLayout 已含），具体审核权限由后端按角色分流，菜单对所有登录用户可见。 */}
+              <Route path="review" element={<CWReviewDashboardPage />} />
               <Route path="components" element={<CWComponentsPage />} />
               <Route path="templates" element={<CWTemplatesPage />} />
               <Route path=":id" element={<CoursewareWorkshopPage />} />
             </Route>
 
             {/* ==================== 教案系统 ==================== */}
+
+            {/* 课件审核独立全屏工作台（弹窗改页面）：必须在 /courseware 布局路由之前注册，
+                脱离 CWLayout 全屏铺满，左大预览等比缩放课件不截断 + 右批注/历史/决策。
+                仅套 AuthGuard，具体审核权限由后端按角色分流。 */}
+            <Route path="/courseware/review/:id" element={
+              <AuthGuard><CWReviewWorkbenchPage /></AuthGuard>
+            } />
 
             {/* 独立全屏评审工作台（必须在 /lesson-plans 布局路由之前注册） */}
             <Route path="/lesson-plans/review/:id" element={
@@ -320,12 +418,13 @@ export default function App() {
               <Route path="plans/:id"        element={<PlanDetailPage />} />
               <Route path="review"           element={<ReviewCenterLPPage />} />
               <Route path="review-v2"        element={<ReviewV2DashboardPage />} />
-              <Route path="tokens"           element={<TokenDashboardPage />} />
-              {/* 优先级2：组件管理收敛为 admin + senior_operator（菜单 roles + 此处 RoleGuard 双重保护） */}
-              <Route path="components"       element={<RoleGuard roles={['admin','senior_operator']}><ComponentsPage /></RoleGuard>} />
+              <Route path="tokens"           element={<Navigate to="/tokens" replace />} />
+              {/* 组件管理：身份白名单（admin/senior_operator）或 教研组组长 双通道放行。
+                  与 LPSidebar 菜单 leadUnlock 配套（光放菜单不够，路由守卫口径必须一致）。 */}
+              <Route path="components"       element={<LeadOrRoleGuard roles={['admin','senior_operator']}><ComponentsPage /></LeadOrRoleGuard>} />
               <Route path="templates"        element={<TemplatesPage />} />
               <Route path="templates/:id"    element={<TemplateEditorPage />} />
-              {/* 优先级2 + 配方搭建一页化批次4：备课配方收敛为 admin + senior_operator（生产端）。
+              {/* 备课配方：身份白名单（admin/senior_operator）或 教研组组长 双通道放行（生产端）。
                   路由全守卫，防直接敲 URL。消费端（StartForm 选用现成配方）在 WorkshopPanels 内，不受本守卫影响。
                   编辑入口已从旧单页编辑器迁移到分步向导：
                     recipes/wizard       新建（无 id）
@@ -333,15 +432,18 @@ export default function App() {
                     recipes/new          → 重定向 /wizard（旧路由兜底）
                     recipes/:id/edit     → 经 EditRedirect 动态重定向 /wizard/:id（旧路由兜底）
                   【清backlog】旧单页编辑器 RecipeEditorPage 文件与其 lazy import 已删除。 */}
-              <Route path="recipes"            element={<RoleGuard roles={['admin','senior_operator']}><RecipesPage /></RoleGuard>} />
-              <Route path="recipes/wizard"     element={<RoleGuard roles={['admin','senior_operator']}><RecipeWizardPage /></RoleGuard>} />
-              <Route path="recipes/wizard/:id" element={<RoleGuard roles={['admin','senior_operator']}><RecipeWizardPage /></RoleGuard>} />
-              <Route path="recipes/new"        element={<RoleGuard roles={['admin','senior_operator']}><Navigate to="/lesson-plans/recipes/wizard" replace /></RoleGuard>} />
-              <Route path="recipes/:id/edit"   element={<RoleGuard roles={['admin','senior_operator']}><EditRedirect /></RoleGuard>} />
+              <Route path="recipes"            element={<LeadOrRoleGuard roles={['admin','senior_operator']}><RecipesPage /></LeadOrRoleGuard>} />
+              <Route path="recipes/wizard"     element={<LeadOrRoleGuard roles={['admin','senior_operator']}><RecipeWizardPage /></LeadOrRoleGuard>} />
+              <Route path="recipes/wizard/:id" element={<LeadOrRoleGuard roles={['admin','senior_operator']}><RecipeWizardPage /></LeadOrRoleGuard>} />
+              <Route path="recipes/new"        element={<LeadOrRoleGuard roles={['admin','senior_operator']}><Navigate to="/lesson-plans/recipes/wizard" replace /></LeadOrRoleGuard>} />
+              <Route path="recipes/:id/edit"   element={<LeadOrRoleGuard roles={['admin','senior_operator']}><EditRedirect /></LeadOrRoleGuard>} />
               <Route path="stages-config"    element={<RoleGuard roles={['admin']}><StagesConfigPage /></RoleGuard>} />
               <Route path="assessment"       element={<AssessmentPage />} />
-              <Route path="textbooks"        element={<TextbooksPage />} />
-              <Route path="resources" element={<RoleGuard roles={['admin','senior_operator','operator']}><MyTeachingResourcesPage /></RoleGuard>} />
+              {/* v10.1：我的备课资料对普通教师（viewer）开放——备课基础资料不按账户身份区分，
+                  建/改权限由各 Tab 内数据 + 后端 service 兜底。与 LPSidebar 菜单白名单口径一致。 */}
+              <Route path="resources" element={<RoleGuard roles={['admin','senior_operator','operator','viewer']}><MyTeachingResourcesPage /></RoleGuard>} />
+              {/* 班级学情 批次2a：学生个体档案独立全屏子页（角色白名单同 resources） */}
+              <Route path="resources/class-profiles/:id/students" element={<RoleGuard roles={['admin','senior_operator','operator','viewer']}><ClassStudentsPage /></RoleGuard>} />
               {/* 旧路径重定向，防存量书签 404 */}
               <Route path="course-outlines" element={<Navigate to="/lesson-plans/resources" replace />} />
             </Route>

@@ -3,6 +3,11 @@ package repository
 // textbook_repo.go — 课本页面图片数据访问层
 //
 // 迭代7新增：课本图片CRUD+搜索+OCR缓存回填+共享+使用计数
+//
+// v231新增：教材照片归档维度扩展
+//   - INSERT/SELECT/UPDATE/Scan 全链路贯通 semester(学期) + unit(单元) 两列
+//   - ListTextbookPages 签名新增 semester/unit 两个筛选参数，支持按学期/单元归档查询
+//   - 排序改为 grade_range → semester → unit → textbook_name → page_number，归档展示更有序
 
 import (
 	"context"
@@ -27,10 +32,10 @@ var (
 func CreateTextbookPage(ctx context.Context, page *models.TextbookPage) error {
 	query := `
 		INSERT INTO textbook_pages (
-			subject, grade_range, textbook_name, chapter, page_number,
+			subject, grade_range, semester, unit, textbook_name, chapter, page_number,
 			file_name, file_path, file_size, mime_type,
 			description, tags, scope, scope_ref_id, uploaded_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		RETURNING id, created_at, updated_at
 	`
 	tags := page.Tags
@@ -43,7 +48,7 @@ func CreateTextbookPage(ctx context.Context, page *models.TextbookPage) error {
 	}
 
 	err := database.DB.QueryRow(ctx, query,
-		page.Subject, page.GradeRange, page.TextbookName, page.Chapter, page.PageNumber,
+		page.Subject, page.GradeRange, page.Semester, page.Unit, page.TextbookName, page.Chapter, page.PageNumber,
 		page.FileName, page.FilePath, page.FileSize, page.MimeType,
 		page.Description, tags, scope, page.ScopeRefID, page.UploadedBy,
 	).Scan(&page.ID, &page.CreatedAt, &page.UpdatedAt)
@@ -59,7 +64,8 @@ func CreateTextbookPage(ctx context.Context, page *models.TextbookPage) error {
 func GetTextbookPageByID(ctx context.Context, id string) (*models.TextbookPage, error) {
 	p := &models.TextbookPage{}
 	query := `
-		SELECT id, subject, grade_range, textbook_name, chapter, page_number,
+		SELECT id, subject, grade_range, COALESCE(semester, ''), COALESCE(unit, ''),
+		       textbook_name, chapter, page_number,
 		       file_name, file_path, file_size, mime_type,
 		       COALESCE(ocr_text, ''), COALESCE(ocr_model, ''), ocr_at,
 		       COALESCE(description, ''), COALESCE(tags::text, '[]'),
@@ -68,7 +74,8 @@ func GetTextbookPageByID(ctx context.Context, id string) (*models.TextbookPage, 
 		FROM textbook_pages WHERE id = $1
 	`
 	err := database.DB.QueryRow(ctx, query, id).Scan(
-		&p.ID, &p.Subject, &p.GradeRange, &p.TextbookName, &p.Chapter, &p.PageNumber,
+		&p.ID, &p.Subject, &p.GradeRange, &p.Semester, &p.Unit,
+		&p.TextbookName, &p.Chapter, &p.PageNumber,
 		&p.FileName, &p.FilePath, &p.FileSize, &p.MimeType,
 		&p.OCRText, &p.OCRModel, &p.OCRAt,
 		&p.Description, &p.Tags,
@@ -88,7 +95,8 @@ func GetTextbookPageByID(ctx context.Context, id string) (*models.TextbookPage, 
 
 // ListTextbookPages 查询课本页面列表（支持多条件筛选）
 // 查询逻辑：我上传的 OR 共享给我可见的
-func ListTextbookPages(ctx context.Context, callerID string, subject string, gradeRange string, textbookName string, scope string, limit int, offset int) ([]*models.TextbookListItem, int, error) {
+// v231：新增 semester(学期) + unit(单元) 两个筛选维度
+func ListTextbookPages(ctx context.Context, callerID string, subject string, gradeRange string, semester string, unit string, textbookName string, scope string, limit int, offset int) ([]*models.TextbookListItem, int, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -106,6 +114,16 @@ func ListTextbookPages(ctx context.Context, callerID string, subject string, gra
 	if gradeRange != "" {
 		where += fmt.Sprintf(" AND tp.grade_range = $%d", argIdx)
 		args = append(args, gradeRange)
+		argIdx++
+	}
+	if semester != "" {
+		where += fmt.Sprintf(" AND tp.semester = $%d", argIdx)
+		args = append(args, semester)
+		argIdx++
+	}
+	if unit != "" {
+		where += fmt.Sprintf(" AND tp.unit = $%d", argIdx)
+		args = append(args, unit)
 		argIdx++
 	}
 	if textbookName != "" {
@@ -128,7 +146,8 @@ func ListTextbookPages(ctx context.Context, callerID string, subject string, gra
 
 	// 查列表
 	listQuery := fmt.Sprintf(`
-		SELECT tp.id, tp.subject, tp.grade_range, tp.textbook_name, tp.chapter, tp.page_number,
+		SELECT tp.id, tp.subject, tp.grade_range, COALESCE(tp.semester, ''), COALESCE(tp.unit, ''),
+		       tp.textbook_name, tp.chapter, tp.page_number,
 		       tp.file_name, tp.file_size, tp.mime_type,
 		       (tp.ocr_text IS NOT NULL AND tp.ocr_text != ''),
 		       COALESCE(tp.description, ''), tp.scope,
@@ -137,7 +156,7 @@ func ListTextbookPages(ctx context.Context, callerID string, subject string, gra
 		FROM textbook_pages tp
 		LEFT JOIN users u ON u.id = tp.uploaded_by
 		%s
-		ORDER BY tp.textbook_name ASC, tp.page_number ASC, tp.created_at DESC
+		ORDER BY tp.grade_range ASC, tp.semester ASC, tp.unit ASC, tp.textbook_name ASC, tp.page_number ASC, tp.created_at DESC
 		LIMIT $%d OFFSET $%d
 	`, where, argIdx, argIdx+1)
 	args = append(args, limit, offset)
@@ -153,7 +172,8 @@ func ListTextbookPages(ctx context.Context, callerID string, subject string, gra
 		item := &models.TextbookListItem{}
 		var filePath string
 		if err := rows.Scan(
-			&item.ID, &item.Subject, &item.GradeRange, &item.TextbookName, &item.Chapter, &item.PageNumber,
+			&item.ID, &item.Subject, &item.GradeRange, &item.Semester, &item.Unit,
+			&item.TextbookName, &item.Chapter, &item.PageNumber,
 			&item.FileName, &item.FileSize, &item.MimeType,
 			&item.HasOCR, &item.Description, &item.Scope,
 			&item.UploadedBy, &item.UploaderName,
@@ -174,6 +194,7 @@ func ListTextbookPages(ctx context.Context, callerID string, subject string, gra
 // ==================== 更新 ====================
 
 // UpdateTextbookPage 更新课本页面元数据
+// v231：新增 semester + unit 两列的更新
 func UpdateTextbookPage(ctx context.Context, id string, req *models.UpdateTextbookRequest) error {
 	tags := req.Tags
 	if tags == "" {
@@ -191,10 +212,10 @@ func UpdateTextbookPage(ctx context.Context, id string, req *models.UpdateTextbo
 	now := time.Now()
 	result, err := database.DB.Exec(ctx, `
 		UPDATE textbook_pages
-		SET chapter = $1, page_number = $2, description = $3,
-		    tags = $4, scope = $5, scope_ref_id = $6, updated_at = $7
-		WHERE id = $8 AND status = 'active'
-	`, req.Chapter, req.PageNumber, req.Description, tags, scope, scopeRefID, now, id)
+		SET semester = $1, unit = $2, chapter = $3, page_number = $4, description = $5,
+		    tags = $6, scope = $7, scope_ref_id = $8, updated_at = $9
+		WHERE id = $10 AND status = 'active'
+	`, req.Semester, req.Unit, req.Chapter, req.PageNumber, req.Description, tags, scope, scopeRefID, now, id)
 	if err != nil {
 		return fmt.Errorf("更新课本页面失败: %w", err)
 	}
@@ -259,7 +280,8 @@ func GetTextbookPagesByIDs(ctx context.Context, ids []string) ([]*models.Textboo
 		return []*models.TextbookPage{}, nil
 	}
 	query := `
-		SELECT id, subject, grade_range, textbook_name, chapter, page_number,
+		SELECT id, subject, grade_range, COALESCE(semester, ''), COALESCE(unit, ''),
+		       textbook_name, chapter, page_number,
 		       file_name, file_path, file_size, mime_type,
 		       COALESCE(ocr_text, ''), COALESCE(ocr_model, ''), ocr_at,
 		       COALESCE(description, ''), COALESCE(tags::text, '[]'),
@@ -279,7 +301,8 @@ func GetTextbookPagesByIDs(ctx context.Context, ids []string) ([]*models.Textboo
 	for rows.Next() {
 		p := &models.TextbookPage{}
 		if err := rows.Scan(
-			&p.ID, &p.Subject, &p.GradeRange, &p.TextbookName, &p.Chapter, &p.PageNumber,
+			&p.ID, &p.Subject, &p.GradeRange, &p.Semester, &p.Unit,
+			&p.TextbookName, &p.Chapter, &p.PageNumber,
 			&p.FileName, &p.FilePath, &p.FileSize, &p.MimeType,
 			&p.OCRText, &p.OCRModel, &p.OCRAt,
 			&p.Description, &p.Tags,

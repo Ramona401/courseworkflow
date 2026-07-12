@@ -15,10 +15,15 @@
  *   父组件不再每次翻页回写（那会形成 state 双源打架，导致点下一页又被旧 prop 拉回）。
  *   改为退出时经 onClose(finalPage) 把最终停留页一次性回传父组件，父组件据此记住下次初值。
  *   initialPage 仅作挂载初值，翻页全程父组件不参与，彻底消除翻页回弹。
+ *
+ * 【v5.5 焦点穿透修复】用户点击课件互动元素（按钮/答题区/拖拽等）后焦点进入 iframe，
+ *   此后键盘事件不冒泡到父 window，翻页快捷键失效。修复：监听来自 iframe 的 postMessage
+ *   导航按键转发消息（由 previewInject.ts 注入脚本发出），在父窗口执行翻页/退出。
+ *   同时在放映容器获得点击时主动 focus 回父文档，确保后续键盘事件能被父 window 监听到。
  */
 import { useState, useEffect, useRef } from 'react'
 import { C, CW_WIDTH, CW_HEIGHT } from './workshopConstants'
-import { injectPreviewMode } from './previewInject'
+import { injectPreviewMode, NAV_KEY_MSG_TYPE } from './previewInject'
 
 export default function SlideshowPlayer({ pages, initialPage, onClose }: {
   pages: { page_number: number; title: string; html_content: string }[]
@@ -93,9 +98,12 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
     return () => { window.removeEventListener('resize', fn); clearTimeout(t) }
   }, [])
 
-  // 键盘导航
+  // 键盘导航（直接在父 window 上监听）
   useEffect(() => {
     const fn = (e: KeyboardEvent) => {
+      // v5.5: 如果焦点在父文档的 input/textarea/select 内，不处理（放映场景通常不会有，但防御性编码）
+      const tag = (e.target as HTMLElement)?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
       if (e.key === 'Escape') { doClose(); return }
       if ((e.key === 'ArrowLeft' || e.key === 'PageUp') && hasPrev) gotoPage(pages[idx - 1].page_number)
       if ((e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') && hasNext) { e.preventDefault(); gotoPage(pages[idx + 1].page_number) }
@@ -103,6 +111,30 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
     }
     window.addEventListener('keydown', fn)
     return () => window.removeEventListener('keydown', fn)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [curPage, idx, hasPrev, hasNext, pages])
+
+  // 【v5.5 焦点穿透修复】监听来自 iframe 的 postMessage 导航按键转发
+  // iframe 内用户点击互动元素后焦点被 iframe 捕获，keydown 不再冒泡到父 window，
+  // 但 previewInject.ts 注入的脚本会把导航按键经 postMessage 转发到这里。
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      // 校验消息格式：必须是来自 iframe 的导航按键转发
+      if (!e.data || e.data.type !== NAV_KEY_MSG_TYPE) return
+      const key = e.data.key as string
+      if (!key) return
+
+      if (key === 'Escape') { doClose(); return }
+      if ((key === 'ArrowLeft' || key === 'PageUp') && hasPrev) {
+        gotoPage(pages[idx - 1].page_number)
+      }
+      if ((key === 'ArrowRight' || key === 'PageDown' || key === ' ') && hasNext) {
+        gotoPage(pages[idx + 1].page_number)
+      }
+      flashUI()
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [curPage, idx, hasPrev, hasNext, pages])
 
@@ -139,8 +171,18 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
   const scale = Math.min(containerSize.w / CW_WIDTH, containerSize.h / CW_HEIGHT)
 
   return (
-    <div ref={boxRef} data-slideshow="1" onMouseMove={flashUI}
+    <div ref={boxRef} data-slideshow="1"
+      onMouseMove={flashUI}
       onClick={(e) => {
+        // 【v5.5 焦点穿透修复】用户点击放映容器的非 iframe 区域时，
+        // 主动把焦点拉回父文档，确保后续键盘事件能被父 window 的 keydown 监听器捕获。
+        // 点击 iframe 内部时此 onClick 不会触发（iframe 吞掉了事件），
+        // 点击控制条按钮时有 stopPropagation 不会到这里，
+        // 所以这里只处理「点击课件两侧空白区域翻页」的场景。
+        if (document.activeElement instanceof HTMLIFrameElement) {
+          // 焦点在 iframe 上 → 把焦点拉回放映容器
+          boxRef.current?.focus()
+        }
         const r = boxRef.current?.getBoundingClientRect()
         if (!r) return
         const x = e.clientX - r.left
@@ -148,11 +190,14 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
         else if (x > r.width * 0.75 && hasNext) gotoPage(pages[idx + 1].page_number)
         flashUI()
       }}
+      // v5.5: 添加 tabIndex 使 div 可聚焦（focus 回拉需要），outline:none 去掉聚焦框
+      tabIndex={-1}
       style={{
         position: 'fixed', inset: 0, zIndex: 99999,
         background: '#fff',              /* v5.2: 白色背景替代黑色 */
         cursor: showUI ? 'default' : 'none',
         overflow: 'hidden',              /* v5.2: 消除外层滚动条 */
+        outline: 'none',                 /* v5.5: 去掉 tabIndex 带来的聚焦框 */
         /* v5.4: flex 居中课件，消除左侧亚像素白边 */
         display: 'flex', alignItems: 'center', justifyContent: 'center',
       }}>

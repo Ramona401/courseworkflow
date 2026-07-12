@@ -2,10 +2,19 @@ package handlers
 
 // 组织与教研组管理HTTP处理器
 //
+// 归属治理批A2(2026-07-04)改动：
+//   组织 CRUD 三个写端点补审计（此前零留痕）：
+//     CreateOrganization → admin.org_create
+//     UpdateOrganization → admin.org_update（detail 含 admin_user_id——
+//       "编辑学校/区域弹窗改主管理员单字段"正是 lichao01 事件中 school_admin
+//       身份消失却查无记录的那条路径,本次收口）
+//     DeleteOrganization → admin.org_delete
+//   审计动作码使用 repository.ActionOrgCreate/Update/Delete 常量。
+//
 // 迭代一 Phase 5 改动：
 //   新增组织多管理员端点（挂在 /api/v1/lesson-plans/organizations/{id}/admins 下）：
 //     - ListOrgAdmins   GET    .../{id}/admins
-//     - AddOrgAdmin     POST   .../{id}/admins         body: {user_id, role_type}
+//     - AddOrgAdmin     POST   .../{id}/admins         body: {user_id, role_type, sync_role}
 //     - RemoveOrgAdmin  DELETE .../{id}/admins/{user_id}
 //   权限分层（admin 任何组织 / region_admin 仅辖区学校 / 其它拒绝）在 service 层判定，
 //   handler 仅从 JWT claims 取 callerRole+callerID 透传。
@@ -20,6 +29,13 @@ package handlers
 //     - senior_operator → 仅本校 + 本校所属父区域（保证组织三栏可用，区域栏只读展示上级）
 //     - 其它/Blocked    → 空集
 //   与教案/审核数据隔离共用同一套 ResolveDataScope，杜绝散落各处的 scope 判断遗漏。
+//
+// B13（任命即同步身份）改动：
+//   AddOrgAdmin 请求体新增 sync_role（前端默认 true）；调用 service 新签名拿
+//   OrgAdminAddResult，按四种结果拼中文 message（前端原样 toast），响应扩为
+//   {message, role_synced, new_role}；RoleSynced=true 时额外写
+//   admin.org_admin_role_sync 审计（region_admin 在用户域唯一写例外，必须留痕）。
+//   审计动作码收敛为 repository 常量（值与旧字面量逐字一致，历史日志兼容）。
 
 import (
 	"encoding/json"
@@ -84,9 +100,15 @@ func (h *OrganizationHandler) ListOrganizations(w http.ResponseWriter, r *http.R
 	utils.Success(w, result)
 }
 
+// CreateOrganization 创建区域/学校（批A2：补审计 admin.org_create）
 func (h *OrganizationHandler) CreateOrganization(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
 	var req models.CreateOrganizationRequest
@@ -99,6 +121,12 @@ func (h *OrganizationHandler) CreateOrganization(w http.ResponseWriter, r *http.
 		h.handleOrgError(w, err)
 		return
 	}
+	repository.WriteAuditLog(claims.UserID, repository.ActionOrgCreate,
+		map[string]interface{}{
+			"org_id":   org.ID,
+			"org_name": req.Name,
+			"org_type": req.Type,
+		}, repository.GetClientIP(r.RemoteAddr))
 	utils.Success(w, org)
 }
 
@@ -120,6 +148,11 @@ func (h *OrganizationHandler) GetOrganization(w http.ResponseWriter, r *http.Req
 	utils.Success(w, org)
 }
 
+// UpdateOrganization 编辑区域/学校（批A2：补审计 admin.org_update）
+//
+// 本端点覆盖"编辑弹窗改主管理员单字段(admin_user_id)"——lichao01 事件中
+// school_admin 身份消失却零留痕的路径。detail 记录请求携带的 name/admin_user_id/
+// status（admin_user_id 为请求原始值，null=未动/置空由前端语义决定，完整留痕即可追溯）。
 func (h *OrganizationHandler) UpdateOrganization(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPutOnly)
@@ -128,6 +161,11 @@ func (h *OrganizationHandler) UpdateOrganization(w http.ResponseWriter, r *http.
 	id := extractIDFromPath(r.URL.Path, utils.PathOrgPrefix)
 	if id == "" {
 		utils.BadRequest(w, utils.MsgMissingOrgID)
+		return
+	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
 	var req models.UpdateOrganizationRequest
@@ -139,9 +177,17 @@ func (h *OrganizationHandler) UpdateOrganization(w http.ResponseWriter, r *http.
 		h.handleOrgError(w, err)
 		return
 	}
+	repository.WriteAuditLog(claims.UserID, repository.ActionOrgUpdate,
+		map[string]interface{}{
+			"org_id":        id,
+			"name":          req.Name,
+			"admin_user_id": req.AdminUserID,
+			"status":        req.Status,
+		}, repository.GetClientIP(r.RemoteAddr))
 	utils.Success(w, map[string]string{"message": "更新成功"})
 }
 
+// DeleteOrganization 删除区域/学校（批A2：补审计 admin.org_delete）
 func (h *OrganizationHandler) DeleteOrganization(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodDeleteOnly)
@@ -152,10 +198,18 @@ func (h *OrganizationHandler) DeleteOrganization(w http.ResponseWriter, r *http.
 		utils.BadRequest(w, utils.MsgMissingOrgID)
 		return
 	}
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		return
+	}
 	if err := h.orgService.DeleteOrganization(r.Context(), id); err != nil {
 		h.handleOrgError(w, err)
 		return
 	}
+	repository.WriteAuditLog(claims.UserID, repository.ActionOrgDelete,
+		map[string]interface{}{"org_id": id},
+		repository.GetClientIP(r.RemoteAddr))
 	utils.Success(w, map[string]string{"message": "删除成功"})
 }
 
@@ -186,8 +240,32 @@ func (h *OrganizationHandler) ListOrgAdmins(w http.ResponseWriter, r *http.Reque
 	utils.Success(w, map[string]interface{}{"admins": items, "total": len(items)})
 }
 
+// orgAdminRoleNameMap 系统身份→中文名（仅供本 handler 拼任命响应文案）
+// 与前端 adminShared.RoleBadge 的 nameMap 口径一致
+var orgAdminRoleNameMap = map[string]string{
+	models.RoleAdmin:             "系统管理员",
+	models.RoleRegionAdmin:       "区域管理员",
+	models.RoleDistrictInspector: "区域教研员",
+	models.RoleSeniorOperator:    "学校管理员",
+	models.RoleOperator:          "骨干教师",
+	models.RoleViewer:            "普通教师",
+}
+
+// orgAdminRoleName 取身份中文名，未登记的返回原始码兜底
+func orgAdminRoleName(role string) string {
+	if name, ok := orgAdminRoleNameMap[role]; ok {
+		return name
+	}
+	return role
+}
+
 // AddOrgAdmin POST /api/v1/lesson-plans/organizations/{id}/admins
-// body: {"user_id":"...", "role_type":"region_admin|school_admin"}
+// body: {"user_id":"...", "role_type":"region_admin|school_admin", "sync_role":true|false}
+//
+// B13：sync_role=true（前端默认勾选）时，若目标当前身份是 operator/viewer，
+// 任命成功后同步升级 users.role（region 任命→region_admin / school 任命→senior_operator）。
+// 响应 {message, role_synced, new_role}，message 按四种结果拼好中文供前端原样 toast。
+// RoleSynced=true 时额外写 admin.org_admin_role_sync 审计。
 func (h *OrganizationHandler) AddOrgAdmin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
@@ -206,22 +284,64 @@ func (h *OrganizationHandler) AddOrgAdmin(w http.ResponseWriter, r *http.Request
 	var req struct {
 		UserID   string `json:"user_id"`
 		RoleType string `json:"role_type"`
+		SyncRole bool   `json:"sync_role"` // B13：是否同步升级系统身份（前端默认 true）
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
-	if err := h.orgService.AddOrgAdmin(r.Context(), orgID, req.UserID, req.RoleType, claims.Role, claims.UserID); err != nil {
+
+	// 调 service：任命 +（可选）同步身份。error 非 nil = 任命本身失败
+	result, err := h.orgService.AddOrgAdmin(r.Context(), orgID, req.UserID, req.RoleType, req.SyncRole, claims.Role, claims.UserID)
+	if err != nil {
 		h.handleOrgError(w, err)
 		return
 	}
-	repository.WriteAuditLog(claims.UserID, "admin.org_admin_add",
+
+	// 任命本体审计（与旧字面量逐字一致的常量，历史日志兼容）
+	repository.WriteAuditLog(claims.UserID, repository.ActionOrgAdminAdd,
 		map[string]interface{}{"org_id": orgID, "target_user": req.UserID, "role_type": req.RoleType},
 		repository.GetClientIP(r.RemoteAddr))
-	utils.Success(w, map[string]string{"message": "任命成功"})
+
+	// ---- 按四种结果拼响应文案 ----
+	message := "任命成功"
+	if req.SyncRole {
+		switch {
+		case result.RoleSynced:
+			// 同步成功：额外写身份同步审计（region_admin 在用户域唯一写例外，必须留痕）
+			message = "任命成功，已同步身份为" + orgAdminRoleName(result.NewRole)
+			repository.WriteAuditLog(claims.UserID, repository.ActionOrgAdminRoleSync,
+				map[string]interface{}{
+					"org_id":      orgID,
+					"target_user": req.UserID,
+					"role_type":   req.RoleType,
+					"from_role":   result.TargetRole,
+					"new_role":    result.NewRole,
+				},
+				repository.GetClientIP(r.RemoteAddr))
+		case result.SyncFailed:
+			// 任命已成功但 users.role 更新失败：明示手工修复路径
+			message = "任命成功，但身份同步失败，请到用户管理手动修改"
+		default:
+			// 目标身份不在升级白名单（已是管理身份等）：任命成功，身份原样
+			message = "任命成功；该用户现有身份为" + orgAdminRoleName(result.TargetRole) + "，未变更"
+		}
+	}
+
+	utils.Success(w, map[string]interface{}{
+		"message":     message,
+		"role_synced": result.RoleSynced,
+		"new_role":    result.NewRole,
+	})
 }
 
 // RemoveOrgAdmin DELETE /api/v1/lesson-plans/organizations/{id}/admins/{user_id}
+//
+// 批C（任命唯一事实源·末任命自动降级）：service 返回 OrgAdminRemoveResult——
+// 目标任命归零且身份为任命制身份(senior_operator/region_admin)时已自动降级为骨干教师。
+// 本 handler：移除本体审计照旧；降级成功额外写 admin.org_admin_role_downgrade 审计，
+// 并在响应 message 明示（目标需重新登录后生效）；降级失败明示手工处理路径。
+// 响应保持 {message: string} 形态，前端 OrgAdminsPanel 零改动兼容。
 func (h *OrganizationHandler) RemoveOrgAdmin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodDeleteOnly)
@@ -237,14 +357,34 @@ func (h *OrganizationHandler) RemoveOrgAdmin(w http.ResponseWriter, r *http.Requ
 		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-	if err := h.orgService.RemoveOrgAdmin(r.Context(), orgID, targetUserID, claims.Role, claims.UserID); err != nil {
+	result, err := h.orgService.RemoveOrgAdmin(r.Context(), orgID, targetUserID, claims.Role, claims.UserID)
+	if err != nil {
 		h.handleOrgError(w, err)
 		return
 	}
-	repository.WriteAuditLog(claims.UserID, "admin.org_admin_remove",
+	// 移除本体审计（与历史逐字一致的常量）
+	repository.WriteAuditLog(claims.UserID, repository.ActionOrgAdminRemove,
 		map[string]interface{}{"org_id": orgID, "target_user": targetUserID},
 		repository.GetClientIP(r.RemoteAddr))
-	utils.Success(w, map[string]string{"message": "移除成功"})
+
+	// 批C：按降级结果拼文案 + 降级审计
+	message := "移除成功"
+	if result != nil {
+		switch {
+		case result.RoleDowngraded:
+			message = "移除成功；该用户已无任何管辖，系统身份已自动调整为骨干教师（其重新登录后生效）"
+			repository.WriteAuditLog(claims.UserID, repository.ActionOrgAdminRoleDowngrade,
+				map[string]interface{}{
+					"org_id":      orgID,
+					"target_user": targetUserID,
+					"from_role":   result.FromRole,
+					"new_role":    result.NewRole,
+				}, repository.GetClientIP(r.RemoteAddr))
+		case result.DowngradeFailed:
+			message = "移除成功，但身份自动降级失败，请到用户管理检查该用户的系统身份"
+		}
+	}
+	utils.Success(w, map[string]string{"message": message})
 }
 
 // ==================== 教研组 CRUD ====================

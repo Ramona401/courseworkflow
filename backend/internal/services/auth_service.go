@@ -10,6 +10,13 @@ package services
 // v172新增：登录/取当前用户时填充 PortalModules（门户板块可见性）
 //   - 普通用户：按所属学校 settings.portal_modules 决定（缺省全开）
 //   - admin：强制全开（保证管理员永远可进所有板块，便于配置和调试）
+//
+// 超管收口新增：JWTClaims 携带 IsSuper（超级管理员标记位）
+//   - 签发 token 时从 user.IsSuper 写入 claims，使中间件 SuperAdminOnly 不查库
+//     即可判定当前请求者是否超管（性能好、与 role 判定同源）。
+//   - 存量 token（未带 is_super 字段）解析后 IsSuper 默认 false，即老 token 一律
+//     按"非超管"处理——最坏结果是老 token 的超管需重新登录换新 token 才能进敏感入口，
+//     fail-safe 收紧方向，不会误放行。
 
 import (
 	"context"
@@ -37,7 +44,11 @@ type JWTClaims struct {
 	UserID   string `json:"user_id"`  // 用户 UUID
 	Username string `json:"username"` // 用户名
 	Role     string `json:"role"`     // 用户角色
-	jwt.RegisteredClaims              // 标准声明（过期时间等）
+	// 超管收口：超级管理员标记位。仅在 Role=admin 时有意义——把"全能 admin"
+	// 细分为超管(true)/二线(false)。中间件 SuperAdminOnly 直接读此字段判定，
+	// 不查库。存量 token 无此字段时反序列化为 false（按非超管处理，收紧方向）。
+	IsSuper              bool `json:"is_super"`
+	jwt.RegisteredClaims      // 标准声明（过期时间等）
 }
 
 // TokenExpiry JWT 有效期：24小时
@@ -61,6 +72,9 @@ func NewAuthService(cfg *config.Config) *AuthService {
 // v172：抽出公共逻辑，Login 与 GetCurrentUser 共用，避免重复。
 //   - OrgLogoURL / OrgName：复用 GetUserOrgLogo
 //   - PortalModules：admin 强制全开；其他角色按组织 settings 配置（缺省全开）
+//
+// 注意：IsSuper 不在此填充——它由 user.ToUserInfo() 从数据库真值直接透传，
+//       与组织附加信息无关。
 func fillUserInfoExtras(ctx context.Context, info *models.UserInfo) {
 	// 组织 Logo 与名称
 	orgLogo, orgName := repository.GetUserOrgLogo(ctx, info.ID)
@@ -139,7 +153,8 @@ func (s *AuthService) Login(ctx context.Context, req *models.LoginRequest) (*mod
 		"role", user.Role,
 	)
 
-	// 7. 返回 token 和用户信息（含组织 Logo/名称 + 门户板块可见性）
+	// 7. 返回 token 和用户信息（含组织 Logo/名称 + 门户板块可见性 + 超管标记）
+	//    IsSuper 已由 user.ToUserInfo() 从数据库真值透传，无需在此重复赋值。
 	info := user.ToUserInfo()
 	fillUserInfoExtras(ctx, info)
 
@@ -153,11 +168,12 @@ func (s *AuthService) Login(ctx context.Context, req *models.LoginRequest) (*mod
 func (s *AuthService) GenerateToken(user *models.User) (string, error) {
 	now := time.Now()
 
-	// 构造 JWT 声明
+	// 构造 JWT 声明（超管收口：写入 IsSuper，使中间件不查库即可判定）
 	claims := &JWTClaims{
 		UserID:   user.ID,
 		Username: user.Username,
 		Role:     user.Role,
+		IsSuper:  user.IsSuper,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(now.Add(TokenExpiry)), // 24小时后过期
 			IssuedAt:  jwt.NewNumericDate(now),                  // 签发时间
@@ -211,6 +227,8 @@ func (s *AuthService) GetCurrentUser(ctx context.Context, claims *JWTClaims) (*m
 		return nil, ErrUserDisabled
 	}
 
+	// info 由 ToUserInfo() 从数据库真值构造，IsSuper 反映当前库中真实标记
+	// （即使 token 里是老值，/auth/me 拿到的也是最新库值，前端据此收口入口）
 	info := user.ToUserInfo()
 
 	// 填充组织 Logo/名称 + 门户板块可见性（与 Login 一致）

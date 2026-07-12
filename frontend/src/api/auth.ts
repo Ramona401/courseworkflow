@@ -37,6 +37,13 @@ export interface UserInfo {
   // key 为板块标识：lesson_plan / courseware / workflow，值 true=可见 false=隐藏。
   // 可能为 undefined（老 token 缓存或后端未下发时），前端统一按“缺省可见”兜底处理。
   portal_modules?: Record<string, boolean>
+  // 超管收口新增：超级管理员标记位（后端 models.UserInfo.IsSuper 已下发，json 键 is_super）。
+  //   - true：真超管，可见"积分管理 / AI管理中心 / AI调用统计 / 提示词管理"等敏感入口；
+  //   - false：二线管理员（仍是 admin 角色），前端隐藏上述四个敏感入口，只保留
+  //            用户管理 / 基础数据管理（学科·课程大纲）/ 组织架构等常规管理能力。
+  // 与 role 正交：仅在 role='admin' 时有区分意义。可能为 undefined（老缓存/后端未下发），
+  // 前端一律按"非超管"兜底（缺省 false，收紧方向，不会误放行敏感入口）。
+  is_super?: boolean
 }
 
 // 登录响应类型

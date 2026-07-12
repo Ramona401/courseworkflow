@@ -1,38 +1,23 @@
 /**
  * AssistantEditModal.tsx — AI 助手编辑/新建弹窗
  *
- * 功能概览:
- *   统一的 AI 助手编辑/新建弹窗,支持三种模式:
- *     1. create-personal — 新建我的(personal)助手  (所有登录用户均可)
- *     2. create-group    — 新建本校(group)助手     (senior_operator/admin)
- *     3. edit            — 编辑现有助手            (按后端权限校验)
+ * 三种模式(mode 决定标题/source/默认字段):
+ *   create-personal 新建我的助手 / create-group 新建本校助手 / edit 编辑现有助手
+ * edit 模式 mount 时 getAssistant(id) 拉完整 prompt;提交后 onSaved 回调透传 ID 给父组件。
  *
- * 使用场景:
- *   - AssistantSelector 底部 "+ 新建个人助手" → mode='create-personal'
- *   - AssistantSelector 条目上 "✏️ 改" → mode='edit' + assistantId
- *   - (未来)管理员后台 → mode='create-group'
+ * Prompt 编辑区双 Tab(v114):[📝 手动编辑] textarea + [💬 AI 帮我写] DesignerPanel;
+ *   切 Tab 不清 state;DesignerPanel onApplyDraft 回写 fullPrompt 并自动切回 manual。
  *
- * 设计要点:
- *   - mode 决定标题/source/默认字段,不让用户在 UI 上切换来源(保证权限清晰)
- *   - edit 模式下 mount 时调 getAssistant(id) 拉完整 prompt
- *   - 提交成功后通过 onSaved 回调把新/更新的助手 ID 透传给父组件,便于父组件刷新列表
- *   - 父组件通过 open/onClose 控制显隐,Modal 只管表单内部状态
+ * share_policy(本次新增):仅【共享助手】(source=group/system)显示 SharePolicyPicker——
+ *   edit 时 loadedSource 为 group/system 显示并回填;create-group 显示默认 use_only;
+ *   create-personal 不显示(个人助手别人看不到,策略无意义)。能编辑者(属主/组长/校管/admin)
+ *   均可改策略(Yuhan 拍板:组长既能维护内容,顺手改策略也无妨)。提交时共享助手带该字段。
  *
- * v114 Batch 2 第 2 轮(2026-04-20 对话式创作):
- *   - 顶部新增 Tab 切换:[📝 手动编辑] [💬 AI 帮我写]
- *   - 通用字段区(name/emoji/description/subject/grade/scenes)始终显示,两 Tab 共享
- *   - 手动编辑 Tab:渲染原有的 fullPrompt textarea(逻辑不变)
- *   - AI 帮我写 Tab:渲染 <AssistantDesignerPanel>,通过 onApplyDraft 回写 fullPrompt + 自动切回 manual Tab
- *   - 切换 Tab 不清空任何 state,fullPrompt/scenes 等在两 Tab 间保持连续
+ * 重构:样式/数据常量外移至 editModalStyles.ts,三档选择器抽至 SharePolicyPicker.tsx,
+ *   以控制本文件行数在 600 红线内。
  *
- * Props 契约:
- *   open          - 是否显示
- *   mode          - 模式:'create-personal' | 'create-group' | 'edit'
- *   assistantId?  - edit 模式下必填
- *   defaultScene? - create 模式下的默认场景(从 Selector 的 scene prop 透传,默认勾选)
- *   defaultSubject? / defaultGrade? - create 模式下的默认学科年级
- *   onClose       - 关闭回调(无参)
- *   onSaved       - 保存成功回调(传入助手 ID 和来源,便于父组件刷新选中)
+ * Props:open / mode / assistantId?(edit必填) / defaultScene? / defaultSubject? /
+ *   defaultGrade? / onClose / onSaved?(id, source)
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react'
@@ -42,41 +27,18 @@ import {
   updateAssistant,
   parseAssistantScenes,
   ASSISTANT_SCENE_LABELS,
+  DEFAULT_SHARE_POLICY,
   type AssistantScene,
   type AssistantSource,
+  type AssistantSharePolicy,
   type CreateAIAssistantRequest,
   type UpdateAIAssistantRequest,
 } from '@/api/ai-assistants'
 import AssistantDesignerPanel from './AssistantDesignerPanel'
-
-/* ==================== 样式常量(与 AssistantSelector 保持一致) ==================== */
-const C = {
-  primary:      '#4F7BE8',
-  primaryLight: 'rgba(79,123,232,0.08)',
-  accent:       '#F59E0B',
-  success:      '#10B981',
-  danger:       '#EF4444',
-  text:         '#1F2937',
-  textSec:      '#6B7280',
-  textMuted:    '#9CA3AF',
-  bg:           '#FAFBFC',
-  card:         '#FFFFFF',
-  border:       '#F3F4F6',
-  borderMid:    '#E5E7EB',
-}
-
-/** 常用 emoji 快捷选择行(用户也可手动输入任意 emoji) */
-const QUICK_EMOJIS = ['🤖', '✨', '🎯', '📚', '🏛️', '🏫', '👤', '🔍', '💡', '🛠', '📝', '🧑‍🏫']
-
-/** 学科可选项(与 workshopConstants 保持一致,避免 import 导致的循环依赖,这里写死) */
-const SUBJECTS = [
-  '', // 空=不限
-  '人工智能', '语文', '数学', '英语', '物理', '化学', '生物',
-  '历史', '地理', '政治', '科学', '信息科技', '技术', '综合实践',
-]
-
-/** prompt 长度上限(与后端 maxAssistantPromptLen 对齐) */
-const MAX_PROMPT_LEN = 128 * 1024
+import SharePolicyPicker from './SharePolicyPicker'
+import {
+  C, QUICK_EMOJIS, SUBJECTS, MAX_PROMPT_LEN, labelStyle, inputStyle,
+} from './editModalStyles'
 
 /** Tab 类型(v114 新增) */
 type EditTab = 'manual' | 'designer'
@@ -115,7 +77,9 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
   const [gradeRange, setGradeRange]   = useState('')
   const [scenes, setScenes]           = useState<AssistantScene[]>([])
   const [fullPrompt, setFullPrompt]   = useState('')
-  // edit 模式下拉到的原始 source(用于 onSaved 回调传回)
+  // share_policy:仅共享助手有意义;create-personal 不展示也不提交
+  const [sharePolicy, setSharePolicy] = useState<AssistantSharePolicy>(DEFAULT_SHARE_POLICY)
+  // edit 模式下拉到的原始 source(用于 onSaved 回调传回 + 判断是否显示策略选择器)
   const [loadedSource, setLoadedSource] = useState<AssistantSource | null>(null)
 
   // ==================== UI 状态 ====================
@@ -136,6 +100,7 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
     setGradeRange(defaultGrade || '')
     setScenes(defaultScene ? [defaultScene] : [])
     setFullPrompt('')
+    setSharePolicy(DEFAULT_SHARE_POLICY)
     setLoadedSource(null)
     setLoadErr(null)
     setActiveTab('manual')  // v114:每次打开默认手动 Tab
@@ -161,6 +126,8 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
           // scenes 详情接口返回的是 JSONB 字符串,需要 parse
           setScenes(parseAssistantScenes(data.scenes))
           setFullPrompt(data.full_prompt || '')
+          // 回填 share_policy(后端保证有值,兜底 use_only 防脏)
+          setSharePolicy(data.share_policy || DEFAULT_SHARE_POLICY)
           setLoadedSource(data.source as AssistantSource)
           setLoading(false)
         })
@@ -201,6 +168,13 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
     setActiveTab('manual')
   }, [])
 
+  // ==================== 是否显示分享策略选择器 ====================
+  // 共享助手才显示:edit 时 loadedSource 为 group/system;create-group 模式本就是共享助手。
+  // create-personal 不显示(个人助手别人看不到,策略无意义)。
+  const showPolicyPicker =
+    mode === 'create-group' ||
+    (mode === 'edit' && (loadedSource === 'group' || loadedSource === 'system'))
+
   // ==================== 表单校验 ====================
   /** 返回错误提示字符串,null 表示校验通过 */
   const validate = (): string | null => {
@@ -231,6 +205,8 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
           subject: subject.trim(),
           grade_range: gradeRange.trim(),
           scenes: scenes,
+          // 仅共享助手带 share_policy;个人助手不带(后端会忽略/兜底)
+          ...(showPolicyPicker ? { share_policy: sharePolicy } : {}),
         }
         await updateAssistant(assistantId, req)
         onSaved?.(assistantId, loadedSource || 'personal')
@@ -247,6 +223,8 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
           subject: subject.trim(),
           grade_range: gradeRange.trim(),
           scenes: scenes,
+          // create-group 是共享助手,带 share_policy;create-personal 不带
+          ...(showPolicyPicker ? { share_policy: sharePolicy } : {}),
         }
         const created = await createAssistant(req)
         onSaved?.(created.id, created.source as AssistantSource)
@@ -268,8 +246,6 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
     mode === 'edit'            ? (name ? `✏️ 编辑 — ${name}` : '✏️ 编辑助手') :
     mode === 'create-group'    ? '🏫 新建本校助手' :
                                  '➕ 新建我的助手'
-
-  // ==================== 子组件:遮罩层 ====================
 
   return (
     <div
@@ -454,6 +430,14 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
                 </div>
               </div>
 
+              {/* ---- share_policy 分享策略选择器(仅共享助手显示) ---- */}
+              {showPolicyPicker && (
+                <SharePolicyPicker
+                  value={sharePolicy}
+                  onChange={setSharePolicy}
+                />
+              )}
+
               {/* ---- v114:Prompt 编辑区(手动/AI 双 Tab) ---- */}
               <div style={{ marginBottom: '8px' }}>
                 {/* Tab 标题行 + 字符数统计 */}
@@ -604,21 +588,4 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
       </div>
     </div>
   )
-}
-
-/* ==================== 样式辅助 ==================== */
-
-const labelStyle: React.CSSProperties = {
-  display: 'block',
-  fontSize: '12px', fontWeight: 600, color: C.textSec,
-  marginBottom: '4px',
-}
-
-const inputStyle: React.CSSProperties = {
-  padding: '7px 10px', borderRadius: '6px',
-  border: `1px solid ${C.border}`,
-  fontSize: '13px', color: C.text,
-  outline: 'none', boxSizing: 'border-box',
-  fontFamily: 'inherit',
-  background: '#fff',
 }

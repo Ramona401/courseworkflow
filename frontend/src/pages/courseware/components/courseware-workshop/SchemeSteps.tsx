@@ -1,59 +1,58 @@
 /**
  * SchemeSteps.tsx — 课件工坊 Step0(AI生成方案)+Step1(确认方案)（批次5b-2从主页面拆出）
  *
- * 拆出范围：两步的全部JSX + 专属7个state/2个effect/3个处理函数
- * （生成方案四来源分流/SSE订阅/10秒兜底轮询/确认方案/AI修改方案/方案预设选择）。
- *
- * 与父级的接缝：
- *   - pages/setPages：方案页面列表是父级真相源（Step4派生统计/loadCourseware恢复都用），传下来；
- *   - sseRef：全工坊共享的单一SSE连接句柄（父级持有，卸载时父级统一close）；
- *   - goToStep/loadCourseware：步骤推进与课件刷新；
- *   - onCoursewareUpdate：兜底轮询发现完成时把最新课件对象回写父级状态。
+ * 【AI自动修正方案】AlignmentReportCard 经 onAutoFix 回调把对齐报告问题拼成的修正指令
+ *   传入本组件，复用 refineCWIndex + SSE 流程执行修正。
+ *   修正完成后自动调 recheckAlignment 触发重新校验，形成"诊断→修正→复查"闭环。
+ *   autoFixMessage 独立于 sseMessage，不会被 loadCourseware 冲掉，持久显示修正结果。
  */
 import { useState, useEffect } from 'react'
 import type { Dispatch, SetStateAction, MutableRefObject } from 'react'
 import {
   getCourseware, generateCWIndex, generateCWIndexFromTopic, generateCWIndexFromPPT,
   generateCWIndexFromDoc, subscribeCWIndexSSE, confirmCWIndex, refineCWIndex, getSchemePresets,
+  recheckAlignment,
 } from '@/api/coursewares'
 import type { SchemePreset, CoursewareDetail, CoursewarePage } from '@/api/coursewares'
 import IndexEditor from '../IndexEditor'
 import AlignmentReportCard from './AlignmentReportCard'
 import { C } from './workshopConstants'
 import { MsgBar } from './PagePreviewBlock'
+import CustomSchemeBuilder from './CustomSchemeBuilder'
 
 interface Props {
   coursewareId: string
   courseware: CoursewareDetail
   isAdmin: boolean
-  /** 0=生成方案 1=确认方案（其余值不渲染任何内容） */
   activeStep: number
   pages: CoursewarePage[]
   setPages: Dispatch<SetStateAction<CoursewarePage[]>>
   sseRef: MutableRefObject<{ close: () => void } | null>
   goToStep: (n: number) => void
   loadCourseware: () => void
-  /** 兜底轮询发现完成时回写父级 courseware 状态 */
   onCoursewareUpdate: (d: CoursewareDetail) => void
 }
 
 export default function SchemeSteps({ coursewareId, courseware, isAdmin, activeStep, pages, setPages, sseRef, goToStep, loadCourseware, onCoursewareUpdate }: Props) {
-  // ==================== 两步专属状态（5b-2自主页面整体迁入） ====================
   const [generating, setGenerating] = useState(false)
   const [sseMessage, setSseMessage] = useState('')
   const [confirming, setConfirming] = useState(false)
-  // v136: 方案预设+AI修改方案
   const [presets, setPresets] = useState<SchemePreset[]>([])
   const [selectedPreset, setSelectedPreset] = useState('auto')
+  const [customPromptHint, setCustomPromptHint] = useState('')  // 自定义预设：老师自己写的课件结构描述
   const [refineFeedback, setRefineFeedback] = useState('')
   const [refining, setRefining] = useState(false)
+  // AI自动修正后自动重新校验的标记（修正完成递增，AlignmentReportCard的key变化触发重挂载重拉）
+  const [alignmentRecheckKey, setAlignmentRecheckKey] = useState(0)
+  // AI自动修正的持久成功提示（独立于sseMessage，不会被loadCourseware冲掉）
+  // 格式：{ text: 显示文案, type: 'success'|'info' }
+  const [autoFixMessage, setAutoFixMessage] = useState<{ text: string; type: 'success' | 'info' } | null>(null)
 
-  // v136: 加载方案预设
   useEffect(() => {
     getSchemePresets().then(p => setPresets(p)).catch(() => {})
   }, [])
 
-  // 生成中的10秒兜底轮询（SSE漏event时仍能推进）：状态离开draft/indexing即视为完成
+  // 生成中10秒兜底轮询
   useEffect(() => {
     if (!generating || !coursewareId) return
     const t = setInterval(async () => { try { const d = await getCourseware(coursewareId); if (d.status !== 'draft' && d.status !== 'indexing') { setGenerating(false); onCoursewareUpdate(d); setPages(d.pages || []); goToStep(1); setSseMessage('✅ 完成'); sseRef.current?.close() } } catch {} }, 10000)
@@ -63,20 +62,16 @@ export default function SchemeSteps({ coursewareId, courseware, isAdmin, activeS
   // Step 0: 生成方案（按来源类型分流四个端点）
   const handleGenerate = async () => {
     if (!coursewareId) return; setGenerating(true); setSseMessage('正在启动...'); setPages([])
+    setAutoFixMessage(null) // 清除旧的修正提示
     try {
       if (courseware.source_type === 'topic_direct') {
-        await generateCWIndexFromTopic(coursewareId, {
-          subject: courseware.subject,
-          grade: courseware.grade,
-          topic: courseware.title,
-          preset: selectedPreset,
-        })
+        await generateCWIndexFromTopic(coursewareId, { subject: courseware.subject, grade: courseware.grade, topic: courseware.title, preset: selectedPreset, custom_prompt_hint: selectedPreset === 'custom' ? customPromptHint : undefined })
       } else if (courseware.source_type === 'ppt_upload') {
-        await generateCWIndexFromPPT(coursewareId, selectedPreset)
+        await generateCWIndexFromPPT(coursewareId, selectedPreset, selectedPreset === 'custom' ? customPromptHint : undefined)
       } else if (courseware.source_type === 'doc_upload') {
-        await generateCWIndexFromDoc(coursewareId, selectedPreset)
+        await generateCWIndexFromDoc(coursewareId, selectedPreset, selectedPreset === 'custom' ? customPromptHint : undefined)
       } else {
-        await generateCWIndex(coursewareId, selectedPreset)
+        await generateCWIndex(coursewareId, selectedPreset, selectedPreset === 'custom' ? customPromptHint : undefined)
       }
       sseRef.current?.close()
       sseRef.current = subscribeCWIndexSSE(coursewareId, {
@@ -95,18 +90,24 @@ export default function SchemeSteps({ coursewareId, courseware, isAdmin, activeS
     } catch { setSseMessage('❌ 启动失败'); setGenerating(false) }
   }
 
-  // Step 1: 确认方案 → 进入选风格
+  // Step 1: 确认方案
   const handleConfirm = async () => {
     if (!coursewareId || !pages.length) return; setConfirming(true)
     try { await confirmCWIndex(coursewareId); goToStep(2); loadCourseware() } catch { alert('确认失败') } finally { setConfirming(false) }
   }
 
-  // v136: AI修改方案（按老师整体意见重出方案，SSE增量刷新页面列表）
-  const handleRefineIndex = async () => {
-    if (!coursewareId || !refineFeedback.trim() || refining) return
-    setRefining(true); setSseMessage('正在根据意见修改方案...')
+  /**
+   * AI修改方案（通用入口）——按指令重出方案，SSE增量刷新页面列表。
+   * @param instruction 修改指令文本
+   * @param autoRecheck 修正完成后是否自动触发对齐重新校验
+   */
+  const doRefineIndex = async (instruction: string, autoRecheck = false) => {
+    if (!coursewareId || !instruction.trim() || refining) return
+    setRefining(true)
+    setSseMessage('🔧 正在根据意见修改方案...')
+    setAutoFixMessage(autoRecheck ? { text: '🔧 AI 正在修正方案，请稍候…', type: 'info' } : null)
     try {
-      await refineCWIndex(coursewareId, refineFeedback.trim())
+      await refineCWIndex(coursewareId, instruction.trim())
       sseRef.current?.close()
       sseRef.current = subscribeCWIndexSSE(coursewareId, {
         onConnected: () => setSseMessage('已连接，AI正在修改方案...'),
@@ -118,31 +119,64 @@ export default function SchemeSteps({ coursewareId, courseware, isAdmin, activeS
             : [...prev, page]
           return next.slice().sort((a, b) => a.page_number - b.page_number)
         }),
-        onIndexDone: d => { setSseMessage('\u2705 ' + d.message); setRefining(false); setRefineFeedback(''); loadCourseware() },
-        onError: d => { setSseMessage('\u274c ' + d.message); setRefining(false) },
+        onIndexDone: d => {
+          setSseMessage('✅ ' + d.message)
+          setRefining(false)
+          setRefineFeedback('')
+          loadCourseware()
+          // AI自动修正后：显示成功提示并触发重新校验
+          if (autoRecheck) {
+            setAutoFixMessage({ text: '✅ 方案已修正完成！正在重新校验对齐度…', type: 'success' })
+            recheckAlignment(coursewareId)
+              .then(() => {
+                setAlignmentRecheckKey(prev => prev + 1)
+                // 延迟更新提示，给校验轮询留时间（校验约10-15秒，卡片自己轮询）
+                setTimeout(() => {
+                  setAutoFixMessage({ text: '✅ 方案修正完成，对齐报告已更新。请查看上方报告了解改善情况。', type: 'success' })
+                }, 2000)
+              })
+              .catch(() => {
+                setAutoFixMessage({ text: '✅ 方案已修正完成，但重新校验未能启动。可点击报告卡片的"🔄 重新校验"手动触发。', type: 'success' })
+              })
+          }
+        },
+        onError: d => {
+          setSseMessage('❌ ' + d.message)
+          setRefining(false)
+          if (autoRecheck) {
+            setAutoFixMessage({ text: '❌ 方案修正失败：' + d.message, type: 'info' })
+          }
+        },
       })
-    } catch { setSseMessage('\u274c 启动失败'); setRefining(false) }
+    } catch {
+      setSseMessage('❌ 启动失败')
+      setRefining(false)
+      if (autoRecheck) {
+        setAutoFixMessage({ text: '❌ 方案修正启动失败，请稍后重试', type: 'info' })
+      }
+    }
   }
 
-  // ==================== JSX（与拆分前 Step0/Step1 逐行一致） ====================
+  // 手动输入修改意见（不自动重新校验）
+  const handleRefineIndex = () => doRefineIndex(refineFeedback)
+
+  // AI自动修正（由AlignmentReportCard的onAutoFix回调触发，修正后自动重新校验）
+  const handleAutoFix = (instruction: string) => doRefineIndex(instruction, true)
+
   return <>
     {/* Step 0: AI生成方案 */}
     {activeStep === 0 && <div>
       <h3 style={{ fontSize: 18, fontWeight: 600, color: C.textPrimary, margin: '0 0 8px' }}>🤖 AI生成课件方案</h3>
       <p style={{ fontSize: 14, color: C.textSecondary, margin: '0 0 20px' }}>AI将分析教案内容，自动为每页设计方案。</p>
-      {/* v136: 方案结构预设选择 */}
       {presets.length > 0 && !generating && (
         <div style={{ marginBottom: 20 }}>
           <div style={{ fontSize: 14, fontWeight: 600, color: C.textPrimary, marginBottom: 10 }}>选择课件结构预设</div>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
             {presets.map(p => (
               <button key={p.key} onClick={() => setSelectedPreset(p.key)}
-                style={{
-                  flex: '1 1 200px', maxWidth: 240, padding: '12px 16px', borderRadius: 10, cursor: 'pointer',
+                style={{ flex: '1 1 200px', maxWidth: 240, padding: '12px 16px', borderRadius: 10, cursor: 'pointer',
                   border: `2px solid ${selectedPreset === p.key ? C.primary : C.border}`,
-                  background: selectedPreset === p.key ? C.primaryBg : C.white,
-                  textAlign: 'left', transition: 'all 200ms',
-                }}>
+                  background: selectedPreset === p.key ? C.primaryBg : C.white, textAlign: 'left', transition: 'all 200ms' }}>
                 <div style={{ fontSize: 20, marginBottom: 4 }}>{p.emoji}</div>
                 <div style={{ fontSize: 14, fontWeight: 600, color: selectedPreset === p.key ? C.primary : C.textPrimary }}>{p.name}</div>
                 <div style={{ fontSize: 12, color: C.textSecondary, marginTop: 2 }}>{p.description}</div>
@@ -152,9 +186,16 @@ export default function SchemeSteps({ coursewareId, courseware, isAdmin, activeS
           </div>
         </div>
       )}
+      {/* 自定义预设：选中custom时显示环节搭建器 */}
+      {selectedPreset === 'custom' && !generating && (
+        <CustomSchemeBuilder
+          value={customPromptHint}
+          onChange={setCustomPromptHint}
+        />
+      )}
       <MsgBar msg={sseMessage} />
       {generating && pages.length > 0 && <div style={{ marginBottom: 16 }}><div style={{ fontSize: 13, color: C.textMuted, marginBottom: 8 }}>已生成 {pages.length} 页方案...</div><IndexEditor coursewareId={coursewareId} pages={pages} onPagesChange={setPages} isAdmin={isAdmin} indexOverview={courseware.index_overview} /></div>}
-      <button onClick={handleGenerate} disabled={generating} style={{ padding: '12px 32px', borderRadius: 10, border: 'none', background: generating ? '#E5E7EB' : 'linear-gradient(135deg, #F59E0B, #EF4444)', color: generating ? '#9CA3AF' : '#fff', fontSize: 15, fontWeight: 600, cursor: generating ? 'default' : 'pointer', boxShadow: generating ? 'none' : '0 4px 16px rgba(245,158,11,0.3)' }}>
+      <button onClick={handleGenerate} disabled={generating || (selectedPreset === 'custom' && !customPromptHint.trim())} style={{ padding: '12px 32px', borderRadius: 10, border: 'none', background: generating ? '#E5E7EB' : 'linear-gradient(135deg, #F59E0B, #EF4444)', color: generating ? '#9CA3AF' : '#fff', fontSize: 15, fontWeight: 600, cursor: generating ? 'default' : 'pointer', boxShadow: generating ? 'none' : '0 4px 16px rgba(245,158,11,0.3)' }}>
         {generating ? '⏳ 生成中...' : pages.length > 0 ? '🔄 重新生成' : '🤖 开始AI生成方案'}
       </button>
       {!generating && pages.length > 0 && <button onClick={() => goToStep(1)} style={{ marginLeft: 12, padding: '12px 24px', borderRadius: 10, border: `1px solid ${C.primary}`, background: C.primaryBg, color: C.primary, fontSize: 15, fontWeight: 600, cursor: 'pointer' }}>✏️ 确认方案 →</button>}
@@ -169,10 +210,32 @@ export default function SchemeSteps({ coursewareId, courseware, isAdmin, activeS
           <button onClick={handleConfirm} disabled={confirming || !pages.length} style={{ padding: '8px 20px', borderRadius: 8, border: 'none', background: pages.length ? 'linear-gradient(135deg, #F59E0B, #EF4444)' : '#E5E7EB', color: pages.length ? '#fff' : '#9CA3AF', fontSize: 14, fontWeight: 600, cursor: pages.length && !confirming ? 'pointer' : 'default' }}>{confirming ? '确认中...' : '确认方案，选择风格 →'}</button>
         </div>
       </div>
-      {/* 课件↔教案对齐报告卡片（仅教案来源课件后端才有报告；非教案来源组件内部自渲染为 null） */}
-      <AlignmentReportCard coursewareId={coursewareId} sourceType={courseware.source_type} />
+
+      {/* AI修正持久成功提示条——独立于sseMessage，不会被loadCourseware冲掉 */}
+      {autoFixMessage && (
+        <div style={{
+          marginBottom: 12, padding: '10px 16px', borderRadius: 10, fontSize: 13, lineHeight: 1.6,
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+          background: autoFixMessage.type === 'success' ? '#F0FDF4' : '#EFF6FF',
+          border: `1.5px solid ${autoFixMessage.type === 'success' ? '#86EFAC' : '#93C5FD'}`,
+          color: autoFixMessage.type === 'success' ? '#166534' : '#1E40AF',
+        }}>
+          <span>{autoFixMessage.text}</span>
+          <button onClick={() => setAutoFixMessage(null)}
+            style={{ background: 'none', border: 'none', fontSize: 16, cursor: 'pointer', color: 'inherit', padding: '0 4px', opacity: 0.6 }}>✕</button>
+        </div>
+      )}
+
+      {/* 课件↔教案对齐报告卡片 */}
+      <AlignmentReportCard
+        key={alignmentRecheckKey}
+        coursewareId={coursewareId}
+        sourceType={courseware.source_type}
+        onAutoFix={handleAutoFix}
+      />
       <IndexEditor coursewareId={coursewareId} pages={pages} onPagesChange={setPages} isAdmin={isAdmin} indexOverview={courseware.index_overview} />
-      {/* v136: AI修改方案输入区 */}
+
+      {/* AI修改方案输入区 */}
       {pages.length > 0 && !refining && (
         <div style={{ marginTop: 16, padding: '16px', borderRadius: 10, border: '1px solid ' + C.border, background: '#FAFAFA' }}>
           <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 8 }}>🤖 对整体方案不满意？输入修改意见让AI重新调整</div>

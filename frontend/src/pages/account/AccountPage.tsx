@@ -12,6 +12,7 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import { getProfile, updateProfile, changePassword } from '@/api/account'
 import type { ProfileInfo } from '@/api/account'
+import MyOrganizationTab from './MyOrganizationTab'
 
 const COLORS = {
   primary:      '#4F7BE8',
@@ -58,7 +59,7 @@ function InfoRow({ label, value }: { label: string; value: React.ReactNode }) {
   )
 }
 
-type TabKey = 'profile' | 'security'
+type TabKey = 'profile' | 'organization' | 'security'
 
 export default function AccountPage() {
   const navigate  = useNavigate()
@@ -157,9 +158,9 @@ export default function AccountPage() {
       <main style={{ maxWidth: '720px', margin: '0 auto', padding: '32px 24px 80px' }}>
         {/* Tab条 */}
         <div style={{ background: COLORS.white, border: `1px solid ${COLORS.border}`, borderRadius: '14px', padding: '8px', marginBottom: '16px', display: 'flex', gap: '8px' }}>
-          {(['profile', 'security'] as const).map((tab, i) => (
+          {(['profile', 'organization', 'security'] as const).map((tab, i) => (
             <button key={tab} onClick={() => setActiveTab(tab)} style={{ border: 'none', borderRadius: '10px', padding: '9px 20px', cursor: 'pointer', fontSize: '14px', fontWeight: activeTab === tab ? 600 : 400, color: activeTab === tab ? COLORS.primary : COLORS.textSec, background: activeTab === tab ? COLORS.primaryLight : 'transparent', transition: 'all 150ms ease' }}>
-              {['基本信息', '安全设置'][i]}
+              {['基本信息', '我的组织', '安全设置'][i]}
             </button>
           ))}
         </div>
@@ -212,6 +213,11 @@ export default function AccountPage() {
               </div>
             </div>
           </>
+        )}
+
+        {/* 我的组织 Tab */}
+        {activeTab === 'organization' && (
+          <MyOrganizationTab systemRole={profile?.role} />
         )}
 
         {/* 安全设置 Tab */}

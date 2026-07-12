@@ -8,6 +8,12 @@
  *   senior_operator    → 学校管理员
  *   operator           → 骨干教师
  *   viewer             → 普通教师
+ *
+ * 归属治理批C（任命唯一事实源）新增：
+ *   APPOINTMENT_ONLY_ROLES —— 任命制身份清单（senior_operator/region_admin）。
+ *   不变式：这两个身份 ⇔ 组织任命存在。获得只能走「组织架构→🛡️管理员」任命
+ *   （自动升身份），失去随末任命移除自动降级。建号弹窗与编辑角色下拉据此过滤；
+ *   ROLE_OPTIONS 本体保持全量（用户列表按角色【筛选】仍需要这两项）。
  */
 
 // ==================== 颜色常量 ====================
@@ -41,6 +47,9 @@ export const ROLE_OPTIONS = [
   { value: 'operator',           label: '骨干教师' },
   { value: 'viewer',             label: '普通教师' },
 ]
+
+// 批C：任命制身份（不可经建号/编辑直接授予，详见文件头注释）
+export const APPOINTMENT_ONLY_ROLES = ['senior_operator', 'region_admin']
 
 export const ACTION_OPTIONS = [
   { value: '', label: '全部操作' },

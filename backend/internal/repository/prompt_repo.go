@@ -16,6 +16,22 @@ var (
 	ErrPromptNotFound = errors.New("提示词不存在")
 )
 
+// PromptKeyExists 检查指定 prompt_key 是否存在于 prompts 表（任意版本，不限 is_current）。
+//
+// v2 治理新增：key 合法性校验从「models 层写死 9 个白名单」改为「DB 里存在即合法」，
+//   使管理页能纳管 prompts 表全部现有 key（含课件/知识库那 19 个），
+//   且未来任何模块新插入的 key 自动可管，无需再改代码。
+//   校验的是「该 key 有没有任何一行记录」，故用 EXISTS（有历史版本即算存在）。
+func PromptKeyExists(key string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM prompts WHERE prompt_key = $1)`
+	var exists bool
+	err := database.DB.QueryRow(context.Background(), query, key).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("检查提示词标识是否存在失败: %w", err)
+	}
+	return exists, nil
+}
+
 // GetCurrentPrompts 获取所有槽位的当前生效版本
 // 返回 is_current=true 的记录，按 prompt_key 排序
 func GetCurrentPrompts() ([]models.Prompt, error) {

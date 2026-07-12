@@ -15,6 +15,7 @@ import type {
   RefineHistoryEntry, PublishTargetsResponse,
   CurriculumKPResponse, PageVersionEntry,
   AlignmentReportResponse,
+  SharedCoursewareListResponse,
 } from './coursewares.types'
 
 // ==================== 课件CRUD ====================
@@ -64,6 +65,7 @@ export async function updateCWPageIndex(coursewareId: string, pageNumber: number
 export async function addCWPage(coursewareId: string, data: {
   title: string; purpose?: string; content_summary?: string
   interaction_type?: string; visual_format?: string
+  media_requirements?: string; estimated_complexity?: number
 }): Promise<CoursewarePage> {
   const resp = await apiClient.post(`/coursewares/${coursewareId}/pages`, data)
   return extractData(resp)
@@ -170,7 +172,7 @@ export async function refinePage(
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/pages/${pageNumber}/refine`,
     body,
-    { timeout: 120000 }, // 多模态微调可能较慢，2分钟超时
+    { timeout: 300000 }, // opus全量重写整页+多模态推理较慢，5分钟超时（防后端已成功而前端先超时报假失败）
   )
   return extractData(resp)
 }
@@ -187,7 +189,7 @@ export async function regenerateCWPage(
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/pages/${pageNumber}/regenerate`,
     {},
-    { timeout: 120000 }, // 单页重生需调用大模型，2分钟超时
+    { timeout: 300000 }, // 单页重生=大模型从零重画整页，5分钟超时（防后端已成功而前端先超时报假失败）
   )
   return extractData(resp)
 }
@@ -224,6 +226,30 @@ export async function rollbackPage(
   return extractData(resp)
 }
 
+/**
+ * 页面级版本对比：取某个历史版本的完整 HTML（版本对比弹窗左侧渲染用，只读）。
+ * 当前版 HTML 前端已有（走 getCoursewarePages 拿当前页 html_content），
+ * 历史版就靠本接口按 versionId 单独取，用于左右并排 diff。
+ * 接口：GET /api/v1/coursewares/{id}/pages/{num}/versions/{versionId}
+ */
+export async function getPageVersionDetail(
+  coursewareId: string,
+  pageNumber: number,
+  versionId: string,
+): Promise<{
+  page_number: number
+  version_id: string
+  version_no: number
+  source: string
+  source_label: string
+  html_content: string
+}> {
+  const resp = await apiClient.get(
+    `/coursewares/${coursewareId}/pages/${pageNumber}/versions/${versionId}`,
+  )
+  return extractData(resp)
+}
+
 /** P0-5: 中途中断批量生成 */
 export async function cancelGenerate(coursewareId: string): Promise<void> {
   await apiClient.post(`/coursewares/${coursewareId}/cancel-generate`)
@@ -231,8 +257,11 @@ export async function cancelGenerate(coursewareId: string): Promise<void> {
 
 // ==================== 课件索引AI生成（SSE流式） ====================
 
-export async function generateCWIndex(coursewareId: string, preset?: string): Promise<void> {
-  await apiClient.post(`/coursewares/${coursewareId}/generate-index`, preset ? { preset } : {})
+export async function generateCWIndex(coursewareId: string, preset?: string, customPromptHint?: string): Promise<void> {
+  const body: Record<string, string> = {}
+  if (preset) body.preset = preset
+  if (customPromptHint) body.custom_prompt_hint = customPromptHint
+  await apiClient.post(`/coursewares/${coursewareId}/generate-index`, body)
 }
 
 // P2：SSE 自动重连参数（照搬教案 lesson-plans.ts 已验证的指数退避范式）
@@ -313,6 +342,37 @@ export function subscribeCWIndexSSE(
         try { callbacks.onError?.(JSON.parse(e.data)) } catch { /* */ }
       }
       // 不再 es.close()
+    })
+
+    // ==================== 全自动装配事件（assembly_*）====================
+    // 与 gen_* 并列的独立事件族，全自动/中间档两种交付模式共用。
+    // 复用同一条 SSE 连接与断线重连机制，无需另开通道。
+    es.addEventListener('assembly_start', (e: MessageEvent) => {
+      try { callbacks.onAssemblyStart?.(JSON.parse(e.data)) } catch { /* */ }
+    })
+    es.addEventListener('assembly_page_html', (e: MessageEvent) => {
+      try { callbacks.onAssemblyPageHtml?.(JSON.parse(e.data)) } catch { /* */ }
+    })
+    // HTML 生成失败进度（后端 EventType 'assembly_progress'）
+    es.addEventListener('assembly_progress', (e: MessageEvent) => {
+      try { callbacks.onAssemblyProgress?.(JSON.parse(e.data)) } catch { /* */ }
+    })
+    // 配图/视频阶段进度：后端分 assembly_page_image / assembly_page_video 两个事件，
+    //   前端合并到 onAssemblyPageMedia 一个回调（二者 data 同构：{page_number, stage, message}）。
+    es.addEventListener('assembly_page_image', (e: MessageEvent) => {
+      try { callbacks.onAssemblyPageMedia?.(JSON.parse(e.data)) } catch { /* */ }
+    })
+    es.addEventListener('assembly_page_video', (e: MessageEvent) => {
+      try { callbacks.onAssemblyPageMedia?.(JSON.parse(e.data)) } catch { /* */ }
+    })
+    es.addEventListener('assembly_page_done', (e: MessageEvent) => {
+      try { callbacks.onAssemblyPageDone?.(JSON.parse(e.data)) } catch { /* */ }
+    })
+    // 装配全部完成：与 gen_done/index_done 同样是正常终止事件，收尾主动关闭且不再重连。
+    es.addEventListener('assembly_done', (e: MessageEvent) => {
+      try { callbacks.onAssemblyDone?.(JSON.parse(e.data)) } catch { /* */ }
+      isClosed = true // 正常完成，主动关闭且不再重连
+      es.close()
     })
 
     // 传输层断开（网络抖动/刷新/切页/服务端关连接）：指数退避自动重连
@@ -586,6 +646,7 @@ export async function generateCWIndexFromTopic(coursewareId: string, data: {
   page_range?: string
   extra_notes?: string
   preset?: string
+  custom_prompt_hint?: string
 }): Promise<void> {
   await apiClient.post(`/coursewares/${coursewareId}/generate-index-topic`, data)
 }
@@ -604,14 +665,17 @@ export async function createCoursewareFromPPT(
   if (title) formData.append('title', title)
   const resp = await apiClient.post('/coursewares/from-ppt', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
-    timeout: 120000, // PPT上传+解析可能较慢，2分钟超时
+    timeout: 300000, // v0.43.1: 大PPT(20MB+)上传较慢, 2分钟→5分钟超时(配合后端ReadHeaderTimeout解除上传读取上限)
   })
   return extractData(resp)
 }
 
 /** v0.42 入口B: 从PPT内容生成课件索引（异步，通过SSE推送进度） */
-export async function generateCWIndexFromPPT(coursewareId: string, preset?: string): Promise<void> {
-  await apiClient.post(`/coursewares/${coursewareId}/generate-index-ppt`, preset ? { preset } : {})
+export async function generateCWIndexFromPPT(coursewareId: string, preset?: string, customPromptHint?: string): Promise<void> {
+  const body: Record<string, string> = {}
+  if (preset) body.preset = preset
+  if (customPromptHint) body.custom_prompt_hint = customPromptHint
+  await apiClient.post(`/coursewares/${coursewareId}/generate-index-ppt`, body)
 }
 
 /** v0.42 入口C: 上传Word文档创建课件（multipart/form-data） */
@@ -628,14 +692,17 @@ export async function createCoursewareFromDoc(
   if (title) formData.append('title', title)
   const resp = await apiClient.post('/coursewares/from-doc', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
-    timeout: 60000,
+    timeout: 300000, // v0.43.1: 大Word文档上传较慢, 1分钟→5分钟超时(配合后端ReadHeaderTimeout解除上传读取上限)
   })
   return extractData(resp)
 }
 
 /** v0.42 入口C: 从Word文档生成课件索引（异步SSE） */
-export async function generateCWIndexFromDoc(coursewareId: string, preset?: string): Promise<void> {
-  await apiClient.post(`/coursewares/${coursewareId}/generate-index-doc`, preset ? { preset } : {})
+export async function generateCWIndexFromDoc(coursewareId: string, preset?: string, customPromptHint?: string): Promise<void> {
+  const body: Record<string, string> = {}
+  if (preset) body.preset = preset
+  if (customPromptHint) body.custom_prompt_hint = customPromptHint
+  await apiClient.post(`/coursewares/${coursewareId}/generate-index-doc`, body)
 }
 
 // ==================== v0.42.11 3D互动单页 ====================
@@ -716,5 +783,97 @@ export interface CoursewareLessonPlanContent {
  */
 export async function getCoursewareLessonPlanContent(coursewareId: string): Promise<CoursewareLessonPlanContent> {
   const resp = await apiClient.get(`/coursewares/${coursewareId}/lesson-plan-content`)
+  return extractData(resp)
+}
+
+
+// ==================== 阶段1：课件发布与共享 + 产权分级 ====================
+//
+// 与 status 生产状态机正交的"发布/共享维度"接口（对应后端 courseware_share_*）。
+// 四个端点：发布/撤回、设代码开放范围、共享课件库列表、复制到我的。
+
+/**
+ * 发布 / 撤回课件（设置发布态）。
+ * target 仅允许：published_personal（个人发布）/ published_shared（共享发布）/ private（撤回到私有）。
+ *   - submitted/approved/revision 等审核态由阶段3的审核接口管理，此处不可传。
+ *   - published_shared 要求课件已生成到至少 preview 状态，否则后端拒绝（不能共享半成品）。
+ * 接口：POST /api/v1/coursewares/{id}/publish   body: { target }
+ */
+export async function publishCourseware(
+  coursewareId: string,
+  target: 'published_personal' | 'published_shared' | 'private',
+): Promise<{ message: string }> {
+  const resp = await apiClient.post(`/coursewares/${coursewareId}/publish`, { target })
+  return extractData(resp)
+}
+
+/**
+ * 设置课件源代码开放范围（产权分级，独立于可见范围）。
+ * scope 仅允许：none/group/school/region/public。
+ *   可见范围决定谁能"看渲染效果"，code_share_scope 决定谁能"复制源码"，两者解耦。
+ * 接口：PUT /api/v1/coursewares/{id}/code-share-scope   body: { code_share_scope }
+ */
+export async function setCodeShareScope(
+  coursewareId: string,
+  scope: 'none' | 'group' | 'school' | 'region' | 'public',
+): Promise<{ message: string }> {
+  const resp = await apiClient.put(`/coursewares/${coursewareId}/code-share-scope`, {
+    code_share_scope: scope,
+  })
+  return extractData(resp)
+}
+
+/**
+ * 查询共享课件库（他人共享给"我"——同校/同组的课件）。
+ * admin 看全部已共享课件；其他角色按"同校∪同组作者白名单"过滤。
+ * 每条带 can_copy 标记（当前登录者能否复制该课件源码），前端据此显隐"复制到我的"按钮。
+ *
+ * 空值兜底关键：后端共享列表为空时返回 coursewares:null（非 []），
+ *   调用方务必用 `resp.coursewares || []` 兜底，避免 .map 崩。
+ * 接口：GET /api/v1/coursewares/shared?subject=&limit=&offset=
+ */
+export async function listSharedCoursewares(params?: {
+  subject?: string; limit?: number; offset?: number
+}): Promise<SharedCoursewareListResponse> {
+  const resp = await apiClient.get('/coursewares/shared', { params })
+  return extractData(resp)
+}
+
+/**
+ * 复制共享课件到我的（Fork：深拷贝主记录 + 页面 + 资产）。
+ * 前置（后端校验）：源课件须为 published_shared、当前用户对其 code_share_scope 有复制权、不能复制自己的。
+ * 副本归当前用户、private、code_share_scope=none、不挂源教案。
+ * 接口：POST /api/v1/coursewares/{id}/fork
+ */
+export async function forkCourseware(
+  coursewareId: string,
+): Promise<{ id: string; title: string; message: string }> {
+  const resp = await apiClient.post(`/coursewares/${coursewareId}/fork`, {})
+  return extractData(resp)
+}
+
+
+// ==================== 全自动一键装配 ====================
+
+/**
+ * 全自动一键装配课件（HTML生成 + AI配图 + 视频首帧占位 总装线）。
+ * 异步启动，立即返回；真实进度经 subscribeCWIndexSSE 的 assembly_* 事件推送。
+ *
+ * 交付模式（三档）由 skipVideo 区分——本函数对应后两档，纯手动档走 generateCWPages 不调此函数：
+ *   - skipVideo=false（默认）：全自动装配，HTML + 配图 + 视频首帧占位（视频按方案关键词命中页决定）
+ *   - skipVideo=true         ：HTML+配图不做视频（中间档），所有页一律跳过视频占位
+ *
+ * 前置强约束（后端 prepareAssembly 校验，未满足则经 SSE 推 error 事件并中止，前端应在调用前先自查）：
+ *   ① 已确认导航栏（nav_template_html 非空）；② 已设风格锚点（style_anchor_asset_id 非空）。
+ *
+ * 接口：POST /api/v1/coursewares/{id}/auto-assemble   body: { skip_video }
+ */
+export async function autoAssemble(coursewareId: string, skipVideo = false): Promise<{
+  message: string; courseware_id: string; skip_video: boolean
+}> {
+  const resp = await apiClient.post(
+    `/coursewares/${coursewareId}/auto-assemble`,
+    { skip_video: skipVideo },
+  )
   return extractData(resp)
 }

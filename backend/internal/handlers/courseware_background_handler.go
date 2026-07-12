@@ -272,3 +272,86 @@ func (h *CoursewareBackgroundHandler) HandleCoursewareBackground(w http.Response
 		bgWriteJSON(w, http.StatusMethodNotAllowed, -1, nil, "Method not allowed")
 	}
 }
+
+
+// ==================== 页级背景覆盖端点 ====================
+
+// HandlePageBackground 页级背景设置——GET/PUT/DELETE /api/v1/coursewares/{id}/pages/{num}/page-bg
+func (h *CoursewareBackgroundHandler) HandlePageBackground(w http.ResponseWriter, r *http.Request) {
+        claims, _ := middleware.GetClaims(r.Context())
+        if claims == nil {
+                bgWriteJSON(w, http.StatusUnauthorized, -1, nil, "未登录")
+                return
+        }
+        // 解析课件ID和页码
+        cwID, pageNum := extractPageBgPath(r.URL.Path)
+        if cwID == "" || pageNum <= 0 {
+                bgWriteJSON(w, http.StatusBadRequest, -1, nil, "无效的课件ID或页码")
+                return
+        }
+
+        switch r.Method {
+        case http.MethodGet:
+                // 查询单页背景设置
+                setting, err := h.svc.GetPageBackground(r.Context(), cwID, pageNum)
+                if err != nil {
+                        bgWriteJSON(w, http.StatusNotFound, -1, nil, "查询页级背景失败: "+err.Error())
+                        return
+                }
+                bgWriteJSON(w, http.StatusOK, 0, setting, "")
+
+        case http.MethodPut:
+                // 设置页级背景
+                var req PageBgRequest
+                if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+                        bgWriteJSON(w, http.StatusBadRequest, -1, nil, "请求体解析失败")
+                        return
+                }
+                result, err := h.svc.SetPageBackground(r.Context(), cwID, claims.UserID, pageNum, req.URL, req.Opacity, req.Mode)
+                if err != nil {
+                        bgWriteErr(w, err)
+                        return
+                }
+                bgWriteJSON(w, http.StatusOK, 0, result, "页级背景已设置")
+
+        case http.MethodDelete:
+                // 清除页级背景（回退到跟随课件级）
+                result, err := h.svc.ClearPageBackground(r.Context(), cwID, claims.UserID, pageNum)
+                if err != nil {
+                        bgWriteErr(w, err)
+                        return
+                }
+                bgWriteJSON(w, http.StatusOK, 0, result, "页级背景已清除")
+
+        default:
+                bgWriteJSON(w, http.StatusMethodNotAllowed, -1, nil, "Method not allowed")
+        }
+}
+
+// PageBgRequest 页级背景设置请求
+type PageBgRequest struct {
+        URL     string   `json:"url"`     // 页级背景图URL（空=仅改蒙版模式不换图）
+        Opacity *float64 `json:"opacity"` // 蒙版透明度 0.0~1.0（null=跟随默认）
+        Mode    string   `json:"mode"`    // default/custom/none
+}
+
+// extractPageBgPath 从 /api/v1/coursewares/{cwID}/pages/{num}/page-bg 提取课件ID和页码
+func extractPageBgPath(path string) (string, int) {
+        // 格式: /api/v1/coursewares/{cwID}/pages/{num}/page-bg
+        p := strings.TrimPrefix(path, "/api/v1/coursewares/")
+        // p = "{cwID}/pages/{num}/page-bg"
+        parts := strings.Split(p, "/")
+        if len(parts) < 4 || parts[1] != "pages" {
+                return "", 0
+        }
+        cwID := parts[0]
+        pageNum := 0
+        for _, c := range parts[2] {
+                if c >= '0' && c <= '9' {
+                        pageNum = pageNum*10 + int(c-'0')
+                } else {
+                        return "", 0
+                }
+        }
+        return cwID, pageNum
+}

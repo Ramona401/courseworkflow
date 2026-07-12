@@ -1,8 +1,17 @@
 /**
- * 课件方案编辑器 — IndexEditor.tsx v2.0 (Phase 3.5)
+ * 课件方案编辑器 — IndexEditor.tsx v3.0
+ *
+ * 本次改造（内容丰富度 + 降认知负担）：
+ *   1. 把不直观的「复杂度 (1-5) 数字框」改为「内容丰富度」三档大按钮：
+ *      🌱 精简 / 📖 适中 / 🎯 充实，并配一句引导文案。
+ *      底层仍写 estimated_complexity（精简=2 / 适中=3 / 充实=5），后端无感、无需改接口。
+ *   2. 把专业字段「交互类型 / 视觉形式」折叠进「⚙ 高级（可不改）」区，默认收起，
+ *      老师不展开就用 AI 给的默认值，减少困惑。
+ *   3. 内容概要文本框上方加引导："写得越详细，AI 越会逐点展开。"
+ *   4. 卡片展示态：突出「内容丰富度」人话标签，其余技术维度弱化为一行小灰字。
  *
  * 两层架构展示：
- *   - 普通用户：看到翻译后的方案（知识目标、能力目标、互动设计、回收方式等）
+ *   - 普通用户：看到翻译后的方案（目的、概要、内容丰富度等人话信息）
  *   - admin：额外可展开查看层1 AOCI技术索引原文
  *
  * 卡片列表展示+编辑+增删+排序
@@ -22,13 +31,30 @@ const C = {
   white: '#fff',
 }
 
-// ==================== 复杂度颜色映射 ====================
-const COMPLEXITY_COLORS: Record<number, { color: string; bg: string; label: string }> = {
-  1: { color: '#059669', bg: '#D1FAE5', label: '简单' },
-  2: { color: '#0891B2', bg: '#CFFAFE', label: '较简单' },
-  3: { color: '#D97706', bg: '#FEF3C7', label: '中等' },
-  4: { color: '#DC2626', bg: '#FEE2E2', label: '较复杂' },
-  5: { color: '#7C3AED', bg: '#EDE9FE', label: '复杂' },
+// ==================== 内容丰富度三档（老师可见的人话） ====================
+// value 即落库的 estimated_complexity：精简=2 / 适中=3 / 充实=5。
+// 这三个值落在后端合法范围(1-5)内，且与后端 appendRichnessGuidance 的归档逻辑对齐
+// （>=4=充实页，==3=适中页，<=2=精简页）。
+interface RichnessOption {
+  value: number
+  emoji: string
+  label: string
+  desc: string
+  color: string
+  bg: string
+}
+const RICHNESS_OPTIONS: RichnessOption[] = [
+  { value: 2, emoji: '🌱', label: '精简', desc: '要点为主，简洁留白', color: '#059669', bg: '#D1FAE5' },
+  { value: 3, emoji: '📖', label: '适中', desc: '标准图文讲解', color: '#0891B2', bg: '#CFFAFE' },
+  { value: 5, emoji: '🎯', label: '充实', desc: '详尽展开，多举例', color: '#DC2626', bg: '#FEE2E2' },
+]
+
+// 把任意 estimated_complexity(1-5) 归并到最近的三档之一，用于展示与高亮选中态。
+// 规则与后端 appendRichnessGuidance 一致：>=4→充实, ==3→适中, <=2→精简。
+function richnessOf(complexity: number): RichnessOption {
+  if (complexity >= 4) return RICHNESS_OPTIONS[2] // 充实
+  if (complexity === 3) return RICHNESS_OPTIONS[1] // 适中
+  return RICHNESS_OPTIONS[0] // 精简（含 1、2 及异常值兜底）
 }
 
 // ==================== Props ====================
@@ -47,6 +73,7 @@ export default function IndexEditor({ coursewareId, pages, onPagesChange, loadin
   const [saving, setSaving] = useState(false)
   const [addingPage, setAddingPage] = useState(false)
   const [expandedIndex, setExpandedIndex] = useState<Set<number>>(new Set()) // admin展开索引的页码集合
+  const [showAdvanced, setShowAdvanced] = useState(false) // 编辑态：是否展开「高级（交互/视觉）」区
 
   // ==================== admin展开/折叠层1索引 ====================
   const toggleIndexExpand = (pageNum: number) => {
@@ -60,6 +87,7 @@ export default function IndexEditor({ coursewareId, pages, onPagesChange, loadin
   // ==================== 开始编辑 ====================
   const startEdit = (page: CoursewarePage) => {
     setEditingPage(page.page_number)
+    setShowAdvanced(false) // 每次进入编辑默认收起高级区
     setEditForm({
       title: page.title,
       purpose: page.purpose,
@@ -83,7 +111,7 @@ export default function IndexEditor({ coursewareId, pages, onPagesChange, loadin
         interaction_type: String(editForm.interaction_type || ''),
         visual_format: String(editForm.visual_format || ''),
         media_requirements: String(editForm.media_requirements || ''),
-        estimated_complexity: Number(editForm.estimated_complexity) || 1,
+        estimated_complexity: Number(editForm.estimated_complexity) || 3,
       })
       const updated = pages.map(p => p.page_number === editingPage ? {
         ...p,
@@ -93,7 +121,7 @@ export default function IndexEditor({ coursewareId, pages, onPagesChange, loadin
         interaction_type: String(editForm.interaction_type || ''),
         visual_format: String(editForm.visual_format || ''),
         media_requirements: String(editForm.media_requirements || ''),
-        estimated_complexity: Number(editForm.estimated_complexity) || 1,
+        estimated_complexity: Number(editForm.estimated_complexity) || 3,
       } : p)
       onPagesChange(updated)
       setEditingPage(null)
@@ -175,7 +203,7 @@ export default function IndexEditor({ coursewareId, pages, onPagesChange, loadin
       <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
         {pages.map((page, idx) => {
           const isEditing = editingPage === page.page_number
-          const cc = COMPLEXITY_COLORS[page.estimated_complexity] || COMPLEXITY_COLORS[1]
+          const rich = richnessOf(page.estimated_complexity) // 内容丰富度（人话标签）
           const it = CW_INTERACTION_TYPES[page.interaction_type] || { label: page.interaction_type, emoji: '📄' }
           const vf = CW_VISUAL_FORMATS[page.visual_format] || { label: page.visual_format, emoji: '📝' }
           const cg = CW_COGNITIVE_LEVELS[page.idx_cognitive_level] || null
@@ -234,42 +262,81 @@ export default function IndexEditor({ coursewareId, pages, onPagesChange, loadin
 
               {/* 卡片内容 */}
               {isEditing ? (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '13px' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '13px' }}>
+                  {/* 教学目的 */}
                   <label style={{ color: C.textSecondary }}>教学目的
                     <textarea value={String(editForm.purpose || '')} onChange={e => setEditForm({ ...editForm, purpose: e.target.value })} rows={2}
                       style={{ width: '100%', border: `1px solid ${C.border}`, borderRadius: '6px', padding: '6px 8px', resize: 'vertical', marginTop: '4px' }} />
                   </label>
+
+                  {/* 内容概要（加引导文案） */}
                   <label style={{ color: C.textSecondary }}>内容概要
-                    <textarea value={String(editForm.content_summary || '')} onChange={e => setEditForm({ ...editForm, content_summary: e.target.value })} rows={3}
+                    <span style={{ color: C.textMuted, fontSize: '12px', marginLeft: '6px' }}>（写得越详细，AI 越会逐点展开这一页）</span>
+                    <textarea value={String(editForm.content_summary || '')} onChange={e => setEditForm({ ...editForm, content_summary: e.target.value })} rows={4}
                       style={{ width: '100%', border: `1px solid ${C.border}`, borderRadius: '6px', padding: '6px 8px', resize: 'vertical', marginTop: '4px' }} />
                   </label>
-                  <div style={{ display: 'flex', gap: '12px' }}>
-                    <label style={{ flex: 1, color: C.textSecondary }}>交互类型
-                      <select value={String(editForm.interaction_type || 'static')} onChange={e => setEditForm({ ...editForm, interaction_type: e.target.value })}
-                        style={{ width: '100%', border: `1px solid ${C.border}`, borderRadius: '6px', padding: '6px 8px', marginTop: '4px' }}>
-                        {Object.entries(CW_INTERACTION_TYPES).map(([k, v]) => (
-                          <option key={k} value={k}>{v.emoji} {v.label}</option>
-                        ))}
-                      </select>
-                    </label>
-                    <label style={{ flex: 1, color: C.textSecondary }}>视觉形式
-                      <select value={String(editForm.visual_format || 'text_heavy')} onChange={e => setEditForm({ ...editForm, visual_format: e.target.value })}
-                        style={{ width: '100%', border: `1px solid ${C.border}`, borderRadius: '6px', padding: '6px 8px', marginTop: '4px' }}>
-                        {Object.entries(CW_VISUAL_FORMATS).map(([k, v]) => (
-                          <option key={k} value={k}>{v.emoji} {v.label}</option>
-                        ))}
-                      </select>
-                    </label>
-                    <label style={{ flex: 1, color: C.textSecondary }}>复杂度 (1-5)
-                      <input type="number" min={1} max={5} value={Number(editForm.estimated_complexity) || 1}
-                        onChange={e => setEditForm({ ...editForm, estimated_complexity: parseInt(e.target.value) || 1 })}
-                        style={{ width: '100%', border: `1px solid ${C.border}`, borderRadius: '6px', padding: '6px 8px', marginTop: '4px' }} />
-                    </label>
+
+                  {/* 内容丰富度（三档大按钮，取代复杂度数字框） */}
+                  <div>
+                    <div style={{ color: C.textSecondary, marginBottom: '6px' }}>
+                      内容丰富度
+                      <span style={{ color: C.textMuted, fontSize: '12px', marginLeft: '6px' }}>（想让这一页内容更多、举例更丰富，就选「充实」）</span>
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      {RICHNESS_OPTIONS.map(opt => {
+                        const selected = richnessOf(Number(editForm.estimated_complexity) || 3).value === opt.value
+                        return (
+                          <button key={opt.value} type="button"
+                            onClick={() => setEditForm({ ...editForm, estimated_complexity: opt.value })}
+                            style={{
+                              flex: 1, padding: '10px 8px', borderRadius: '10px', cursor: 'pointer',
+                              border: `2px solid ${selected ? opt.color : C.border}`,
+                              background: selected ? opt.bg : C.white,
+                              display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px',
+                              transition: 'all 0.15s',
+                            }}>
+                            <span style={{ fontSize: '20px' }}>{opt.emoji}</span>
+                            <span style={{ fontSize: '13px', fontWeight: 700, color: selected ? opt.color : C.textPrimary }}>{opt.label}</span>
+                            <span style={{ fontSize: '11px', color: selected ? opt.color : C.textMuted, textAlign: 'center', lineHeight: '1.3' }}>{opt.desc}</span>
+                          </button>
+                        )
+                      })}
+                    </div>
                   </div>
-                  <label style={{ color: C.textSecondary }}>多媒体需求
-                    <input value={String(editForm.media_requirements || '')} onChange={e => setEditForm({ ...editForm, media_requirements: e.target.value })}
-                      style={{ width: '100%', border: `1px solid ${C.border}`, borderRadius: '6px', padding: '6px 8px', marginTop: '4px' }} />
-                  </label>
+
+                  {/* 高级（可不改）：交互类型 / 视觉形式 / 多媒体需求，默认折叠 */}
+                  <div style={{ marginTop: '2px' }}>
+                    <button type="button" onClick={() => setShowAdvanced(v => !v)}
+                      style={{ background: 'transparent', border: 'none', color: C.textMuted, fontSize: '12px', cursor: 'pointer', padding: '4px 0' }}>
+                      {showAdvanced ? '▼' : '▶'} ⚙ 高级选项（可不改，不确定就保持默认）
+                    </button>
+                    {showAdvanced && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '6px', padding: '12px', borderRadius: '8px', background: '#F9FAFB', border: `1px solid ${C.border}` }}>
+                        <div style={{ display: 'flex', gap: '12px' }}>
+                          <label style={{ flex: 1, color: C.textSecondary }}>交互类型
+                            <select value={String(editForm.interaction_type || 'static')} onChange={e => setEditForm({ ...editForm, interaction_type: e.target.value })}
+                              style={{ width: '100%', border: `1px solid ${C.border}`, borderRadius: '6px', padding: '6px 8px', marginTop: '4px' }}>
+                              {Object.entries(CW_INTERACTION_TYPES).map(([k, v]) => (
+                                <option key={k} value={k}>{v.emoji} {v.label}</option>
+                              ))}
+                            </select>
+                          </label>
+                          <label style={{ flex: 1, color: C.textSecondary }}>视觉形式
+                            <select value={String(editForm.visual_format || 'text_heavy')} onChange={e => setEditForm({ ...editForm, visual_format: e.target.value })}
+                              style={{ width: '100%', border: `1px solid ${C.border}`, borderRadius: '6px', padding: '6px 8px', marginTop: '4px' }}>
+                              {Object.entries(CW_VISUAL_FORMATS).map(([k, v]) => (
+                                <option key={k} value={k}>{v.emoji} {v.label}</option>
+                              ))}
+                            </select>
+                          </label>
+                        </div>
+                        <label style={{ color: C.textSecondary }}>多媒体需求
+                          <input value={String(editForm.media_requirements || '')} onChange={e => setEditForm({ ...editForm, media_requirements: e.target.value })}
+                            style={{ width: '100%', border: `1px solid ${C.border}`, borderRadius: '6px', padding: '6px 8px', marginTop: '4px' }} />
+                        </label>
+                      </div>
+                    )}
+                  </div>
                 </div>
               ) : (
                 <div>
@@ -284,25 +351,24 @@ export default function IndexEditor({ coursewareId, pages, onPagesChange, loadin
                       <strong>概要：</strong>{page.content_summary}
                     </div>
                   )}
-                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                    <span style={{ padding: '2px 8px', borderRadius: '10px', fontSize: '12px', background: '#DBEAFE', color: '#2563EB' }}>
-                      {it.emoji} {it.label}
+
+                  {/* 突出展示：内容丰富度（人话标签，老师最该关注的一项） */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
+                    <span style={{
+                      padding: '3px 12px', borderRadius: '10px', fontSize: '12px', fontWeight: 700,
+                      background: rich.bg, color: rich.color,
+                    }}>
+                      {rich.emoji} 内容{rich.label}
                     </span>
-                    <span style={{ padding: '2px 8px', borderRadius: '10px', fontSize: '12px', background: '#EDE9FE', color: '#7C3AED' }}>
-                      {vf.emoji} {vf.label}
-                    </span>
-                    <span style={{ padding: '2px 8px', borderRadius: '10px', fontSize: '12px', background: cc.bg, color: cc.color }}>
-                      ⚡ {cc.label}
-                    </span>
-                    {cg && (
-                      <span style={{ padding: '2px 8px', borderRadius: '10px', fontSize: '12px', background: cg.bg, color: cg.color }}>
-                        🧠 {cg.label}
-                      </span>
-                    )}
+                  </div>
+
+                  {/* 弱化展示：技术维度收成一行小灰字（交互/视觉/认知/多媒体） */}
+                  <div style={{ fontSize: '12px', color: C.textMuted, display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+                    <span>{it.emoji} {it.label}</span>
+                    <span>{vf.emoji} {vf.label}</span>
+                    {cg && <span>🧠 {cg.label}</span>}
                     {page.media_requirements && (
-                      <span style={{ padding: '2px 8px', borderRadius: '10px', fontSize: '12px', background: '#FEF3C7', color: '#D97706' }}>
-                        🖼️ {page.media_requirements.length > 20 ? page.media_requirements.slice(0, 20) + '...' : page.media_requirements}
-                      </span>
+                      <span>🖼️ {page.media_requirements.length > 16 ? page.media_requirements.slice(0, 16) + '...' : page.media_requirements}</span>
                     )}
                   </div>
 

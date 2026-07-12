@@ -1,47 +1,42 @@
 package services
 
-// course_outline_match.go — 课程大纲与教案的「学段范围相交」匹配（备课注入用）
+// course_outline_match.go — 课程大纲与教案的「学段范围相交 + 教材版本」匹配（备课注入用）
 //
-// ============================== 背景与本次改版原因 ==============================
+// ============================== 背景与演进 ==============================
 //
 // 教案 lesson_plans 只有 subject + grade。历史上 grade 存的是"小学低段/小学中段/七年级"
 // 这类学段或单年级写法；大纲 course_outlines 的 grade 则可能是"一年级/六年级/小学一至六年级"
 // 等任意写法。
 //
-// 旧逻辑（v1）用"大纲集合 ⊇ 教案集合"（spanCovers）判定命中，并且只取最贴合的一份。
-// 这在真实数据上大面积失败：
-//   - 语文大纲是"按单个年级分册"录入的（一年级…六年级，每年级一份），grade 是单点集合，
-//     例如"六年级" → {6}；
-//   - 而语文教案的 grade 是学段写法，例如"小学中段" → {3,4}；
-//   - "大纲 ⊇ 教案" 要求 {6} ⊇ {3,4}，永远不成立 → 大纲从不注入。
-//   （人工智能学科恰好用"小学一至六年级"这种宽集合大纲，才偶然能覆盖教案单点而注入成功，
-//    掩盖了这个 bug。）
+// v1（已废弃）：用"大纲集合 ⊇ 教案集合"（spanCovers）判定命中，且只取最贴合一份。
+//   在真实数据上大面积失败：语文大纲按单年级分册录入（grade={6}），而教案是学段写法
+//   （grade={3,4}），"大纲 ⊇ 教案"永不成立 → 大纲从不注入。
 //
-// 本次改版（Yuhan 决策）：
-//   1) 判定从"超集覆盖"改为「年级集合相交即命中」——只要大纲覆盖的年级与教案覆盖的年级
-//      有任一交集，就算命中。这样：
-//        · 新教案"一年级"{1} 与大纲"一年级"{1} 相交 → 命中；
-//        · 老教案"小学低段"{1,2} 与大纲"一年级"{1}、"二年级"{2} 都相交 → 都命中；
-//        · 教案"七年级"{7} 与任何小学语文大纲都不相交 → 不注入（正确）。
-//   2) 存量学段教案（"小学低段/中段/高段"）会同时相交到多个年级的大纲，按 Yuhan 决策
-//      「多份全注入」——返回所有相交命中的大纲并全部拼进上下文（含同年级上下册）。
-//      代价是 token 偏多，但保证学段写法的老教案也能吃到对应年级的整册大纲。
+// v2（学段相交·多份全注入，Yuhan 决策）：
+//   判定改为「年级集合相交即命中」，并把所有相交命中的大纲全部注入。
 //
-// 文案升级（2026-06-22，硬指令）：线上实测发现大纲已成功注入 system prompt，但 AI 仍
-//   按 training data 里的旧版教材记忆作答，还反复声称"读不到您上传的资料/附件"。根因是
-//   旧注入文案太软（"供你把握…不要整段复述"），没让 AI 认领并优先采信这份大纲。因此把
-//   BuildCourseOutlinesContext 的文案从"软背景"升级为"硬指令"，明确告知 AI：这就是它
-//   已拥有的、权威的、最新版大纲，也正是老师口中的"备课资料"，必须优先据此回答篇目/单元/
-//   课时等事实，绝不能说读不到、也不能用旧记忆硬猜。匹配逻辑未动，仅改注入文案。
+// v3（教材版本，本次 Yuhan 决策）：一标多本，同学科同年级同册次可能有人教版/北师大版/
+//   统编版等多套大纲。改为「老师在备课首屏显式选定教材版本」，注入时按版本精确过滤：
+//     · 严格只注入 publisher == 选定版本 的大纲；
+//     · 绝不做任何跨版本兜底（不拿人教版兜底、也不拿通用版兜底）——不同版本教材单元结构、
+//       篇目、课时完全不同，跨版本注入是「错的资料」，比不注入更糟。对不上就不注入。
+//     · "通用/不限版本"本身是一个独立的版本值（publisher 空串）；老师选"通用"时，
+//       也只注入 publisher 为空串的大纲，不与任何具名版本互相兜底。
+//   版本选择落点：备课首屏的教材版本选择器（见 ListAvailablePublishers）。没选版本=不注入。
+//
+// 文案（硬指令）：BuildCourseOutlinesContext 明确告知 AI 这份大纲已注入、是权威最新版、
+//   也正是老师口中的"备课资料"，必须优先据此回答篇目/单元/课时等事实，绝不能说"读不到资料"
+//   或用旧记忆硬猜。
 //
 // ============================== 兼容性说明 ==============================
 //
-//   - 旧函数 MatchBestOutline / BuildCourseOutlineContext 的签名完全保留，内部转调新逻辑，
-//     供 unit_plan_service.go 等旧调用方继续使用（取相交命中里"最贴合"的一份，行为安全）。
-//   - 新增 MatchOutlines（复数，返回全部相交命中）+ BuildCourseOutlinesContext（复数，
-//     把多份大纲拼成一个上下文块），供备课工坊 analyze/design 注入「多份全注入」。
+//   - MatchBestOutline / BuildCourseOutlineContext（单份，旧签名）保留，供 unit_plan_service.go
+//     等旧调用方使用（取相交命中里"最贴合"的一份，不涉及版本，行为安全）。
+//   - MatchOutlines（复数，仅学段相交、不过滤版本）保留：供 ListAvailablePublishers 汇总
+//     "该学科年级有哪些版本"，以及任何只需学段相交的场景。
+//   - 新增 MatchOutlinesByPublisher（学段相交 + 版本精确过滤）：供备课工坊注入按选定版本取大纲。
 //
-// 原则（Yuhan 决策）：宁缺不错——一份都没相交就不注入，这是正常状态不是缺陷。
+// 原则（Yuhan 决策）：宁缺不错——一份都没相交、或选定版本下无大纲，就不注入，这是正常状态。
 
 import (
 	"strings"
@@ -150,7 +145,7 @@ func normalizeGradeToSpan(raw string) gradeSpan {
 
 // spansIntersect 两个年级集合是否有交集（任一相同年级即相交）
 //
-// 这是本次改版的核心判据，取代旧的 spanCovers（超集覆盖）。
+// 这是核心判据，取代旧的 spanCovers（超集覆盖）。
 // 任一集合为空都视为不相交（教案没年级或大纲没年级，无从匹配）。
 func spansIntersect(a, b gradeSpan) bool {
 	if len(a) == 0 || len(b) == 0 {
@@ -184,17 +179,18 @@ func intersectionSize(a, b gradeSpan) int {
 	return cnt
 }
 
-// ==================== 新逻辑：多份相交命中（备课工坊 analyze/design 用） ====================
+// ==================== 学段相交（不过滤版本）：版本汇总 / 通用场景用 ====================
 
-// MatchOutlines 从同学科候选里挑出「年级集合与教案相交」的全部大纲
+// MatchOutlines 从同学科候选里挑出「年级集合与教案相交」的全部大纲（不过滤版本）
 //
-// 用于备课工坊 analyze/design 阶段的「多份全注入」（Yuhan 决策）：
-//   - 教案"一年级"{1}：通常只相交到"一年级"上下册（如有两册则两份都命中）；
-//   - 教案"小学低段"{1,2}：相交到一年级、二年级的所有册次大纲，全部返回；
-//   - 一份都没相交 → 返回空切片（注入层据此静默跳过，正常单课备课）。
+// 用途：
+//   - ListAvailablePublishers 汇总"该学科该年级到底有哪些版本的大纲"（需要看到所有版本）；
+//   - 任何只需学段相交、不区分版本的旧场景。
+//
+// 备课工坊的实际注入请用 MatchOutlinesByPublisher（带版本精确过滤）。
 //
 // candidates 由 repository.ListActiveOutlinesBySubject 提供，已按 updated_at 倒序，
-// 本函数保持该相对顺序返回（注入时较新的大纲排在前面）。
+// 本函数保持该相对顺序返回。
 func MatchOutlines(planGradeRaw string, candidates []*models.CourseOutline) []*models.CourseOutline {
 	planSpan := normalizeGradeToSpan(planGradeRaw)
 	if len(planSpan) == 0 {
@@ -202,6 +198,37 @@ func MatchOutlines(planGradeRaw string, candidates []*models.CourseOutline) []*m
 	}
 	var hits []*models.CourseOutline
 	for _, c := range candidates {
+		outlineSpan := normalizeGradeToSpan(c.Grade)
+		if spansIntersect(outlineSpan, planSpan) {
+			hits = append(hits, c)
+		}
+	}
+	return hits
+}
+
+// ==================== 学段相交 + 教材版本精确过滤（备课工坊注入用） ====================
+
+// MatchOutlinesByPublisher 在「学段相交」基础上，严格只保留 publisher == selectedPublisher 的大纲
+//
+// 这是备课工坊注入的正式匹配函数（Yuhan 决策）：
+//   - selectedPublisher 是老师在备课首屏显式选定的教材版本（空串=老师选了"通用/不限版本"）；
+//   - 严格精确匹配 publisher，绝不跨版本兜底：选"人教版"只回人教版，选"通用"(空串)只回空串版本；
+//   - 没有相交大纲、或相交大纲里没有该版本 → 返回空切片（注入层据此不注入，提示联系管理员上传）。
+//
+// 注意与"老师没选版本"的区别：没选版本不应调用本函数（注入层直接跳过）；本函数被调用即表示
+// 老师已明确选定某版本（含显式选"通用"），故空串也是一个有效、需精确匹配的版本值。
+func MatchOutlinesByPublisher(planGradeRaw, selectedPublisher string, candidates []*models.CourseOutline) []*models.CourseOutline {
+	planSpan := normalizeGradeToSpan(planGradeRaw)
+	if len(planSpan) == 0 {
+		return nil
+	}
+	want := strings.TrimSpace(selectedPublisher)
+	var hits []*models.CourseOutline
+	for _, c := range candidates {
+		// 版本精确过滤（零跨版本兜底）
+		if strings.TrimSpace(c.Publisher) != want {
+			continue
+		}
 		outlineSpan := normalizeGradeToSpan(c.Grade)
 		if spansIntersect(outlineSpan, planSpan) {
 			hits = append(hits, c)
@@ -253,9 +280,8 @@ func BuildCourseOutlinesContext(outlines []*models.CourseOutline) string {
 
 // MatchBestOutline 从同学科候选里挑「与教案年级相交且最贴合」的一份；无相交 → nil
 //
-// 兼容保留：供 unit_plan_service.go 等只需要单份大纲的旧调用方使用。
-// 判据已随本次改版从"超集覆盖"切换为"相交命中"，并在相交命中中取「交集最大、
-// 大纲范围最窄」者为最贴合（既贴合教案年级、又尽量是聚焦的整册大纲而非超宽大纲）。
+// 兼容保留：供 unit_plan_service.go 等只需要单份大纲的旧调用方使用（不涉及版本过滤）。
+// 在相交命中中取「交集最大、大纲范围最窄」者为最贴合。
 func MatchBestOutline(planGradeRaw string, candidates []*models.CourseOutline) *models.CourseOutline {
 	planSpan := normalizeGradeToSpan(planGradeRaw)
 	if len(planSpan) == 0 {

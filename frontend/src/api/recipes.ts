@@ -5,6 +5,9 @@
  * 迭代2：流程预设+校验
  * 迭代4B-2：画像感知智能推荐
  * 迭代5：自定义阶段CRUD
+ * BugFix（自定义阶段提示词无法保存）：
+ *   CustomStageResponse 补 system_prompt / prompt_variants / output_format 三个全文字段，
+ *   与后端同步返回，供 StepWorkflow 编辑弹窗正确回填，避免空串覆盖已存提示词。
  */
 import apiClient from './client'
 
@@ -180,7 +183,13 @@ export interface UpdateCustomStageRequest {
   skippable?: boolean
 }
 
-/** 自定义阶段响应 */
+/**
+ * 自定义阶段响应
+ * BugFix（自定义阶段提示词无法保存）：
+ *   补 system_prompt / prompt_variants / output_format 三个全文字段（后端已同步返回），
+ *   供 StepWorkflow.openEditStageModal 用真实值回填编辑弹窗，
+ *   避免此前以空串回填、保存时空串覆盖数据库已存提示词。
+ */
 export interface CustomStageResponse {
   stage_code: string
   stage_name: string
@@ -188,6 +197,9 @@ export interface CustomStageResponse {
   gate_mode: string
   skippable: boolean
   has_prompt: boolean
+  system_prompt?: string    // BugFix：系统提示词全文（供编辑回填）
+  prompt_variants?: string  // BugFix：对话策略变体 JSON 全文（供编辑回填）
+  output_format?: string    // BugFix：产出物格式 JSON 全文（供编辑回填）
 }
 
 // ==================== 配方 CRUD ====================

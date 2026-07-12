@@ -13,58 +13,60 @@ import (
 // v58新增：CurrentStage + StageConfig 阶段化备课工坊
 // v127新增：ReviewLevel + ReviewSchoolID 多级审核支持
 type LessonPlan struct {
-	ID                string     `json:"id"`                  // UUID主键
-	Title             string     `json:"title"`               // 教案标题
-	Subject           string     `json:"subject"`             // 学科
-	Grade             string     `json:"grade"`               // 年级
-	Topic             string     `json:"topic"`               // 课题
-	DurationMinutes   int        `json:"duration_minutes"`    // 课时时长（分钟）
-	ContentMarkdown   string     `json:"content_markdown"`    // Markdown格式教案正文
-	ContentStructured string     `json:"content_structured"`  // 结构化内容JSON
-	GenerationConfig  string     `json:"generation_config"`   // 生成配置JSON
-	MatchedComponents string     `json:"matched_components"`  // 匹配注入的组件ID列表JSON
-	ConversationLog   string     `json:"conversation_log"`    // AI对话记录JSON
-	AIReviewScore     *float64   `json:"ai_review_score"`     // AI评审总分
-	AIReviewResult    string     `json:"ai_review_result"`    // AI评审详细结果JSON
-	AIReviewHistory   string     `json:"ai_review_history"`   // 评审历史JSON
-	Status            string     `json:"status"`              // 教案状态
-	Visibility        string     `json:"visibility"`          // 可见范围
-	AuthorID          string     `json:"author_id"`           // 作者用户ID
-	GroupID           *string    `json:"group_id"`            // 所属教研组ID
-	SchoolID          *string    `json:"school_id"`           // 所属学校ID
-	ForkedFrom        *string    `json:"forked_from"`         // fork来源教案ID
-	ForkCount         int        `json:"fork_count"`          // 被fork次数
-	TemplateID        *string    `json:"template_id"`         // 使用的提示词模板ID
-	RecipeID          *string    `json:"recipe_id"`           // Phase 7A：使用的备课配方ID
-	UnitPlanID        *string    `json:"unit_plan_id"`        // 大单元备课：挂载的单元方案ID（nil=未挂载，挂载后五阶段注入并让大纲让位）
-	ViewCount         int        `json:"view_count"`          // 浏览次数
-	UseCount          int        `json:"use_count"`           // 使用次数
-	Version           int        `json:"version"`             // 版本号
-	CurrentStage      string     `json:"current_stage"`       // Phase 7B：当前所在阶段代码（空=未开始/旧模式）
-	StageConfig       string     `json:"stage_config"`        // Phase 7B：阶段配置快照JSON
-	TextbookPageIDs   string     `json:"textbook_page_ids"`   // 迭代7B：关联的课本图片ID数组JSON
-	LessonIndex          string     `json:"lesson_index"`           // v86新增：AOCI索引文本（编码行+语义标签行）
-	IdxCognitiveLevel    int        `json:"idx_cognitive_level"`    // v86新增：认知层级冗余列（1-6）
-	IdxPedagogyIntensity int        `json:"idx_pedagogy_intensity"` // v86新增：教法强度冗余列（1-3）
-	IdxStructureType     int        `json:"idx_structure_type"`     // v86新增：结构类型冗余列（1-5）
-	IdxQualityLevel      int        `json:"idx_quality_level"`      // v86新增：质量等级冗余列（1-5）
-	ReviewLevel       int        `json:"review_level"`        // v127新增：当前审核级别（0=未提交, 1=L1, 2=L2, 3=L3）
-	ReviewSchoolID    *string    `json:"review_school_id"`    // v127新增：审核关联的学校ID
-	CreatedAt         *time.Time `json:"created_at"`          // 创建时间
-	UpdatedAt         *time.Time `json:"updated_at"`          // 更新时间
+	ID                     string     `json:"id"`                       // UUID主键
+	Title                  string     `json:"title"`                    // 教案标题
+	Subject                string     `json:"subject"`                  // 学科
+	Grade                  string     `json:"grade"`                    // 年级
+	Topic                  string     `json:"topic"`                    // 课题
+	DurationMinutes        int        `json:"duration_minutes"`         // 课时时长（分钟）
+	ContentMarkdown        string     `json:"content_markdown"`         // Markdown格式教案正文
+	ContentStructured      string     `json:"content_structured"`       // 结构化内容JSON
+	GenerationConfig       string     `json:"generation_config"`        // 生成配置JSON
+	MatchedComponents      string     `json:"matched_components"`       // 匹配注入的组件ID列表JSON
+	ConversationLog        string     `json:"conversation_log"`         // AI对话记录JSON
+	AIReviewScore          *float64   `json:"ai_review_score"`          // AI评审总分
+	AIReviewResult         string     `json:"ai_review_result"`         // AI评审详细结果JSON
+	AIReviewHistory        string     `json:"ai_review_history"`        // 评审历史JSON
+	Status                 string     `json:"status"`                   // 教案状态
+	Visibility             string     `json:"visibility"`               // 可见范围
+	AuthorID               string     `json:"author_id"`                // 作者用户ID
+	GroupID                *string    `json:"group_id"`                 // 所属教研组ID
+	SchoolID               *string    `json:"school_id"`                // 所属学校ID
+	ForkedFrom             *string    `json:"forked_from"`              // fork来源教案ID
+	ForkCount              int        `json:"fork_count"`               // 被fork次数
+	TemplateID             *string    `json:"template_id"`              // 使用的提示词模板ID
+	RecipeID               *string    `json:"recipe_id"`                // Phase 7A：使用的备课配方ID
+	UnitPlanID             *string    `json:"unit_plan_id"`             // 大单元备课：挂载的单元方案ID（nil=未挂载，挂载后五阶段注入并让大纲让位）
+	ClassProfileID         *string    `json:"class_profile_id"`         // 班级学情：挂载的班级学情卡ID（nil=未挂载，挂载后 analyze/design/write 三阶段注入四大段群体学情；与单元方案维度正交、独立不让位）
+	CourseOutlinePublisher *string    `json:"course_outline_publisher"` // 教材版本增强：备课首屏选定的课程大纲教材版本（nil=未关联大纲不注入；空串=通用版；具名=该版本精确注入零兜底）
+	ViewCount              int        `json:"view_count"`               // 浏览次数
+	UseCount               int        `json:"use_count"`                // 使用次数
+	Version                int        `json:"version"`                  // 版本号
+	CurrentStage           string     `json:"current_stage"`            // Phase 7B：当前所在阶段代码（空=未开始/旧模式）
+	StageConfig            string     `json:"stage_config"`             // Phase 7B：阶段配置快照JSON
+	TextbookPageIDs        string     `json:"textbook_page_ids"`        // 迭代7B：关联的课本图片ID数组JSON
+	LessonIndex            string     `json:"lesson_index"`             // v86新增：AOCI索引文本（编码行+语义标签行）
+	IdxCognitiveLevel      int        `json:"idx_cognitive_level"`      // v86新增：认知层级冗余列（1-6）
+	IdxPedagogyIntensity   int        `json:"idx_pedagogy_intensity"`   // v86新增：教法强度冗余列（1-3）
+	IdxStructureType       int        `json:"idx_structure_type"`       // v86新增：结构类型冗余列（1-5）
+	IdxQualityLevel        int        `json:"idx_quality_level"`        // v86新增：质量等级冗余列（1-5）
+	ReviewLevel            int        `json:"review_level"`             // v127新增：当前审核级别（0=未提交, 1=L1, 2=L2, 3=L3）
+	ReviewSchoolID         *string    `json:"review_school_id"`         // v127新增：审核关联的学校ID
+	CreatedAt              *time.Time `json:"created_at"`               // 创建时间
+	UpdatedAt              *time.Time `json:"updated_at"`               // 更新时间
 }
 
 // ==================== 教案状态常量 ====================
 
 const (
 	LPStatusDraft             = "draft"              // 草稿
-	LPStatusPublishedPersonal = "published_personal"  // 个人发布（即刻可用）
-	LPStatusSubmitted         = "submitted"           // 已提交评审（等待L1）
-	LPStatusRevision          = "revision"            // 退回修改（来自任意级别）
-	LPStatusApproved          = "approved"            // 最终审核通过
-	LPStatusPublishedShared   = "published_shared"    // 共享发布
-	LPStatusDeveloping        = "developing"          // 课件开发中（教案锁定）
-	LPStatusCompleted         = "completed"           // 已完成
+	LPStatusPublishedPersonal = "published_personal" // 个人发布（即刻可用）
+	LPStatusSubmitted         = "submitted"          // 已提交评审（等待L1）
+	LPStatusRevision          = "revision"           // 退回修改（来自任意级别）
+	LPStatusApproved          = "approved"           // 最终审核通过
+	LPStatusPublishedShared   = "published_shared"   // 共享发布
+	LPStatusDeveloping        = "developing"         // 课件开发中（教案锁定）
+	LPStatusCompleted         = "completed"          // 已完成
 )
 
 // LPStatusNameMap 教案状态中文名映射（v127新增三种状态）
@@ -126,26 +128,26 @@ type ComponentExtraction struct {
 
 // PromptTemplate 提示词模板
 type PromptTemplate struct {
-	ID                string     `json:"id"`
-	Name              string     `json:"name"`
-	Description       *string    `json:"description"`
-	Level             string     `json:"level"`
-	OwnerID           string     `json:"owner_id"`
-	ParentTemplateID  *string    `json:"parent_template_id"`
-	SystemPrompt      *string    `json:"system_prompt"`
-	ContextRules      *string    `json:"context_rules"`
-	GenerationRules   *string    `json:"generation_rules"`
-	ReviewRules       *string    `json:"review_rules"`
-	OutputFormat      *string    `json:"output_format"`
-	CustomInstructions *string   `json:"custom_instructions"`
-	Subject           string     `json:"subject"`
-	GradeRange        string     `json:"grade_range"`
-	IsDefault         bool       `json:"is_default"`
-	Version           int        `json:"version"`
-	Status            string     `json:"status"`
-	CreatedBy         *string    `json:"created_by"`
-	CreatedAt         *time.Time `json:"created_at"`
-	UpdatedAt         *time.Time `json:"updated_at"`
+	ID                 string     `json:"id"`
+	Name               string     `json:"name"`
+	Description        *string    `json:"description"`
+	Level              string     `json:"level"`
+	OwnerID            string     `json:"owner_id"`
+	ParentTemplateID   *string    `json:"parent_template_id"`
+	SystemPrompt       *string    `json:"system_prompt"`
+	ContextRules       *string    `json:"context_rules"`
+	GenerationRules    *string    `json:"generation_rules"`
+	ReviewRules        *string    `json:"review_rules"`
+	OutputFormat       *string    `json:"output_format"`
+	CustomInstructions *string    `json:"custom_instructions"`
+	Subject            string     `json:"subject"`
+	GradeRange         string     `json:"grade_range"`
+	IsDefault          bool       `json:"is_default"`
+	Version            int        `json:"version"`
+	Status             string     `json:"status"`
+	CreatedBy          *string    `json:"created_by"`
+	CreatedAt          *time.Time `json:"created_at"`
+	UpdatedAt          *time.Time `json:"updated_at"`
 }
 
 // ==================== 提示词模板层级常量 ====================
@@ -224,67 +226,67 @@ type LessonPlanListItem struct {
 	ForkCount       int        `json:"fork_count"`
 	ViewCount       int        `json:"view_count"`
 	ForkedFrom      *string    `json:"forked_from"`
-	RecipeID        *string    `json:"recipe_id,omitempty"`        // Phase 7A：关联配方ID
-	RecipeName      string     `json:"recipe_name,omitempty"`     // Phase 7A：关联配方名称
-	LessonIndex     string     `json:"lesson_index,omitempty"`    // v86新增：AOCI索引文本
-	IdxQualityLevel int        `json:"idx_quality_level"`         // v86新增：质量等级
-	ReviewLevel     int        `json:"review_level"`              // v127新增：当前审核级别
+	RecipeID        *string    `json:"recipe_id,omitempty"`    // Phase 7A：关联配方ID
+	RecipeName      string     `json:"recipe_name,omitempty"`  // Phase 7A：关联配方名称
+	LessonIndex     string     `json:"lesson_index,omitempty"` // v86新增：AOCI索引文本
+	IdxQualityLevel int        `json:"idx_quality_level"`      // v86新增：质量等级
+	ReviewLevel     int        `json:"review_level"`           // v127新增：当前审核级别
 	CreatedAt       *time.Time `json:"created_at"`
 	UpdatedAt       *time.Time `json:"updated_at"`
 	// v125新增：互动计数（由service层填充）
-	LikeCount     int  `json:"like_count"`      // 点赞总数
-	FavoriteCount int  `json:"favorite_count"`   // 收藏总数
-	IsLiked       bool `json:"is_liked"`         // 当前用户是否已点赞
-	IsFavorited   bool `json:"is_favorited"`     // 当前用户是否已收藏
+	LikeCount     int  `json:"like_count"`     // 点赞总数
+	FavoriteCount int  `json:"favorite_count"` // 收藏总数
+	IsLiked       bool `json:"is_liked"`       // 当前用户是否已点赞
+	IsFavorited   bool `json:"is_favorited"`   // 当前用户是否已收藏
 }
 
 type LessonPlanDetailResponse struct {
-	ID                string     `json:"id"`
-	Title             string     `json:"title"`
-	Subject           string     `json:"subject"`
-	Grade             string     `json:"grade"`
-	Topic             string     `json:"topic"`
-	DurationMinutes   int        `json:"duration_minutes"`
-	ContentMarkdown   string     `json:"content_markdown"`
-	ContentStructured string     `json:"content_structured"`
-	GenerationConfig  string     `json:"generation_config"`
-	MatchedComponents string     `json:"matched_components"`
-	AIReviewScore     *float64   `json:"ai_review_score"`
-	AIReviewResult    string     `json:"ai_review_result"`
-	AIReviewHistory   string     `json:"ai_review_history"`
-	Status            string     `json:"status"`
-	StatusName        string     `json:"status_name"`
-	Visibility        string     `json:"visibility"`
-	AuthorID          string     `json:"author_id"`
-	AuthorName        string     `json:"author_name"`
-	GroupID           *string    `json:"group_id"`
-	GroupName         string     `json:"group_name"`
-	SchoolID          *string    `json:"school_id"`
-	ForkedFrom        *string    `json:"forked_from"`
-	ForkCount         int        `json:"fork_count"`
-	ViewCount         int        `json:"view_count"`
-	UseCount          int        `json:"use_count"`
-	Version           int        `json:"version"`
-	RecipeID          *string    `json:"recipe_id,omitempty"`           // Phase 7A：关联配方ID
-	RecipeName        string     `json:"recipe_name,omitempty"`         // Phase 7A：关联配方名称
-	LessonIndex       string     `json:"lesson_index,omitempty"`        // v86新增：AOCI索引
-	IdxCognitiveLevel int        `json:"idx_cognitive_level"`           // v86新增：认知层级
-	IdxPedagogyIntensity int     `json:"idx_pedagogy_intensity"`        // v86新增：教法强度
-	IdxStructureType  int        `json:"idx_structure_type"`            // v86新增：结构类型
-	IdxQualityLevel   int        `json:"idx_quality_level"`             // v86新增：质量等级
-	ReviewLevel       int        `json:"review_level"`                  // v127新增：当前审核级别
-	ReviewSchoolID    *string    `json:"review_school_id,omitempty"`    // v127新增：审核关联学校
-	CurrentStage      string     `json:"current_stage,omitempty"`       // Phase 7B：当前阶段
-	StageConfig       string     `json:"stage_config,omitempty"`        // Phase 7B：阶段配置
+	ID                   string   `json:"id"`
+	Title                string   `json:"title"`
+	Subject              string   `json:"subject"`
+	Grade                string   `json:"grade"`
+	Topic                string   `json:"topic"`
+	DurationMinutes      int      `json:"duration_minutes"`
+	ContentMarkdown      string   `json:"content_markdown"`
+	ContentStructured    string   `json:"content_structured"`
+	GenerationConfig     string   `json:"generation_config"`
+	MatchedComponents    string   `json:"matched_components"`
+	AIReviewScore        *float64 `json:"ai_review_score"`
+	AIReviewResult       string   `json:"ai_review_result"`
+	AIReviewHistory      string   `json:"ai_review_history"`
+	Status               string   `json:"status"`
+	StatusName           string   `json:"status_name"`
+	Visibility           string   `json:"visibility"`
+	AuthorID             string   `json:"author_id"`
+	AuthorName           string   `json:"author_name"`
+	GroupID              *string  `json:"group_id"`
+	GroupName            string   `json:"group_name"`
+	SchoolID             *string  `json:"school_id"`
+	ForkedFrom           *string  `json:"forked_from"`
+	ForkCount            int      `json:"fork_count"`
+	ViewCount            int      `json:"view_count"`
+	UseCount             int      `json:"use_count"`
+	Version              int      `json:"version"`
+	RecipeID             *string  `json:"recipe_id,omitempty"`        // Phase 7A：关联配方ID
+	RecipeName           string   `json:"recipe_name,omitempty"`      // Phase 7A：关联配方名称
+	LessonIndex          string   `json:"lesson_index,omitempty"`     // v86新增：AOCI索引
+	IdxCognitiveLevel    int      `json:"idx_cognitive_level"`        // v86新增：认知层级
+	IdxPedagogyIntensity int      `json:"idx_pedagogy_intensity"`     // v86新增：教法强度
+	IdxStructureType     int      `json:"idx_structure_type"`         // v86新增：结构类型
+	IdxQualityLevel      int      `json:"idx_quality_level"`          // v86新增：质量等级
+	ReviewLevel          int      `json:"review_level"`               // v127新增：当前审核级别
+	ReviewSchoolID       *string  `json:"review_school_id,omitempty"` // v127新增：审核关联学校
+	CurrentStage         string   `json:"current_stage,omitempty"`    // Phase 7B：当前阶段
+	StageConfig          string   `json:"stage_config,omitempty"`     // Phase 7B：阶段配置
 	// v125新增：互动计数
-	LikeCount     int  `json:"like_count"`      // 点赞总数
-	FavoriteCount int  `json:"favorite_count"`   // 收藏总数
-	IsLiked       bool `json:"is_liked"`         // 当前用户是否已点赞
-	IsFavorited   bool `json:"is_favorited"`     // 当前用户是否已收藏
-	Reviews           []*LessonPlanReviewItem `json:"reviews"`
-	LinkedPipelineID  *string                `json:"linked_pipeline_id,omitempty"`
-	CreatedAt         *time.Time `json:"created_at"`
-	UpdatedAt         *time.Time `json:"updated_at"`
+	LikeCount        int                     `json:"like_count"`     // 点赞总数
+	FavoriteCount    int                     `json:"favorite_count"` // 收藏总数
+	IsLiked          bool                    `json:"is_liked"`       // 当前用户是否已点赞
+	IsFavorited      bool                    `json:"is_favorited"`   // 当前用户是否已收藏
+	Reviews          []*LessonPlanReviewItem `json:"reviews"`
+	LinkedPipelineID *string                 `json:"linked_pipeline_id,omitempty"`
+	CreatedAt        *time.Time              `json:"created_at"`
+	UpdatedAt        *time.Time              `json:"updated_at"`
 }
 
 type LessonPlanReviewItem struct {
