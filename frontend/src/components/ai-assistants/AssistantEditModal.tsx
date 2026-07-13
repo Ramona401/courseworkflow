@@ -43,6 +43,94 @@ import {
 /** Tab 类型(v114 新增) */
 type EditTab = 'manual' | 'designer'
 
+/** 备课工坊单助手运行时实际注入上限；完整原稿仍按原存储上限保存。 */
+const WORKSHOP_RUNTIME_PROMPT_LEN = 8000
+
+/** 助手创建入口可选的具体学科，主动排除历史“空值=不限”选项。 */
+const ASSISTANT_SUBJECTS = SUBJECTS.filter(
+  item => item.trim() !== '',
+)
+
+/** 助手创建入口只允许一年级至高三的12个具体年级。 */
+const ASSISTANT_GRADES: string[] = [
+  '一年级',
+  '二年级',
+  '三年级',
+  '四年级',
+  '五年级',
+  '六年级',
+  '七年级',
+  '八年级',
+  '九年级',
+  '高一',
+  '高二',
+  '高三',
+]
+
+/**
+ * 存量具体年级同义值映射。
+ *
+ * 合法的单一年级可以自动回填到当前标准名称；
+ * “小学低段”“高中”“1-6”“10-12”等学段或范围值不在映射中，
+ * 编辑时会留空并要求老师重新选择。
+ */
+const ASSISTANT_GRADE_ALIASES: Record<string, string> = {
+  '1': '一年级',
+  '1年级': '一年级',
+  '一年级': '一年级',
+  '2': '二年级',
+  '2年级': '二年级',
+  '二年级': '二年级',
+  '3': '三年级',
+  '3年级': '三年级',
+  '三年级': '三年级',
+  '4': '四年级',
+  '4年级': '四年级',
+  '四年级': '四年级',
+  '5': '五年级',
+  '5年级': '五年级',
+  '五年级': '五年级',
+  '6': '六年级',
+  '6年级': '六年级',
+  '六年级': '六年级',
+  '7': '七年级',
+  '7年级': '七年级',
+  '七年级': '七年级',
+  '初一': '七年级',
+  '8': '八年级',
+  '8年级': '八年级',
+  '八年级': '八年级',
+  '初二': '八年级',
+  '9': '九年级',
+  '9年级': '九年级',
+  '九年级': '九年级',
+  '初三': '九年级',
+  '10': '高一',
+  '10年级': '高一',
+  '十年级': '高一',
+  '高一': '高一',
+  '11': '高二',
+  '11年级': '高二',
+  '十一年级': '高二',
+  '高二': '高二',
+  '12': '高三',
+  '12年级': '高三',
+  '十二年级': '高三',
+  '高三': '高三',
+}
+
+function normalizeAssistantSubject(value?: string): string {
+  const trimmed = (value || '').trim()
+  return ASSISTANT_SUBJECTS.includes(trimmed)
+    ? trimmed
+    : ''
+}
+
+function normalizeAssistantGrade(value?: string): string {
+  const trimmed = (value || '').trim()
+  return ASSISTANT_GRADE_ALIASES[trimmed] || ''
+}
+
 /* ==================== Props 类型 ==================== */
 
 export type AssistantEditMode = 'create-personal' | 'create-group' | 'edit'
@@ -75,8 +163,12 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
   const [description, setDescription] = useState('')
   const [subject, setSubject]         = useState('')
   const [gradeRange, setGradeRange]   = useState('')
+  // 编辑存量无效资源时显示原值，提示老师重新选择具体条件。
+  const [legacySubjectValue, setLegacySubjectValue] = useState('')
+  const [legacyGradeValue, setLegacyGradeValue] = useState('')
   const [scenes, setScenes]           = useState<AssistantScene[]>([])
   const [fullPrompt, setFullPrompt]   = useState('')
+  const promptChars = Array.from(fullPrompt).length
   // share_policy:仅共享助手有意义;create-personal 不展示也不提交
   const [sharePolicy, setSharePolicy] = useState<AssistantSharePolicy>(DEFAULT_SHARE_POLICY)
   // edit 模式下拉到的原始 source(用于 onSaved 回调传回 + 判断是否显示策略选择器)
@@ -96,8 +188,29 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
     setName('')
     setAvatar('🤖')
     setDescription('')
-    setSubject(defaultSubject || '')
-    setGradeRange(defaultGrade || '')
+
+    const rawDefaultSubject = (defaultSubject || '').trim()
+    const normalizedSubject = normalizeAssistantSubject(
+      rawDefaultSubject,
+    )
+    setSubject(normalizedSubject)
+    setLegacySubjectValue(
+      rawDefaultSubject && !normalizedSubject
+        ? rawDefaultSubject
+        : '',
+    )
+
+    const rawDefaultGrade = (defaultGrade || '').trim()
+    const normalizedGrade = normalizeAssistantGrade(
+      rawDefaultGrade,
+    )
+    setGradeRange(normalizedGrade)
+    setLegacyGradeValue(
+      rawDefaultGrade && !normalizedGrade
+        ? rawDefaultGrade
+        : '',
+    )
+
     setScenes(defaultScene ? [defaultScene] : [])
     setFullPrompt('')
     setSharePolicy(DEFAULT_SHARE_POLICY)
@@ -121,8 +234,29 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
           setName(data.name || '')
           setAvatar(data.avatar_emoji || '🤖')
           setDescription(data.description || '')
-          setSubject(data.subject || '')
-          setGradeRange(data.grade_range || '')
+
+          const rawSubject = (data.subject || '').trim()
+          const normalizedSubject = normalizeAssistantSubject(
+            rawSubject,
+          )
+          setSubject(normalizedSubject)
+          setLegacySubjectValue(
+            rawSubject && !normalizedSubject
+              ? rawSubject
+              : '',
+          )
+
+          const rawGrade = (data.grade_range || '').trim()
+          const normalizedGrade = normalizeAssistantGrade(
+            rawGrade,
+          )
+          setGradeRange(normalizedGrade)
+          setLegacyGradeValue(
+            rawGrade && !normalizedGrade
+              ? rawGrade
+              : '',
+          )
+
           // scenes 详情接口返回的是 JSONB 字符串,需要 parse
           setScenes(parseAssistantScenes(data.scenes))
           setFullPrompt(data.full_prompt || '')
@@ -179,6 +313,21 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
   /** 返回错误提示字符串,null 表示校验通过 */
   const validate = (): string | null => {
     if (!name.trim()) return '请填写助手名称'
+
+    if (!subject.trim()) {
+      return '请选择助手适用的具体学科'
+    }
+    if (!ASSISTANT_SUBJECTS.includes(subject.trim())) {
+      return '适用学科必须从当前学科清单中选择'
+    }
+
+    if (!gradeRange.trim()) {
+      return '请选择助手适用的具体年级'
+    }
+    if (!ASSISTANT_GRADES.includes(gradeRange.trim())) {
+      return '适用年级必须选择一年级至高三中的一个具体年级'
+    }
+
     if (!fullPrompt.trim()) return '请填写系统提示词(Prompt)\n如在 AI Tab 生成了草稿,请先点"✓ 应用到编辑"把草稿写入表单'
     if (scenes.length === 0) return '请至少勾选一个适用场景'
     if (fullPrompt.length > MAX_PROMPT_LEN) {
@@ -367,30 +516,70 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
                 />
               </div>
 
-              {/* ---- 通用字段:学科 + 年级 ---- */}
+              {/* ---- 通用字段:学科 + 具体年级 ---- */}
               <div style={{ display: 'flex', gap: '12px', marginBottom: '16px' }}>
                 <div style={{ flex: 1 }}>
-                  <label style={labelStyle}>适用学科 <span style={{ color: C.textMuted, fontWeight: 400 }}>(空=不限)</span></label>
+                  <label style={labelStyle}>
+                    适用学科 <span style={{ color: C.danger }}>*</span>
+                  </label>
                   <select
                     value={subject}
-                    onChange={e => setSubject(e.target.value)}
+                    onChange={e => {
+                      setSubject(e.target.value)
+                      setLegacySubjectValue('')
+                    }}
                     style={{ ...inputStyle, width: '100%', cursor: 'pointer' }}
                   >
-                    {SUBJECTS.map(s => (
-                      <option key={s} value={s}>{s || '(不限)'}</option>
+                    <option value="">请选择具体学科</option>
+                    {ASSISTANT_SUBJECTS.map(s => (
+                      <option key={s} value={s}>{s}</option>
                     ))}
                   </select>
+
+                  {legacySubjectValue && (
+                    <div style={{
+                      marginTop: '6px',
+                      fontSize: '11px',
+                      lineHeight: 1.5,
+                      color: '#92400E',
+                    }}>
+                      ⚠️ 原适用学科“{legacySubjectValue}”不在当前学科清单中，
+                      请重新选择后保存。
+                    </div>
+                  )}
                 </div>
+
                 <div style={{ flex: 1 }}>
-                  <label style={labelStyle}>适用年级 <span style={{ color: C.textMuted, fontWeight: 400 }}>(空=不限)</span></label>
-                  <input
-                    type="text"
+                  <label style={labelStyle}>
+                    适用具体年级 <span style={{ color: C.danger }}>*</span>
+                  </label>
+                  <select
                     value={gradeRange}
-                    onChange={e => setGradeRange(e.target.value)}
-                    placeholder="例:1-6 或 7-9 或 初一"
-                    maxLength={20}
-                    style={{ ...inputStyle, width: '100%' }}
-                  />
+                    onChange={e => {
+                      setGradeRange(e.target.value)
+                      setLegacyGradeValue('')
+                    }}
+                    style={{ ...inputStyle, width: '100%', cursor: 'pointer' }}
+                  >
+                    <option value="">请选择一年级至高三</option>
+                    {ASSISTANT_GRADES.map(grade => (
+                      <option key={grade} value={grade}>
+                        {grade}
+                      </option>
+                    ))}
+                  </select>
+
+                  {legacyGradeValue && (
+                    <div style={{
+                      marginTop: '6px',
+                      fontSize: '11px',
+                      lineHeight: 1.5,
+                      color: '#92400E',
+                    }}>
+                      ⚠️ 原年级“{legacyGradeValue}”不是单一具体年级，
+                      不会参与自动匹配。请重新选择后保存。
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -456,10 +645,14 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
                     style={{
                       fontSize: '11px',
                       fontWeight: 400,
-                      color: fullPrompt.length > MAX_PROMPT_LEN ? C.danger : C.textMuted,
+                      color: fullPrompt.length > MAX_PROMPT_LEN
+                        ? C.danger
+                        : promptChars > WORKSHOP_RUNTIME_PROMPT_LEN
+                          ? C.accent
+                          : C.textMuted,
                     }}
                   >
-                    {fullPrompt.length.toLocaleString()} / {MAX_PROMPT_LEN.toLocaleString()} 字符
+                    {promptChars.toLocaleString()} Unicode字符 · 存储上限 {MAX_PROMPT_LEN.toLocaleString()}
                   </span>
                 </div>
 
@@ -533,9 +726,23 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
                       }}
                     />
                     <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px', lineHeight: 1.6 }}>
-                      💡 这是 AI 的 system prompt,决定助手的角色定位、评审风格、输出格式。
-                      支持长至 128KB(约 4 万中文字),可容纳 v3.0 这种完整方法论文档。
+                      💡 完整原稿可以较长并完整保存；推荐运行版控制在2000—5000字符，
+                      复杂学科或地方规范较多时可到6000字符。
                     </div>
+                    {promptChars > WORKSHOP_RUNTIME_PROMPT_LEN && (
+                      <div style={{
+                        marginTop: '8px', padding: '9px 12px', borderRadius: '8px',
+                        background: 'rgba(245,158,11,0.08)',
+                        border: '1px solid rgba(245,158,11,0.28)',
+                        color: '#92400E', fontSize: '12px', lineHeight: 1.6,
+                      }}>
+                        ⚠️ 当前提示词为 <b>{promptChars.toLocaleString()}</b> 个Unicode字符。
+                        完整内容仍会保存，但备课工坊每轮最多注入前
+                        <b> {WORKSHOP_RUNTIME_PROMPT_LEN.toLocaleString()} </b>
+                        个字符。建议让AI删除重复背景和案例复述，优先保留教学方法、地方要求、
+                        成长引导、自检规则和与老师协商的边界。
+                      </div>
+                    )}
                   </>
                 )}
 

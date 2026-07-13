@@ -29,13 +29,14 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import {
-  startConversation, sendChatMessage, publishLessonPlanPersonal,
+  startConversation, sendChatMessage, publishLessonPlanPersonal, updateLessonPlan,
   getLessonPlan, getConversation,
   getStageStatus, advanceStage, switchToStage,
   type LessonPlan, type ConversationMessage, type ConvComponent,
-  type StageProgressItem,
+  type StageProgressItem, type RecipeSelectionMode,
 } from '@/api/lesson-plans'
 import { updatePlanUnitPlan } from '@/api/unit-plans'
+import type { LessonPlanContentRestoreResponse } from '@/api/lesson-plan-versions'
 import { updatePlanTextbooks } from '@/api/lesson-plan-textbooks'
 import { updatePlanClassProfile } from '@/api/lesson-plan-class-profiles'
 import { setLessonPlanCourseOutlinePublisher } from '@/api/course-outlines'
@@ -88,6 +89,9 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
   const [coursePublisher, setCoursePublisher] = useState<string | null>(null)
   // v203 新增：对话模式首屏配方选择（选了传 recipe_id，没选就不传）
   const [recipeId, setRecipeId] = useState('')
+  // 配方三态：默认智能选择；老师也可指定配方或明确不使用。
+  const [recipeMode, setRecipeMode] =
+    useState<RecipeSelectionMode>('auto')
   // v231 新增：课时时长选择（默认45分钟，小学常见40分钟，老师可在首屏自由选择）
   const [duration, setDuration] = useState(45)
   const [startLoading, setStartLoading] = useState(false)
@@ -139,20 +143,41 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
   // B-P1-22: 可滚动消息容器ref——滚动前据此判断用户是否贴近底部，决定是否自动跟随
   const messagesScrollRef = useRef<HTMLDivElement>(null)
 
-  // 助手轻量选择入口 Phase 1：教案就绪且学科已知时，加载老师×学科助手偏好(三态)。
-  // 用 plan.subject 而非组件 subject state 作 key —— 偏好是「老师×学科」维度，必须对齐教案实际学科。
+  // 教案就绪或阶段变化时，按“学科+具体年级+当前阶段”加载有效助手偏好。
+  //
+  // 数据库存量偏好仍按老师×学科保存；后端会在每次读取时重新校验
+  // 当前具体年级和阶段。不适用时返回has_record=false，并继续同年级自动匹配。
   useEffect(() => {
     const subj = plan?.subject
-    // 可见性补丁·修复跨教案残留：学科一变(含新建/切换教案)立即清空上一课的自动匹配名,
-    // 顶栏回退"自动匹配",待新课第一条消息回来再填真名(避免显示上一课助手名的串台)。
+    const planGrade = plan?.grade
+
+    // 学科、年级或阶段变化时立即清除上一条件下的自动匹配名称。
     setLiveAssistantLabel('')
-    if (!subj) { setAssistantPref(null); return }
+
+    if (!subj || !planGrade) {
+      setAssistantPref(null)
+      return
+    }
+
     let cancelled = false
-    getAssistantPref(subj)
-      .then((p) => { if (!cancelled) setAssistantPref(p) })
-      .catch(() => { if (!cancelled) setAssistantPref(null) })
-    return () => { cancelled = true }
-  }, [plan?.subject])
+
+    getAssistantPref(
+      subj,
+      planGrade,
+      currentStage || undefined,
+    )
+      .then((nextPref) => {
+        if (!cancelled) setAssistantPref(nextPref)
+      })
+      .catch(() => {
+        if (!cancelled) setAssistantPref(null)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [plan?.subject, plan?.grade, currentStage])
+
 
   const lastSentComponentIdsRef = useRef<string[]>([])
 
@@ -198,6 +223,46 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
   }, [])
 
   const isBusy = isThinking || !!streaming || fullGenerating
+
+  /**
+   * v233：正文变化后同步服务端正式教案状态。
+   *
+   * AI正文更新通过SSE只会直接更新planContent，数据库中的version已经递增，
+   * 但页面plan仍可能保留进入页面时的旧版本号。
+   *
+   * 对planContent变化做300ms合并后重新读取教案，统一同步：
+   *   - version
+   *   - title
+   *   - content_markdown
+   *   - duration_minutes
+   *   - status等其它正式字段
+   *
+   * 依赖只包含plan.id和planContent，setPlan不会再次触发本效果，
+   * 因此不会形成循环请求。
+   */
+  useEffect(() => {
+    if (!plan?.id || !planContent) return
+
+    const planID = plan.id
+    const timer = window.setTimeout(() => {
+      void getLessonPlan(planID)
+        .then(latestPlan => {
+          setPlan(previous =>
+            previous?.id === latestPlan.id
+              ? latestPlan
+              : previous
+          )
+        })
+        .catch(error => {
+          console.error(
+            '正文更新后同步教案正式版本失败:',
+            error,
+          )
+        })
+    }, 300)
+
+    return () => window.clearTimeout(timer)
+  }, [plan?.id, planContent])
 
   // 重试 harness Hook（doSilentResend 用 ref 桥接前向引用）
   const doSilentResendRef = useRef<(text: string) => void>(() => {})
@@ -292,10 +357,24 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
 
   // 开始备课
   const handleStart = async () => {
-    if (!topic.trim() || startLoading) return
+    if (
+      !topic.trim() ||
+      startLoading ||
+      (recipeMode === 'selected' && !recipeId)
+    ) return
     setStartLoading(true)
     try {
-      const resp = await startConversation({ subject, grade, topic: topic.trim(), duration_minutes: duration, recipe_id: recipeId || undefined })
+      const resp = await startConversation({
+        subject,
+        grade,
+        topic: topic.trim(),
+        duration_minutes: duration,
+        recipe_mode: recipeMode,
+        recipe_id:
+          recipeMode === 'selected'
+            ? recipeId || undefined
+            : undefined,
+      })
       setPlan(resp.plan)
       setMessages([resp.opening_message])
       setPhase('chatting')
@@ -523,6 +602,60 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     }
   }
 
+  /**
+   * 保存老师在右侧教案画布中直接编辑的完整正文。
+   *
+   * 保存走现有 PUT /lesson-plans/plans/{id}，不新增接口。
+   * AI忙碌期间禁止保存，避免人工旧稿与SSE新稿互相覆盖。
+   */
+  const handleManualContentSave = async (nextContent: string) => {
+    if (!plan) {
+      throw new Error('当前教案尚未加载')
+    }
+    if (isBusy) {
+      throw new Error('AI正在处理正文，请等待完成后再保存')
+    }
+
+    await updateLessonPlan(plan.id, {
+      content_markdown: nextContent,
+    })
+
+    // 不再基于页面旧version执行+1。
+    // AI可能已经在后台多次更新正文，页面缓存版本可能落后于数据库。
+    // 保存成功后重新读取正式教案，确保按钮、版本弹窗和数据库完全一致。
+    const latestPlan = await getLessonPlan(plan.id)
+    setPlan(latestPlan)
+    setPlanContent(
+      latestPlan.content_markdown || nextContent,
+    )
+
+    showToast(
+      `✅ 教案正文已保存，当前版本v${latestPlan.version}`,
+    )
+  }
+
+  /**
+   * 历史版本恢复成功后，同步画布、教案标题、课时时长和版本号。
+   */
+  const handleContentRestored = (
+    result: LessonPlanContentRestoreResponse,
+  ) => {
+    setPlanContent(result.content_markdown)
+    setPlan(previous => previous
+      ? {
+          ...previous,
+          title: result.title,
+          content_markdown: result.content_markdown,
+          duration_minutes: result.duration_minutes,
+          version: result.current_version,
+        }
+      : previous
+    )
+    showToast(
+      `✅ 已恢复历史v${result.restored_from_version}，当前为v${result.current_version}`,
+    )
+  }
+
   const handlePublish = async () => {
     if (!plan) return
     if (!planContent || planContent.trim().length === 0) {
@@ -642,6 +775,7 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     setClassProfileId('') // 班级学情挂载：回到首屏清空上一次的班级学情选择
     setCoursePublisher(null) // 教材版本：回到首屏清空上一次的版本选择
     setRecipeId('') // 配方选择：回到首屏清空上一次的配方选择:回到首屏清空上一次的单元方案选择
+    setRecipeMode('auto') // 配方模式：回到首屏恢复智能选择
     setSelectedComponentIds(new Set()); setShowComponentsModal(false)
     setShowTextbookModal(false); setAttachedTextbookIds([])
     setShowRefModal(false); setRefMaterialName(''); refMaterialRef.current = '' // 参考资料附件：退出即清空
@@ -704,6 +838,7 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
           unitPlanId={unitPlanId} setUnitPlanId={setUnitPlanId}
           classProfileId={classProfileId} setClassProfileId={setClassProfileId}
           coursePublisher={coursePublisher} setCoursePublisher={setCoursePublisher}
+          recipeMode={recipeMode} setRecipeMode={setRecipeMode}
           recipeId={recipeId} setRecipeId={setRecipeId}
           startLoading={startLoading}
           onStart={handleStart}
@@ -753,6 +888,7 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
           <AssistantSwitcher
             open={showAssistantPanel && !!plan?.subject}
             subject={plan?.subject || ''}
+            grade={plan?.grade || ''}
             stage={currentStage || undefined}
             pref={assistantPref}
             onClose={() => setShowAssistantPanel(false)}
@@ -811,8 +947,22 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
         {showCanvas && (
           <div style={{ width: isNarrow ? '100%' : '440px', flexShrink: 0, overflow: 'hidden' }}>
             <ConversationCanvas
+              planID={plan?.id || ''}
               content={planContent}
-              busy={!!streaming && (currentStage === 'write' || currentStage === 'revise')}
+              currentVersion={plan?.version || 1}
+              busy={isBusy}
+              canEdit={Boolean(
+                plan &&
+                [
+                  'draft',
+                  'published_personal',
+                  'revision',
+                  'approved',
+                  'published_shared',
+                ].includes(plan.status)
+              )}
+              onSaveContent={handleManualContentSave}
+              onContentRestored={handleContentRestored}
               onFillMissing={(label) => sendText(`请帮我补充「${label}」部分的内容，直接更新到教案正文里。`)}
             />
           </div>

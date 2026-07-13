@@ -25,9 +25,11 @@ import {
 export interface AssistantSwitcherProps {
   /** 是否展开面板（受控） */
   open: boolean
-  /** 当前学科（候选列表与偏好的 key） */
+  /** 当前学科（必须精确匹配） */
   subject: string
-  /** 当前阶段代码（可选，传了按场景过滤候选；不传列该学科全部） */
+  /** 当前具体年级（必须严格匹配） */
+  grade: string
+  /** 当前阶段代码（用于场景过滤） */
   stage?: string
   /** 当前偏好三态（父组件持有；null 表示尚未加载） */
   pref: AssistantPref | null
@@ -53,7 +55,7 @@ function sourceBadgeStyle(source: string): { bg: string; color: string } {
 }
 
 export default function AssistantSwitcher({
-  open, subject, stage, pref, onClose, onChanged,
+  open, subject, grade, stage, pref, onClose, onChanged,
 }: AssistantSwitcherProps) {
   const [options, setOptions] = useState<AssistantOption[]>([])
   const [loading, setLoading] = useState(false)
@@ -67,7 +69,7 @@ export default function AssistantSwitcher({
     let cancelled = false
     setLoading(true)
     setError('')
-    getAssistantOptions(subject, stage)
+    getAssistantOptions(subject, grade, stage)
       .then((resp) => {
         if (cancelled) return
         setOptions(resp.assistants || [])
@@ -82,7 +84,7 @@ export default function AssistantSwitcher({
     return () => {
       cancelled = true
     }
-  }, [open, subject, stage])
+  }, [open, subject, grade, stage])
 
   // 选择某项（assistantId='' 表示系统默认）→ PUT 偏好 → 回调 → 关闭。
   const handlePick = useCallback(
@@ -91,7 +93,7 @@ export default function AssistantSwitcher({
       setSavingId(assistantId)
       setError('')
       try {
-        const next = await putAssistantPref(subject, assistantId)
+        const next = await putAssistantPref(subject, grade, stage, assistantId)
         onChanged(next)
         onClose()
       } catch {
@@ -100,7 +102,7 @@ export default function AssistantSwitcher({
         setSavingId(null)
       }
     },
-    [subject, savingId, onChanged, onClose]
+    [subject, grade, stage, savingId, onChanged, onClose]
   )
 
   if (!open) return null
@@ -138,7 +140,7 @@ export default function AssistantSwitcher({
       >
         {/* 面板标题 */}
         <div style={{ padding: '6px 8px 8px', fontSize: '12px', color: C.textSec }}>
-          为「{subject}」选择备课助手
+          为「{subject} · {grade}」选择备课助手
           <span style={{ display: 'block', marginTop: '2px', fontSize: '11px', color: C.textSec, opacity: 0.8 }}>
             切换下一轮起生效，已有对话不变
           </span>
@@ -194,7 +196,7 @@ export default function AssistantSwitcher({
         )}
         {!loading && !error && options.length === 0 && (
           <div style={{ padding: '16px', textAlign: 'center', fontSize: '12px', color: C.textSec }}>
-            该学科暂无可选助手，将使用系统默认
+            当前学科和具体年级暂无可选助手，将使用系统默认
           </div>
         )}
         {!loading &&

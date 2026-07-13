@@ -260,16 +260,18 @@ func (s *LessonPlanService) GetLessonPlan(ctx context.Context, id string) (*mode
 // ListLessonPlans 获取教案列表
 //
 // 迭代一 Phase 4（数据隔离收口）：scope *DataScope 入参。
-//   从 scope 中拆出 UserIDs（本人 ∪ 管辖成员白名单）与 IsAdmin（是否看全部），
-//   传给 repository.ListLessonPlans。可见性 OR 子句（本人/管辖 ∪ 共享可见）在 repo 层拼接。
-//   scope 为 nil 的防御性处理：退化为"非 admin + 空白名单"——只能看共享教案，
-//   绝不退化为 admin 全量（fail-closed）。正常调用路径由 handler 保证 scope 非 nil。
+//
+//	从 scope 中拆出 UserIDs（本人 ∪ 管辖成员白名单）与 IsAdmin（是否看全部），
+//	传给 repository.ListLessonPlans。可见性 OR 子句（本人/管辖 ∪ 共享可见）在 repo 层拼接。
+//	scope 为 nil 的防御性处理：退化为"非 admin + 空白名单"——只能看共享教案，
+//	绝不退化为 admin 全量（fail-closed）。正常调用路径由 handler 保证 scope 非 nil。
 //
 // 「我的教案只显示 1 条」Bug 修复：
-//   新增 callerID string 入参（放在最前），透传给 repository.ListLessonPlans。
-//   当 scope 因未绑校 fail-closed 成空集时，作者查自己教案会被空白名单误伤；
-//   repo 层据 callerID 加"作者是自己则恒放行"分支，保证用户始终能看到自己全部教案。
-//   callerID 不参与 scope 拆解，是独立于 scope 的"自己恒可见"信号。
+//
+//	新增 callerID string 入参（放在最前），透传给 repository.ListLessonPlans。
+//	当 scope 因未绑校 fail-closed 成空集时，作者查自己教案会被空白名单误伤；
+//	repo 层据 callerID 加"作者是自己则恒放行"分支，保证用户始终能看到自己全部教案。
+//	callerID 不参与 scope 拆解，是独立于 scope 的"自己恒可见"信号。
 func (s *LessonPlanService) ListLessonPlans(ctx context.Context, callerID string, authorID string, groupID string, status string, subject string, grade string, limit int, offset int, qualityLevel int, structureType int, cognitiveLevel int, pedagogyIntensity int, scope *DataScope) (*models.LessonPlanListResponse, error) {
 	// 从 DataScope 拆出 repo 层需要的原始参数（repo 不能反向依赖 services 包）
 	var scopeUserIDs []string
@@ -294,7 +296,12 @@ func (s *LessonPlanService) ListLessonPlans(ctx context.Context, callerID string
 }
 
 // UpdateLessonPlan 更新教案内容
-func (s *LessonPlanService) UpdateLessonPlan(ctx context.Context, id string, callerID string, req *models.UpdateLessonPlanRequest) error {
+func (s *LessonPlanService) UpdateLessonPlan(
+	ctx context.Context,
+	id string,
+	callerID string,
+	req *models.UpdateLessonPlanRequest,
+) error {
 	lp, err := repository.GetLessonPlanByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, repository.ErrLessonPlanNotFound) {
@@ -306,8 +313,9 @@ func (s *LessonPlanService) UpdateLessonPlan(ctx context.Context, id string, cal
 	if lp.AuthorID != callerID {
 		return ErrLPNotAuthor
 	}
-	// v125改动：允许 approved/published_shared 状态编辑（老师持续改进）
-	// 仅 submitted（评审中锁定）和 developing/completed（课件关联锁定）不可编辑
+
+	// 允许老师持续改进自己的草稿、个人发布、退回、审核通过和共享教案。
+	// submitted评审中、developing课件开发中、completed已完成继续保持锁定。
 	editableStatuses := map[string]bool{
 		models.LPStatusDraft:             true,
 		models.LPStatusPublishedPersonal: true,
@@ -323,15 +331,35 @@ func (s *LessonPlanService) UpdateLessonPlan(ctx context.Context, id string, cal
 	if title == "" {
 		title = lp.Title
 	}
-	dur := req.DurationMinutes
-	if dur <= 0 {
-		dur = lp.DurationMinutes
+
+	duration := req.DurationMinutes
+	if duration <= 0 {
+		duration = lp.DurationMinutes
 	}
 
-	if err := repository.UpdateLessonPlanContent(ctx, id, title, req.ContentMarkdown, "", dur); err != nil {
-		lpLog.Error("更新教案失败", "plan_id", id, "error", err)
+	// 老师通过详情页、对话模式画布或专家模式画布保存正文时，
+	// 统一记录为manual来源，并保存真实操作人。
+	if err := repository.UpdateLessonPlanContent(
+		ctx,
+		id,
+		title,
+		req.ContentMarkdown,
+		"",
+		duration,
+		models.LessonPlanVersionMeta{
+			ChangeSource:  models.LPVersionSourceManual,
+			ChangedBy:     &callerID,
+			ChangeSummary: "老师手动编辑教案正文",
+		},
+	); err != nil {
+		lpLog.Error(
+			"更新教案失败",
+			"plan_id", id,
+			"error", err,
+		)
 		return err
 	}
+
 	return nil
 }
 
@@ -450,10 +478,11 @@ func (s *LessonPlanService) SubmitForReview(ctx context.Context, id string, call
 // Phase5：approved且ai_review_score>=8.5时异步触发通道二自动萃取
 //
 // v121改动（AI辅助修改 Bug 修复 · 方案C）：
-//   revision 分支新增：教研员退回教案时,自动把最新一轮已归档(archived)的批注
-//   恢复为 pending。业务含义是"退回即继续工作"——作者需要用 AI 辅助修改继续
-//   处理上一轮未彻底解决的批注,不能让它们因为已归档而隐藏所有操作按钮。
-//   恢复失败不阻断退回流程,仅记录日志。
+//
+//	revision 分支新增：教研员退回教案时,自动把最新一轮已归档(archived)的批注
+//	恢复为 pending。业务含义是"退回即继续工作"——作者需要用 AI 辅助修改继续
+//	处理上一轮未彻底解决的批注,不能让它们因为已归档而隐藏所有操作按钮。
+//	恢复失败不阻断退回流程,仅记录日志。
 func (s *LessonPlanService) ReviewLessonPlan(ctx context.Context, planID string, reviewerID string, req *models.CreateLessonPlanReviewRequest) error {
 	lp, err := repository.GetLessonPlanByID(ctx, planID)
 	if err != nil {
@@ -532,14 +561,15 @@ func (s *LessonPlanService) ReviewLessonPlan(ctx context.Context, planID string,
 // 正常情况下能走到 approved 的教案已经过审核端校验，这里是双保险。
 //
 // 迭代一 Phase 4 收尾改动（越权封堵）：
-//   新增"仅作者本人 OR admin 可共享发布"的身份校验。原先此方法只校验状态，
-//   导致任何登录用户拿到一个 approved 教案 ID 就能调它翻状态（越权）。
-//   - 作者本人（callerID == lp.AuthorID）：放行。教师对自己已通过的教案做收尾确认。
-//   - admin：放行（超级管理员兜底）。通过 FindUserByID 反查角色判定，
-//     与 review_v2_service.go 的 ReviewL1 admin 判定惯例一致，无需给本方法加 role 参数。
-//   - 其他所有人（含审核员 senior_operator/教研组长/其他教师）：返回 ErrLPNotPublisher。
-//     审核员的"公开权力"已在审核通过（approved 即全平台可见）时行使完毕，
-//     不应再经手共享发布，避免权限链重复与责任模糊。
+//
+//	新增"仅作者本人 OR admin 可共享发布"的身份校验。原先此方法只校验状态，
+//	导致任何登录用户拿到一个 approved 教案 ID 就能调它翻状态（越权）。
+//	- 作者本人（callerID == lp.AuthorID）：放行。教师对自己已通过的教案做收尾确认。
+//	- admin：放行（超级管理员兜底）。通过 FindUserByID 反查角色判定，
+//	  与 review_v2_service.go 的 ReviewL1 admin 判定惯例一致，无需给本方法加 role 参数。
+//	- 其他所有人（含审核员 senior_operator/教研组长/其他教师）：返回 ErrLPNotPublisher。
+//	  审核员的"公开权力"已在审核通过（approved 即全平台可见）时行使完毕，
+//	  不应再经手共享发布，避免权限链重复与责任模糊。
 func (s *LessonPlanService) PublishShared(ctx context.Context, id string, callerID string) error {
 	lp, err := repository.GetLessonPlanByID(ctx, id)
 	if err != nil {

@@ -115,40 +115,35 @@ func (s *LessonPlanGenService) handleWriteStageOutput(
 		return
 	}
 
-	// v203修复（只存后半部分）：缩写保护——当AI模型因max_tokens截断只输出后半段教案时，
-	// 该截断片段可能通过DetectLessonPlanContent的五重检测（后半段仍含足够标记词），
-	// 如果不拦截就会整段覆盖之前已存的完整教案，导致教案永久丢失前半部分。
-	// 保护规则：已有正文≥800字 且 新正文不到已有的70% 且 新正文前300字不含"教学目标/教学设计"
-	// （不是从头开始的完整新版教案）→ 拒绝覆盖，广播已有正文刷新画布。
-	// 安全边界：
-	//   - 首次生成（已有为空）→ 不触发（正常保存）
-	//   - 老师要求缩短但从头写的完整版 → 前300字含"教学目标"，允许覆盖
-	//   - 修订/扩写后的更长版 → 新>已有*70%，允许覆盖
-	//   - AI截断的后半段 → 短且不含开头标志，拦截覆盖
+	// 缩写保护增强：
+	//
+	// 旧规则只检查新正文前300字是否包含“教学目标”或“教学设计”。
+	// 当个人助手把【基本信息】、教材分析、设计理念放在教学目标之前时，
+	// 一份完整新版也可能被误判为“只输出了后半段”，导致画布继续显示旧正文。
+	//
+	// 现在仍保留“新正文不足旧正文70%”这一风险条件，但使用
+	// hasLessonPlanOpeningStructure识别多种可信教案开头。
 	existingMd := strings.TrimSpace(lp.ContentMarkdown)
 	existingRunes := []rune(existingMd)
 	newRunes := []rune(content)
-	if len(existingRunes) > 800 && len(newRunes) < len(existingRunes)*7/10 {
-		headLen := 300
-		if len(newRunes) < headLen {
-			headLen = len(newRunes)
-		}
-		headCheck := string(newRunes[:headLen])
-		if !strings.Contains(headCheck, "教学目标") && !strings.Contains(headCheck, "教学设计") {
-			lpGenLog.Warn("write阶段缩写保护：新内容明显短于已有内容且非完整教案开头，拒绝覆盖",
-				"plan_id", planID,
-				"existing_runes", len(existingRunes),
-				"new_runes", len(newRunes))
-			// 广播已有正文刷新画布（保持同步）
-			GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
-				EventType: models.LPSSEContentUpdate,
-				PlanID:    planID,
-				Content:   existingMd,
-			})
-			return
-		}
-	}
 
+	if len(existingRunes) > 800 &&
+		len(newRunes) < len(existingRunes)*7/10 &&
+		!hasLessonPlanOpeningStructure(content) {
+		lpGenLog.Warn(
+			"write阶段缩写保护：新内容明显短于已有正文且缺少可信教案开头，拒绝覆盖",
+			"plan_id", planID,
+			"existing_runes", len(existingRunes),
+			"new_runes", len(newRunes),
+		)
+
+		GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
+			EventType: models.LPSSEContentUpdate,
+			PlanID:    planID,
+			Content:   existingMd,
+		})
+		return
+	}
 	// 更新教案正文到lesson_plans表
 	if err := repository.UpdateLessonPlanContent(ctx, planID, lp.Title, content, "{}", lp.DurationMinutes); err != nil {
 		lpGenLog.Warn("write阶段更新教案正文失败", "plan_id", planID, "error", err)

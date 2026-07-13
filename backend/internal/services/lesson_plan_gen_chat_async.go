@@ -72,6 +72,7 @@ import (
 // v172说明（已撤销 done 补发）：SSE 是教案会话级共享长连接，发 done 会让前端关闭整条连接，
 //
 //	故不每轮发 done；「生成中」状态复位由前端 onMessageDone 处理。
+//
 // refMaterialInjectMaxRunes 参考资料注入 system prompt 的防御性上限(rune 计)。
 // 前端长文档已压缩,正常远小于此;此处为兜底,防止异常超长文本撑爆上下文。
 const refMaterialInjectMaxRunes = 8000
@@ -84,6 +85,7 @@ func (s *LessonPlanGenService) processChatStageAsync(
 	req *models.LessonPlanChatRequest,
 	assistantPrompt string,
 	assistantLabel string, // 助手轻量选择入口·可见性补丁:本轮匹配的助手名,随 message_done 回传前端显示
+	assistantReceipt *models.AssistantContextReceipt,
 	fullGenerate bool,
 	turnID string,
 ) {
@@ -107,7 +109,14 @@ func (s *LessonPlanGenService) processChatStageAsync(
 	}
 
 	// 加载阶段系统提示词(v110:使用 V2 版本支持 assistantPrompt 注入)
-	stageSystemPrompt, err := s.stageService.LoadStagePromptContextV2(ctx, lp, currentStage, assistantPrompt, userMsg.Content)
+	stageSystemPrompt, contextReceipt, err := s.stageService.LoadStagePromptContextWithReceipt(
+		ctx,
+		lp,
+		currentStage,
+		assistantPrompt,
+		userMsg.Content,
+		assistantReceipt,
+	)
 	if err != nil {
 		lpGenLog.Warn("加载阶段提示词失败", "plan_id", planID, "stage", currentStage, "error", err)
 		s.broadcastError(planID, turnID, "加载阶段配置失败，请刷新重试")
@@ -119,14 +128,33 @@ func (s *LessonPlanGenService) processChatStageAsync(
 	// 前端已在浏览器端提取(短文档=原文/长文档=压缩要点)，此处仅拼接 + 防御性 rune 截断兜底。
 	// req.RefMaterial 为空(未挂附件)时行为 100% 不变。不落库、不复用。
 	if rm := strings.TrimSpace(req.RefMaterial); rm != "" {
+		originalRunes := len([]rune(rm))
 		if rr := []rune(rm); len(rr) > refMaterialInjectMaxRunes {
 			rm = string(rr[:refMaterialInjectMaxRunes])
-			lpGenLog.Info("参考资料超上限已截断注入", "plan_id", planID, "max_runes", refMaterialInjectMaxRunes)
+			lpGenLog.Info(
+				"参考资料超上限已截断注入",
+				"plan_id", planID,
+				"max_runes", refMaterialInjectMaxRunes,
+			)
 		}
 		stageSystemPrompt += "\n\n【备课参考资料（老师上传的附件）】\n" +
 			"以下是老师为本次备课上传的参考资料，请在备课时充分参考其中的知识点、教学要求与重点，" +
 			"但不要照搬，需结合本课实际情况取舍。\n" + rm + "\n"
-		lpGenLog.Info("已注入参考资料附件", "plan_id", planID, "stage", currentStage, "ref_runes", len([]rune(rm)))
+		if contextReceipt != nil {
+			contextReceipt.RefMaterial = &models.MaterialContextReceipt{
+				Status:         models.ContextReceiptLoaded,
+				CharacterCount: len([]rune(rm)),
+			}
+			if originalRunes > refMaterialInjectMaxRunes {
+				contextReceipt.RefMaterial.Reason = "参考资料超过运行预算，本轮已安全截断后读取"
+			}
+		}
+		lpGenLog.Info(
+			"已注入参考资料附件",
+			"plan_id", planID,
+			"stage", currentStage,
+			"ref_runes", len([]rune(rm)),
+		)
 	}
 
 	// 全委托标志：本轮是否实际注入了全委托指令（用于后续跳过停滞检测）
@@ -139,22 +167,34 @@ func (s *LessonPlanGenService) processChatStageAsync(
 
 		switch {
 		case hasExistingContent:
-			// 态a：已有教案内容 → 注入防重复生成指令
+			// 右侧教案画布采用完整文档覆盖模型，不存在可靠的局部Patch协议。
+			//
+			// 老师明确要求修改、补充、删除或重组教案时，AI必须输出修改后的
+			// 完整Markdown教案，后端才能重新提取并通过content_update同步画布。
+			// 只回答“已经修改”或只输出局部片段，都无法安全更新整份教案。
 			contentLen := len(latestLP.ContentMarkdown)
 			stageSystemPrompt += fmt.Sprintf(`
 
-== 重要提示（系统级指令，最高优先级）==
-教案正文已经成功生成并保存（共%d字符），右侧面板已经展示给了老师。
-请注意以下规则：
-1. 不要再重新输出完整教案。教案已经保存好了。
-2. 如果老师说"输出""生成""写出来"等话，请告诉老师教案已经生成完毕并显示在右侧面板，问老师是否需要修改某个部分。
-3. 如果老师要求修改教案的某个具体部分，可以针对性地讨论修改方案，但不要输出完整教案。
-4. 你现在的角色是帮助老师确认教案是否满意、讨论是否需要局部调整。
-5. 如果老师确认教案没问题，建议老师点击"完成本阶段"按钮进入下一阶段（AI评审）。`, contentLen)
+== 已有教案修改与画布同步规则（系统级指令，最高优先级）==
+教案正文已经生成并保存（共%d字符），右侧画布显示的是数据库中的完整正文。
 
-			lpGenLog.Info("write阶段已有教案内容，注入防重复生成指令",
-				"plan_id", planID, "stage", currentStage, "content_len", contentLen)
+系统使用“完整教案覆盖”方式更新画布，请严格遵守：
 
+1. 老师只是询问教案是否生成、要求重复展示时，不要重复输出整篇；请说明完整教案已经显示在右侧画布。
+2. 老师明确要求修改、补充、删除、改写、调整格式或重组结构时，必须输出【修改后的完整教案Markdown】。
+3. 完整新版必须从教案标题或最前面的正式信息板块开始，一直输出到最后一个板块，不得只输出修改位置。
+4. 未被要求修改的原有板块必须完整保留，不能因为修改一处而遗漏其他部分。
+5. 【基本信息】【教材分析】【设计理念】【学情依据】【课程标准对接】【评价量规】等自定义板块均属于正式教案正文，必须写入完整新版。
+6. 禁止只输出“修改说明”“调整建议”“已经更新”等承诺性文字而不输出完整教案，否则右侧画布不会同步。
+7. 老师尚未确认修改方案时可以先讨论；老师确认“按这个修改”后，下一次回复必须输出完整更新版教案。
+8. 完整新版输出完成后，可以提醒老师查看右侧画布。`, contentLen)
+
+			lpGenLog.Info(
+				"write阶段已有正文，注入完整教案覆盖式修改规则",
+				"plan_id", planID,
+				"stage", currentStage,
+				"content_len", contentLen,
+			)
 		case fullGenerate:
 			// 态b：正文为空 + 老师选择全委托 → 注入全委托一次性出稿指令
 			stageSystemPrompt += fullGenerateWritePrompt
@@ -178,6 +218,11 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		}
 	}
 
+	// 全部临时指令拼接完成后，记录本轮最终system prompt规模。
+	if contextReceipt != nil {
+		contextReceipt.SystemPromptRunes = len([]rune(stageSystemPrompt))
+	}
+
 	// 构建Episodic Memory
 	allOutputs, _ := repository.ListStageOutputs(ctx, planID)
 	var priorOutputs []*models.WorkshopStageOutput
@@ -196,7 +241,10 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		"plan_id", planID, "stage", currentStage,
 		"working_msgs", len(currentStageMsgs), "episodic_len", len(episodicSummary),
 		"prior_stages", len(priorOutputs), "assistant_injected", assistantPrompt != "",
-		"full_generate", fullGenerate, "full_gen_injected", fullGenInjected)
+		"full_generate", fullGenerate, "full_gen_injected", fullGenInjected,
+		"assistant_prompt_runes", len([]rune(assistantPrompt)),
+		"system_prompt_runes", len([]rune(stageSystemPrompt)),
+		"user_prompt_runes", len([]rune(userPrompt)))
 
 	// 流式推送
 	chunkCount := 0
@@ -328,6 +376,12 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		displayContent = appendSuggestionToNarrative(pureDisplay, suggestionText)
 	}
 	aiReply := s.parseAIReply(ctx, displayContent, lp)
+	if contextReceipt != nil {
+		if aiReply.Metadata == nil {
+			aiReply.Metadata = make(map[string]interface{})
+		}
+		aiReply.Metadata["context_receipt"] = contextReceipt
+	}
 
 	if err := s.appendMessage(ctx, planID, aiReply); err != nil {
 		lpGenLog.Warn("写入AI消息失败", "plan_id", planID, "error", err)

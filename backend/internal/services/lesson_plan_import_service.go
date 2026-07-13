@@ -49,6 +49,28 @@ func (s *LessonPlanGenService) ImportExistingPlan(
 		dur = 45
 	}
 
+	// 导入已有教案携带的显式recipe_id也必须匹配当前学科和具体年级。
+	// 校验失败时只忽略错误配方，导入正文和后续AI评审仍照常进行。
+	req.RecipeID = strings.TrimSpace(req.RecipeID)
+	if req.RecipeID != "" {
+		if _, recipeErr := loadRecipeForLesson(
+			ctx,
+			req.RecipeID,
+			req.Subject,
+			req.Grade,
+		); recipeErr != nil {
+			lpGenLog.Warn(
+				"导入已有教案携带的配方不适用于当前学科或具体年级，已忽略",
+				"author", authorID,
+				"subject", req.Subject,
+				"grade", req.Grade,
+				"recipe_id", req.RecipeID,
+				"error", recipeErr,
+			)
+			req.RecipeID = ""
+		}
+	}
+
 	// ---- 1. 创建教案记录，写入已有正文 ----
 	title := fmt.Sprintf("%s %s — %s", req.Grade, req.Subject, req.Topic)
 	lp := &models.LessonPlan{

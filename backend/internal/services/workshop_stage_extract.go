@@ -160,13 +160,14 @@ func splitSuggestionBlock(content string) (pureContent string, suggestionText st
 // extractWriteStageFromNatural 从write/revise阶段的自然语言回复中提取教案内容
 //
 // v193：提取教案前先用 splitSuggestionBlock 切走「教师建议块」——
-//   * pureContent（无建议块）喂 DetectLessonPlanContent，落库教案正文硬保证不含建议；
-//   * 切出的建议文本拼进 narrative，老师在对话气泡看得到、但不进教案。
+//   - pureContent（无建议块）喂 DetectLessonPlanContent，落库教案正文硬保证不含建议；
+//   - 切出的建议文本拼进 narrative，老师在对话气泡看得到、但不进教案。
 //
 // v200（P0-04补漏）：DetectLessonPlanContent 提取出的正文会从标题行一直取到末尾，AI 追加在
-//   教案末尾的 ```suggested_actions 芯片块会被一并截进正文。故对 lessonContent 再套
-//   StripSuggestedActionsBlock 后才落库，保证落库教案正文绝不含芯片块；未识别到教案时的
-//   降级 narrative 同样补剥一层（与展示路径口径一致）。
+//
+//	教案末尾的 ```suggested_actions 芯片块会被一并截进正文。故对 lessonContent 再套
+//	StripSuggestedActionsBlock 后才落库，保证落库教案正文绝不含芯片块；未识别到教案时的
+//	降级 narrative 同样补剥一层（与展示路径口径一致）。
 func extractWriteStageFromNatural(content string) (string, string, bool) {
 	// v193：先切走教师建议块，后续教案提取只认纯净内容
 	pureContent, suggestionText := splitSuggestionBlock(content)
@@ -303,6 +304,10 @@ func DetectLessonPlanContent(content string) string {
 	if startIdx < 0 {
 		return ""
 	}
+	// 个人助手可能把【基本信息】、教材分析、设计理念等正式板块
+	// 放在传统“教学目标”或“课题”锚点之前。
+	// 向前扩展正文起点，保留这些正式前置板块，但不纳入普通聊天前言。
+	startIdx = expandLessonPlanStart(lines, startIdx)
 
 	// 教学过程：支持多种命名方式
 	hasProcess := strings.Contains(content, "教学过程") ||
@@ -331,6 +336,174 @@ func DetectLessonPlanContent(content string) string {
 		return ""
 	}
 	return result
+}
+
+// lessonPlanLeadingKeywords 是可以出现在完整教案前部的正式结构名称。
+// 本表只用于定位正文边界和缩写保护，不规定教案必须采用固定章节顺序。
+var lessonPlanLeadingKeywords = []string{
+	"基本信息",
+	"单元主题",
+	"课程名称",
+	"课题名称",
+	"课时名称",
+	"教材分析",
+	"学情分析",
+	"学情依据",
+	"设计理念",
+	"课程标准",
+	"课标对接",
+	"核心素养",
+	"知识框架",
+	"教学目标",
+	"教学重点",
+	"教学难点",
+	"教学重难点",
+	"教学准备",
+	"评价设计",
+	"评价量规",
+	"教学过程",
+	"作业设计",
+	"作业布置",
+	"板书设计",
+	"教学反思",
+}
+
+// expandLessonPlanStart 从传统教案锚点向前寻找正式的前置板块。
+//
+// 例如AI输出：
+//
+//	以下为调整后的完整版本：
+//
+//	【基本信息】
+//	单元主题：……
+//	课题名称：……
+//
+// 原逻辑可能从“课题名称”开始截取，丢失【基本信息】和单元主题。
+// 本函数只识别明确的教案结构名称，不会把普通聊天前言纳入正文。
+func expandLessonPlanStart(lines []string, anchorIdx int) int {
+	if anchorIdx <= 0 || anchorIdx >= len(lines) {
+		return anchorIdx
+	}
+
+	windowStart := anchorIdx - 40
+	if windowStart < 0 {
+		windowStart = 0
+	}
+
+	for index := windowStart; index < anchorIdx; index++ {
+		if isLessonPlanLeadingHeading(lines[index]) {
+			return index
+		}
+	}
+
+	return anchorIdx
+}
+
+// isLessonPlanLeadingHeading 判断一行是否是正式教案前置标题或信息字段。
+//
+// 支持Markdown标题、方括号标题、中文编号标题，以及“单元主题：……”
+// “课题名称：……”等字段行。
+func isLessonPlanLeadingHeading(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || len([]rune(trimmed)) > 100 {
+		return false
+	}
+
+	containsKeyword := func(text string) bool {
+		for _, keyword := range lessonPlanLeadingKeywords {
+			if strings.Contains(text, keyword) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Markdown标题必须包含正式教案结构词，
+	// 避免把“## 修改说明”等普通说明误判为正文起点。
+	if strings.HasPrefix(trimmed, "#") {
+		return containsKeyword(trimmed)
+	}
+
+	bracketPrefixes := []string{"【", "[", "〔"}
+	for _, prefix := range bracketPrefixes {
+		if strings.HasPrefix(trimmed, prefix) &&
+			containsKeyword(trimmed) {
+			return true
+		}
+	}
+
+	for _, keyword := range lessonPlanLeadingKeywords {
+		if trimmed == keyword ||
+			strings.HasPrefix(trimmed, keyword+"：") ||
+			strings.HasPrefix(trimmed, keyword+":") {
+			return true
+		}
+	}
+
+	ordinalPrefixes := []string{
+		"一、", "二、", "三、", "四、", "五、",
+		"六、", "七、", "八、", "九、", "十、",
+		"（一）", "（二）", "（三）", "（四）", "（五）",
+		"(一)", "(二)", "(三)", "(四)", "(五)",
+	}
+
+	for _, prefix := range ordinalPrefixes {
+		if strings.HasPrefix(trimmed, prefix) &&
+			containsKeyword(trimmed) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasLessonPlanOpeningStructure 判断新正文是否具有可信的完整教案开头。
+//
+// 当新正文明显短于旧正文时，本函数帮助区分：
+//  1. 从教学过程后半段开始的截断残片；
+//  2. 从【基本信息】、教材分析、设计理念等开始的完整新版。
+//
+// 只检查前900个Unicode字符，不要求固定章节顺序。
+func hasLessonPlanOpeningStructure(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return false
+	}
+
+	runes := []rune(trimmed)
+	if len(runes) > 900 {
+		runes = runes[:900]
+	}
+
+	head := string(runes)
+
+	openingMarkers := []string{
+		"教学设计",
+		"完整教案",
+		"基本信息",
+		"单元主题",
+		"课程名称",
+		"课题名称",
+		"课时名称",
+		"教材分析",
+		"学情分析",
+		"学情依据",
+		"设计理念",
+		"课程标准",
+		"课标对接",
+		"核心素养",
+		"知识框架",
+		"教学目标",
+		"教学准备",
+	}
+
+	for _, marker := range openingMarkers {
+		if strings.Contains(head, marker) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // trimTrailingChatter 去掉教案末尾的AI客套话
@@ -375,8 +548,8 @@ func trimTrailingChatter(content string) string {
 //
 // v169双链路：
 //
-//      链路1（优先）：解析 AI 回复尾部的 ```json 结构化块（新版提示词约定输出此块）
-//      链路2（降级）：解析失败时，沿用原有 Markdown 正则提取（兼容旧格式）
+//	链路1（优先）：解析 AI 回复尾部的 ```json 结构化块（新版提示词约定输出此块）
+//	链路2（降级）：解析失败时，沿用原有 Markdown 正则提取（兼容旧格式）
 //
 // 两条链路任一成功（total_score>0）即返回 hasContent=true；
 // 都失败时返回 hasContent=false，narrative 兜底为对话原文截断（供上层 fallback）。

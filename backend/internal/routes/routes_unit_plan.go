@@ -1,14 +1,17 @@
 package routes
 
-// routes_unit_plan.go — 单元方案路由注册（大单元备课·独立模块）
+// routes_unit_plan.go — 单元方案及其参考资料路由注册
 //
-//   /api/v1/unit-plans         GET 列表 / POST 开始会话
-//   /api/v1/unit-plans/{id}    GET 详情 / DELETE 删除
-//   /api/v1/unit-plans/{id}/chat  POST 对话一轮
-//   /api/v1/unit-plans/{id}/save  POST 定稿保存
+// 单元方案：
+//   /api/v1/unit-plans
+//   /api/v1/unit-plans/{id}
+//   /api/v1/unit-plans/{id}/chat
+//   /api/v1/unit-plans/{id}/save
+//   /api/v1/unit-plans/mountable
 //
-// 自构造 service+handler，routes.go 的 Setup 只需加一行 registerUnitPlanRoutes(mux, authMW, cfg)。
-// 写权限的归属校验在 service 层，路由层只要求登录态（仿 registerCourseOutlineRoutes）。
+// 大单元参考资料：
+//   GET/POST /api/v1/unit-plan-materials?unit_plan_id={id}
+//   DELETE   /api/v1/unit-plan-materials/{material_id}?unit_plan_id={id}
 
 import (
 	"net/http"
@@ -24,11 +27,29 @@ func registerUnitPlanRoutes(
 	authMW func(http.Handler) http.Handler,
 	cfg *config.Config,
 ) {
-	svc := services.NewUnitPlanService(cfg)
-	h := handlers.NewUnitPlanHandler(svc)
+	unitPlanService := services.NewUnitPlanService(cfg)
+	unitPlanHandler := handlers.NewUnitPlanHandler(unitPlanService)
+
+	materialService := services.NewUnitPlanMaterialService()
+	materialHandler := handlers.NewUnitPlanMaterialHandler(materialService)
 
 	mux.Handle("/api/v1/unit-plans", middleware.Chain(
-		http.HandlerFunc(h.HandleCollection), authMW))
+		http.HandlerFunc(unitPlanHandler.HandleCollection),
+		authMW,
+	))
+
 	mux.Handle("/api/v1/unit-plans/", middleware.Chain(
-		http.HandlerFunc(h.HandleItem), authMW))
+		http.HandlerFunc(unitPlanHandler.HandleItem),
+		authMW,
+	))
+
+	mux.Handle("/api/v1/unit-plan-materials", middleware.Chain(
+		http.HandlerFunc(materialHandler.HandleCollection),
+		authMW,
+	))
+
+	mux.Handle("/api/v1/unit-plan-materials/", middleware.Chain(
+		http.HandlerFunc(materialHandler.HandleItem),
+		authMW,
+	))
 }

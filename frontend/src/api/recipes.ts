@@ -363,14 +363,27 @@ export async function getMarketRecipes(params?: Record<string, string | number>)
 // ==================== 对话模式可用配方查询 ====================
 
 /**
- * 获取当前老师在指定学科下可见的配方列表（对话模式首屏配方下拉消费）
+ * 获取当前老师在指定学科和具体年级下可见的配方。
  *
- * 可见性：个人创建 + 教研组共享 + 学校共享
- * 排序：学校配方 > 教研组配方 > 个人配方（教研共识优先）
+ * 可见性：个人创建 + 教研组共享 + 学校共享。
+ * 严格匹配：学科精确一致，具体年级完全一致；
+ * 不接受空年级、学段级或跨年级范围配方。
  */
-export async function getAvailableRecipes(subject?: string): Promise<{ recipes: RecipeListItem[]; total: number }> {
-  const params: Record<string, string> = {}
-  if (subject) params.subject = subject
-  const resp = await apiClient.get('/lesson-plans/recipes/available', { params })
+export async function getAvailableRecipes(
+  subject: string,
+  grade: string,
+): Promise<{
+  recipes: RecipeListItem[]
+  total: number
+}> {
+  const resp = await apiClient.get(
+    '/lesson-plans/recipes/available',
+    {
+      params: {
+        subject,
+        grade,
+      },
+    },
+  )
   return resp.data.data
 }

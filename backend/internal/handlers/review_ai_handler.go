@@ -33,6 +33,7 @@ import (
 	"tedna/internal/config"
 	"tedna/internal/logger"
 	"tedna/internal/middleware"
+	"tedna/internal/models"
 	"tedna/internal/repository"
 	"tedna/internal/services"
 	"tedna/internal/utils"
@@ -115,9 +116,11 @@ func prepareSSEResponse(w http.ResponseWriter) http.Flusher {
 // ReviewAIOverviewRequest 生成教案概览请求体
 // v110 新增字段:AssistantID(可选)
 type ReviewAIOverviewRequest struct {
-	PlanMeta    string `json:"plan_meta"`    // 教案基本信息(学科/年级/课题/课时)
-	PlanContent string `json:"plan_content"` // 教案正文内容
-	AssistantID string `json:"assistant_id"` // v110 新增:可选的 AI 助手 ID
+	PlanMeta    string `json:"plan_meta"`
+	PlanContent string `json:"plan_content"`
+	Subject     string `json:"subject"`
+	Grade       string `json:"grade"`
+	AssistantID string `json:"assistant_id"`
 }
 
 // Overview POST /lesson-plans/review-ai/overview (SSE)
@@ -148,7 +151,15 @@ func (h *ReviewAIHandler) Overview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// v110 新增:根据 assistant_id 决定 system prompt
-	systemPrompt, err := h.resolveSystemPrompt(r, claims.UserID, claims.Role, req.AssistantID, reviewOverviewDefaultPrompt)
+	systemPrompt, err := h.resolveSystemPrompt(
+		r,
+		claims.UserID,
+		claims.Role,
+		req.AssistantID,
+		reviewOverviewDefaultPrompt,
+		req.Subject,
+		req.Grade,
+	)
 	if err != nil {
 		utils.BadRequest(w, err.Error())
 		return
@@ -230,11 +241,13 @@ func (h *ReviewAIHandler) Overview(w http.ResponseWriter, r *http.Request) {
 // ReviewAIChatRequest 对话式审核请求体
 // v110 新增字段:AssistantID(可选)
 type ReviewAIChatRequest struct {
-	PlanMeta    string              `json:"plan_meta"`    // 教案基本信息
-	PlanContent string              `json:"plan_content"` // 教案正文内容
-	History     []map[string]string `json:"history"`      // 对话历史 [{role,content},...]
-	Message     string              `json:"message"`      // 当前问题
-	AssistantID string              `json:"assistant_id"` // v110 新增:可选的 AI 助手 ID
+	PlanMeta    string              `json:"plan_meta"`
+	PlanContent string              `json:"plan_content"`
+	Subject     string              `json:"subject"`
+	Grade       string              `json:"grade"`
+	History     []map[string]string `json:"history"`
+	Message     string              `json:"message"`
+	AssistantID string              `json:"assistant_id"`
 }
 
 // Chat POST /lesson-plans/review-ai/chat (SSE)
@@ -265,7 +278,15 @@ func (h *ReviewAIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// v110 新增:根据 assistant_id 决定 system prompt
-	systemPrompt, err := h.resolveSystemPrompt(r, claims.UserID, claims.Role, req.AssistantID, reviewChatDefaultPrompt)
+	systemPrompt, err := h.resolveSystemPrompt(
+		r,
+		claims.UserID,
+		claims.Role,
+		req.AssistantID,
+		reviewChatDefaultPrompt,
+		req.Subject,
+		req.Grade,
+	)
 	if err != nil {
 		utils.BadRequest(w, err.Error())
 		return
@@ -370,38 +391,104 @@ func (h *ReviewAIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 // 加载失败时返回清晰的用户可见错误;由 caller 决定 HTTP 状态码
 func (h *ReviewAIHandler) resolveSystemPrompt(
 	r *http.Request,
-	userID, role, assistantID, defaultPrompt string,
+	userID string,
+	role string,
+	assistantID string,
+	defaultPrompt string,
+	subject string,
+	grade string,
 ) (string, error) {
-	if strings.TrimSpace(assistantID) == "" {
+	assistantID = strings.TrimSpace(assistantID)
+	if assistantID == "" {
 		return defaultPrompt, nil
 	}
 	if h.assistantService == nil {
-		// 服务未注入的兜底(理论上不会发生)
-		reviewAILog.Warn("AIAssistantService未初始化, 降级使用默认prompt")
+		reviewAILog.Warn(
+			"AIAssistantService未初始化，降级使用默认prompt",
+		)
 		return defaultPrompt, nil
 	}
 
-	actor := services.BuildActorFromClaims(r.Context(), userID, role)
-	a, err := h.assistantService.LoadActiveAssistantForUse(r.Context(), actor, assistantID)
+	subject = strings.TrimSpace(subject)
+	grade = strings.TrimSpace(grade)
+	if subject == "" || grade == "" {
+		return "", errors.New(
+			"缺少教案学科或具体年级，无法校验所选AI助手",
+		)
+	}
+
+	actor := services.BuildActorFromClaims(
+		r.Context(),
+		userID,
+		role,
+	)
+
+	assistant, err :=
+		h.assistantService.LoadActiveAssistantForLessonUse(
+			r.Context(),
+			actor,
+			assistantID,
+			subject,
+			grade,
+			models.SceneReviewWorkbench,
+		)
 	if err != nil {
-		// 用户友好错误
 		switch {
-		case errors.Is(err, repository.ErrAIAssistantNotFound):
-			return "", errors.New("选择的 AI 助手不存在")
-		case errors.Is(err, repository.ErrAIAssistantInactive):
-			return "", errors.New("选择的 AI 助手已停用,请切换其他助手")
-		case errors.Is(err, services.ErrAssistantPermDenied):
-			return "", errors.New("无权使用该 AI 助手")
+		case errors.Is(
+			err,
+			repository.ErrAIAssistantNotFound,
+		):
+			return "", errors.New(
+				"选择的 AI 助手不存在",
+			)
+
+		case errors.Is(
+			err,
+			repository.ErrAIAssistantInactive,
+		):
+			return "", errors.New(
+				"选择的 AI 助手已停用，请切换其他助手",
+			)
+
+		case errors.Is(
+			err,
+			services.ErrAssistantPermDenied,
+		):
+			return "", errors.New(
+				"无权使用该 AI 助手",
+			)
+
+		case errors.Is(
+			err,
+			services.ErrAssistantLessonMismatch,
+		):
+			return "", errors.New(
+				"选择的 AI 助手不适用于当前教案的学科、具体年级或评审场景",
+			)
+
 		default:
-			reviewAILog.Error("加载助手失败", "assistant_id", assistantID, "error", err)
-			return "", errors.New("加载 AI 助手失败,请稍后重试")
+			reviewAILog.Error(
+				"加载助手失败",
+				"assistant_id", assistantID,
+				"subject", subject,
+				"grade", grade,
+				"error", err,
+			)
+			return "", errors.New(
+				"加载 AI 助手失败，请稍后重试",
+			)
 		}
 	}
-	if strings.TrimSpace(a.FullPrompt) == "" {
-		reviewAILog.Warn("助手full_prompt为空, 降级使用默认prompt", "assistant_id", assistantID)
+
+	if strings.TrimSpace(assistant.FullPrompt) == "" {
+		reviewAILog.Warn(
+			"助手full_prompt为空，降级使用默认prompt",
+			"assistant_id", assistantID,
+		)
 		return defaultPrompt, nil
 	}
-	return a.FullPrompt, nil
+
+	return assistant.FullPrompt, nil
 }
 
 // schoolIDPtrH 空串转 nil 的小工具（handlers 包内用；与 services.schoolIDPtr 等价，

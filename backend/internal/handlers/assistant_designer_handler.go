@@ -1,32 +1,27 @@
 package handlers
 
-// assistant_designer_handler.go — AI 助手对话式创作 HTTP 接口(TE-DNA 3.0 P0.5)
+// assistant_designer_handler.go — AI 助手对话式创作与教学风格画像接口
 //
-// 对应 Service:services/assistant_designer_service.go
+// 接口清单：
+//   POST /api/v1/ai-assistants/design/chat
+//     对话式生成助手，使用 SSE 流式返回。
 //
-// 接口清单:
-//   POST /api/v1/ai-assistants/design/chat  — 对话式生成(SSE 流式)
+//   POST /api/v1/ai-assistants/design/profile-materials
+//     一次性读取平台教案或前端提取的 Word/PDF/粘贴文字，
+//     返回可编辑的教学风格与成长画像，使用普通 JSON 返回。
 //
-// SSE 事件协议:
-//   event: connected    → {"phase":"start"}              流建立
-//   event: searching    → {"reason":"为何要查库..."}        AI 决定调组件库时
-//   event: components   → {"components":[{id,name,library_type,...}]}  查到组件
-//   event: chunk        → {"chunk":"..."}                 AI 最终回复流式文本(多次)
-//   event: draft_update → {"draft":"...完整草稿..."}       草稿更新(一次)
-//   event: done         → {"reply":"...","draft":"...","referenced":[id,id]}
-//   event: error        → {"error":"..."}                 任何错误
-//
-// 错误处理:
-//   - 鉴权失败 / 请求体格式错误:走普通 JSON 400/401(非 SSE)
-//   - 进入 SSE 后的错误走 error 事件
-//
-// 积分硬闸 batch (2026-07-04):
-//   DesignChat 调用补传 claims.UserID(服务层据此构造带 UserID 的 traceCtx,
-//   修复设计器两阶段 AI 调用 traceCtx=nil 的积分旁路:0积分照用/不扣费/不留痕)。
-//   服务层阶段1失败现已回调 OnError,积分拦截文案经 error 事件直达前端。
+// SSE 事件协议：
+//   event: connected    → {"phase":"start"}
+//   event: searching    → {"reason":"为何要查库..."}
+//   event: components   → {"components":[...]}
+//   event: chunk        → {"chunk":"..."}
+//   event: draft_update → {"draft":"...完整草稿..."}
+//   event: done         → {"reply":"...","draft":"...","referenced":[...]}
+//   event: error        → {"error":"..."}
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -38,34 +33,21 @@ import (
 	"tedna/internal/utils"
 )
 
-// AssistantDesignerHandler AI 助手对话式创作处理器
+// AssistantDesignerHandler AI 助手创作与教学风格画像处理器。
 type AssistantDesignerHandler struct {
 	designerService *services.AssistantDesignerService
 }
 
-// NewAssistantDesignerHandler 构造函数
+// NewAssistantDesignerHandler 构造函数。
 func NewAssistantDesignerHandler(ds *services.AssistantDesignerService) *AssistantDesignerHandler {
 	return &AssistantDesignerHandler{
 		designerService: ds,
 	}
 }
 
-// ==================== 请求体定义 ====================
-
-// DesignChatRequest 对话式创作请求
-type DesignChatRequest struct {
-	Message      string                     `json:"message"`       // 老师本轮消息
-	History      []services.DesignerMessage `json:"history"`       // 对话历史(可空)
-	Subject      string                     `json:"subject"`       // Modal 当前学科
-	Grade        string                     `json:"grade"`         // Modal 当前年级
-	Scenes       []string                   `json:"scenes"`        // Modal 勾选的场景
-	CurrentDraft string                     `json:"current_draft"` // 当前草稿(可空)
-}
-
 // ==================== SSE 工具函数 ====================
 
-// writeDesignerSSEEvent 向客户端写入一条 SSE 事件
-// 格式与 review_ai_handler/annotation_handler 保持一致,便于前端统一消费
+// writeDesignerSSEEvent 向客户端写入一条 SSE 事件。
 func writeDesignerSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string, data interface{}) {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
@@ -75,8 +57,7 @@ func writeDesignerSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventTyp
 	flusher.Flush()
 }
 
-// prepareDesignerSSE 切换 HTTP 响应为 SSE 流式模式
-// 返回 flusher(不支持时返回 nil)
+// prepareDesignerSSE 切换 HTTP 响应为 SSE 流式模式。
 func prepareDesignerSSE(w http.ResponseWriter) http.Flusher {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -86,25 +67,17 @@ func prepareDesignerSSE(w http.ResponseWriter) http.Flusher {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("X-Accel-Buffering", "no") // 关键:禁用 Nginx 对 SSE 的缓冲
+	w.Header().Set("X-Accel-Buffering", "no")
 	return flusher
 }
 
-// ==================== 对话式创作接口 ====================
+// ==================== 教学风格画像 ====================
 
-// Chat POST /api/v1/ai-assistants/design/chat (SSE 流式)
+// ProfileMaterials POST /api/v1/ai-assistants/design/profile-materials
 //
-// 请求体:DesignChatRequest
-// 响应:SSE 事件流(见文件头部 SSE 事件协议注释)
-//
-// 流程:
-//   1. 鉴权 + 参数校验(走普通 JSON 错误响应)
-//   2. 切换 SSE 响应头,发 connected 事件
-//   3. 调 designerService.DesignChat(传入 callbacks 把每个阶段的事件转成 SSE)
-//   4. 老师看到:AI 思考 → [若需要]查库进度 → 流式回复 → 草稿更新 → 完成
-func (h *AssistantDesignerHandler) Chat(w http.ResponseWriter, r *http.Request) {
-	// ========== 前置错误阶段:走普通 JSON 响应 ==========
-
+// 普通 JSON 接口，不使用 SSE。
+// 原始材料只在本次请求中使用，不写数据库。
+func (h *AssistantDesignerHandler) ProfileMaterials(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
@@ -116,7 +89,79 @@ func (h *AssistantDesignerHandler) Chat(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var req DesignChatRequest
+	if h.designerService == nil {
+		utils.InternalError(w, "Designer 服务未初始化")
+		return
+	}
+
+	var req services.StyleProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.BadRequest(w, utils.MsgBadRequestBody)
+		return
+	}
+
+	resp, err := h.designerService.AnalyzeStyleProfile(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+		&req,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, services.ErrStyleProfileNoMaterials),
+			errors.Is(err, services.ErrStyleProfileTooManyMaterials),
+			errors.Is(err, services.ErrStyleProfileMaterialInvalid),
+			errors.Is(err, services.ErrStyleProfileMaterialTooLong),
+			errors.Is(err, services.ErrStyleProfileTotalTooLong),
+			errors.Is(err, services.ErrStyleProfilePlanEmpty):
+			utils.BadRequest(w, err.Error())
+
+		case errors.Is(err, services.ErrStyleProfilePlanNotAccessible):
+			utils.Forbidden(w, err.Error())
+
+		default:
+			log.Printf(
+				"[designer profile] 画像生成失败 user=%s error=%v",
+				claims.UserID,
+				err,
+			)
+			utils.InternalError(w, err.Error())
+		}
+		return
+	}
+
+	utils.Success(w, resp)
+}
+
+// ==================== 对话式创作 ====================
+
+// Chat POST /api/v1/ai-assistants/design/chat
+//
+// 流程：
+//  1. 鉴权和参数校验。
+//  2. 切换 SSE 响应头并发送 connected。
+//  3. 调用 Designer 两阶段 AI 服务。
+//  4. 通过回调推送查库、组件、流式文本、草稿和完成事件。
+func (h *AssistantDesignerHandler) Chat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		return
+	}
+
+	var req struct {
+		Message      string                     `json:"message"`
+		History      []services.DesignerMessage `json:"history"`
+		Subject      string                     `json:"subject"`
+		Grade        string                     `json:"grade"`
+		Scenes       []string                   `json:"scenes"`
+		CurrentDraft string                     `json:"current_draft"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
@@ -130,20 +175,15 @@ func (h *AssistantDesignerHandler) Chat(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// ========== 切换 SSE 响应头 ==========
-
 	flusher := prepareDesignerSSE(w)
 	if flusher == nil {
 		utils.InternalError(w, "不支持流式响应")
 		return
 	}
 
-	// 发送 connected 事件(让前端知道流已建立)
 	writeDesignerSSEEvent(w, flusher, "connected", map[string]string{
 		"phase": "start",
 	})
-
-	// ========== 构造 Designer 上下文 + SSE 回调 ==========
 
 	dCtx := &services.DesignerContext{
 		Subject:      strings.TrimSpace(req.Subject),
@@ -154,7 +194,6 @@ func (h *AssistantDesignerHandler) Chat(w http.ResponseWriter, r *http.Request) 
 
 	startTime := time.Now()
 
-	// SSE 回调:每个阶段把事件转成 SSE 推给前端
 	callbacks := &services.DesignerStreamCallbacks{
 		OnSearching: func(reason string) {
 			writeDesignerSSEEvent(w, flusher, "searching", map[string]string{
@@ -172,7 +211,6 @@ func (h *AssistantDesignerHandler) Chat(w http.ResponseWriter, r *http.Request) 
 			})
 		},
 		OnDone: func(reply, draft string, referenced []string) {
-			// draft 如果非空,先单独发一个 draft_update 事件,方便前端"草稿区"单独订阅
 			if strings.TrimSpace(draft) != "" {
 				writeDesignerSSEEvent(w, flusher, "draft_update", map[string]string{
 					"draft": draft,
@@ -183,9 +221,14 @@ func (h *AssistantDesignerHandler) Chat(w http.ResponseWriter, r *http.Request) 
 				"draft":      draft,
 				"referenced": referenced,
 			})
-			log.Printf("[designer chat] 完成 user=%s subject=%s grade=%s ref_count=%d latency=%dms",
-				claims.UserID, dCtx.Subject, dCtx.Grade, len(referenced),
-				time.Since(startTime).Milliseconds())
+			log.Printf(
+				"[designer chat] 完成 user=%s subject=%s grade=%s ref_count=%d latency=%dms",
+				claims.UserID,
+				dCtx.Subject,
+				dCtx.Grade,
+				len(referenced),
+				time.Since(startTime).Milliseconds(),
+			)
 		},
 		OnError: func(errMsg string) {
 			writeDesignerSSEEvent(w, flusher, "error", map[string]string{
@@ -194,12 +237,18 @@ func (h *AssistantDesignerHandler) Chat(w http.ResponseWriter, r *http.Request) 
 		},
 	}
 
-	// ========== 调用 Service ==========
-	// 积分硬闸 batch:补传 claims.UserID(认证中间件保证非空),
-	// 服务层据此构造 traceCtx,积分守卫/扣费/trace 全部归位。
-
-	if err := h.designerService.DesignChat(r.Context(), claims.UserID, req.Message, req.History, dCtx, callbacks); err != nil {
-		// 此时已经进入 SSE 模式,错误已通过 OnError 回调推给前端,这里只记日志
-		log.Printf("[designer chat] DesignChat 失败: user=%s err=%v", claims.UserID, err)
+	if err := h.designerService.DesignChat(
+		r.Context(),
+		claims.UserID,
+		req.Message,
+		req.History,
+		dCtx,
+		callbacks,
+	); err != nil {
+		log.Printf(
+			"[designer chat] DesignChat 失败: user=%s err=%v",
+			claims.UserID,
+			err,
+		)
 	}
 }

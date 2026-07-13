@@ -35,20 +35,23 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import {
   startConversation, sendChatMessage, triggerAIReview, applyAISuggestions,
-  publishLessonPlanPersonal, createLessonPlanSSE, getLessonPlan, getConversation,
+  publishLessonPlanPersonal, updateLessonPlan, createLessonPlanSSE, getLessonPlan, getConversation,
   getStageStatus, advanceStage, skipStage, backStage, getStageOutput, resetStage, switchToStage, getStageCompleteness,
   type LessonPlan, type ConversationMessage, type AIReviewResult, type ConvComponent,
   type StageProgressItem, type StageEventData, type StageCompletenessResponse,
   type SSEConnectionState, type SSEConnection,
+  type RecipeSelectionMode,
 } from '@/api/lesson-plans'
 import {
-  C, renderMarkdown, type StreamingState,
+  C, type StreamingState,
   STAGE_STATUS_ICON, STAGE_STATUS_COLOR, STAGE_CODE_EMOJI,
 } from './components/workshopConstants'
 import {
   StartForm, AIBubble, UserBubble, ThinkingIndicator, ReviewPanel,
 } from './components/WorkshopPanels'
+import LessonDocumentEditor from './components/LessonDocumentEditor'
 import { setLessonPlanCourseOutlinePublisher } from '@/api/course-outlines'
+import type { LessonPlanContentRestoreResponse } from '@/api/lesson-plan-versions'
 import { StageSummaryModal } from './components/StageSummaryModal'
 import { StageTransitionView } from './components/StageTransitionView'
 import { StageSeparatorBubble } from './components/StageSeparatorBubble'
@@ -367,6 +370,7 @@ export default function WorkshopPage() {
             return prev
           })
           const planData = await getLessonPlan(currentPlanId)
+          setPlan(planData)
           if (planData.content_markdown) setPlanContent(planData.content_markdown)
           if (planData.current_stage && planData.stage_config) {
             await refreshStages(currentPlanId)
@@ -379,6 +383,36 @@ export default function WorkshopPage() {
       },
     })
   }, [token, refreshStages])
+
+  /**
+   * v233：AI或系统更新正文后同步数据库中的正式教案版本。
+   *
+   * SSE的content_update只携带正文，不携带version。
+   * 因此正文更新后重新读取一次教案，避免右栏按钮长期显示旧版本。
+   */
+  useEffect(() => {
+    if (!plan?.id || !planContent) return
+
+    const planID = plan.id
+    const timer = window.setTimeout(() => {
+      void getLessonPlan(planID)
+        .then(latestPlan => {
+          setPlan(previous =>
+            previous?.id === latestPlan.id
+              ? latestPlan
+              : previous
+          )
+        })
+        .catch(error => {
+          console.error(
+            '正文更新后同步专家模式正式版本失败:',
+            error,
+          )
+        })
+    }, 300)
+
+    return () => window.clearTimeout(timer)
+  }, [plan?.id, planContent])
 
   useEffect(() => {
     if (!effectivePlanId || phase !== 'resuming') return
@@ -460,12 +494,31 @@ export default function WorkshopPage() {
     }
   }
 
-  const handleStart = async (subject: string, grade: string, topic: string, duration: number, recipeId?: string, textbookPageIds?: string[], coursePublisher?: string | null) => {
+  const handleStart = async (
+    subject: string,
+    grade: string,
+    topic: string,
+    duration: number,
+    recipeMode: RecipeSelectionMode,
+    recipeId?: string,
+    textbookPageIds?: string[],
+    coursePublisher?: string | null,
+  ) => {
     setStartLoading(true)
     try {
-      const req: Record<string, unknown> = { subject, grade, topic, duration_minutes: duration }
-      if (recipeId) req.recipe_id = recipeId
-      if (textbookPageIds && textbookPageIds.length > 0) req.textbook_page_ids = textbookPageIds
+      const req: Record<string, unknown> = {
+        subject,
+        grade,
+        topic,
+        duration_minutes: duration,
+        recipe_mode: recipeMode,
+      }
+      if (recipeMode === 'selected' && recipeId) {
+        req.recipe_id = recipeId
+      }
+      if (textbookPageIds && textbookPageIds.length > 0) {
+        req.textbook_page_ids = textbookPageIds
+      }
       const resp = await startConversation(req as unknown as Parameters<typeof startConversation>[0])
       setPlan(resp.plan)
       setMessages([resp.opening_message])
@@ -633,6 +686,59 @@ export default function WorkshopPage() {
     setApplyingReview(true)
     try { await applyAISuggestions(plan.id, ids) }
     catch (err) { setApplyingReview(false); console.error('应用建议失败:', err) }
+  }
+
+  /**
+   * 保存老师在专家模式右栏中直接编辑的完整正文。
+   *
+   * 复用现有教案更新接口，并同步本页 planContent，
+   * 保存完成后右栏预览、发布门控和后续AI上下文都读取同一份正文。
+   */
+  const handleManualContentSave = async (nextContent: string) => {
+    if (!plan) {
+      throw new Error('当前教案尚未加载')
+    }
+    if (isBusy) {
+      throw new Error('AI正在处理正文，请等待完成后再保存')
+    }
+
+    await updateLessonPlan(plan.id, {
+      content_markdown: nextContent,
+    })
+
+    // 服务端是版本号唯一事实来源。
+    // 不使用页面缓存version+1，避免AI已更新多版时显示错误版本。
+    const latestPlan = await getLessonPlan(plan.id)
+    setPlan(latestPlan)
+    setPlanContent(
+      latestPlan.content_markdown || nextContent,
+    )
+
+    showContentToast(
+      `✅ 教案正文已保存，当前版本v${latestPlan.version}`,
+    )
+  }
+
+  /**
+   * 历史版本恢复成功后同步专家模式右栏和顶部教案信息。
+   */
+  const handleContentRestored = (
+    result: LessonPlanContentRestoreResponse,
+  ) => {
+    setPlanContent(result.content_markdown)
+    setPlan(previous => previous
+      ? {
+          ...previous,
+          title: result.title,
+          content_markdown: result.content_markdown,
+          duration_minutes: result.duration_minutes,
+          version: result.current_version,
+        }
+      : previous
+    )
+    showContentToast(
+      `✅ 已恢复历史v${result.restored_from_version}，当前为v${result.current_version}`,
+    )
   }
 
   const handlePublish = async () => {
@@ -1134,7 +1240,7 @@ export default function WorkshopPage() {
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 16px', marginBottom: '12px', background: 'linear-gradient(135deg, rgba(79,123,232,0.06), rgba(16,185,129,0.06))', borderRadius: '10px', border: '1px solid rgba(79,123,232,0.15)', fontSize: '13px', color: '#374151', alignSelf: 'stretch' }}>
               <span style={{ fontSize: '15px', flexShrink: 0 }}>📷</span>
               <span style={{ flex: 1, lineHeight: 1.6 }}>
-                想在教案里插入图片？完成备课后，在「<span style={{ fontWeight: 600, color: '#4F7BE8' }}>我的教案 → 详情页</span>」点段落右侧 ✏️ 即可上传图片
+                想直接调整教案？可在右侧「<span style={{ fontWeight: 600, color: '#4F7BE8' }}>教案预览</span>」点击「编辑正文」，并支持拖拽、粘贴或点击上传图片
               </span>
               <button
                 onClick={() => { setImageTipDismissed(true); try { localStorage.setItem('workshop_image_tip_dismissed', '1') } catch {} }}
@@ -1346,16 +1452,58 @@ export default function WorkshopPage() {
         </div>
 
         <div style={{ flex: 1, overflow: 'hidden' }}>
-          {rightPanel === 'preview' && (
-            <div style={{ height: '100%', overflowY: 'auto', padding: '16px', boxSizing: 'border-box' }}>
-              {planContent
-                ? <div style={{ fontSize: '13px', lineHeight: 1.8 }}>{renderMarkdown(planContent)}</div>
-                : <div style={{ height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: C.textMuted, textAlign: 'center', padding: '24px' }}>
-                    <div style={{ fontSize: '32px', marginBottom: '12px' }}>📄</div>
-                    <div style={{ fontSize: '14px', lineHeight: 1.6 }}>教案内容将在这里实时显示<br />进行到"教案撰写"阶段后自动更新</div>
-                  </div>
+          {rightPanel === 'preview' && plan && (
+            <LessonDocumentEditor
+              content={planContent}
+              planID={plan.id}
+              currentVersion={plan.version || 1}
+              disabled={
+                isBusy ||
+                ![
+                  'draft',
+                  'published_personal',
+                  'revision',
+                  'approved',
+                  'published_shared',
+                ].includes(plan.status)
               }
-            </div>
+              disabledReason={
+                isBusy
+                  ? 'AI正在生成、评审或切换阶段，完成后即可编辑'
+                  : ![
+                      'draft',
+                      'published_personal',
+                      'revision',
+                      'approved',
+                      'published_shared',
+                    ].includes(plan.status)
+                    ? '当前教案状态已锁定，不允许修改正文'
+                    : ''
+              }
+              onSave={handleManualContentSave}
+              onRestored={handleContentRestored}
+              compact
+              emptyState={(
+                <div style={{
+                  height: '100%',
+                  minHeight: '300px',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: C.textMuted,
+                  textAlign: 'center',
+                  padding: '24px',
+                }}>
+                  <div style={{ fontSize: '32px', marginBottom: '12px' }}>📄</div>
+                  <div style={{ fontSize: '14px', lineHeight: 1.7 }}>
+                    教案内容将在这里实时显示
+                    <br />
+                    也可以点击「手动填写」直接开始
+                  </div>
+                </div>
+              )}
+            />
           )}
           {rightPanel === 'review' && (
             review && review.total_score

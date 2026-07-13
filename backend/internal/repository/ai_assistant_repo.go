@@ -160,7 +160,8 @@ func GetAIAssistantByID(ctx context.Context, id string) (*models.AIAssistant, er
 // ListAIAssistants 列表查询,按可见性规则返回当前用户可见的助手
 //
 // 里程碑一可见性(OR 并集):
-//   system(所有人) + 教研组级 group(我所属的组) + 全校级 group(同校) + personal(自己)
+//
+//	system(所有人) + 教研组级 group(我所属的组) + 全校级 group(同校) + personal(自己)
 //
 // v115改动:GradeRange 过滤前先调 NormalizeGradeToSegment 归一化为学段
 //
@@ -222,17 +223,15 @@ func ListAIAssistants(ctx context.Context, params *models.ListAIAssistantsParams
 		where += " AND a.is_active = true"
 	}
 	if params.Subject != "" {
-		where += fmt.Sprintf(" AND (a.subject = $%d OR a.subject IS NULL OR a.subject = '')", argIdx)
+		// 学科严格匹配：空学科通用助手不再参与具体课程匹配。
+		where += fmt.Sprintf(" AND a.subject = $%d", argIdx)
 		args = append(args, params.Subject)
 		argIdx++
 	}
-	// v115:Grade 过滤升级为学段级匹配
-	if params.GradeRange != "" {
-		segment := utils.NormalizeGradeToSegment(params.GradeRange)
-		where += fmt.Sprintf(" AND (a.grade_range = $%d OR a.grade_range IS NULL OR a.grade_range = '')", argIdx)
-		args = append(args, segment)
-		argIdx++
-	}
+	// 具体年级不直接在SQL中比较：
+	// 数据库存量可能使用“高三/十二年级/12年级/12”等同义表达，
+	// 扫描结果后统一调用utils.IsStrictGradeMatch。
+	// 学段、空年级和跨年级范围都会被严格排除。
 	if params.Scene != "" {
 		// scenes 是 JSONB 数组,使用 @> 判断包含
 		where += fmt.Sprintf(" AND a.scenes @> $%d::jsonb", argIdx)
@@ -304,6 +303,16 @@ func ListAIAssistants(ctx context.Context, params *models.ListAIAssistantsParams
 		// 回填教研组归属(供前端区分教研组级/全校级展示)
 		item.GroupID = groupID
 
+		// 具体年级严格过滤：高三只接受高三、12、十二年级等同义表达。
+		// 高中、高一、高二、范围或空年级助手均不参与匹配。
+		if params.GradeRange != "" &&
+			!utils.IsStrictGradeMatch(
+				item.GradeRange,
+				params.GradeRange,
+			) {
+			continue
+		}
+
 		// 解析 scenes
 		var scenes []string
 		_ = json.Unmarshal([]byte(scenesJSON), &scenes)
@@ -345,29 +354,36 @@ func ListAIAssistants(ctx context.Context, params *models.ListAIAssistantsParams
 	if items == nil {
 		items = []*models.AIAssistantListItem{}
 	}
+
+	// 年级在Go层完成严格过滤时，以过滤后的数量作为真实total。
+	if params.GradeRange != "" {
+		total = len(items)
+	}
+
 	return items, total, nil
 }
 
 // canEditAssistant 判断当前用户能否编辑该助手(列表层快速提示)
 //
 // ⚠ 说明:本函数仅用于列表项 CanEdit/CanDelete 的"按钮显隐提示",
-//   不是权限的最终防线。真正的编辑/删除拦截在 service 层 canEdit(),
-//   那里有完整的 MyLeadGroupIDs,能精确判定"组长可改本组其他人建的助手"。
 //
-//   本函数为保持改动收敛,对教研组级助手只放行"创建者本人 + admin",
-//   不放行"组长改组员建的组助手"(此情况按钮不显示,但组长仍可经正常编辑入口操作,
-//   service 层会放行)。这是 UI 提示偏保守、不影响安全与功能正确性的有意取舍。
+//	不是权限的最终防线。真正的编辑/删除拦截在 service 层 canEdit(),
+//	那里有完整的 MyLeadGroupIDs,能精确判定"组长可改本组其他人建的助手"。
 //
-//   share_policy 叠加(本次新增):
-//     use_only / locked → 即使 source 规则允许,非属主非 admin 也不显示编辑按钮
-//       (防"标准被改坏":只有属主、组长、admin 能改;组员看到的是只读)
-//     open              → 不额外收紧,沿用 source 规则
+//	本函数为保持改动收敛,对教研组级助手只放行"创建者本人 + admin",
+//	不放行"组长改组员建的组助手"(此情况按钮不显示,但组长仍可经正常编辑入口操作,
+//	service 层会放行)。这是 UI 提示偏保守、不影响安全与功能正确性的有意取舍。
 //
-//   规则(综合 source + share_policy):
-//     admin      → 任何助手都可编辑(不受 share_policy 限制)
-//     system     → 非 admin 一律不可
-//     group      → 创建者本人可编辑;use_only/locked 时非创建者(组长除外,组长由 service 兜底)不可
-//     personal   → 仅创建者本人(personal 本就只有自己看,share_policy 不额外影响)
+//	share_policy 叠加(本次新增):
+//	  use_only / locked → 即使 source 规则允许,非属主非 admin 也不显示编辑按钮
+//	    (防"标准被改坏":只有属主、组长、admin 能改;组员看到的是只读)
+//	  open              → 不额外收紧,沿用 source 规则
+//
+//	规则(综合 source + share_policy):
+//	  admin      → 任何助手都可编辑(不受 share_policy 限制)
+//	  system     → 非 admin 一律不可
+//	  group      → 创建者本人可编辑;use_only/locked 时非创建者(组长除外,组长由 service 兜底)不可
+//	  personal   → 仅创建者本人(personal 本就只有自己看,share_policy 不额外影响)
 func canEditAssistant(source, sharePolicy string, createdBy *string, orgID *string, groupID *string, params *models.ListAIAssistantsParams) bool {
 	// admin 可编辑任何助手(share_policy 对 admin 不设限)
 	if params.CurrentUserRole == models.RoleAdmin {
@@ -402,7 +418,8 @@ func canEditAssistant(source, sharePolicy string, createdBy *string, orgID *stri
 }
 
 // containsStrRepo 判断字符串切片是否包含目标值(repository 层内部小工具)
-//   (与 service 层 containsStr 同名不同包,这里独立一份避免跨层依赖)
+//
+//	(与 service 层 containsStr 同名不同包,这里独立一份避免跨层依赖)
 func containsStrRepo(list []string, target string) bool {
 	for _, v := range list {
 		if v == target {
@@ -415,16 +432,17 @@ func containsStrRepo(list []string, target string) bool {
 // canViewPromptAssistant 判断当前用户能否查看该助手的 full_prompt 原文(列表层快速提示,本次新增)
 //
 // ⚠ 与 canEditAssistant 同理:仅用于列表项 CanViewPrompt 的"按钮显隐提示",
-//   最终拦截在 service 层 GetAssistant(无权时把 full_prompt 置空)。
 //
-//   "能看原文" = "能编辑"同款闸门(Yuhan 拍板:看原文权限与编辑权限对齐):
-//     admin / 属主本人 / open 助手任何可见者 / 本组组长(对本组 use_only/open 助手) → 可看
-//     其余(包括能看到 use_only 助手的普通组员) → 不可看(防"丢给 AI 分析"绕开 fork 拿原文)
+//	最终拦截在 service 层 GetAssistant(无权时把 full_prompt 置空)。
 //
-//   注意:能进到列表里的助手已通过可见性过滤(locked 非属主已被剔除),
-//     所以这里 locked 只剩属主自己,直接复用 canEditAssistant 的判定即可:
-//       open  → 任何可见者可看(单独放行)
-//       其他  → 落到 canEditAssistant(admin/属主/组长)
+//	"能看原文" = "能编辑"同款闸门(Yuhan 拍板:看原文权限与编辑权限对齐):
+//	  admin / 属主本人 / open 助手任何可见者 / 本组组长(对本组 use_only/open 助手) → 可看
+//	  其余(包括能看到 use_only 助手的普通组员) → 不可看(防"丢给 AI 分析"绕开 fork 拿原文)
+//
+//	注意:能进到列表里的助手已通过可见性过滤(locked 非属主已被剔除),
+//	  所以这里 locked 只剩属主自己,直接复用 canEditAssistant 的判定即可:
+//	    open  → 任何可见者可看(单独放行)
+//	    其他  → 落到 canEditAssistant(admin/属主/组长)
 func canViewPromptAssistant(source, sharePolicy string, createdBy *string, orgID *string, groupID *string, params *models.ListAIAssistantsParams) bool {
 	// open:任何能看到的人都能看原文(open 本就允许 fork 带走,看原文更无妨)
 	if sharePolicy == models.SharePolicyOpen {
@@ -437,14 +455,15 @@ func canViewPromptAssistant(source, sharePolicy string, createdBy *string, orgID
 // canForkAssistant 判断当前用户能否把该助手 fork 成自己的(列表层快速提示,本次新增)
 //
 // ⚠ 与 canEditAssistant 同理:仅用于列表项 CanFork 的"按钮显隐提示",
-//   最终拦截在 service.ForkAssistant。
 //
-//   fork 语义=复制一份成自己的 personal 助手带走并可改。share_policy 决定能否带走:
-//     open      → 谁能看到(已被可见性 WHERE 过滤过)就能 fork
-//     use_only  → 仅属主/admin 可 fork(防产权流失:别人只能用不能复制带走)
-//     locked    → 仅属主/admin 可 fork(且 locked 本就只有属主/admin 可见)
+//	最终拦截在 service.ForkAssistant。
 //
-//   注意:能进到列表里的助手已通过可见性过滤,所以这里只需判 share_policy + 属主/admin。
+//	fork 语义=复制一份成自己的 personal 助手带走并可改。share_policy 决定能否带走:
+//	  open      → 谁能看到(已被可见性 WHERE 过滤过)就能 fork
+//	  use_only  → 仅属主/admin 可 fork(防产权流失:别人只能用不能复制带走)
+//	  locked    → 仅属主/admin 可 fork(且 locked 本就只有属主/admin 可见)
+//
+//	注意:能进到列表里的助手已通过可见性过滤,所以这里只需判 share_policy + 属主/admin。
 func canForkAssistant(sharePolicy string, createdBy *string, params *models.ListAIAssistantsParams) bool {
 	// admin 可 fork 任何可见助手
 	if params.CurrentUserRole == models.RoleAdmin {
@@ -466,7 +485,8 @@ func canForkAssistant(sharePolicy string, createdBy *string, params *models.List
 // 不允许修改:source/created_by/organization_id/group_id(归属永久不变)
 //
 // share_policy(本次新增):req.SharePolicy 为 nil 时不改(保持原值),
-//   非 nil 且合法时更新;非 nil 但非法值则忽略不改(防脏数据)。
+//
+//	非 nil 且合法时更新;非 nil 但非法值则忽略不改(防脏数据)。
 func UpdateAIAssistant(ctx context.Context, id string, req *models.UpdateAIAssistantRequest) error {
 	// 将 scenes 数组转换为 JSONB 字符串
 	scenesJSON, err := json.Marshal(req.Scenes)

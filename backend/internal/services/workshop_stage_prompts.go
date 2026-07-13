@@ -115,13 +115,17 @@ const chatPromptContentMaxRunes = 6000
 // 第4层只剩"骨架永远在 + 叠加"这一条路径。
 var stageAssistantOverlayEnabled = true
 
-// assistantOverlayMaxRunesPerPrompt 单个助手补充段注入第4层时的字数上限(按 rune 计)。
+// assistantOverlayMaxRunesPerPrompt 单个助手补充段注入第4层时的运行时上限（按 rune 计）。
 //
-// 助手补充本就是几百字的"教学经验 + 语气偏好 + 校本规范",1500 rune 绰绰有余,
-// 正常助手不会触发截断;仅对异常超长的助手内容做保护性按字截断,防止
-// 骨架(几千字)+ 多助手叠加 + 前序产出 + 课本注入 叠起来撑爆上下文。
-// 骨架(stage.SystemPrompt)永不被此上限约束。
-const assistantOverlayMaxRunesPerPrompt = 1500
+// 设计调整：1500 rune 只能容纳简短语气偏好，无法完整承载学科教学方法、地方教研要求、
+// 教师已有优势、成长目标和自检规则。现提高到 8000 rune：
+//   - 推荐助手正文控制在 2000—5000 rune；
+//   - 地方规范较多的复杂学科可到约 6000 rune；
+//   - 8000 rune 是运行保护上限，不是鼓励每份助手都写满。
+//
+// 完整原稿仍可在 ai_assistants.full_prompt 中保存；这里只控制每轮备课实际注入量。
+// 阶段骨架、配方、教材、学情和前序成果均不受此常量直接截断。
+const assistantOverlayMaxRunesPerPrompt = 8000
 
 // assistantOverlayConflictNotice 叠加段的前置冲突声明(§2.1)。
 //
@@ -346,7 +350,16 @@ func buildAssistantOverlay(assistantPrompts []string) string {
 		// 剥离助手夹带的芯片块(系统独占芯片协议,助手不得下发芯片)。
 		stripped := StripSuggestedActionsBlock(p)
 		// 保护性按 rune 截断,防极端超长助手内容撑爆上下文(正常助手远不及上限)。
-		stripped = safeUTF8Truncate(strings.TrimSpace(stripped), assistantOverlayMaxRunesPerPrompt)
+		stripped = strings.TrimSpace(stripped)
+		originalRunes := len([]rune(stripped))
+		stripped = safeUTF8Truncate(stripped, assistantOverlayMaxRunesPerPrompt)
+		if originalRunes > assistantOverlayMaxRunesPerPrompt {
+			logger.WithModule("workshop_stage_prompts").Warn(
+				"助手完整原稿超过工坊运行预算，已按Unicode字符安全截断",
+				"original_runes", originalRunes,
+				"injected_runes", assistantOverlayMaxRunesPerPrompt,
+			)
+		}
 		if strings.TrimSpace(stripped) == "" {
 			continue
 		}
@@ -961,24 +974,27 @@ func safeUTF8Truncate(s string, maxChars int) string {
 // ==================== v198:教学逻辑内核(pedagogyLogicCore)====================
 //
 // 背景与动机:
-//   AI 做教案时倾向于按"语义相似度"拼出一份"看起来像好教案"的东西,而非从学科逻辑的
-//   严谨性出发。典型病症有四:① 为了通俗好讲而编造违背学科本质的伪机制(如把 AI 图像识别
-//   讲成"先识别颜色再识别形状再组合"这类人类预设串行流水线,违背 AI 从样本中自学特征的
-//   本质);② 导入与情境脱离学生真实生活(2025 新课标明确要求与学生实际生活相关联);
-//   ③ 每个环节换一个新例子,徒增学生(尤其低年级)认知负荷、削弱逻辑主线;④ 通篇堆砌
-//   互不关联的前沿术语与华丽活动,却没有一条清晰的核心逻辑主线贯穿。
+//
+//	AI 做教案时倾向于按"语义相似度"拼出一份"看起来像好教案"的东西,而非从学科逻辑的
+//	严谨性出发。典型病症有四:① 为了通俗好讲而编造违背学科本质的伪机制(如把 AI 图像识别
+//	讲成"先识别颜色再识别形状再组合"这类人类预设串行流水线,违背 AI 从样本中自学特征的
+//	本质);② 导入与情境脱离学生真实生活(2025 新课标明确要求与学生实际生活相关联);
+//	③ 每个环节换一个新例子,徒增学生(尤其低年级)认知负荷、削弱逻辑主线;④ 通篇堆砌
+//	互不关联的前沿术语与华丽活动,却没有一条清晰的核心逻辑主线贯穿。
 //
 // 本函数产出一段「教学逻辑内核」规范,注入 analyze/design/write 三个阶段的第5层(对话规范),
 // 让 AI 从一开始就以"学科逻辑严谨性"而非"语义像不像好教案"为标准来设计与撰写。
 //
 // 关键校准(用户定调,不可教条化):
-//   学科本质约束不能限定太死。允许、且【鼓励】用学生这个年龄能听懂的生活化比喻把抽象
-//   原理讲明白(合理具象化);要扣的只是"歪曲学科真实机制、会让学生形成错误认知"的那种
-//   伪简化。给 AI 的是"正例+反例对照",指明安全区在哪,而非一味禁止具象化把 AI 吓得不敢讲。
+//
+//	学科本质约束不能限定太死。允许、且【鼓励】用学生这个年龄能听懂的生活化比喻把抽象
+//	原理讲明白(合理具象化);要扣的只是"歪曲学科真实机制、会让学生形成错误认知"的那种
+//	伪简化。给 AI 的是"正例+反例对照",指明安全区在哪,而非一味禁止具象化把 AI 吓得不敢讲。
 //
 // 分学段差异(第3条例子连贯性):按 grade 经 NormalizeGradeToSegment 归一为 小学/初中/高中,
-//   动态拼入对应一档措辞——小学最严(单例贯穿、禁频繁换例),初中(主线+至多一对照例),
-//   高中(主线下多角度延展但共享同一核心逻辑)。无法识别学段时用稳妥的通用口径。
+//
+//	动态拼入对应一档措辞——小学最严(单例贯穿、禁频繁换例),初中(主线+至多一对照例),
+//	高中(主线下多角度延展但共享同一核心逻辑)。无法识别学段时用稳妥的通用口径。
 func pedagogyLogicCore(grade string) string {
 	// 第3条"例子连贯性"按学段差异化:小学最严,初高中递进放宽
 	segment := utils.NormalizeGradeToSegment(grade)

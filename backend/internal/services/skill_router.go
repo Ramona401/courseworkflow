@@ -204,9 +204,37 @@ func RouteDefaultAssistant(
 		return ""
 	}
 
+	// 二次严格复核：即使仓储、测试替身或未来其它列表实现返回宽松候选，
+	// 默认路由也只接受学科、具体年级和当前场景全部明确一致的助手。
+	strictItems := make(
+		[]*models.AIAssistantListItem,
+		0,
+		len(resp.Assistants),
+	)
+	for _, item := range resp.Assistants {
+		if strictAssistantMatchesListItem(
+			item,
+			subject,
+			grade,
+			scene,
+		) {
+			strictItems = append(strictItems, item)
+		}
+	}
+	if len(strictItems) == 0 {
+		skillRouterLog.Info(
+			"默认助手解析-没有具体年级严格匹配候选，使用系统阶段骨架",
+			"stage", stageCode,
+			"scene", scene,
+			"subject", subject,
+			"grade", grade,
+		)
+		return ""
+	}
+
 	// 关键：按 PRD 优先级重排（个人>本校>系统），同档内保持仓储原有的次级排序稳定性。
 	// 用 SliceStable 保证同 source 内不打乱仓储已排好的 sort_order/created_at 次序。
-	items := resp.Assistants
+	items := strictItems
 	sort.SliceStable(items, func(i, j int) bool {
 		return assistantSourceRank(items[i].Source) < assistantSourceRank(items[j].Source)
 	})

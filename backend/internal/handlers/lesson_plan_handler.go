@@ -69,10 +69,11 @@ func NewLessonPlanHandler(lpService *services.LessonPlanService) *LessonPlanHand
 //     此外任何登录用户都能看到 published_shared/approved 的共享教案（教案库浏览）。
 //
 // 「我的教案只显示 1 条」Bug 修复：
-//   额外把 claims.UserID 作为 callerID 透传给 service。当 senior 等角色的 scope
-//   因未绑校而 fail-closed 成空集时，作者查自己教案（author_id=自己）会被空白名单
-//   误伤。callerID 让 repo 层能在可见性子句里加"作者是自己则恒放行"分支，
-//   保证任何用户始终能看到自己的全部教案，且不影响教案库页的既有可见性。
+//
+//	额外把 claims.UserID 作为 callerID 透传给 service。当 senior 等角色的 scope
+//	因未绑校而 fail-closed 成空集时，作者查自己教案（author_id=自己）会被空白名单
+//	误伤。callerID 让 repo 层能在可见性子句里加"作者是自己则恒放行"分支，
+//	保证任何用户始终能看到自己的全部教案，且不影响教案库页的既有可见性。
 func (h *LessonPlanHandler) ListLessonPlans(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
@@ -421,6 +422,7 @@ func (h *LessonPlanHandler) handleLPError(w http.ResponseWriter, err error) {
 		// 属于权限不足，与 ErrLPNotAuthor 同类。
 		utils.Fail(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, services.ErrLPNotFound),
+		errors.Is(err, services.ErrLPVersionNotFound),
 		errors.Is(err, services.ErrTemplateNotFound):
 		utils.Fail(w, http.StatusNotFound, err.Error())
 	default:

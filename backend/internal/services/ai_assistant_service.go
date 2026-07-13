@@ -78,6 +78,8 @@ var (
 	ErrAssistantNameRequired    = errors.New("助手名称不能为空")
 	ErrAssistantPromptRequired  = errors.New("助手提示词不能为空")
 	ErrAssistantScenesRequired  = errors.New("助手适用场景至少选择一项")
+	ErrAssistantSubjectRequired = errors.New("助手适用学科不能为空")
+	ErrAssistantGradeRequired   = errors.New("助手适用年级必须选择一年级至高三中的一个具体年级")
 	ErrAssistantInvalidSource   = errors.New("助手来源无效")
 	ErrAssistantInvalidScene    = errors.New("助手场景代码无效")
 	ErrAssistantPermDenied      = errors.New("无权操作此助手")
@@ -111,9 +113,10 @@ func NewAIAssistantService() *AIAssistantService {
 // AssistantActorContext 操作者上下文(调用方从 JWT claims 解析后传入)
 //
 // 里程碑一新增教研组三字段,由 BuildActorFromClaims 统一填充:
-//   MyGroupIDs               我所属的全部教研组 ID(成员/骨干/组长都算)→ 定可见范围
-//   MyLeadGroupIDs           我担任 lead(组长)的教研组 ID            → 定能否编辑该组助手
-//   MyLeadOrBackboneGroupIDs 我担任 lead 或 backbone 的教研组 ID      → 定能往哪些组发布
+//
+//	MyGroupIDs               我所属的全部教研组 ID(成员/骨干/组长都算)→ 定可见范围
+//	MyLeadGroupIDs           我担任 lead(组长)的教研组 ID            → 定能否编辑该组助手
+//	MyLeadOrBackboneGroupIDs 我担任 lead 或 backbone 的教研组 ID      → 定能往哪些组发布
 type AssistantActorContext struct {
 	UserID   string // 当前用户 ID
 	Role     string // 角色:admin / senior_operator / operator / viewer
@@ -145,12 +148,12 @@ func (s *AIAssistantService) ListAssistants(
 	onlyActive bool,
 ) (*models.AIAssistantListResponse, error) {
 	params := &models.ListAIAssistantsParams{
-		Scene:           scene,
-		Subject:         subject,
-		GradeRange:      gradeRange,
-		CurrentUserID:   actor.UserID,
-		CurrentUserRole: actor.Role,
-		CurrentSchoolID: actor.SchoolID,
+		Scene:               scene,
+		Subject:             subject,
+		GradeRange:          gradeRange,
+		CurrentUserID:       actor.UserID,
+		CurrentUserRole:     actor.Role,
+		CurrentSchoolID:     actor.SchoolID,
 		CurrentGroupIDs:     actor.MyGroupIDs,     // 里程碑一:透传我的教研组集合供可见性 SQL
 		CurrentLeadGroupIDs: actor.MyLeadGroupIDs, // 本次新增:透传我担任组长的教研组,供列表层正确判定组长可编辑/可看原文
 		OnlyActive:          onlyActive,
@@ -170,13 +173,15 @@ func (s *AIAssistantService) ListAssistants(
 // GetAssistant 获取助手详情并校验可见性
 //
 // withPrompt 参数(本次新增,产权保护):
-//   true  → 调用方需要 full_prompt 原文(如详情展示/编辑回填/丢给 AI 分析)。
-//           若请求者无权查看原文(!canViewPrompt),则把 FullPrompt 置空并设 PromptProtected=true,
-//           防止 use_only 助手的原文被"丢给 AI 分析"或直接调 API 绕开 fork 闸门拿走。
-//   false → 调用方只需元数据,不关心原文(预留;当前外部调用都传 true)。
+//
+//	true  → 调用方需要 full_prompt 原文(如详情展示/编辑回填/丢给 AI 分析)。
+//	        若请求者无权查看原文(!canViewPrompt),则把 FullPrompt 置空并设 PromptProtected=true,
+//	        防止 use_only 助手的原文被"丢给 AI 分析"或直接调 API 绕开 fork 闸门拿走。
+//	false → 调用方只需元数据,不关心原文(预留;当前外部调用都传 true)。
 //
 // ⚠ 内部需要完整原文的逻辑(Fork 复制 / Update 编辑回填)不应走本方法的截断路径,
-//   它们直接用 repository.GetAIAssistantByID 读全量(各自有独立的权限闸门)。
+//
+//	它们直接用 repository.GetAIAssistantByID 读全量(各自有独立的权限闸门)。
 func (s *AIAssistantService) GetAssistant(
 	ctx context.Context,
 	actor *AssistantActorContext,
@@ -202,9 +207,10 @@ func (s *AIAssistantService) GetAssistant(
 // canViewPrompt 判断当前用户能否查看该助手的 full_prompt 原文
 //
 // 与 canEdit 同款闸门(Yuhan 拍板:看原文权限与编辑权限对齐),额外放宽 open:
-//   open      → 任何可见者都可看原文(open 本就允许 fork 带走,看原文更无妨)
-//   use_only  → 仅 admin / 属主 / 本组组长(=canEdit)
-//   locked    → 仅 admin / 属主(canView 已保证非属主非 admin 看不到 locked,故走到这里必是属主/admin)
+//
+//	open      → 任何可见者都可看原文(open 本就允许 fork 带走,看原文更无妨)
+//	use_only  → 仅 admin / 属主 / 本组组长(=canEdit)
+//	locked    → 仅 admin / 属主(canView 已保证非属主非 admin 看不到 locked,故走到这里必是属主/admin)
 //
 // 用途:GetAssistant 据此决定是否返回 full_prompt;列表层有等价的 canViewPromptAssistant。
 func (s *AIAssistantService) canViewPrompt(actor *AssistantActorContext, a *models.AIAssistant) bool {
@@ -272,6 +278,29 @@ func (s *AIAssistantService) CreateAssistant(
 	if strings.TrimSpace(req.Name) == "" {
 		return nil, ErrAssistantNameRequired
 	}
+
+	// 写入最终防线：助手必须绑定非空学科和单一具体年级。
+	//
+	// 合法同义表达会在入库前统一规范化：
+	// 十二年级、12年级、12、高三 → 高三。
+	// 高中、10-12、1-6、小学低段及空值均拒绝。
+	rawSubject := strings.TrimSpace(req.Subject)
+	if rawSubject == "" {
+		return nil, ErrAssistantSubjectRequired
+	}
+
+	normalizedSubject, normalizedGrade, validScope :=
+		normalizeStrictResourceScope(
+			rawSubject,
+			req.GradeRange,
+		)
+	if !validScope {
+		return nil, ErrAssistantGradeRequired
+	}
+
+	req.Subject = normalizedSubject
+	req.GradeRange = normalizedGrade
+
 	if strings.TrimSpace(req.FullPrompt) == "" {
 		return nil, ErrAssistantPromptRequired
 	}
@@ -446,6 +475,26 @@ func (s *AIAssistantService) UpdateAssistant(
 	if strings.TrimSpace(req.Name) == "" {
 		return ErrAssistantNameRequired
 	}
+
+	// 更新同样执行最终防线。
+	// 编辑存量“高中/范围/空年级”助手时，必须先改成一个具体年级。
+	rawSubject := strings.TrimSpace(req.Subject)
+	if rawSubject == "" {
+		return ErrAssistantSubjectRequired
+	}
+
+	normalizedSubject, normalizedGrade, validScope :=
+		normalizeStrictResourceScope(
+			rawSubject,
+			req.GradeRange,
+		)
+	if !validScope {
+		return ErrAssistantGradeRequired
+	}
+
+	req.Subject = normalizedSubject
+	req.GradeRange = normalizedGrade
+
 	if strings.TrimSpace(req.FullPrompt) == "" {
 		return ErrAssistantPromptRequired
 	}
@@ -477,17 +526,18 @@ func (s *AIAssistantService) UpdateAssistant(
 // canEdit 判断当前用户是否能编辑该助手
 //
 // 里程碑一 + share_policy 收紧:
-//   admin     → 恒可(不受 share_policy 限制)
-//   属主本人   → 恒可(自己的东西)
-//   system    → 非 admin 一律不可
-//   group:
-//     创建者本人 → 恒可
-//     教研组级该组 lead(组长):
-//        use_only → 可编辑(组长=该组标准维护者,use_only 只防组员乱改不防组长维护)
-//        locked   → 不可编辑(locked=仅属主,连组长也挡)
-//        open     → 可编辑(沿用里程碑一原行为)
-//     全校级非创建者 → 不可(避免跨人篡改)
-//   personal  → 仅创建者本人
+//
+//	admin     → 恒可(不受 share_policy 限制)
+//	属主本人   → 恒可(自己的东西)
+//	system    → 非 admin 一律不可
+//	group:
+//	  创建者本人 → 恒可
+//	  教研组级该组 lead(组长):
+//	     use_only → 可编辑(组长=该组标准维护者,use_only 只防组员乱改不防组长维护)
+//	     locked   → 不可编辑(locked=仅属主,连组长也挡)
+//	     open     → 可编辑(沿用里程碑一原行为)
+//	  全校级非创建者 → 不可(避免跨人篡改)
+//	personal  → 仅创建者本人
 func (s *AIAssistantService) canEdit(actor *AssistantActorContext, a *models.AIAssistant) bool {
 	// admin 可编辑任何助手(share_policy 对 admin 不设限)
 	if actor.Role == models.RoleAdmin {
@@ -558,7 +608,7 @@ func (s *AIAssistantService) DeleteAssistant(
 //   - open      → 可见即可 fork
 //   - use_only  → 仅属主本人 / admin 可 fork(否则 ErrAssistantForkNotAllowed)
 //   - locked    → 仅属主本人 / admin 可 fork(且 locked 本就只有属主/admin 可见)
-//   fork 出的副本默认 share_policy=use_only(自己的副本也默认保护,不继承原 policy)
+//     fork 出的副本默认 share_policy=use_only(自己的副本也默认保护,不继承原 policy)
 func (s *AIAssistantService) ForkAssistant(
 	ctx context.Context,
 	actor *AssistantActorContext,
@@ -617,7 +667,8 @@ func (s *AIAssistantService) ForkAssistant(
 // 评审工作台 / 工坊各阶段调用此方法取得助手内容
 //
 // 注意:share_policy 不影响"使用"——use_only/locked 的本意都是"可用,只是不能 fork/改"。
-//   locked 的可见性收紧已在 canView 处理(非属主非 admin 在 canView 即被拒)。
+//
+//	locked 的可见性收紧已在 canView 处理(非属主非 admin 在 canView 即被拒)。
 func (s *AIAssistantService) LoadActiveAssistantForUse(
 	ctx context.Context,
 	actor *AssistantActorContext,

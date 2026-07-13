@@ -99,7 +99,17 @@ func (h *UnitPlanHandler) HandleItem(w http.ResponseWriter, r *http.Request) {
 			h.mapError(w, err)
 			return
 		}
-		utils.Success(w, map[string]interface{}{"plan": plan, "messages": msgs})
+
+		// can_edit 由后端根据当前登录用户与方案创建者确定，前端据此决定：
+		//   - 创建者：草稿和已发布方案均可重新进入 AI 会话继续优化；
+		//   - 其他可见用户：只能查看正式方案，不能进入续作编辑。
+		// 真正的写权限仍由 Chat/Save 服务层再次校验，避免仅依赖前端按钮。
+		canEdit := plan.CreatedBy == claims.UserID
+		utils.Success(w, map[string]interface{}{
+			"plan":     plan,
+			"messages": msgs,
+			"can_edit": canEdit,
+		})
 	case http.MethodDelete:
 		if err := h.svc.Delete(r.Context(), claims.Role, claims.UserID, id); err != nil {
 			h.mapError(w, err)

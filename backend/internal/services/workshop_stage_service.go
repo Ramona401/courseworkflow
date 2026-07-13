@@ -570,13 +570,51 @@ func (s *WorkshopStageService) LoadStagePromptContextV2(
 	assistantPrompt string,
 	recentUserText string, // 技能路由 Phase1:透传给 BuildStageSystemPromptV2 第3层精排;空串→保底
 ) (string, error) {
-	// 判断是否为自定义阶段(来自配方 recipe_stages 表)
+	// 运行时重新校验lesson_plans.recipe_id。
+	//
+	// 存量教案可能已经关联了跨学科、跨年级或学段级配方。
+	// 这里不修改数据库，只在本轮提示词装配中忽略不适用配方，
+	// 防止错误配方继续提供阶段定义、教案结构、流程模式和上下文。
+	var recipe *models.TeachingRecipe
+	validRecipeID := ""
+
+	if lp.RecipeID != nil &&
+		strings.TrimSpace(*lp.RecipeID) != "" {
+		candidate, recipeErr := loadRecipeForLesson(
+			ctx,
+			*lp.RecipeID,
+			lp.Subject,
+			lp.Grade,
+		)
+		if recipeErr != nil {
+			wsLog.Warn(
+				"教案关联配方不适用于当前学科或具体年级，本轮忽略",
+				"plan_id", lp.ID,
+				"stage", stageCode,
+				"recipe_id", *lp.RecipeID,
+				"subject", lp.Subject,
+				"grade", lp.Grade,
+				"error", recipeErr,
+			)
+		} else {
+			recipe = candidate
+			validRecipeID = candidate.ID
+		}
+	}
+
+	// 只有严格有效的配方才能启用配方自定义阶段。
 	isCustomStage := false
-	if lp.StageConfig != "" && lp.StageConfig != "[]" {
+	if recipe != nil &&
+		lp.StageConfig != "" &&
+		lp.StageConfig != "[]" {
 		var snapshots []models.StageConfigSnapshot
-		if json.Unmarshal([]byte(lp.StageConfig), &snapshots) == nil {
-			for _, snap := range snapshots {
-				if snap.StageCode == stageCode && snap.IsCustom {
+		if json.Unmarshal(
+			[]byte(lp.StageConfig),
+			&snapshots,
+		) == nil {
+			for _, snapshot := range snapshots {
+				if snapshot.StageCode == stageCode &&
+					snapshot.IsCustom {
 					isCustomStage = true
 					break
 				}
@@ -584,45 +622,107 @@ func (s *WorkshopStageService) LoadStagePromptContextV2(
 		}
 	}
 
-	// 加载阶段定义(优先级:自定义阶段 > 配方覆盖 > 系统默认)
-	var stage *models.WorkshopStage
-	var err error
-	if isCustomStage && lp.RecipeID != nil && *lp.RecipeID != "" {
-		stage, err = repository.GetRecipeStageByCode(ctx, *lp.RecipeID, stageCode)
-		if err != nil {
-			wsLog.Warn("自定义阶段加载失败，尝试系统默认", "stage_code", stageCode, "error", err)
-			stage, err = repository.GetStageByCode(ctx, models.StageSourceSystem, stageCode)
+	// 加载系统阶段。若存量错误配方留下了自定义阶段代码，
+	// 系统不存在同名阶段时安全退回系统“write”阶段，
+	// 保证旧教案仍可继续运行，而不是因错误关联直接中断。
+	loadSystemStage := func(
+		code string,
+	) (*models.WorkshopStage, error) {
+		stage, stageErr := repository.GetStageByCode(
+			ctx,
+			models.StageSourceSystem,
+			code,
+		)
+		if stageErr == nil && stage != nil {
+			return stage, nil
 		}
-	} else if lp.RecipeID != nil && *lp.RecipeID != "" {
-		stage, err = repository.GetStageByCode(ctx, models.StageSourceRecipe, stageCode)
-		if err != nil {
-			stage, err = repository.GetStageByCode(ctx, models.StageSourceSystem, stageCode)
+
+		if code == "write" {
+			return nil, stageErr
 		}
-	} else {
-		stage, err = repository.GetStageByCode(ctx, models.StageSourceSystem, stageCode)
-	}
-	if err != nil {
-		return "", fmt.Errorf("加载阶段定义失败: %w", err)
+
+		wsLog.Warn(
+			"系统不存在当前阶段定义，退回系统教案撰写阶段",
+			"plan_id", lp.ID,
+			"requested_stage", code,
+			"fallback_stage", "write",
+			"error", stageErr,
+		)
+
+		return repository.GetStageByCode(
+			ctx,
+			models.StageSourceSystem,
+			"write",
+		)
 	}
 
-	// 加载配方(用于全局上下文+promptMode+lessonStructure)
-	var recipe *models.TeachingRecipe
+	// 阶段定义优先级：
+	// 有效配方自定义阶段 > 有效配方覆盖阶段 > 系统同名阶段 > 系统write兜底。
+	var stage *models.WorkshopStage
+	var err error
+
+	switch {
+	case isCustomStage:
+		stage, err = repository.GetRecipeStageByCode(
+			ctx,
+			validRecipeID,
+			stageCode,
+		)
+		if err != nil || stage == nil {
+			wsLog.Warn(
+				"有效配方的自定义阶段加载失败，退回系统阶段",
+				"plan_id", lp.ID,
+				"recipe_id", validRecipeID,
+				"stage", stageCode,
+				"error", err,
+			)
+			stage, err = loadSystemStage(stageCode)
+		}
+
+	case recipe != nil:
+		stage, err = repository.GetStageByCode(
+			ctx,
+			models.StageSourceRecipe,
+			stageCode,
+		)
+		if err != nil || stage == nil {
+			stage, err = loadSystemStage(stageCode)
+		}
+
+	default:
+		stage, err = loadSystemStage(stageCode)
+	}
+
+	if err != nil {
+		return "", fmt.Errorf(
+			"加载阶段定义失败: %w",
+			err,
+		)
+	}
+	if stage == nil {
+		return "", errors.New(
+			"加载阶段定义失败：阶段定义为空",
+		)
+	}
+
+	// 只有严格有效的配方才能提供全局上下文、教案结构和备课模式。
 	promptMode := models.PromptModeGuided
 	lessonStructure := ""
-	if lp.RecipeID != nil && *lp.RecipeID != "" {
-		recipe, _ = repository.GetRecipeByID(ctx, *lp.RecipeID)
-		if recipe != nil {
-			if recipe.PromptMode != "" {
-				promptMode = recipe.PromptMode
-			}
-			if recipe.LessonStructure != "" && recipe.LessonStructure != "[]" {
-				lessonStructure = recipe.LessonStructure
-			}
+
+	if recipe != nil {
+		if recipe.PromptMode != "" {
+			promptMode = recipe.PromptMode
+		}
+		if recipe.LessonStructure != "" &&
+			recipe.LessonStructure != "[]" {
+			lessonStructure = recipe.LessonStructure
 		}
 	}
 
 	// 阶段级别的 promptMode 覆盖(StageConfig 快照中的配置优先)
-	if lp.StageConfig != "" && lp.StageConfig != "[]" {
+	if recipe != nil &&
+		lp.StageConfig != "" &&
+		lp.StageConfig != "[]" {
 		var snapshots []models.StageConfigSnapshot
 		if json.Unmarshal([]byte(lp.StageConfig), &snapshots) == nil {
 			for _, snap := range snapshots {

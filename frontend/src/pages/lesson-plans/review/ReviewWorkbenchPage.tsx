@@ -278,6 +278,8 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
       {
         plan_meta: planMeta,
         plan_content: planContent.slice(0, 3000),
+        subject: plan.subject,
+        grade: plan.grade,
         assistant_id: assistantId ?? '',
       },
       {
@@ -322,6 +324,8 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
       {
         plan_meta: planMeta,
         plan_content: planContent.slice(0, 4000),
+        subject: plan.subject,
+        grade: plan.grade,
         history,
         message: userMsg,
         assistant_id: assistantId ?? '',

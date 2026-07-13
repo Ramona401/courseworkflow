@@ -60,9 +60,11 @@ export default function StepBasicInfo({ formData, updateForm }: StepBasicInfoPro
 
       {/* 学科选择 */}
       <div style={{ marginBottom: '24px' }}>
-        <label style={labelStyle}>学科</label>
+        <label style={labelStyle}>
+          学科 <span style={{ color: C.danger }}>*</span>
+        </label>
         <div style={{ fontSize: '12px', color: C.textMuted, marginBottom: '10px' }}>
-          选择这个配方主要适用的学科，AI会据此推荐匹配的教学组件
+          选择一个具体学科。配方只会在学科完全一致的备课中出现。
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
           {SUBJECTS.map(s => (
@@ -79,9 +81,11 @@ export default function StepBasicInfo({ formData, updateForm }: StepBasicInfoPro
 
       {/* 年级选择 */}
       <div>
-        <label style={labelStyle}>年级</label>
+        <label style={labelStyle}>
+          具体年级 <span style={{ color: C.danger }}>*</span>
+        </label>
         <div style={{ fontSize: '12px', color: C.textMuted, marginBottom: '10px' }}>
-          选择这个配方主要适用的年级段
+          选择一年级至高三中的一个具体年级。学段和跨年级范围不参与自动匹配。
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
           {GRADES.map(g => (

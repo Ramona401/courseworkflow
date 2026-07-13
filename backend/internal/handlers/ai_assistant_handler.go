@@ -353,6 +353,8 @@ func (h *AIAssistantHandler) writeServiceError(w http.ResponseWriter, err error)
 	case errors.Is(err, services.ErrAssistantNameRequired),
 		errors.Is(err, services.ErrAssistantPromptRequired),
 		errors.Is(err, services.ErrAssistantScenesRequired),
+		errors.Is(err, services.ErrAssistantSubjectRequired),
+		errors.Is(err, services.ErrAssistantGradeRequired),
 		errors.Is(err, services.ErrAssistantInvalidSource),
 		errors.Is(err, services.ErrAssistantInvalidScene),
 		errors.Is(err, services.ErrAssistantPromptTooLong),

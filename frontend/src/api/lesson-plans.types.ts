@@ -305,6 +305,89 @@ export interface ConvAction {
   style: 'primary' | 'secondary' | 'danger'
 }
 
+/* ==================== 备课上下文回执 ==================== */
+
+/** 开始备课时的配方选择三态 */
+export type RecipeSelectionMode = 'auto' | 'selected' | 'none'
+
+/** 单项上下文的真实处理状态，与后端models.ContextReceiptStatus逐项对齐 */
+export type ContextReceiptStatus =
+  | 'loaded'
+  | 'not_linked'
+  | 'not_applicable'
+  | 'deferred'
+  | 'superseded'
+  | 'unavailable'
+  | 'forbidden'
+  | 'explicit_none'
+  | 'not_found'
+
+/** 本轮实际使用的AI助手及其选择来源 */
+export interface AssistantContextReceipt {
+  status: ContextReceiptStatus
+  selection_mode?: string
+  id?: string
+  name?: string
+  source?: string
+  reason?: string
+}
+
+/** 配方、教材和各类挂载材料的真实读取状态 */
+export interface MaterialContextReceipt {
+  status: ContextReceiptStatus
+  selection_mode?: RecipeSelectionMode
+  id?: string
+  name?: string
+  reason?: string
+  count?: number
+  readable_count?: number
+  unreadable_count?: number
+  character_count?: number
+  titles?: string[]
+}
+
+/** 单个专业组件的教师可理解摘要 */
+export interface ComponentContextReceiptItem {
+  id: string
+  library_type: string
+  library_name: string
+  display_label: string
+  quality_score?: number
+}
+
+/** 本轮专业组件的真实选择来源和最终使用条目 */
+export interface ComponentsContextReceipt {
+  status: ContextReceiptStatus
+  selection_mode?: string
+  candidate_count?: number
+  reranked?: boolean
+  items?: ComponentContextReceiptItem[]
+  reason?: string
+}
+
+/** 一轮AI回复实际使用的上下文摘要 */
+export interface ContextReceipt {
+  version: string
+  stage_code: string
+  assistant?: AssistantContextReceipt
+  recipe?: MaterialContextReceipt
+  components?: ComponentsContextReceipt
+  textbook?: MaterialContextReceipt
+  unit_plan?: MaterialContextReceipt
+  course_outline?: MaterialContextReceipt
+  class_profile?: MaterialContextReceipt
+  ref_material?: MaterialContextReceipt
+  /** 后端调试信息，教师端卡片不展示 */
+  system_prompt_runes?: number
+}
+
+/** 对话消息元数据：保留扩展索引，兼容soft_retry等既有字段 */
+export interface ConversationMessageMetadata {
+  context_receipt?: ContextReceipt
+  soft_retry?: boolean
+  [key: string]: unknown
+}
+
 export interface ConversationMessage {
   id: string
   role: ConvRole
@@ -313,7 +396,7 @@ export interface ConversationMessage {
   options?: ConvOption[]
   components?: ConvComponent[]
   actions?: ConvAction[]
-  metadata?: Record<string, unknown>
+  metadata?: ConversationMessageMetadata
   created_at: string
 }
 
@@ -325,6 +408,7 @@ export interface StartConversationRequest {
   template_id?: string
   group_id?: string
   recipe_id?: string
+  recipe_mode?: RecipeSelectionMode
   textbook_page_ids?: string[]  // 迭代7B:关联课本图片ID列表
 }
 

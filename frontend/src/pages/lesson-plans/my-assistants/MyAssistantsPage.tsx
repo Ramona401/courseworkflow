@@ -39,6 +39,7 @@ import AssistantDesignerPanel from '@/components/ai-assistants/AssistantDesigner
 import SaveAssistantModal from '@/components/ai-assistants/SaveAssistantModal'
 import PastePromptModal from '@/components/ai-assistants/PastePromptModal'
 import AssistantEditModal from '@/components/ai-assistants/AssistantEditModal'
+import AssistantStyleProfileModal from './AssistantStyleProfileModal'
 import DrawerAssistantCard, { miniBtn } from './DrawerAssistantCard'
 
 /* ==================== 样式常量(与助手系列组件保持一致) ==================== */
@@ -58,8 +59,12 @@ const C = {
   groupAccent:    '#F59E0B',
 }
 
-/** localStorage key:记住老师的主教学科 */
+/** localStorage key:记住老师的主教学科与学段 */
 const LS_KEY = 'tedna_my_assistants_subject'
+const LS_GRADE_KEY = 'tedna_my_assistants_grade'
+
+/** 助手按学段匹配，保存统一使用标准学段值 */
+const GRADE_SEGMENTS = ['', '小学', '初中', '高中']
 
 /** 学科可选项(与 SaveAssistantModal/AssistantEditModal 保持一致) */
 const SUBJECTS = ['', ...DEFAULT_SUBJECTS]  // 空=不限；单一真相源（方案甲，v231）
@@ -95,6 +100,13 @@ export default function MyAssistantsPage() {
     try { localStorage.setItem(LS_KEY, subject) } catch { /* 忽略写入失败 */ }
   }, [subject])
 
+  const [grade, setGrade] = useState<string>(() => {
+    try { return localStorage.getItem(LS_GRADE_KEY) || '' } catch { return '' }
+  })
+  useEffect(() => {
+    try { localStorage.setItem(LS_GRADE_KEY, grade) } catch { /* 忽略写入失败 */ }
+  }, [grade])
+
   // ==================== 现成助手列表 ====================
   const [related, setRelated]     = useState<AIAssistantListItem[]>([])
   const [loading, setLoading]     = useState(false)
@@ -115,6 +127,9 @@ export default function MyAssistantsPage() {
 
   // ==================== 粘贴提示词弹窗 ====================
   const [pasteOpen, setPasteOpen] = useState(false)
+
+  // ==================== 从历史教案生成教学风格画像 ====================
+  const [styleProfileOpen, setStyleProfileOpen] = useState(false)
 
   // ==================== 编辑助手弹窗(本次新增) ====================
   const [editId, setEditId] = useState<string | null>(null)
@@ -150,6 +165,19 @@ export default function MyAssistantsPage() {
     setInjected('')
     setTimeout(() => setInjected(text), 30)
   }, [])
+
+  // ==================== 将确认后的教学风格画像送入现有设计画布 ====================
+  const handleUseStyleProfile = useCallback((profile: string) => {
+    const guide =
+      `下面是根据我的历史教案和教研材料形成、并由我确认后的《教学风格与成长画像》。\n\n` +
+      `${profile}\n\n` +
+      `请不要机械复刻任何一份旧教案。请先帮我确认这份画像中哪些内容应该成为长期助手规则，` +
+      `哪些只适合作为提醒；然后结合组件知识库，和我一起生成一位既尊重我的教学优势、` +
+      `又会主动指出问题并推动我持续提升的助手。`
+
+    setStyleProfileOpen(false)
+    injectToCanvas(guide)
+  }, [injectToCanvas])
 
   // ==================== designer "存为我的助手"回调 ====================
   const handleApplyDraft = useCallback((draft: string) => {
@@ -295,9 +323,38 @@ export default function MyAssistantsPage() {
             {SUBJECTS.map(s => <option key={s} value={s}>{s || '(全部学科)'}</option>)}
           </select>
         </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '13px', fontWeight: 600, color: C.text }}>学段</span>
+          <select
+            value={grade}
+            onChange={e => setGrade(e.target.value)}
+            style={{
+              padding: '6px 11px', borderRadius: '8px', border: `1px solid ${C.borderMid}`,
+              fontSize: '14px', fontWeight: 600, color: C.primary, background: C.primaryLight,
+              cursor: 'pointer', outline: 'none',
+            }}
+          >
+            {GRADE_SEGMENTS.map(g => <option key={g} value={g}>{g || '(不限学段)'}</option>)}
+          </select>
+        </div>
         <div style={{ flex: 1, minWidth: '160px', fontSize: '12px', color: C.textSec, lineHeight: 1.6 }}>
           {roleHint(role)}
         </div>
+        {/* 从教案生成成长型助手入口 */}
+        <button
+          onClick={() => setStyleProfileOpen(true)}
+          style={{
+            display: 'flex', alignItems: 'center', gap: '6px',
+            padding: '8px 14px', borderRadius: '9px',
+            border: '1px solid rgba(16,185,129,0.45)',
+            background: 'rgba(16,185,129,0.08)', color: '#047857',
+            fontSize: '13px', fontWeight: 650, cursor: 'pointer',
+            whiteSpace: 'nowrap', flexShrink: 0,
+          }}
+          title="选择自己的历史教案或上传教研材料，提取教学风格与成长方向"
+        >
+          📚 从我的教案生成
+        </button>
         {/* 粘贴提示词入口 */}
         <button
           onClick={() => setPasteOpen(true)}
@@ -372,7 +429,7 @@ export default function MyAssistantsPage() {
         <div style={{ flex: 1, minHeight: 0 }}>
           <AssistantDesignerPanel
             subject={subject}
-            grade=""
+            grade={grade}
             scenes={WORKSHOP_SCENES}
             initialDraft=""
             onApplyDraft={handleApplyDraft}
@@ -501,6 +558,7 @@ export default function MyAssistantsPage() {
         draft={draftToSave}
         userRole={role}
         defaultSubject={subject}
+        defaultGrade={grade}
         onClose={() => setSaveOpen(false)}
         onSaved={handleSaved}
       />
@@ -512,6 +570,16 @@ export default function MyAssistantsPage() {
         assistantId={editId || undefined}
         onClose={() => setEditId(null)}
         onSaved={handleEditSaved}
+      />
+
+      {/* ==================== 从历史教案生成教学风格画像 ==================== */}
+      <AssistantStyleProfileModal
+        open={styleProfileOpen}
+        subject={subject}
+        grade={grade}
+        currentUserID={user?.id || ''}
+        onClose={() => setStyleProfileOpen(false)}
+        onUseProfile={handleUseStyleProfile}
       />
 
       {/* ==================== 粘贴提示词弹窗 ==================== */}

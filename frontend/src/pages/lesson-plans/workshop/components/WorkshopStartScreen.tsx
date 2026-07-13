@@ -7,7 +7,10 @@
  */
 
 import { useNavigate } from 'react-router-dom'
-import type { ConversationMessage } from '@/api/lesson-plans'
+import type {
+  ConversationMessage,
+  RecipeSelectionMode,
+} from '@/api/lesson-plans'
 import { C } from './workshopConstants'
 import { StartForm } from './WorkshopPanels'
 import ImportPlanModal from './ImportPlanModal'
@@ -47,7 +50,16 @@ interface StartScreenProps {
   startLoading: boolean
   showImportModal: boolean
   setShowImportModal: (v: boolean) => void
-  onStart: (subject: string, grade: string, topic: string, duration: number, recipeId?: string, textbookPageIds?: string[]) => void
+  onStart: (
+    subject: string,
+    grade: string,
+    topic: string,
+    duration: number,
+    recipeMode: RecipeSelectionMode,
+    recipeId?: string,
+    textbookPageIds?: string[],
+    coursePublisher?: string | null,
+  ) => void
   onImportSuccess: (planId: string, openingMessage: ConversationMessage) => void
 }
 

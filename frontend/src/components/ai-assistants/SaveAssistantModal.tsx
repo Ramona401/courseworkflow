@@ -84,6 +84,9 @@ const C = {
 /** 学科可选项(与 AssistantEditModal 的 SUBJECTS 保持一致,避免循环依赖写死) */
 const SUBJECTS = ['', ...DEFAULT_SUBJECTS]  // 空=不限；单一真相源（方案甲，v231）
 
+/** 标准学段值，与助手列表仓储的NormalizeGradeToSegment口径对齐 */
+const GRADE_SEGMENTS = ['', '小学', '初中', '高中']
+
 /** 工坊全部场景(defaultScene 为空时的兜底默认勾选——覆盖备课全链路 5 阶段) */
 const WORKSHOP_SCENES: AssistantScene[] = [
   'workshop_analyze', 'workshop_design', 'workshop_write', 'workshop_review', 'workshop_revise',
@@ -91,6 +94,12 @@ const WORKSHOP_SCENES: AssistantScene[] = [
 
 /** prompt 长度上限(与后端 maxAssistantPromptLen 对齐) */
 const MAX_PROMPT_LEN = 128 * 1024
+
+/**
+ * 备课工坊运行时单助手注入上限。
+ * 完整原稿仍可保存；超过此值时，工坊会使用前8000个Unicode字符并记录告警。
+ */
+const WORKSHOP_RUNTIME_PROMPT_LEN = 8000
 
 /** 分享策略选择器里展示的三档顺序(默认 use_only 居首,最保护) */
 const SHARE_POLICY_ORDER: AssistantSharePolicy[] = ['use_only', 'open', 'locked']
@@ -155,6 +164,8 @@ export interface SaveAssistantModalProps {
   defaultSubject?: string
   /** 默认勾选的场景(取自 designer 当前场景) */
   defaultScene?: AssistantScene
+  /** 默认学段，小学/初中/高中；空表示不限 */
+  defaultGrade?: string
   /** 关闭回调 */
   onClose: () => void
   /** 保存成功回调,传回新助手 ID 和最终 source */
@@ -164,11 +175,21 @@ export interface SaveAssistantModalProps {
 /* ==================== 主组件 ==================== */
 
 export default function SaveAssistantModal(props: SaveAssistantModalProps) {
-  const { open, draft, defaultSubject, defaultScene, onClose, onSaved } = props
+  const {
+    open,
+    draft,
+    defaultSubject,
+    defaultScene,
+    defaultGrade,
+    onClose,
+    onSaved,
+  } = props
+  const draftChars = Array.from(draft).length
 
   // ==================== 表单状态 ====================
   const [name, setName]       = useState('')
   const [subject, setSubject] = useState('')
+  const [gradeRange, setGradeRange] = useState('')
   const [scenes, setScenes]   = useState<AssistantScene[]>([])
   const [shelf, setShelf]     = useState<ShelfKey>('personal') // 货架:默认存为我的
   const [sharePolicy, setSharePolicy] = useState<AssistantSharePolicy>(DEFAULT_SHARE_POLICY) // 分享策略:默认仅可用
@@ -192,6 +213,7 @@ export default function SaveAssistantModal(props: SaveAssistantModalProps) {
     // 基础表单初始化
     setName('')
     setSubject(defaultSubject || '')
+    setGradeRange(defaultGrade || '')
     setScenes(defaultScene ? [defaultScene] : [...WORKSHOP_SCENES])
     setShelf('personal')              // 货架默认 personal(无论什么身份,默认"先存给自己"最安全)
     setSharePolicy(DEFAULT_SHARE_POLICY) // 策略默认仅可用(最保护)
@@ -227,7 +249,7 @@ export default function SaveAssistantModal(props: SaveAssistantModalProps) {
       })
 
     return () => { cancelled = true }
-  }, [open, defaultSubject, defaultScene])
+  }, [open, defaultSubject, defaultScene, defaultGrade])
 
   // ==================== ESC 关闭 ====================
   useEffect(() => {
@@ -277,7 +299,7 @@ export default function SaveAssistantModal(props: SaveAssistantModalProps) {
         source,                 // 后端会按角色+教研组身份再校验
         full_prompt: draft,
         subject: subject.trim(),
-        grade_range: '',
+        grade_range: gradeRange.trim(),
         scenes,
         ...(groupID ? { group_id: groupID } : {}), // 仅教研组级携带 group_id
         // 分享策略:仅共享货架携带用户所选;personal 不传,后端兜底 use_only
@@ -338,9 +360,22 @@ export default function SaveAssistantModal(props: SaveAssistantModalProps) {
             background: C.primaryLight, border: '1px solid rgba(79,123,232,0.15)',
             fontSize: '12px', color: C.textSec, lineHeight: 1.6,
           }}>
-            ✨ 已聊出一版提示词草稿(<b style={{ color: C.primary }}>{draft.length.toLocaleString()}</b> 字符)。
+            ✨ 已聊出一版提示词草稿(<b style={{ color: C.primary }}>{draftChars.toLocaleString()}</b> 字符)。
             填好下面的信息就能保存,之后备课时随时能选用。
           </div>
+
+          {draftChars > WORKSHOP_RUNTIME_PROMPT_LEN && (
+            <div style={{
+              marginBottom: '16px', padding: '10px 12px', borderRadius: '8px',
+              background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.28)',
+              color: '#92400E', fontSize: '12px', lineHeight: 1.6,
+            }}>
+              ⚠️ 当前草稿为 <b>{draftChars.toLocaleString()}</b> 个Unicode字符。
+              完整原稿仍会保存，但备课工坊单次运行最多注入前
+              <b> {WORKSHOP_RUNTIME_PROMPT_LEN.toLocaleString()} </b>
+              个字符。建议回到左侧让AI压缩重复解释，保留教学方法、地方要求、成长目标和自检规则。
+            </div>
+          )}
 
           {/* 名称 */}
           <div style={{ marginBottom: '16px' }}>
@@ -502,6 +537,27 @@ export default function SaveAssistantModal(props: SaveAssistantModalProps) {
             >
               {SUBJECTS.map(s => (
                 <option key={s} value={s}>{s || '(不限学科)'}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* 学段 */}
+          <div style={{ marginBottom: '16px' }}>
+            <label style={labelStyle}>
+              适用学段
+              <span style={{ color: C.textMuted, fontWeight: 400 }}>
+                {' '}(用于自动匹配，可改)
+              </span>
+            </label>
+            <select
+              value={gradeRange}
+              onChange={e => setGradeRange(e.target.value)}
+              style={{ ...inputStyle, width: '100%', cursor: 'pointer' }}
+            >
+              {GRADE_SEGMENTS.map(g => (
+                <option key={g} value={g}>
+                  {g || '(不限学段)'}
+                </option>
               ))}
             </select>
           </div>

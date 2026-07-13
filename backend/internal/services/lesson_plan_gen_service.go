@@ -141,21 +141,63 @@ func (s *LessonPlanGenService) StartConversation(
 		dur = 45
 	}
 
-	// ==================== v203：对话模式配方自动挂载 ====================
-	// 对话模式 handleStart 不传 recipe_id，导致 lp.RecipeID 恒为 nil，配方的教案结构/流程/
-	// 学情风格全部不注入，AI 拿到空骨架（yingjun 截图九大板块缺失的根因）。
-	// 此处在【显式 recipe_id 为空】时，按「学校默认配方 → group/school 学科匹配配方 → 空」
-	// 三级 fail-open 解析（详见 recipe_resolver.go 的 ResolveDefaultRecipe），解析到则回填
-	// req.RecipeID。回填后，本函数下方所有既有 `if req.RecipeID != ""` 分支会自动命中，
-	// 与专家模式走完全相同的下游，无需任何额外接线。
-	// 显式 recipe_id（专家模式）不进此分支，行为一字不变；解析失败退回纯骨架=改造前现状。
-	if strings.TrimSpace(req.RecipeID) == "" {
-		if resolvedRecipeID := s.ResolveDefaultRecipe(ctx, authorID, req.Subject); resolvedRecipeID != "" {
-			req.RecipeID = resolvedRecipeID
-			lpGenLog.Info("对话模式自动挂载配方",
-				"author", authorID, "subject", req.Subject, "topic", req.Topic,
-				"recipe_id", resolvedRecipeID)
+	// ==================== 配方三态解析与自动挂载 ====================
+	// recipe_mode由normalizeStartRecipeSelection统一解释：
+	//   auto     → 根据学校默认、教研组共享和学科规则自动选择；
+	//   selected → 使用老师明确传入的recipe_id；
+	//   none     → 老师明确不使用配方，禁止自动匹配。
+	//
+	// 旧客户端不传recipe_mode时保持兼容：
+	// 有recipe_id视为selected，无recipe_id视为auto。
+	recipeSelectionMode := normalizeStartRecipeSelection(req)
+
+	// 老师显式选择的配方同样必须通过学科和具体年级复核。
+	// 校验失败时只清除错误配方，不自动换用另一份配方。
+	if recipeSelectionMode == models.RecipeSelectionModeSelected &&
+		req.RecipeID != "" {
+		if _, recipeErr := loadRecipeForLesson(
+			ctx,
+			req.RecipeID,
+			req.Subject,
+			req.Grade,
+		); recipeErr != nil {
+			lpGenLog.Warn(
+				"老师选择的配方与当前学科或具体年级不匹配，已禁止挂载",
+				"author", authorID,
+				"subject", req.Subject,
+				"grade", req.Grade,
+				"recipe_id", req.RecipeID,
+				"error", recipeErr,
+			)
+			req.RecipeID = ""
 		}
+	}
+
+	if recipeSelectionMode == models.RecipeSelectionModeAuto {
+		if resolvedRecipeID := s.ResolveDefaultRecipe(
+			ctx,
+			authorID,
+			req.Subject,
+			req.Grade,
+		); resolvedRecipeID != "" {
+			req.RecipeID = resolvedRecipeID
+			lpGenLog.Info(
+				"开始备课自动挂载配方",
+				"author", authorID,
+				"subject", req.Subject,
+				"topic", req.Topic,
+				"recipe_id", resolvedRecipeID,
+				"recipe_mode", recipeSelectionMode,
+			)
+		}
+	} else if recipeSelectionMode == models.RecipeSelectionModeNone {
+		lpGenLog.Info(
+			"老师明确选择不使用配方",
+			"author", authorID,
+			"subject", req.Subject,
+			"topic", req.Topic,
+			"recipe_mode", recipeSelectionMode,
+		)
 	}
 
 	title := fmt.Sprintf("%s %s — %s", req.Grade, req.Subject, req.Topic)
@@ -221,6 +263,16 @@ func (s *LessonPlanGenService) StartConversation(
 		lpGenLog.Warn("阶段开场白生成失败，使用默认开场", "plan_id", lp.ID, "error", err)
 		openingMsg = buildDefaultOpeningMessage(req)
 	}
+
+	// 将本次配方选择方式写入开场消息metadata。
+	// ConversationMessage会整体进入conversation_log，因此无需新增数据库字段，
+	// SSE实时消息、断线补齐和历史恢复都能读取同一份确定性状态。
+	if openingMsg.Metadata == nil {
+		openingMsg.Metadata = make(map[string]interface{})
+	}
+	openingMsg.Metadata[recipeSelectionModeMetadataKey] = string(
+		recipeSelectionMode,
+	)
 
 	// 推送阶段开始事件
 	go func() {
@@ -367,7 +419,17 @@ func (s *LessonPlanGenService) Chat(
 	// 老师传了 assistant_id → 用指定助手；没传 → 由 resolveAssistantPrompt 内
 	// 「偏好表 → RouteDefaultAssistant 兜底」链自动解析（解析不到则空串=不替换第4层）。
 	// 传入 lp 供偏好查询(lp.Subject)与默认助手解析读取 当前阶段/学科/年级 维度。
-	assistantPrompt, assistantLabel := s.resolveAssistantPrompt(ctx, lp, req.AssistantID, callerID)
+	assistantResolution := s.resolveAssistantPromptForReceipt(
+		ctx,
+		lp,
+		req.AssistantID,
+		callerID,
+	)
+	assistantPrompt := assistantResolution.Prompt
+	assistantLabel := ""
+	if assistantResolution.Receipt != nil {
+		assistantLabel = assistantResolution.Receipt.Name
+	}
 
 	// v168/v169:全委托标志(按阶段在 processChatStageAsync 内判定)
 	fullGenerate := req.FullGenerate
@@ -376,7 +438,18 @@ func (s *LessonPlanGenService) Chat(
 	turnID := req.ClientTurnID
 	go func() {
 		bgCtx := context.Background()
-		s.processChatStageAsync(bgCtx, lp, userMsg, currentStageMsgs, req, assistantPrompt, assistantLabel, fullGenerate, turnID)
+		s.processChatStageAsync(
+			bgCtx,
+			lp,
+			userMsg,
+			currentStageMsgs,
+			req,
+			assistantPrompt,
+			assistantLabel,
+			assistantResolution.Receipt,
+			fullGenerate,
+			turnID,
+		)
 	}()
 
 	return nil
@@ -415,90 +488,130 @@ func (s *LessonPlanGenService) resolveAssistantPrompt(
 	assistantID string,
 	callerID string,
 ) (string, string) {
+	if s.assistantService == nil || lp == nil {
+		return "", ""
+	}
+
+	user, err := repository.FindUserByID(
+		ctx,
+		callerID,
+	)
+	if err != nil {
+		lpGenLog.Warn(
+			"加载用户角色失败，使用系统阶段骨架",
+			"caller_id", callerID,
+			"error", err,
+		)
+		return "", ""
+	}
+
+	actor := BuildActorFromClaims(
+		ctx,
+		callerID,
+		user.Role,
+	)
+	scene := stageCodeToAssistantScene(
+		lp.CurrentStage,
+	)
+
+	load := func(id string) (*models.AIAssistant, error) {
+		assistant, loadErr :=
+			s.assistantService.LoadActiveAssistantForLessonUse(
+				ctx,
+				actor,
+				id,
+				lp.Subject,
+				lp.Grade,
+				scene,
+			)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if strings.TrimSpace(assistant.FullPrompt) == "" {
+			return nil, errors.New("助手内容为空")
+		}
+		return assistant, nil
+	}
+
 	assistantID = strings.TrimSpace(assistantID)
 
-	// assistantService 未注入：手动与默认两条路都无从加载，直接走空串老行为。
-	if s.assistantService == nil {
-		if assistantID != "" {
-			lpGenLog.Warn("Chat 收到 assistant_id 但 assistantService 未注入,降级到默认 prompt",
-				"assistant_id", assistantID)
+	if assistantID != "" {
+		assistant, loadErr := load(assistantID)
+		if loadErr != nil {
+			lpGenLog.Warn(
+				"显式助手不适用于当前课程，使用系统阶段骨架",
+				"assistant_id", assistantID,
+				"subject", lp.Subject,
+				"grade", lp.Grade,
+				"scene", scene,
+				"error", loadErr,
+			)
+			return "", ""
 		}
-		return "", ""
+		return assistant.FullPrompt, assistant.Name
 	}
 
-	// 构造操作者上下文（一次构造，供默认助手解析与 LoadActiveAssistantForUse 复用）。
-	// 反查用户角色失败则无法判定可见性，安全起见走空串老行为。
-	user, err := repository.FindUserByID(ctx, callerID)
-	if err != nil {
-		lpGenLog.Warn("Chat 加载用户角色失败,降级到默认 prompt",
-			"caller_id", callerID, "error", err)
-		return "", ""
-	}
-	actor := BuildActorFromClaims(ctx, callerID, user.Role)
+	prefID, found, prefErr := repository.GetPref(
+		ctx,
+		callerID,
+		lp.Subject,
+	)
+	if prefErr != nil {
+		lpGenLog.Warn(
+			"查询老师助手偏好失败，继续自动匹配",
+			"caller_id", callerID,
+			"subject", lp.Subject,
+			"grade", lp.Grade,
+			"error", prefErr,
+		)
+	} else if found {
+		prefID = strings.TrimSpace(prefID)
 
-	// 老师没手动选助手 → 先查老师×学科偏好，再以技能路由兜底。
-	if assistantID == "" {
-		// lp 为空时无法查偏好/解析默认助手（理论上 Chat 与开场白路径 lp 必非空，此为防御）。
-		if lp == nil {
+		if prefID == "" {
 			return "", ""
 		}
 
-		// —— 步骤2：查老师×学科偏好表（助手轻量选择入口 Phase 1 核心）——
-		prefID, found, perr := repository.GetPref(ctx, callerID, lp.Subject)
-		if perr != nil {
-			// 2c：真实 DB 错误。只 Warn，不阻塞——降级到步骤3技能路由兜底。
-			lpGenLog.Warn("查询老师×学科助手偏好失败,降级到默认助手兜底",
-				"caller_id", callerID, "subject", lp.Subject, "error", perr)
-		} else if found {
-			if strings.TrimSpace(prefID) != "" {
-				// 2a：老师为该学科显式选定了某助手 → 用它（走下方统一加载路径）。
-				assistantID = strings.TrimSpace(prefID)
-				lpGenLog.Info("命中老师×学科助手偏好",
-					"plan_id", lp.ID, "subject", lp.Subject, "stage", lp.CurrentStage,
-					"pref_assistant_id", assistantID)
-			} else {
-				// 2b：老师显式选了「系统默认(纯骨架)」→ 直接返回空串，绝不再走兜底。
-				// 这正是三态语义的关键：显式选系统默认 ≠ 从没选过。
-				lpGenLog.Info("老师×学科偏好为显式系统默认(纯骨架),不挂任何助手",
-					"plan_id", lp.ID, "subject", lp.Subject, "stage", lp.CurrentStage)
-				return "", ""
-			}
+		assistant, loadErr := load(prefID)
+		if loadErr == nil {
+			return assistant.FullPrompt, assistant.Name
 		}
 
-		// —— 步骤3：无偏好命中（无记录 / 偏好查询出错）→ RouteDefaultAssistant 末位兜底 ——
-		// 仅当上面没把 assistantID 赋成偏好助手时才进入（2a 命中则跳过本段）。
-		if assistantID == "" {
-			defaultID := RouteDefaultAssistant(ctx, s.assistantService, actor, lp.CurrentStage, lp.Subject, lp.Grade)
-			if defaultID == "" {
-				// 3b：无可见默认助手 → 不替换第4层，沿用阶段原生角色（与改造前"未选助手"行为一致）。
-				return "", ""
-			}
-			// 3a：技能路由解析到默认助手。
-			assistantID = defaultID
-			lpGenLog.Info("Chat 自动挂载默认助手（技能路由兜底）",
-				"plan_id", lp.ID, "stage", lp.CurrentStage,
-				"default_assistant_id", defaultID)
-		}
+		lpGenLog.Info(
+			"老师助手偏好不适用于当前课程，继续自动匹配",
+			"plan_id", lp.ID,
+			"pref_assistant_id", prefID,
+			"subject", lp.Subject,
+			"grade", lp.Grade,
+			"scene", scene,
+		)
 	}
 
-	// 统一加载路径：手动选择 / 偏好命中 / 默认挂载在此汇合。
-	a, err := s.assistantService.LoadActiveAssistantForUse(ctx, actor, assistantID)
-	if err != nil {
-		lpGenLog.Warn("Chat 加载 AI 助手失败,降级到默认 prompt",
-			"assistant_id", assistantID, "caller_id", callerID, "error", err)
+	defaultID := RouteDefaultAssistant(
+		ctx,
+		s.assistantService,
+		actor,
+		lp.CurrentStage,
+		lp.Subject,
+		lp.Grade,
+	)
+	if defaultID == "" {
 		return "", ""
 	}
 
-	if strings.TrimSpace(a.FullPrompt) == "" {
-		lpGenLog.Warn("Chat 助手 full_prompt 为空,降级到默认 prompt",
-			"assistant_id", assistantID)
+	assistant, loadErr := load(defaultID)
+	if loadErr != nil {
+		lpGenLog.Warn(
+			"自动助手最终复核失败，使用系统阶段骨架",
+			"assistant_id", defaultID,
+			"subject", lp.Subject,
+			"grade", lp.Grade,
+			"scene", scene,
+			"error", loadErr,
+		)
 		return "", ""
 	}
 
-	lpGenLog.Info("Chat 使用 AI 助手",
-		"assistant_id", assistantID, "assistant_name", a.Name,
-		"source", a.Source, "prompt_len", len(a.FullPrompt))
-	return a.FullPrompt, a.Name
+	return assistant.FullPrompt, assistant.Name
 }
 
 // ==================== 3. 获取对话历史 ====================

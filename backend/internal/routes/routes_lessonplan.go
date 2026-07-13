@@ -22,11 +22,11 @@ package routes
 //           压缩结果不落库，前端内存持有，每轮 chat 经 ref_material 字段携带。）
 
 import (
-        "encoding/json"
-        "net/http"
+	"encoding/json"
+	"net/http"
 
-        "tedna/internal/handlers"
-        "tedna/internal/middleware"
+	"tedna/internal/handlers"
+	"tedna/internal/middleware"
 )
 
 // registerLessonPlanRoutes 注册教案系统所有路由
@@ -35,528 +35,545 @@ import (
 // 助手轻量选择入口 Phase 1 改动:新增 prefHandler 参数(老师×学科助手偏好处理器)
 // 参考资料附件改动:新增 refHandler 参数(参考资料压缩处理器)
 func registerLessonPlanRoutes(
-        mux *http.ServeMux,
-        authMW func(http.Handler) http.Handler,
-        orgHandler *handlers.OrganizationHandler,
-        compHandler *handlers.ComponentHandler,
-        lpHandler *handlers.LessonPlanHandler,
-        lpGenHandler *handlers.LessonPlanGenHandler,
-        recipeHandler *handlers.RecipeHandler,
-        wsStageHandler *handlers.WorkshopStageHandler,
-        assessHandler *handlers.AssessmentHandler,
-        tbHandler *handlers.TextbookHandler,
-        annotationHandler *handlers.AnnotationHandler,
-        reviewAIHandler *handlers.ReviewAIHandler,
-        assetHandler *handlers.LessonPlanAssetHandler,
-        interactionHandler *handlers.LessonPlanInteractionHandler,
-        prefHandler *handlers.TeacherAssistantPrefHandler,
-        refHandler *handlers.LessonPlanRefHandler,
+	mux *http.ServeMux,
+	authMW func(http.Handler) http.Handler,
+	orgHandler *handlers.OrganizationHandler,
+	compHandler *handlers.ComponentHandler,
+	lpHandler *handlers.LessonPlanHandler,
+	lpGenHandler *handlers.LessonPlanGenHandler,
+	recipeHandler *handlers.RecipeHandler,
+	wsStageHandler *handlers.WorkshopStageHandler,
+	assessHandler *handlers.AssessmentHandler,
+	tbHandler *handlers.TextbookHandler,
+	annotationHandler *handlers.AnnotationHandler,
+	reviewAIHandler *handlers.ReviewAIHandler,
+	assetHandler *handlers.LessonPlanAssetHandler,
+	interactionHandler *handlers.LessonPlanInteractionHandler,
+	prefHandler *handlers.TeacherAssistantPrefHandler,
+	refHandler *handlers.LessonPlanRefHandler,
 ) {
-        // ---- v125新增：我的收藏列表（需在 /plans/ 通配前注册） ----
-        mux.Handle("/api/v1/lesson-plans/my-favorites",
-                middleware.Chain(http.HandlerFunc(interactionHandler.ListMyFavorites), authMW))
+	// ---- v125新增：我的收藏列表（需在 /plans/ 通配前注册） ----
+	mux.Handle("/api/v1/lesson-plans/my-favorites",
+		middleware.Chain(http.HandlerFunc(interactionHandler.ListMyFavorites), authMW))
 
-        // ---- 参考资料附件(PDF/Word)：长参考资料压缩端点（精确路径，不与 /plans/ 通配冲突） ----
-        // 老师上传 PDF/Word 后前端浏览器端提取文字，长文档(≥3000字)POST 到此压成结构化要点；
-        // 短文档前端不调此端点直接注入。压缩结果不落库，前端内存持有、每轮 chat 携带。登录即可。
-        mux.Handle("/api/v1/lesson-plans/ref-material/compress",
-                middleware.Chain(http.HandlerFunc(refHandler.CompressRefMaterial), authMW))
+	// ---- 参考资料附件(PDF/Word)：长参考资料压缩端点（精确路径，不与 /plans/ 通配冲突） ----
+	// 老师上传 PDF/Word 后前端浏览器端提取文字，长文档(≥3000字)POST 到此压成结构化要点；
+	// 短文档前端不调此端点直接注入。压缩结果不落库，前端内存持有、每轮 chat 携带。登录即可。
+	mux.Handle("/api/v1/lesson-plans/ref-material/compress",
+		middleware.Chain(http.HandlerFunc(refHandler.CompressRefMaterial), authMW))
 
-        // ---- 助手轻量选择入口 Phase 1：老师×学科助手偏好（精确路径，不与 /plans/ 通配冲突） ----
-        // 读/写偏好同一路径按 method 分发；可选助手列表单独一条。三条均登录即可（service 内按可见性收窄）。
-        mux.Handle("/api/v1/lesson-plans/assistant-prefs", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                switch r.Method {
-                case http.MethodGet:
-                        prefHandler.GetPref(w, r)
-                case http.MethodPut:
-                        prefHandler.PutPref(w, r)
-                default:
-                        methodNotAllowedJSON(w, "仅支持GET/PUT请求")
-                }
-        }), authMW))
+	// ---- 助手轻量选择入口 Phase 1：老师×学科助手偏好（精确路径，不与 /plans/ 通配冲突） ----
+	// 读/写偏好同一路径按 method 分发；可选助手列表单独一条。三条均登录即可（service 内按可见性收窄）。
+	mux.Handle("/api/v1/lesson-plans/assistant-prefs", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			prefHandler.GetPref(w, r)
+		case http.MethodPut:
+			prefHandler.PutPref(w, r)
+		default:
+			methodNotAllowedJSON(w, "仅支持GET/PUT请求")
+		}
+	}), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/assistant-options",
-                middleware.Chain(http.HandlerFunc(prefHandler.GetOptions), authMW))
+	mux.Handle("/api/v1/lesson-plans/assistant-options",
+		middleware.Chain(http.HandlerFunc(prefHandler.GetOptions), authMW))
 
-        // ---- 教案SSE推送(内部JWT验证)----
-        mux.HandleFunc("/api/v1/lesson-plans/sse/", lpGenHandler.StreamPlan)
+	// ---- 教案SSE推送(内部JWT验证)----
+	mux.HandleFunc("/api/v1/lesson-plans/sse/", lpGenHandler.StreamPlan)
 
-        // ---- 开始对话(特殊路径,需在/plans/前注册)----
-        mux.Handle("/api/v1/lesson-plans/plans/start-conversation",
-                middleware.Chain(http.HandlerFunc(lpGenHandler.StartConversation), authMW))
+	// ---- 开始对话(特殊路径,需在/plans/前注册)----
+	mux.Handle("/api/v1/lesson-plans/plans/start-conversation",
+		middleware.Chain(http.HandlerFunc(lpGenHandler.StartConversation), authMW))
 
-        // ---- v108新增:导入已有教案(需在/plans/通配路由前注册)----
-        mux.Handle("/api/v1/lesson-plans/plans/import-existing",
-                middleware.Chain(http.HandlerFunc(lpGenHandler.ImportExistingPlan), authMW))
+	// ---- v108新增:导入已有教案(需在/plans/通配路由前注册)----
+	mux.Handle("/api/v1/lesson-plans/plans/import-existing",
+		middleware.Chain(http.HandlerFunc(lpGenHandler.ImportExistingPlan), authMW))
 
-        // ==================== 阶段化备课工坊(Phase 7B 新增)====================
+	// ==================== 阶段化备课工坊(Phase 7B 新增)====================
 
-        mux.Handle("/api/v1/lesson-plans/workshop/stages/defaults",
-                middleware.Chain(http.HandlerFunc(wsStageHandler.GetDefaultStages), authMW))
+	mux.Handle("/api/v1/lesson-plans/workshop/stages/defaults",
+		middleware.Chain(http.HandlerFunc(wsStageHandler.GetDefaultStages), authMW))
 
-        // ==================== 教学风格前测(迭代3新增)====================
+	// ==================== 教学风格前测(迭代3新增)====================
 
-        mux.Handle("/api/v1/lesson-plans/assessment/start",
-                middleware.Chain(http.HandlerFunc(assessHandler.StartAssessment), authMW))
+	mux.Handle("/api/v1/lesson-plans/assessment/start",
+		middleware.Chain(http.HandlerFunc(assessHandler.StartAssessment), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/assessment/chat",
-                middleware.Chain(http.HandlerFunc(assessHandler.ChatAssessment), authMW))
+	mux.Handle("/api/v1/lesson-plans/assessment/chat",
+		middleware.Chain(http.HandlerFunc(assessHandler.ChatAssessment), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/assessment/submit",
-                middleware.Chain(http.HandlerFunc(assessHandler.SubmitAssessment), authMW))
+	mux.Handle("/api/v1/lesson-plans/assessment/submit",
+		middleware.Chain(http.HandlerFunc(assessHandler.SubmitAssessment), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/assessment/skip",
-                middleware.Chain(http.HandlerFunc(assessHandler.SkipAssessment), authMW))
+	mux.Handle("/api/v1/lesson-plans/assessment/skip",
+		middleware.Chain(http.HandlerFunc(assessHandler.SkipAssessment), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/assessment/result",
-                middleware.Chain(http.HandlerFunc(assessHandler.GetAssessmentResult), authMW))
+	mux.Handle("/api/v1/lesson-plans/assessment/result",
+		middleware.Chain(http.HandlerFunc(assessHandler.GetAssessmentResult), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/assessment/auto-recipe",
-                middleware.Chain(http.HandlerFunc(assessHandler.AutoGenerateRecipe), authMW))
+	mux.Handle("/api/v1/lesson-plans/assessment/auto-recipe",
+		middleware.Chain(http.HandlerFunc(assessHandler.AutoGenerateRecipe), authMW))
 
-        // ==================== 组织管理 ====================
+	// ==================== 组织管理 ====================
 
-        mux.Handle("/api/v1/lesson-plans/organizations", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                switch r.Method {
-                case http.MethodGet:
-                        orgHandler.ListOrganizations(w, r)
-                case http.MethodPost:
-                        claims, ok := middleware.GetClaims(r.Context())
-                        if !ok || !hasRole(claims.Role, roleAdmin) {
-                                forbiddenJSON(w, "仅管理员可创建组织")
-                                return
-                        }
-                        orgHandler.CreateOrganization(w, r)
-                default:
-                        methodNotAllowedJSON(w, "仅支持GET/POST请求")
-                }
-        }), authMW))
+	mux.Handle("/api/v1/lesson-plans/organizations", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			orgHandler.ListOrganizations(w, r)
+		case http.MethodPost:
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || !hasRole(claims.Role, roleAdmin) {
+				forbiddenJSON(w, "仅管理员可创建组织")
+				return
+			}
+			orgHandler.CreateOrganization(w, r)
+		default:
+			methodNotAllowedJSON(w, "仅支持GET/POST请求")
+		}
+	}), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/organizations/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                path := r.URL.Path
-                // ---- 迭代一 Phase 5：组织多管理员端点（/admins 优先于单组织 GET/PUT/DELETE 判定）----
-                // 权限分层（admin 任何组织 / region_admin 仅辖区学校 / 其它拒绝）在 service 层判定。
-                if indexOf(path, "/admins/") >= 0 && r.Method == http.MethodDelete {
-                        // DELETE .../{id}/admins/{user_id}
-                        orgHandler.RemoveOrgAdmin(w, r)
-                        return
-                }
-                if hasSuffix(path, "/admins") {
-                        switch r.Method {
-                        case http.MethodGet:
-                                orgHandler.ListOrgAdmins(w, r)
-                        case http.MethodPost:
-                                orgHandler.AddOrgAdmin(w, r)
-                        default:
-                                methodNotAllowedJSON(w, "仅支持GET/POST请求")
-                        }
-                        return
-                }
-                // ---- 原有单组织 CRUD ----
-                switch r.Method {
-                case http.MethodGet:
-                        orgHandler.GetOrganization(w, r)
-                case http.MethodPut:
-                        claims, ok := middleware.GetClaims(r.Context())
-                        if !ok || !hasRole(claims.Role, roleAdmin) {
-                                forbiddenJSON(w, "仅管理员可更新组织")
-                                return
-                        }
-                        orgHandler.UpdateOrganization(w, r)
-                case http.MethodDelete:
-                        claims, ok := middleware.GetClaims(r.Context())
-                        if !ok || !hasRole(claims.Role, roleAdmin) {
-                                forbiddenJSON(w, "仅管理员可删除组织")
-                                return
-                        }
-                        orgHandler.DeleteOrganization(w, r)
-                default:
-                        methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
-                }
-        }), authMW))
+	mux.Handle("/api/v1/lesson-plans/organizations/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		// ---- 迭代一 Phase 5：组织多管理员端点（/admins 优先于单组织 GET/PUT/DELETE 判定）----
+		// 权限分层（admin 任何组织 / region_admin 仅辖区学校 / 其它拒绝）在 service 层判定。
+		if indexOf(path, "/admins/") >= 0 && r.Method == http.MethodDelete {
+			// DELETE .../{id}/admins/{user_id}
+			orgHandler.RemoveOrgAdmin(w, r)
+			return
+		}
+		if hasSuffix(path, "/admins") {
+			switch r.Method {
+			case http.MethodGet:
+				orgHandler.ListOrgAdmins(w, r)
+			case http.MethodPost:
+				orgHandler.AddOrgAdmin(w, r)
+			default:
+				methodNotAllowedJSON(w, "仅支持GET/POST请求")
+			}
+			return
+		}
+		// ---- 原有单组织 CRUD ----
+		switch r.Method {
+		case http.MethodGet:
+			orgHandler.GetOrganization(w, r)
+		case http.MethodPut:
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || !hasRole(claims.Role, roleAdmin) {
+				forbiddenJSON(w, "仅管理员可更新组织")
+				return
+			}
+			orgHandler.UpdateOrganization(w, r)
+		case http.MethodDelete:
+			claims, ok := middleware.GetClaims(r.Context())
+			if !ok || !hasRole(claims.Role, roleAdmin) {
+				forbiddenJSON(w, "仅管理员可删除组织")
+				return
+			}
+			orgHandler.DeleteOrganization(w, r)
+		default:
+			methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
+		}
+	}), authMW))
 
-        // ==================== 教研组管理 ====================
+	// ==================== 教研组管理 ====================
 
-        mux.Handle("/api/v1/lesson-plans/teaching-groups", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                switch r.Method {
-                case http.MethodGet:
-                        orgHandler.ListTeachingGroups(w, r)
-                case http.MethodPost:
-                        orgHandler.CreateTeachingGroup(w, r)
-                default:
-                        methodNotAllowedJSON(w, "仅支持GET/POST请求")
-                }
-        }), authMW))
+	mux.Handle("/api/v1/lesson-plans/teaching-groups", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			orgHandler.ListTeachingGroups(w, r)
+		case http.MethodPost:
+			orgHandler.CreateTeachingGroup(w, r)
+		default:
+			methodNotAllowedJSON(w, "仅支持GET/POST请求")
+		}
+	}), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/teaching-groups/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                path := r.URL.Path
-                switch {
-                case hasSuffix(path, "/members") && r.Method == http.MethodPost:
-                        orgHandler.AddGroupMember(w, r)
-                case indexOf(path, "/members/") >= 0 && r.Method == http.MethodDelete:
-                        orgHandler.RemoveGroupMember(w, r)
-                default:
-                        switch r.Method {
-                        case http.MethodGet:
-                                orgHandler.GetTeachingGroupDetail(w, r)
-                        case http.MethodPut:
-                                orgHandler.UpdateTeachingGroup(w, r)
-                        case http.MethodDelete:
-                                orgHandler.DeleteTeachingGroup(w, r)
-                        default:
-                                methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
-                        }
-                }
-        }), authMW))
+	mux.Handle("/api/v1/lesson-plans/teaching-groups/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case hasSuffix(path, "/members") && r.Method == http.MethodPost:
+			orgHandler.AddGroupMember(w, r)
+		case indexOf(path, "/members/") >= 0 && r.Method == http.MethodDelete:
+			orgHandler.RemoveGroupMember(w, r)
+		default:
+			switch r.Method {
+			case http.MethodGet:
+				orgHandler.GetTeachingGroupDetail(w, r)
+			case http.MethodPut:
+				orgHandler.UpdateTeachingGroup(w, r)
+			case http.MethodDelete:
+				orgHandler.DeleteTeachingGroup(w, r)
+			default:
+				methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
+			}
+		}
+	}), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/my-groups",
-                middleware.Chain(http.HandlerFunc(orgHandler.GetUserTeachingGroups), authMW))
+	mux.Handle("/api/v1/lesson-plans/my-groups",
+		middleware.Chain(http.HandlerFunc(orgHandler.GetUserTeachingGroups), authMW))
 
-        // ==================== 迭代7:课本上传 ====================
+	// ==================== 迭代7:课本上传 ====================
 
-        // 上传接口(multipart,需在通配符路由前注册)
-        mux.Handle("/api/v1/lesson-plans/textbooks/upload",
-                middleware.Chain(http.HandlerFunc(tbHandler.UploadTextbook), authMW))
+	// 上传接口(multipart,需在通配符路由前注册)
+	mux.Handle("/api/v1/lesson-plans/textbooks/upload",
+		middleware.Chain(http.HandlerFunc(tbHandler.UploadTextbook), authMW))
 
-        // 课本列表
-        mux.Handle("/api/v1/lesson-plans/textbooks", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                switch r.Method {
-                case http.MethodGet:
-                        tbHandler.ListTextbooks(w, r)
-                default:
-                        methodNotAllowedJSON(w, "仅支持GET请求")
-                }
-        }), authMW))
+	// 课本列表
+	mux.Handle("/api/v1/lesson-plans/textbooks", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			tbHandler.ListTextbooks(w, r)
+		default:
+			methodNotAllowedJSON(w, "仅支持GET请求")
+		}
+	}), authMW))
 
-        // 课本子路由:详情/更新/删除/OCR
-        mux.Handle("/api/v1/lesson-plans/textbooks/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                path := r.URL.Path
-                switch {
-                case hasSuffix(path, "/ocr") && r.Method == http.MethodPost:
-                        tbHandler.TriggerOCR(w, r)
-                default:
-                        switch r.Method {
-                        case http.MethodGet:
-                                tbHandler.GetTextbook(w, r)
-                        case http.MethodPut:
-                                tbHandler.UpdateTextbook(w, r)
-                        case http.MethodDelete:
-                                tbHandler.DeleteTextbook(w, r)
-                        default:
-                                methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
-                        }
-                }
-        }), authMW))
+	// 课本子路由:详情/更新/删除/OCR
+	mux.Handle("/api/v1/lesson-plans/textbooks/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case hasSuffix(path, "/ocr") && r.Method == http.MethodPost:
+			tbHandler.TriggerOCR(w, r)
+		default:
+			switch r.Method {
+			case http.MethodGet:
+				tbHandler.GetTextbook(w, r)
+			case http.MethodPut:
+				tbHandler.UpdateTextbook(w, r)
+			case http.MethodDelete:
+				tbHandler.DeleteTextbook(w, r)
+			default:
+				methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
+			}
+		}
+	}), authMW))
 
-        // ==================== v123 新增:教案资产管理(独立 /assets/{id} 路由)====================
-        //
-        // 注意:/plans/{id}/assets 这条路由不在这里注册,而是放到下面"教案CRUD"
-        // 通配处理器里(因为 /plans/ 已经是通配前缀,在外面单独注册会被冲掉)。
-        //
-        // 这里只注册 /assets/{asset_id} 这条独立路由(不带 /plans/ 前缀)。
-        mux.Handle("/api/v1/lesson-plans/assets/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                switch r.Method {
-                case http.MethodGet:
-                        assetHandler.GetAsset(w, r)
-                case http.MethodPut:
-                        assetHandler.UpdateAsset(w, r)
-                case http.MethodDelete:
-                        assetHandler.DeleteAsset(w, r)
-                default:
-                        methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
-                }
-        }), authMW))
+	// ==================== v123 新增:教案资产管理(独立 /assets/{id} 路由)====================
+	//
+	// 注意:/plans/{id}/assets 这条路由不在这里注册,而是放到下面"教案CRUD"
+	// 通配处理器里(因为 /plans/ 已经是通配前缀,在外面单独注册会被冲掉)。
+	//
+	// 这里只注册 /assets/{asset_id} 这条独立路由(不带 /plans/ 前缀)。
+	mux.Handle("/api/v1/lesson-plans/assets/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			assetHandler.GetAsset(w, r)
+		case http.MethodPut:
+			assetHandler.UpdateAsset(w, r)
+		case http.MethodDelete:
+			assetHandler.DeleteAsset(w, r)
+		default:
+			methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
+		}
+	}), authMW))
 
-        // ==================== 组件库 ====================
+	// ==================== 组件库 ====================
 
-        mux.Handle("/api/v1/lesson-plans/components", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                switch r.Method {
-                case http.MethodGet:
-                        compHandler.ListComponents(w, r)
-                case http.MethodPost:
-                        compHandler.CreateComponent(w, r)
-                default:
-                        methodNotAllowedJSON(w, "仅支持GET/POST请求")
-                }
-        }), authMW))
+	mux.Handle("/api/v1/lesson-plans/components", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			compHandler.ListComponents(w, r)
+		case http.MethodPost:
+			compHandler.CreateComponent(w, r)
+		default:
+			methodNotAllowedJSON(w, "仅支持GET/POST请求")
+		}
+	}), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/components/match",
-                middleware.Chain(http.HandlerFunc(compHandler.MatchComponents), authMW))
+	mux.Handle("/api/v1/lesson-plans/components/match",
+		middleware.Chain(http.HandlerFunc(compHandler.MatchComponents), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/components/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                path := r.URL.Path
-                switch {
-                case hasSuffix(path, "/review"):
-                        compHandler.ReviewComponent(w, r)
-                default:
-                        switch r.Method {
-                        case http.MethodGet:
-                                compHandler.GetComponent(w, r)
-                        case http.MethodPut:
-                                compHandler.UpdateComponent(w, r)
-                        case http.MethodDelete:
-                                compHandler.DeleteComponent(w, r)
-                        default:
-                                methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
-                        }
-                }
-        }), authMW))
+	mux.Handle("/api/v1/lesson-plans/components/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case hasSuffix(path, "/review"):
+			compHandler.ReviewComponent(w, r)
+		default:
+			switch r.Method {
+			case http.MethodGet:
+				compHandler.GetComponent(w, r)
+			case http.MethodPut:
+				compHandler.UpdateComponent(w, r)
+			case http.MethodDelete:
+				compHandler.DeleteComponent(w, r)
+			default:
+				methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
+			}
+		}
+	}), authMW))
 
-        // ==================== 萃取队列 ====================
+	// ==================== 萃取队列 ====================
 
-        mux.Handle("/api/v1/lesson-plans/extractions",
-                middleware.Chain(http.HandlerFunc(compHandler.ListExtractions), authMW))
+	mux.Handle("/api/v1/lesson-plans/extractions",
+		middleware.Chain(http.HandlerFunc(compHandler.ListExtractions), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/extractions/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                path := r.URL.Path
-                if hasSuffix(path, "/confirm") {
-                        compHandler.ConfirmExtraction(w, r)
-                        return
-                }
-                w.Header().Set("Content-Type", "application/json")
-                w.WriteHeader(http.StatusNotFound)
-                _ = json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "未知的萃取子路径"})
-        }), authMW))
+	mux.Handle("/api/v1/lesson-plans/extractions/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if hasSuffix(path, "/confirm") {
+			compHandler.ConfirmExtraction(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": -1, "message": "未知的萃取子路径"})
+	}), authMW))
 
-        // ==================== 备课配方 ====================
+	// ==================== 备课配方 ====================
 
-        // 迭代2:预设流程模板(需在 /recipes/ 和 /recipes/recommend 前注册)
-        mux.Handle("/api/v1/lesson-plans/recipes/flow-presets",
-                middleware.Chain(http.HandlerFunc(recipeHandler.GetFlowPresets), authMW))
+	// 迭代2:预设流程模板(需在 /recipes/ 和 /recipes/recommend 前注册)
+	mux.Handle("/api/v1/lesson-plans/recipes/flow-presets",
+		middleware.Chain(http.HandlerFunc(recipeHandler.GetFlowPresets), authMW))
 
-        // 迭代2:校验流程完整性
-        mux.Handle("/api/v1/lesson-plans/recipes/validate-flow",
-                middleware.Chain(http.HandlerFunc(recipeHandler.ValidateFlow), authMW))
+	// 迭代2:校验流程完整性
+	mux.Handle("/api/v1/lesson-plans/recipes/validate-flow",
+		middleware.Chain(http.HandlerFunc(recipeHandler.ValidateFlow), authMW))
 
-        // 迭代4B-2新增:画像感知智能推荐(需在 /recipes/ 和 /recipes/recommend 前注册)
-        mux.Handle("/api/v1/lesson-plans/recipes/smart-recommend",
-                middleware.Chain(http.HandlerFunc(recipeHandler.SmartRecommendComponents), authMW))
+	// 迭代4B-2新增:画像感知智能推荐(需在 /recipes/ 和 /recipes/recommend 前注册)
+	mux.Handle("/api/v1/lesson-plans/recipes/smart-recommend",
+		middleware.Chain(http.HandlerFunc(recipeHandler.SmartRecommendComponents), authMW))
 
-        // 迭代6新增:配方市场排行榜
-        mux.Handle("/api/v1/lesson-plans/recipes/market",
-                middleware.Chain(http.HandlerFunc(recipeHandler.ListMarketRecipes), authMW))
+	// 迭代6新增:配方市场排行榜
+	mux.Handle("/api/v1/lesson-plans/recipes/market",
+		middleware.Chain(http.HandlerFunc(recipeHandler.ListMarketRecipes), authMW))
 
-        // 对话模式可用配方列表（需在 /recipes/ 和 /recipes/recommend 前注册）
-        mux.Handle("/api/v1/lesson-plans/recipes/available",
-                middleware.Chain(http.HandlerFunc(handlers.HandleListAvailableRecipes), authMW))
+	// 对话模式可用配方列表（需在 /recipes/ 和 /recipes/recommend 前注册）
+	mux.Handle("/api/v1/lesson-plans/recipes/available",
+		middleware.Chain(http.HandlerFunc(handlers.HandleListAvailableRecipes), authMW))
 
-        // 智能推荐(原始版本)
-        mux.Handle("/api/v1/lesson-plans/recipes/recommend",
-                middleware.Chain(http.HandlerFunc(recipeHandler.RecommendComponents), authMW))
+	// 智能推荐(原始版本)
+	mux.Handle("/api/v1/lesson-plans/recipes/recommend",
+		middleware.Chain(http.HandlerFunc(recipeHandler.RecommendComponents), authMW))
 
-        // 配方列表 + 创建
-        mux.Handle("/api/v1/lesson-plans/recipes", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                switch r.Method {
-                case http.MethodGet:
-                        recipeHandler.ListRecipes(w, r)
-                case http.MethodPost:
-                        recipeHandler.CreateRecipe(w, r)
-                default:
-                        methodNotAllowedJSON(w, "仅支持GET/POST请求")
-                }
-        }), authMW))
+	// 配方列表 + 创建
+	mux.Handle("/api/v1/lesson-plans/recipes", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			recipeHandler.ListRecipes(w, r)
+		case http.MethodPost:
+			recipeHandler.CreateRecipe(w, r)
+		default:
+			methodNotAllowedJSON(w, "仅支持GET/POST请求")
+		}
+	}), authMW))
 
-        // 配方子路由(迭代5:custom-stages必须在通用/{id}路由之前匹配)
-        mux.Handle("/api/v1/lesson-plans/recipes/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                path := r.URL.Path
-                switch {
-                // ---- 迭代5新增:自定义阶段CRUD ----
-                case indexOf(path, "/custom-stages/") >= 0:
-                        switch r.Method {
-                        case http.MethodPut:
-                                wsStageHandler.UpdateCustomStage(w, r)
-                        case http.MethodDelete:
-                                wsStageHandler.DeleteCustomStage(w, r)
-                        default:
-                                methodNotAllowedJSON(w, "仅支持PUT/DELETE请求")
-                        }
-                case hasSuffix(path, "/custom-stages"):
-                        switch r.Method {
-                        case http.MethodGet:
-                                wsStageHandler.ListCustomStages(w, r)
-                        case http.MethodPost:
-                                wsStageHandler.CreateCustomStage(w, r)
-                        default:
-                                methodNotAllowedJSON(w, "仅支持GET/POST请求")
-                        }
-                // ---- 原有配方子路由 ----
-                case hasSuffix(path, "/fork") && r.Method == http.MethodPost:
-                        recipeHandler.ForkRecipe(w, r)
-                case hasSuffix(path, "/share") && r.Method == http.MethodPut:
-                        recipeHandler.ShareRecipe(w, r)
-                case hasSuffix(path, "/student-profile") && r.Method == http.MethodPut:
-                        recipeHandler.UpdateStudentProfile(w, r)
-                case hasSuffix(path, "/preview-context") && r.Method == http.MethodGet:
-                        recipeHandler.PreviewContext(w, r)
-                // 迭代6新增:配方效果统计
-                case hasSuffix(path, "/stats") && r.Method == http.MethodGet:
-                        recipeHandler.GetRecipeStats(w, r)
-                default:
-                        switch r.Method {
-                        case http.MethodGet:
-                                recipeHandler.GetRecipe(w, r)
-                        case http.MethodPut:
-                                recipeHandler.UpdateRecipe(w, r)
-                        case http.MethodDelete:
-                                recipeHandler.DeleteRecipe(w, r)
-                        default:
-                                methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
-                        }
-                }
-        }), authMW))
+	// 配方子路由(迭代5:custom-stages必须在通用/{id}路由之前匹配)
+	mux.Handle("/api/v1/lesson-plans/recipes/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		// ---- 迭代5新增:自定义阶段CRUD ----
+		case indexOf(path, "/custom-stages/") >= 0:
+			switch r.Method {
+			case http.MethodPut:
+				wsStageHandler.UpdateCustomStage(w, r)
+			case http.MethodDelete:
+				wsStageHandler.DeleteCustomStage(w, r)
+			default:
+				methodNotAllowedJSON(w, "仅支持PUT/DELETE请求")
+			}
+		case hasSuffix(path, "/custom-stages"):
+			switch r.Method {
+			case http.MethodGet:
+				wsStageHandler.ListCustomStages(w, r)
+			case http.MethodPost:
+				wsStageHandler.CreateCustomStage(w, r)
+			default:
+				methodNotAllowedJSON(w, "仅支持GET/POST请求")
+			}
+		// ---- 原有配方子路由 ----
+		case hasSuffix(path, "/fork") && r.Method == http.MethodPost:
+			recipeHandler.ForkRecipe(w, r)
+		case hasSuffix(path, "/share") && r.Method == http.MethodPut:
+			recipeHandler.ShareRecipe(w, r)
+		case hasSuffix(path, "/student-profile") && r.Method == http.MethodPut:
+			recipeHandler.UpdateStudentProfile(w, r)
+		case hasSuffix(path, "/preview-context") && r.Method == http.MethodGet:
+			recipeHandler.PreviewContext(w, r)
+		// 迭代6新增:配方效果统计
+		case hasSuffix(path, "/stats") && r.Method == http.MethodGet:
+			recipeHandler.GetRecipeStats(w, r)
+		default:
+			switch r.Method {
+			case http.MethodGet:
+				recipeHandler.GetRecipe(w, r)
+			case http.MethodPut:
+				recipeHandler.UpdateRecipe(w, r)
+			case http.MethodDelete:
+				recipeHandler.DeleteRecipe(w, r)
+			default:
+				methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
+			}
+		}
+	}), authMW))
 
-        // ==================== 教案CRUD + 阶段操作 ====================
+	// ==================== 教案CRUD + 阶段操作 ====================
 
-        mux.Handle("/api/v1/lesson-plans/plans", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                switch r.Method {
-                case http.MethodGet:
-                        lpHandler.ListLessonPlans(w, r)
-                case http.MethodPost:
-                        lpHandler.CreateLessonPlan(w, r)
-                default:
-                        methodNotAllowedJSON(w, "仅支持GET/POST请求")
-                }
-        }), authMW))
+	mux.Handle("/api/v1/lesson-plans/plans", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			lpHandler.ListLessonPlans(w, r)
+		case http.MethodPost:
+			lpHandler.CreateLessonPlan(w, r)
+		default:
+			methodNotAllowedJSON(w, "仅支持GET/POST请求")
+		}
+	}), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/plans/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                path := r.URL.Path
-                switch {
-                // ---- v123 新增:教案资产管理(/plans/{id}/assets) ----
-                // 必须放在通配处理最前面,因为它的优先级最高(具体路径优先于通用 GET/PUT/DELETE)
-                case hasSuffix(path, "/assets") && r.Method == http.MethodPost:
-                        assetHandler.UploadAsset(w, r)
-                case hasSuffix(path, "/assets") && r.Method == http.MethodGet:
-                        assetHandler.ListAssets(w, r)
-                // ---- v125新增：教案互动（点赞/收藏） ----
-                case hasSuffix(path, "/interact") && r.Method == http.MethodPost:
-                        interactionHandler.ToggleInteraction(w, r)
-                case hasSuffix(path, "/interactions") && r.Method == http.MethodGet:
-                        interactionHandler.GetInteractions(w, r)
-                // ---- 迭代3.5 A2-2新增:课本中途挂载(PUT /plans/{id}/textbooks) ----
-                // 引擎每轮对话重读 lesson_plans.textbook_page_ids 拼OCR进系统提示词，
-                // 故更新该列后下一轮对话自动携带课本上下文，引擎零改动。
-                case hasSuffix(path, "/textbooks") && r.Method == http.MethodPut:
-                        lpHandler.UpdateLessonPlanTextbooks(w, r)
-                // ---- 大单元挂载新增:单元方案中途挂载/解除(PUT /plans/{id}/unit-plan) ----
-                // 与课本挂载同款机制：注入层每轮重读 lesson_plans.unit_plan_id 决定是否注入
-                // 单元方案上下文（仅注入 active），故更新该列后下一轮对话自动生效，引擎零改动。
-                // unit_plan_id 传空串 "" = 解除挂载（取消大单元绑定）。
-                // 后缀 /unit-plan 与上方所有后缀（/assets、/textbooks、/interact 等）均不冲突。
-                case hasSuffix(path, "/unit-plan") && r.Method == http.MethodPut:
-                        lpHandler.UpdateLessonPlanUnitPlan(w, r)
-                // ---- 班级学情挂载·批次3：班级学情卡中途挂载/解除(PUT /plans/{id}/class-profile) ----
-                // 与单元方案挂载同款机制：注入层每轮重读 lesson_plans.class_profile_id 决定是否注入
-                // 班级学情四大段(仅 analyze/design/write 三阶段、仅 active 且归属本人)，故更新该列后
-                // 下一轮对话自动生效，引擎零改动。class_profile_id 传空串 "" = 解除挂载(取消班级关联)。
-                // 后缀 /class-profile 与上方所有后缀(/assets、/textbooks、/unit-plan、/interact 等)均不冲突。
-                case hasSuffix(path, "/class-profile") && r.Method == http.MethodPut:
-                        lpHandler.UpdateLessonPlanClassProfile(w, r)
-                // ---- 教材版本增强：课程大纲教材版本设置/解除(PUT /plans/{id}/course-outline-publisher) ----
-                // 备课首屏选定教材版本后写入 lesson_plans.course_outline_publisher，注入层下一轮 analyze/design
-                // 阶段据此版本精确匹配注入对应版本大纲（零跨版本兜底）。三态：传 null=解除不注入、传 ""=通用版、
-                // 传 "人教版"=具名版本。后缀 /course-outline-publisher 与上方所有后缀均不冲突。
-                case hasSuffix(path, "/course-outline-publisher") && r.Method == http.MethodPut:
-                        lpHandler.UpdateLessonPlanCourseOutlinePublisher(w, r)
-                // ---- 阶段操作 ----
-                case hasSuffix(path, "/stages/switch") && r.Method == http.MethodPost:
-                        wsStageHandler.SwitchToStage(w, r)
-                case hasSuffix(path, "/stages/reset") && r.Method == http.MethodPost:
-                        wsStageHandler.ResetStage(w, r)
-                case hasSuffix(path, "/stages/advance") && r.Method == http.MethodPost:
-                        wsStageHandler.AdvanceStage(w, r)
-                case hasSuffix(path, "/stages/skip") && r.Method == http.MethodPost:
-                        wsStageHandler.SkipStage(w, r)
-                case hasSuffix(path, "/stages/back") && r.Method == http.MethodPost:
-                        wsStageHandler.BackStage(w, r)
-                // 迭代12新增:阶段推荐组件
-                case hasSuffix(path, "/completeness") && indexOf(path, "/stages/") >= 0 && r.Method == http.MethodGet:
-                        wsStageHandler.GetStageCompleteness(w, r)
-                case hasSuffix(path, "/recommended-components") && indexOf(path, "/stages/") >= 0 && r.Method == http.MethodGet:
-                        wsStageHandler.GetStageRecommendedComponents(w, r)
-                case hasSuffix(path, "/output") && indexOf(path, "/stages/") >= 0 && r.Method == http.MethodGet:
-                        wsStageHandler.GetStageOutput(w, r)
-                case hasSuffix(path, "/stages") && r.Method == http.MethodGet:
-                        wsStageHandler.GetStageStatus(w, r)
-                case hasSuffix(path, "/chat"):
-                        lpGenHandler.Chat(w, r)
-                case hasSuffix(path, "/trigger-review"):
-                        lpGenHandler.TriggerAIReview(w, r)
-                case hasSuffix(path, "/apply-suggestions"):
-                        lpGenHandler.ApplyAISuggestions(w, r)
-                case hasSuffix(path, "/conversation"):
-                        lpGenHandler.GetConversation(w, r)
-                case hasSuffix(path, "/publish-personal"):
-                        lpHandler.PublishPersonal(w, r)
-                case hasSuffix(path, "/submit-review"):
-                        lpHandler.SubmitForReview(w, r)
-                case hasSuffix(path, "/review"):
-                        lpHandler.ReviewLessonPlan(w, r)
-                case hasSuffix(path, "/publish-shared"):
-                        lpHandler.PublishShared(w, r)
-                case hasSuffix(path, "/start-development"):
-                        lpHandler.StartDevelopment(w, r)
-                case hasSuffix(path, "/fork"):
-                        lpHandler.ForkLessonPlan(w, r)
-                // ---- 段落批注路由 ----
-                case hasSuffix(path, "/resolve") && indexOf(path, "/annotations/") >= 0 && r.Method == http.MethodPut:
-                        annotationHandler.ResolveAnnotation(w, r)
-                case hasSuffix(path, "/ai-fix") && indexOf(path, "/annotations/") >= 0 && r.Method == http.MethodPost:
-                        annotationHandler.AIFixAnnotation(w, r)
-                case indexOf(path, "/annotations/") >= 0 && r.Method == http.MethodPut:
-                        annotationHandler.UpdateAnnotation(w, r)
-                case indexOf(path, "/annotations/") >= 0 && r.Method == http.MethodDelete:
-                        annotationHandler.DeleteAnnotation(w, r)
-                case hasSuffix(path, "/annotations") && r.Method == http.MethodGet:
-                        annotationHandler.ListAnnotations(w, r)
-                case hasSuffix(path, "/annotations") && r.Method == http.MethodPost:
-                        annotationHandler.CreateAnnotation(w, r)
-                default:
-                        switch r.Method {
-                        case http.MethodGet:
-                                lpHandler.GetLessonPlan(w, r)
-                        case http.MethodPut:
-                                lpHandler.UpdateLessonPlan(w, r)
-                        case http.MethodDelete:
-                                lpHandler.DeleteLessonPlan(w, r)
-                        default:
-                                methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
-                        }
-                }
-        }), authMW))
+	mux.Handle("/api/v1/lesson-plans/plans/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		// ---- v123 新增:教案资产管理(/plans/{id}/assets) ----
+		// 必须放在通配处理最前面,因为它的优先级最高(具体路径优先于通用 GET/PUT/DELETE)
+		case hasSuffix(path, "/assets") && r.Method == http.MethodPost:
+			assetHandler.UploadAsset(w, r)
+		case hasSuffix(path, "/assets") && r.Method == http.MethodGet:
+			assetHandler.ListAssets(w, r)
+		// ---- 教案正文版本历史：列表 / 详情 / 恢复 ----
+		// 路由从最长子路径到最短子路径匹配，避免列表路由抢占详情。
+		case hasSuffix(path, "/restore") &&
+			indexOf(path, "/versions/") >= 0 &&
+			r.Method == http.MethodPost:
+			lpHandler.RestoreContentVersion(w, r)
+		case indexOf(path, "/versions/") >= 0 &&
+			r.Method == http.MethodGet:
+			lpHandler.GetContentVersion(w, r)
+		case hasSuffix(path, "/versions") &&
+			r.Method == http.MethodGet:
+			lpHandler.ListContentVersions(w, r)
+		case indexOf(path, "/versions") >= 0:
+			methodNotAllowedJSON(
+				w,
+				"教案版本列表与详情仅支持GET，恢复仅支持POST",
+			)
+		// ---- v125新增：教案互动（点赞/收藏） ----
+		case hasSuffix(path, "/interact") && r.Method == http.MethodPost:
+			interactionHandler.ToggleInteraction(w, r)
+		case hasSuffix(path, "/interactions") && r.Method == http.MethodGet:
+			interactionHandler.GetInteractions(w, r)
+		// ---- 迭代3.5 A2-2新增:课本中途挂载(PUT /plans/{id}/textbooks) ----
+		// 引擎每轮对话重读 lesson_plans.textbook_page_ids 拼OCR进系统提示词，
+		// 故更新该列后下一轮对话自动携带课本上下文，引擎零改动。
+		case hasSuffix(path, "/textbooks") && r.Method == http.MethodPut:
+			lpHandler.UpdateLessonPlanTextbooks(w, r)
+		// ---- 大单元挂载新增:单元方案中途挂载/解除(PUT /plans/{id}/unit-plan) ----
+		// 与课本挂载同款机制：注入层每轮重读 lesson_plans.unit_plan_id 决定是否注入
+		// 单元方案上下文（仅注入 active），故更新该列后下一轮对话自动生效，引擎零改动。
+		// unit_plan_id 传空串 "" = 解除挂载（取消大单元绑定）。
+		// 后缀 /unit-plan 与上方所有后缀（/assets、/textbooks、/interact 等）均不冲突。
+		case hasSuffix(path, "/unit-plan") && r.Method == http.MethodPut:
+			lpHandler.UpdateLessonPlanUnitPlan(w, r)
+		// ---- 班级学情挂载·批次3：班级学情卡中途挂载/解除(PUT /plans/{id}/class-profile) ----
+		// 与单元方案挂载同款机制：注入层每轮重读 lesson_plans.class_profile_id 决定是否注入
+		// 班级学情四大段(仅 analyze/design/write 三阶段、仅 active 且归属本人)，故更新该列后
+		// 下一轮对话自动生效，引擎零改动。class_profile_id 传空串 "" = 解除挂载(取消班级关联)。
+		// 后缀 /class-profile 与上方所有后缀(/assets、/textbooks、/unit-plan、/interact 等)均不冲突。
+		case hasSuffix(path, "/class-profile") && r.Method == http.MethodPut:
+			lpHandler.UpdateLessonPlanClassProfile(w, r)
+		// ---- 教材版本增强：课程大纲教材版本设置/解除(PUT /plans/{id}/course-outline-publisher) ----
+		// 备课首屏选定教材版本后写入 lesson_plans.course_outline_publisher，注入层下一轮 analyze/design
+		// 阶段据此版本精确匹配注入对应版本大纲（零跨版本兜底）。三态：传 null=解除不注入、传 ""=通用版、
+		// 传 "人教版"=具名版本。后缀 /course-outline-publisher 与上方所有后缀均不冲突。
+		case hasSuffix(path, "/course-outline-publisher") && r.Method == http.MethodPut:
+			lpHandler.UpdateLessonPlanCourseOutlinePublisher(w, r)
+		// ---- 阶段操作 ----
+		case hasSuffix(path, "/stages/switch") && r.Method == http.MethodPost:
+			wsStageHandler.SwitchToStage(w, r)
+		case hasSuffix(path, "/stages/reset") && r.Method == http.MethodPost:
+			wsStageHandler.ResetStage(w, r)
+		case hasSuffix(path, "/stages/advance") && r.Method == http.MethodPost:
+			wsStageHandler.AdvanceStage(w, r)
+		case hasSuffix(path, "/stages/skip") && r.Method == http.MethodPost:
+			wsStageHandler.SkipStage(w, r)
+		case hasSuffix(path, "/stages/back") && r.Method == http.MethodPost:
+			wsStageHandler.BackStage(w, r)
+		// 迭代12新增:阶段推荐组件
+		case hasSuffix(path, "/completeness") && indexOf(path, "/stages/") >= 0 && r.Method == http.MethodGet:
+			wsStageHandler.GetStageCompleteness(w, r)
+		case hasSuffix(path, "/recommended-components") && indexOf(path, "/stages/") >= 0 && r.Method == http.MethodGet:
+			wsStageHandler.GetStageRecommendedComponents(w, r)
+		case hasSuffix(path, "/output") && indexOf(path, "/stages/") >= 0 && r.Method == http.MethodGet:
+			wsStageHandler.GetStageOutput(w, r)
+		case hasSuffix(path, "/stages") && r.Method == http.MethodGet:
+			wsStageHandler.GetStageStatus(w, r)
+		case hasSuffix(path, "/chat"):
+			lpGenHandler.Chat(w, r)
+		case hasSuffix(path, "/trigger-review"):
+			lpGenHandler.TriggerAIReview(w, r)
+		case hasSuffix(path, "/apply-suggestions"):
+			lpGenHandler.ApplyAISuggestions(w, r)
+		case hasSuffix(path, "/conversation"):
+			lpGenHandler.GetConversation(w, r)
+		case hasSuffix(path, "/publish-personal"):
+			lpHandler.PublishPersonal(w, r)
+		case hasSuffix(path, "/submit-review"):
+			lpHandler.SubmitForReview(w, r)
+		case hasSuffix(path, "/review"):
+			lpHandler.ReviewLessonPlan(w, r)
+		case hasSuffix(path, "/publish-shared"):
+			lpHandler.PublishShared(w, r)
+		case hasSuffix(path, "/start-development"):
+			lpHandler.StartDevelopment(w, r)
+		case hasSuffix(path, "/fork"):
+			lpHandler.ForkLessonPlan(w, r)
+		// ---- 段落批注路由 ----
+		case hasSuffix(path, "/resolve") && indexOf(path, "/annotations/") >= 0 && r.Method == http.MethodPut:
+			annotationHandler.ResolveAnnotation(w, r)
+		case hasSuffix(path, "/ai-fix") && indexOf(path, "/annotations/") >= 0 && r.Method == http.MethodPost:
+			annotationHandler.AIFixAnnotation(w, r)
+		case indexOf(path, "/annotations/") >= 0 && r.Method == http.MethodPut:
+			annotationHandler.UpdateAnnotation(w, r)
+		case indexOf(path, "/annotations/") >= 0 && r.Method == http.MethodDelete:
+			annotationHandler.DeleteAnnotation(w, r)
+		case hasSuffix(path, "/annotations") && r.Method == http.MethodGet:
+			annotationHandler.ListAnnotations(w, r)
+		case hasSuffix(path, "/annotations") && r.Method == http.MethodPost:
+			annotationHandler.CreateAnnotation(w, r)
+		default:
+			switch r.Method {
+			case http.MethodGet:
+				lpHandler.GetLessonPlan(w, r)
+			case http.MethodPut:
+				lpHandler.UpdateLessonPlan(w, r)
+			case http.MethodDelete:
+				lpHandler.DeleteLessonPlan(w, r)
+			default:
+				methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
+			}
+		}
+	}), authMW))
 
-        // ==================== 提示词模板 ====================
+	// ==================== 提示词模板 ====================
 
-        // ---- 审核员AI辅助(overview + chat)----
-        mux.Handle("/api/v1/lesson-plans/review-ai/overview",
-                authMW(http.HandlerFunc(reviewAIHandler.Overview)))
-        mux.Handle("/api/v1/lesson-plans/review-ai/chat",
-                authMW(http.HandlerFunc(reviewAIHandler.Chat)))
+	// ---- 审核员AI辅助(overview + chat)----
+	mux.Handle("/api/v1/lesson-plans/review-ai/overview",
+		authMW(http.HandlerFunc(reviewAIHandler.Overview)))
+	mux.Handle("/api/v1/lesson-plans/review-ai/chat",
+		authMW(http.HandlerFunc(reviewAIHandler.Chat)))
 
-        mux.Handle("/api/v1/lesson-plans/templates", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                switch r.Method {
-                case http.MethodGet:
-                        lpHandler.ListPromptTemplates(w, r)
-                case http.MethodPost:
-                        lpHandler.CreatePromptTemplate(w, r)
-                default:
-                        methodNotAllowedJSON(w, "仅支持GET/POST请求")
-                }
-        }), authMW))
+	mux.Handle("/api/v1/lesson-plans/templates", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			lpHandler.ListPromptTemplates(w, r)
+		case http.MethodPost:
+			lpHandler.CreatePromptTemplate(w, r)
+		default:
+			methodNotAllowedJSON(w, "仅支持GET/POST请求")
+		}
+	}), authMW))
 
-        mux.Handle("/api/v1/lesson-plans/templates/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                path := r.URL.Path
-                switch {
-                case hasSuffix(path, "/resolved"):
-                        lpHandler.ResolvePromptTemplate(w, r)
-                default:
-                        switch r.Method {
-                        case http.MethodGet:
-                                lpHandler.GetPromptTemplate(w, r)
-                        case http.MethodPut:
-                                lpHandler.UpdatePromptTemplate(w, r)
-                        default:
-                                methodNotAllowedJSON(w, "仅支持GET/PUT请求")
-                        }
-                }
-        }), authMW))
+	mux.Handle("/api/v1/lesson-plans/templates/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case hasSuffix(path, "/resolved"):
+			lpHandler.ResolvePromptTemplate(w, r)
+		default:
+			switch r.Method {
+			case http.MethodGet:
+				lpHandler.GetPromptTemplate(w, r)
+			case http.MethodPut:
+				lpHandler.UpdatePromptTemplate(w, r)
+			default:
+				methodNotAllowedJSON(w, "仅支持GET/PUT请求")
+			}
+		}
+	}), authMW))
 }

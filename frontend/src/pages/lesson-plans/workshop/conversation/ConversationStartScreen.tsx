@@ -19,11 +19,13 @@
  *   不选时默认 45 分钟（后端兜底逻辑不变）。
  */
 import { useState, useEffect } from 'react'
+import type { RecipeSelectionMode } from '@/api/lesson-plans'
 import { C, SUBJECTS, GRADES } from '../components/workshopConstants'
 import { getMountableUnitPlans, type UnitPlanListItem } from '@/api/unit-plans'
 import { getClassProfiles, type ClassProfileListItem } from '@/api/class-profiles'
 import { getAvailablePublishers, publisherLabel } from '@/api/course-outlines'
 import { getAvailableRecipes, type RecipeListItem } from '@/api/recipes'
+import RecipeModeSelector from '../components/RecipeModeSelector'
 
 /** 配方 scope 徽标配置 */
 const RECIPE_SCOPE_BADGE: Record<string, { label: string; color: string; bg: string }> = {
@@ -54,6 +56,9 @@ interface ConversationStartScreenProps {
   /** 选定的课程大纲教材版本（选填；null=不关联大纲；''=通用版；具名=该版本）——受控值由父组件持有 */
   coursePublisher: string | null
   setCoursePublisher: (v: string | null) => void
+  /** 配方选择方式：auto=智能选择，selected=指定配方，none=明确不使用 */
+  recipeMode: RecipeSelectionMode
+  setRecipeMode: (v: RecipeSelectionMode) => void
   /** 选中的配方ID（选填；空串=不使用配方）——受控值由父组件持有 */
   recipeId: string
   setRecipeId: (v: string) => void
@@ -72,10 +77,11 @@ export default function ConversationStartScreen({
   unitPlanId, setUnitPlanId,
   classProfileId, setClassProfileId,
   coursePublisher, setCoursePublisher,
+  recipeMode, setRecipeMode,
   recipeId, setRecipeId,
   startLoading, onStart, onImport, onSwitchMode,
 }: ConversationStartScreenProps) {
-  // ===== 配方下拉：按当前学科拉可见配方 =====
+  // ===== 配方下拉：按当前学科和具体年级拉可见配方 =====
   const [recipes, setRecipes] = useState<RecipeListItem[]>([])
   const [recipesLoading, setRecipesLoading] = useState(false)
 
@@ -83,13 +89,19 @@ export default function ConversationStartScreen({
     let cancelled = false
     if (!subject) { setRecipes([]); return }
     setRecipesLoading(true)
-    getAvailableRecipes(subject)
+    getAvailableRecipes(subject, grade)
       .then(resp => {
         if (cancelled) return
         const list = resp.recipes || []
         setRecipes(list)
-        // 学科切换时：已选配方若不在新学科列表里则清空
-        setRecipeId(recipeId && list.some(r => r.id === recipeId) ? recipeId : '')
+        // 学科或年级切换时：已选配方若不在新列表里则清空
+        setRecipeId(
+          recipeId && list.some(r => r.id === recipeId)
+            ? recipeId
+            : recipeMode === 'selected' && list.length > 0
+              ? list[0].id
+              : ''
+        )
       })
       .catch(err => {
         if (cancelled) return
@@ -100,7 +112,7 @@ export default function ConversationStartScreen({
       .finally(() => { if (!cancelled) setRecipesLoading(false) })
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subject])
+  }, [subject, grade])
 
   // ===== 单元方案下拉：按当前学科拉可挂载方案 =====
   const [unitPlans, setUnitPlans] = useState<UnitPlanListItem[]>([])
@@ -187,7 +199,6 @@ export default function ConversationStartScreen({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subject, grade])
 
-  const selectedRecipe = recipes.find(r => r.id === recipeId)
 
   /** 时长按钮样式（复用专家模式的 selBtn 交互风格） */
   const durBtn = (active: boolean): React.CSSProperties => ({
@@ -198,6 +209,19 @@ export default function ConversationStartScreen({
     fontSize: '13px', fontWeight: active ? 600 : 400,
     cursor: 'pointer', transition: 'all 150ms ease',
   })
+
+  const recipeReady =
+    recipeMode !== 'selected' || Boolean(recipeId)
+
+  const startButtonText = startLoading
+    ? '正在准备备课环境…'
+    : recipeMode === 'auto'
+      ? '✨ 智能匹配并开始备课'
+      : recipeMode === 'selected'
+        ? recipeId
+          ? '📦 带指定配方开始备课'
+          : '请先选择配方'
+        : '开始备课（不使用配方）'
 
   return (
     <div style={{ height: 'calc(100vh - 120px)', overflow: 'auto', margin: '-28px -32px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '24px' }}>
@@ -236,36 +260,17 @@ export default function ConversationStartScreen({
           </div>
         </div>
 
-        {/* ===== 配方选择（选填）——仅当本学科有可用配方时才显示 ===== */}
-        {recipes.length > 0 && (
-          <div style={{ marginTop: '14px', textAlign: 'left' }}>
-            <label style={{ display: 'block', fontSize: '12px', fontWeight: 600, color: C.textSec, marginBottom: '6px', paddingLeft: '2px' }}>
-              📦 备课配方（选填）
-            </label>
-            <select value={recipeId} onChange={e => setRecipeId(e.target.value)} disabled={recipesLoading}
-              style={{ width: '100%', padding: '11px 14px', borderRadius: '12px', border: `1.5px solid ${recipeId ? '#F59E0B' : C.border}`, fontSize: '14px', color: recipeId ? C.text : C.textMuted, background: C.card, cursor: 'pointer', outline: 'none', boxSizing: 'border-box', transition: 'border-color 150ms ease' }}>
-              <option value="">不使用配方（AI用系统预置骨架）</option>
-              {recipes.map(r => {
-                const badge = RECIPE_SCOPE_BADGE[r.scope] || RECIPE_SCOPE_BADGE.personal
-                return (
-                  <option key={r.id} value={r.id}>
-                    [{badge.label}] {r.name} · {r.component_count}组件 · 用{r.use_count}次
-                  </option>
-                )
-              })}
-            </select>
-            {selectedRecipe && (
-              <div style={{ fontSize: '11px', color: '#92400E', marginTop: '6px', paddingLeft: '2px', lineHeight: 1.5, background: '#FFFBEB', borderRadius: '6px', padding: '6px 10px' }}>
-                ✅ 已选「{selectedRecipe.name}」— {selectedRecipe.description || '教案结构+流程+学情由此配方定义'}
-              </div>
-            )}
-            {!recipeId && (
-              <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px', paddingLeft: '2px', lineHeight: 1.5 }}>
-                💡 不选配方时，AI助手的指引（含结构）将作为唯一个性化来源
-              </div>
-            )}
-          </div>
-        )}
+        {/* ===== 配方三态选择 ===== */}
+        <div style={{ marginTop: '14px', textAlign: 'left' }}>
+          <RecipeModeSelector
+            mode={recipeMode}
+            setMode={setRecipeMode}
+            recipes={recipes}
+            recipeId={recipeId}
+            setRecipeId={setRecipeId}
+            loading={recipesLoading}
+          />
+        </div>
 
         {/* ===== 单元方案（选填）——仅当本学科有可挂载方案时才显示 ===== */}
         {unitPlans.length > 0 && (
@@ -341,9 +346,36 @@ export default function ConversationStartScreen({
           </div>
         )}
 
-        <button onClick={onStart} disabled={!topic.trim() || startLoading}
-          style={{ marginTop: '22px', padding: '13px 52px', borderRadius: '14px', border: 'none', background: (!topic.trim() || startLoading) ? '#E5E7EB' : `linear-gradient(135deg, ${C.primary}, #818CF8)`, color: (!topic.trim() || startLoading) ? C.textMuted : '#fff', fontSize: '16px', fontWeight: 700, cursor: (!topic.trim() || startLoading) ? 'not-allowed' : 'pointer', boxShadow: (!topic.trim() || startLoading) ? 'none' : '0 6px 20px rgba(79,123,232,0.35)', transition: 'all 200ms ease' }}>
-          {startLoading ? '正在准备备课环境…' : recipeId ? '📦 带配方开始备课' : '开始备课'}
+        <button
+          onClick={onStart}
+          disabled={!topic.trim() || startLoading || !recipeReady}
+          style={{
+            marginTop: '22px',
+            padding: '13px 52px',
+            borderRadius: '14px',
+            border: 'none',
+            background:
+              (!topic.trim() || startLoading || !recipeReady)
+                ? '#E5E7EB'
+                : `linear-gradient(135deg, ${C.primary}, #818CF8)`,
+            color:
+              (!topic.trim() || startLoading || !recipeReady)
+                ? C.textMuted
+                : '#fff',
+            fontSize: '16px',
+            fontWeight: 700,
+            cursor:
+              (!topic.trim() || startLoading || !recipeReady)
+                ? 'not-allowed'
+                : 'pointer',
+            boxShadow:
+              (!topic.trim() || startLoading || !recipeReady)
+                ? 'none'
+                : '0 6px 20px rgba(79,123,232,0.35)',
+            transition: 'all 200ms ease',
+          }}
+        >
+          {startButtonText}
         </button>
         <div style={{ borderTop: `1px solid ${C.border}`, margin: '28px 0 16px' }} />
         <div style={{ display: 'flex', justifyContent: 'center', gap: '20px', fontSize: '13px' }}>

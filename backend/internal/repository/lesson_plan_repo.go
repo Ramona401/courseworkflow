@@ -318,24 +318,184 @@ func ListLessonPlans(ctx context.Context, callerID string, authorID string, grou
 	return items, total, nil
 }
 
-// UpdateLessonPlanContent 更新教案内容
-func UpdateLessonPlanContent(ctx context.Context, id string, title string, contentMd string, contentStruct string, durMinutes int) error {
+// UpdateLessonPlanContent 更新教案内容。
+//
+// v233正文版本历史：
+//   - 使用SELECT ... FOR UPDATE锁定当前教案行，防止并发更新产生重复版本号。
+//   - 内容真正变化时，先把修改前状态写入lesson_plan_content_versions。
+//   - 快照与正文更新位于同一事务，要么同时成功，要么同时回滚。
+//   - 可选versionMeta用于标记manual/ai/import/restore/system来源；
+//     旧调用方不传时自动按system处理，保持全部既有调用兼容。
+//   - 完全相同的内容重复保存直接返回，不增加version也不产生噪音快照。
+//   - 每份教案只保留最近50份历史快照，防止长期编辑无限增长。
+func UpdateLessonPlanContent(
+	ctx context.Context,
+	id string,
+	title string,
+	contentMd string,
+	contentStruct string,
+	durMinutes int,
+	versionMeta ...models.LessonPlanVersionMeta,
+) error {
 	if contentStruct == "" {
 		contentStruct = "{}"
 	}
+
+	meta := models.LessonPlanVersionMeta{
+		ChangeSource: models.LPVersionSourceSystem,
+	}
+	if len(versionMeta) > 0 {
+		meta = versionMeta[0]
+	}
+	switch meta.ChangeSource {
+	case models.LPVersionSourceManual,
+		models.LPVersionSourceAI,
+		models.LPVersionSourceImport,
+		models.LPVersionSourceRestore,
+		models.LPVersionSourceSystem:
+		// 合法来源保持原值。
+	default:
+		meta.ChangeSource = models.LPVersionSourceSystem
+	}
+
+	tx, err := database.DB.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("开始教案正文更新事务失败: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	var (
+		currentTitle         string
+		currentContentMd     string
+		currentContentStruct string
+		currentDuration      int
+		currentVersion       int
+	)
+
+	err = tx.QueryRow(ctx, `
+		SELECT
+			title,
+			content_markdown,
+			content_structured::text,
+			duration_minutes,
+			version
+		FROM lesson_plans
+		WHERE id = $1
+		  AND deleted_at IS NULL
+		FOR UPDATE
+	`, id).Scan(
+		&currentTitle,
+		&currentContentMd,
+		&currentContentStruct,
+		&currentDuration,
+		&currentVersion,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrLessonPlanNotFound
+		}
+		return fmt.Errorf("读取教案修改前正文失败: %w", err)
+	}
+
+	// 完全相同的保存属于无操作，不增加版本号和历史噪音。
+	if currentTitle == title &&
+		currentContentMd == contentMd &&
+		currentContentStruct == contentStruct &&
+		currentDuration == durMinutes {
+		return tx.Commit(ctx)
+	}
+
+	// 在覆盖之前保存当前完整状态。
+	_, err = tx.Exec(ctx, `
+		INSERT INTO lesson_plan_content_versions (
+			lesson_plan_id,
+			version_number,
+			title,
+			content_markdown,
+			content_structured,
+			duration_minutes,
+			change_source,
+			changed_by,
+			change_summary
+		) VALUES (
+			$1,
+			$2,
+			$3,
+			$4,
+			$5::jsonb,
+			$6,
+			$7,
+			$8,
+			$9
+		)
+		ON CONFLICT (
+			lesson_plan_id,
+			version_number
+		) DO NOTHING
+	`,
+		id,
+		currentVersion,
+		currentTitle,
+		currentContentMd,
+		currentContentStruct,
+		currentDuration,
+		meta.ChangeSource,
+		meta.ChangedBy,
+		meta.ChangeSummary,
+	)
+	if err != nil {
+		return fmt.Errorf("保存教案修改前版本失败: %w", err)
+	}
+
 	now := time.Now()
-	result, err := database.DB.Exec(ctx, `
+	result, err := tx.Exec(ctx, `
 		UPDATE lesson_plans
-		SET title = $1, content_markdown = $2, content_structured = $3,
-		    duration_minutes = $4, version = version + 1, updated_at = $5
-		WHERE id = $6
-	`, title, contentMd, contentStruct, durMinutes, now, id)
+		SET
+			title = $1,
+			content_markdown = $2,
+			content_structured = $3::jsonb,
+			duration_minutes = $4,
+			version = $5,
+			updated_at = $6
+		WHERE id = $7
+		  AND deleted_at IS NULL
+	`,
+		title,
+		contentMd,
+		contentStruct,
+		durMinutes,
+		currentVersion+1,
+		now,
+		id,
+	)
 	if err != nil {
 		return fmt.Errorf("更新教案内容失败: %w", err)
 	}
 	if result.RowsAffected() == 0 {
 		return ErrLessonPlanNotFound
 	}
+
+	// 每份教案只保留最新50份快照。
+	_, err = tx.Exec(ctx, `
+		DELETE FROM lesson_plan_content_versions
+		WHERE id IN (
+			SELECT id
+			FROM lesson_plan_content_versions
+			WHERE lesson_plan_id = $1
+			ORDER BY version_number DESC, created_at DESC
+			OFFSET 50
+		)
+	`, id)
+	if err != nil {
+		return fmt.Errorf("清理教案过期历史版本失败: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("提交教案正文更新事务失败: %w", err)
+	}
+
 	return nil
 }
 

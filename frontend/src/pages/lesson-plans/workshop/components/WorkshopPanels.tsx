@@ -17,24 +17,34 @@
  */
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import type { ConversationMessage, AIReviewResult, ConvComponent } from '@/api/lesson-plans'
+import type {
+  ConversationMessage,
+  AIReviewResult,
+  ConvComponent,
+  RecipeSelectionMode,
+} from '@/api/lesson-plans'
 import { getAvailableRecipes, type RecipeListItem } from '@/api/recipes'
 import { getTextbooks, triggerTextbookOCR, type TextbookListItem } from '@/api/textbooks'
 import { getAvailablePublishers, publisherLabel } from '@/api/course-outlines'
 import { C, SUBJECTS, GRADES, renderMarkdown } from './workshopConstants'
+import ContextReceiptCard from './context-receipt/ContextReceiptCard'
+import RecipeModeSelector from './RecipeModeSelector'
 
-// ==================== 配方 scope 徽标配置（与对话模式共用同一套配色） ====================
-
-const RECIPE_SCOPE_BADGE: Record<string, { label: string; color: string; bg: string }> = {
-  school:   { label: '学校', color: '#166534', bg: '#DCFCE7' },
-  group:    { label: '教研组', color: '#1E40AF', bg: '#DBEAFE' },
-  personal: { label: '个人', color: '#6B7280', bg: '#F3F4F6' },
-}
+// ==================== 首屏备课表单 ====================
 
 // ==================== 首屏备课表单 ====================
 
 interface StartFormProps {
-  onStart: (subject: string, grade: string, topic: string, duration: number, recipeId?: string, textbookPageIds?: string[], coursePublisher?: string | null) => void
+  onStart: (
+    subject: string,
+    grade: string,
+    topic: string,
+    duration: number,
+    recipeMode: RecipeSelectionMode,
+    recipeId?: string,
+    textbookPageIds?: string[],
+    coursePublisher?: string | null,
+  ) => void
   loading: boolean
 }
 
@@ -53,6 +63,8 @@ export function StartForm({ onStart, loading }: StartFormProps) {
   const [recipes, setRecipes]             = useState<RecipeListItem[]>([])
   const [recipesLoading, setRecipesLoad]  = useState(false)
   const [selectedRecipeId, setSelectedId] = useState<string | null>(null)
+  const [recipeMode, setRecipeMode] =
+    useState<RecipeSelectionMode>('auto')
 
   const [textbooks, setTextbooks]             = useState<TextbookListItem[]>([])
   const [textbooksLoading, setTextbooksLoad]  = useState(false)
@@ -61,22 +73,28 @@ export function StartForm({ onStart, loading }: StartFormProps) {
   const [ocrInProgress, setOcrInProgress] = useState<Set<string>>(new Set())
   const [ocrFailed, setOcrFailed]         = useState<Set<string>>(new Set())
 
-  // v203 简化：按学科拉可见配方（复用对话模式同一 API），学科切换时重拉并清空已选
+  // v203 简化：按学科和具体年级拉可见配方（复用对话模式同一 API），学科切换时重拉并清空已选
   useEffect(() => {
     let cancelled = false
     setRecipesLoad(true)
-    getAvailableRecipes(subject)
+    getAvailableRecipes(subject, grade)
       .then(resp => {
         if (cancelled) return
         const list = resp.recipes || []
         setRecipes(list)
-        // 学科切换时：已选配方若不在新列表里则清空
-        setSelectedId(prev => prev && list.some(r => r.id === prev) ? prev : null)
+        // 学科或年级切换时：已选配方若不在新列表里则清空
+        setSelectedId(prev =>
+          prev && list.some(r => r.id === prev)
+            ? prev
+            : recipeMode === 'selected' && list.length > 0
+              ? list[0].id
+              : null
+        )
       })
       .catch(() => { if (!cancelled) setRecipes([]) })
       .finally(() => { if (!cancelled) setRecipesLoad(false) })
     return () => { cancelled = true }
-  }, [subject])
+  }, [subject, grade])
 
   useEffect(() => {
     const loadTextbooks = async () => {
@@ -144,10 +162,24 @@ export function StartForm({ onStart, loading }: StartFormProps) {
   const handleSubmit = () => {
     if (!topic.trim()) return
     if (ocrInProgress.size > 0) return
-    onStart(subject, grade, topic.trim(), duration, selectedRecipeId || undefined, selectedTextbookIds.size > 0 ? Array.from(selectedTextbookIds) : undefined, coursePublisher)
+    if (recipeMode === 'selected' && !selectedRecipeId) return
+
+    onStart(
+      subject,
+      grade,
+      topic.trim(),
+      duration,
+      recipeMode,
+      recipeMode === 'selected'
+        ? selectedRecipeId || undefined
+        : undefined,
+      selectedTextbookIds.size > 0
+        ? Array.from(selectedTextbookIds)
+        : undefined,
+      coursePublisher,
+    )
   }
 
-  const selectedRecipe = recipes.find(r => r.id === selectedRecipeId)
   const selBtn = (active: boolean): React.CSSProperties => ({
     padding: '6px 14px', borderRadius: '20px',
     border: `1px solid ${active ? C.primary : C.border}`,
@@ -156,6 +188,22 @@ export function StartForm({ onStart, loading }: StartFormProps) {
     fontSize: '13px', fontWeight: active ? 600 : 400,
     cursor: 'pointer', transition: 'all 150ms ease',
   })
+
+  const recipeReady =
+    recipeMode !== 'selected' || Boolean(selectedRecipeId)
+
+  const startButtonText =
+    ocrInProgress.size > 0
+      ? `课本识别中（${ocrInProgress.size}）请稍候...`
+      : loading
+        ? '正在准备备课环境...'
+        : recipeMode === 'auto'
+          ? '✨ 智能匹配并开始备课 →'
+          : recipeMode === 'selected'
+            ? selectedRecipeId
+              ? '📦 带指定配方开始备课 →'
+              : '请先选择配方'
+            : '开始备课（不使用配方）→'
 
   return (
     <div style={{ maxWidth: '680px', margin: '0 auto', padding: '36px 0' }}>
@@ -199,44 +247,17 @@ export function StartForm({ onStart, loading }: StartFormProps) {
           </div>
         </div>
 
-        {/* v203 简化：配方下拉（与对话模式一致的交互，复用 getAvailableRecipes） */}
-        {recipes.length > 0 && (
-          <div style={{ marginBottom: '18px' }}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>📦 备课配方（选填）</label>
-            <select value={selectedRecipeId || ''} onChange={e => setSelectedId(e.target.value || null)} disabled={recipesLoading}
-              style={{ width: '100%', padding: '11px 14px', borderRadius: '10px', border: `1.5px solid ${selectedRecipeId ? '#F59E0B' : C.border}`, fontSize: '14px', color: selectedRecipeId ? C.text : C.textMuted, background: C.card, cursor: 'pointer', outline: 'none', boxSizing: 'border-box', transition: 'border-color 150ms ease' }}>
-              <option value="">不使用配方（AI用系统预置骨架）</option>
-              {recipes.map(r => {
-                const badge = RECIPE_SCOPE_BADGE[r.scope] || RECIPE_SCOPE_BADGE.personal
-                return (
-                  <option key={r.id} value={r.id}>
-                    [{badge.label}] {r.name} · {r.component_count}组件 · 用{r.use_count}次
-                  </option>
-                )
-              })}
-            </select>
-            {selectedRecipe && (
-              <div style={{ marginTop: '8px', padding: '8px 12px', background: '#FFFBEB', borderRadius: '8px', border: '1px solid #FDE68A', fontSize: '12px', color: '#92400E', lineHeight: 1.6 }}>
-                ✅ 已选「{selectedRecipe.name}」— {selectedRecipe.description || '教案结构+流程+学情由此配方定义'}
-              </div>
-            )}
-            {!selectedRecipeId && (
-              <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px', lineHeight: 1.5 }}>
-                💡 不选配方时，AI助手的指引（含结构）将作为唯一个性化来源
-              </div>
-            )}
-          </div>
-        )}
-        {recipes.length === 0 && !recipesLoading && (
-          <div style={{ marginBottom: '18px', padding: '12px 14px', background: 'rgba(79,123,232,0.04)', borderRadius: '10px', border: '1px dashed rgba(79,123,232,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div style={{ fontSize: '13px', color: C.textSec, lineHeight: 1.6 }}>
-              📦 暂无「{subject}」学科的可用配方 — AI将使用系统预置骨架
-            </div>
-            <button onClick={() => navigate('/lesson-plans/recipes')} style={{ padding: '6px 12px', borderRadius: '8px', border: 'none', background: C.primary, color: '#fff', fontSize: '12px', fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>
-              去配方管理
-            </button>
-          </div>
-        )}
+        {/* 配方三态选择（对话模式与专家模式共用同一组件） */}
+        <div style={{ marginBottom: '18px' }}>
+          <RecipeModeSelector
+            mode={recipeMode}
+            setMode={setRecipeMode}
+            recipes={recipes}
+            recipeId={selectedRecipeId || ''}
+            setRecipeId={value => setSelectedId(value || null)}
+            loading={recipesLoading}
+          />
+        </div>
 
         {/* 教材版本（选填）——仅当本学科本年级真实有大纲时才显示 */}
         {coursePublishers.length > 0 && (
@@ -264,9 +285,52 @@ export function StartForm({ onStart, loading }: StartFormProps) {
           </div>
         )}
 
-        <button onClick={handleSubmit} disabled={!topic.trim() || loading || ocrInProgress.size > 0}
-          style={{ width: '100%', padding: '14px', borderRadius: '10px', border: 'none', background: (!topic.trim() || loading || ocrInProgress.size > 0) ? '#E5E7EB' : C.primary, color: (!topic.trim() || loading || ocrInProgress.size > 0) ? C.textMuted : '#fff', fontSize: '16px', fontWeight: 600, cursor: (!topic.trim() || loading || ocrInProgress.size > 0) ? 'not-allowed' : 'pointer', transition: 'all 200ms ease' }}>
-          {ocrInProgress.size > 0 ? `课本识别中（${ocrInProgress.size}）请稍候...` : loading ? '正在准备备课环境...' : selectedRecipeId ? '📦 带配方开始备课 →' : '开始备课 →'}
+        <button
+          onClick={handleSubmit}
+          disabled={
+            !topic.trim() ||
+            loading ||
+            ocrInProgress.size > 0 ||
+            !recipeReady
+          }
+          style={{
+            width: '100%',
+            padding: '14px',
+            borderRadius: '10px',
+            border: 'none',
+            background:
+              (
+                !topic.trim() ||
+                loading ||
+                ocrInProgress.size > 0 ||
+                !recipeReady
+              )
+                ? '#E5E7EB'
+                : C.primary,
+            color:
+              (
+                !topic.trim() ||
+                loading ||
+                ocrInProgress.size > 0 ||
+                !recipeReady
+              )
+                ? C.textMuted
+                : '#fff',
+            fontSize: '16px',
+            fontWeight: 600,
+            cursor:
+              (
+                !topic.trim() ||
+                loading ||
+                ocrInProgress.size > 0 ||
+                !recipeReady
+              )
+                ? 'not-allowed'
+                : 'pointer',
+            transition: 'all 200ms ease',
+          }}
+        >
+          {startButtonText}
         </button>
         {selectedTextbookIds.size > 0 && (
           <div style={{ marginTop: '8px', padding: '10px 12px', background: 'rgba(16,185,129,0.06)', borderRadius: '8px', fontSize: '12px', color: '#166534', lineHeight: 1.6 }}>
@@ -370,6 +434,9 @@ export function AIBubble({ msg, streaming = false, onSelectComponent, selectedCo
             <style>{`@keyframes cursor-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }`}</style>
           </div>
         )}
+
+        <ContextReceiptCard receipt={msg.metadata?.context_receipt} />
+
         {msg.type === 'components' && msg.components && msg.components.length > 0 && (
           <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
             {msg.components.map(comp => {

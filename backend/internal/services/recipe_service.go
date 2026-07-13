@@ -31,8 +31,8 @@ import (
 
 var (
 	ErrRecipeNameRequired    = errors.New("配方名称不能为空")
-	ErrRecipeSubjectRequired = errors.New("学科不能为空")
-	ErrRecipeGradeRequired   = errors.New("年级不能为空")
+	ErrRecipeSubjectRequired = errors.New("配方适用学科不能为空")
+	ErrRecipeGradeRequired   = errors.New("配方适用年级必须选择一年级至高三中的一个具体年级")
 	ErrRecipeNotFound        = errors.New("配方不存在")
 	ErrRecipeUnauthorized    = errors.New("无权操作此配方")
 	ErrRecipeShareInvalid    = errors.New("共享范围无效，可选：group/school")
@@ -55,12 +55,22 @@ func (s *RecipeService) CreateRecipe(ctx context.Context, req *models.CreateReci
 	if strings.TrimSpace(req.Name) == "" {
 		return nil, ErrRecipeNameRequired
 	}
-	if strings.TrimSpace(req.Subject) == "" {
+	rawSubject := strings.TrimSpace(req.Subject)
+	if rawSubject == "" {
 		return nil, ErrRecipeSubjectRequired
 	}
-	if strings.TrimSpace(req.GradeRange) == "" {
+
+	normalizedSubject, normalizedGrade, validScope :=
+		normalizeStrictResourceScope(
+			rawSubject,
+			req.GradeRange,
+		)
+	if !validScope {
 		return nil, ErrRecipeGradeRequired
 	}
+
+	req.Subject = normalizedSubject
+	req.GradeRange = normalizedGrade
 
 	// 组件ID列表转JSON
 	componentJSON := "[]"
@@ -163,6 +173,23 @@ func (s *RecipeService) UpdateRecipe(ctx context.Context, recipeID string, req *
 	if strings.TrimSpace(req.Name) == "" {
 		return ErrRecipeNameRequired
 	}
+
+	rawSubject := strings.TrimSpace(req.Subject)
+	if rawSubject == "" {
+		return ErrRecipeSubjectRequired
+	}
+
+	normalizedSubject, normalizedGrade, validScope :=
+		normalizeStrictResourceScope(
+			rawSubject,
+			req.GradeRange,
+		)
+	if !validScope {
+		return ErrRecipeGradeRequired
+	}
+
+	req.Subject = normalizedSubject
+	req.GradeRange = normalizedGrade
 
 	r, err := repository.GetRecipeByID(ctx, recipeID)
 	if err != nil {
