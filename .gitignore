@@ -24,6 +24,14 @@ backup/
 db-backups/
 *.sql
 *.sql.gz
+
+# backend/migrations中的正式迁移必须进入Git
+# 正式迁移命名规范：
+# 1. migration_v版本_说明.sql
+# 2. YYYYMMDD_说明.sql
+!backend/migrations/migration_v*.sql
+!backend/migrations/20*_*.sql
+
 # 服务器二进制和临时文件
 backend/server
 backend/server.backup.*
@@ -32,32 +40,36 @@ backend/tedna_server
 backend/server.log*
 backend/.scannerwork/
 
-# 前端构建的时间戳备份目录(临时产物,不入库)
+# 前端构建的时间戳备份目录（临时产物，不入库）
 frontend/dist.*/
 frontend/dist.manual-backup.*
 frontend/dist.pre_deploy_*
 
-# ===== v161 补充:运行时数据与历史快照不入库 =====
-# 用户上传的媒体/课本/Logo(运行时数据,只在磁盘+OSS,不进git)
+# ===== v161 补充：运行时数据与历史快照不入库 =====
+# 用户上传的媒体、课本、Logo（运行时数据，只在磁盘和OSS，不进Git）
 uploads/
+
 # 历史代码快照目录
 code-backups/
-# 各类备份/失败/删除标记文件
+
+# 各类备份、失败和删除标记文件
 *.bak
 *.bak.txt
 *.backup2.*
 *.deleted.*
 *.failed_*
 sql-migrations/**/*.failed_*
+
 # 误创建的空文件
 frontend/=
 旧文件
+
 *.backup
 *.backup.*
 backend/internal/**/*.backup.*
 backend/internal/**/*.backup2.*
 
-# ===== 运维产物（备份/失败件/缓存），不入库 =====
+# ===== 运维产物（备份、失败件、缓存），不入库 =====
 *_failed.*
 __pycache__/
 *.pyc
@@ -65,3 +77,42 @@ _bak_*/
 backups/
 *.fix.*
 v*_fix.sh
+
+# ===== 生产基线治理：源码旁时间戳备份和中间版本 =====
+# cat完整覆盖前生成的常见备份
+*.bak.*
+*.bak_*
+
+# backup_nav、backup3、backup634等变体
+*.backup_*
+*.backup[0-9]*.*
+*_backup_*
+
+# 破损或临时修订版本
+*.broken.*
+*.broken_*
+*.MYBROKEN.*
+*.beforefmt.*
+*.beforefmt_*
+*.beforegofmt.*
+*.beforegofmt_*
+*.prefmt.*
+*.prefmt_*
+*.presafe.*
+*.presafe_*
+*.imfix.*
+*.imfix_*
+*.badver.*
+*.badver_*
+*.badrewrite.*
+*.badrewrite_*
+*_before_fix_*
+
+# 当前服务器上的实验提示词草稿
+backend/prompt_generate_v9_new.txt
+backend/prompt_image_v7_clean.txt
+backend/prompt_image_v7_fixed.txt
+backend/prompt_image_v7_from_v6.txt
+
+# 当前服务器本地交接材料
+/全自动装配_交接_20260705_171733.md
