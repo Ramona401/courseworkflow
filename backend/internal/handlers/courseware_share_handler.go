@@ -12,8 +12,10 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
+	"tedna/internal/services"
 
 	"tedna/internal/middleware"
 	"tedna/internal/models"
@@ -22,19 +24,38 @@ import (
 
 // PublishCourseware POST /api/v1/coursewares/{id}/publish — 发布 / 撤回
 // body: {"target":"published_personal"|"published_shared"|"private"}
-func (h *CoursewareHandler) PublishCourseware(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) PublishCourseware(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/publish")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/publish",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
 
@@ -44,28 +65,53 @@ func (h *CoursewareHandler) PublishCourseware(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if err := h.cwService.SetPublishState(r.Context(), id, claims.UserID, req.Target); err != nil {
-		utils.InternalError(w, err.Error())
+	if err := h.cwService.SetPublishStateForActor(
+		r.Context(),
+		id,
+		actor,
+		req.Target,
+	); err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]string{"message": "操作成功"})
 }
 
 // SetCodeShareScope PUT /api/v1/coursewares/{id}/code-share-scope — 设源代码开放范围
 // body: {"code_share_scope":"none"|"group"|"school"|"region"|"public"}
-func (h *CoursewareHandler) SetCodeShareScope(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) SetCodeShareScope(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/code-share-scope")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/code-share-scope",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
 
@@ -75,66 +121,195 @@ func (h *CoursewareHandler) SetCodeShareScope(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if err := h.cwService.SetCodeShareScope(r.Context(), id, claims.UserID, req.CodeShareScope); err != nil {
-		utils.InternalError(w, err.Error())
+	if err := h.cwService.SetCodeShareScopeForActor(
+		r.Context(),
+		id,
+		actor,
+		req.CodeShareScope,
+	); err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
-	utils.Success(w, map[string]string{"message": "代码开放范围已更新"})
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "代码开放范围已更新",
+		},
+	)
 }
 
 // ListSharedCoursewares GET /api/v1/coursewares/shared — 共享课件库列表
 // query: subject（可选）、limit、offset
-func (h *CoursewareHandler) ListSharedCoursewares(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) ListSharedCoursewares(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+
 	subject := r.URL.Query().Get("subject")
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	limit, _ := strconv.Atoi(
+		r.URL.Query().Get("limit"),
+	)
+	offset, _ := strconv.Atoi(
+		r.URL.Query().Get("offset"),
+	)
 	if limit <= 0 {
 		limit = 20
 	}
+	if offset < 0 {
+		offset = 0
+	}
 
-	resp, err := h.cwService.ListSharedCoursewares(r.Context(), claims.UserID, claims.Role, subject, limit, offset)
+	resp, err := h.cwService.ListSharedCoursewares(
+		r.Context(),
+		actor,
+		subject,
+		limit,
+		offset,
+	)
 	if err != nil {
-		utils.InternalError(w, "查询共享课件失败: "+err.Error())
+		switch {
+		case errors.Is(
+			err,
+			services.ErrCoursewareActorRequired,
+		),
+			errors.Is(
+				err,
+				services.ErrCoursewareEducationDomainMismatch,
+			):
+			utils.Fail(
+				w,
+				http.StatusForbidden,
+				err.Error(),
+			)
+
+		case errors.Is(
+			err,
+			services.ErrCoursewareEducationDomainInvalid,
+		):
+			utils.InternalError(
+				w,
+				"共享课件教育域异常，请联系管理员处理",
+			)
+
+		default:
+			utils.InternalError(
+				w,
+				"查询共享课件失败: "+err.Error(),
+			)
+		}
 		return
 	}
+
 	utils.Success(w, resp)
 }
 
 // ForkCourseware POST /api/v1/coursewares/{id}/fork — 复制共享课件到我的
-func (h *CoursewareHandler) ForkCourseware(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) ForkCourseware(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	srcID := extractCoursewareMiddleID(r.URL.Path, "/fork")
+
+	srcID := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/fork",
+	)
 	if srcID == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
 
-	cw, err := h.cwService.ForkCourseware(r.Context(), srcID, claims.UserID, claims.Role)
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+
+	cw, err := h.cwService.ForkCourseware(
+		r.Context(),
+		srcID,
+		actor,
+	)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		switch {
+		case errors.Is(
+			err,
+			services.ErrCoursewareActorRequired,
+		),
+			errors.Is(
+				err,
+				services.ErrCoursewareCreationDomainRequired,
+			),
+			errors.Is(
+				err,
+				services.ErrCoursewareEducationDomainMismatch,
+			),
+			errors.Is(
+				err,
+				services.ErrCoursewareForkSourceDomainUnsupported,
+			):
+			utils.Fail(
+				w,
+				http.StatusForbidden,
+				err.Error(),
+			)
+
+		case errors.Is(
+			err,
+			services.ErrCoursewareEducationDomainInvalid,
+		):
+			utils.InternalError(
+				w,
+				"来源课件教育域异常，请联系管理员处理",
+			)
+
+		default:
+			utils.InternalError(w, err.Error())
+		}
 		return
 	}
-	utils.Success(w, map[string]interface{}{
-		"id":      cw.ID,
-		"title":   cw.Title,
-		"message": "已复制到我的课件",
-	})
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"id":               cw.ID,
+			"title":            cw.Title,
+			"education_domain": cw.EducationDomain,
+			"message":          "已复制到我的课件",
+		},
+	)
 }

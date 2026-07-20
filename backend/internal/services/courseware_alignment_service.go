@@ -46,71 +46,119 @@ func NewCoursewareAlignmentService(cfg *config.Config) *CoursewareAlignmentServi
 // alignMaxLessonContentRunes 教案正文喂AI的截断上限（与索引压缩同量级，控制token）
 const alignMaxLessonContentRunes = 18000
 
-// ==================== 异步触发入口 ====================
+// ==================== 受控执行入口说明 ====================
 
-// TriggerAlignmentAsync 异步触发对齐校验（go func 包裹，调用方零等待）
-//
-// 由 saveAndBroadcast（方案落库后）与 handler 手动重算端点调用。
-// 内部自行判断课件来源/教案是否存在，非教案来源或无教案则静默跳过不留记录。
-func (s *CoursewareAlignmentService) TriggerAlignmentAsync(coursewareID string, userID string) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[courseware_alignment] 对齐校验 panic 已恢复: cw=%s r=%v", coursewareID, r)
-			}
-		}()
-		ctx := context.Background()
-		s.runAlignment(ctx, coursewareID, userID)
-	}()
-}
+// 对齐任务只能通过TriggerAlignmentTracked启动。
+// 不再保留接收裸userID并自行启动goroutine的TriggerAlignmentAsync旁路。
 
 // ==================== 校验主流程 ====================
 
 // runAlignment 执行一次完整对齐校验（同步，由 TriggerAlignmentAsync 在 goroutine 内调用）
-func (s *CoursewareAlignmentService) runAlignment(ctx context.Context, coursewareID string, userID string) {
-	// ---- 1. 取课件，判断来源 ----
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+func (s *CoursewareAlignmentService) runAlignment(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+) {
+	// ---- 1. 最终执行前重新加载正式课件并二次授权 ----
+	courseware,
+		scopedActor,
+		lessonPlan,
+		err :=
+		loadOwnedAlignmentInputs(
+			ctx,
+			coursewareID,
+			actor,
+		)
 	if err != nil {
-		log.Printf("[courseware_alignment] 取课件失败，跳过: cw=%s err=%v", coursewareID, err)
+		log.Printf(
+			"[courseware_alignment] 对齐执行授权失败，跳过: cw=%s err=%v",
+			coursewareID,
+			err,
+		)
 		return
 	}
-	// 仅教案来源才有对齐意义；其它来源（主题/PPT/Doc/3D）静默跳过，不留记录
-	if cw.SourceType != models.CWSourceLessonPlan {
-		log.Printf("[courseware_alignment] 非教案来源(%s)，跳过对齐: cw=%s", cw.SourceType, coursewareID)
-		return
-	}
-	if cw.LessonPlanID == nil || *cw.LessonPlanID == "" {
-		log.Printf("[courseware_alignment] 课件未关联教案，跳过对齐: cw=%s", coursewareID)
-		return
-	}
-	lessonPlanID := cw.LessonPlanID
 
-	// ---- 2. 取课件页面方案（方案侧输入）----
-	pages, err := repository.ListCoursewarePages(ctx, coursewareID)
+	// 仅教案来源才有对齐意义；其它来源静默跳过。
+	if courseware.SourceType !=
+		models.CWSourceLessonPlan {
+		log.Printf(
+			"[courseware_alignment] 非教案来源(%s)，跳过对齐: cw=%s",
+			courseware.SourceType,
+			coursewareID,
+		)
+		return
+	}
+
+	if lessonPlan == nil ||
+		courseware.LessonPlanID == nil ||
+		strings.TrimSpace(
+			*courseware.LessonPlanID,
+		) == "" {
+		log.Printf(
+			"[courseware_alignment] 关联教案输入为空，跳过: cw=%s",
+			coursewareID,
+		)
+		return
+	}
+
+	lessonPlanID := courseware.LessonPlanID
+	userID := scopedActor.UserID
+
+	// ---- 2. 取课件页面方案 ----
+	pages, err :=
+		repository.ListCoursewarePages(
+			ctx,
+			coursewareID,
+		)
 	if err != nil || len(pages) == 0 {
-		log.Printf("[courseware_alignment] 取课件页面失败或为空，跳过: cw=%s err=%v", coursewareID, err)
+		log.Printf(
+			"[courseware_alignment] 取课件页面失败或为空，跳过: cw=%s err=%v",
+			coursewareID,
+			err,
+		)
 		return
 	}
 
-	// ---- 3. 占位：先写 generating 让前端立刻可见"校验中" ----
-	if err := repository.UpsertGeneratingReport(ctx, coursewareID, lessonPlanID, len(pages)); err != nil {
-		log.Printf("[courseware_alignment] 写 generating 占位失败（继续校验）: cw=%s err=%v", coursewareID, err)
+	// ---- 3. 完成全部授权与跨资源校验后才写generating占位 ----
+	if err :=
+		repository.UpsertGeneratingReport(
+			ctx,
+			coursewareID,
+			lessonPlanID,
+			len(pages),
+		); err != nil {
+		log.Printf(
+			"[courseware_alignment] 写generating占位失败（继续校验）: cw=%s err=%v",
+			coursewareID,
+			err,
+		)
 	}
 
-	// ---- 4. 取教案正文 ----
-	lp, err := repository.GetLessonPlanByID(ctx, *lessonPlanID)
-	if err != nil {
-		s.failReport(ctx, coursewareID, lessonPlanID, "关联教案不存在")
+	// ---- 4. 提取已经通过教育域校验的教案正文 ----
+	lessonContent :=
+		ExtractLessonPlanContentForCW(
+			lessonPlan,
+		)
+	if len(
+		strings.TrimSpace(
+			lessonContent,
+		),
+	) < 50 {
+		s.failReport(
+			ctx,
+			coursewareID,
+			lessonPlanID,
+			"教案内容过少，无法比对",
+		)
 		return
 	}
-	lessonContent := ExtractLessonPlanContentForCW(lp)
-	if len(strings.TrimSpace(lessonContent)) < 50 {
-		s.failReport(ctx, coursewareID, lessonPlanID, "教案内容过少，无法比对")
-		return
-	}
-	// 截断控制 token
-	if len([]rune(lessonContent)) > alignMaxLessonContentRunes {
-		lessonContent = string([]rune(lessonContent)[:alignMaxLessonContentRunes]) + "\n\n[教案过长，已截取前部]"
+
+	lessonRunes := []rune(lessonContent)
+	if len(lessonRunes) >
+		alignMaxLessonContentRunes {
+		lessonContent = string(
+			lessonRunes[:alignMaxLessonContentRunes],
+		) + "\n\n[教案过长，已截取前部]"
 	}
 
 	// ---- 5. 加载对齐提示词 ----
@@ -122,7 +170,7 @@ func (s *CoursewareAlignmentService) runAlignment(ctx context.Context, coursewar
 	}
 
 	// ---- 6. 构建用户提示词（教案正文 + 逐页方案）----
-	userPrompt := s.buildAlignmentUserPrompt(lp, lessonContent, pages)
+	userPrompt := s.buildAlignmentUserPrompt(lessonPlan, lessonContent, pages)
 
 	// ---- 7. 调 AI（courseware_alignment 场景，opus；未授权校经分流降级 qwen）----
 	aiCfg, err := ai.GetEffectiveConfig(

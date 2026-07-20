@@ -9,6 +9,8 @@
  */
 
 import { useRef, useState } from 'react'
+import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import { C } from './workshopConstants'
 import { generateSubjectExperimentCode } from '@/api/subjectExperiment'
 import type { SubjectExperimentTarget } from '@/api/subjectExperiment'
@@ -181,6 +183,23 @@ function theme(target: SubjectExperimentTarget): ExperimentTheme {
   }
 }
 
+
+/**
+ * 为实验模板底稿生成短标识，避免把完整HTML写入sessionStorage键。
+ */
+function hashExperimentDraftIdentity(
+  value: string,
+): string {
+  let hash = 2166136261
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+
+  return (hash >>> 0).toString(36)
+}
+
 export default function ExperimentAIPanel({
   target,
   mode,
@@ -191,9 +210,28 @@ export default function ExperimentAIPanel({
   onExit,
   busyExternal,
 }: Props) {
+  const { user } = useAuth()
   const currentTheme = theme(target)
 
-  const [desc, setDesc] = useState('')
+  /**
+   * 物理、化学、生命科学和地理共用同一保护逻辑，
+   * 通过target、模式、模板名和底稿标识彼此隔离。
+   */
+  const descDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'subject-experiment-ai',
+    resourceId: [
+      target,
+      mode,
+      templateName || 'no-template',
+      hashExperimentDraftIdentity(baseCode),
+    ].join('|'),
+    field: 'description',
+    initialValue: '',
+    maxHistory: 40,
+  })
+  const desc = descDraft.value
+  const setDesc = descDraft.setValue
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [rounds, setRounds] = useState(0)
@@ -260,7 +298,8 @@ export default function ExperimentAIPanel({
 
       onCode(result.code)
       setRounds(current => current + 1)
-      setDesc('')
+      // AI成功返回后才提交文字草稿；失败时保持原文。
+      descDraft.commit()
     } catch (caughtError) {
       setError(
         caughtError instanceof Error
@@ -497,6 +536,9 @@ export default function ExperimentAIPanel({
       <textarea
         value={desc}
         onChange={event => setDesc(event.target.value)}
+        onKeyDown={event => {
+          descDraft.handleKeyDown(event)
+        }}
         placeholder={placeholder}
         maxLength={2400}
         rows={5}
@@ -519,6 +561,10 @@ export default function ExperimentAIPanel({
             : '#fff',
         }}
       />
+
+      <div style={{ marginTop: 6, fontSize: 11, color: C.textMuted, lineHeight: 1.5 }}>
+        描述已自动保存 · AI生成失败不会清除 · Ctrl/Command+Z恢复误删
+      </div>
 
       <button
         onClick={handleGenerate}

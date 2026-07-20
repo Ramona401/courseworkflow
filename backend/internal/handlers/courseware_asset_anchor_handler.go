@@ -29,67 +29,148 @@ import (
 //	响应:   { "asset_id", "anchor_url", "vaoci" }
 //
 // 一步式同步：内部完成「校验资产归属 → 取公网URL → 多模态提取VAOCI → 落库」。
-func (h *CoursewareAssetHandler) SetStyleAnchor(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) SetStyleAnchor(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	cwID := extractAnchorCoursewareID(r.URL.Path)
-	if cwID == "" {
+	coursewareID :=
+		extractAnchorCoursewareID(
+			r.URL.Path,
+		)
+	if coursewareID == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
 
-	var req struct {
-		AssetID string `json:"asset_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
-		return
-	}
-	if req.AssetID == "" {
-		utils.BadRequest(w, "asset_id不能为空")
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
 		return
 	}
 
-	result, err := h.assetService.SetStyleAnchor(r.Context(), cwID, req.AssetID, claims.UserID)
-	if err != nil {
-		utils.InternalError(w, err.Error())
+	var request struct {
+		AssetID string `json:"asset_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(
+		&request,
+	); err != nil {
+		utils.BadRequest(
+			w,
+			"请求参数格式错误",
+		)
 		return
 	}
+
+	assetID := strings.TrimSpace(
+		request.AssetID,
+	)
+	if assetID == "" {
+		utils.BadRequest(
+			w,
+			"asset_id不能为空",
+		)
+		return
+	}
+
+	result, err := h.assetService.SetStyleAnchor(
+		r.Context(),
+		coursewareID,
+		assetID,
+		actor,
+	)
+	if err != nil {
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
+		return
+	}
+
 	utils.Success(w, result)
 }
 
 // ClearStyleAnchor DELETE /api/v1/coursewares/{id}/style-anchor
 // 清除课件当前的风格锚点（两字段置NULL）。
-func (h *CoursewareAssetHandler) ClearStyleAnchor(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) ClearStyleAnchor(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodDelete {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持DELETE请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	cwID := extractAnchorCoursewareID(r.URL.Path)
-	if cwID == "" {
+	coursewareID :=
+		extractAnchorCoursewareID(
+			r.URL.Path,
+		)
+	if coursewareID == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
 
-	if err := h.assetService.ClearStyleAnchor(r.Context(), cwID, claims.UserID); err != nil {
-		utils.InternalError(w, err.Error())
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
 		return
 	}
-	utils.Success(w, map[string]string{"message": "风格锚点已清除"})
+
+	if err := h.assetService.ClearStyleAnchor(
+		r.Context(),
+		coursewareID,
+		actor,
+	); err != nil {
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
+		return
+	}
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "风格锚点已清除",
+		},
+	)
 }
 
 // extractAnchorCoursewareID 从 /api/v1/coursewares/{id}/style-anchor 提取课件ID

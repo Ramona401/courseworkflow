@@ -109,20 +109,40 @@ type cwSchemeItem struct {
 // ==================== 核心方法：生成课件索引（两层AI） ====================
 
 // GenerateIndex 生成课件索引（异步执行，通过SSE推送进度）
-func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID string, userID string, preset string, customHint string) error {
-	// ---- 1. 获取课件信息 ----
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+func (s *CoursewareIndexService) GenerateIndex(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+	preset string,
+	customHint string,
+) error {
+	// ---- 1. 可信Actor二次授权并重新加载正式课件 ----
+	cw, scopedActor, err :=
+		loadOwnedCoursewareForSchemeMutation(
+			ctx,
+			coursewareID,
+			actor,
+		)
 	if err != nil {
-		s.broadcastError(coursewareID, "课件不存在: "+err.Error())
-		return fmt.Errorf("课件不存在: %w", err)
+		s.broadcastError(
+			coursewareID,
+			"课件授权失败: "+err.Error(),
+		)
+		return err
 	}
-	if cw.UserID != userID {
-		s.broadcastError(coursewareID, "无权操作此课件")
-		return fmt.Errorf("无权操作此课件")
-	}
-	if cw.Status != models.CoursewareStatusDraft && cw.Status != models.CoursewareStatusIndexing {
-		s.broadcastError(coursewareID, "当前状态不允许生成方案: "+cw.Status)
-		return fmt.Errorf("当前状态不允许生成方案: %s", cw.Status)
+
+	userID := scopedActor.UserID
+
+	if cw.Status != models.CoursewareStatusDraft &&
+		cw.Status != models.CoursewareStatusIndexing {
+		s.broadcastError(
+			coursewareID,
+			"当前状态不允许生成方案: "+cw.Status,
+		)
+		return fmt.Errorf(
+			"当前状态不允许生成方案: %s",
+			cw.Status,
+		)
 	}
 
 	// ---- 2. 获取关联教案全部内容 ----
@@ -135,7 +155,20 @@ func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID
 		s.broadcastError(coursewareID, "关联教案不存在: "+err.Error())
 		return fmt.Errorf("关联教案不存在: %w", err)
 	}
-	lessonContent := s.extractLessonPlanContent(lp)
+	if domainErr :=
+		validateCoursewareLinkedLessonPlanDomain(
+			cw,
+			lp,
+		); domainErr != nil {
+		s.broadcastError(
+			coursewareID,
+			"关联教案教育域异常",
+		)
+		return domainErr
+	}
+
+	lessonContent :=
+		s.extractLessonPlanContent(lp)
 	if len(lessonContent) < 50 {
 		s.broadcastError(coursewareID, "教案内容过少，无法生成课件方案")
 		return fmt.Errorf("教案内容过少")
@@ -209,7 +242,7 @@ func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID
 		// 层2提示词缺失时降级为规则翻译
 		log.Printf("[courseware_index] 层2提示词缺失，降级为规则翻译: %v", err)
 		pages := s.fallbackTranslateToPages(rawPages, coursewareID)
-		return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
+		return s.saveAndBroadcast(ctx, coursewareID, scopedActor, overview, pages)
 	}
 
 	// ---- 8. 构建层2输入（将所有页面的AOCI索引拼接） ----
@@ -228,7 +261,7 @@ func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID
 	if err != nil {
 		log.Printf("[courseware_index] 层2 AI配置失败，降级规则翻译: %v", err)
 		pages := s.fallbackTranslateToPages(rawPages, coursewareID)
-		return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
+		return s.saveAndBroadcast(ctx, coursewareID, scopedActor, overview, pages)
 	}
 
 	traceCtx2 := &ai.TraceContext{SceneCode: "scanner", UserID: &userID, SchoolID: schoolIDPtr(gidSchoolID)}
@@ -236,7 +269,7 @@ func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID
 	if err != nil {
 		log.Printf("[courseware_index] 层2 AI调用失败，降级规则翻译: %v", err)
 		pages := s.fallbackTranslateToPages(rawPages, coursewareID)
-		return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
+		return s.saveAndBroadcast(ctx, coursewareID, scopedActor, overview, pages)
 	}
 
 	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
@@ -249,7 +282,7 @@ func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID
 	if err != nil {
 		log.Printf("[courseware_index] 层2 JSON解析失败，降级规则翻译: %v", err)
 		pages := s.fallbackTranslateToPages(rawPages, coursewareID)
-		return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
+		return s.saveAndBroadcast(ctx, coursewareID, scopedActor, overview, pages)
 	}
 
 	// ---- 11. 合并层1索引+层2方案 → CoursewarePage ----
@@ -260,12 +293,18 @@ func (s *CoursewareIndexService) GenerateIndex(ctx context.Context, coursewareID
 		callResult1.ModelUsed, callResult1.TokensUsed,
 		callResult2.ModelUsed, callResult2.TokensUsed)
 
-	return s.saveAndBroadcast(ctx, coursewareID, overview, pages)
+	return s.saveAndBroadcast(ctx, coursewareID, scopedActor, overview, pages)
 }
 
 // ==================== 保存并广播（统一出口） ====================
 
-func (s *CoursewareIndexService) saveAndBroadcast(ctx context.Context, coursewareID string, overview string, pages []*models.CoursewarePage) error {
+func (s *CoursewareIndexService) saveAndBroadcast(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+	overview string,
+	pages []*models.CoursewarePage,
+) error {
 	// 删除旧页面
 	if err := repository.DeleteAllCoursewarePages(ctx, coursewareID); err != nil {
 		log.Printf("[courseware_index] 删除旧页面失败: %v", err)
@@ -300,37 +339,37 @@ func (s *CoursewareIndexService) saveAndBroadcast(ctx context.Context, coursewar
 		},
 	})
 
-	// 对齐校验统一触发点：方案落库后异步比对"课件方案↔教案教学意图"。
-	// 覆盖所有让方案变化的路径（首次生成/AI改方案/重出方案都走本函数）。
-	// alignmentService 内部自行判断来源（仅 lesson_plan 来源才跑），非教案来源静默跳过。
-	// 取课件 userID 作为操作者供模型分流；取不到则用空串（service 内按 fail-closed 处理）。
+	// 对齐校验统一触发点：
+	// 使用当前方案Service已经授权并收敛到历史教育域的Actor。
+	// Tracker登记前和runAlignment执行时都会再次加载正式课件。
 	if s.alignmentService != nil {
-		alignUserID := ""
-		if cw, e := repository.GetCoursewareByID(ctx, coursewareID); e == nil {
-			alignUserID = cw.UserID
+		result, alignErr :=
+			s.alignmentService.
+				TriggerAlignmentTracked(
+					ctx,
+					coursewareID,
+					actor,
+				)
+		if alignErr != nil {
+			log.Printf(
+				"[courseware_index] 自动对齐任务授权失败: cw=%s err=%v",
+				coursewareID,
+				alignErr,
+			)
+		} else if result != BackgroundStarted &&
+			result != BackgroundAlreadyRunning {
+			log.Printf(
+				"[courseware_index] 自动对齐任务未启动: cw=%s result=%s",
+				coursewareID,
+				result,
+			)
 		}
-		s.alignmentService.TriggerAlignmentAsync(coursewareID, alignUserID)
 	}
 
-	// 教案规整触发点：方案落库后异步规整教案原文，供后续逐页生成注入
-	//（提升课件对教案的还原度、保证跨页共享案例一致）。
-	// best-effort：goroutine 内执行，失败只记日志、绝不阻断建索引与生成；
-	// normalizeService 内部自判来源（仅 lesson_plan/doc_upload 才规整），其余静默跳过。
-	// 用独立 context.Background()：规整是后台任务，需独立于可能随请求结束被取消的 ctx。
+	// 教案规整统一触发点：由Tracked入口登记唯一任务后异步执行。
+	// 服务进入draining后不再启动新的规整任务，已有成功结果仍由EnsureNormalized复用。
 	if s.normalizeService != nil {
-		go func(cwID string) {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("[courseware_index] 规整触发panic已兜底: %v", r)
-				}
-			}()
-			bgCtx := context.Background()
-			cwForNorm, e := repository.GetCoursewareByID(bgCtx, cwID)
-			if e != nil || cwForNorm == nil {
-				return
-			}
-			_ = s.normalizeService.EnsureNormalized(bgCtx, cwForNorm)
-		}(coursewareID)
+		s.normalizeService.TriggerEnsureNormalizedTracked(coursewareID)
 	}
 
 	return nil

@@ -110,78 +110,202 @@ func (s *UnitPlanService) GetUnitPlan(ctx context.Context, role, userID, id stri
 
 // ---------- 开始会话（建草稿 + 出第一步） ----------
 
-func (s *UnitPlanService) StartSession(ctx context.Context, role, userID string, req *models.StartUnitPlanRequest) (*models.UnitPlan, string, error) {
-	if !models.IsValidUnitPlanScope(req.Scope) {
-		return nil, "", ErrUnitPlanScopeInvalid
-	}
-	if req.Scope == models.UnitPlanScopeSystem {
-		req.ScopeTargetID = models.UnitPlanSystemTargetID
-	}
-	if strings.TrimSpace(req.Subject) == "" || strings.TrimSpace(req.Grade) == "" ||
-		strings.TrimSpace(req.Unit) == "" || strings.TrimSpace(req.ScopeTargetID) == "" {
+func (s *UnitPlanService) StartSession(
+	ctx context.Context,
+	_ string,
+	userID string,
+	req *models.StartUnitPlanRequest,
+) (*models.UnitPlan, string, error) {
+	if req == nil {
 		return nil, "", ErrUnitPlanFieldRequired
 	}
-	if !s.canManageScope(ctx, role, userID, req.Scope, req.ScopeTargetID) {
-		return nil, "", ErrUnitPlanNoPermission
+
+	if !models.IsValidUnitPlanScope(
+		req.Scope,
+	) {
+		return nil, "", ErrUnitPlanScopeInvalid
 	}
 
-	title := strings.TrimSpace(req.Title)
+	if req.Scope ==
+		models.UnitPlanScopeSystem {
+		req.ScopeTargetID =
+			models.UnitPlanSystemTargetID
+	}
+
+	req.Subject = strings.TrimSpace(
+		req.Subject,
+	)
+	req.Grade = strings.TrimSpace(
+		req.Grade,
+	)
+	req.Volume = strings.TrimSpace(
+		req.Volume,
+	)
+	req.Unit = strings.TrimSpace(
+		req.Unit,
+	)
+	req.ScopeTargetID = strings.TrimSpace(
+		req.ScopeTargetID,
+	)
+
+	if req.Subject == "" ||
+		req.Grade == "" ||
+		req.Unit == "" ||
+		req.ScopeTargetID == "" {
+		return nil, "", ErrUnitPlanFieldRequired
+	}
+
+	// 实时读取users.role并解析唯一具体教学域，
+	// 不信任Handler从JWT传入的历史角色。
+	actor, err := resolveCourseOutlineActor(
+		ctx,
+		userID,
+	)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// 目标归属域必须从正式组织关系解析，
+	// 请求体不能自行声明或伪造教育域。
+	resourceDomain, err :=
+		resolveCourseOutlineResourceDomain(
+			ctx,
+			req.Scope,
+			req.ScopeTargetID,
+		)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if resourceDomain !=
+		actor.EducationDomain {
+		return nil,
+			"",
+			ErrOutlineEducationDomainMismatch
+	}
+
+	if !s.canManageScope(
+		ctx,
+		actor.Role,
+		actor.UserID,
+		req.Scope,
+		req.ScopeTargetID,
+	) {
+		return nil,
+			"",
+			ErrUnitPlanNoPermission
+	}
+
+	title := strings.TrimSpace(
+		req.Title,
+	)
 	if title == "" {
-		title = strings.TrimSpace(req.Grade) + strings.TrimSpace(req.Volume) + strings.TrimSpace(req.Unit) + " 单元方案"
+		title = req.Grade +
+			req.Volume +
+			req.Unit +
+			" 单元方案"
 	}
 
-	// v233：规范化教材版本三态（与教案侧 UpdateLessonPlanCourseOutlinePublisher 同口径）：
-	//   nil 保持 nil（不关联大纲，含老客户端不传该字段的情况）；
-	//   非 nil 去空白后保留——注意空串是有效版本值（通用/不限版本），不可归一为 nil。
+	// K12允许空出版社和具名出版社。
+	//
+	// vocational/adult只允许空字符串普通课程大纲；
+	// 直接调用API伪造“人教版”等具名版本会在INSERT前被拒绝。
 	if req.CourseOutlinePublisher != nil {
-		trimmed := strings.TrimSpace(*req.CourseOutlinePublisher)
-		req.CourseOutlinePublisher = &trimmed
+		normalizedPublisher,
+			publisherErr :=
+			normalizeCourseOutlinePublisherForDomain(
+				actor.EducationDomain,
+				*req.CourseOutlinePublisher,
+			)
+		if publisherErr != nil {
+			return nil,
+				"",
+				publisherErr
+		}
+
+		req.CourseOutlinePublisher =
+			&normalizedPublisher
 	}
 
 	draft := &models.UnitPlan{
 		Scope:                  req.Scope,
 		ScopeTargetID:          req.ScopeTargetID,
-		Subject:                strings.TrimSpace(req.Subject),
-		Grade:                  strings.TrimSpace(req.Grade),
-		Volume:                 strings.TrimSpace(req.Volume),
-		Unit:                   strings.TrimSpace(req.Unit),
+		Subject:                req.Subject,
+		Grade:                  req.Grade,
+		Volume:                 req.Volume,
+		Unit:                   req.Unit,
 		Title:                  title,
 		SourceType:             models.UnitPlanSourceGenerated,
-		CreatedBy:              userID,
+		CreatedBy:              actor.UserID,
 		CourseOutlinePublisher: req.CourseOutlinePublisher,
 	}
-	if err := repository.CreateUnitPlanDraft(ctx, draft); err != nil {
+
+	if err := repository.CreateUnitPlanDraft(
+		ctx,
+		draft,
+	); err != nil {
 		return nil, "", err
 	}
 
-	systemPrompt, outlineInjected := s.buildSystemPrompt(ctx, draft.Subject, draft.Grade, draft.CourseOutlinePublisher)
+	systemPrompt,
+		outlineInjected,
+		promptErr :=
+		s.buildSystemPromptForUnitPlan(
+			ctx,
+			draft,
+		)
+	if promptErr != nil {
+		return draft, "", promptErr
+	}
 
-	// 开场白按"是否真的注入了大纲"分流：
-	//   已注入 → 让 AI 从已注入大纲中定位本单元并回显篇目课时（原有话术）；
-	//   未注入（未关联/选定版本下无大纲/大纲正文为空）→ 请老师自行提供篇目课时，
-	//   绝不能让 AI 去"已注入的大纲"里找（根本没注入，会诱发幻觉或"读不到资料"话术）。
 	var kickoff string
+
 	if outlineInjected {
 		kickoff = fmt.Sprintf(
 			"现在开始为以下单元做大单元整体教学设计：\n学科【%s】 年级【%s】 册次【%s】 单元【%s】。\n"+
 				"请执行步骤1（确认基础信息）：从已注入的课程大纲中定位本单元，回显学科/年级/册次/单元名/本单元课文篇目（含略读带*）与大致课时，请老师确认或补充。严格只做这一步，然后停下等确认。",
-			draft.Subject, draft.Grade, upDash(draft.Volume), draft.Unit,
+			draft.Subject,
+			draft.Grade,
+			upDash(draft.Volume),
+			draft.Unit,
 		)
 	} else {
 		kickoff = fmt.Sprintf(
 			"现在开始为以下单元做大单元整体教学设计：\n学科【%s】 年级【%s】 册次【%s】 单元【%s】。\n"+
 				"请执行步骤1（确认基础信息）：本次备课未注入课程大纲，请回显学科/年级/册次/单元名，并请老师提供本单元的课文篇目（含略读带*）与大致课时；不要凭记忆猜测篇目。严格只做这一步，然后停下等确认。",
-			draft.Subject, draft.Grade, upDash(draft.Volume), draft.Unit,
+			draft.Subject,
+			draft.Grade,
+			upDash(draft.Volume),
+			draft.Unit,
 		)
 	}
 
-	reply, err := s.callUnitAI(ctx, userID, systemPrompt, kickoff)
+	reply, err := s.callUnitAI(
+		ctx,
+		actor.UserID,
+		systemPrompt,
+		kickoff,
+	)
 	if err != nil {
 		return draft, "", err
 	}
-	if e := repository.AppendUnitPlanMessage(ctx, draft.ID, "assistant", reply); e != nil {
-		unitPlanLog.Warn("追加开场消息失败", "id", draft.ID, "error", e)
+
+	if appendErr :=
+		repository.AppendUnitPlanMessage(
+			ctx,
+			draft.ID,
+			"assistant",
+			reply,
+		); appendErr != nil {
+		unitPlanLog.Warn(
+			"追加开场消息失败",
+			"id",
+			draft.ID,
+			"error",
+			appendErr,
+		)
 	}
+
 	return draft, reply, nil
 }
 
@@ -200,7 +324,11 @@ func (s *UnitPlanService) Chat(ctx context.Context, role, userID, id, message st
 	}
 	history := models.ParseUnitPlanLog(p.ConversationLog)
 	// v233：每轮从方案实体重读版本选择做三态注入（会话建立时已定版落库）
-	systemPrompt, _ := s.buildSystemPrompt(ctx, p.Subject, p.Grade, p.CourseOutlinePublisher)
+	systemPrompt, _, promptErr :=
+		s.buildSystemPromptForUnitPlan(ctx, p)
+	if promptErr != nil {
+		return "", promptErr
+	}
 
 	// 每轮聊天按当前unit_plan_id重新读取有效参考资料。
 	// 不在会话创建时一次性固化；新增或删除资料后，下一轮自然生效。

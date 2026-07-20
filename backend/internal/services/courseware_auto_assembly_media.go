@@ -47,6 +47,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"tedna/internal/ai"
 	"tedna/internal/models"
@@ -62,7 +63,9 @@ var cwAssemblyVideoKeywords = []string{"视频", "动画", "演示", "短片", "
 // generateOnePageHTML 生成单页完整 HTML 并落库，返回组装后的完整 HTML。
 //
 // 完全复刻 GenerateRemainingPages 的单页生成链路，保证与批量生成产出一致：
-//   匹配组件 → 构建 batch user prompt → 调 AI → 抽取内容区HTML → 后端拼接导航模板组装完整页 → 落库。
+//
+//	匹配组件 → 构建 batch user prompt → 调 AI → 抽取内容区HTML → 后端拼接导航模板组装完整页 → 落库。
+//
 // 出错返回 error，由主编排记为该页 HTML 失败（该页不再进入配图流水线）。
 func (s *CoursewareAutoAssemblyService) generateOnePageHTML(
 	ctx context.Context, pc *cwAssemblyPageContext, page *models.CoursewarePage,
@@ -82,29 +85,109 @@ func (s *CoursewareAutoAssemblyService) generateOnePageHTML(
 		userPrompt = "⚠️ 这是封面页（第1页），请生成大标题居中的封面设计，突出课件标题、学科年级与机构品牌。\n\n" + userPrompt
 	}
 
-	// 3. 调 AI 生成内容区（真实签名 4 参：cfg, systemPrompt, userPrompt, traceCtx；schoolID 走 traceCtx）
+	// 3. 调AI生成内容区。
+	// API错误、空HTML或互动契约未落实时，均在当前页自动纠偏重试。
 	traceCtx := &ai.TraceContext{
 		SceneCode: "courseware_generate",
 		UserID:    &pc.userID,
 		SchoolID:  schoolIDPtr(pc.schoolID),
 	}
-	result, err := ai.CallAI(pc.aiCfg, pc.genPrompt.Content, userPrompt, traceCtx)
-	if err != nil {
-		return "", fmt.Errorf("AI生成失败: %w", err)
-	}
-	if result == nil || strings.TrimSpace(result.Content) == "" {
-		return "", fmt.Errorf("AI返回空内容")
+
+	var lastErr error
+	fullHTML := ""
+	attemptPrompt := userPrompt
+
+	for attempt := 1; attempt <= cwGenMaxAttempts; attempt++ {
+		callResult, callErr := ai.CallAI(
+			pc.aiCfg,
+			pc.genPrompt.Content,
+			attemptPrompt,
+			traceCtx,
+		)
+		lastErr = callErr
+
+		if lastErr == nil &&
+			(callResult == nil ||
+				strings.TrimSpace(callResult.Content) == "") {
+			lastErr = fmt.Errorf("AI返回空内容")
+		}
+
+		if lastErr == nil {
+			contentHTML := s.genService.extractHTMLFromAIOutput(
+				callResult.Content,
+			)
+			if strings.TrimSpace(contentHTML) == "" {
+				lastErr = fmt.Errorf("抽取HTML为空")
+			} else {
+				// 只检查AI生成的内容区，避免系统导航栏事件干扰互动类型验收。
+				interactionCheck :=
+					validateGeneratedPageInteraction(
+						page.InteractionType,
+						contentHTML,
+					)
+
+				if interactionCheck.OK {
+					fullHTML = s.genService.assembleFullPage(
+						contentHTML,
+						pc.navHTML,
+						page.PageNumber,
+						pc.totalPages,
+						pc.tplInfo,
+					)
+
+					if attempt > 1 {
+						cwAssemblyLog.Info(
+							"全自动装配互动契约纠偏成功",
+							"page", page.PageNumber,
+							"interaction_type", page.InteractionType,
+							"attempt", attempt,
+						)
+					}
+					break
+				}
+
+				lastErr = fmt.Errorf(
+					"互动方式未落实: %s",
+					interactionCheck.Reason,
+				)
+				attemptPrompt = buildCWInteractionRepairPrompt(
+					userPrompt,
+					page,
+					interactionCheck,
+				)
+
+				cwAssemblyLog.Warn(
+					"全自动装配互动契约验收失败，准备纠偏重试",
+					"page", page.PageNumber,
+					"interaction_type", page.InteractionType,
+					"reason", interactionCheck.Reason,
+					"detail", interactionCheck.Detail,
+					"attempt", attempt,
+					"max_attempts", cwGenMaxAttempts,
+				)
+			}
+		}
+
+		if lastErr != nil && attempt < cwGenMaxAttempts {
+			time.Sleep(
+				time.Duration(attempt) *
+					cwGenRetryBaseDelay,
+			)
+		}
 	}
 
-	// 4. 抽取内容区 HTML
-	contentHTML := s.genService.extractHTMLFromAIOutput(result.Content)
-	if strings.TrimSpace(contentHTML) == "" {
-		return "", fmt.Errorf("抽取HTML为空")
+	if strings.TrimSpace(fullHTML) == "" {
+		if lastErr == nil {
+			lastErr = fmt.Errorf(
+				"未形成通过互动契约验收的有效HTML",
+			)
+		}
+		return "", fmt.Errorf(
+			"单页生成失败(共尝试%d次): %v",
+			cwGenMaxAttempts,
+			lastErr,
+		)
 	}
-
-	// 5. 后端拼接导航模板组装完整页（真实签名 5 参：
-	//    assembleFullPage(contentHTML, navTemplate, pageNum, totalPages, tplInfo)）
-	fullHTML := s.genService.assembleFullPage(contentHTML, pc.navHTML, page.PageNumber, pc.totalPages, pc.tplInfo)
 
 	// 6. 落库（真实签名 6 参：UpdateCWPageHTML(ctx, pageID, html, placeholderMap, matchedIDs, status)）
 	matchedIDs := s.genService.buildMatchedComponentIDs(matched)
@@ -144,20 +227,21 @@ func (s *CoursewareAutoAssemblyService) assembleOnePageMedia(
 // assembleImage 单页配图链（best-effort，结果写入 res）。
 //
 // 流程（对齐平台真实"统一微调融图"路径 + 封面直填分支 + 融图收尾后处理）：
-//   1. SuggestImagePrompt 读本页 HTML 里的真实图片占位，产出配图提示词（无占位则空 → 跳过配图）
-//   2. 取主图（items[0]），GenerateImage 生图（不传 RefImageURL → 内部自动带风格锚点风格档位）
-//   3. 上云：UploadAssetToOSS(本地URL) 拿公网URL，UpdateCWAssetPublicURL 回写 public_oss_url
-//   4. 融图，按页型分流：
-//        · 封面页(page.PageNumber==1)：fillCoverImageIntoPlaceholder 占位直填，不调 RefinePage、不重排；
-//          若封面无占位/定位失败，降级回 RefinePage（不失配图能力）。
-//        · 非封面页：RefinePage 融图，AI 把图融进本页预留占位（内部已落库）。
-//   5. 【非封面融图成功后】postProcessPageImages 收尾（A:URL校正 + B:空占位按需兜底）。
+//  1. SuggestImagePrompt 读本页 HTML 里的真实图片占位，产出配图提示词（无占位则空 → 跳过配图）
+//  2. 取主图（items[0]），GenerateImage 生图（不传 RefImageURL → 内部自动带风格锚点风格档位）
+//  3. 上云：UploadAssetToOSS(本地URL) 拿公网URL，UpdateCWAssetPublicURL 回写 public_oss_url
+//  4. 融图，按页型分流：
+//     · 封面页(page.PageNumber==1)：fillCoverImageIntoPlaceholder 占位直填，不调 RefinePage、不重排；
+//     若封面无占位/定位失败，降级回 RefinePage（不失配图能力）。
+//     · 非封面页：RefinePage 融图，AI 把图融进本页预留占位（内部已落库）。
+//  5. 【非封面融图成功后】postProcessPageImages 收尾（A:URL校正 + B:空占位按需兜底）。
 //
 // 【配图价值守卫 v0.43.2】是否配图完全由本页 HTML 是否有真实图片占位决定（含封面）：
-//   · 封面若在生成阶段预留了主视觉图占位（img-placeholder），会正常配图增吸引力；纯 SVG 装饰无占位则自动跳过。
-//   · 纯文字/练习页在生成阶段就不留占位，SuggestImagePrompt 返回空数组、自动跳过（不再按页码一刀切）。
-//   保留"空 MediaRequirements 跳过"作为省钱双保险：此类页方案本无配图需求，连生图都不必启动。
-//   注意本函数无返回值，跳过用 return（非 return nil）。
+//
+//	· 封面若在生成阶段预留了主视觉图占位（img-placeholder），会正常配图增吸引力；纯 SVG 装饰无占位则自动跳过。
+//	· 纯文字/练习页在生成阶段就不留占位，SuggestImagePrompt 返回空数组、自动跳过（不再按页码一刀切）。
+//	保留"空 MediaRequirements 跳过"作为省钱双保险：此类页方案本无配图需求，连生图都不必启动。
+//	注意本函数无返回值，跳过用 return（非 return nil）。
 func (s *CoursewareAutoAssemblyService) assembleImage(
 	ctx context.Context, pc *cwAssemblyPageContext, page *models.CoursewarePage, res *cwAssemblyPageResult,
 ) {
@@ -179,7 +263,7 @@ func (s *CoursewareAutoAssemblyService) assembleImage(
 	})
 
 	// 1. AI 写配图提示词（读该页 HTML 里真实图片占位驱动；无占位返回空数组）
-	suggestions, err := s.assetService.SuggestImagePrompt(ctx, pc.coursewareID, page.PageNumber, pc.userID)
+	suggestions, err := s.assetService.SuggestImagePrompt(ctx, pc.coursewareID, page.PageNumber, pc.actor)
 	if err != nil {
 		res.imageOK = false
 		res.errMsg = fmt.Sprintf("第%d页写配图提示词失败: %v", page.PageNumber, err)
@@ -222,7 +306,7 @@ func (s *CoursewareAutoAssemblyService) assembleImage(
 		PlaceholderID: "",
 		Prompt:        mainPrompt,
 		Size:          imgSize,
-		UserID:        pc.userID,
+		Actor:         pc.actor,
 	})
 	if err != nil || imgResp == nil {
 		res.imageOK = false
@@ -278,7 +362,7 @@ func (s *CoursewareAutoAssemblyService) assembleImage(
 	// 6. RefinePage 融图：把公网URL写进指令，让 AI 把图融进本页预留占位。
 	//    imageDataURI 传空（该参数是"页面渲染截图多模态"，非配图用途）。
 	fuseInstruction := s.buildImageFuseInstruction(publicURL)
-	if _, rfErr := s.genService.RefinePage(ctx, pc.coursewareID, pc.userID, page.PageNumber, fuseInstruction, ""); rfErr != nil {
+	if _, rfErr := s.genService.RefinePage(ctx, pc.coursewareID, pc.actor, page.PageNumber, fuseInstruction, ""); rfErr != nil {
 		res.imageOK = false
 		res.errMsg = fmt.Sprintf("第%d页融图失败: %v", page.PageNumber, rfErr)
 		cwAssemblyLog.Warn("融图失败", "page", page.PageNumber, "error", rfErr)
@@ -305,19 +389,22 @@ func (s *CoursewareAutoAssemblyService) assembleImage(
 // 顶部导航栏整体复位，落库。仅在全自动装配的非封面融图后调用，best-effort。
 //
 // 【为什么需要】RefinePage 是"AI 重写整页"融图。虽指令要求"不动导航栏"，但 AI 整页重写时
-//   常改动导航栏的 position:absolute;top:0;height:80px;z-index 定位样式，或挪位、丢失
-//   NAV_START/NAV_END 标记——表现为老师反馈的"自动生成课件，导航栏格式没压住"。
-//   手动批量生成后不融图，导航栏一直是 assembleFullPage 硬拼的权威版本，故无此问题。
+//
+//	常改动导航栏的 position:absolute;top:0;height:80px;z-index 定位样式，或挪位、丢失
+//	NAV_START/NAV_END 标记——表现为老师反馈的"自动生成课件，导航栏格式没压住"。
+//	手动批量生成后不融图，导航栏一直是 assembleFullPage 硬拼的权威版本，故无此问题。
 //
 // 【权威导航栏口径】与 assembleFullPage 完全一致：pc.navHTML(即 cw.NavTemplateHTML) 内
-//   {{PAGE_NUM}}→页号、{{TOTAL_PAGES}}→总页数。
+//
+//	{{PAGE_NUM}}→页号、{{TOTAL_PAGES}}→总页数。
 //
 // 【双策略定位页内导航栏区块】
-//   策略A：页面含 <!-- NAV_START -->/<!-- NAV_END --> 标记 → 把标记区间整体替换为权威导航栏；
-//   策略B：无标记(assembleFullPage 插入的 nav 本就不带标记，或 AI 弄丢标记) →
-//         用 cwFindMatchingDivClose 定位"根 div 内第一个子 div"(= 导航栏在页面里的固定位置，
-//         与 assembleFullPage 的插入位置一致)，整体替换为权威导航栏。
-//   两策略均定位失败 → 原样返回，不写库(best-effort，绝不影响装配主流程)。
+//
+//	策略A：页面含 <!-- NAV_START -->/<!-- NAV_END --> 标记 → 把标记区间整体替换为权威导航栏；
+//	策略B：无标记(assembleFullPage 插入的 nav 本就不带标记，或 AI 弄丢标记) →
+//	      用 cwFindMatchingDivClose 定位"根 div 内第一个子 div"(= 导航栏在页面里的固定位置，
+//	      与 assembleFullPage 的插入位置一致)，整体替换为权威导航栏。
+//	两策略均定位失败 → 原样返回，不写库(best-effort，绝不影响装配主流程)。
 func (s *CoursewareAutoAssemblyService) restoreAuthoritativeNav(
 	ctx context.Context, pc *cwAssemblyPageContext, page *models.CoursewarePage,
 ) {
@@ -405,22 +492,26 @@ func replaceNavInPageHTML(html string, authNav string) (string, bool) {
 // ==================== 融图收尾后处理（A: URL 校正 + B: 空占位按需兜底）====================
 
 // cwImgTagRe 匹配 HTML 里的 <img ... src="..." ...> 标签，用于逐个校正 src。
-//   捕获组1 = <img 到 src=" 之前的部分；组2 = src 引号内的 URL；组3 = src 之后到 > 的部分。
-//   只处理双引号 src（本平台生成的 <img> 一律双引号），单引号极罕见不处理，避免误伤。
+//
+//	捕获组1 = <img 到 src=" 之前的部分；组2 = src 引号内的 URL；组3 = src 之后到 > 的部分。
+//	只处理双引号 src（本平台生成的 <img> 一律双引号），单引号极罕见不处理，避免误伤。
 var cwImgTagRe = regexp.MustCompile(`(?is)(<img\b[^>]*?\bsrc=")([^"]*)("[^>]*>)`)
 
 // cwEmptyPlaceholderRe 匹配一个 img-placeholder 占位 div（class 含 img-placeholder）及其内容到配对 </div>。
-//   (?is) 忽略大小写 + 让 . 跨行；[^>]* 容忍占位 div 上的 data-desc/style 等属性；
-//   内部用 .*? 非贪婪吃到第一个 </div>（占位内部不嵌套 div，故第一个 </div> 即配对；
-//   Go 的 RE2 引擎不支持负向先行断言 (?!，故用 .*? 而非 (?:(?!</div>).)*?）。
-//   命中后由回调 fillOrRemoveEmptyPlaceholders 判定该块内部是否已含 <img>：含则跳过、不含才处理。
+//
+//	(?is) 忽略大小写 + 让 . 跨行；[^>]* 容忍占位 div 上的 data-desc/style 等属性；
+//	内部用 .*? 非贪婪吃到第一个 </div>（占位内部不嵌套 div，故第一个 </div> 即配对；
+//	Go 的 RE2 引擎不支持负向先行断言 (?!，故用 .*? 而非 (?:(?!</div>).)*?）。
+//	命中后由回调 fillOrRemoveEmptyPlaceholders 判定该块内部是否已含 <img>：含则跳过、不含才处理。
 var cwEmptyPlaceholderRe = regexp.MustCompile(`(?is)<div\b[^>]*\bimg-placeholder\b[^>]*>.*?</div>`)
 
 // postProcessPageImages 融图收尾后处理（best-effort，失败仅记日志不影响主流程）。
 //
 // 读该页 RefinePage 落库后的最新 HTML，依次做两件事后写回：
-//   A. sanitizeImgSrcInHTML：修所有 <img src> 的坏 URL（补 "://"、去 src 内空格）；
-//   B. fillOrRemoveEmptyPlaceholders：按本页是否有配图需求，补填或收起残留的空 img-placeholder。
+//
+//	A. sanitizeImgSrcInHTML：修所有 <img src> 的坏 URL（补 "://"、去 src 内空格）；
+//	B. fillOrRemoveEmptyPlaceholders：按本页是否有配图需求，补填或收起残留的空 img-placeholder。
+//
 // 若两步都未改动 HTML，则不落库（省一次写库）。
 func (s *CoursewareAutoAssemblyService) postProcessPageImages(
 	ctx context.Context, page *models.CoursewarePage, mainPublicURL string,
@@ -455,12 +546,12 @@ func (s *CoursewareAutoAssemblyService) postProcessPageImages(
 // sanitizeImgSrcInHTML 纯语法修复 HTML 中所有 <img> 的 src（A 闸门）。
 //
 // 只做两件确定安全、不涉及业务语义的修复：
-//   1. 为协议头补回丢失的 "://"：AI 转写偶发把 "https://x" 写成 "httpsx" / "https:/x" / "https//x"，
-//      统一修正为 "https://x"（http 同理）。仅当 src 以 http/https 开头且协议分隔符残缺时才修，
-//      已正确的 "https://" 不受影响。
-//   2. 去掉 src 值内部的空格：AI 偶发在 URL 中间插空格（如 ".../de3 / 22010..."），一律删除。
-//      URL 本身不允许裸空格，删除是安全的（真正需要空格的会被编码为 %20，不含裸空格）。
-//   本地相对路径（/uploads/...）不带协议头，第1条不动它；第2条同样为其去空格（修 logo 被插空格的问题）。
+//  1. 为协议头补回丢失的 "://"：AI 转写偶发把 "https://x" 写成 "httpsx" / "https:/x" / "https//x"，
+//     统一修正为 "https://x"（http 同理）。仅当 src 以 http/https 开头且协议分隔符残缺时才修，
+//     已正确的 "https://" 不受影响。
+//  2. 去掉 src 值内部的空格：AI 偶发在 URL 中间插空格（如 ".../de3 / 22010..."），一律删除。
+//     URL 本身不允许裸空格，删除是安全的（真正需要空格的会被编码为 %20，不含裸空格）。
+//     本地相对路径（/uploads/...）不带协议头，第1条不动它；第2条同样为其去空格（修 logo 被插空格的问题）。
 func sanitizeImgSrcInHTML(html string) string {
 	if strings.TrimSpace(html) == "" {
 		return html
@@ -507,9 +598,9 @@ func fixOneURL(url string) string {
 
 // fillOrRemoveEmptyPlaceholders 处理残留的空 img-placeholder 占位（B 兜底）。
 //
-//   needImage=true （本页确有配图需求）：把每个空占位 div 的【内部】替换为撑满的 <img>（复用主图 URL），
-//     保留占位 div 的 class/style 外壳（定位与尺寸），只填内容——胜过留一个 "🖼️..." 裂框。
-//   needImage=false（本页无配图需求，占位多半是误判/装饰）：整个空占位 div 移除，不留裂框。
+//	needImage=true （本页确有配图需求）：把每个空占位 div 的【内部】替换为撑满的 <img>（复用主图 URL），
+//	  保留占位 div 的 class/style 外壳（定位与尺寸），只填内容——胜过留一个 "🖼️..." 裂框。
+//	needImage=false（本页无配图需求，占位多半是误判/装饰）：整个空占位 div 移除，不留裂框。
 //
 // 「空占位」判定：命中的占位块内部不含 <img>（含 <img> 说明已被融图填充，原样保留不动）。
 // mainPublicURL 为空时（理论不会）退化为仅移除，避免填入空 src。
@@ -688,7 +779,7 @@ func (s *CoursewareAutoAssemblyService) assembleVideoPlaceholder(
 	})
 
 	// 1. AI 写视频分镜（多镜，每镜含首帧图提示词 ImagePrompt）
-	shots, err := s.assetService.SuggestVideoPrompt(ctx, pc.coursewareID, page.PageNumber, pc.userID)
+	shots, err := s.assetService.SuggestVideoPrompt(ctx, pc.coursewareID, page.PageNumber, pc.actor)
 	if err != nil || len(shots) == 0 {
 		res.videoOK = false
 		cwAssemblyLog.Warn("视频分镜生成失败或为空，跳过视频占位", "page", page.PageNumber, "error", err)
@@ -709,7 +800,7 @@ func (s *CoursewareAutoAssemblyService) assembleVideoPlaceholder(
 		PlaceholderID: "",
 		Prompt:        framePrompt,
 		Size:          "2560x1440",
-		UserID:        pc.userID,
+		Actor:         pc.actor,
 	})
 	if err != nil || frameResp == nil {
 		res.videoOK = false

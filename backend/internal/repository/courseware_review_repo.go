@@ -29,6 +29,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"tedna/internal/database"
@@ -41,6 +42,46 @@ var (
 	// ErrCWReviewNotFound 课件审核记录不存在
 	ErrCWReviewNotFound = errors.New("课件审核记录不存在")
 )
+
+// buildCWReviewEducationDomainFilter 构建审核查询的教育域SQL过滤。
+func buildCWReviewEducationDomainFilter(
+	alias string,
+	currentEducationDomain string,
+	startIdx int,
+) (string, []interface{}, int) {
+	if alias == "" {
+		alias = "c"
+	}
+	if startIdx <= 0 {
+		startIdx = 1
+	}
+
+	domain := strings.ToLower(
+		strings.TrimSpace(currentEducationDomain),
+	)
+
+	switch {
+	case models.IsTeachingEducationDomain(domain):
+		return fmt.Sprintf(
+				" AND %s.education_domain = $%d",
+				alias,
+				startIdx,
+			),
+			[]interface{}{domain},
+			startIdx + 1
+
+	case domain == models.EducationDomainMixed:
+		return fmt.Sprintf(
+				" AND %s.education_domain IN ('k12', 'vocational', 'adult')",
+				alias,
+			),
+			nil,
+			startIdx
+
+	default:
+		return " AND 1 = 0", nil, startIdx
+	}
+}
 
 // ==================== 审核记录 CRUD ====================
 
@@ -156,24 +197,35 @@ func scanCWPendingItem(rows pgx.Rows) (*models.CWPendingReviewItem, error) {
 //
 // 与教案差异：课件无 group_id，"组内课件"= 课件作者 ∈ 审核员所在(lead/backbone)教研组的成员。
 // 流程：先查审核员的 lead/backbone 教研组 → 取这些组的全部成员 user_id → 课件作者 ∈ 这些成员 且 publish_state='submitted' 且 review_level=0。
-func ListCWPendingReviewsL1(ctx context.Context, reviewerID string, limit int, offset int) ([]*models.CWPendingReviewItem, int, error) {
-	// 1) 审核员作为 lead/backbone 的教研组成员（即"本组所有人"）
-	memberQuery := `
+func ListCWPendingReviewsL1(
+	ctx context.Context,
+	reviewerID string,
+	currentEducationDomain string,
+	limit int,
+	offset int,
+) ([]*models.CWPendingReviewItem, int, error) {
+	memberRows, err := database.DB.Query(ctx, `
 		SELECT DISTINCT m2.user_id
 		FROM teaching_group_members m1
-		JOIN teaching_group_members m2 ON m2.group_id = m1.group_id
-		WHERE m1.user_id = $1 AND m1.role IN ('lead', 'backbone')`
-	memberRows, err := database.DB.Query(ctx, memberQuery, reviewerID)
+		JOIN teaching_group_members m2
+			ON m2.group_id = m1.group_id
+		WHERE m1.user_id = $1
+			AND m1.role IN ('lead', 'backbone')`,
+		reviewerID,
+	)
 	if err != nil {
-		return nil, 0, fmt.Errorf("查询审核员可管成员失败: %w", err)
+		return nil, 0, fmt.Errorf(
+			"查询审核员可管成员失败: %w",
+			err,
+		)
 	}
 	defer memberRows.Close()
 
 	var memberIDs []string
 	for memberRows.Next() {
-		var uid string
-		if err := memberRows.Scan(&uid); err == nil {
-			memberIDs = append(memberIDs, uid)
+		var userID string
+		if err := memberRows.Scan(&userID); err == nil {
+			memberIDs = append(memberIDs, userID)
 		}
 	}
 	if len(memberIDs) == 0 {
@@ -181,185 +233,66 @@ func ListCWPendingReviewsL1(ctx context.Context, reviewerID string, limit int, o
 	}
 
 	inClause, args := buildInClause(memberIDs, 1)
+	domainClause, domainArgs, nextIdx :=
+		buildCWReviewEducationDomainFilter(
+			"c",
+			currentEducationDomain,
+			len(args)+1,
+		)
+	args = append(args, domainArgs...)
 
-	// 2) 统计总数
 	countQuery := fmt.Sprintf(`
-		SELECT COUNT(*) FROM coursewares c
-		WHERE c.publish_state = 'submitted' AND c.review_level = 0 AND c.user_id IN (%s)`, inClause)
+		SELECT COUNT(*)
+		FROM coursewares c
+		WHERE c.publish_state = 'submitted'
+			AND c.review_level = 0
+			AND c.user_id IN (%s)%s`,
+		inClause,
+		domainClause,
+	)
+
 	var total int
-	if err := database.DB.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("统计课件L1待审核数失败: %w", err)
-	}
-
-	if limit <= 0 {
-		limit = 20
-	}
-	nextIdx := len(args) + 1
-	listQuery := fmt.Sprintf(`
-		SELECT`+cwPendingSelectColumns+cwPendingFromJoin+`
-		WHERE c.publish_state = 'submitted' AND c.review_level = 0 AND c.user_id IN (%s)
-		ORDER BY c.updated_at ASC
-		LIMIT $%d OFFSET $%d`, inClause, nextIdx, nextIdx+1)
-	args = append(args, limit, offset)
-
-	rows, err := database.DB.Query(ctx, listQuery, args...)
-	if err != nil {
-		return nil, 0, fmt.Errorf("查询课件L1待审核列表失败: %w", err)
-	}
-	defer rows.Close()
-
-	var items []*models.CWPendingReviewItem
-	for rows.Next() {
-		item, err := scanCWPendingItem(rows)
-		if err != nil {
-			return nil, 0, fmt.Errorf("扫描课件L1待审核行失败: %w", err)
-		}
-		item.ReviewLevel = models.ReviewLevelL1
-		item.LevelName = models.ReviewLevelNameMap[models.ReviewLevelL1]
-		items = append(items, item)
-	}
-	return items, total, nil
-}
-
-// ListCWPendingReviewsL1All 获取全部 L1 待审核课件（admin 场景，不限教研组）
-// 条件：publish_state='submitted' AND review_level=0。
-func ListCWPendingReviewsL1All(ctx context.Context, limit int, offset int) ([]*models.CWPendingReviewItem, int, error) {
-	var total int
-	if err := database.DB.QueryRow(ctx,
-		`SELECT COUNT(*) FROM coursewares c
-		 WHERE c.publish_state = 'submitted' AND c.review_level = 0`,
+	if err := database.DB.QueryRow(
+		ctx,
+		countQuery,
+		args...,
 	).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("统计课件全量L1待审核数失败: %w", err)
-	}
-
-	if limit <= 0 {
-		limit = 100
-	}
-	listQuery := `
-		SELECT` + cwPendingSelectColumns + cwPendingFromJoin + `
-		WHERE c.publish_state = 'submitted' AND c.review_level = 0
-		ORDER BY c.updated_at ASC
-		LIMIT $1 OFFSET $2`
-	rows, err := database.DB.Query(ctx, listQuery, limit, offset)
-	if err != nil {
-		return nil, 0, fmt.Errorf("查询课件全量L1待审核列表失败: %w", err)
-	}
-	defer rows.Close()
-
-	var items []*models.CWPendingReviewItem
-	for rows.Next() {
-		item, err := scanCWPendingItem(rows)
-		if err != nil {
-			return nil, 0, fmt.Errorf("扫描课件全量L1待审核行失败: %w", err)
-		}
-		item.ReviewLevel = models.ReviewLevelL1
-		item.LevelName = models.ReviewLevelNameMap[models.ReviewLevelL1]
-		items = append(items, item)
-	}
-	return items, total, nil
-}
-
-// ListCWPendingReviewsL2 获取 L2 待审核课件列表
-// schoolID 非空只查该校（按 review_school_id 匹配）；为空查全部（admin 场景）。
-// 条件：publish_state='submitted' AND review_level=1。
-func ListCWPendingReviewsL2(ctx context.Context, schoolID string, limit int, offset int) ([]*models.CWPendingReviewItem, int, error) {
-	var countQuery, listQuery string
-	var countArgs, listArgs []interface{}
-
-	if schoolID != "" {
-		countQuery = `SELECT COUNT(*) FROM coursewares c
-			WHERE c.publish_state = 'submitted' AND c.review_level = 1 AND c.review_school_id = $1`
-		countArgs = []interface{}{schoolID}
-	} else {
-		countQuery = `SELECT COUNT(*) FROM coursewares c
-			WHERE c.publish_state = 'submitted' AND c.review_level = 1`
-		countArgs = []interface{}{}
-	}
-
-	var total int
-	if err := database.DB.QueryRow(ctx, countQuery, countArgs...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("统计课件L2待审核数失败: %w", err)
+		return nil, 0, err
 	}
 
 	if limit <= 0 {
 		limit = 20
 	}
-
-	if schoolID != "" {
-		listQuery = `SELECT` + cwPendingSelectColumns + cwPendingFromJoin + `
-			WHERE c.publish_state = 'submitted' AND c.review_level = 1 AND c.review_school_id = $1
-			ORDER BY c.updated_at ASC
-			LIMIT $2 OFFSET $3`
-		listArgs = []interface{}{schoolID, limit, offset}
-	} else {
-		listQuery = `SELECT` + cwPendingSelectColumns + cwPendingFromJoin + `
-			WHERE c.publish_state = 'submitted' AND c.review_level = 1
-			ORDER BY c.updated_at ASC
-			LIMIT $1 OFFSET $2`
-		listArgs = []interface{}{limit, offset}
+	if offset < 0 {
+		offset = 0
 	}
 
-	rows, err := database.DB.Query(ctx, listQuery, listArgs...)
-	if err != nil {
-		return nil, 0, fmt.Errorf("查询课件L2待审核列表失败: %w", err)
-	}
-	defer rows.Close()
-
-	var items []*models.CWPendingReviewItem
-	for rows.Next() {
-		item, err := scanCWPendingItem(rows)
-		if err != nil {
-			return nil, 0, fmt.Errorf("扫描课件L2待审核行失败: %w", err)
-		}
-		item.ReviewLevel = models.ReviewLevelL2
-		item.LevelName = models.ReviewLevelNameMap[models.ReviewLevelL2]
-		items = append(items, item)
-	}
-	return items, total, nil
-}
-
-// ListCWPendingReviewsBySchools 按"审核学校白名单"获取待审核课件列表（B3 新增，区域管理员辖区视图）
-//
-// 参数 pendingForLevel：待审核的目标级别——
-//   models.ReviewLevelL1(=1) → 查 DB 中 review_level=0 的"待L1"课件；
-//   models.ReviewLevelL2(=2) → 查 DB 中 review_level=1 的"待L2"课件。
-//   （DB 的 review_level 语义是"已通过到第几级"，待审级别 = 已通过级别 + 1，故 dbLevel = pendingForLevel - 1）
-//
-// 过滤列统一用 review_school_id：SubmitForReview 提交时即写入作者学校，
-// L1/L2 待审阶段该列都有值，与既有 L2 单校查询同列同口径。
-// 学校白名单为空时直接返回空列表（fail-closed，绝不退化为全局查询）。
-func ListCWPendingReviewsBySchools(ctx context.Context, schoolIDs []string, pendingForLevel int, limit int, offset int) ([]*models.CWPendingReviewItem, int, error) {
-	if len(schoolIDs) == 0 {
-		return []*models.CWPendingReviewItem{}, 0, nil
-	}
-	dbLevel := pendingForLevel - 1
-
-	// $1 = dbLevel，学校白名单占位符从 $2 起
-	inClause, schoolArgs := buildInClause(schoolIDs, 2)
-	args := append([]interface{}{dbLevel}, schoolArgs...)
-
-	countQuery := fmt.Sprintf(`
-		SELECT COUNT(*) FROM coursewares c
-		WHERE c.publish_state = 'submitted' AND c.review_level = $1 AND c.review_school_id IN (%s)`, inClause)
-	var total int
-	if err := database.DB.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("按学校统计课件待审核数失败: %w", err)
-	}
-
-	if limit <= 0 {
-		limit = 100
-	}
-	nextIdx := len(args) + 1
 	listQuery := fmt.Sprintf(`
 		SELECT`+cwPendingSelectColumns+cwPendingFromJoin+`
-		WHERE c.publish_state = 'submitted' AND c.review_level = $1 AND c.review_school_id IN (%s)
+		WHERE c.publish_state = 'submitted'
+			AND c.review_level = 0
+			AND c.user_id IN (%s)%s
 		ORDER BY c.updated_at ASC
-		LIMIT $%d OFFSET $%d`, inClause, nextIdx, nextIdx+1)
-	args = append(args, limit, offset)
+		LIMIT $%d OFFSET $%d`,
+		inClause,
+		domainClause,
+		nextIdx,
+		nextIdx+1,
+	)
 
-	rows, err := database.DB.Query(ctx, listQuery, args...)
+	listArgs := append(
+		append([]interface{}{}, args...),
+		limit,
+		offset,
+	)
+
+	rows, err := database.DB.Query(
+		ctx,
+		listQuery,
+		listArgs...,
+	)
 	if err != nil {
-		return nil, 0, fmt.Errorf("按学校查询课件待审核列表失败: %w", err)
+		return nil, 0, err
 	}
 	defer rows.Close()
 
@@ -367,84 +300,449 @@ func ListCWPendingReviewsBySchools(ctx context.Context, schoolIDs []string, pend
 	for rows.Next() {
 		item, err := scanCWPendingItem(rows)
 		if err != nil {
-			return nil, 0, fmt.Errorf("扫描按学校待审核行失败: %w", err)
+			return nil, 0, err
 		}
-		item.ReviewLevel = pendingForLevel
-		item.LevelName = models.ReviewLevelNameMap[pendingForLevel]
+		item.ReviewLevel = models.ReviewLevelL1
+		item.LevelName =
+			models.ReviewLevelNameMap[models.ReviewLevelL1]
 		items = append(items, item)
 	}
-	return items, total, nil
+
+	return items, total, rows.Err()
+}
+
+// ListCWPendingReviewsL1All 获取全部 L1 待审核课件（admin 场景，不限教研组）
+// 条件：publish_state='submitted' AND review_level=0。
+func ListCWPendingReviewsL1All(
+	ctx context.Context,
+	currentEducationDomain string,
+	limit int,
+	offset int,
+) ([]*models.CWPendingReviewItem, int, error) {
+	domainClause, args, nextIdx :=
+		buildCWReviewEducationDomainFilter(
+			"c",
+			currentEducationDomain,
+			1,
+		)
+
+	countQuery := `
+		SELECT COUNT(*)
+		FROM coursewares c
+		WHERE c.publish_state = 'submitted'
+			AND c.review_level = 0` +
+		domainClause
+
+	var total int
+	if err := database.DB.QueryRow(
+		ctx,
+		countQuery,
+		args...,
+	).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	listQuery := fmt.Sprintf(`
+		SELECT`+cwPendingSelectColumns+cwPendingFromJoin+`
+		WHERE c.publish_state = 'submitted'
+			AND c.review_level = 0%s
+		ORDER BY c.updated_at ASC
+		LIMIT $%d OFFSET $%d`,
+		domainClause,
+		nextIdx,
+		nextIdx+1,
+	)
+
+	listArgs := append(
+		append([]interface{}{}, args...),
+		limit,
+		offset,
+	)
+
+	rows, err := database.DB.Query(
+		ctx,
+		listQuery,
+		listArgs...,
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	items := []*models.CWPendingReviewItem{}
+	for rows.Next() {
+		item, err := scanCWPendingItem(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		item.ReviewLevel = models.ReviewLevelL1
+		item.LevelName =
+			models.ReviewLevelNameMap[models.ReviewLevelL1]
+		items = append(items, item)
+	}
+
+	return items, total, rows.Err()
+}
+
+// ListCWPendingReviewsL2 获取 L2 待审核课件列表
+// schoolID 非空只查该校（按 review_school_id 匹配）；为空查全部（admin 场景）。
+// 条件：publish_state='submitted' AND review_level=1。
+func ListCWPendingReviewsL2(
+	ctx context.Context,
+	schoolID string,
+	currentEducationDomain string,
+	limit int,
+	offset int,
+) ([]*models.CWPendingReviewItem, int, error) {
+	conditions := []string{
+		"c.publish_state = 'submitted'",
+		"c.review_level = 1",
+	}
+	args := []interface{}{}
+	argIdx := 1
+
+	if schoolID != "" {
+		conditions = append(
+			conditions,
+			fmt.Sprintf(
+				"c.review_school_id = $%d",
+				argIdx,
+			),
+		)
+		args = append(args, schoolID)
+		argIdx++
+	}
+
+	domainClause, domainArgs, nextIdx :=
+		buildCWReviewEducationDomainFilter(
+			"c",
+			currentEducationDomain,
+			argIdx,
+		)
+	args = append(args, domainArgs...)
+
+	whereClause := strings.Join(
+		conditions,
+		" AND ",
+	) + domainClause
+
+	countQuery := fmt.Sprintf(
+		"SELECT COUNT(*) FROM coursewares c WHERE %s",
+		whereClause,
+	)
+
+	var total int
+	if err := database.DB.QueryRow(
+		ctx,
+		countQuery,
+		args...,
+	).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	if limit <= 0 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	listQuery := fmt.Sprintf(`
+		SELECT`+cwPendingSelectColumns+cwPendingFromJoin+`
+		WHERE %s
+		ORDER BY c.updated_at ASC
+		LIMIT $%d OFFSET $%d`,
+		whereClause,
+		nextIdx,
+		nextIdx+1,
+	)
+
+	listArgs := append(
+		append([]interface{}{}, args...),
+		limit,
+		offset,
+	)
+
+	rows, err := database.DB.Query(
+		ctx,
+		listQuery,
+		listArgs...,
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	items := []*models.CWPendingReviewItem{}
+	for rows.Next() {
+		item, err := scanCWPendingItem(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		item.ReviewLevel = models.ReviewLevelL2
+		item.LevelName =
+			models.ReviewLevelNameMap[models.ReviewLevelL2]
+		items = append(items, item)
+	}
+
+	return items, total, rows.Err()
+}
+
+// ListCWPendingReviewsBySchools 按"审核学校白名单"获取待审核课件列表（B3 新增，区域管理员辖区视图）
+//
+// 参数 pendingForLevel：待审核的目标级别——
+//
+//	models.ReviewLevelL1(=1) → 查 DB 中 review_level=0 的"待L1"课件；
+//	models.ReviewLevelL2(=2) → 查 DB 中 review_level=1 的"待L2"课件。
+//	（DB 的 review_level 语义是"已通过到第几级"，待审级别 = 已通过级别 + 1，故 dbLevel = pendingForLevel - 1）
+//
+// 过滤列统一用 review_school_id：SubmitForReview 提交时即写入作者学校，
+// L1/L2 待审阶段该列都有值，与既有 L2 单校查询同列同口径。
+// 学校白名单为空时直接返回空列表（fail-closed，绝不退化为全局查询）。
+func ListCWPendingReviewsBySchools(
+	ctx context.Context,
+	schoolIDs []string,
+	pendingForLevel int,
+	currentEducationDomain string,
+	limit int,
+	offset int,
+) ([]*models.CWPendingReviewItem, int, error) {
+	if len(schoolIDs) == 0 {
+		return []*models.CWPendingReviewItem{}, 0, nil
+	}
+
+	dbLevel := pendingForLevel - 1
+	inClause, schoolArgs := buildInClause(schoolIDs, 2)
+	args := append(
+		[]interface{}{dbLevel},
+		schoolArgs...,
+	)
+
+	domainClause, domainArgs, nextIdx :=
+		buildCWReviewEducationDomainFilter(
+			"c",
+			currentEducationDomain,
+			len(args)+1,
+		)
+	args = append(args, domainArgs...)
+
+	countQuery := fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM coursewares c
+		WHERE c.publish_state = 'submitted'
+			AND c.review_level = $1
+			AND c.review_school_id IN (%s)%s`,
+		inClause,
+		domainClause,
+	)
+
+	var total int
+	if err := database.DB.QueryRow(
+		ctx,
+		countQuery,
+		args...,
+	).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	if limit <= 0 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	listQuery := fmt.Sprintf(`
+		SELECT`+cwPendingSelectColumns+cwPendingFromJoin+`
+		WHERE c.publish_state = 'submitted'
+			AND c.review_level = $1
+			AND c.review_school_id IN (%s)%s
+		ORDER BY c.updated_at ASC
+		LIMIT $%d OFFSET $%d`,
+		inClause,
+		domainClause,
+		nextIdx,
+		nextIdx+1,
+	)
+
+	listArgs := append(
+		append([]interface{}{}, args...),
+		limit,
+		offset,
+	)
+
+	rows, err := database.DB.Query(
+		ctx,
+		listQuery,
+		listArgs...,
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	items := []*models.CWPendingReviewItem{}
+	for rows.Next() {
+		item, err := scanCWPendingItem(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		item.ReviewLevel = pendingForLevel
+		item.LevelName =
+			models.ReviewLevelNameMap[pendingForLevel]
+		items = append(items, item)
+	}
+
+	return items, total, rows.Err()
 }
 
 // ==================== 已审核记录查询 ====================
 
 // ListCWReviewedRecords 查询课件已审核记录列表（按级别 + 审核员 + 决策过滤）
 // isAdmin=true 时不限 reviewerID（查所有人的）。
-func ListCWReviewedRecords(ctx context.Context, reviewerID string, level int, decision string, isAdmin bool, limit int, offset int) ([]*models.CWReviewedListItem, int, error) {
+func ListCWReviewedRecords(
+	ctx context.Context,
+	reviewerID string,
+	level int,
+	decision string,
+	isAdmin bool,
+	currentEducationDomain string,
+	limit int,
+	offset int,
+) ([]*models.CWReviewedListItem, int, error) {
 	where := "r.review_level = $1"
 	args := []interface{}{level}
 	argIdx := 2
 
-	if !isAdmin && reviewerID != "" {
-		where += fmt.Sprintf(" AND r.reviewer_id = $%d", argIdx)
-		args = append(args, reviewerID)
-		argIdx++
+	if !isAdmin {
+		if reviewerID == "" {
+			where += " AND 1 = 0"
+		} else {
+			where += fmt.Sprintf(
+				" AND r.reviewer_id = $%d",
+				argIdx,
+			)
+			args = append(args, reviewerID)
+			argIdx++
+		}
 	}
+
 	if decision != "" {
-		where += fmt.Sprintf(" AND r.decision = $%d", argIdx)
+		where += fmt.Sprintf(
+			" AND r.decision = $%d",
+			argIdx,
+		)
 		args = append(args, decision)
 		argIdx++
 	}
 
+	domainClause, domainArgs, nextIdx :=
+		buildCWReviewEducationDomainFilter(
+			"c",
+			currentEducationDomain,
+			argIdx,
+		)
+	where += domainClause
+	args = append(args, domainArgs...)
+
+	countQuery := fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM courseware_reviews r
+		JOIN coursewares c ON c.id = r.courseware_id
+		WHERE %s`,
+		where,
+	)
+
 	var total int
-	countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM courseware_reviews r WHERE %s`, where)
-	if err := database.DB.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("统计课件已审核记录数失败: %w", err)
+	if err := database.DB.QueryRow(
+		ctx,
+		countQuery,
+		args...,
+	).Scan(&total); err != nil {
+		return nil, 0, err
 	}
 
 	if limit <= 0 {
 		limit = 50
 	}
+	if offset < 0 {
+		offset = 0
+	}
 
 	listQuery := fmt.Sprintf(`
-		SELECT r.id, r.courseware_id,
-		       COALESCE(c.title, '') AS courseware_title,
-		       COALESCE(c.subject, '') AS subject,
-		       COALESCE(c.grade, '') AS grade,
-		       COALESCE(author.display_name, author.username, '') AS author_name,
-		       r.review_level,
-		       COALESCE(reviewer.display_name, reviewer.username, '') AS reviewer_name,
-		       r.decision, r.score, r.comment, r.created_at
+		SELECT
+			r.id,
+			r.courseware_id,
+			COALESCE(c.title, ''),
+			COALESCE(c.subject, ''),
+			COALESCE(c.grade, ''),
+			COALESCE(author.display_name, author.username, ''),
+			r.review_level,
+			COALESCE(reviewer.display_name, reviewer.username, ''),
+			r.decision,
+			r.score,
+			r.comment,
+			r.created_at
 		FROM courseware_reviews r
-		LEFT JOIN coursewares c ON c.id = r.courseware_id
+		JOIN coursewares c ON c.id = r.courseware_id
 		LEFT JOIN users author ON author.id = c.user_id
 		LEFT JOIN users reviewer ON reviewer.id = r.reviewer_id
 		WHERE %s
 		ORDER BY r.created_at DESC
-		LIMIT $%d OFFSET $%d`, where, argIdx, argIdx+1)
-	args = append(args, limit, offset)
+		LIMIT $%d OFFSET $%d`,
+		where,
+		nextIdx,
+		nextIdx+1,
+	)
 
-	rows, err := database.DB.Query(ctx, listQuery, args...)
+	listArgs := append(
+		append([]interface{}{}, args...),
+		limit,
+		offset,
+	)
+
+	rows, err := database.DB.Query(
+		ctx,
+		listQuery,
+		listArgs...,
+	)
 	if err != nil {
-		return nil, 0, fmt.Errorf("查询课件已审核记录失败: %w", err)
+		return nil, 0, err
 	}
 	defer rows.Close()
 
-	var items []*models.CWReviewedListItem
+	items := []*models.CWReviewedListItem{}
 	for rows.Next() {
 		item := &models.CWReviewedListItem{}
-		err := rows.Scan(
-			&item.ID, &item.CoursewareID, &item.CoursewareTitle, &item.Subject,
-			&item.Grade, &item.AuthorName, &item.ReviewLevel,
-			&item.ReviewerName, &item.Decision, &item.Score, &item.Comment, &item.CreatedAt,
-		)
-		if err != nil {
-			return nil, 0, fmt.Errorf("扫描课件已审核记录行失败: %w", err)
+		if err := rows.Scan(
+			&item.ID,
+			&item.CoursewareID,
+			&item.CoursewareTitle,
+			&item.Subject,
+			&item.Grade,
+			&item.AuthorName,
+			&item.ReviewLevel,
+			&item.ReviewerName,
+			&item.Decision,
+			&item.Score,
+			&item.Comment,
+			&item.CreatedAt,
+		); err != nil {
+			return nil, 0, err
 		}
-		item.LevelName = models.ReviewLevelNameMap[item.ReviewLevel]
+		item.LevelName =
+			models.ReviewLevelNameMap[item.ReviewLevel]
 		items = append(items, item)
 	}
-	return items, total, nil
+
+	return items, total, rows.Err()
 }
 
 // ==================== 审核统计 ====================
@@ -452,69 +750,178 @@ func ListCWReviewedRecords(ctx context.Context, reviewerID string, level int, de
 // GetCWReviewStats 获取课件审核统计（B3 修复版：待审计数按调用方白名单收窄，fail-closed）
 //
 // 待审核数（TotalPending）口径必须与该角色的待审列表严格一致，按以下优先级：
-//   1. isAdmin=true                       → 全局计数（对应 admin 的全量列表）；
-//   2. level=L1 且 memberIDs 非空          → 按"教研组成员作者"计数（对应 lead/backbone 的 L1 列表）；
-//   3. schoolIDs 非空                     → 按 review_school_id ∈ 白名单计数
-//                                           （senior 传 [本校] 对应其 L2 列表；region_admin 传辖区学校对应其 L1+L2 列表）；
-//   4. 三者皆无                           → 计 0（fail-closed）。
+//  1. isAdmin=true                       → 全局计数（对应 admin 的全量列表）；
+//  2. level=L1 且 memberIDs 非空          → 按"教研组成员作者"计数（对应 lead/backbone 的 L1 列表）；
+//  3. schoolIDs 非空                     → 按 review_school_id ∈ 白名单计数
+//     （senior 传 [本校] 对应其 L2 列表；region_admin 传辖区学校对应其 L1+L2 列表）；
+//  4. 三者皆无                           → 计 0（fail-closed）。
 //
 // ⚠ 历史泄漏（B3 堵住）：旧实现里"非 admin 且无教研组"的 L1、以及所有非 admin 的 L2，
-//   都落到无过滤的全局计数——区域管理员/学校管理员的统计卡显示全系统所有学校的待审数。
+//
+//	都落到无过滤的全局计数——区域管理员/学校管理员的统计卡显示全系统所有学校的待审数。
 //
 // 已审核/已通过/已退回三项为"审核员个人产出"口径：admin 看全局、非 admin 看本人 reviewer_id，
 // 不涉及跨校泄漏，维持原逻辑不变。
-func GetCWReviewStats(ctx context.Context, reviewerID string, level int, isAdmin bool, memberIDs []string, schoolIDs []string) (*models.CWReviewStatsResponse, error) {
+func GetCWReviewStats(
+	ctx context.Context,
+	reviewerID string,
+	level int,
+	isAdmin bool,
+	memberIDs []string,
+	schoolIDs []string,
+	currentEducationDomain string,
+) (*models.CWReviewStatsResponse, error) {
 	stats := &models.CWReviewStatsResponse{}
-
-	// dbPendingLevel：DB 的 review_level 语义是"已通过到第几级"，待审级别 = 已通过级别 + 1
 	dbPendingLevel := level - 1
 
-	// ---------- 待审核数（口径与列表一致，fail-closed）----------
 	if isAdmin {
-		// admin：全局计数
-		_ = database.DB.QueryRow(ctx,
-			`SELECT COUNT(*) FROM coursewares c
-			 WHERE c.publish_state = 'submitted' AND c.review_level = $1`, dbPendingLevel,
+		domainClause, domainArgs, _ :=
+			buildCWReviewEducationDomainFilter(
+				"c",
+				currentEducationDomain,
+				2,
+			)
+		args := append(
+			[]interface{}{dbPendingLevel},
+			domainArgs...,
+		)
+		query := `
+			SELECT COUNT(*)
+			FROM coursewares c
+			WHERE c.publish_state = 'submitted'
+				AND c.review_level = $1` +
+			domainClause
+		_ = database.DB.QueryRow(
+			ctx,
+			query,
+			args...,
 		).Scan(&stats.TotalPending)
-	} else if level == models.ReviewLevelL1 && len(memberIDs) > 0 {
-		// lead/backbone 的 L1：按教研组成员作者计数
-		inClause, args := buildInClause(memberIDs, 1)
-		q := fmt.Sprintf(`SELECT COUNT(*) FROM coursewares c
-			WHERE c.publish_state = 'submitted' AND c.review_level = 0 AND c.user_id IN (%s)`, inClause)
-		_ = database.DB.QueryRow(ctx, q, args...).Scan(&stats.TotalPending)
-	} else if len(schoolIDs) > 0 {
-		// senior（本校 L2）/ region_admin（辖区 L1+L2）：按 review_school_id 白名单计数
-		inClause, schoolArgs := buildInClause(schoolIDs, 2)
-		q := fmt.Sprintf(`SELECT COUNT(*) FROM coursewares c
-			WHERE c.publish_state = 'submitted' AND c.review_level = $1 AND c.review_school_id IN (%s)`, inClause)
-		args := append([]interface{}{dbPendingLevel}, schoolArgs...)
-		_ = database.DB.QueryRow(ctx, q, args...).Scan(&stats.TotalPending)
-	}
-	// 以上分支均不匹配（非 admin、无教研组、无学校白名单）→ TotalPending 保持 0（fail-closed）
 
-	// ---------- 已审核/已通过/已退回（审核员个人产出口径，原逻辑不变）----------
+	} else if level == models.ReviewLevelL1 &&
+		len(memberIDs) > 0 {
+		inClause, args := buildInClause(memberIDs, 1)
+		domainClause, domainArgs, _ :=
+			buildCWReviewEducationDomainFilter(
+				"c",
+				currentEducationDomain,
+				len(args)+1,
+			)
+		args = append(args, domainArgs...)
+
+		query := fmt.Sprintf(`
+			SELECT COUNT(*)
+			FROM coursewares c
+			WHERE c.publish_state = 'submitted'
+				AND c.review_level = 0
+				AND c.user_id IN (%s)%s`,
+			inClause,
+			domainClause,
+		)
+		_ = database.DB.QueryRow(
+			ctx,
+			query,
+			args...,
+		).Scan(&stats.TotalPending)
+
+	} else if len(schoolIDs) > 0 {
+		inClause, schoolArgs := buildInClause(schoolIDs, 2)
+		args := append(
+			[]interface{}{dbPendingLevel},
+			schoolArgs...,
+		)
+		domainClause, domainArgs, _ :=
+			buildCWReviewEducationDomainFilter(
+				"c",
+				currentEducationDomain,
+				len(args)+1,
+			)
+		args = append(args, domainArgs...)
+
+		query := fmt.Sprintf(`
+			SELECT COUNT(*)
+			FROM coursewares c
+			WHERE c.publish_state = 'submitted'
+				AND c.review_level = $1
+				AND c.review_school_id IN (%s)%s`,
+			inClause,
+			domainClause,
+		)
+		_ = database.DB.QueryRow(
+			ctx,
+			query,
+			args...,
+		).Scan(&stats.TotalPending)
+	}
+
 	if isAdmin {
-		_ = database.DB.QueryRow(ctx,
-			`SELECT COUNT(*) FROM courseware_reviews WHERE review_level = $1`, level,
+		domainClause, domainArgs, _ :=
+			buildCWReviewEducationDomainFilter(
+				"c",
+				currentEducationDomain,
+				2,
+			)
+		args := append(
+			[]interface{}{level},
+			domainArgs...,
+		)
+		base := `
+			FROM courseware_reviews r
+			JOIN coursewares c ON c.id = r.courseware_id
+			WHERE r.review_level = $1` +
+			domainClause
+
+		_ = database.DB.QueryRow(
+			ctx,
+			"SELECT COUNT(*) "+base,
+			args...,
 		).Scan(&stats.TotalReviewed)
-		_ = database.DB.QueryRow(ctx,
-			`SELECT COUNT(*) FROM courseware_reviews WHERE review_level = $1 AND decision = 'approved'`, level,
+		_ = database.DB.QueryRow(
+			ctx,
+			"SELECT COUNT(*) "+base+
+				" AND r.decision = 'approved'",
+			args...,
 		).Scan(&stats.TotalApproved)
-		_ = database.DB.QueryRow(ctx,
-			`SELECT COUNT(*) FROM courseware_reviews WHERE review_level = $1 AND decision = 'revision'`, level,
+		_ = database.DB.QueryRow(
+			ctx,
+			"SELECT COUNT(*) "+base+
+				" AND r.decision = 'revision'",
+			args...,
 		).Scan(&stats.TotalRevision)
+
 	} else {
-		_ = database.DB.QueryRow(ctx,
-			`SELECT COUNT(*) FROM courseware_reviews WHERE reviewer_id = $1 AND review_level = $2`,
-			reviewerID, level,
+		domainClause, domainArgs, _ :=
+			buildCWReviewEducationDomainFilter(
+				"c",
+				currentEducationDomain,
+				3,
+			)
+		args := append(
+			[]interface{}{reviewerID, level},
+			domainArgs...,
+		)
+		base := `
+			FROM courseware_reviews r
+			JOIN coursewares c ON c.id = r.courseware_id
+			WHERE r.reviewer_id = $1
+				AND r.review_level = $2` +
+			domainClause
+
+		_ = database.DB.QueryRow(
+			ctx,
+			"SELECT COUNT(*) "+base,
+			args...,
 		).Scan(&stats.TotalReviewed)
-		_ = database.DB.QueryRow(ctx,
-			`SELECT COUNT(*) FROM courseware_reviews WHERE reviewer_id = $1 AND review_level = $2 AND decision = 'approved'`,
-			reviewerID, level,
+		_ = database.DB.QueryRow(
+			ctx,
+			"SELECT COUNT(*) "+base+
+				" AND r.decision = 'approved'",
+			args...,
 		).Scan(&stats.TotalApproved)
-		_ = database.DB.QueryRow(ctx,
-			`SELECT COUNT(*) FROM courseware_reviews WHERE reviewer_id = $1 AND review_level = $2 AND decision = 'revision'`,
-			reviewerID, level,
+		_ = database.DB.QueryRow(
+			ctx,
+			"SELECT COUNT(*) "+base+
+				" AND r.decision = 'revision'",
+			args...,
 		).Scan(&stats.TotalRevision)
 	}
 

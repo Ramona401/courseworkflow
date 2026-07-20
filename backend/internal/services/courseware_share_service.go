@@ -118,31 +118,90 @@ func (s *CoursewareService) SetCodeShareScope(ctx context.Context, id string, us
 //     只看这些人共享的课件。解析失败/未绑校组 → 至少含本人（看得到自己共享的）。
 //
 // 逐条计算 CanCopy（当前登录者能否复制该课件源码），供前端显隐"复制到我的"按钮。
-func (s *CoursewareService) ListSharedCoursewares(ctx context.Context, userID string, role string, subject string, limit int, offset int) (*models.SharedCoursewareListResponse, error) {
+func (s *CoursewareService) ListSharedCoursewares(
+	ctx context.Context,
+	actor *CoursewareActorContext,
+	subject string,
+	limit int,
+	offset int,
+) (*models.SharedCoursewareListResponse, error) {
+	if actor == nil || actor.UserID == "" {
+		return nil, ErrCoursewareActorRequired
+	}
 	if limit <= 0 {
 		limit = 20
 	}
-
-	// 1) 解析可见作者白名单
-	var visibleAuthorIDs []string
-	if role == models.RoleAdmin {
-		visibleAuthorIDs = nil // admin 不限作者
-	} else {
-		visibleAuthorIDs = s.resolveSameOrgUserIDs(ctx, userID)
+	if offset < 0 {
+		offset = 0
 	}
 
-	// 2) 查询
-	items, total, err := repository.ListSharedCoursewares(ctx, visibleAuthorIDs, subject, limit, offset)
+	// admin在mixed管理页面可跨组织查看；
+	// 其它角色继续遵守原有同校或同组作者范围。
+	var visibleAuthorIDs []string
+	if actor.Role == models.RoleAdmin {
+		visibleAuthorIDs = nil
+	} else {
+		visibleAuthorIDs = s.resolveSameOrgUserIDs(
+			ctx,
+			actor.UserID,
+		)
+	}
+
+	items, total, err :=
+		repository.ListSharedCoursewares(
+			ctx,
+			visibleAuthorIDs,
+			actor.EducationDomain,
+			subject,
+			limit,
+			offset,
+		)
 	if err != nil {
 		return nil, err
 	}
 
-	// 3) 逐条裁决 CanCopy。先把当前用户的学校ID/教研组ID集合算一次，避免每条都查库。
-	viewerSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
-	viewerGroupIDs := s.resolveUserGroupIDSet(ctx, userID)
+	viewerSchoolID, _ :=
+		repository.GetSchoolIDByUserID(
+			ctx,
+			actor.UserID,
+		)
+	viewerGroupIDs := s.resolveUserGroupIDSet(
+		ctx,
+		actor.UserID,
+	)
 
-	for _, it := range items {
-		it.CanCopy = s.resolveCanCopy(ctx, role, it.AuthorID, it.CodeShareScope, viewerSchoolID, viewerGroupIDs)
+	for _, item := range items {
+		if item == nil {
+			return nil,
+				ErrCoursewareEducationDomainInvalid
+		}
+
+		// Go层第二次复核，防止未来SQL调整意外放大教育域范围。
+		probe := &models.Courseware{
+			ID:              item.ID,
+			EducationDomain: item.EducationDomain,
+		}
+		if err := ValidateCoursewareEducationDomainForActor(
+			actor,
+			probe,
+		); err != nil {
+			return nil, err
+		}
+
+		// common资源可以跨教育域查看，但不能直接Fork为具体运行课件。
+		if item.EducationDomain == models.EducationDomainCommon {
+			item.CanCopy = false
+			continue
+		}
+
+		item.CanCopy = s.resolveCanCopy(
+			ctx,
+			actor.Role,
+			item.AuthorID,
+			item.CodeShareScope,
+			viewerSchoolID,
+			viewerGroupIDs,
+		)
 	}
 
 	return &models.SharedCoursewareListResponse{
@@ -162,123 +221,255 @@ func (s *CoursewareService) ListSharedCoursewares(ctx context.Context, userID st
 //
 // 复制内容：课件主记录（重置为当前用户、私有、流程态沿用源 status）、全部页面、全部资产。
 // 新课件 publish_state=private、code_share_scope=none、review_level=0（产权归复制者，默认不外发）。
-func (s *CoursewareService) ForkCourseware(ctx context.Context, srcID string, userID string, role string) (*models.Courseware, error) {
-	src, err := repository.GetCoursewareByID(ctx, srcID)
+func (s *CoursewareService) ForkCourseware(
+	ctx context.Context,
+	srcID string,
+	actor *CoursewareActorContext,
+) (*models.Courseware, error) {
+	if actor == nil || actor.UserID == "" {
+		return nil, ErrCoursewareActorRequired
+	}
+
+	userID := actor.UserID
+	role := actor.Role
+
+	src, err := repository.GetCoursewareByID(
+		ctx,
+		srcID,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("源课件不存在: %w", err)
+		return nil, fmt.Errorf(
+			"源课件不存在: %w",
+			err,
+		)
 	}
 	if src.UserID == userID {
-		return nil, fmt.Errorf("这是您自己的课件，无需复制")
-	}
-	if src.PublishState != models.CWPublishPublishedShared {
-		return nil, fmt.Errorf("该课件未共享，不能复制")
-	}
-
-	// 代码复制权裁决
-	viewerSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
-	viewerGroupIDs := s.resolveUserGroupIDSet(ctx, userID)
-	if !s.resolveCanCopy(ctx, role, src.UserID, src.CodeShareScope, viewerSchoolID, viewerGroupIDs) {
-		return nil, fmt.Errorf("该课件作者未开放源码复制权限")
+		return nil, fmt.Errorf(
+			"这是您自己的课件，无需复制",
+		)
 	}
 
-	// 1) 复制课件主记录（归当前用户，私有，代码不外发；流程态沿用源以便复制者继续编辑/预览）
+	// 教育域先于共享状态和代码开放范围执行，避免跨域用户通过错误差异
+	// 探测或复制其它教学域课件。
+	forkDomain, err :=
+		ResolveCoursewareForkEducationDomain(
+			actor,
+			src,
+		)
+	if err != nil {
+		return nil, err
+	}
+
+	if src.PublishState !=
+		models.CWPublishPublishedShared {
+		return nil, fmt.Errorf(
+			"该课件未共享，不能复制",
+		)
+	}
+
+	viewerSchoolID, _ :=
+		repository.GetSchoolIDByUserID(
+			ctx,
+			userID,
+		)
+	viewerGroupIDs := s.resolveUserGroupIDSet(
+		ctx,
+		userID,
+	)
+
+	if !s.resolveCanCopy(
+		ctx,
+		role,
+		src.UserID,
+		src.CodeShareScope,
+		viewerSchoolID,
+		viewerGroupIDs,
+	) {
+		return nil, fmt.Errorf(
+			"该课件作者未开放源码复制权限",
+		)
+	}
+
+	// 副本归当前用户所有，但教育域必须继承来源课件快照，
+	// 不能重新按复制者当前学校推导。
 	newCW := &models.Courseware{
-		LessonPlanID: nil, // 复制品不挂源教案，避免误关联
-		UserID:       userID,
-		Title:        src.Title + "（副本）",
-		Subject:      src.Subject,
-		Grade:        src.Grade,
-		Status:       src.Status,
-		SourceType:   src.SourceType,
-		PageCount:    src.PageCount,
-	}
-	if err := repository.CreateCourseware(ctx, newCW); err != nil {
-		return nil, fmt.Errorf("创建副本课件失败: %w", err)
+		LessonPlanID:    nil,
+		UserID:          userID,
+		Title:           src.Title + "（副本）",
+		Subject:         src.Subject,
+		Grade:           src.Grade,
+		EducationDomain: forkDomain,
+		Status:          src.Status,
+		SourceType:      src.SourceType,
+		PageCount:       src.PageCount,
 	}
 
-	// 复制风格/Logo/机构名/导航栏/概述等展示要素（逐字段写，复用现成 Update 函数）
+	if err := repository.CreateCourseware(
+		ctx,
+		newCW,
+	); err != nil {
+		return nil, fmt.Errorf(
+			"创建副本课件失败: %w",
+			err,
+		)
+	}
+
+	// 复制风格、Logo、机构名、导航栏和脉络。
 	if src.StyleConfig != "" {
-		_ = repository.UpdateCoursewareStyle(ctx, newCW.ID, src.StyleConfig)
+		_ = repository.UpdateCoursewareStyle(
+			ctx,
+			newCW.ID,
+			src.StyleConfig,
+		)
 	}
 	if src.LogoURL != "" {
-		_ = repository.UpdateCoursewareLogo(ctx, newCW.ID, src.LogoURL)
+		_ = repository.UpdateCoursewareLogo(
+			ctx,
+			newCW.ID,
+			src.LogoURL,
+		)
 	}
 	if src.OrgName != "" {
-		_ = repository.UpdateCoursewareOrgName(ctx, newCW.ID, src.OrgName)
+		_ = repository.UpdateCoursewareOrgName(
+			ctx,
+			newCW.ID,
+			src.OrgName,
+		)
 	}
 	if src.NavTemplateHTML != "" {
-		_ = repository.UpdateCoursewareNavTemplate(ctx, newCW.ID, src.NavTemplateHTML)
+		_ = repository.UpdateCoursewareNavTemplate(
+			ctx,
+			newCW.ID,
+			src.NavTemplateHTML,
+		)
 	}
 	if src.IndexOverview != "" {
-		_ = repository.UpdateCoursewareOverview(ctx, newCW.ID, src.IndexOverview)
+		_ = repository.UpdateCoursewareOverview(
+			ctx,
+			newCW.ID,
+			src.IndexOverview,
+		)
 	}
 
-	// 2) 复制全部页面。建立 旧pageID → 新pageID 映射，供资产挂载到新页。
-	srcPages, err := repository.ListCoursewarePages(ctx, srcID)
+	// 复制全部页面，并建立旧页ID到新页ID的映射。
+	srcPages, err := repository.ListCoursewarePages(
+		ctx,
+		srcID,
+	)
 	if err != nil {
-		shareServiceLog.Warn("复制课件：读取源页面失败", "src", srcID, "error", err)
-		return newCW, nil // 主记录已建，页面复制失败不阻断，返回已建课件
+		shareServiceLog.Warn(
+			"复制课件：读取源页面失败",
+			"src",
+			srcID,
+			"error",
+			err,
+		)
+		return newCW, nil
 	}
-	oldToNewPageID := make(map[string]string, len(srcPages))
-	for _, p := range srcPages {
-		np := &models.CoursewarePage{
+
+	oldToNewPageID := make(
+		map[string]string,
+		len(srcPages),
+	)
+
+	for _, page := range srcPages {
+		newPage := &models.CoursewarePage{
 			CoursewareID:        newCW.ID,
-			PageNumber:          p.PageNumber,
-			Title:               p.Title,
-			Purpose:             p.Purpose,
-			ContentSummary:      p.ContentSummary,
-			InteractionType:     p.InteractionType,
-			VisualFormat:        p.VisualFormat,
-			MediaRequirements:   p.MediaRequirements,
-			EstimatedComplexity: p.EstimatedComplexity,
-			PageIndex:           p.PageIndex,
-			IdxCognitiveLevel:   p.IdxCognitiveLevel,
-			IdxInteractionLevel: p.IdxInteractionLevel,
-			IdxVisualFormat:     p.IdxVisualFormat,
-			HTMLContent:         p.HTMLContent,
-			PlaceholderMap:      p.PlaceholderMap,
-			MatchedComponentIDs: p.MatchedComponentIDs,
-			Status:              p.Status,
+			PageNumber:          page.PageNumber,
+			Title:               page.Title,
+			Purpose:             page.Purpose,
+			ContentSummary:      page.ContentSummary,
+			InteractionType:     page.InteractionType,
+			VisualFormat:        page.VisualFormat,
+			MediaRequirements:   page.MediaRequirements,
+			EstimatedComplexity: page.EstimatedComplexity,
+			PageIndex:           page.PageIndex,
+			IdxCognitiveLevel:   page.IdxCognitiveLevel,
+			IdxInteractionLevel: page.IdxInteractionLevel,
+			IdxVisualFormat:     page.IdxVisualFormat,
+			HTMLContent:         page.HTMLContent,
+			PlaceholderMap:      page.PlaceholderMap,
+			MatchedComponentIDs: page.MatchedComponentIDs,
+			Status:              page.Status,
 		}
-		if err := repository.CreateCoursewarePage(ctx, np); err != nil {
-			shareServiceLog.Warn("复制课件：创建副本页面失败", "page_number", p.PageNumber, "error", err)
+
+		if err := repository.CreateCoursewarePage(
+			ctx,
+			newPage,
+		); err != nil {
+			shareServiceLog.Warn(
+				"复制课件：创建副本页面失败",
+				"page_number",
+				page.PageNumber,
+				"error",
+				err,
+			)
 			continue
 		}
-		oldToNewPageID[p.ID] = np.ID
+
+		oldToNewPageID[page.ID] = newPage.ID
 	}
 
-	// 3) 复制全部资产（图片/视频），page_id 重映射到新页；课件级资产（page_id=nil）保持 nil。
-	srcAssets, aErr := repository.ListCWAssetsByCourseware(ctx, srcID)
-	if aErr == nil {
-		for _, a := range srcAssets {
+	// 复制全部资产，page_id重映射到副本页面。
+	srcAssets, assetErr :=
+		repository.ListCWAssetsByCourseware(
+			ctx,
+			srcID,
+		)
+	if assetErr == nil {
+		for _, asset := range srcAssets {
 			var newPageID *string
-			if a.PageID != nil {
-				if mapped, ok := oldToNewPageID[*a.PageID]; ok {
-					newPageID = &mapped
+			if asset.PageID != nil {
+				if mapped, ok :=
+					oldToNewPageID[*asset.PageID]; ok {
+					mappedCopy := mapped
+					newPageID = &mappedCopy
 				}
 			}
-			na := &models.CoursewareAsset{
+
+			newAsset := &models.CoursewareAsset{
 				CoursewareID:     newCW.ID,
 				PageID:           newPageID,
-				PlaceholderID:    a.PlaceholderID,
-				AssetType:        a.AssetType,
-				GenerationPrompt: a.GenerationPrompt,
-				OssURL:           a.OssURL,
-				PublicOSSURL:     a.PublicOSSURL,
-				FileSize:         a.FileSize,
-				MimeType:         a.MimeType,
-				Metadata:         a.Metadata,
-				Status:           a.Status,
+				PlaceholderID:    asset.PlaceholderID,
+				AssetType:        asset.AssetType,
+				GenerationPrompt: asset.GenerationPrompt,
+				OssURL:           asset.OssURL,
+				PublicOSSURL:     asset.PublicOSSURL,
+				FileSize:         asset.FileSize,
+				MimeType:         asset.MimeType,
+				Metadata:         asset.Metadata,
+				Status:           asset.Status,
 			}
-			if err := repository.CreateCWAsset(ctx, na); err != nil {
-				shareServiceLog.Warn("复制课件：创建副本资产失败", "placeholder", a.PlaceholderID, "error", err)
+
+			if err := repository.CreateCWAsset(
+				ctx,
+				newAsset,
+			); err != nil {
+				shareServiceLog.Warn(
+					"复制课件：创建副本资产失败",
+					"placeholder",
+					asset.PlaceholderID,
+					"error",
+					err,
+				)
 			}
 		}
 	}
 
-	shareServiceLog.Info("课件复制完成",
-		"src_courseware_id", srcID, "new_courseware_id", newCW.ID,
-		"pages", len(oldToNewPageID), "user_id", userID)
+	shareServiceLog.Info(
+		"课件复制完成",
+		"src_courseware_id",
+		srcID,
+		"new_courseware_id",
+		newCW.ID,
+		"education_domain",
+		newCW.EducationDomain,
+		"pages",
+		len(oldToNewPageID),
+		"user_id",
+		userID,
+	)
+
 	return newCW, nil
 }
 

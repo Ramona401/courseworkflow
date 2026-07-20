@@ -21,6 +21,8 @@
  *       非该比例的外来页面导入后观感可能与原始来源不同（可再用微调/源码编辑修正）。
  */
 import { useState } from 'react'
+import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import { addCWPage, regenerateCWPage, importPageHtml } from '@/api/coursewares'
 import { C } from './workshopConstants'
 
@@ -54,16 +56,173 @@ interface Props {
   onClose: () => void
 }
 
-export default function AddPageModal({ coursewareId, currentPageCount, onDone, onClose }: Props) {
-  // 模式：ai=AI生成（原有流程） / paste=粘贴HTML（批次B新增）
-  const [mode, setMode] = useState<'ai' | 'paste'>('ai')
 
-  // 表单字段（title 两模式共用）
-  const [title, setTitle] = useState(`第 ${currentPageCount + 1} 页`)
-  const [purpose, setPurpose] = useState('')
-  const [contentSummary, setContentSummary] = useState('')
-  const [richness, setRichness] = useState(3) // 默认适中
-  const [pasteHtml, setPasteHtml] = useState('') // 批次B：粘贴的HTML代码
+interface AddPageDraftForm {
+  mode: 'ai' | 'paste'
+  title: string
+  purpose: string
+  contentSummary: string
+  richness: number
+  pasteHtml: string
+}
+
+function createAddPageInitialForm(
+  currentPageCount: number,
+): AddPageDraftForm {
+  return {
+    mode: 'ai',
+    title:
+      `第 ${currentPageCount + 1} 页`,
+    purpose: '',
+    contentSummary: '',
+    richness: 3,
+    pasteHtml: '',
+  }
+}
+
+function parseAddPageDraftForm(
+  raw: string,
+  fallback: AddPageDraftForm,
+): AddPageDraftForm {
+  if (!raw.trim()) {
+    return {
+      ...fallback,
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(
+      raw,
+    ) as Partial<AddPageDraftForm>
+
+    const richness =
+      parsed.richness === 2
+      || parsed.richness === 5
+        ? parsed.richness
+        : 3
+
+    return {
+      mode:
+        parsed.mode === 'paste'
+          ? 'paste'
+          : 'ai',
+      title:
+        typeof parsed.title === 'string'
+          ? parsed.title
+          : fallback.title,
+      purpose:
+        typeof parsed.purpose === 'string'
+          ? parsed.purpose
+          : '',
+      contentSummary:
+        typeof parsed.contentSummary === 'string'
+          ? parsed.contentSummary
+          : '',
+      richness,
+      pasteHtml:
+        typeof parsed.pasteHtml === 'string'
+          ? parsed.pasteHtml
+          : '',
+    }
+  } catch {
+    return {
+      ...fallback,
+    }
+  }
+}
+
+export default function AddPageModal({ coursewareId, currentPageCount, onDone, onClose }: Props) {
+  const { user } = useAuth()
+
+  /**
+   * 每一个“待新增页码”使用独立草稿。
+   *
+   * 当前页创建成功并刷新列表后，currentPageCount增加，
+   * 下一次打开弹窗会自动进入新的草稿空间和新的默认标题。
+   */
+  const initialForm =
+    createAddPageInitialForm(
+      currentPageCount,
+    )
+
+  const formDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'courseware-add-page',
+    resourceId: [
+      coursewareId,
+      `next-page-${currentPageCount + 1}`,
+    ].join('|'),
+    field: 'form',
+    initialValue:
+      JSON.stringify(initialForm),
+    maxHistory: 6,
+    coalesceMs: 1200,
+  })
+
+  const form = parseAddPageDraftForm(
+    formDraft.value,
+    initialForm,
+  )
+
+  const {
+    mode,
+    title,
+    purpose,
+    contentSummary,
+    richness,
+    pasteHtml,
+  } = form
+
+  const updateFormJSON = (
+    patch: Partial<AddPageDraftForm>,
+  ) => {
+    formDraft.setValue(
+      previousText =>
+        JSON.stringify({
+          ...parseAddPageDraftForm(
+            previousText,
+            initialForm,
+          ),
+          ...patch,
+        }),
+    )
+  }
+
+  const setMode = (
+    value: 'ai' | 'paste',
+  ) => updateFormJSON({
+    mode: value,
+  })
+
+  const setTitle = (
+    value: string,
+  ) => updateFormJSON({
+    title: value,
+  })
+
+  const setPurpose = (
+    value: string,
+  ) => updateFormJSON({
+    purpose: value,
+  })
+
+  const setContentSummary = (
+    value: string,
+  ) => updateFormJSON({
+    contentSummary: value,
+  })
+
+  const setRichness = (
+    value: number,
+  ) => updateFormJSON({
+    richness: value,
+  })
+
+  const setPasteHtml = (
+    value: string,
+  ) => updateFormJSON({
+    pasteHtml: value,
+  })
 
   // 操作状态
   const [phase, setPhase] = useState<'form' | 'creating' | 'generating' | 'done' | 'error'>('form')
@@ -106,12 +265,18 @@ export default function AddPageModal({ coursewareId, currentPageCount, onDone, o
         await regenerateCWPage(coursewareId, pageNum)
         setPhase('done')
         // 短暂展示成功后自动关闭
-        setTimeout(() => onDone(pageNum), 800)
+        setTimeout(() => {
+          formDraft.clear()
+          onDone(pageNum)
+        }, 800)
       } catch {
         // 生成失败但页面已创建成功——仍然通知父级刷新，老师可以手动重生成
         setPhase('done')
         setErrorMsg('页面已创建，但 HTML 生成失败，可稍后在微调面板手动重新生成')
-        setTimeout(() => onDone(pageNum), 2000)
+        setTimeout(() => {
+          formDraft.clear()
+          onDone(pageNum)
+        }, 2000)
       }
     } catch (err: unknown) {
       setPhase('error')
@@ -157,14 +322,20 @@ export default function AddPageModal({ coursewareId, currentPageCount, onDone, o
       try {
         await importPageHtml(coursewareId, pageNum, pasteHtml)
         setPhase('done')
-        setTimeout(() => onDone(pageNum), 800)
+        setTimeout(() => {
+          formDraft.clear()
+          onDone(pageNum)
+        }, 800)
       } catch (err: unknown) {
         // 导入失败但页面已创建成功——仍然通知父级刷新，老师可在源码编辑里重试粘贴
         setPhase('done')
         setErrorMsg('页面已创建，但HTML导入失败：'
           + (err instanceof Error ? err.message : '未知错误')
           + '。可选中该页用「✏️ 编辑源码」重试粘贴')
-        setTimeout(() => onDone(pageNum), 2500)
+        setTimeout(() => {
+          formDraft.clear()
+          onDone(pageNum)
+        }, 2500)
       }
     } catch (err: unknown) {
       setPhase('error')
@@ -243,6 +414,9 @@ export default function AddPageModal({ coursewareId, currentPageCount, onDone, o
               <input
                 value={title}
                 onChange={e => setTitle(e.target.value)}
+                onKeyDown={e => {
+                  formDraft.handleKeyDown(e)
+                }}
                 placeholder="例如：实验操作步骤"
                 style={inputStyle}
                 autoFocus
@@ -260,6 +434,9 @@ export default function AddPageModal({ coursewareId, currentPageCount, onDone, o
                 <input
                   value={purpose}
                   onChange={e => setPurpose(e.target.value)}
+                  onKeyDown={e => {
+                    formDraft.handleKeyDown(e)
+                  }}
                   placeholder="例如：学生通过观察实验现象，理解光合作用原理"
                   style={inputStyle}
                 />
@@ -274,6 +451,9 @@ export default function AddPageModal({ coursewareId, currentPageCount, onDone, o
                 <textarea
                   value={contentSummary}
                   onChange={e => setContentSummary(e.target.value)}
+                  onKeyDown={e => {
+                    formDraft.handleKeyDown(e)
+                  }}
                   placeholder="例如：1. 实验材料准备 2. 操作步骤（先...再...然后...） 3. 注意事项"
                   rows={3}
                   style={textareaStyle}
@@ -323,6 +503,9 @@ export default function AddPageModal({ coursewareId, currentPageCount, onDone, o
                 <textarea
                   value={pasteHtml}
                   onChange={e => setPasteHtml(e.target.value)}
+                  onKeyDown={e => {
+                    formDraft.handleKeyDown(e)
+                  }}
                   placeholder={'把别人的完整页面HTML代码粘贴到这里…\n（例如从共享课件库「复制源码」得到的代码，或外部制作的 1920×1080 单页HTML）'}
                   rows={9}
                   spellCheck={false}
@@ -339,6 +522,21 @@ export default function AddPageModal({ coursewareId, currentPageCount, onDone, o
                 ③ 补注本课件当前背景，与整套课件视觉统一。外部HTML没有导航栏属正常现象。
               </div>
             </>}
+
+            <div
+              style={{
+                padding: '8px 10px',
+                borderRadius: 8,
+                background: '#F9FAFB',
+                color: '#6B7280',
+                fontSize: 11,
+                lineHeight: 1.6,
+              }}
+            >
+              表单和HTML已自动保存 ·
+              创建失败不会清除 ·
+              Ctrl/Command+Z恢复误删
+            </div>
 
             {/* 错误提示 */}
             {errorMsg && (

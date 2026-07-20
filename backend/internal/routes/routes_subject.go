@@ -1,13 +1,25 @@
 package routes
 
-// routes_subject.go — 学科字典路由注册（v231）
+// routes_subject.go — 学科字典与组织教育域基础数据路由
 //
-// 两组：
-//   公开只读（authMW，登录即可）：GET /api/v1/subjects — 前端各下拉统一消费。
-//   管理 CRUD（authMW + adminOnly）：/api/v1/admin/subjects 与 /api/v1/admin/subjects/{id}
-//     GET 列表(含停用) / POST 新建 / PUT 编辑 / DELETE 删除（内置学科禁删）。
+// 学科字典：
+//   GET /api/v1/subjects
+//       登录用户按自身教育域和教学组织读取课程目录；
 //
-// 风格对齐 routes_curriculum.go（公开只读）与 routes_kb.go 的 kbAdminMux（admin 按 path+method 分发）。
+//   GET/POST /api/v1/admin/subjects
+//   PUT/DELETE /api/v1/admin/subjects/{id}
+//       admin管理统一课程定义。
+//
+// 组织教育域：
+//   GET /api/v1/admin/organization-education-domains
+//       admin只读查看全部组织当前教育域；
+//
+//   PUT /api/v1/admin/organization-education-domains/{id}
+//       保留旧客户端兼容路由；
+//       仅超级管理员可以到达；
+//       对真实组织统一返回409 Conflict，不执行任何修改。
+//
+// 处理器和服务在本注册函数中自构造，保持routes.go主初始化零改动。
 
 import (
 	"net/http"
@@ -15,52 +27,120 @@ import (
 
 	"tedna/internal/handlers"
 	"tedna/internal/middleware"
+	"tedna/internal/services"
 )
 
-// registerSubjectRoutes 注册学科字典公开只读 + admin 管理路由
 func registerSubjectRoutes(
 	mux *http.ServeMux,
 	authMW func(http.Handler) http.Handler,
 	adminOnly func(http.Handler) http.Handler,
 	subjectHandler *handlers.SubjectHandler,
 ) {
-	// ==================== 公开只读（登录即可）====================
-	mux.Handle("/api/v1/subjects", middleware.Chain(
-		http.HandlerFunc(subjectHandler.ListPublic), authMW))
+	// ==================== 公开课程目录 ====================
 
-	// ==================== 管理 CRUD（admin only）====================
-	adminMux := middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimRight(r.URL.Path, "/")
+	mux.Handle(
+		"/api/v1/subjects",
+		middleware.Chain(
+			http.HandlerFunc(subjectHandler.ListPublic),
+			authMW,
+		),
+	)
 
-		// 带 {id} 的编辑/删除：/api/v1/admin/subjects/{id}
-		if strings.HasPrefix(path, "/api/v1/admin/subjects/") {
-			switch r.Method {
-			case http.MethodPut:
-				subjectHandler.Update(w, r)
-			case http.MethodDelete:
-				subjectHandler.Delete(w, r)
-			default:
-				http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+	// ==================== 统一课程定义管理 ====================
+
+	subjectAdminMux := middleware.Chain(
+		http.HandlerFunc(func(
+			w http.ResponseWriter,
+			r *http.Request,
+		) {
+			path := strings.TrimRight(r.URL.Path, "/")
+
+			if strings.HasPrefix(
+				path,
+				"/api/v1/admin/subjects/",
+			) {
+				switch r.Method {
+				case http.MethodPut:
+					subjectHandler.Update(w, r)
+				case http.MethodDelete:
+					subjectHandler.Delete(w, r)
+				default:
+					http.Error(
+						w,
+						`{"code":-1,"message":"Method not allowed"}`,
+						http.StatusMethodNotAllowed,
+					)
+				}
+				return
 			}
-			return
-		}
 
-		// 集合级：/api/v1/admin/subjects
-		if path == "/api/v1/admin/subjects" {
-			switch r.Method {
-			case http.MethodGet:
-				subjectHandler.ListAdmin(w, r)
-			case http.MethodPost:
-				subjectHandler.Create(w, r)
-			default:
-				http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+			if path == "/api/v1/admin/subjects" {
+				switch r.Method {
+				case http.MethodGet:
+					subjectHandler.ListAdmin(w, r)
+				case http.MethodPost:
+					subjectHandler.Create(w, r)
+				default:
+					http.Error(
+						w,
+						`{"code":-1,"message":"Method not allowed"}`,
+						http.StatusMethodNotAllowed,
+					)
+				}
+				return
 			}
-			return
-		}
 
-		http.Error(w, `{"code":-1,"message":"未找到路由"}`, http.StatusNotFound)
-	}), authMW, adminOnly)
+			http.Error(
+				w,
+				`{"code":-1,"message":"未找到路由"}`,
+				http.StatusNotFound,
+			)
+		}),
+		authMW,
+		adminOnly,
+	)
 
-	mux.Handle("/api/v1/admin/subjects", adminMux)
-	mux.Handle("/api/v1/admin/subjects/", adminMux)
+	mux.Handle(
+		"/api/v1/admin/subjects",
+		subjectAdminMux,
+	)
+	mux.Handle(
+		"/api/v1/admin/subjects/",
+		subjectAdminMux,
+	)
+
+	// ==================== 组织教育域只读管理 ====================
+
+	educationDomainService :=
+		services.NewOrganizationEducationDomainService()
+
+	educationDomainHandler :=
+		handlers.NewOrganizationEducationDomainHandler(
+			educationDomainService,
+		)
+
+	// 查看：所有admin均可读取。
+	mux.Handle(
+		"/api/v1/admin/organization-education-domains",
+		middleware.Chain(
+			http.HandlerFunc(educationDomainHandler.List),
+			authMW,
+			adminOnly,
+		),
+	)
+
+	// 旧修改路由：超级管理员可到达，但Handler固定返回409。
+	//
+	// 继续保留权限墙，避免普通admin利用错误响应探测随机组织ID。
+	superAdminOnly := middleware.SuperAdminOnly()
+
+	mux.Handle(
+		"/api/v1/admin/organization-education-domains/",
+		middleware.Chain(
+			http.HandlerFunc(educationDomainHandler.Update),
+			authMW,
+			adminOnly,
+			superAdminOnly,
+		),
+	)
 }

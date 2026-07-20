@@ -7,6 +7,14 @@ package services
 // v231新增：教材照片归档维度扩展
 //   - UploadTextbookPage 落库时带 Semester(学期) + Unit(单元) 两字段
 //   - ListTextbookPages 签名新增 semester/unit 两个筛选参数并透传给 repository
+//
+// 上下文15新增：K12课本模块统一教育域闸门
+//   - 每次请求实时读取用户角色和确定性教育域，不信任JWT历史教育域或前端参数
+//   - K12正常查询与操作
+//   - vocational/adult/mixed/common/空值/非法值列表返回成功空数组
+//   - 非K12详情与写操作明确返回403
+//   - 教育域解析的数据库错误继续上抛为5xx，不能伪装为空列表
+//   - OCR为同步执行，无独立任务或Worker，因此本上下文不新增数据库字段
 
 import (
 	"context"
@@ -34,6 +42,7 @@ var (
 	ErrTextbookUnauthorized = errors.New("无权操作此课本页面")
 	ErrTextbookFileInvalid  = errors.New("文件格式无效，仅支持JPG/PNG/WEBP图片")
 	ErrTextbookFileTooLarge = errors.New("文件过大，最大支持10MB")
+	ErrTextbookK12Only      = errors.New("当前教育域不支持课本能力")
 )
 
 // ==================== 常量 ====================
@@ -42,7 +51,7 @@ const (
 	// MaxTextbookFileSize 最大文件大小10MB
 	MaxTextbookFileSize = 10 * 1024 * 1024
 	// TextbookUploadDir 上传目录
-	TextbookUploadDir = "/www/wwwroot/tedna/uploads/textbooks"
+	TextbookUploadDir = "/www/wwwroot/tedna/private/textbooks"
 )
 
 // 允许的MIME类型
@@ -68,6 +77,14 @@ type TextbookService struct {
 	cfg *config.Config
 }
 
+// textbookActorEducationContext 是课本模块运行时使用的最小教育域上下文。
+//
+// DomainConflict单独保留，防止“解析结果碰巧为k12但实际同时属于多个具体教育域”被误放行。
+type textbookActorEducationContext struct {
+	Domain         string
+	DomainConflict bool
+}
+
 var tbLog = logger.WithModule("textbook")
 
 // NewTextbookService 创建课本服务实例
@@ -75,13 +92,97 @@ func NewTextbookService(cfg *config.Config) *TextbookService {
 	return &TextbookService{cfg: cfg}
 }
 
+// ==================== K12教育域统一解析 ====================
+
+// resolveTextbookActorEducationContext 实时解析当前用户的确定性教育域。
+//
+// 解析顺序：
+//  1. 从users表实时读取角色，避免JWT中的历史角色造成授权漂移；
+//  2. 使用统一ResolveUserEducationContext解析任命、校籍和教研组关系；
+//  3. 原样保留DomainConflict，由调用方fail-closed处理；
+//  4. 不使用NormalizeEducationDomain，避免空值或非法值静默回退K12。
+func resolveTextbookActorEducationContext(ctx context.Context, callerID string) (*textbookActorEducationContext, error) {
+	if strings.TrimSpace(callerID) == "" {
+		return nil, ErrTextbookUnauthorized
+	}
+
+	user, err := repository.FindUserByID(ctx, callerID)
+	if err != nil {
+		return nil, fmt.Errorf("读取课本操作者实时角色失败: %w", err)
+	}
+
+	educationContext, err := repository.ResolveUserEducationContext(ctx, callerID, user.Role)
+	if err != nil {
+		return nil, fmt.Errorf("解析课本操作者教育域失败: %w", err)
+	}
+	if educationContext == nil {
+		return nil, errors.New("解析课本操作者教育域失败: 返回空上下文")
+	}
+
+	return &textbookActorEducationContext{
+		Domain:         strings.ToLower(strings.TrimSpace(educationContext.EducationDomain)),
+		DomainConflict: educationContext.DomainConflict,
+	}, nil
+}
+
+// textbookActorCanUseK12Module 判断当前实时教育域是否可以进入K12课本模块。
+func textbookActorCanUseK12Module(actorContext *textbookActorEducationContext) bool {
+	return actorContext != nil &&
+		!actorContext.DomainConflict &&
+		actorContext.Domain == models.EducationDomainK12
+}
+
+// AuthorizeK12TextbookWrite 为Handler在解析multipart大文件前提供前置权限检查。
+//
+// Service内的正式写方法仍会再次执行同一检查，前置检查只用于尽早拒绝无权请求，
+// 不能替代业务层最终授权。
+func (s *TextbookService) AuthorizeK12TextbookWrite(ctx context.Context, callerID string) error {
+	actorContext, err := resolveTextbookActorEducationContext(ctx, callerID)
+	if err != nil {
+		return err
+	}
+	if !textbookActorCanUseK12Module(actorContext) {
+		return ErrTextbookK12Only
+	}
+	return nil
+}
+
+// resolveK12TextbookWriteDomain 返回经过严格验证的K12教育域，供Repository显式域参数使用。
+func resolveK12TextbookWriteDomain(ctx context.Context, callerID string) (string, error) {
+	actorContext, err := resolveTextbookActorEducationContext(ctx, callerID)
+	if err != nil {
+		return "", err
+	}
+	if !textbookActorCanUseK12Module(actorContext) {
+		return "", ErrTextbookK12Only
+	}
+	return models.EducationDomainK12, nil
+}
+
+// mapTextbookRepositoryError 把Repository教育域防线错误映射为Service统一错误。
+func mapTextbookRepositoryError(err error) error {
+	if errors.Is(err, repository.ErrTextbookEducationDomainUnsupported) {
+		return ErrTextbookK12Only
+	}
+	if errors.Is(err, repository.ErrTextbookNotFound) {
+		return ErrTextbookNotFound
+	}
+	return err
+}
+
 // ==================== 上传图片 ====================
 
 // UploadTextbookPage 上传课本页面图片
-// 1. 校验文件格式和大小
-// 2. 保存到本地目录
-// 3. 写入数据库记录
+//  1. 严格校验调用方必须为K12
+//  2. 校验文件格式和大小
+//  3. 保存到本地目录
+//  4. 写入数据库记录
 func (s *TextbookService) UploadTextbookPage(ctx context.Context, file multipart.File, header *multipart.FileHeader, req *models.UploadTextbookRequest, callerID string) (*models.TextbookPage, error) {
+	educationDomain, err := resolveK12TextbookWriteDomain(ctx, callerID)
+	if err != nil {
+		return nil, err
+	}
+
 	// 校验必填字段
 	if strings.TrimSpace(req.Subject) == "" {
 		return nil, errors.New("学科不能为空")
@@ -143,7 +244,7 @@ func (s *TextbookService) UploadTextbookPage(ctx context.Context, file multipart
 
 	written, err := io.Copy(dst, file)
 	if err != nil {
-		os.Remove(fullPath) // 清理失败文件
+		_ = os.Remove(fullPath) // 清理失败文件
 		return nil, fmt.Errorf("保存文件失败: %w", err)
 	}
 
@@ -180,9 +281,9 @@ func (s *TextbookService) UploadTextbookPage(ctx context.Context, file multipart
 		UploadedBy:   callerID,
 	}
 
-	if err := repository.CreateTextbookPage(ctx, page); err != nil {
-		os.Remove(fullPath) // 数据库写入失败时清理文件
-		return nil, err
+	if err := repository.CreateTextbookPageForEducationDomain(ctx, page, educationDomain); err != nil {
+		_ = os.Remove(fullPath) // 数据库写入失败时清理文件
+		return nil, mapTextbookRepositoryError(err)
 	}
 
 	tbLog.Info("课本图片上传成功",
@@ -193,20 +294,25 @@ func (s *TextbookService) UploadTextbookPage(ctx context.Context, file multipart
 		"file", header.Filename,
 		"size", written,
 		"uploader", callerID,
+		"education_domain", educationDomain,
 	)
 	return page, nil
 }
 
 // ==================== 查询 ====================
 
-// GetTextbookPage 获取课本页面详情
-func (s *TextbookService) GetTextbookPage(ctx context.Context, id string) (*models.TextbookDetailResponse, error) {
-	page, err := repository.GetTextbookPageByID(ctx, id)
+// GetTextbookPage 获取课本页面详情。
+//
+// 直接ID访问同样执行K12教育域校验，非K12不能通过猜测ID读取课本详情。
+func (s *TextbookService) GetTextbookPage(ctx context.Context, id string, callerID string) (*models.TextbookDetailResponse, error) {
+	educationDomain, err := resolveK12TextbookWriteDomain(ctx, callerID)
 	if err != nil {
-		if errors.Is(err, repository.ErrTextbookNotFound) {
-			return nil, ErrTextbookNotFound
-		}
 		return nil, err
+	}
+
+	page, err := repository.GetTextbookPageByIDForEducationDomain(ctx, id, educationDomain)
+	if err != nil {
+		return nil, mapTextbookRepositoryError(err)
 	}
 
 	// 查询上传者名称
@@ -218,53 +324,278 @@ func (s *TextbookService) GetTextbookPage(ctx context.Context, id string) (*mode
 	return &models.TextbookDetailResponse{
 		TextbookPage: *page,
 		UploaderName: uploaderName,
-		ImageURL:     "/uploads/textbooks/" + page.FilePath,
+		ImageURL:     "/api/v1/lesson-plans/textbooks/" + page.ID + "/image",
 		HasOCR:       page.OCRText != "",
 	}, nil
 }
 
+// OpenTextbookImage 为课本图片鉴权端点打开正式图片文件。
+//
+// 安全规则：
+//   - 实时用户教育域必须仍然是确定性K12；
+//   - 课本记录必须存在并且为active；
+//   - 只接受数据库保存的相对路径；
+//   - 清理路径后必须仍位于TextbookUploadDir私有目录内；
+//   - 解析符号链接后的真实路径也必须位于私有目录内；
+//   - 只返回普通文件，不返回目录或其它特殊文件。
+//
+// 返回的文件由Handler负责关闭。
+func (s *TextbookService) OpenTextbookImage(
+	ctx context.Context,
+	id string,
+	callerID string,
+) (*os.File, os.FileInfo, string, error) {
+	educationDomain, err :=
+		resolveK12TextbookWriteDomain(
+			ctx,
+			callerID,
+		)
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	page, err :=
+		repository.GetTextbookPageByIDForEducationDomain(
+			ctx,
+			id,
+			educationDomain,
+		)
+	if err != nil {
+		return nil, nil, "",
+			mapTextbookRepositoryError(err)
+	}
+
+	relativePath := filepath.Clean(
+		strings.TrimSpace(page.FilePath),
+	)
+
+	separator := string(os.PathSeparator)
+
+	if relativePath == "" ||
+		relativePath == "." ||
+		relativePath == ".." ||
+		filepath.IsAbs(relativePath) ||
+		strings.HasPrefix(
+			relativePath,
+			".."+separator,
+		) {
+		return nil, nil, "",
+			ErrTextbookNotFound
+	}
+
+	basePath, err :=
+		filepath.Abs(TextbookUploadDir)
+	if err != nil {
+		return nil, nil, "",
+			fmt.Errorf(
+				"解析课本私有目录失败: %w",
+				err,
+			)
+	}
+
+	fullPath, err :=
+		filepath.Abs(
+			filepath.Join(
+				basePath,
+				relativePath,
+			),
+		)
+	if err != nil {
+		return nil, nil, "",
+			fmt.Errorf(
+				"解析课本图片路径失败: %w",
+				err,
+			)
+	}
+
+	if fullPath == basePath ||
+		!strings.HasPrefix(
+			fullPath,
+			basePath+separator,
+		) {
+		return nil, nil, "",
+			ErrTextbookNotFound
+	}
+
+	// 再解析真实符号链接路径，防止目录内恶意链接指向私有目录外。
+	resolvedBase, err :=
+		filepath.EvalSymlinks(basePath)
+	if err != nil {
+		return nil, nil, "",
+			fmt.Errorf(
+				"解析课本私有目录真实路径失败: %w",
+				err,
+			)
+	}
+
+	resolvedPath, err :=
+		filepath.EvalSymlinks(fullPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, "",
+				ErrTextbookNotFound
+		}
+
+		return nil, nil, "",
+			fmt.Errorf(
+				"解析课本图片真实路径失败: %w",
+				err,
+			)
+	}
+
+	if resolvedPath == resolvedBase ||
+		!strings.HasPrefix(
+			resolvedPath,
+			resolvedBase+separator,
+		) {
+		return nil, nil, "",
+			ErrTextbookNotFound
+	}
+
+	file, err := os.Open(resolvedPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, "",
+				ErrTextbookNotFound
+		}
+
+		return nil, nil, "",
+			fmt.Errorf(
+				"打开课本图片失败: %w",
+				err,
+			)
+	}
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+
+		return nil, nil, "",
+			fmt.Errorf(
+				"读取课本图片信息失败: %w",
+				err,
+			)
+	}
+
+	if !fileInfo.Mode().IsRegular() {
+		_ = file.Close()
+
+		return nil, nil, "",
+			ErrTextbookNotFound
+	}
+
+	mimeType := strings.ToLower(
+		strings.TrimSpace(page.MimeType),
+	)
+
+	if !allowedMimeTypes[mimeType] {
+		_ = file.Close()
+
+		return nil, nil, "",
+			ErrTextbookFileInvalid
+	}
+
+	return file,
+		fileInfo,
+		mimeType,
+		nil
+}
+
 // ListTextbookPages 查询课本页面列表
 // v231：新增 semester(学期) + unit(单元) 两个筛选参数，透传给 repository
+//
+// 非K12、mixed、common、空值、非法域或教育域冲突返回成功空数组；
+// 只有数据库解析错误或K12真实查询错误才返回error。
 func (s *TextbookService) ListTextbookPages(ctx context.Context, callerID string, subject string, gradeRange string, semester string, unit string, textbookName string, scope string, limit int, offset int) (*models.TextbookListResponse, error) {
-	items, total, err := repository.ListTextbookPages(ctx, callerID, subject, gradeRange, semester, unit, textbookName, scope, limit, offset)
+	actorContext, err := resolveTextbookActorEducationContext(ctx, callerID)
 	if err != nil {
 		return nil, err
 	}
+	if !textbookActorCanUseK12Module(actorContext) {
+		return &models.TextbookListResponse{
+			Pages: []*models.TextbookListItem{},
+			Total: 0,
+		}, nil
+	}
+
+	items, total, err := repository.ListTextbookPagesForEducationDomain(
+		ctx,
+		callerID,
+		actorContext.Domain,
+		subject,
+		gradeRange,
+		semester,
+		unit,
+		textbookName,
+		scope,
+		limit,
+		offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	// 上下文15：列表图片URL统一改为鉴权端点。
+	//
+	// 前端不能再依赖公开/uploads目录读取原文件；
+	// 实际图片内容必须通过携带登录凭证的API Blob请求获得。
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+
+		item.ImageURL =
+			"/api/v1/lesson-plans/textbooks/" +
+				item.ID +
+				"/image"
+	}
+
 	return &models.TextbookListResponse{Pages: items, Total: total}, nil
 }
 
 // ==================== 更新 ====================
 
-// UpdateTextbookPage 更新课本页面元数据（需验证所有权）
+// UpdateTextbookPage 更新课本页面元数据（需验证K12教育域与所有权）
 func (s *TextbookService) UpdateTextbookPage(ctx context.Context, id string, req *models.UpdateTextbookRequest, callerID string) error {
-	page, err := repository.GetTextbookPageByID(ctx, id)
+	educationDomain, err := resolveK12TextbookWriteDomain(ctx, callerID)
 	if err != nil {
-		if errors.Is(err, repository.ErrTextbookNotFound) {
-			return ErrTextbookNotFound
-		}
 		return err
+	}
+
+	page, err := repository.GetTextbookPageByIDForEducationDomain(ctx, id, educationDomain)
+	if err != nil {
+		return mapTextbookRepositoryError(err)
 	}
 	if page.UploadedBy != callerID {
 		return ErrTextbookUnauthorized
 	}
-	return repository.UpdateTextbookPage(ctx, id, req)
+
+	if err := repository.UpdateTextbookPageForEducationDomain(ctx, id, req, educationDomain); err != nil {
+		return mapTextbookRepositoryError(err)
+	}
+	return nil
 }
 
 // ==================== 删除 ====================
 
-// DeleteTextbookPage 删除课本页面（软删除，需验证所有权）
+// DeleteTextbookPage 删除课本页面（软删除，需验证K12教育域与所有权）
 func (s *TextbookService) DeleteTextbookPage(ctx context.Context, id string, callerID string) error {
-	page, err := repository.GetTextbookPageByID(ctx, id)
+	educationDomain, err := resolveK12TextbookWriteDomain(ctx, callerID)
 	if err != nil {
-		if errors.Is(err, repository.ErrTextbookNotFound) {
-			return ErrTextbookNotFound
-		}
 		return err
+	}
+
+	page, err := repository.GetTextbookPageByIDForEducationDomain(ctx, id, educationDomain)
+	if err != nil {
+		return mapTextbookRepositoryError(err)
 	}
 	if page.UploadedBy != callerID {
 		return ErrTextbookUnauthorized
 	}
-	return repository.DeleteTextbookPage(ctx, id)
+
+	if err := repository.DeleteTextbookPageForEducationDomain(ctx, id, educationDomain); err != nil {
+		return mapTextbookRepositoryError(err)
+	}
+	return nil
 }
 
 // ==================== OCR识别（调用AI Vision）====================
@@ -281,12 +612,14 @@ func (s *TextbookService) DeleteTextbookPage(ctx context.Context, id string, cal
 //
 // 表格仍用Markdown表格(前端renderMarkdown支持/将支持，不冲突)。
 func (s *TextbookService) RecognizeTextbookPage(ctx context.Context, id string, callerID string) (string, error) {
-	page, err := repository.GetTextbookPageByID(ctx, id)
+	educationDomain, err := resolveK12TextbookWriteDomain(ctx, callerID)
 	if err != nil {
-		if errors.Is(err, repository.ErrTextbookNotFound) {
-			return "", ErrTextbookNotFound
-		}
 		return "", err
+	}
+
+	page, err := repository.GetTextbookPageByIDForEducationDomain(ctx, id, educationDomain)
+	if err != nil {
+		return "", mapTextbookRepositoryError(err)
 	}
 
 	// 读取图片文件
@@ -335,12 +668,72 @@ func (s *TextbookService) RecognizeTextbookPage(ctx context.Context, id string, 
 		return "", fmt.Errorf("AI识别失败: %w", err)
 	}
 
-	// 回填OCR结果到数据库
-	if err := repository.UpdateTextbookOCR(ctx, id, result.Content, result.ModelUsed); err != nil {
-		tbLog.Warn("OCR结果回填失败", "id", id, "error", err)
+	// OCR执行完成后再次解析当前用户教育域。
+	//
+	// AI调用可能持续数秒，期间用户的组织任命、角色或教育域可能发生变化；
+	// 因此不能继续沿用执行前取得的educationDomain。
+	// 只有执行结束时仍然是确定性K12用户，才允许回填识别结果。
+	executionDomain, err :=
+		resolveK12TextbookWriteDomain(
+			ctx,
+			callerID,
+		)
+	if err != nil {
+		return "", err
 	}
 
-	tbLog.Info("课本OCR识别完成", "id", id, "model", result.ModelUsed, "text_len", len(result.Content))
+	// 执行时重新读取课本正式记录。
+	//
+	// Repository的K12专用详情读取只允许active记录；
+	// 页面若在AI执行期间被归档、删除或替换文件，识别结果不得写入。
+	freshPage, err :=
+		repository.GetTextbookPageByIDForEducationDomain(
+			ctx,
+			id,
+			executionDomain,
+		)
+	if err != nil {
+		return "",
+			mapTextbookRepositoryError(err)
+	}
+
+	if freshPage == nil ||
+		strings.TrimSpace(freshPage.Status) != "active" ||
+		strings.TrimSpace(freshPage.FilePath) == "" ||
+		filepath.Clean(freshPage.FilePath) !=
+			filepath.Clean(page.FilePath) {
+		return "", ErrTextbookNotFound
+	}
+
+	// OCR为同步链路：
+	// HTTP请求成功返回前必须确认数据库回填成功。
+	//
+	// 数据库错误不能只记录Warn后继续返回识别成功，
+	// 否则前端会显示“识别完成”，实际下一轮AI却读取不到OCR原文。
+	if err :=
+		repository.UpdateTextbookOCRForEducationDomain(
+			ctx,
+			id,
+			result.Content,
+			result.ModelUsed,
+			executionDomain,
+		); err != nil {
+		return "", fmt.Errorf(
+			"OCR结果回填失败: %w",
+			mapTextbookRepositoryError(err),
+		)
+	}
+
+	// 后续完成日志使用执行时重新确认的正式教育域。
+	educationDomain = executionDomain
+
+	tbLog.Info(
+		"课本OCR识别完成",
+		"id", id,
+		"model", result.ModelUsed,
+		"text_len", len(result.Content),
+		"education_domain", educationDomain,
+	)
 	return result.Content, nil
 }
 
@@ -349,6 +742,9 @@ func (s *TextbookService) RecognizeTextbookPage(ctx context.Context, id string, 
 // BuildTextbookContext 从课本图片ID列表构建AI上下文文本
 // 有OCR缓存的直接用文字，没有的标记"未识别"
 // 返回格式化的课本内容文本，可直接拼入系统提示词
+//
+// 注意：本函数的运行时教案教育域复核将在上下文15后端第二批接入，
+// 当前第一批先完成HTTP入口与挂载写入硬闸，避免一次修改超过5个文件。
 func (s *TextbookService) BuildTextbookContext(ctx context.Context, pageIDs []string) string {
 	if len(pageIDs) == 0 {
 		return ""

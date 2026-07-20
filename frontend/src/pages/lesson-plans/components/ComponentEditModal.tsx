@@ -8,8 +8,8 @@
  *   - 学科/年级/注入模式/可见范围选择
  *   - 创建模式和编辑模式（通过componentId区分）
  */
-import { useState, useEffect, useCallback } from 'react'
-import { DEFAULT_SUBJECTS } from '@/constants/subjects'
+import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useSubjects } from '@/hooks/useSubjects'
 import {
   getComponent, createComponent, updateComponent,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -57,7 +57,6 @@ const SCOPE_OPTIONS: { value: string; label: string }[] = [
   { value: 'personal', label: '个人' },
 ]
 
-const SUBJECTS = ['general', ...DEFAULT_SUBJECTS]  // 单一真相源（方案甲，v231）
 const GRADES = ['','七年级','八年级','九年级','高一','高二','高三','小学低段','小学中段','小学高段']
 
 /** 预置风格标签（迭代4B标签体系） */
@@ -104,6 +103,16 @@ interface ComponentEditModalProps {
 export default function ComponentEditModal({ componentId, presetLibraryType, onClose, onSaved }: ComponentEditModalProps) {
   const isEdit = !!componentId
 
+  /**
+   * 当前用户教育域和教学组织下的课程目录。
+   * “general”是组件库自身的通用条件，不属于正式课程目录。
+   */
+  const {
+    subjects,
+    loading: subjectsLoading,
+    empty: subjectsEmpty,
+  } = useSubjects()
+
   // ---- 表单状态 ----
   const [libraryType, setLibraryType] = useState<LibraryType>(presetLibraryType || 'activity_design')
   const [subject, setSubject] = useState('general')
@@ -117,6 +126,39 @@ export default function ComponentEditModal({ componentId, presetLibraryType, onC
   const [tagInput, setTagInput] = useState('')
   const [tags, setTags] = useState<string[]>([])
 
+  /**
+   * 新建组件可选“通用”或当前教育域课程。
+   *
+   * 编辑存量组件时，如果原课程已不在当前目录中，
+   * 仍把原值临时放进下拉，避免打开弹窗就静默改写历史数据。
+   */
+  const subjectOptions = useMemo(() => {
+    const current = [
+      'general',
+      ...subjects,
+    ]
+
+    if (
+      subject &&
+      !current.includes(subject)
+    ) {
+      return [
+        ...current,
+        subject,
+      ]
+    }
+
+    return current
+  }, [
+    subjects,
+    subject,
+  ])
+
+  const legacySubject =
+    subject !== 'general' &&
+    Boolean(subject) &&
+    !subjects.includes(subject)
+
   // ---- 页面状态 ----
   const [loading, setLoading] = useState(isEdit)
   const [saving, setSaving] = useState(false)
@@ -125,6 +167,33 @@ export default function ComponentEditModal({ componentId, presetLibraryType, onC
   const showToast = (msg: string, type: 'success' | 'error' = 'success') => {
     setToast({ msg, type }); setTimeout(() => setToast(null), 3000)
   }
+
+  /**
+   * 新建模式不允许恢复其它教育域的旧课程值。
+   * 当前目录加载完成后，非法值统一回到“通用”。
+   *
+   * 编辑模式不自动覆盖原课程，由老师主动决定是否调整。
+   */
+  useEffect(() => {
+    if (
+      subjectsLoading ||
+      isEdit
+    ) {
+      return
+    }
+
+    if (
+      subject !== 'general' &&
+      !subjects.includes(subject)
+    ) {
+      setSubject('general')
+    }
+  }, [
+    subjectsLoading,
+    isEdit,
+    subjects,
+    subject,
+  ])
 
   // ---- 编辑模式：加载组件数据 ----
   useEffect(() => {
@@ -265,9 +334,61 @@ export default function ComponentEditModal({ componentId, presetLibraryType, onC
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: '12px', marginBottom: '20px' }}>
                 <div>
                   <label style={labelStyle}>学科</label>
-                  <select value={subject} onChange={e => setSubject(e.target.value)} style={selectStyle}>
-                    {SUBJECTS.map(s => <option key={s} value={s}>{s === 'general' ? '通用' : s}</option>)}
+                  <select
+                    value={subject}
+                    disabled={subjectsLoading}
+                    onChange={event =>
+                      setSubject(event.target.value)
+                    }
+                    style={selectStyle}
+                  >
+                    {subjectOptions.map(option => (
+                      <option
+                        key={option}
+                        value={option}
+                      >
+                        {option === 'general'
+                          ? '通用'
+                          : option}
+                      </option>
+                    ))}
                   </select>
+
+                  {subjectsLoading && (
+                    <div style={{
+                      marginTop: '5px',
+                      fontSize: '11px',
+                      color: C.textMuted,
+                    }}>
+                      正在加载当前组织课程...
+                    </div>
+                  )}
+
+                  {subjectsEmpty &&
+                   !subjectsLoading && (
+                    <div style={{
+                      marginTop: '5px',
+                      fontSize: '11px',
+                      color: C.textMuted,
+                      lineHeight: 1.5,
+                    }}>
+                      当前组织未配置专属课程，
+                      仍可创建通用组件。
+                    </div>
+                  )}
+
+                  {legacySubject &&
+                   !subjectsLoading && (
+                    <div style={{
+                      marginTop: '5px',
+                      fontSize: '11px',
+                      color: '#92400E',
+                      lineHeight: 1.5,
+                    }}>
+                      原课程“{subject}”不在当前目录中。
+                      当前编辑可暂时保留；改选后将使用当前教育域课程。
+                    </div>
+                  )}
                 </div>
                 <div>
                   <label style={labelStyle}>年级</label>

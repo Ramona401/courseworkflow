@@ -48,51 +48,53 @@ import (
 // Courseware 课件主记录（对应 coursewares 表）
 // 状态机: draft → indexing → styling → generating → preview → confirmed → in_pipeline
 type Courseware struct {
-	ID              string     `json:"id"`
-	LessonPlanID    *string    `json:"lesson_plan_id"`    // v0.42: 改为可空指针，支持非教案来源
-	UserID          string     `json:"user_id"`
-	Title           string     `json:"title"`
-	Subject         string     `json:"subject"`
-	Grade           string     `json:"grade"`
-	Status          string     `json:"status"`
-	StyleConfig     string     `json:"style_config"`
-	PageCount       int        `json:"page_count"`
-	IndexOverview   string     `json:"index_overview"`
-	LogoURL         string     `json:"logo_url"`
-	OrgName         string     `json:"org_name"`
-	NavTemplateHTML string     `json:"nav_template_html"`
-	PipelineID      *string    `json:"pipeline_id"`
-	SourceType      string     `json:"source_type"`       // v0.42: 来源类型(lesson_plan/ppt_upload/topic_direct/html_import)
-	SourceFilePath  string     `json:"source_file_path"`  // v0.42: PPT/文档上传时的文件路径
-	EduModuleID     string     `json:"edu_module_id"`     // v0.43预留: edu平台模块ID
-	PublishedVersion int       `json:"published_version"` // v0.43预留: 发布版本号
+	ID           string  `json:"id"`
+	LessonPlanID *string `json:"lesson_plan_id"` // v0.42: 改为可空指针，支持非教案来源
+	UserID       string  `json:"user_id"`
+	Title        string  `json:"title"`
+	Subject      string  `json:"subject"`
+	Grade        string  `json:"grade"`
+	// EducationDomain 课件创建时确定的资源教育域快照，创建后不随用户换校或组织变化。
+	EducationDomain  string  `json:"education_domain"`
+	Status           string  `json:"status"`
+	StyleConfig      string  `json:"style_config"`
+	PageCount        int     `json:"page_count"`
+	IndexOverview    string  `json:"index_overview"`
+	LogoURL          string  `json:"logo_url"`
+	OrgName          string  `json:"org_name"`
+	NavTemplateHTML  string  `json:"nav_template_html"`
+	PipelineID       *string `json:"pipeline_id"`
+	SourceType       string  `json:"source_type"`       // v0.42: 来源类型(lesson_plan/ppt_upload/topic_direct/html_import)
+	SourceFilePath   string  `json:"source_file_path"`  // v0.42: PPT/文档上传时的文件路径
+	EduModuleID      string  `json:"edu_module_id"`     // v0.43预留: edu平台模块ID
+	PublishedVersion int     `json:"published_version"` // v0.43预留: 发布版本号
 	// ---- 风格锚点字段（VAOCI 课程级风格一致性，轮1新增）----
 	// StyleAnchorAssetID 风格锚点对应的图片资产ID(指向 courseware_assets.id)；nil=未设锚点
 	StyleAnchorAssetID *string `json:"style_anchor_asset_id"`
 	// StyleAnchorVAOCI 锚点图的 VAOCI 索引文本(多模态AI读图提取结果)；空=未设锚点
-	StyleAnchorVAOCI   string  `json:"style_anchor_vaoci"`
+	StyleAnchorVAOCI string `json:"style_anchor_vaoci"`
 	// KPCodes 课程知识库轮新增：从主题创建时勾选的课标知识点编码数组的JSON文本
 	// 对应 coursewares.kp_codes(jsonb) 列；空串=未勾选。生成索引时读出注入难度适配约束。
-	KPCodes         string     `json:"kp_codes"`
+	KPCodes string `json:"kp_codes"`
 	// ---- 阶段1：发布/审核维度字段（与 status 生产状态机正交，绝不混用）----
 	// PublishState 发布态：private/published_personal/submitted/approved/published_shared/revision
 	//   对应 coursewares.publish_state 列，默认 private（私有）。详见 CWPublish* 常量。
-	PublishState   string  `json:"publish_state"`
+	PublishState string `json:"publish_state"`
 	// ReviewLevel 审核层级进度：0未提交 / 1=L1教研组通过 / 2=L2学校通过
 	//   对应 coursewares.review_level 列，默认 0。
-	ReviewLevel    int     `json:"review_level"`
+	ReviewLevel int `json:"review_level"`
 	// ReviewSchoolID 提交审核时反查的作者所属学校ID（供 L2 学校审核按校过滤）
 	//   对应 coursewares.review_school_id 列，可空指针；nil=未提交审核。
 	ReviewSchoolID *string `json:"review_school_id"`
 	// CodeShareScope 源代码开放范围（产权保护，独立于"课件可见范围"）：
 	//   none/group/school/region/public，对应 coursewares.code_share_scope 列，默认 none。详见 CWCodeShare* 常量。
-	CodeShareScope string  `json:"code_share_scope"`
+	CodeShareScope string `json:"code_share_scope"`
 	// ---- 阶段4：集体备课维度字段（与 status/publish_state 正交）----
 	// CollabState 集体备课态：idle（非集体备课，仅作者可微调）/ in_session（集体备课进行中，参与者也获共享微调权）
 	//   对应 coursewares.collab_state 列，默认 idle。详见 CWCollab* 常量。
-	CollabState    string  `json:"collab_state"`
-	CreatedAt       *time.Time `json:"created_at"`
-	UpdatedAt       *time.Time `json:"updated_at"`
+	CollabState string     `json:"collab_state"`
+	CreatedAt   *time.Time `json:"created_at"`
+	UpdatedAt   *time.Time `json:"updated_at"`
 }
 
 // ==================== 课件页面模型 ====================
@@ -100,22 +102,22 @@ type Courseware struct {
 // CoursewarePage 课件单页（对应 courseware_pages 表）
 // 两层架构：层1技术索引(admin可见) + 层2用户方案(翻译后展示)
 type CoursewarePage struct {
-	ID                  string     `json:"id"`
-	CoursewareID        string     `json:"courseware_id"`
-	PageNumber          int        `json:"page_number"`
+	ID           string `json:"id"`
+	CoursewareID string `json:"courseware_id"`
+	PageNumber   int    `json:"page_number"`
 	// ---- 层2：用户友好方案字段 ----
-	Title               string     `json:"title"`
-	Purpose             string     `json:"purpose"`
-	ContentSummary      string     `json:"content_summary"`
-	InteractionType     string     `json:"interaction_type"`
-	VisualFormat        string     `json:"visual_format"`
-	MediaRequirements   string     `json:"media_requirements"`
-	EstimatedComplexity int        `json:"estimated_complexity"`
+	Title               string `json:"title"`
+	Purpose             string `json:"purpose"`
+	ContentSummary      string `json:"content_summary"`
+	InteractionType     string `json:"interaction_type"`
+	VisualFormat        string `json:"visual_format"`
+	MediaRequirements   string `json:"media_requirements"`
+	EstimatedComplexity int    `json:"estimated_complexity"`
 	// ---- 层1：AOCI技术索引 ----
-	PageIndex           string     `json:"page_index"`
-	IdxCognitiveLevel   int        `json:"idx_cognitive_level"`
-	IdxInteractionLevel int        `json:"idx_interaction_level"`
-	IdxVisualFormat     string     `json:"idx_visual_format"`
+	PageIndex           string `json:"page_index"`
+	IdxCognitiveLevel   int    `json:"idx_cognitive_level"`
+	IdxInteractionLevel int    `json:"idx_interaction_level"`
+	IdxVisualFormat     string `json:"idx_visual_format"`
 	// ---- 生成相关字段 ----
 	HTMLContent         string     `json:"html_content"`
 	PlaceholderMap      string     `json:"placeholder_map"`
@@ -129,24 +131,24 @@ type CoursewarePage struct {
 
 // CoursewareAsset 课件多媒体资源（对应 courseware_assets 表）
 type CoursewareAsset struct {
-	ID               string     `json:"id"`
-	CoursewareID     string     `json:"courseware_id"`
-	PageID           *string    `json:"page_id"`
-	PlaceholderID    string     `json:"placeholder_id"`
-	AssetType        string     `json:"asset_type"`
-	GenerationPrompt string     `json:"generation_prompt"`
-	OssURL           string     `json:"oss_url"`
-	PublicOSSURL     string     `json:"public_oss_url"`
-	FileSize         int64      `json:"file_size"`
-	MimeType         string     `json:"mime_type"`
+	ID               string  `json:"id"`
+	CoursewareID     string  `json:"courseware_id"`
+	PageID           *string `json:"page_id"`
+	PlaceholderID    string  `json:"placeholder_id"`
+	AssetType        string  `json:"asset_type"`
+	GenerationPrompt string  `json:"generation_prompt"`
+	OssURL           string  `json:"oss_url"`
+	PublicOSSURL     string  `json:"public_oss_url"`
+	FileSize         int64   `json:"file_size"`
+	MimeType         string  `json:"mime_type"`
 	// Metadata 资产元数据的原始 JSON 字符串（对应 courseware_assets.metadata jsonb 列）。
 	// 视频锚点轮新增：
 	//   - 视频资产：可存 {"source_frame_asset_id":"<首帧图asset_id>"} 做首帧溯源；
 	//   - 视频上传：可存 ffprobe 元数据 {"duration","width","height","codec","fps","bit_rate"}。
 	// 空串语义 = NULL（仓储层 nullIfEmptyJSON 负责空串↔NULL 转换，避免空串写 jsonb 报错）。
-	Metadata         string     `json:"metadata"`
-	Status           string     `json:"status"`
-	CreatedAt        *time.Time `json:"created_at"`
+	Metadata  string     `json:"metadata"`
+	Status    string     `json:"status"`
+	CreatedAt *time.Time `json:"created_at"`
 }
 
 // ==================== 课件状态常量 ====================
@@ -190,12 +192,12 @@ var CoursewareStatusOrder = map[string]int{
 // 默认 private（私有），等于"只有作者自己能看，未进入任何共享或审核流程"。
 
 const (
-	CWPublishPrivate          = "private"            // 私有（默认）：仅作者可见
+	CWPublishPrivate           = "private"            // 私有（默认）：仅作者可见
 	CWPublishPublishedPersonal = "published_personal" // 个人发布：作者标记完成，暂未共享给他人
-	CWPublishSubmitted        = "submitted"          // 已提交审核：进入教研组/学校审核流，提交后锁定编辑
-	CWPublishApproved         = "approved"           // 审核通过：待发布共享
-	CWPublishPublishedShared  = "published_shared"   // 已共享发布：同校/同组可见
-	CWPublishRevision         = "revision"           // 审核退回：需修改后重新提交
+	CWPublishSubmitted         = "submitted"          // 已提交审核：进入教研组/学校审核流，提交后锁定编辑
+	CWPublishApproved          = "approved"           // 审核通过：待发布共享
+	CWPublishPublishedShared   = "published_shared"   // 已共享发布：同校/同组可见
+	CWPublishRevision          = "revision"           // 审核退回：需修改后重新提交
 )
 
 // CWPublishStateNameMap 发布态中文名映射（前端发布徽章用）
@@ -285,12 +287,12 @@ func IsValidCollabState(s string) bool {
 // ==================== v0.42: 课件来源类型常量 ====================
 
 const (
-	CWSourceLessonPlan = "lesson_plan"  // 从教案创建
-	CWSourcePPTUpload  = "ppt_upload"   // 从PPT上传创建
+	CWSourceLessonPlan  = "lesson_plan"  // 从教案创建
+	CWSourcePPTUpload   = "ppt_upload"   // 从PPT上传创建
 	CWSourceTopicDirect = "topic_direct" // 从主题直接创建
-	CWSourceDocUpload  = "doc_upload"   // 从Word文档上传创建
-	CWSourceHTMLImport = "html_import"  // HTML导入
-	CWSource3DSingle   = "3d_single"    // 3D互动单页
+	CWSourceDocUpload   = "doc_upload"   // 从Word文档上传创建
+	CWSourceHTMLImport  = "html_import"  // HTML导入
+	CWSource3DSingle    = "3d_single"    // 3D互动单页
 )
 
 // CWSourceNameMap 课件来源类型中文名映射
@@ -417,6 +419,7 @@ func GetSchemePresetByKey(key string) *SchemePreset {
 //   - preset为空或"auto" → 返回空串（AI自行规划）
 //   - preset为"custom"   → 返回customHint（老师自己写的描述），customHint为空则返回空串
 //   - 其余系统预设        → 返回该预设的PromptHint（忽略customHint）
+//
 // 此函数是四条索引生成链路（教案/主题/PPT/Doc）注入预设提示词的统一出口，
 // 替代原先各处直接调 GetSchemePresetByKey(preset).PromptHint 的分散逻辑。
 func ResolveSchemePromptHint(preset string, customHint string) string {
@@ -449,7 +452,7 @@ type CreateCoursewareRequest struct {
 // 课程知识库轮新增 KPCodes：选中的课标知识点编码数组（可选）。
 //   - 为空：完全兼容原有"纯主题规划"逻辑，AI 自行决定难度；
 //   - 非空：服务层据此查 curriculum_standards 注入"难度自动适配约束段落"，
-//           使生成的课件难度严格贴合课标对该年级该知识点的深度要求。
+//     使生成的课件难度严格贴合课标对该年级该知识点的深度要求。
 type CreateCoursewareFromTopicRequest struct {
 	Subject    string   `json:"subject"`     // 学科（必填）
 	Grade      string   `json:"grade"`       // 年级（必填）
@@ -533,7 +536,7 @@ type RollbackStatusRequest struct {
 
 // GenerateIndexRequest v136新增：生成索引请求（含可选预设）
 type GenerateIndexRequest struct {
-	Preset          string `json:"preset"`            // 可选: primary_fun/middle_standard/high_depth/auto/custom/空
+	Preset           string `json:"preset"`             // 可选: primary_fun/middle_standard/high_depth/auto/custom/空
 	CustomPromptHint string `json:"custom_prompt_hint"` // 仅preset=custom时使用：老师自定义的课件结构描述文本
 }
 
@@ -546,7 +549,8 @@ type RefineIndexRequest struct {
 
 // PublishCoursewareRequest 发布课件请求（设置发布态）
 // target 取值：published_personal（个人发布）/ published_shared（共享发布，需先审核通过或作者直接共享）
-//   实际允许的目标态由 service 层按当前发布态 + 角色裁决，本结构只承载意图。
+//
+//	实际允许的目标态由 service 层按当前发布态 + 角色裁决，本结构只承载意图。
 type PublishCoursewareRequest struct {
 	Target string `json:"target"` // 目标发布态
 }
@@ -573,45 +577,49 @@ type AddCollabMemberRequest struct {
 
 // CoursewareListItem 课件列表单条
 type CoursewareListItem struct {
-	ID              string     `json:"id"`
-	LessonPlanID    *string    `json:"lesson_plan_id"`     // v0.42: 改为可空指针
-	LessonPlanTitle string     `json:"lesson_plan_title"`
-	Title           string     `json:"title"`
-	Subject         string     `json:"subject"`
-	Grade           string     `json:"grade"`
-	Status          string     `json:"status"`
-	StatusName      string     `json:"status_name"`
-	PageCount       int        `json:"page_count"`
-	PipelineID      *string    `json:"pipeline_id"`
-	SourceType      string     `json:"source_type"`        // v0.42: 来源类型
-	SourceName      string     `json:"source_name"`        // v0.42: 来源类型中文名
+	ID              string  `json:"id"`
+	LessonPlanID    *string `json:"lesson_plan_id"` // v0.42: 改为可空指针
+	LessonPlanTitle string  `json:"lesson_plan_title"`
+	Title           string  `json:"title"`
+	Subject         string  `json:"subject"`
+	Grade           string  `json:"grade"`
+	// EducationDomain 课件所属资源教育域，供列表展示和调用方确认隔离边界。
+	EducationDomain string  `json:"education_domain"`
+	Status          string  `json:"status"`
+	StatusName      string  `json:"status_name"`
+	PageCount       int     `json:"page_count"`
+	PipelineID      *string `json:"pipeline_id"`
+	SourceType      string  `json:"source_type"` // v0.42: 来源类型
+	SourceName      string  `json:"source_name"` // v0.42: 来源类型中文名
 	// ---- 阶段1：发布/共享维度（供"我的课件"列表展示发布徽章、代码范围）----
-	PublishState     string `json:"publish_state"`      // 发布态
-	PublishStateName string `json:"publish_state_name"` // 发布态中文名
-	ReviewLevel      int    `json:"review_level"`       // 审核层级进度
-	CodeShareScope   string `json:"code_share_scope"`   // 源代码开放范围
-	CreatedAt       *time.Time `json:"created_at"`
-	UpdatedAt       *time.Time `json:"updated_at"`
+	PublishState     string     `json:"publish_state"`      // 发布态
+	PublishStateName string     `json:"publish_state_name"` // 发布态中文名
+	ReviewLevel      int        `json:"review_level"`       // 审核层级进度
+	CodeShareScope   string     `json:"code_share_scope"`   // 源代码开放范围
+	CreatedAt        *time.Time `json:"created_at"`
+	UpdatedAt        *time.Time `json:"updated_at"`
 }
 
 // SharedCoursewareListItem 共享课件库列表单条（阶段1新增）
 // 用于"共享课件库"页面：列出他人共享给我（同校/同组）的课件，带作者名、学校名、
 // 以及"当前登录者能否复制此课件源码"的标记（前端据此显隐"复制到我的"按钮）。
 type SharedCoursewareListItem struct {
-	ID               string     `json:"id"`
-	Title            string     `json:"title"`
-	Subject          string     `json:"subject"`
-	Grade            string     `json:"grade"`
+	ID      string `json:"id"`
+	Title   string `json:"title"`
+	Subject string `json:"subject"`
+	Grade   string `json:"grade"`
+	// EducationDomain 共享课件所属资源教育域，供共享市场执行跨域隔离。
+	EducationDomain  string     `json:"education_domain"`
 	PageCount        int        `json:"page_count"`
 	SourceType       string     `json:"source_type"`
 	SourceName       string     `json:"source_name"`
-	AuthorID         string     `json:"author_id"`         // 作者用户ID
-	AuthorName       string     `json:"author_name"`       // 作者显示名
-	SchoolName       string     `json:"school_name"`       // 作者所属学校名
-	PublishState     string     `json:"publish_state"`     // 发布态（共享库里通常为 published_shared）
+	AuthorID         string     `json:"author_id"`     // 作者用户ID
+	AuthorName       string     `json:"author_name"`   // 作者显示名
+	SchoolName       string     `json:"school_name"`   // 作者所属学校名
+	PublishState     string     `json:"publish_state"` // 发布态（共享库里通常为 published_shared）
 	PublishStateName string     `json:"publish_state_name"`
-	CodeShareScope   string     `json:"code_share_scope"`  // 源代码开放范围
-	CanCopy          bool       `json:"can_copy"`          // 当前登录者能否复制源码（按 code_share_scope + 归属关系裁决）
+	CodeShareScope   string     `json:"code_share_scope"` // 源代码开放范围
+	CanCopy          bool       `json:"can_copy"`         // 当前登录者能否复制源码（按 code_share_scope + 归属关系裁决）
 	CreatedAt        *time.Time `json:"created_at"`
 	UpdatedAt        *time.Time `json:"updated_at"`
 }
@@ -624,45 +632,47 @@ type SharedCoursewareListResponse struct {
 
 // CoursewareDetailResponse 课件详情响应
 type CoursewareDetailResponse struct {
-	ID              string            `json:"id"`
-	LessonPlanID    *string           `json:"lesson_plan_id"`    // v0.42: 改为可空指针
-	LessonPlanTitle string            `json:"lesson_plan_title"`
-	UserID          string            `json:"user_id"`
-	Title           string            `json:"title"`
-	Subject         string            `json:"subject"`
-	Grade           string            `json:"grade"`
-	Status          string            `json:"status"`
-	StatusName      string            `json:"status_name"`
-	StyleConfig     string            `json:"style_config"`
-	PageCount       int               `json:"page_count"`
-	IndexOverview   string            `json:"index_overview"`
-	LogoURL         string            `json:"logo_url"`
-	OrgName         string            `json:"org_name"`
-	NavTemplateHTML string            `json:"nav_template_html"`
-	PipelineID      *string           `json:"pipeline_id"`
-	SourceType      string            `json:"source_type"`       // v0.42: 来源类型
-	SourceName      string            `json:"source_name"`       // v0.42: 来源类型中文名
+	ID              string  `json:"id"`
+	LessonPlanID    *string `json:"lesson_plan_id"` // v0.42: 改为可空指针
+	LessonPlanTitle string  `json:"lesson_plan_title"`
+	UserID          string  `json:"user_id"`
+	Title           string  `json:"title"`
+	Subject         string  `json:"subject"`
+	Grade           string  `json:"grade"`
+	// EducationDomain 课件创建时的资源教育域快照，具体运行链必须以此字段为准。
+	EducationDomain string  `json:"education_domain"`
+	Status          string  `json:"status"`
+	StatusName      string  `json:"status_name"`
+	StyleConfig     string  `json:"style_config"`
+	PageCount       int     `json:"page_count"`
+	IndexOverview   string  `json:"index_overview"`
+	LogoURL         string  `json:"logo_url"`
+	OrgName         string  `json:"org_name"`
+	NavTemplateHTML string  `json:"nav_template_html"`
+	PipelineID      *string `json:"pipeline_id"`
+	SourceType      string  `json:"source_type"` // v0.42: 来源类型
+	SourceName      string  `json:"source_name"` // v0.42: 来源类型中文名
 	// ---- 风格锚点字段（轮1新增，供前端读取当前锚点状态）----
-	StyleAnchorAssetID *string        `json:"style_anchor_asset_id"` // nil=未设锚点
-	StyleAnchorVAOCI   string         `json:"style_anchor_vaoci"`    // 锚点VAOCI索引文本
-	StyleAnchorURL     string         `json:"style_anchor_url"`      // 锚点图公网URL（轮3：供前端跨页显示缩略图，优先OSS地址）
+	StyleAnchorAssetID *string `json:"style_anchor_asset_id"` // nil=未设锚点
+	StyleAnchorVAOCI   string  `json:"style_anchor_vaoci"`    // 锚点VAOCI索引文本
+	StyleAnchorURL     string  `json:"style_anchor_url"`      // 锚点图公网URL（轮3：供前端跨页显示缩略图，优先OSS地址）
 	// KPCodes 课程知识库轮新增：本课件勾选的课标知识点编码数组JSON文本，供前端生成索引时回传
-	KPCodes         string            `json:"kp_codes"`
+	KPCodes string `json:"kp_codes"`
 	// ---- 阶段1：发布/审核维度（供详情页展示发布徽章、代码范围、审核进度）----
-	PublishState     string `json:"publish_state"`      // 发布态
-	PublishStateName string `json:"publish_state_name"` // 发布态中文名
-	ReviewLevel      int    `json:"review_level"`       // 审核层级进度
-	ReviewSchoolID   *string `json:"review_school_id"`  // 提交审核时的作者学校ID（可空）
-	CodeShareScope   string `json:"code_share_scope"`   // 源代码开放范围
+	PublishState     string  `json:"publish_state"`      // 发布态
+	PublishStateName string  `json:"publish_state_name"` // 发布态中文名
+	ReviewLevel      int     `json:"review_level"`       // 审核层级进度
+	ReviewSchoolID   *string `json:"review_school_id"`   // 提交审核时的作者学校ID（可空）
+	CodeShareScope   string  `json:"code_share_scope"`   // 源代码开放范围
 	// ---- 阶段4：集体备课维度（供详情页展示集体备课徽章、判断是否可发起/结束）----
-	CollabState      string `json:"collab_state"`       // 集体备课态：idle/in_session
-        // CollabMemberCount 集体备课在场参与者数（阶段4治本补丁）：
-        //   前端据此区分真集体备课(in_session且有人)与幽灵会话(in_session但0人)，
-        //   由 GetCourseware 用 repository.CountCollabMembers 填充。
-        CollabMemberCount int `json:"collab_member_count"`
-	Pages           []*CoursewarePage `json:"pages"`
-	CreatedAt       *time.Time        `json:"created_at"`
-	UpdatedAt       *time.Time        `json:"updated_at"`
+	CollabState string `json:"collab_state"` // 集体备课态：idle/in_session
+	// CollabMemberCount 集体备课在场参与者数（阶段4治本补丁）：
+	//   前端据此区分真集体备课(in_session且有人)与幽灵会话(in_session但0人)，
+	//   由 GetCourseware 用 repository.CountCollabMembers 填充。
+	CollabMemberCount int               `json:"collab_member_count"`
+	Pages             []*CoursewarePage `json:"pages"`
+	CreatedAt         *time.Time        `json:"created_at"`
+	UpdatedAt         *time.Time        `json:"updated_at"`
 }
 
 // CoursewareListResponse 课件列表响应
@@ -699,11 +709,11 @@ type CollabMemberView struct {
 // 当前请求者能否在本课件微调（canEdit，前端据此显隐微调入口）、全部参与者列表。
 type CollabStatusResponse struct {
 	CoursewareID string              `json:"courseware_id"`
-	CollabState  string              `json:"collab_state"`  // idle/in_session
-	OwnerID      string              `json:"owner_id"`      // 课件作者ID（发起/加人/结束的权限主体）
-	CanEdit      bool                `json:"can_edit"`      // 当前请求者此刻能否微调本课件（作者/admin/集体备课参与者，且非锁定态）
-	Members      []*CollabMemberView `json:"members"`       // 参与者列表
-	Total        int                 `json:"total"`         // 参与者数量
+	CollabState  string              `json:"collab_state"` // idle/in_session
+	OwnerID      string              `json:"owner_id"`     // 课件作者ID（发起/加人/结束的权限主体）
+	CanEdit      bool                `json:"can_edit"`     // 当前请求者此刻能否微调本课件（作者/admin/集体备课参与者，且非锁定态）
+	Members      []*CollabMemberView `json:"members"`      // 参与者列表
+	Total        int                 `json:"total"`        // 参与者数量
 }
 
 // ==================== 课程知识库模型（本轮新增，只读） ====================
@@ -756,24 +766,41 @@ type TextbookUnit struct {
 // CoursewarePageVersion 课件页面 html_content 版本快照（完整记录，含 HTML）
 // 用于 GetPageVersion（取单版完整内容预览/回退）与 CreatePageVersion 返回值。
 type CoursewarePageVersion struct {
-	ID           string     `json:"id"`
-	PageID       string     `json:"page_id"`       // 归属页（courseware_pages.id）
-	CoursewareID string     `json:"courseware_id"` // 归属课件（冗余存，便于按课件批量查清）
-	VersionNo    int        `json:"version_no"`    // 该页第几版，每页独立从1递增
-	HTMLContent  string     `json:"html_content"`  // 该版本的完整页面HTML快照（非diff）
-	Source       string     `json:"source"`        // 版本来源枚举（见 CWPageVersionSource* 常量）
-	Note         string     `json:"note"`          // 可选备注（微调指令/重生说明/回退说明）
-	CreatedAt    *time.Time `json:"created_at"`
-}
+	ID           string `json:"id"`
+	PageID       string `json:"page_id"`
+	CoursewareID string `json:"courseware_id"`
+	VersionNo    int    `json:"version_no"`
 
-// CoursewarePageVersionListItem 版本列表单条（轻量，不含 html_content，省流量）
-// 用于 ListPageVersions —— 前端列表只显示版本号/来源/备注/时间，点"预览"再单独取完整HTML。
-type CoursewarePageVersionListItem struct {
-	ID        string     `json:"id"`
-	VersionNo int        `json:"version_no"`
+	// HTMLContent 保存该版本的完整页面HTML。
+	HTMLContent string `json:"html_content"`
+
+	// PlaceholderMap和MatchedComponentIDs保存创建版本时的页面JSON元数据。
+	// 空字符串表示数据库中的NULL。
+	PlaceholderMap      string `json:"placeholder_map"`
+	MatchedComponentIDs string `json:"matched_component_ids"`
+
+	// PageStatus保存创建该版本时的页面状态。
+	// 历史仅HTML版本没有该值。
+	PageStatus string `json:"page_status"`
+
+	// MetadataSnapshotComplete区分：
+	//   - false：迁移前的历史版本，仅保证HTML有效；
+	//   - true：迁移后的完整版本，可恢复HTML及页面元数据。
+	MetadataSnapshotComplete bool `json:"metadata_snapshot_complete"`
+
 	Source    string     `json:"source"`
 	Note      string     `json:"note"`
 	CreatedAt *time.Time `json:"created_at"`
+}
+
+// CoursewarePageVersionListItem 版本列表轻量记录。
+type CoursewarePageVersionListItem struct {
+	ID                       string     `json:"id"`
+	VersionNo                int        `json:"version_no"`
+	Source                   string     `json:"source"`
+	Note                     string     `json:"note"`
+	MetadataSnapshotComplete bool       `json:"metadata_snapshot_complete"`
+	CreatedAt                *time.Time `json:"created_at"`
 }
 
 // ==================== 课件页面版本来源常量 ====================
@@ -806,7 +833,8 @@ var CWPageVersionSourceNameMap = map[string]string{
 
 // CollabCandidate 集体备课可选参与者（轻量，供"加参与者"下拉选人）。
 // 来源：当前用户同校 + 同教研组的成员（复用 share 的 resolveSameOrgUserIDs），
-//   已排除本人、已排除 admin/viewer（admin非教研参与者、viewer只读，均不作候选）。
+//
+//	已排除本人、已排除 admin/viewer（admin非教研参与者、viewer只读，均不作候选）。
 type CollabCandidate struct {
 	UserID      string `json:"user_id"`
 	Username    string `json:"username"`

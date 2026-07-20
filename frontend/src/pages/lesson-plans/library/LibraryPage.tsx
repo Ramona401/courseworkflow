@@ -22,7 +22,7 @@ import {
   type LessonPlanStatus,
   type TeachingGroup,
 } from '@/api/lesson-plans'
-import { SUBJECTS } from '@/pages/lesson-plans/workshop/components/workshopConstants'
+import { useSubjects } from '@/hooks/useSubjects'
 import { toggleInteraction, getInteractions, type InteractionCounts } from '@/api/lesson-plan-interactions'
 
 /* ==================== 样式常量 ==================== */
@@ -323,12 +323,43 @@ export default function LibraryPage() {
   const { user } = useAuth()
   const navigate  = useNavigate()
 
+  /**
+   * 教案库课程筛选读取当前用户教育域和教学组织的课程目录。
+   * “全部”仅作为查询筛选哨兵，不属于正式课程值。
+   */
+  const {
+    subjects: subjectOptions,
+    loading: subjectsLoading,
+  } = useSubjects({
+    withAll: true,
+  })
+
   const [scope, setScope]               = useState<LibraryScope>('group')
   const [keyword, setKeyword]           = useState('')
   const [subjectFilter, setSubjectFilter] = useState('全部')
   const [gradeFilter,   setGradeFilter]   = useState('全部')
   const [qualityFilter, setQualityFilter] = useState('全部')
   const [structFilter,  setStructFilter]  = useState('全部')
+
+  /**
+   * 切换账号、学校或教育域后，
+   * 清理已经不属于当前课程目录的筛选值。
+   */
+  useEffect(() => {
+    if (subjectsLoading) return
+
+    if (
+      !subjectOptions.includes(
+        subjectFilter,
+      )
+    ) {
+      setSubjectFilter('全部')
+    }
+  }, [
+    subjectsLoading,
+    subjectOptions,
+    subjectFilter,
+  ])
 
   const [plans, setPlans]     = useState<LessonPlan[]>([])
   const [total, setTotal]     = useState(0)
@@ -506,7 +537,7 @@ export default function LibraryPage() {
           <span style={{ fontSize: '13px', fontWeight: 500, color: C.textSec, flexShrink: 0 }}>学科</span>
           <select value={subjectFilter} onChange={e => setSubjectFilter(e.target.value)}
             style={{ padding: '6px 10px', borderRadius: '6px', border: `1px solid ${subjectFilter !== '全部' ? C.primary : C.border}`, background: subjectFilter !== '全部' ? C.primaryLight : 'transparent', color: subjectFilter !== '全部' ? C.primary : C.textSec, fontSize: '13px', cursor: 'pointer', outline: 'none' }}>
-            {SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
+            {subjectOptions.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>

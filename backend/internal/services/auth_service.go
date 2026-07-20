@@ -1,22 +1,21 @@
 package services
 
-// 用户认证服务：登录验证 + JWT签发 + JWT验证
-// Phase8日志升级：
-//   - 查找用户失败（数据库错误）→ ERROR
-//   - Token生成失败 → ERROR
-//   - 更新登录信息失败 → WARN（不影响登录主流程，可接受）
-//   - 用户登录成功 → INFO（记录username/role，便于审计）
+// auth_service.go — 用户认证、JWT与登录上下文装配
 //
-// v172新增：登录/取当前用户时填充 PortalModules（门户板块可见性）
-//   - 普通用户：按所属学校 settings.portal_modules 决定（缺省全开）
-//   - admin：强制全开（保证管理员永远可进所有板块，便于配置和调试）
+// 教育域隔离：
+//   Login与GetCurrentUser统一调用repository.ResolveUserEducationContext；
+//   一次装配组织Logo、组织名称、门户板块、education_domain、education_org_id、
+//   education_domain_ready、education_domain_error和education_profile。
 //
-// 超管收口新增：JWTClaims 携带 IsSuper（超级管理员标记位）
-//   - 签发 token 时从 user.IsSuper 写入 claims，使中间件 SuperAdminOnly 不查库
-//     即可判定当前请求者是否超管（性能好、与 role 判定同源）。
-//   - 存量 token（未带 is_super 字段）解析后 IsSuper 默认 false，即老 token 一律
-//     按"非超管"处理——最坏结果是老 token 的超管需重新登录换新 token 才能进敏感入口，
-//     fail-safe 收紧方向，不会误放行。
+// 区域管理员：
+//   - 固定域来自organization_admins.education_domain；
+//   - 多个同域区域任命允许；
+//   - 无任命、空值、非法值、多域冲突和数据库查询失败全部fail-closed；
+//   - 身份认证仍成功，但education_domain_ready=false；
+//   - 绝不回退K12，也不取第一条任命作为授权判断。
+//
+// JWT继续只保存用户身份和超管标记，不保存教育域。
+// 因此重新登录和GET /auth/me都会读取数据库中的最新任命状态。
 
 import (
 	"context"
@@ -31,7 +30,6 @@ import (
 	"tedna/internal/utils"
 )
 
-// 认证服务相关错误
 var (
 	ErrInvalidCredentials = errors.New("用户名或密码错误")
 	ErrUserDisabled       = errors.New("账户已被禁用")
@@ -39,76 +37,181 @@ var (
 	ErrTokenExpired       = errors.New("令牌已过期")
 )
 
-// JWTClaims 自定义 JWT 声明
+// JWTClaims 自定义JWT声明。
 type JWTClaims struct {
-	UserID   string `json:"user_id"`  // 用户 UUID
-	Username string `json:"username"` // 用户名
-	Role     string `json:"role"`     // 用户角色
-	// 超管收口：超级管理员标记位。仅在 Role=admin 时有意义——把"全能 admin"
-	// 细分为超管(true)/二线(false)。中间件 SuperAdminOnly 直接读此字段判定，
-	// 不查库。存量 token 无此字段时反序列化为 false（按非超管处理，收紧方向）。
-	IsSuper              bool `json:"is_super"`
-	jwt.RegisteredClaims      // 标准声明（过期时间等）
+	UserID   string `json:"user_id"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	IsSuper  bool   `json:"is_super"`
+	jwt.RegisteredClaims
 }
 
-// TokenExpiry JWT 有效期：24小时
 const TokenExpiry = 24 * time.Hour
 
-// AuthService 认证服务
 type AuthService struct {
-	cfg *config.Config // 配置（含 JWTSecret）
+	cfg *config.Config
 }
 
-// 模块日志：所有认证相关日志自动携带 module=auth 字段
 var authLog = logger.WithModule("auth")
 
-// NewAuthService 创建认证服务实例
 func NewAuthService(cfg *config.Config) *AuthService {
 	return &AuthService{cfg: cfg}
 }
 
-// fillUserInfoExtras 填充 UserInfo 的组织相关附加信息（Logo、组织名、门户板块可见性）
+// markEducationDomainUnavailable 将用户教育域设置为统一异常状态。
 //
-// v172：抽出公共逻辑，Login 与 GetCurrentUser 共用，避免重复。
-//   - OrgLogoURL / OrgName：复用 GetUserOrgLogo
-//   - PortalModules：admin 强制全开；其他角色按组织 settings 配置（缺省全开）
-//
-// 注意：IsSuper 不在此填充——它由 user.ToUserInfo() 从数据库真值直接透传，
-//       与组织附加信息无关。
-func fillUserInfoExtras(ctx context.Context, info *models.UserInfo) {
-	// 组织 Logo 与名称
-	orgLogo, orgName := repository.GetUserOrgLogo(ctx, info.ID)
-	info.OrgLogoURL = orgLogo
-	info.OrgName = orgName
+// 该方法不暴露具体数据库错误，只下发固定提示。
+// EducationProfile暂用mixed画像保持结构完整；下一上下文由前端统一守卫阻断教学入口。
+func markEducationDomainUnavailable(info *models.UserInfo) {
+	info.EducationDomain = ""
+	info.EducationOrgID = ""
+	info.EducationDomainReady = false
+	info.EducationDomainError =
+		models.EducationDomainNotReadyMessage
+	info.EducationProfile = models.EducationProfileForDomain(
+		models.EducationDomainMixed,
+	)
+}
 
-	// 门户板块可见性
+// applyResolvedUserEducationContext 把Repository解析结果装配到UserInfo。
+//
+// 区域管理员额外执行防御性复核：即使未来Repository被错误修改并返回mixed、
+// common或空值，本层仍会标记未就绪，不让非法域进入登录响应授权上下文。
+func applyResolvedUserEducationContext(
+	info *models.UserInfo,
+	educationContext *models.UserEducationContext,
+) {
+	if educationContext == nil {
+		markEducationDomainUnavailable(info)
+		return
+	}
+
+	info.OrgLogoURL = educationContext.OrganizationLogo
+	info.OrgName = educationContext.OrganizationName
+	info.EducationOrgID = educationContext.OrganizationID
+
+	if info.Role == models.RoleRegionAdmin &&
+		!models.IsTeachingEducationDomain(
+			educationContext.EducationDomain,
+		) {
+		markEducationDomainUnavailable(info)
+		info.PortalModules = models.DefaultPortalModules()
+		return
+	}
+
+	info.EducationDomain = educationContext.EducationDomain
+	info.EducationDomainReady = true
+	info.EducationDomainError = ""
+	info.EducationProfile = models.EducationProfileForDomain(
+		educationContext.EducationDomain,
+	)
+
 	if info.Role == models.RoleAdmin {
-		// admin 永远全开，不受任何组织配置限制
 		info.PortalModules = models.DefaultPortalModules()
 	} else {
-		info.PortalModules = repository.GetUserPortalModules(ctx, info.ID)
+		info.PortalModules = educationContext.PortalModules
 	}
 }
 
-// Login 登录：验证用户名密码，返回 JWT token + 用户信息
-func (s *AuthService) Login(ctx context.Context, req *models.LoginRequest) (*models.LoginResponse, error) {
-	// 1. 根据用户名查找用户
+// fillUserInfoExtras 填充登录用户的组织、门户与教育域上下文。
+func fillUserInfoExtras(ctx context.Context, info *models.UserInfo) {
+	educationContext, err := repository.ResolveUserEducationContext(
+		ctx,
+		info.ID,
+		info.Role,
+	)
+	if err != nil {
+		// 区域管理员教育域异常不阻断身份认证，但必须fail-closed：
+		// 清空教育域并显式下发未就绪状态，绝不默认K12。
+		if info.Role == models.RoleRegionAdmin {
+			orgLogo, orgName := repository.GetUserOrgLogo(
+				ctx,
+				info.ID,
+			)
+			info.OrgLogoURL = orgLogo
+			info.OrgName = orgName
+			info.PortalModules = models.DefaultPortalModules()
+			markEducationDomainUnavailable(info)
+
+			authLog.Warn(
+				"区域管理员教育域解析失败，已按未就绪状态下发",
+				"user_id", info.ID,
+				"role", info.Role,
+				"error", err,
+			)
+			return
+		}
+
+		// 非区域管理员继续保持当前兼容行为。
+		// 本上下文只收口区域管理员登录，不提前扩大到其它角色。
+		authLog.Warn(
+			"解析用户教育域失败，使用兼容默认",
+			"user_id", info.ID,
+			"role", info.Role,
+			"error", err,
+		)
+
+		orgLogo, orgName := repository.GetUserOrgLogo(ctx, info.ID)
+		info.OrgLogoURL = orgLogo
+		info.OrgName = orgName
+
+		if info.Role == models.RoleAdmin ||
+			info.Role == models.RoleDistrictInspector {
+			info.PortalModules = models.DefaultPortalModules()
+			info.EducationDomain = models.EducationDomainMixed
+		} else {
+			info.PortalModules = repository.GetUserPortalModules(
+				ctx,
+				info.ID,
+			)
+			info.EducationDomain = models.EducationDomainK12
+		}
+
+		info.EducationDomainReady = true
+		info.EducationDomainError = ""
+		info.EducationProfile = models.EducationProfileForDomain(
+			info.EducationDomain,
+		)
+		return
+	}
+
+	applyResolvedUserEducationContext(
+		info,
+		educationContext,
+	)
+
+	if educationContext.DomainConflict {
+		authLog.Warn(
+			"用户同时属于多个具体教育域，已按确定性首个教学组织解析",
+			"user_id", info.ID,
+			"role", info.Role,
+			"education_domain", educationContext.EducationDomain,
+			"education_org_id", educationContext.OrganizationID,
+		)
+	}
+}
+
+// Login 登录。
+func (s *AuthService) Login(
+	ctx context.Context,
+	req *models.LoginRequest,
+) (*models.LoginResponse, error) {
 	user, err := repository.FindUserByUsername(ctx, req.Username)
 	if err != nil {
 		if errors.Is(err, repository.ErrUserNotFound) {
 			return nil, ErrInvalidCredentials
 		}
-		// ERROR：数据库查询失败，系统级错误
-		authLog.Error("查找用户失败",
+		authLog.Error(
+			"查找用户失败",
 			"username", req.Username,
 			"error", err,
 		)
 		return nil, err
 	}
 
-	// 2. 检查用户状态是否为 active
 	if user.Status != models.StatusActive {
-		authLog.Warn("禁用账户尝试登录",
+		authLog.Warn(
+			"禁用账户尝试登录",
 			"username", user.Username,
 			"user_id", user.ID,
 			"status", user.Status,
@@ -116,19 +219,18 @@ func (s *AuthService) Login(ctx context.Context, req *models.LoginRequest) (*mod
 		return nil, ErrUserDisabled
 	}
 
-	// 3. 验证密码（bcrypt 比对）
 	if !utils.CheckPassword(req.Password, user.PasswordHash) {
-		authLog.Warn("密码验证失败",
+		authLog.Warn(
+			"密码验证失败",
 			"username", req.Username,
 		)
 		return nil, ErrInvalidCredentials
 	}
 
-	// 4. 生成 JWT token
 	token, err := s.GenerateToken(user)
 	if err != nil {
-		// ERROR：Token生成失败，系统级错误
-		authLog.Error("生成token失败",
+		authLog.Error(
+			"生成token失败",
 			"username", user.Username,
 			"user_id", user.ID,
 			"error", err,
@@ -136,27 +238,27 @@ func (s *AuthService) Login(ctx context.Context, req *models.LoginRequest) (*mod
 		return nil, err
 	}
 
-	// 5. 更新登录时间和次数
 	if err := repository.UpdateLoginInfo(ctx, user.ID); err != nil {
-		// WARN：更新失败不影响登录主流程，记录警告继续执行
-		authLog.Warn("更新登录信息失败",
+		authLog.Warn(
+			"更新登录信息失败",
 			"username", user.Username,
 			"user_id", user.ID,
 			"error", err,
 		)
 	}
 
-	// 6. INFO：登录成功，记录关键字段便于审计
-	authLog.Info("用户登录成功",
+	info := user.ToUserInfo()
+	fillUserInfoExtras(ctx, info)
+
+	authLog.Info(
+		"用户登录成功",
 		"username", user.Username,
 		"user_id", user.ID,
 		"role", user.Role,
+		"education_domain", info.EducationDomain,
+		"education_domain_ready", info.EducationDomainReady,
+		"education_org_id", info.EducationOrgID,
 	)
-
-	// 7. 返回 token 和用户信息（含组织 Logo/名称 + 门户板块可见性 + 超管标记）
-	//    IsSuper 已由 user.ToUserInfo() 从数据库真值透传，无需在此重复赋值。
-	info := user.ToUserInfo()
-	fillUserInfoExtras(ctx, info)
 
 	return &models.LoginResponse{
 		Token: token,
@@ -164,49 +266,49 @@ func (s *AuthService) Login(ctx context.Context, req *models.LoginRequest) (*mod
 	}, nil
 }
 
-// GenerateToken 根据用户信息生成 JWT token
+// GenerateToken 根据用户信息生成JWT。
 func (s *AuthService) GenerateToken(user *models.User) (string, error) {
 	now := time.Now()
 
-	// 构造 JWT 声明（超管收口：写入 IsSuper，使中间件不查库即可判定）
 	claims := &JWTClaims{
 		UserID:   user.ID,
 		Username: user.Username,
 		Role:     user.Role,
 		IsSuper:  user.IsSuper,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(now.Add(TokenExpiry)), // 24小时后过期
-			IssuedAt:  jwt.NewNumericDate(now),                  // 签发时间
-			NotBefore: jwt.NewNumericDate(now),                  // 生效时间
-			Issuer:    "tedna",                                  // 签发者
+			ExpiresAt: jwt.NewNumericDate(now.Add(TokenExpiry)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+			Issuer:    "tedna",
 		},
 	}
 
-	// 使用 HS256 签名算法创建 token
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(s.cfg.JWTSecret))
 }
 
-// ValidateToken 验证 JWT token 并返回声明
-func (s *AuthService) ValidateToken(tokenString string) (*JWTClaims, error) {
-	// 解析 token
-	token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
-		// 确保签名方法是 HMAC
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, ErrInvalidToken
-		}
-		return []byte(s.cfg.JWTSecret), nil
-	})
+// ValidateToken 验证JWT。
+func (s *AuthService) ValidateToken(
+	tokenString string,
+) (*JWTClaims, error) {
+	token, err := jwt.ParseWithClaims(
+		tokenString,
+		&JWTClaims{},
+		func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, ErrInvalidToken
+			}
+			return []byte(s.cfg.JWTSecret), nil
+		},
+	)
 
 	if err != nil {
-		// 区分过期和其他错误
 		if errors.Is(err, jwt.ErrTokenExpired) {
 			return nil, ErrTokenExpired
 		}
 		return nil, ErrInvalidToken
 	}
 
-	// 提取并验证声明
 	claims, ok := token.Claims.(*JWTClaims)
 	if !ok || !token.Valid {
 		return nil, ErrInvalidToken
@@ -215,23 +317,21 @@ func (s *AuthService) ValidateToken(tokenString string) (*JWTClaims, error) {
 	return claims, nil
 }
 
-// GetCurrentUser 根据 JWT 声明获取当前用户完整信息
-func (s *AuthService) GetCurrentUser(ctx context.Context, claims *JWTClaims) (*models.UserInfo, error) {
+// GetCurrentUser 根据JWT声明返回当前用户完整信息。
+func (s *AuthService) GetCurrentUser(
+	ctx context.Context,
+	claims *JWTClaims,
+) (*models.UserInfo, error) {
 	user, err := repository.FindUserByID(ctx, claims.UserID)
 	if err != nil {
 		return nil, err
 	}
 
-	// 再次检查用户状态（防止 token 有效但用户已被禁用）
 	if user.Status != models.StatusActive {
 		return nil, ErrUserDisabled
 	}
 
-	// info 由 ToUserInfo() 从数据库真值构造，IsSuper 反映当前库中真实标记
-	// （即使 token 里是老值，/auth/me 拿到的也是最新库值，前端据此收口入口）
 	info := user.ToUserInfo()
-
-	// 填充组织 Logo/名称 + 门户板块可见性（与 Login 一致）
 	fillUserInfoExtras(ctx, info)
 
 	return info, nil

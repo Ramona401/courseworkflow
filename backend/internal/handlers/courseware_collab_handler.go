@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"tedna/internal/services"
 
 	"tedna/internal/middleware"
 	"tedna/internal/models"
@@ -26,99 +27,202 @@ import (
 )
 
 // StartCollab POST /api/v1/coursewares/{id}/collab/start — 发起集体备课
-func (h *CoursewareHandler) StartCollab(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) StartCollab(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/collab/start")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/collab/start",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
 
-	// body 可选：{members:[...]}（首批参与者）。允许空 body（只发起不拉人）。
-	var req models.StartCollabRequest
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req) // 解析失败按空处理，不阻断
-	}
-
-	if err := h.cwService.StartCollab(r.Context(), id, claims.UserID, req.Members); err != nil {
-		utils.InternalError(w, err.Error())
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
-	utils.Success(w, map[string]string{"message": "已发起集体备课"})
+
+	var req models.StartCollabRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	if err := h.cwService.StartCollabForActor(
+		r.Context(),
+		id,
+		actor,
+		req.Members,
+	); err != nil {
+		writeCoursewareControlError(w, err)
+		return
+	}
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "已发起集体备课",
+		},
+	)
 }
 
 // EndCollab POST /api/v1/coursewares/{id}/collab/end — 结束集体备课
-func (h *CoursewareHandler) EndCollab(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) EndCollab(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/collab/end")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/collab/end",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
-	if err := h.cwService.EndCollab(r.Context(), id, claims.UserID); err != nil {
-		utils.InternalError(w, err.Error())
+
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
-	utils.Success(w, map[string]string{"message": "已结束集体备课"})
+
+	if err := h.cwService.EndCollabForActor(
+		r.Context(),
+		id,
+		actor,
+	); err != nil {
+		writeCoursewareControlError(w, err)
+		return
+	}
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "已结束集体备课",
+		},
+	)
 }
 
 // GetCollabStatus GET /api/v1/coursewares/{id}/collab — 查集体备课状态
-func (h *CoursewareHandler) GetCollabStatus(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) GetCollabStatus(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	// 这里 path 形如 .../{id}/collab（无更深后缀），用 TrimSuffix 取 id
+
 	id := extractCollabCoursewareID(r.URL.Path)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
-	resp, err := h.cwService.GetCollabStatus(r.Context(), id, claims.UserID, claims.Role)
+
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+
+	resp, err := h.cwService.GetCollabStatus(
+		r.Context(),
+		id,
+		actor,
+	)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		handleCoursewareAccessError(
+			w,
+			err,
+			"查询集体备课状态失败",
+		)
 		return
 	}
+
 	utils.Success(w, resp)
 }
 
 // AddCollabMember POST /api/v1/coursewares/{id}/collab/members — 加参与者
-func (h *CoursewareHandler) AddCollabMember(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) AddCollabMember(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/collab/members")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/collab/members",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
+
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
+		return
+	}
+
 	var req models.AddCollabMemberRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, "请求参数格式错误")
@@ -128,42 +232,83 @@ func (h *CoursewareHandler) AddCollabMember(w http.ResponseWriter, r *http.Reque
 		utils.BadRequest(w, "参与者用户ID不能为空")
 		return
 	}
-	if err := h.cwService.AddCollabMember(r.Context(), id, claims.UserID, req.UserID); err != nil {
-		utils.InternalError(w, err.Error())
+
+	if err := h.cwService.AddCollabMemberForActor(
+		r.Context(),
+		id,
+		actor,
+		req.UserID,
+	); err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
-	utils.Success(w, map[string]string{"message": "已添加参与者"})
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "已添加参与者",
+		},
+	)
 }
 
 // RemoveCollabMember DELETE /api/v1/coursewares/{id}/collab/members/{uid} — 移除参与者
-func (h *CoursewareHandler) RemoveCollabMember(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) RemoveCollabMember(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodDelete {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	// path: /api/v1/coursewares/{id}/collab/members/{uid}
-	//   id  = /collab/members/ 之前的中间段
-	//   uid = path 末段
-	id := extractCoursewareMiddleID(r.URL.Path, "/collab/members/")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/collab/members/",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
-	uid := path.Base(r.URL.Path)
-	if uid == "" || uid == "members" {
+
+	targetUserID := path.Base(r.URL.Path)
+	if targetUserID == "" || targetUserID == "members" {
 		utils.BadRequest(w, "缺少参与者用户ID")
 		return
 	}
-	if err := h.cwService.RemoveCollabMember(r.Context(), id, claims.UserID, uid); err != nil {
-		utils.InternalError(w, err.Error())
+
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
-	utils.Success(w, map[string]string{"message": "已移除参与者"})
+
+	if err := h.cwService.RemoveCollabMemberForActor(
+		r.Context(),
+		id,
+		actor,
+		targetUserID,
+	); err != nil {
+		writeCoursewareControlError(w, err)
+		return
+	}
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "已移除参与者",
+		},
+	)
 }
 
 // extractCollabCoursewareID 从 /api/v1/coursewares/{id}/collab[/] 提取课件ID（GET 状态查询用）。
@@ -175,7 +320,7 @@ func extractCollabCoursewareID(p string) string {
 		return ""
 	}
 	rest := strings.TrimPrefix(p, prefix)
-	rest = strings.TrimSuffix(rest, "/")     // 去掉可能的尾斜杠
+	rest = strings.TrimSuffix(rest, "/")       // 去掉可能的尾斜杠
 	rest = strings.TrimSuffix(rest, "/collab") // 去掉 /collab 末段
 	// 此时 rest 应当就是纯 id（不含更多斜杠）
 	if rest == "" || strings.Contains(rest, "/") {

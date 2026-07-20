@@ -43,8 +43,10 @@
  *   - 不动 whiteSpace:'pre-wrap': renderMarkdown 输出结构化节点,pre-wrap 只影响内部纯文本换行,无冲突
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
+import type { SetStateAction } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import {
   getLessonPlan,
   reviewLessonPlan,
@@ -228,11 +230,46 @@ function consumeReviewAISSE(
 
 interface ChatMsg { role: 'user' | 'assistant'; content: string }
 
+/**
+ * 安全解析评审建议列表草稿。
+ */
+function parseReviewSuggestionList(
+  raw: string,
+): string[] {
+  if (!raw.trim()) return []
+
+  try {
+    const parsed = JSON.parse(raw)
+
+    if (!Array.isArray(parsed)) {
+      return []
+    }
+
+    return parsed.filter(
+      (item): item is string =>
+        typeof item === 'string',
+    )
+  } catch {
+    return []
+  }
+}
+
 function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
+  const { user } = useAuth()
+
   const [overview, setOverview]         = useState<string>('')
   const [overviewLoading, setOvLoading] = useState(false)
   const [chatMsgs, setChatMsgs]         = useState<ChatMsg[]>([])
-  const [chatInput, setChatInput]       = useState('')
+  const chatInputDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'lesson-plan-review-ai',
+    resourceId: plan.id,
+    field: 'chat-message',
+    initialValue: '',
+    maxHistory: 40,
+  })
+  const chatInput = chatInputDraft.value
+  const setChatInput = chatInputDraft.setValue
   const [chatLoading, setChatLoading]   = useState(false)
   const [activePanel, setActivePanel]   = useState<'overview' | 'chat'>('overview')
   const chatEndRef = useRef<HTMLDivElement>(null)
@@ -276,6 +313,10 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
     consumeReviewAISSE(
       '/api/v1/lesson-plans/review-ai/overview',
       {
+        // B2-B：评审概览请求携带教案ID。
+        // 后端只信任该ID重新读取数据库教案及education_domain快照，
+        // 不使用前端传入的学科、年级作为资源域授权依据。
+        lesson_plan_id: plan.id,
         plan_meta: planMeta,
         plan_content: planContent.slice(0, 3000),
         subject: plan.subject,
@@ -299,7 +340,16 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
         },
       },
     )
-  }, [overviewLoading, overview, planContent, planMeta, assistantId])
+  }, [
+    overviewLoading,
+    overview,
+    planContent,
+    planMeta,
+    assistantId,
+    plan.id,
+    plan.subject,
+    plan.grade,
+  ])
 
   /**
    * v113 改造:sendChat 改为 SSE 流式消费
@@ -307,7 +357,6 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
   const sendChat = () => {
     if (!chatInput.trim() || chatLoading) return
     const userMsg = chatInput.trim()
-    setChatInput('')
 
     const history = chatMsgs.map(m => ({ role: m.role, content: m.content }))
 
@@ -317,11 +366,16 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
       { role: 'assistant', content: '' },
     ])
     setChatLoading(true)
+    // 请求发起后清空显示值，并保留Ctrl+Z恢复快照。
+    chatInputDraft.commit()
 
     let accumulated = ''
     consumeReviewAISSE(
       '/api/v1/lesson-plans/review-ai/chat',
       {
+        // B2-B：评审对话请求携带教案ID。
+        // 后端据此使用同一份教案快照域校验手动选择的评审助手。
+        lesson_plan_id: plan.id,
         plan_meta: planMeta,
         plan_content: planContent.slice(0, 4000),
         subject: plan.subject,
@@ -352,6 +406,8 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
           setChatLoading(false)
         },
         onError: (err) => {
+          // 连接或AI调用失败时恢复老师本轮输入。
+          setChatInput(userMsg)
           setChatMsgs(prev => {
             if (prev.length === 0) return prev
             const next = [...prev]
@@ -404,6 +460,7 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
         {/* v112新增：AI助手选择器 */}
         {/* v113 STEP 6 新增:onEdit + onCreateNew 回调触发 Modal */}
         <div style={{ marginBottom: '8px' }}>
+          {/* B2-B：助手候选列表绑定当前教案快照域。 */}
           <AssistantSelector
             key={selectorKey}
             scene="review_workbench"
@@ -411,6 +468,7 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
             onChange={setAssistantId}
             subject={plan.subject}
             grade={plan.grade}
+            lessonPlanId={plan.id}
             disabled={chatLoading || overviewLoading}
             compact={true}
             onEdit={handleEditAssistant}
@@ -560,7 +618,13 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
               <textarea
                 value={chatInput}
                 onChange={e => setChatInput(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat() } }}
+                onKeyDown={e => {
+                  if (chatInputDraft.handleKeyDown(e)) return
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    sendChat()
+                  }
+                }}
                 placeholder="问AI关于这份教案的问题..."
                 rows={2}
                 disabled={chatLoading}
@@ -574,7 +638,7 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
               </button>
             </div>
             <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px', textAlign: 'center' }}>
-              Enter发送 · Shift+Enter换行
+              已自动保存草稿 · Enter发送 · Shift+Enter换行 · Ctrl/Command+Z恢复误删
             </div>
           </div>
         </>
@@ -604,9 +668,27 @@ function PlanPreviewPanel({ plan, annotations, onAnnotationCreated, onAnnotation
   onAnnotationDeleted: (id: string) => void
 }) {
   const [activeAnnotIdx, setActiveAnnotIdx] = useState<number | null>(null)
-  const [annotInput, setAnnotInput]         = useState('')
   const [savingAnnot, setSavingAnnot]       = useState(false)
   const { user } = useAuth()
+
+  /**
+   * 每个教案段落使用独立草稿键。
+   *
+   * 关闭批注框不会删除内容，再次打开同一段落即可恢复。
+   */
+  const annotationDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'lesson-plan-review-annotation',
+    resourceId: plan.id,
+    field:
+      activeAnnotIdx === null
+        ? 'inactive'
+        : `paragraph-${activeAnnotIdx}`,
+    initialValue: '',
+    maxHistory: 30,
+  })
+  const annotInput = annotationDraft.value
+  const setAnnotInput = annotationDraft.setValue
   const content = plan.content_markdown || ''
 
   return (
@@ -645,7 +727,7 @@ function PlanPreviewPanel({ plan, annotations, onAnnotationCreated, onAnnotation
                       {renderMarkdown(para)}
                     </div>
                     <button
-                      onClick={() => { setActiveAnnotIdx(isActive ? null : idx); setAnnotInput('') }}
+                      onClick={() => setActiveAnnotIdx(isActive ? null : idx)}
                       title="添加批注"
                       style={{ flexShrink: 0, marginTop: '4px', padding: '2px 7px', borderRadius: '5px', border: 'none', background: isActive ? '#FEF3C7' : paraAnnotations.length > 0 ? '#FFF7ED' : '#F3F4F6', color: paraAnnotations.length > 0 ? '#92400E' : '#6B7280', fontSize: '11px', fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
                       💬 {paraAnnotations.length > 0 ? paraAnnotations.length : '+'}
@@ -683,13 +765,16 @@ function PlanPreviewPanel({ plan, annotations, onAnnotationCreated, onAnnotation
                       <textarea
                         value={annotInput}
                         onChange={e => setAnnotInput(e.target.value)}
+                        onKeyDown={e => {
+                          annotationDraft.handleKeyDown(e)
+                        }}
                         placeholder="写下评审意见..."
                         rows={3}
                         style={{ width: '100%', padding: '7px 9px', borderRadius: '5px', border: '1px solid #FED7AA', fontSize: '12px', lineHeight: 1.6, outline: 'none', resize: 'vertical', boxSizing: 'border-box', fontFamily: 'inherit', background: '#fff' }}
                       />
                       <div style={{ display: 'flex', gap: '5px', marginTop: '6px', justifyContent: 'flex-end' }}>
                         <button
-                          onClick={() => { setActiveAnnotIdx(null); setAnnotInput('') }}
+                          onClick={() => setActiveAnnotIdx(null)}
                           style={{ padding: '4px 10px', borderRadius: '5px', border: '1px solid #E5E7EB', background: '#fff', fontSize: '11px', color: '#6B7280', cursor: 'pointer' }}>
                           取消
                         </button>
@@ -704,7 +789,7 @@ function PlanPreviewPanel({ plan, annotations, onAnnotationCreated, onAnnotation
                                 content: annotInput.trim(),
                               })
                               onAnnotationCreated(newA)
-                              setAnnotInput('')
+                              annotationDraft.clear()
                               setActiveAnnotIdx(null)
                             } catch { alert('保存失败') }
                             setSavingAnnot(false)
@@ -735,26 +820,131 @@ function PlanPreviewPanel({ plan, annotations, onAnnotationCreated, onAnnotation
 
 function ReviewActionPanel({ plan, onSubmit, onCancel, submitting }: {
   plan: LessonPlan
-  onSubmit: (decision: string, score: number, comments: string, suggestions: string[]) => Promise<void>
+  onSubmit: (decision: string, score: number, comments: string, suggestions: string[]) => Promise<boolean>
   onCancel: () => void
   submitting: boolean
 }) {
-  const [decision, setDecision]       = useState<'approved' | 'revision'>('approved')
-  const [score, setScore]             = useState<number>(8)
-  const [comments, setComments]       = useState('')
-  const [suggestion, setSuggestion]   = useState('')
-  const [suggestions, setSuggestions] = useState<string[]>([])
+  const { user } = useAuth()
 
+  const decisionDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'lesson-plan-review-action',
+    resourceId: plan.id,
+    field: 'decision',
+    initialValue: 'approved',
+  })
+  const decision:
+    | 'approved'
+    | 'revision' =
+    decisionDraft.value === 'revision'
+      ? 'revision'
+      : 'approved'
+  const setDecision = (
+    value: 'approved' | 'revision',
+  ) => decisionDraft.setValue(value)
+
+  const scoreDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'lesson-plan-review-action',
+    resourceId: plan.id,
+    field: 'score',
+    initialValue: '8',
+  })
+  const parsedScore = Number.parseFloat(
+    scoreDraft.value,
+  )
+  const score = Number.isFinite(parsedScore)
+    ? Math.min(10, Math.max(1, parsedScore))
+    : 8
+  const setScore = (value: number) =>
+    scoreDraft.setValue(String(value))
+
+  const commentsDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'lesson-plan-review-action',
+    resourceId: plan.id,
+    field: 'comments',
+    initialValue: '',
+    maxHistory: 30,
+  })
+  const comments = commentsDraft.value
+  const setComments = commentsDraft.setValue
+
+  const suggestionDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'lesson-plan-review-action',
+    resourceId: plan.id,
+    field: 'current-suggestion',
+    initialValue: '',
+    maxHistory: 30,
+  })
+  const suggestion = suggestionDraft.value
+  const setSuggestion = suggestionDraft.setValue
+
+  const suggestionsDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'lesson-plan-review-action',
+    resourceId: plan.id,
+    field: 'suggestions',
+    initialValue: '[]',
+    maxHistory: 20,
+  })
+  const suggestions = parseReviewSuggestionList(
+    suggestionsDraft.value,
+  )
+
+  const setSuggestions = useCallback(
+    (
+      next: SetStateAction<string[]>,
+    ) => {
+      suggestionsDraft.setValue(
+        (previousText) => {
+          const previous =
+            parseReviewSuggestionList(
+              previousText,
+            )
+
+          const resolved =
+            typeof next === 'function'
+              ? next(previous)
+              : next
+
+          return JSON.stringify(
+            resolved,
+          )
+        },
+      )
+    },
+    [suggestionsDraft.setValue],
+  )
   const addSuggestion = () => {
     if (!suggestion.trim()) return
     setSuggestions(prev => [...prev, suggestion.trim()])
-    setSuggestion('')
+    // 当前建议已进入持久化列表，可以清空输入框。
+    suggestionDraft.clear()
   }
   const removeSuggestion = (i: number) => setSuggestions(prev => prev.filter((_, idx) => idx !== i))
 
-  const handleSubmit = () => {
-    if (!comments.trim()) { alert('请填写评审意见'); return }
-    onSubmit(decision, score, comments, suggestions)
+  const handleSubmit = async () => {
+    if (!comments.trim()) {
+      alert('请填写评审意见')
+      return
+    }
+
+    const success = await onSubmit(
+      decision,
+      score,
+      comments,
+      suggestions,
+    )
+
+    if (!success) return
+
+    decisionDraft.clear()
+    scoreDraft.clear()
+    commentsDraft.clear()
+    suggestionDraft.clear()
+    suggestionsDraft.clear()
   }
 
   const decisionCfg = DECISION_CONFIG[decision]
@@ -791,6 +981,9 @@ function ReviewActionPanel({ plan, onSubmit, onCancel, submitting }: {
           <textarea
             value={comments}
             onChange={e => setComments(e.target.value)}
+            onKeyDown={e => {
+              commentsDraft.handleKeyDown(e)
+            }}
             placeholder="整体教学设计评价..."
             rows={6}
             style={{ width: '100%', padding: '9px 11px', borderRadius: '7px', border: `1px solid ${comments ? C.primary : C.border}`, fontSize: '13px', color: C.text, outline: 'none', boxSizing: 'border-box', resize: 'vertical', lineHeight: 1.7, fontFamily: 'inherit', background: C.card }}
@@ -820,7 +1013,10 @@ function ReviewActionPanel({ plan, onSubmit, onCancel, submitting }: {
               type="text"
               value={suggestion}
               onChange={e => setSuggestion(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && addSuggestion()}
+              onKeyDown={e => {
+                if (suggestionDraft.handleKeyDown(e)) return
+                if (e.key === 'Enter') addSuggestion()
+              }}
               placeholder="输入建议，回车添加..."
               style={{ flex: 1, padding: '6px 9px', borderRadius: '5px', border: `1px solid ${C.border}`, fontSize: '12px', color: C.text, outline: 'none', fontFamily: 'inherit', background: C.card }}
               onFocus={e => { e.target.style.borderColor = C.primary }}
@@ -834,6 +1030,19 @@ function ReviewActionPanel({ plan, onSubmit, onCancel, submitting }: {
             </button>
           </div>
         </div>
+      </div>
+
+      <div
+        style={{
+          padding: '6px 16px',
+          fontSize: '10px',
+          color: C.textMuted,
+          background: C.bg,
+          borderTop: `1px solid ${C.border}`,
+          textAlign: 'center',
+        }}
+      >
+        评审内容已自动保存 · Ctrl/Command+Z恢复误删
       </div>
 
       {/* 底部结论区 */}
@@ -903,16 +1112,54 @@ export default function ReviewWorkbenchPage() {
       .catch(() => setAnnotations([]))
   }, [id])
 
-  const handleSubmitReview = async (decision: string, score: number, comments: string, suggestions: string[]) => {
-    if (!id || submitting) return
+  const handleSubmitReview = async (
+    decision: string,
+    score: number,
+    comments: string,
+    suggestions: string[],
+  ): Promise<boolean> => {
+    if (!id || submitting) {
+      return false
+    }
+
     setSubmitting(true)
+
     try {
-      await reviewLessonPlan(id, { decision, score, comments, suggestions: suggestions.join('\n') })
-      showToast(`评审完成：${decision === 'approved' ? '✅ 评审通过' : '↩️ 退回修改'} ✓`)
-      setTimeout(() => navigate('/lesson-plans/review'), 1500)
-    } catch (e) {
-      console.error('提交评审失败:', e)
-      showToast('提交失败，请稍后重试', 'error')
+      await reviewLessonPlan(id, {
+        decision,
+        score,
+        comments,
+        suggestions:
+          suggestions.join('\n'),
+      })
+
+      showToast(
+        `评审完成：${
+          decision === 'approved'
+            ? '✅ 评审通过'
+            : '↩️ 退回修改'
+        } ✓`,
+      )
+
+      setTimeout(
+        () =>
+          navigate(
+            '/lesson-plans/review',
+          ),
+        1500,
+      )
+
+      return true
+    } catch (error) {
+      console.error(
+        '提交评审失败:',
+        error,
+      )
+      showToast(
+        '提交失败，未提交内容已经保留',
+        'error',
+      )
+      return false
     } finally {
       setSubmitting(false)
     }

@@ -1,286 +1,763 @@
 /**
- * OrgAdminsPanel.tsx — 组织多管理员管理内嵌展开面板（Phase 6.4 + B13 任命即同步身份）
+ * OrgAdminsPanel.tsx — 组织多管理员管理面板
  *
- * 用途：
- *   在 AdminPage「组织架构」Tab 的学校卡片/区域卡片中，展开后管理该组织的管理员
- *   （organization_admins 表，school→school_admin / region→region_admin）。
- *   交互范式仿 MemberPanel：展开式面板 + UserSearchPicker 选人 + 列表 + 移除（二次确认）。
- *
- * 后端对接（admin.ts，路由 /lesson-plans/organizations/{id}/admins）：
- *   - getOrgAdmins(orgId)                                    列出
- *   - addOrgAdmin(orgId, {user_id, role_type, sync_role})    任命（B13 返回 AddOrgAdminResult）
- *   - removeOrgAdmin(orgId, userId)                          移除
- *
- * 权限（后端 organization_admin_service 二次校验，前端不放松）：
- *   - admin        ：可对任意组织任命/移除；
- *   - region_admin ：仅其管辖区域本身或辖区学校；
- *   - 其它角色      ：后端拒绝。失败（403 等）由后端返回错误消息，本面板红字提示。
- *
- * B13 任命即同步身份（根治"有管辖无门票"静默失效）：
- *   - 选人后展示其当前系统身份（RoleBadge，来自 UserSearchPicker 第三参透传）；
- *   - 目标身份为 骨干教师(operator)/普通教师(viewer) 时，显示默认勾选的
- *     "任命后同步升级为区域管理员/学校管理员"勾选框（sync_role）；
- *   - 目标已具备其它身份时不显勾选框，灰字说明"任命仅授予管辖范围，不变更账户身份"；
- *   - 任命成功后 toast 后端拼好的 message（四种结果文案由后端统一产出），
- *     role_synced=true 时前端追加"对方重新登录后生效"——JWT 内嵌角色，
- *     目标用户的旧 token 在重新登录前仍按旧身份判定；
- *   - 移除任命永不降级账户身份（后端规则），面板底部与移除确认弹窗均有明示。
+ * 区域管理员固定教育域规则：
+ *   1. 任命region_admin时必须主动选择k12、vocational或adult；
+ *   2. 可选项由后端按该区域实际存在的有效学校类型返回；
+ *   3. 前端不默认选择K12；
+ *   4. 同一用户跨教育域任命由后端返回409拒绝；
+ *   5. 存量未配置区域任命明确显示异常标记；
+ *   6. school_admin不填写教育域，直接继承学校。
  */
-import { useState, useEffect, useCallback } from 'react'
-import { getOrgAdmins, addOrgAdmin, removeOrgAdmin } from '@/api/admin'
-import type { OrgAdminItem } from '@/api/admin'
+
+import { useCallback, useEffect, useState } from 'react'
+import {
+  addOrgAdmin,
+  getOrgAdminManagement,
+  removeOrgAdmin,
+} from '@/api/admin'
+import type {
+  OrgAdminItem,
+  TeachingEducationDomain,
+} from '@/api/admin'
 import { C, fmt } from './adminConstants'
-import { UserSearchPicker } from './UserSearchPicker'
 import { ConfirmDialog } from './ConfirmDialog'
 import { RoleBadge } from './adminShared'
+import { UserSearchPicker } from './UserSearchPicker'
 
 interface OrgAdminsPanelProps {
-  /** 组织ID（学校ID或区域ID） */
   orgId: string
-  /** 组织类型：school（学校管理员）/ region（区域管理员），决定任命的 role_type */
   orgType: 'region' | 'school'
-  /** 收起面板回调 */
   onClose: () => void
-  /** 任命/移除成功后的回调（供父级刷新展示，如学校卡片上的"管理员"名） */
   onChanged?: () => void
 }
 
-export function OrgAdminsPanel({ orgId, orgType, onClose, onChanged }: OrgAdminsPanelProps) {
+const educationDomainNames: Record<
+  TeachingEducationDomain,
+  string
+> = {
+  k12: 'K12基础教育',
+  vocational: '职业教育',
+  adult: '成人教育',
+}
+
+function getEducationDomainName(domain: string): string {
+  if (
+    domain === 'k12' ||
+    domain === 'vocational' ||
+    domain === 'adult'
+  ) {
+    return educationDomainNames[domain]
+  }
+
+  return '教育域未配置'
+}
+
+export function OrgAdminsPanel({
+  orgId,
+  orgType,
+  onClose,
+  onChanged,
+}: OrgAdminsPanelProps) {
   const [admins, setAdmins] = useState<OrgAdminItem[]>([])
+  const [availableDomains, setAvailableDomains] = useState<
+    TeachingEducationDomain[]
+  >([])
+  const [educationDomain, setEducationDomain] = useState<
+    TeachingEducationDomain | ''
+  >('')
+
   const [loading, setLoading] = useState(true)
-  const [addUserId, setAddUserId] = useState('')
-  const [addUserName, setAddUserName] = useState('')
-  // B13：选中用户的当前系统身份（UserSearchPicker 第三参透传；清空选择时为空串）
-  const [addUserRole, setAddUserRole] = useState('')
-  // B13：同步升级勾选框状态，默认勾选（换人重选时重置回 true）
-  const [syncRole, setSyncRole] = useState(true)
   const [adding, setAdding] = useState(false)
   const [error, setError] = useState('')
-  // B13：成功提示（绿色横幅，展示后端拼好的任命结果文案）
   const [notice, setNotice] = useState('')
-  const [confirmRemove, setConfirmRemove] = useState<{ open: boolean; userId: string; name: string }>({
-    open: false, userId: '', name: '',
+
+  const [addUserId, setAddUserId] = useState('')
+  const [addUserName, setAddUserName] = useState('')
+  const [addUserRole, setAddUserRole] = useState('')
+  const [syncRole, setSyncRole] = useState(true)
+
+  const [confirmRemove, setConfirmRemove] = useState<{
+    open: boolean
+    userId: string
+    name: string
+  }>({
+    open: false,
+    userId: '',
+    name: '',
   })
 
-  // role_type 由组织类型决定：学校→school_admin，区域→region_admin
-  const roleType = orgType === 'region' ? 'region_admin' : 'school_admin'
-  const roleLabel = orgType === 'region' ? '区域管理员' : '学校管理员'
+  const isRegion = orgType === 'region'
+  const roleType = isRegion
+    ? 'region_admin'
+    : 'school_admin'
+  const roleLabel = isRegion
+    ? '区域管理员'
+    : '学校管理员'
 
-  // B13：同步升级白名单——仅骨干教师/普通教师起步可升级（与后端 service 白名单一致）
-  const syncEligible = addUserRole === 'operator' || addUserRole === 'viewer'
+  const syncEligible =
+    addUserRole === 'operator' ||
+    addUserRole === 'viewer'
 
-  // ==================== 加载管理员列表 ====================
+  const noAvailableRegionDomain =
+    isRegion && availableDomains.length === 0
+
+  const addDisabled =
+    adding ||
+    !addUserId ||
+    noAvailableRegionDomain ||
+    (isRegion && !educationDomain)
+
   const load = useCallback(async () => {
     try {
       setLoading(true)
       setError('')
-      setAdmins(await getOrgAdmins(orgId))
+
+      const result = await getOrgAdminManagement(orgId)
+
+      setAdmins(result.admins)
+      setAvailableDomains(
+        result.available_education_domains
+      )
+
+      // 不自动选择第一项。
+      // 若原选择已经不在后端允许范围内，则立即清空。
+      setEducationDomain(current =>
+        current &&
+        result.available_education_domains.includes(current)
+          ? current
+          : ''
+      )
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : '加载管理员失败')
+      setError(
+        e instanceof Error
+          ? e.message
+          : '加载管理员失败'
+      )
     } finally {
       setLoading(false)
     }
   }, [orgId])
 
-  useEffect(() => { load() }, [load])
+  useEffect(() => {
+    void load()
+  }, [load])
 
-  // ==================== 任命管理员（B13：携带 sync_role，toast 后端文案）====================
   const handleAdd = useCallback(async () => {
-    if (!addUserId) { setError('请先选择要任命的用户'); return }
+    if (!addUserId) {
+      setError('请先选择要任命的用户')
+      return
+    }
+
+    if (isRegion && !educationDomain) {
+      setError('请选择该负责人固定负责的教育类型')
+      return
+    }
+
     try {
       setAdding(true)
       setError('')
       setNotice('')
-      // sync_role 仅在"白名单内且勾选"时为 true；已具管理身份者恒 false（后端亦有兜底）
+
       const result = await addOrgAdmin(orgId, {
         user_id: addUserId,
         role_type: roleType,
+        education_domain:
+          isRegion && educationDomain
+            ? educationDomain
+            : undefined,
         sync_role: syncEligible && syncRole,
       })
-      // 后端 message 已按四种结果拼好；同步成功时追加重新登录提示（JWT 内嵌角色）
-      setNotice(result.message + (result.role_synced ? '（对方重新登录后生效）' : ''))
+
+      setNotice(
+        result.message +
+          (result.role_synced
+            ? '（对方重新登录后生效）'
+            : '')
+      )
+
       setAddUserId('')
       setAddUserName('')
       setAddUserRole('')
+      setEducationDomain('')
       setSyncRole(true)
+
       await load()
       onChanged?.()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : '任命失败')
+      setError(
+        e instanceof Error ? e.message : '任命失败'
+      )
     } finally {
       setAdding(false)
     }
-  }, [addUserId, orgId, roleType, syncEligible, syncRole, load, onChanged])
+  }, [
+    addUserId,
+    educationDomain,
+    isRegion,
+    load,
+    onChanged,
+    orgId,
+    roleType,
+    syncEligible,
+    syncRole,
+  ])
 
-  // ==================== 移除管理员（二次确认；B13：移除永不降级身份）====================
-  const doRemove = useCallback(async (userId: string) => {
-    try {
-      setError('')
-      setNotice('')
-      await removeOrgAdmin(orgId, userId)
-      await load()
-      onChanged?.()
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : '移除失败')
-    } finally {
-      setConfirmRemove({ open: false, userId: '', name: '' })
-    }
-  }, [orgId, load, onChanged])
+  const handleRemove = useCallback(
+    async (userId: string) => {
+      try {
+        setError('')
+        setNotice('')
+
+        await removeOrgAdmin(orgId, userId)
+
+        setNotice('移除成功')
+        await load()
+        onChanged?.()
+      } catch (e: unknown) {
+        setError(
+          e instanceof Error ? e.message : '移除失败'
+        )
+      } finally {
+        setConfirmRemove({
+          open: false,
+          userId: '',
+          name: '',
+        })
+      }
+    },
+    [load, onChanged, orgId]
+  )
 
   return (
-    <div style={{ padding: '16px', background: 'rgba(124,58,237,0.05)', borderTop: `1px dashed ${C.border}` }}>
-
-      {/* 移除二次确认弹窗（B13：明示移除不降级身份） */}
+    <div
+      style={{
+        padding: '16px',
+        background: 'rgba(124,58,237,0.05)',
+        borderTop: `1px dashed ${C.border}`,
+      }}
+    >
       {confirmRemove.open && (
         <ConfirmDialog
           title={`移除${roleLabel}`}
-          message={`确认移除「${confirmRemove.name}」的${roleLabel}身份？移除后该用户将无法再管理本${orgType === 'region' ? '区域' : '学校'}。移除不会降级其账户身份，如需降级请到用户管理手动修改。`}
-          onConfirm={() => doRemove(confirmRemove.userId)}
-          onCancel={() => setConfirmRemove({ open: false, userId: '', name: '' })}
+          message={
+            `确认移除「${confirmRemove.name}」的` +
+            `${roleLabel}任命？移除后该用户将无法继续管理本` +
+            `${isRegion ? '区域' : '学校'}。` +
+            '若这是该用户最后一个任命制管辖，系统会自动将其账户身份调整为骨干教师；' +
+            '若仍有其它任命，账户身份保持不变。'
+          }
+          onConfirm={() =>
+            handleRemove(confirmRemove.userId)
+          }
+          onCancel={() =>
+            setConfirmRemove({
+              open: false,
+              userId: '',
+              name: '',
+            })
+          }
         />
       )}
 
-      {/* 面板标题 */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <span style={{ fontSize: '13px', fontWeight: 600, color: C.text }}>🛡️ {roleLabel}管理</span>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          marginBottom: '12px',
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+          }}
+        >
+          <span
+            style={{
+              fontSize: '13px',
+              fontWeight: 600,
+              color: C.text,
+            }}
+          >
+            🛡️ {roleLabel}管理
+          </span>
+
           {admins.length > 0 && (
-            <span style={{ fontSize: '11px', padding: '1px 7px', borderRadius: '10px', background: C.purpleLight, color: C.purple, fontWeight: 600 }}>
+            <span
+              style={{
+                padding: '1px 7px',
+                borderRadius: '10px',
+                background: C.purpleLight,
+                color: C.purple,
+                fontSize: '11px',
+                fontWeight: 600,
+              }}
+            >
               共 {admins.length} 人
             </span>
           )}
         </div>
-        <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '12px', color: C.textMuted }}>
+
+        <button
+          onClick={onClose}
+          style={{
+            border: 'none',
+            background: 'none',
+            color: C.textMuted,
+            cursor: 'pointer',
+            fontSize: '12px',
+          }}
+        >
           收起 ▲
         </button>
       </div>
 
-      {/* 错误提示（红） */}
       {error && (
-        <div style={{ fontSize: '12px', color: C.danger, marginBottom: '10px', padding: '8px 12px', background: C.dangerLight, borderRadius: '8px', lineHeight: 1.5 }}>
+        <div
+          style={{
+            marginBottom: '10px',
+            padding: '8px 12px',
+            borderRadius: '8px',
+            background: C.dangerLight,
+            color: C.danger,
+            fontSize: '12px',
+            lineHeight: 1.5,
+          }}
+        >
           {error}
         </div>
       )}
 
-      {/* B13：任命结果提示（绿，展示后端文案） */}
       {notice && (
-        <div style={{ fontSize: '12px', color: C.success, marginBottom: '10px', padding: '8px 12px', background: C.successLight, borderRadius: '8px', lineHeight: 1.5 }}>
+        <div
+          style={{
+            marginBottom: '10px',
+            padding: '8px 12px',
+            borderRadius: '8px',
+            background: C.successLight,
+            color: C.success,
+            fontSize: '12px',
+            lineHeight: 1.5,
+          }}
+        >
           ✓ {notice}
         </div>
       )}
 
-      {/* 管理员列表 */}
       {loading ? (
-        <div style={{ fontSize: '12px', color: C.textMuted, padding: '8px 0' }}>加载中...</div>
+        <div
+          style={{
+            padding: '8px 0',
+            color: C.textMuted,
+            fontSize: '12px',
+          }}
+        >
+          加载中...
+        </div>
       ) : admins.length === 0 ? (
-        <div style={{ fontSize: '12px', color: C.textMuted, padding: '8px 0' }}>暂无{roleLabel}，请在下方添加</div>
+        <div
+          style={{
+            padding: '8px 0',
+            color: C.textMuted,
+            fontSize: '12px',
+          }}
+        >
+          暂无{roleLabel}，请在下方添加
+        </div>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '14px' }}>
-          {admins.map(a => (
-            <div key={a.id} style={{
-              display: 'flex', alignItems: 'center', gap: '8px',
-              padding: '8px 12px', borderRadius: '8px',
-              background: C.white, border: `1px solid ${C.border}`,
-            }}>
-              {/* 头像 */}
-              <div style={{
-                width: '28px', height: '28px', borderRadius: '50%', flexShrink: 0,
-                background: 'linear-gradient(135deg,#7C3AED,#4F7BE8)',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                color: '#fff', fontSize: '11px', fontWeight: 700,
-              }}>
-                {(a.display_name || a.username).charAt(0).toUpperCase()}
-              </div>
-              {/* 姓名 + 任命时间 */}
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <span style={{ fontSize: '13px', fontWeight: 600, color: C.text }}>{a.display_name || a.username}</span>
-                  <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '8px', background: C.purpleLight, color: C.purple, border: `1px solid ${C.purple}44`, fontWeight: 700 }}>
-                    {roleLabel}
-                  </span>
-                </div>
-                <div style={{ fontSize: '11px', color: C.textMuted }}>@{a.username} · 任命于 {fmt(a.created_at)}</div>
-              </div>
-              {/* 移除按钮 */}
-              <button
-                onClick={() => setConfirmRemove({ open: true, userId: a.user_id, name: a.display_name || a.username })}
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '6px',
+            marginBottom: '14px',
+          }}
+        >
+          {admins.map(admin => {
+            const configured =
+              admin.education_domain === 'k12' ||
+              admin.education_domain ===
+                'vocational' ||
+              admin.education_domain === 'adult'
+
+            return (
+              <div
+                key={`${admin.org_id}:${admin.user_id}`}
                 style={{
-                  padding: '4px 10px', borderRadius: '6px',
-                  border: '1px solid #FEE2E2', background: '#FEF2F2',
-                  color: '#EF4444', fontSize: '11px', cursor: 'pointer',
-                  fontWeight: 500, whiteSpace: 'nowrap',
-                }}>
-                移除
-              </button>
-            </div>
-          ))}
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  padding: '8px 12px',
+                  border: `1px solid ${C.border}`,
+                  borderRadius: '8px',
+                  background: C.white,
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    width: '28px',
+                    height: '28px',
+                    flexShrink: 0,
+                    borderRadius: '50%',
+                    background:
+                      'linear-gradient(135deg,#7C3AED,#4F7BE8)',
+                    color: '#fff',
+                    fontSize: '11px',
+                    fontWeight: 700,
+                  }}
+                >
+                  {(admin.display_name || admin.username)
+                    .charAt(0)
+                    .toUpperCase()}
+                </div>
+
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      flexWrap: 'wrap',
+                      gap: '6px',
+                    }}
+                  >
+                    <span
+                      style={{
+                        color: C.text,
+                        fontSize: '13px',
+                        fontWeight: 600,
+                      }}
+                    >
+                      {admin.display_name ||
+                        admin.username}
+                    </span>
+
+                    <span
+                      style={{
+                        padding: '1px 6px',
+                        border: `1px solid ${C.purple}44`,
+                        borderRadius: '8px',
+                        background: C.purpleLight,
+                        color: C.purple,
+                        fontSize: '10px',
+                        fontWeight: 700,
+                      }}
+                    >
+                      {roleLabel}
+                    </span>
+
+                    {isRegion && (
+                      <span
+                        style={{
+                          padding: '1px 6px',
+                          border: configured
+                            ? '1px solid #A7F3D0'
+                            : '1px solid #FECACA',
+                          borderRadius: '8px',
+                          background: configured
+                            ? '#ECFDF5'
+                            : '#FEF2F2',
+                          color: configured
+                            ? '#047857'
+                            : '#DC2626',
+                          fontSize: '10px',
+                          fontWeight: 700,
+                        }}
+                      >
+                        {getEducationDomainName(
+                          admin.education_domain
+                        )}
+                      </span>
+                    )}
+                  </div>
+
+                  <div
+                    style={{
+                      color: C.textMuted,
+                      fontSize: '11px',
+                    }}
+                  >
+                    @{admin.username} · 任命于{' '}
+                    {fmt(admin.created_at)}
+                  </div>
+                </div>
+
+                <button
+                  onClick={() =>
+                    setConfirmRemove({
+                      open: true,
+                      userId: admin.user_id,
+                      name:
+                        admin.display_name ||
+                        admin.username,
+                    })
+                  }
+                  style={{
+                    padding: '4px 10px',
+                    border: '1px solid #FEE2E2',
+                    borderRadius: '6px',
+                    background: '#FEF2F2',
+                    color: '#EF4444',
+                    cursor: 'pointer',
+                    fontSize: '11px',
+                    fontWeight: 500,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  移除
+                </button>
+              </div>
+            )
+          })}
         </div>
       )}
 
-      {/* 任命区域 */}
-      <div style={{ background: C.white, borderRadius: '10px', border: `1px solid ${C.border}`, padding: '12px' }}>
-        <div style={{ fontSize: '12px', fontWeight: 600, color: C.textSec, marginBottom: '10px' }}>任命{roleLabel}</div>
+      <div
+        style={{
+          padding: '12px',
+          border: `1px solid ${C.border}`,
+          borderRadius: '10px',
+          background: C.white,
+        }}
+      >
+        <div
+          style={{
+            marginBottom: '10px',
+            color: C.textSec,
+            fontSize: '12px',
+            fontWeight: 600,
+          }}
+        >
+          任命{roleLabel}
+        </div>
+
         <UserSearchPicker
           label=""
-          value={addUserId} valueName={addUserName}
-          onChange={(id, n, role) => {
+          value={addUserId}
+          valueName={addUserName}
+          onChange={(id, name, role) => {
             setAddUserId(id)
-            setAddUserName(n)
+            setAddUserName(name)
             setAddUserRole(role || '')
-            setSyncRole(true)   // 换人重选时勾选框重置回默认勾选
+            setEducationDomain('')
+            setSyncRole(true)
           }}
           placeholder="输入用户名搜索要任命的用户..."
         />
 
-        {/* B13：选中后展示当前身份 + 同步升级勾选/说明 */}
+        {isRegion && (
+          <div style={{ marginBottom: '10px' }}>
+            <label
+              style={{
+                display: 'block',
+                marginBottom: '6px',
+                color: C.textSec,
+                fontSize: '12px',
+                fontWeight: 600,
+              }}
+            >
+              负责教育类型
+              <span style={{ color: C.danger }}>
+                {' '}*
+              </span>
+            </label>
+
+            <select
+              value={educationDomain}
+              disabled={noAvailableRegionDomain}
+              onChange={event =>
+                setEducationDomain(
+                  event.target.value as
+                    | TeachingEducationDomain
+                    | ''
+                )
+              }
+              style={{
+                width: '100%',
+                padding: '8px 10px',
+                border: `1px solid ${C.border}`,
+                borderRadius: '7px',
+                background: noAvailableRegionDomain
+                  ? '#F3F4F6'
+                  : C.white,
+                color: educationDomain
+                  ? C.text
+                  : C.textMuted,
+                cursor: noAvailableRegionDomain
+                  ? 'not-allowed'
+                  : 'pointer',
+                fontSize: '13px',
+              }}
+            >
+              <option value="">
+                请选择负责教育类型
+              </option>
+
+              {availableDomains.map(domain => (
+                <option key={domain} value={domain}>
+                  {educationDomainNames[domain]}
+                </option>
+              ))}
+            </select>
+
+            {noAvailableRegionDomain ? (
+              <div
+                style={{
+                  marginTop: '6px',
+                  padding: '7px 9px',
+                  border: '1px solid #FDE68A',
+                  borderRadius: '7px',
+                  background: '#FFFBEB',
+                  color: '#92400E',
+                  fontSize: '11px',
+                  lineHeight: 1.5,
+                }}
+              >
+                本区域下暂无已正确配置教育类型的有效学校，
+                暂不能任命区域教育负责人。
+              </div>
+            ) : (
+              <div
+                style={{
+                  marginTop: '5px',
+                  color: C.textMuted,
+                  fontSize: '11px',
+                  lineHeight: 1.5,
+                }}
+              >
+                这里只显示本区域实际存在的学校类型。
+                任命后负责人固定属于该教育域，不提供切换。
+              </div>
+            )}
+          </div>
+        )}
+
         {addUserId && addUserRole && (
-          <div style={{
-            marginBottom: '10px', padding: '10px 12px', borderRadius: '8px',
-            background: C.bg, border: `1px solid ${C.border}`,
-          }}>
-            {/* 当前身份行 */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: syncEligible ? '8px' : '6px' }}>
-              <span style={{ fontSize: '12px', color: C.textSec }}>当前身份：</span>
+          <div
+            style={{
+              marginBottom: '10px',
+              padding: '10px 12px',
+              border: `1px solid ${C.border}`,
+              borderRadius: '8px',
+              background: C.bg,
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                marginBottom: syncEligible
+                  ? '8px'
+                  : '6px',
+              }}
+            >
+              <span
+                style={{
+                  color: C.textSec,
+                  fontSize: '12px',
+                }}
+              >
+                当前身份：
+              </span>
               <RoleBadge role={addUserRole} />
             </div>
+
             {syncEligible ? (
-              // 白名单内：默认勾选的同步升级勾选框
-              <label style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', cursor: 'pointer' }}>
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: '8px',
+                  cursor: 'pointer',
+                }}
+              >
                 <input
                   type="checkbox"
                   checked={syncRole}
-                  onChange={e => setSyncRole(e.target.checked)}
-                  style={{ marginTop: '2px', cursor: 'pointer' }}
+                  onChange={event =>
+                    setSyncRole(event.target.checked)
+                  }
+                  style={{
+                    marginTop: '2px',
+                    cursor: 'pointer',
+                  }}
                 />
-                <span style={{ fontSize: '12px', color: C.text, lineHeight: 1.5 }}>
-                  任命后同步升级账户身份为「{roleLabel}」
+
+                <span
+                  style={{
+                    color: C.text,
+                    fontSize: '12px',
+                    lineHeight: 1.5,
+                  }}
+                >
+                  任命后同步升级账户身份为
+                  「{roleLabel}」
                   <span style={{ color: C.textMuted }}>
-                    （推荐勾选：不升级则对方登录后没有用户管理入口）
+                    （推荐勾选：否则对方登录后没有对应管理入口）
                   </span>
                 </span>
               </label>
             ) : (
-              // 白名单外（已具管理身份/教研员等）：灰字说明，不显勾选框
-              <div style={{ fontSize: '12px', color: C.textMuted, lineHeight: 1.5 }}>
-                任命仅授予管辖范围，不会变更其账户身份。
+              <div
+                style={{
+                  color: C.textMuted,
+                  fontSize: '12px',
+                  lineHeight: 1.5,
+                }}
+              >
+                任命只增加管辖范围，不改变其现有账户身份。
               </div>
             )}
           </div>
         )}
 
         <button
-          onClick={handleAdd} disabled={adding || !addUserId}
+          onClick={handleAdd}
+          disabled={addDisabled}
           style={{
-            width: '100%', padding: '8px', borderRadius: '7px', border: 'none', marginTop: '4px',
-            background: (!addUserId || adding) ? '#E5E7EB' : C.purple,
-            color: (!addUserId || adding) ? '#9CA3AF' : '#fff',
-            fontSize: '13px', fontWeight: 600,
-            cursor: (!addUserId || adding) ? 'not-allowed' : 'pointer',
-          }}>
-          {adding ? '任命中...' : `+ 任命为${roleLabel}`}
+            width: '100%',
+            marginTop: '4px',
+            padding: '8px',
+            border: 'none',
+            borderRadius: '7px',
+            background: addDisabled
+              ? '#E5E7EB'
+              : C.purple,
+            color: addDisabled
+              ? '#9CA3AF'
+              : '#fff',
+            cursor: addDisabled
+              ? 'not-allowed'
+              : 'pointer',
+            fontSize: '13px',
+            fontWeight: 600,
+          }}
+        >
+          {adding
+            ? '任命中...'
+            : `+ 任命为${roleLabel}`}
         </button>
-        <div style={{ marginTop: '8px', fontSize: '11px', color: C.textMuted, lineHeight: 1.5 }}>
-          💡 {roleLabel}可管理本{orgType === 'region' ? '区域' : '学校'}的用户与教研组。一个{orgType === 'region' ? '区域' : '学校'}可设置多名管理员。移除任命不会自动降级账户身份。
+
+        <div
+          style={{
+            marginTop: '8px',
+            color: C.textMuted,
+            fontSize: '11px',
+            lineHeight: 1.5,
+          }}
+        >
+          💡{' '}
+          {isRegion
+            ? '同一用户可以负责多个区域，但所有有效区域任命必须属于同一个教育域。'
+            : '学校管理员的教育域直接继承学校，不需要单独选择。'}
+          移除最后一个任命制管辖时，
+          系统会自动将账户身份调整为骨干教师。
         </div>
       </div>
     </div>

@@ -58,6 +58,13 @@ var (
 // ==================== 教案CRUD ====================
 
 // CreateLessonPlan 创建教案
+//
+// education_domain由数据库BEFORE INSERT触发器生成快照：
+//   - 普通创建按作者当前教学教育域；
+//   - Fork创建按来源教案教育域继承。
+//
+// INSERT完成后必须通过RETURNING回填最终值，确保内存中的LessonPlan
+// 与数据库资源快照保持一致，供同一请求后续助手和配方隔离直接使用。
 func CreateLessonPlan(ctx context.Context, lp *models.LessonPlan) error {
 	query := `
 		INSERT INTO lesson_plans (
@@ -72,7 +79,7 @@ func CreateLessonPlan(ctx context.Context, lp *models.LessonPlan) error {
 			$11, $12, $13, $14, $15, $16, $17,
 			$18
 		)
-		RETURNING id, created_at, updated_at
+		RETURNING id, education_domain, created_at, updated_at
 	`
 	dur := lp.DurationMinutes
 	if dur <= 0 {
@@ -112,7 +119,7 @@ func CreateLessonPlan(ctx context.Context, lp *models.LessonPlan) error {
 		lp.ContentMarkdown, contentStruct, genConfig, matchedComp, convLog,
 		status, visibility, lp.AuthorID, lp.GroupID, lp.SchoolID, lp.TemplateID, lp.RecipeID,
 		textbookIDs,
-	).Scan(&lp.ID, &lp.CreatedAt, &lp.UpdatedAt)
+	).Scan(&lp.ID, &lp.EducationDomain, &lp.CreatedAt, &lp.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("创建教案失败: %w", err)
 	}
@@ -120,6 +127,9 @@ func CreateLessonPlan(ctx context.Context, lp *models.LessonPlan) error {
 }
 
 // GetLessonPlanByID 根据ID查询教案
+//
+// 必须读取education_domain资源快照。具体教案运行时，助手与配方Actor
+// 以此字段覆盖登录用户的mixed或当前组织域，保证同一教案始终使用创建时域。
 // 回收站迭代: WHERE 加 AND deleted_at IS NULL 排除已软删教案
 func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, error) {
 	lp := &models.LessonPlan{}
@@ -132,7 +142,7 @@ func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, erro
 		       content_markdown, content_structured, generation_config,
 		       matched_components, conversation_log,
 		       ai_review_score, ai_review_result, ai_review_history,
-		       status, visibility, author_id, group_id, school_id,
+		       status, visibility, author_id, group_id, school_id, education_domain,
 		       forked_from, fork_count, template_id, recipe_id,
 		       COALESCE(unit_plan_id::text, '') AS unit_plan_id,
 		       COALESCE(class_profile_id::text, '') AS class_profile_id,
@@ -151,7 +161,7 @@ func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, erro
 		&lp.ContentMarkdown, &lp.ContentStructured, &lp.GenerationConfig,
 		&lp.MatchedComponents, &lp.ConversationLog,
 		&lp.AIReviewScore, &lp.AIReviewResult, &lp.AIReviewHistory,
-		&lp.Status, &lp.Visibility, &lp.AuthorID, &lp.GroupID, &lp.SchoolID,
+		&lp.Status, &lp.Visibility, &lp.AuthorID, &lp.GroupID, &lp.SchoolID, &lp.EducationDomain,
 		&lp.ForkedFrom, &lp.ForkCount, &lp.TemplateID, &lp.RecipeID,
 		&unitPlanIDStr,
 		&classProfileIDStr,

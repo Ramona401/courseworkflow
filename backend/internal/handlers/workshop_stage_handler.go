@@ -237,83 +237,189 @@ func (h *WorkshopStageHandler) BackStage(w http.ResponseWriter, r *http.Request)
 
 // ==================== 自定义阶段 CRUD ====================
 
-func (h *WorkshopStageHandler) ListCustomStages(w http.ResponseWriter, r *http.Request) {
-	recipeID := extractRecipeIDFromCustomStagePath(r.URL.Path)
-	if recipeID == "" {
-		utils.BadRequest(w, utils.MsgInvalidRecipeID)
+// ListCustomStages 列出当前Actor有权查看的配方自定义阶段。
+func (h *WorkshopStageHandler) ListCustomStages(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
 		return
 	}
-	stages, err := h.stageService.ListCustomStages(r.Context(), recipeID)
-	if err != nil {
-		utils.InternalError(w, "获取自定义阶段失败")
-		return
-	}
-	utils.Success(w, map[string]interface{}{"stages": stages})
-}
 
-func (h *WorkshopStageHandler) CreateCustomStage(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
-		return
-	}
-	recipeID := extractRecipeIDFromCustomStagePath(r.URL.Path)
+	recipeID := extractRecipeIDFromCustomStagePath(
+		r.URL.Path,
+	)
 	if recipeID == "" {
-		utils.BadRequest(w, utils.MsgInvalidRecipeID)
+		utils.BadRequest(
+			w,
+			utils.MsgInvalidRecipeID,
+		)
 		return
 	}
-	var req models.CreateCustomStageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, utils.MsgBadRequestArgs)
-		return
-	}
-	resp, err := h.stageService.CreateCustomStage(r.Context(), recipeID, &req, claims.UserID)
+
+	stages, err :=
+		h.stageService.
+			ListCustomStagesForActor(
+				r.Context(),
+				actor,
+				recipeID,
+			)
 	if err != nil {
 		handleCustomStageError(w, err)
 		return
 	}
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"stages": stages,
+		},
+	)
+}
+
+// CreateCustomStage 为作者本人配方创建自定义阶段。
+func (h *WorkshopStageHandler) CreateCustomStage(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
+		return
+	}
+
+	recipeID := extractRecipeIDFromCustomStagePath(
+		r.URL.Path,
+	)
+	if recipeID == "" {
+		utils.BadRequest(
+			w,
+			utils.MsgInvalidRecipeID,
+		)
+		return
+	}
+
+	var req models.CreateCustomStageRequest
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			utils.MsgBadRequestArgs,
+		)
+		return
+	}
+
+	resp, err :=
+		h.stageService.
+			CreateCustomStageForActor(
+				r.Context(),
+				actor,
+				recipeID,
+				&req,
+			)
+	if err != nil {
+		handleCustomStageError(w, err)
+		return
+	}
+
 	utils.Success(w, resp)
 }
 
-func (h *WorkshopStageHandler) UpdateCustomStage(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+// UpdateCustomStage 更新作者本人配方的自定义阶段。
+func (h *WorkshopStageHandler) UpdateCustomStage(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
 		return
 	}
-	recipeID, stageCode := extractRecipeIDAndStageCodeFromCustomStagePath(r.URL.Path)
+
+	recipeID, stageCode :=
+		extractRecipeIDAndStageCodeFromCustomStagePath(
+			r.URL.Path,
+		)
 	if recipeID == "" || stageCode == "" {
-		utils.BadRequest(w, "配方ID或阶段代码无效")
+		utils.BadRequest(
+			w,
+			"配方ID或阶段代码无效",
+		)
 		return
 	}
+
 	var req models.UpdateCustomStageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, utils.MsgBadRequestArgs)
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			utils.MsgBadRequestArgs,
+		)
 		return
 	}
-	if err := h.stageService.UpdateCustomStage(r.Context(), recipeID, stageCode, &req, claims.UserID); err != nil {
+
+	if err :=
+		h.stageService.
+			UpdateCustomStageForActor(
+				r.Context(),
+				actor,
+				recipeID,
+				stageCode,
+				&req,
+			); err != nil {
 		handleCustomStageError(w, err)
 		return
 	}
-	utils.Success(w, map[string]string{"message": "更新成功"})
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "更新成功",
+		},
+	)
 }
 
-func (h *WorkshopStageHandler) DeleteCustomStage(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+// DeleteCustomStage 删除作者本人配方的自定义阶段。
+func (h *WorkshopStageHandler) DeleteCustomStage(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
 		return
 	}
-	recipeID, stageCode := extractRecipeIDAndStageCodeFromCustomStagePath(r.URL.Path)
+
+	recipeID, stageCode :=
+		extractRecipeIDAndStageCodeFromCustomStagePath(
+			r.URL.Path,
+		)
 	if recipeID == "" || stageCode == "" {
-		utils.BadRequest(w, "配方ID或阶段代码无效")
+		utils.BadRequest(
+			w,
+			"配方ID或阶段代码无效",
+		)
 		return
 	}
-	if err := h.stageService.DeleteCustomStage(r.Context(), recipeID, stageCode, claims.UserID); err != nil {
+
+	if err :=
+		h.stageService.
+			DeleteCustomStageForActor(
+				r.Context(),
+				actor,
+				recipeID,
+				stageCode,
+			); err != nil {
 		handleCustomStageError(w, err)
 		return
 	}
-	utils.Success(w, map[string]string{"message": "删除成功"})
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "删除成功",
+		},
+	)
 }
 
 // ==================== 辅助函数 ====================

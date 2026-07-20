@@ -1,338 +1,715 @@
 /**
- * SubjectsPanel.tsx — 后台「学科管理」面板（v231）
+ * SubjectsPanel.tsx — 后台课程定义与课程目录管理主面板
  *
- * 用途：
- *   学科字典的运营管理入口。原学科散落在前端 8+ 处硬编码、各副本不一致
- *   （备课下拉缺劳动/道法/美术/音乐/体育等），现改为数据库单一真相源，
- *   本面板即其管理界面——增删改后，全站学科下拉经 useSubjects 统一同步。
+ * 职责：
+ *   1. 加载课程定义、目录归属和学校教育域；
+ *   2. 管理新增、编辑、启停和删除流程；
+ *   3. 校验目录教育域、适用学校和重复配置；
+ *   4. 调用后端事务接口同步保存subjects和subject_catalog_entries。
  *
- * 交互范式仿本目录 KBAuthorizedPanel：C 颜色常量 + 原生 button/input +
- *   Toast 提示 + ConfirmDialog 二次确认，无 antd。
- *
- * 后端对接（api/subjects.ts，路由 /api/v1/admin/subjects，仅 admin）：
- *   - getAllSubjects()               列出全部（含停用）
- *   - createSubject / updateSubject / deleteSubject
- *   增删改后调用 refreshSubjects() 同步全站下拉缓存。
- *
- * 说明：学科深层能力（AOCI 索引编码 code、课标库约束）仍「有就用没就降级」，
- *   新增学科能选能备课，暂无课标约束注入属预期行为，非 bug。
- *
- * 挂载：AdminPage 的「📚 学科管理」Tab（仅 admin 可见）。
+ * 模块拆分：
+ *   - SubjectCatalogFormModal：课程定义与目录编辑弹窗；
+ *   - SubjectCatalogEditor：单条目录编辑；
+ *   - SubjectCatalogTable：课程与目录列表；
+ *   - 本文件只保留数据状态、校验和接口调用。
  */
-import { useState, useEffect, useCallback } from 'react'
+
 import {
-  getAllSubjects, createSubject, updateSubject, deleteSubject,
-  type SubjectItem,
+  useCallback,
+  useEffect,
+  useState,
+} from 'react'
+
+import {
+  createSubject,
+  deleteSubject,
+  getAllSubjects,
+  updateSubject,
 } from '@/api/subjects'
-import { refreshSubjects } from '@/hooks/useSubjects'
+import type {
+  SubjectAdminItem,
+  SubjectCatalogEntryRequest,
+} from '@/api/subjects'
+
+import {
+  getOrganizationEducationDomains,
+} from '@/api/organization-education-domains'
+import type {
+  OrganizationEducationDomainItem,
+} from '@/api/organization-education-domains'
+
+import {
+  refreshSubjects,
+} from '@/hooks/useSubjects'
+
 import { C } from './adminConstants'
 import { Toast } from './adminShared'
 import { ConfirmDialog } from './ConfirmDialog'
 
-// 编辑/新增表单的字段结构
-interface SubjectForm {
-  name: string
-  code: string
-  sort_order: number
-  note: string
-  is_active: boolean
+import {
+  catalogEntryToDraft,
+  createEmptyCatalogDraft,
+} from './SubjectCatalogEditor'
+import type {
+  SubjectCatalogDraft,
+} from './SubjectCatalogEditor'
+
+import {
+  SubjectCatalogFormModal,
+} from './SubjectCatalogFormModal'
+import type {
+  SubjectCatalogFormValue,
+} from './SubjectCatalogFormModal'
+
+import {
+  SubjectCatalogTable,
+} from './SubjectCatalogTable'
+
+/* ==================== 表单模型 ==================== */
+
+type SubjectForm =
+  SubjectCatalogFormValue
+
+/**
+ * 创建新增课程表单。
+ *
+ * 默认生成一条空目录，提醒管理员必须明确选择
+ * 教育域和适用学校。
+ */
+function createEmptyForm(
+  sortOrder: number,
+): SubjectForm {
+  return {
+    name: '',
+    code: '',
+    sort_order: sortOrder,
+    note: '',
+    is_active: true,
+    catalog_entries: [
+      createEmptyCatalogDraft(
+        sortOrder,
+      ),
+    ],
+  }
 }
 
-const emptyForm = (sortOrder: number): SubjectForm => ({
-  name: '', code: '', sort_order: sortOrder, note: '', is_active: true,
-})
+/* ==================== 目录请求转换 ==================== */
+
+/**
+ * 将目录编辑草稿转换成后端写入请求。
+ *
+ * 前端校验：
+ *   - 至少存在一条目录；
+ *   - 每条目录必须选择具体教育域；
+ *   - 学校专属目录必须选择学校；
+ *   - 同一教育域公共目录不能重复；
+ *   - 同一学校目录不能重复。
+ *
+ * 后端仍会执行组织类型、状态和教育域一致性终校验。
+ */
+function buildCatalogRequests(
+  entries: SubjectCatalogDraft[],
+): {
+  error: string
+  requests: SubjectCatalogEntryRequest[]
+} {
+  if (entries.length === 0) {
+    return {
+      error:
+        '请至少配置一个教育域或适用学校',
+      requests: [],
+    }
+  }
+
+  const seen =
+    new Set<string>()
+
+  const requests:
+    SubjectCatalogEntryRequest[] = []
+
+  for (
+    let index = 0;
+    index < entries.length;
+    index += 1
+  ) {
+    const entry = entries[index]
+    const position = index + 1
+
+    if (!entry.education_domain) {
+      return {
+        error:
+          `第${position}项课程目录尚未选择教育域`,
+        requests: [],
+      }
+    }
+
+    if (
+      entry.scope ===
+        'organization' &&
+      !entry.organization_id.trim()
+    ) {
+      return {
+        error:
+          `第${position}项课程目录尚未选择适用学校`,
+        requests: [],
+      }
+    }
+
+    const organizationId =
+      entry.scope === 'public'
+        ? null
+        : entry.organization_id.trim()
+
+    const duplicateKey = [
+      entry.education_domain,
+      organizationId || 'public',
+    ].join('::')
+
+    if (seen.has(duplicateKey)) {
+      return {
+        error:
+          `第${position}项与已有课程目录重复`,
+        requests: [],
+      }
+    }
+
+    seen.add(duplicateKey)
+
+    requests.push({
+      education_domain:
+        entry.education_domain,
+      organization_id:
+        organizationId,
+      display_name:
+        entry.display_name.trim(),
+      sort_order:
+        entry.sort_order,
+      is_active:
+        entry.is_active,
+    })
+  }
+
+  return {
+    error: '',
+    requests,
+  }
+}
+
+/* ==================== 主组件 ==================== */
 
 export function SubjectsPanel() {
-  const [list, setList] = useState<SubjectItem[]>([])
-  const [loading, setLoading] = useState(true)
-  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null)
-  const showToast = useCallback((m: string, t: 'success' | 'error') => setToast({ message: m, type: t }), [])
+  const [
+    list,
+    setList,
+  ] = useState<
+    SubjectAdminItem[]
+  >([])
 
-  // 编辑弹窗：editing=null 且 modalOpen=true → 新增；editing 有值 → 编辑
-  const [modalOpen, setModalOpen] = useState(false)
-  const [editing, setEditing] = useState<SubjectItem | null>(null)
-  const [form, setForm] = useState<SubjectForm>(emptyForm(100))
-  const [saving, setSaving] = useState(false)
+  const [
+    organizations,
+    setOrganizations,
+  ] = useState<
+    OrganizationEducationDomainItem[]
+  >([])
 
-  // 删除二次确认
-  const [confirmDel, setConfirmDel] = useState<{ open: boolean; id: string; name: string }>({
-    open: false, id: '', name: '',
+  const [
+    loading,
+    setLoading,
+  ] = useState(true)
+
+  const [
+    saving,
+    setSaving,
+  ] = useState(false)
+
+  const [
+    modalOpen,
+    setModalOpen,
+  ] = useState(false)
+
+  const [
+    editing,
+    setEditing,
+  ] = useState<
+    SubjectAdminItem | null
+  >(null)
+
+  const [
+    form,
+    setForm,
+  ] = useState<SubjectForm>(
+    createEmptyForm(100),
+  )
+
+  const [
+    toast,
+    setToast,
+  ] = useState<{
+    message: string
+    type:
+      | 'success'
+      | 'error'
+  } | null>(null)
+
+  const [
+    confirmDel,
+    setConfirmDel,
+  ] = useState<{
+    open: boolean
+    id: string
+    name: string
+  }>({
+    open: false,
+    id: '',
+    name: '',
   })
 
-  // ==================== 加载列表 ====================
-  const load = useCallback(async () => {
-    try {
-      setLoading(true)
-      const items = await getAllSubjects()
-      setList(items)
-    } catch (e: unknown) {
-      showToast(e instanceof Error ? e.message : '加载学科列表失败', 'error')
-    } finally {
-      setLoading(false)
-    }
-  }, [showToast])
-
-  useEffect(() => { load() }, [load])
-
-  // ==================== 打开新增/编辑 ====================
-  const openCreate = () => {
-    const maxSort = list.reduce((m, s) => Math.max(m, s.sort_order), 0)
-    setEditing(null)
-    setForm(emptyForm(maxSort + 10))
-    setModalOpen(true)
-  }
-
-  const openEdit = (row: SubjectItem) => {
-    setEditing(row)
-    setForm({
-      name: row.name, code: row.code || '',
-      sort_order: row.sort_order, note: row.note || '',
-      is_active: row.is_active,
-    })
-    setModalOpen(true)
-  }
-
-  // ==================== 保存（新增/编辑）====================
-  const handleSave = async () => {
-    const name = form.name.trim()
-    if (!name) { showToast('请输入学科名', 'error'); return }
-    try {
-      setSaving(true)
-      if (editing) {
-        await updateSubject(editing.id, {
-          name, code: form.code.trim(),
-          sort_order: form.sort_order, note: form.note.trim(),
-          is_active: form.is_active,
+  const showToast =
+    useCallback(
+      (
+        message: string,
+        type:
+          | 'success'
+          | 'error',
+      ) => {
+        setToast({
+          message,
+          type,
         })
-        showToast('已保存', 'success')
-      } else {
-        await createSubject({
-          name, code: form.code.trim(),
-          sort_order: form.sort_order, note: form.note.trim(),
-        })
-        showToast('已新增', 'success')
+      },
+      [],
+    )
+
+  /* ==================== 数据加载 ==================== */
+
+  const load =
+    useCallback(async () => {
+      try {
+        setLoading(true)
+
+        const [
+          subjectItems,
+          organizationResult,
+        ] = await Promise.all([
+          getAllSubjects(),
+          getOrganizationEducationDomains(),
+        ])
+
+        setList(subjectItems)
+
+        setOrganizations(
+          organizationResult
+            .organizations || [],
+        )
+      } catch (
+        error: unknown
+      ) {
+        showToast(
+          error instanceof Error
+            ? error.message
+            : '加载课程管理数据失败',
+          'error',
+        )
+      } finally {
+        setLoading(false)
       }
-      setModalOpen(false)
-      await load()
-      await refreshSubjects() // 同步全站下拉
-    } catch (e: unknown) {
-      showToast(e instanceof Error ? e.message : '保存失败', 'error')
-    } finally {
-      setSaving(false)
-    }
+    }, [
+      showToast,
+    ])
+
+  useEffect(() => {
+    load()
+  }, [
+    load,
+  ])
+
+  /* ==================== 打开弹窗 ==================== */
+
+  const openCreate = () => {
+    const maxSort =
+      list.reduce(
+        (
+          currentMax,
+          row,
+        ) =>
+          Math.max(
+            currentMax,
+            row.sort_order,
+          ),
+        0,
+      )
+
+    setEditing(null)
+
+    setForm(
+      createEmptyForm(
+        maxSort + 10,
+      ),
+    )
+
+    setModalOpen(true)
   }
 
-  // ==================== 行内启停 ====================
-  const handleToggleActive = async (row: SubjectItem) => {
-    try {
-      await updateSubject(row.id, { is_active: !row.is_active })
-      showToast(!row.is_active ? '已启用' : '已停用', 'success')
-      await load()
-      await refreshSubjects()
-    } catch (e: unknown) {
-      showToast(e instanceof Error ? e.message : '操作失败', 'error')
-      await load()
-    }
+  const openEdit = (
+    row: SubjectAdminItem,
+  ) => {
+    setEditing(row)
+
+    setForm({
+      name: row.name,
+      code: row.code || '',
+      sort_order:
+        row.sort_order,
+      note: row.note || '',
+      is_active:
+        row.is_active,
+      catalog_entries:
+        (
+          row.catalog_entries ||
+          []
+        ).map(
+          catalogEntryToDraft,
+        ),
+    })
+
+    setModalOpen(true)
   }
 
-  // ==================== 删除 ====================
-  const doDelete = async (id: string) => {
-    try {
-      await deleteSubject(id)
-      showToast('已删除', 'success')
-      await load()
-      await refreshSubjects()
-    } catch (e: unknown) {
-      showToast(e instanceof Error ? e.message : '删除失败', 'error')
-    } finally {
-      setConfirmDel({ open: false, id: '', name: '' })
-    }
-  }
+  /* ==================== 保存 ==================== */
 
-  // 输入框统一样式
-  const inputStyle: React.CSSProperties = {
-    width: '100%', padding: '9px 12px', borderRadius: '8px',
-    border: `1px solid ${C.border}`, fontSize: '13px', outline: 'none',
-    boxSizing: 'border-box', background: C.white, color: C.text,
-  }
-  const labelStyle: React.CSSProperties = {
-    fontSize: '12px', fontWeight: 600, color: C.textSec, marginBottom: '5px', display: 'block',
-  }
+  const handleSave =
+    async () => {
+      const name =
+        form.name.trim()
+
+      if (!name) {
+        showToast(
+          '请输入课程名称',
+          'error',
+        )
+        return
+      }
+
+      const catalogResult =
+        buildCatalogRequests(
+          form.catalog_entries,
+        )
+
+      if (
+        catalogResult.error
+      ) {
+        showToast(
+          catalogResult.error,
+          'error',
+        )
+        return
+      }
+
+      try {
+        setSaving(true)
+
+        if (editing) {
+          await updateSubject(
+            editing.id,
+            {
+              name,
+              code:
+                form.code.trim(),
+              sort_order:
+                form.sort_order,
+              note:
+                form.note.trim(),
+              is_active:
+                form.is_active,
+              catalog_entries:
+                catalogResult
+                  .requests,
+            },
+          )
+
+          showToast(
+            '课程及目录配置已保存',
+            'success',
+          )
+        } else {
+          await createSubject({
+            name,
+            code:
+              form.code.trim(),
+            sort_order:
+              form.sort_order,
+            note:
+              form.note.trim(),
+            catalog_entries:
+              catalogResult
+                .requests,
+          })
+
+          showToast(
+            '课程及目录配置已新增',
+            'success',
+          )
+        }
+
+        setModalOpen(false)
+
+        await load()
+        await refreshSubjects()
+      } catch (
+        error: unknown
+      ) {
+        showToast(
+          error instanceof Error
+            ? error.message
+            : '保存失败',
+          'error',
+        )
+      } finally {
+        setSaving(false)
+      }
+    }
+
+  /* ==================== 行内启停 ==================== */
+
+  const handleToggleActive =
+    async (
+      row: SubjectAdminItem,
+    ) => {
+      try {
+        await updateSubject(
+          row.id,
+          {
+            is_active:
+              !row.is_active,
+          },
+        )
+
+        showToast(
+          !row.is_active
+            ? '课程已启用'
+            : '课程已停用',
+          'success',
+        )
+
+        await load()
+        await refreshSubjects()
+      } catch (
+        error: unknown
+      ) {
+        showToast(
+          error instanceof Error
+            ? error.message
+            : '操作失败',
+          'error',
+        )
+
+        await load()
+      }
+    }
+
+  /* ==================== 删除 ==================== */
+
+  const doDelete =
+    async (
+      id: string,
+    ) => {
+      try {
+        await deleteSubject(id)
+
+        showToast(
+          '课程及目录配置已删除',
+          'success',
+        )
+
+        await load()
+        await refreshSubjects()
+      } catch (
+        error: unknown
+      ) {
+        showToast(
+          error instanceof Error
+            ? error.message
+            : '删除失败',
+          'error',
+        )
+      } finally {
+        setConfirmDel({
+          open: false,
+          id: '',
+          name: '',
+        })
+      }
+    }
+
+  /* ==================== 渲染 ==================== */
 
   return (
     <div>
-      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
-
-      {/* 删除二次确认 */}
-      {confirmDel.open && (
-        <ConfirmDialog
-          title="删除学科"
-          message={`确认删除学科「${confirmDel.name}」？删除后不影响已有教案/课件等历史数据，但该学科将从所有下拉中移除。`}
-          onConfirm={() => doDelete(confirmDel.id)}
-          onCancel={() => setConfirmDel({ open: false, id: '', name: '' })}
+      {toast && (
+        <Toast
+          message={
+            toast.message
+          }
+          type={
+            toast.type
+          }
+          onClose={() => {
+            setToast(null)
+          }}
         />
       )}
 
-      {/* 新增/编辑弹窗 */}
-      {modalOpen && (
-        <div style={{
-          position: 'fixed', inset: 0, zIndex: 11000,
-          background: 'rgba(0,0,0,0.45)', backdropFilter: 'blur(4px)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}>
-          <div style={{ background: C.white, borderRadius: '16px', width: '420px', padding: '28px', boxShadow: '0 20px 60px rgba(0,0,0,0.2)' }}>
-            <div style={{ fontSize: '16px', fontWeight: 700, color: C.text, marginBottom: '18px' }}>
-              {editing ? '编辑学科' : '新增学科'}
-            </div>
-
-            <div style={{ marginBottom: '14px' }}>
-              <label style={labelStyle}>学科名 <span style={{ color: C.danger }}>*</span></label>
-              <input value={form.name} maxLength={50}
-                onChange={e => setForm(p => ({ ...p, name: e.target.value }))}
-                placeholder="如：信息科技" style={inputStyle} />
-            </div>
-
-            <div style={{ marginBottom: '14px' }}>
-              <label style={labelStyle}>索引编码（可选）</label>
-              <input value={form.code} maxLength={20}
-                onChange={e => setForm(p => ({ ...p, code: e.target.value }))}
-                placeholder="对应 AOCI 索引编码，可留空" style={inputStyle} />
-            </div>
-
-            <div style={{ marginBottom: '14px' }}>
-              <label style={labelStyle}>排序（数值越小越靠前）</label>
-              <input type="number" value={form.sort_order} min={1} max={9999}
-                onChange={e => setForm(p => ({ ...p, sort_order: Number(e.target.value) || 0 }))}
-                style={inputStyle} />
-            </div>
-
-            <div style={{ marginBottom: '14px' }}>
-              <label style={labelStyle}>备注（可选）</label>
-              <input value={form.note} maxLength={200}
-                onChange={e => setForm(p => ({ ...p, note: e.target.value }))}
-                placeholder="可选" style={inputStyle} />
-            </div>
-
-            {/* 编辑态才显示启停开关（新增默认启用）*/}
-            {editing && (
-              <div style={{ marginBottom: '18px', display: 'flex', alignItems: 'center', gap: '10px' }}>
-                <label style={{ ...labelStyle, marginBottom: 0 }}>状态</label>
-                <button
-                  onClick={() => setForm(p => ({ ...p, is_active: !p.is_active }))}
-                  style={{
-                    padding: '5px 14px', borderRadius: '20px', border: 'none', cursor: 'pointer',
-                    fontSize: '12px', fontWeight: 600,
-                    background: form.is_active ? C.successLight : C.bg,
-                    color: form.is_active ? C.success : C.textMuted,
-                  }}>
-                  {form.is_active ? '● 启用中' : '○ 已停用'}
-                </button>
-              </div>
-            )}
-
-            <div style={{ display: 'flex', gap: '10px' }}>
-              <button onClick={() => setModalOpen(false)} disabled={saving}
-                style={{ flex: 1, padding: '10px', borderRadius: '10px', border: `1px solid ${C.border}`, background: C.bg, fontSize: '14px', color: C.textSec, cursor: 'pointer' }}>
-                取消
-              </button>
-              <button onClick={handleSave} disabled={saving}
-                style={{ flex: 1, padding: '10px', borderRadius: '10px', border: 'none', background: saving ? '#9CA3AF' : `linear-gradient(135deg,${C.primary},#7C3AED)`, color: '#fff', fontSize: '14px', fontWeight: 600, cursor: saving ? 'not-allowed' : 'pointer' }}>
-                {saving ? '保存中...' : '保存'}
-              </button>
-            </div>
-          </div>
-        </div>
+      {confirmDel.open && (
+        <ConfirmDialog
+          title="删除课程"
+          message={
+            `确认删除课程「${confirmDel.name}」？` +
+            '该课程的全部教育域和学校目录配置也会一并删除。' +
+            '已有教案和课件的历史课程名称快照不受影响。'
+          }
+          onConfirm={() => {
+            doDelete(
+              confirmDel.id,
+            )
+          }}
+          onCancel={() => {
+            setConfirmDel({
+              open: false,
+              id: '',
+              name: '',
+            })
+          }}
+        />
       )}
 
-      {/* 标题栏 */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px' }}>
+      <SubjectCatalogFormModal
+        open={modalOpen}
+        editing={
+          editing !== null
+        }
+        value={form}
+        organizations={
+          organizations
+        }
+        loading={loading}
+        saving={saving}
+        onChange={patch => {
+          setForm(
+            previous => ({
+              ...previous,
+              ...patch,
+            }),
+          )
+        }}
+        onCancel={() => {
+          setModalOpen(false)
+        }}
+        onSave={
+          handleSave
+        }
+      />
+
+      <div
+        style={{
+          display: 'flex',
+          alignItems:
+            'flex-start',
+          justifyContent:
+            'space-between',
+          gap: '20px',
+          marginBottom: '16px',
+        }}
+      >
         <div>
-          <div style={{ fontSize: '16px', fontWeight: 700, color: C.text, display: 'flex', alignItems: 'center', gap: '8px' }}>
-            📚 学科管理
+          <div
+            style={{
+              display: 'flex',
+              alignItems:
+                'center',
+              gap: '8px',
+              color: C.text,
+              fontSize: '16px',
+              fontWeight: 700,
+            }}
+          >
+            📚 课程定义与目录
+
             {list.length > 0 && (
-              <span style={{ fontSize: '12px', fontWeight: 400, color: C.textMuted }}>共 {list.length} 个学科</span>
+              <span
+                style={{
+                  color:
+                    C.textMuted,
+                  fontSize:
+                    '12px',
+                  fontWeight:
+                    400,
+                }}
+              >
+                共 {list.length}
+                门课程
+              </span>
             )}
           </div>
-          <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '4px', lineHeight: 1.6, maxWidth: '640px' }}>
-            全平台学科下拉的统一数据源。此处增删改后，备课工坊 / 课件工坊 / 配方 / AI助手等所有学科下拉即时同步。
-            内置学科不可删除（可停用）；停用后仅从下拉隐藏，不影响历史数据。
+
+          <div
+            style={{
+              maxWidth: '760px',
+              marginTop: '4px',
+              color: C.textMuted,
+              fontSize: '12px',
+              lineHeight: 1.6,
+            }}
+          >
+            新增课程时必须配置教育域和适用学校。
+            教师下拉只显示当前教育域公共课程及本校专属课程；
+            备注字段不参与课程可见性判断。
           </div>
         </div>
-        <button onClick={openCreate}
-          style={{ padding: '8px 18px', borderRadius: '8px', border: 'none', background: `linear-gradient(135deg,${C.primary},#7C3AED)`, color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>
-          + 新增学科
+
+        <button
+          type="button"
+          disabled={loading}
+          onClick={openCreate}
+          style={{
+            padding:
+              '8px 18px',
+            borderRadius:
+              '8px',
+            border: 'none',
+            background:
+              loading
+                ? '#9CA3AF'
+                : `linear-gradient(135deg,${C.primary},#7C3AED)`,
+            color: '#fff',
+            fontSize: '13px',
+            fontWeight: 600,
+            cursor:
+              loading
+                ? 'not-allowed'
+                : 'pointer',
+            whiteSpace:
+              'nowrap',
+          }}
+        >
+          + 新增课程
         </button>
       </div>
 
-      {/* 列表 */}
-      <div style={{ background: C.white, borderRadius: '14px', border: `1px solid ${C.border}`, overflow: 'hidden' }}>
-        {/* 表头 */}
-        <div style={{ display: 'grid', gridTemplateColumns: '80px 2fr 1fr 1fr 2fr 200px', padding: '12px 20px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '12px', fontWeight: 600, color: C.textSec }}>
-          <span>排序</span><span>学科名</span><span>编码</span><span>状态</span><span>备注</span><span>操作</span>
-        </div>
-
-        {loading ? (
-          <div style={{ padding: '40px', textAlign: 'center', color: C.textMuted }}>加载中...</div>
-        ) : list.length === 0 ? (
-          <div style={{ padding: '40px', textAlign: 'center', color: C.textMuted }}>暂无学科，点击右上角「新增学科」添加</div>
-        ) : (
-          list.map((s, idx) => (
-            <div key={s.id}
-              style={{ display: 'grid', gridTemplateColumns: '80px 2fr 1fr 1fr 2fr 200px', padding: '13px 20px', alignItems: 'center', borderBottom: idx < list.length - 1 ? `1px solid ${C.border}` : 'none', fontSize: '13px' }}>
-              {/* 排序 */}
-              <span style={{ color: C.textMuted, fontFamily: 'monospace' }}>{s.sort_order}</span>
-              {/* 学科名 + 内置标 */}
-              <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span style={{ fontWeight: 600, color: C.text }}>{s.name}</span>
-                {s.is_system && (
-                  <span style={{ fontSize: '10px', padding: '1px 7px', borderRadius: '8px', background: C.primaryLight, color: C.primary, fontWeight: 600 }}>内置</span>
-                )}
-              </span>
-              {/* 编码 */}
-              <span>
-                {s.code
-                  ? <span style={{ fontSize: '11px', padding: '1px 8px', borderRadius: '6px', background: C.bg, color: C.textSec, border: `1px solid ${C.border}`, fontFamily: 'monospace' }}>{s.code}</span>
-                  : <span style={{ color: C.textMuted }}>—</span>}
-              </span>
-              {/* 状态（点击切换）*/}
-              <span>
-                <button onClick={() => handleToggleActive(s)}
-                  style={{
-                    padding: '3px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer',
-                    fontSize: '11px', fontWeight: 600,
-                    background: s.is_active ? C.successLight : C.bg,
-                    color: s.is_active ? C.success : C.textMuted,
-                  }}
-                  title={s.is_active ? '点击停用' : '点击启用'}>
-                  {s.is_active ? '● 启用' : '○ 停用'}
-                </button>
-              </span>
-              {/* 备注 */}
-              <span style={{ color: s.note ? C.textSec : C.textMuted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {s.note || '—'}
-              </span>
-              {/* 操作 */}
-              <span style={{ display: 'flex', gap: '6px' }}>
-                <button onClick={() => openEdit(s)}
-                  style={{ padding: '4px 12px', borderRadius: '6px', border: `1px solid ${C.border}`, background: C.bg, color: C.primary, fontSize: '12px', cursor: 'pointer', fontWeight: 500 }}>
-                  编辑
-                </button>
-                {s.is_system ? (
-                  <button disabled title="内置学科不可删除，如需隐藏请停用"
-                    style={{ padding: '4px 12px', borderRadius: '6px', border: `1px solid ${C.border}`, background: C.bg, color: C.textMuted, fontSize: '12px', cursor: 'not-allowed', fontWeight: 500 }}>
-                    删除
-                  </button>
-                ) : (
-                  <button onClick={() => setConfirmDel({ open: true, id: s.id, name: s.name })}
-                    style={{ padding: '4px 12px', borderRadius: '6px', border: '1px solid #FEE2E2', background: '#FEF2F2', color: C.danger, fontSize: '12px', cursor: 'pointer', fontWeight: 500 }}>
-                    删除
-                  </button>
-                )}
-              </span>
-            </div>
-          ))
-        )}
-      </div>
+      <SubjectCatalogTable
+        list={list}
+        loading={loading}
+        onToggleActive={
+          handleToggleActive
+        }
+        onEdit={openEdit}
+        onDelete={row => {
+          setConfirmDel({
+            open: true,
+            id: row.id,
+            name: row.name,
+          })
+        }}
+      />
     </div>
   )
 }

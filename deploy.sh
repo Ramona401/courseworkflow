@@ -69,8 +69,188 @@ OLD_BIN_BACKUP=""
 DB_BACKUP_FILE=""
 BACKUP_SIZE=""
 
+# 上下文15：课本图片从公开uploads目录迁移到项目私有目录。
+#
+# 私有目录位于systemd现有ReadWritePaths覆盖范围内，
+# 新后端只从该目录读写，Nginx不再直接暴露课本原图。
+TEXTBOOK_PUBLIC_DIR="$PROJECT_ROOT/uploads/textbooks"
+TEXTBOOK_PRIVATE_DIR="$PROJECT_ROOT/private/textbooks"
+TEXTBOOK_MIGRATION_ACTIVE=0
+TEXTBOOK_PROBE_PATH=""
+
 # 开始计时
 START_TS=$(date +%s)
+
+# ============================================================================
+# 上下文15：课本图片私有迁移辅助函数
+# ============================================================================
+
+# prepare_textbook_private_storage 将当前公开目录中的全部课本图片
+# 增量复制到私有目录。
+#
+# 部署前执行一次，后端重启后再执行一次：
+#   - 第一次复制绝大部分存量文件；
+#   - 第二次捕获旧后端优雅退出期间刚完成的上传。
+#
+# 公开目录此时仍保留，因此新后端健康检查失败并自动回滚旧二进制时，
+# 旧版本仍能继续访问原图片，不会出现数据路径断裂。
+prepare_textbook_private_storage() {
+    mkdir -p "$PROJECT_ROOT/private"
+    mkdir -p "$TEXTBOOK_PRIVATE_DIR"
+
+    chmod 700 "$PROJECT_ROOT/private"
+    chmod 700 "$TEXTBOOK_PRIVATE_DIR"
+
+    if [ -d "$TEXTBOOK_PUBLIC_DIR" ]; then
+        cp -a "$TEXTBOOK_PUBLIC_DIR/." "$TEXTBOOK_PRIVATE_DIR/"
+    fi
+
+    # 私有目录中所有文件和子目录只允许root访问。
+    chmod -R go-rwx "$TEXTBOOK_PRIVATE_DIR"
+
+    # 记录一条真实旧文件相对路径，供部署后的公开直链冒烟检查使用。
+    TEXTBOOK_PROBE_PATH=$(python3 - "$TEXTBOOK_PUBLIC_DIR" <<'PYTEXTBOOKPROBE'
+import sys
+from pathlib import Path
+from urllib.parse import quote
+
+public_dir = Path(sys.argv[1])
+
+if not public_dir.exists():
+    print("")
+    raise SystemExit(0)
+
+for path in sorted(public_dir.rglob("*")):
+    if path.is_file() and not path.is_symlink():
+        relative = path.relative_to(public_dir).as_posix()
+        print(quote(relative, safe="/"))
+        raise SystemExit(0)
+
+print("")
+PYTEXTBOOKPROBE
+)
+}
+
+# verify_textbook_private_storage 对公开目录中的每一个普通文件做逐文件校验：
+#   - 私有目录必须存在同名文件；
+#   - 文件大小必须一致；
+#   - SHA-256必须一致；
+#   - 两侧都禁止出现符号链接。
+#
+# 私有目录允许存在额外文件，因为新后端启动后可能已经收到新上传。
+verify_textbook_private_storage() {
+    python3 - "$TEXTBOOK_PUBLIC_DIR" "$TEXTBOOK_PRIVATE_DIR" <<'PYTEXTBOOKVERIFY'
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+public_dir = Path(sys.argv[1])
+private_dir = Path(sys.argv[2])
+
+if not private_dir.exists():
+    raise SystemExit("课本私有目录不存在")
+
+if not public_dir.exists():
+    print("       ✅ 公开课本目录不存在，无存量文件需要校验")
+    raise SystemExit(0)
+
+checked_files = 0
+checked_bytes = 0
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+for root, directory_names, file_names in os.walk(
+    public_dir,
+    followlinks=False,
+):
+    root_path = Path(root)
+
+    for directory_name in directory_names:
+        directory_path = root_path / directory_name
+
+        if directory_path.is_symlink():
+            raise SystemExit(
+                f"公开课本目录存在符号链接目录：{directory_path}"
+            )
+
+    for file_name in file_names:
+        public_path = root_path / file_name
+
+        if public_path.is_symlink():
+            raise SystemExit(
+                f"公开课本目录存在符号链接文件：{public_path}"
+            )
+
+        if not public_path.is_file():
+            raise SystemExit(
+                f"公开课本目录存在非普通文件：{public_path}"
+            )
+
+        relative_path = public_path.relative_to(public_dir)
+        private_path = private_dir / relative_path
+
+        if private_path.is_symlink():
+            raise SystemExit(
+                f"私有课本目录存在符号链接文件：{private_path}"
+            )
+
+        if not private_path.is_file():
+            raise SystemExit(
+                f"私有目录缺少课本文件：{relative_path}"
+            )
+
+        public_size = public_path.stat().st_size
+        private_size = private_path.stat().st_size
+
+        if public_size != private_size:
+            raise SystemExit(
+                f"课本文件大小不一致：{relative_path}"
+            )
+
+        if sha256_file(public_path) != sha256_file(private_path):
+            raise SystemExit(
+                f"课本文件校验和不一致：{relative_path}"
+            )
+
+        checked_files += 1
+        checked_bytes += public_size
+
+print(
+    "       ✅ 课本图片迁移校验通过 "
+    f"({checked_files}个文件，{checked_bytes}字节)"
+)
+PYTEXTBOOKVERIFY
+}
+
+# retire_public_textbook_storage 只在新后端健康检查成功后执行。
+#
+# 此时私有副本已完成两轮复制和逐文件SHA-256校验，
+# 可以安全删除公开目录中的重复文件，并创建一个空的700权限目录。
+#
+# 即使Nginx仍配置了/uploads静态映射，该目录也没有任何课本文件，
+# 旧的伪造或缓存URL因此无法再读取原图。
+retire_public_textbook_storage() {
+    verify_textbook_private_storage
+
+    rm -rf "$TEXTBOOK_PUBLIC_DIR"
+    mkdir -p "$TEXTBOOK_PUBLIC_DIR"
+    chmod 700 "$TEXTBOOK_PUBLIC_DIR"
+
+    echo "   ✅ 公开课本目录已清空并降为700权限"
+    echo "   ✅ 课本原图现仅保存在: $TEXTBOOK_PRIVATE_DIR"
+}
+
 
 echo "========= TE-DNA 2.0 部署开始 ========="
 echo "时间:     $(date '+%Y-%m-%d %H:%M:%S')"
@@ -335,6 +515,27 @@ else
     ls -td "$FRONTEND_DIR/dist.backup."* 2>/dev/null | tail -n +4 | xargs -r rm -rf
 fi
 
+
+# ============================================================================
+# 3.5 课本图片私有迁移预同步
+# ============================================================================
+#
+# 只有本次同时发布新后端时才迁移。
+# 纯前端部署不能提前退役旧后端仍在使用的公开目录。
+if [ "$SKIP_BACKEND" = "1" ]; then
+    echo ""
+    echo "3.5 ⏭ 跳过课本图片私有迁移（本次未发布后端）"
+else
+    echo ""
+    echo "3.5 课本图片私有迁移预同步"
+
+    prepare_textbook_private_storage
+    verify_textbook_private_storage
+
+    TEXTBOOK_MIGRATION_ACTIVE=1
+    echo "   ✅ 私有目录预同步完成，公开目录暂时保留用于安全回滚"
+fi
+
 # ============================================================================
 # 4. Nginx 配置校验与重载
 # ============================================================================
@@ -371,6 +572,17 @@ else
 
     systemctl restart "$SERVICE_NAME"
     echo "   ✅ systemctl restart $SERVICE_NAME 已发送"
+
+    if [ "$TEXTBOOK_MIGRATION_ACTIVE" = "1" ]; then
+        echo "   同步旧后端优雅退出后的课本图片增量..."
+
+        # 旧进程停止接收新请求并完成在途请求后，
+        # 再复制一次公开目录，捕获重启期间最后完成的上传。
+        prepare_textbook_private_storage
+        verify_textbook_private_storage
+
+        echo "   ✅ 旧后端优雅退出后的课本图片增量同步完成"
+    fi
 fi
 
 # ============================================================================
@@ -410,6 +622,17 @@ else
     false
 fi
 
+
+# 新后端健康检查成功后，才正式退役公开课本目录。
+#
+# 如果健康检查失败，上面的自动回滚会在公开目录仍完整时恢复旧后端，
+# 因此不会因文件迁移破坏回滚链。
+if [ "$TEXTBOOK_MIGRATION_ACTIVE" = "1" ]; then
+    echo ""
+    echo "6.1 正式退役公开课本图片目录"
+    retire_public_textbook_storage
+fi
+
 # ============================================================================
 # 7. 端点冒烟验证
 # ============================================================================
@@ -418,15 +641,36 @@ echo "7. 端点冒烟验证"
 GO_HEALTH=$(curl -so/dev/null -w%{http_code} "$HEALTH_URL")
 NGINX_HTTPS=$(curl -so/dev/null -w%{http_code} --insecure "$PUBLIC_URL")
 NGINX_API=$(curl -so/dev/null -w%{http_code} --insecure "$PUBLIC_URL/api/v1/health")
+
+# 鉴权图片端点在没有JWT时必须返回401。
+TEXTBOOK_IMAGE_UNAUTH=$(curl -so/dev/null -w%{http_code} --insecure     "$PUBLIC_URL/api/v1/lesson-plans/textbooks/00000000-0000-0000-0000-000000000000/image")
+
+# 原公开/uploads直链不得再返回真实图片。
+TEXTBOOK_DIRECT_PATH="${TEXTBOOK_PROBE_PATH:-__context15_direct_access_probe__.png}"
+TEXTBOOK_DIRECT_STATUS=$(curl -so/dev/null -w%{http_code} --insecure     "$PUBLIC_URL/uploads/textbooks/$TEXTBOOK_DIRECT_PATH")
 echo "   Go 直连 /health:     $GO_HEALTH"
 echo "   Nginx HTTPS 首页:    $NGINX_HTTPS"
 echo "   Nginx HTTPS /health: $NGINX_API"
+echo "   课本图片无JWT访问:  $TEXTBOOK_IMAGE_UNAUTH"
+echo "   旧课本公开直链:     $TEXTBOOK_DIRECT_STATUS"
 
 if [ "$GO_HEALTH" != "200" ] || [ "$NGINX_HTTPS" != "200" ] || [ "$NGINX_API" != "200" ]; then
     echo "   ❌ 关键端点异常，请人工核查"
     false
 fi
+
+if [ "$TEXTBOOK_IMAGE_UNAUTH" != "401" ]; then
+    echo "   ❌ 课本图片鉴权端点未正确拒绝无JWT请求"
+    false
+fi
+
+if [ "$TEXTBOOK_DIRECT_STATUS" = "200" ]; then
+    echo "   ❌ 旧/uploads课本直链仍可直接访问"
+    false
+fi
+
 echo "   ✅ 所有关键端点正常"
+echo "   ✅ 课本图片鉴权与公开直链关闭验证通过"
 
 # ============================================================================
 # 8. 部署统计

@@ -1,143 +1,408 @@
 package handlers
 
-// curriculum_handler.go — 课程知识库公共只读查询处理器
+// curriculum_handler.go — K12课程知识库只读查询处理器
 //
-// 平台级公共接口（/api/v1/curriculum/*），学科无关、场景无关：
-//   课件工坊「从主题创建」查它做难度适配；
-//   备课工坊「教案撰写」将来同样复用同一批接口取知识点。
-// 因此本 handler 不依赖任何 courseware/lesson_plan 服务，只读 curriculum_repo。
+// 课程知识点、教材单元和出版社数据目前都是K12专属基础数据。
 //
-// 提供接口：
-//   GET /api/v1/curriculum/knowledge-points?subject=数学&grade=3   — 按学科+年级查知识点清单（供勾选+难度适配）
-//   GET /api/v1/curriculum/textbook-units?subject=数学&publisher=人教版&grade=3&semester=上册 — 查教材单元
-//   GET /api/v1/curriculum/publishers?subject=数学&grade=3         — 查某学科某年级有哪些教材版本
+// 安全规则：
+//   1. JWT只提供用户ID，不作为教育域真相源；
+//   2. 每次请求实时读取users.role；
+//   3. 使用教案创建严格解析器取得唯一具体教学域；
+//   4. 只有K12继续查询数据库；
+//   5. vocational、adult、mixed、空值、非法值和归属冲突返回成功空数组；
+//   6. 数据库或基础设施错误返回5xx，不伪装成空数据。
+//
+// Repository还会再次校验显式educationDomain参数，
+// 防止其它内部调用绕过Handler。
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"tedna/internal/middleware"
+	"tedna/internal/models"
 	"tedna/internal/repository"
 	"tedna/internal/utils"
 )
 
-// CurriculumHandler 课程知识库只读查询处理器
-type CurriculumHandler struct{}
+// curriculumHandlerDeps 是课程知识库查询的最小依赖集合。
+type curriculumHandlerDeps struct {
+	findUser func(
+		ctx context.Context,
+		userID string,
+	) (*models.User, error)
 
-// NewCurriculumHandler 创建课程知识库处理器
+	resolveEducationDomain func(
+		ctx context.Context,
+		userID string,
+		role string,
+	) (string, error)
+
+	listKnowledgePoints func(
+		ctx context.Context,
+		educationDomain string,
+		subject string,
+		gradeNum int,
+	) ([]*models.CurriculumKP, error)
+
+	listTextbookUnits func(
+		ctx context.Context,
+		educationDomain string,
+		subject string,
+		publisher string,
+		gradeNum int,
+		semester string,
+	) ([]*models.TextbookUnit, error)
+
+	listPublishers func(
+		ctx context.Context,
+		educationDomain string,
+		subject string,
+		gradeNum int,
+	) ([]string, error)
+}
+
+// CurriculumHandler 课程知识库只读查询处理器。
+type CurriculumHandler struct {
+	deps curriculumHandlerDeps
+}
+
+// NewCurriculumHandler 创建课程知识库处理器。
 func NewCurriculumHandler() *CurriculumHandler {
-	return &CurriculumHandler{}
+	return &CurriculumHandler{
+		deps: curriculumHandlerDeps{
+			findUser: repository.FindUserByID,
+			resolveEducationDomain: repository.
+				ResolveLessonPlanCreationEducationDomain,
+			listKnowledgePoints: repository.
+				ListCurriculumKPsBySubjectGrade,
+			listTextbookUnits: repository.
+				ListTextbookUnits,
+			listPublishers: repository.
+				ListTextbookPublishers,
+		},
+	}
+}
+
+// resolveCurriculumEducationDomain 实时解析当前请求的可信教育域。
+//
+// 无有效教学域、域冲突或区域管理员任命未就绪属于安全空结果；
+// 数据库和其它基础设施错误必须向上传递。
+func (h *CurriculumHandler) resolveCurriculumEducationDomain(
+	ctx context.Context,
+	userID string,
+) (string, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return "", nil
+	}
+
+	user, err := h.deps.findUser(ctx, userID)
+	if err != nil {
+		if errors.Is(
+			err,
+			repository.ErrUserNotFound,
+		) {
+			return "", nil
+		}
+
+		return "", fmt.Errorf(
+			"读取课程知识库查询用户失败: %w",
+			err,
+		)
+	}
+	if user == nil ||
+		strings.TrimSpace(user.Role) == "" {
+		return "", nil
+	}
+
+	domain, err := h.deps.resolveEducationDomain(
+		ctx,
+		userID,
+		user.Role,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(
+			err,
+			repository.ErrLessonPlanCreationEducationDomainUnavailable,
+		),
+			errors.Is(
+				err,
+				repository.ErrLessonPlanCreationEducationDomainConflict,
+			),
+			errors.Is(
+				err,
+				repository.ErrRegionAdminEducationDomainNotReady,
+			):
+			return "", nil
+
+		default:
+			return "", fmt.Errorf(
+				"解析课程知识库查询教育域失败: %w",
+				err,
+			)
+		}
+	}
+
+	domain = strings.ToLower(
+		strings.TrimSpace(domain),
+	)
+	if !models.IsTeachingEducationDomain(domain) {
+		return "", nil
+	}
+
+	return domain, nil
 }
 
 // ListKnowledgePoints GET /api/v1/curriculum/knowledge-points
-// 按学科+年级查询课标知识点清单。
-// query: subject(必填) grade(年级数字1-9,可选;不传则返回该学科全部年级)
-// 返回按 domain 分组排序的知识点数组，供前端勾选 + 后续难度适配。
-func (h *CurriculumHandler) ListKnowledgePoints(w http.ResponseWriter, r *http.Request) {
+func (h *CurriculumHandler) ListKnowledgePoints(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET请求",
+		)
 		return
 	}
-	// 登录即可访问（公共数据，但仍要求登录态，避免裸暴露）
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	subject := r.URL.Query().Get("subject")
+	subject := strings.TrimSpace(
+		r.URL.Query().Get("subject"),
+	)
 	if subject == "" {
-		utils.BadRequest(w, "缺少 subject 参数")
+		utils.BadRequest(
+			w,
+			"缺少 subject 参数",
+		)
 		return
 	}
-	gradeNum, _ := strconv.Atoi(r.URL.Query().Get("grade"))
 
-	kps, err := repository.ListCurriculumKPsBySubjectGrade(r.Context(), subject, gradeNum)
+	gradeNum, _ := strconv.Atoi(
+		r.URL.Query().Get("grade"),
+	)
+
+	domain, err := h.resolveCurriculumEducationDomain(
+		r.Context(),
+		claims.UserID,
+	)
 	if err != nil {
-		utils.InternalError(w, "查询知识点失败: "+err.Error())
+		utils.InternalError(
+			w,
+			"查询知识点失败",
+		)
 		return
 	}
-	if kps == nil {
-		kps = nil // 保持 nil → JSON 序列化为 null；前端按空处理
+
+	knowledgePoints := []*models.CurriculumKP{}
+
+	if domain == models.EducationDomainK12 {
+		knowledgePoints, err =
+			h.deps.listKnowledgePoints(
+				r.Context(),
+				domain,
+				subject,
+				gradeNum,
+			)
+		if err != nil {
+			utils.InternalError(
+				w,
+				"查询知识点失败",
+			)
+			return
+		}
+		if knowledgePoints == nil {
+			knowledgePoints =
+				[]*models.CurriculumKP{}
+		}
 	}
-	utils.Success(w, map[string]interface{}{
-		"subject":          subject,
-		"grade":            gradeNum,
-		"knowledge_points": kps,
-		"total":            len(kps),
-	})
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"subject":          subject,
+			"grade":            gradeNum,
+			"knowledge_points": knowledgePoints,
+			"total":            len(knowledgePoints),
+		},
+	)
 }
 
 // ListTextbookUnits GET /api/v1/curriculum/textbook-units
-// 按学科+版本+年级+册查询教材单元。
-// query: subject(必填) publisher(可选) grade(可选) semester(可选)
-func (h *CurriculumHandler) ListTextbookUnits(w http.ResponseWriter, r *http.Request) {
+func (h *CurriculumHandler) ListTextbookUnits(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	subject := r.URL.Query().Get("subject")
+	subject := strings.TrimSpace(
+		r.URL.Query().Get("subject"),
+	)
 	if subject == "" {
-		utils.BadRequest(w, "缺少 subject 参数")
+		utils.BadRequest(
+			w,
+			"缺少 subject 参数",
+		)
 		return
 	}
-	publisher := r.URL.Query().Get("publisher")
-	semester := r.URL.Query().Get("semester")
-	gradeNum, _ := strconv.Atoi(r.URL.Query().Get("grade"))
 
-	units, err := repository.ListTextbookUnits(r.Context(), subject, publisher, gradeNum, semester)
+	publisher := strings.TrimSpace(
+		r.URL.Query().Get("publisher"),
+	)
+	semester := strings.TrimSpace(
+		r.URL.Query().Get("semester"),
+	)
+	gradeNum, _ := strconv.Atoi(
+		r.URL.Query().Get("grade"),
+	)
+
+	domain, err := h.resolveCurriculumEducationDomain(
+		r.Context(),
+		claims.UserID,
+	)
 	if err != nil {
-		utils.InternalError(w, "查询教材单元失败: "+err.Error())
+		utils.InternalError(
+			w,
+			"查询教材单元失败",
+		)
 		return
 	}
-	utils.Success(w, map[string]interface{}{
-		"subject":   subject,
-		"publisher": publisher,
-		"grade":     gradeNum,
-		"semester":  semester,
-		"units":     units,
-		"total":     len(units),
-	})
+
+	units := []*models.TextbookUnit{}
+
+	if domain == models.EducationDomainK12 {
+		units, err = h.deps.listTextbookUnits(
+			r.Context(),
+			domain,
+			subject,
+			publisher,
+			gradeNum,
+			semester,
+		)
+		if err != nil {
+			utils.InternalError(
+				w,
+				"查询教材单元失败",
+			)
+			return
+		}
+		if units == nil {
+			units = []*models.TextbookUnit{}
+		}
+	}
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"subject":   subject,
+			"publisher": publisher,
+			"grade":     gradeNum,
+			"semester":  semester,
+			"units":     units,
+			"total":     len(units),
+		},
+	)
 }
 
 // ListPublishers GET /api/v1/curriculum/publishers
-// 查询某学科某年级下有哪些教材版本（供前端版本下拉）。
-// query: subject(必填) grade(必填)
-func (h *CurriculumHandler) ListPublishers(w http.ResponseWriter, r *http.Request) {
+func (h *CurriculumHandler) ListPublishers(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	subject := r.URL.Query().Get("subject")
-	gradeNum, _ := strconv.Atoi(r.URL.Query().Get("grade"))
+	subject := strings.TrimSpace(
+		r.URL.Query().Get("subject"),
+	)
+	gradeNum, _ := strconv.Atoi(
+		r.URL.Query().Get("grade"),
+	)
 	if subject == "" || gradeNum <= 0 {
-		utils.BadRequest(w, "缺少 subject 或 grade 参数")
+		utils.BadRequest(
+			w,
+			"缺少 subject 或 grade 参数",
+		)
 		return
 	}
 
-	publishers, err := repository.ListTextbookPublishers(r.Context(), subject, gradeNum)
+	domain, err := h.resolveCurriculumEducationDomain(
+		r.Context(),
+		claims.UserID,
+	)
 	if err != nil {
-		utils.InternalError(w, "查询教材版本失败: "+err.Error())
+		utils.InternalError(
+			w,
+			"查询教材版本失败",
+		)
 		return
 	}
-	if publishers == nil {
-		publishers = []string{}
+
+	publishers := []string{}
+
+	if domain == models.EducationDomainK12 {
+		publishers, err =
+			h.deps.listPublishers(
+				r.Context(),
+				domain,
+				subject,
+				gradeNum,
+			)
+		if err != nil {
+			utils.InternalError(
+				w,
+				"查询教材版本失败",
+			)
+			return
+		}
+		if publishers == nil {
+			publishers = []string{}
+		}
 	}
-	utils.Success(w, map[string]interface{}{
-		"subject":    subject,
-		"grade":      gradeNum,
-		"publishers": publishers,
-	})
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"subject":    subject,
+			"grade":      gradeNum,
+			"publishers": publishers,
+		},
+	)
 }

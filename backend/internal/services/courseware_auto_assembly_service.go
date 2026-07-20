@@ -112,6 +112,7 @@ type cwAssemblyPageResult struct {
 type cwAssemblyPageContext struct {
 	coursewareID  string
 	userID        string
+	actor         *CoursewareActorContext
 	schoolID      string
 	cw            *models.Courseware
 	styleCfg      *cwStyleConfig // 真实类型（gen_service 内小写 cwStyleConfig）
@@ -135,22 +136,54 @@ type cwAssemblyPageContext struct {
 // 由 handler 在 go func 内以 context.Background() 调用。
 //
 // skipVideo：交付模式区分——
-//   false = 全自动装配（HTML + 配图 + 视频首帧占位，视频按关键词命中页决定）
-//   true  = HTML+配图不做视频（中间档，所有页一律跳过视频占位）
-func (s *CoursewareAutoAssemblyService) AutoAssemble(ctx context.Context, coursewareID string, userID string, skipVideo bool) error {
+//
+//	false = 全自动装配（HTML + 配图 + 视频首帧占位，视频按关键词命中页决定）
+//	true  = HTML+配图不做视频（中间档，所有页一律跳过视频占位）
+func (s *CoursewareAutoAssemblyService) AutoAssemble(ctx context.Context, coursewareID string, actor *CoursewareActorContext, skipVideo bool) error {
 	startTime := time.Now()
 
-	// ---- 防并发：同一课件同时只允许一个装配任务 ----
-	if _, busy := cwAssemblyRunning.LoadOrStore(coursewareID, struct{}{}); busy {
-		s.pushError(coursewareID, "该课件正在装配中，请勿重复触发")
-		return fmt.Errorf("课件正在装配中: %s", coursewareID)
+	// Handler已完成启动前预检；后台任务再次加载正式课件，
+	// 执行作者专属权限与教育域二次校验。
+	cw, scopedActor, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				coursewareID,
+				actor,
+			)
+	if err != nil {
+		s.pushError(
+			coursewareID,
+			err.Error(),
+		)
+		return err
+	}
+
+	// 权限校验必须先于运行锁，避免无权调用者占用装配锁。
+	if _, busy := cwAssemblyRunning.LoadOrStore(
+		coursewareID,
+		struct{}{},
+	); busy {
+		s.pushError(
+			coursewareID,
+			"该课件正在装配中，请勿重复触发",
+		)
+		return fmt.Errorf(
+			"课件正在装配中: %s",
+			coursewareID,
+		)
 	}
 	defer cwAssemblyRunning.Delete(coursewareID)
 
-	// ---- 前置校验（含风格锚点强约束）+ 资源加载（skipVideo 一并写入上下文）----
-	pc, pages, err := s.prepareAssembly(ctx, coursewareID, userID, skipVideo)
+	// 前置业务校验、风格锚点强约束与资源加载。
+	pc, pages, err := s.prepareAssembly(
+		ctx,
+		cw,
+		scopedActor,
+		skipVideo,
+	)
 	if err != nil {
-		return err // prepareAssembly 内部已推送具体错误事件
+		return err
 	}
 
 	totalPages := len(pages)
@@ -377,19 +410,25 @@ func (s *CoursewareAutoAssemblyService) AutoAssemble(ctx context.Context, course
 // 复用 gen_service 的私有方法（同包可调），与批量生成保持完全一致的风格/模板/教案上下文。
 // skipVideo 一并写入返回的上下文，供单页视频链判定是否跳过。
 func (s *CoursewareAutoAssemblyService) prepareAssembly(
-	ctx context.Context, coursewareID string, userID string, skipVideo bool,
+	ctx context.Context,
+	cw *models.Courseware,
+	actor *CoursewareActorContext,
+	skipVideo bool,
 ) (*cwAssemblyPageContext, []*models.CoursewarePage, error) {
-	// 1. 课件存在 + 归属
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
-	if err != nil {
-		s.pushError(coursewareID, "课件不存在: "+err.Error())
-		return nil, nil, fmt.Errorf("课件不存在: %w", err)
+	if cw == nil {
+		return nil, nil,
+			ErrCoursewareEducationDomainInvalid
 	}
-	if cw.UserID != userID {
-		s.pushError(coursewareID, "无权操作此课件")
-		return nil, nil, fmt.Errorf("无权操作此课件")
+	if actor == nil ||
+		strings.TrimSpace(actor.UserID) == "" {
+		return nil, nil,
+			ErrCoursewareActorRequired
 	}
 
+	coursewareID := cw.ID
+	userID := actor.UserID
+
+	// 1. 作者专属权限与教育域已由AutoAssemble后台入口校验。
 	// 2. 状态校验：generating / preview 才允许装配
 	if cw.Status != models.CoursewareStatusGenerating && cw.Status != models.CoursewareStatusPreview {
 		s.pushError(coursewareID, "当前状态不允许全自动装配: "+cw.Status)
@@ -455,6 +494,7 @@ func (s *CoursewareAutoAssemblyService) prepareAssembly(
 	pc := &cwAssemblyPageContext{
 		coursewareID:  coursewareID,
 		userID:        userID,
+		actor:         actor,
 		schoolID:      schoolID,
 		cw:            cw,
 		styleCfg:      styleCfg,

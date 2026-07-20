@@ -73,28 +73,30 @@ func (s *WorkshopStageService) GetRecommendedComponents(
 	seenIDs := make(map[string]bool)
 	var allItems []*models.RecommendedComponentItem
 
-	// 只有严格匹配当前学科和具体年级的配方，
-	// 才能向阶段推荐列表提供配方组件。
-	//
-	// 存量错误关联不修改数据库，只在本轮运行时忽略。
+	// 配方组件按本会话的选择方式加载：
+	//   - 自动配方继续严格匹配学科和具体年级；
+	//   - 老师指定配方只校验active与使用权限；
+	//   - 明确不使用配方时不提供配方组件。
 	if lp.RecipeID != nil &&
 		strings.TrimSpace(*lp.RecipeID) != "" {
-		recipe, recipeErr := loadRecipeForLesson(
-			ctx,
-			*lp.RecipeID,
-			lp.Subject,
-			lp.Grade,
-		)
+		recipe, selectionMode, recipeErr :=
+			loadRecipeForPlanUse(
+				ctx,
+				lp,
+			)
+
 		if recipeErr != nil {
 			wsLog.Info(
-				"阶段组件推荐忽略不适用配方",
+				"阶段组件推荐忽略当前不可用的配方",
 				"plan_id", lessonPlanID,
 				"stage", stageCode,
 				"recipe_id", *lp.RecipeID,
+				"recipe_mode", selectionMode,
 				"subject", lp.Subject,
 				"grade", lp.Grade,
+				"error", recipeErr,
 			)
-		} else {
+		} else if recipe != nil {
 			recipeItems := s.getRecipeComponentsForStage(
 				ctx,
 				recipe,

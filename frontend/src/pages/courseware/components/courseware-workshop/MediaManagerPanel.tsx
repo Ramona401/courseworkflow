@@ -25,6 +25,8 @@
  * 每步失败自动降级保留上一步可用成片，与三选项导出弹窗配套。
  */
 import { useState, useEffect } from 'react'
+import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import {
   generateCWImage, uploadCWImage, listPageAssets, deleteCWAsset,
   advancedConcatCWVideos, uploadCWVideo, burnInSubtitle,
@@ -73,18 +75,187 @@ interface Props {
   onPageUpdated?: (pageNum: number, html: string) => void
 }
 
+
+const MEDIA_IMAGE_SIZE_OPTIONS = [
+  '1920x1920',
+  '2560x1440',
+  '3072x1280',
+  '1440x2560',
+]
+
+interface MediaImageDraftForm {
+  prompt: string
+  size: string
+  styleKey: string
+  stylePrefixText: string
+  strippedStyleTail: string
+}
+
+function createMediaImageInitialForm():
+  MediaImageDraftForm {
+  return {
+    prompt: '',
+    size: '1920x1920',
+    styleKey: '',
+    stylePrefixText: '',
+    strippedStyleTail: '',
+  }
+}
+
+function parseMediaImageDraftForm(
+  raw: string,
+  fallback: MediaImageDraftForm,
+): MediaImageDraftForm {
+  if (!raw.trim()) {
+    return {
+      ...fallback,
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(
+      raw,
+    ) as Partial<MediaImageDraftForm>
+
+    const size =
+      typeof parsed.size === 'string'
+      && MEDIA_IMAGE_SIZE_OPTIONS.includes(
+        parsed.size,
+      )
+        ? parsed.size
+        : fallback.size
+
+    const styleKey =
+      typeof parsed.styleKey === 'string'
+      && CW_IMG_STYLES.some(
+        style =>
+          style.key === parsed.styleKey,
+      )
+        ? parsed.styleKey
+        : ''
+
+    return {
+      prompt:
+        typeof parsed.prompt === 'string'
+          ? parsed.prompt
+          : '',
+      size,
+      styleKey,
+      stylePrefixText:
+        typeof parsed.stylePrefixText ===
+          'string'
+          ? parsed.stylePrefixText
+          : '',
+      strippedStyleTail:
+        typeof parsed.strippedStyleTail ===
+          'string'
+          ? parsed.strippedStyleTail
+          : '',
+    }
+  } catch {
+    return {
+      ...fallback,
+    }
+  }
+}
+
 export default function MediaManagerPanel({ coursewareId, pageNum, courseware, anchorSetting, anchorClearing, onSetAnchor, onClearAnchor, mediaTab }: Props) {
   // ==================== 共享状态 ====================
-  const [mediaAssets, setMediaAssets] = useState<CoursewareAsset[]>([])
-  const [mediaGenPrompt, setMediaGenPrompt] = useState('')
-  const [mediaSize, setMediaSize] = useState('1920x1920')
+  const { user } = useAuth()
+
+  const [mediaAssets, setMediaAssets] =
+    useState<CoursewareAsset[]>([])
+
+  /**
+   * 图片生成文字表单按用户、课件和页码隔离。
+   *
+   * 这里只保存纯文字和枚举状态；
+   * 参考图URL、上传文件、资产ID和生成结果均不进入草稿。
+   */
+  const initialMediaImageForm =
+    createMediaImageInitialForm()
+
+  const mediaImageDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'courseware-media-image',
+    resourceId: [
+      coursewareId,
+      `page-${pageNum}`,
+    ].join('|'),
+    field: 'generation-form',
+    initialValue:
+      JSON.stringify(
+        initialMediaImageForm,
+      ),
+    maxHistory: 30,
+  })
+
+  const mediaImageForm =
+    parseMediaImageDraftForm(
+      mediaImageDraft.value,
+      initialMediaImageForm,
+    )
+
+  const updateMediaImageForm = (
+    patch: Partial<MediaImageDraftForm>,
+  ) => {
+    mediaImageDraft.setValue(
+      previousText =>
+        JSON.stringify({
+          ...parseMediaImageDraftForm(
+            previousText,
+            initialMediaImageForm,
+          ),
+          ...patch,
+        }),
+    )
+  }
+
+  const mediaGenPrompt =
+    mediaImageForm.prompt
+  const mediaSize =
+    mediaImageForm.size
+  const mediaStyleKey =
+    mediaImageForm.styleKey
+  const stylePrefixText =
+    mediaImageForm.stylePrefixText
+  const strippedStyleTail =
+    mediaImageForm.strippedStyleTail
+
+  const setMediaGenPrompt = (
+    value: string,
+  ) => updateMediaImageForm({
+    prompt: value,
+  })
+
+  const setMediaSize = (
+    value: string,
+  ) => updateMediaImageForm({
+    size: value,
+  })
+
+  const setMediaStyleKey = (
+    value: string,
+  ) => updateMediaImageForm({
+    styleKey: value,
+  })
+
+  const setStylePrefixText = (
+    value: string,
+  ) => updateMediaImageForm({
+    stylePrefixText: value,
+  })
+
+  const setStrippedStyleTail = (
+    value: string,
+  ) => updateMediaImageForm({
+    strippedStyleTail: value,
+  })
+
   const [mediaGenerating, setMediaGenerating] = useState(false)
   const [mediaMessage, setMediaMessage] = useState('')
   const [mediaPreviewUrl, setMediaPreviewUrl] = useState('')
   const [mediaRefUrl, setMediaRefUrl] = useState('')
-  const [mediaStyleKey, setMediaStyleKey] = useState('')
-  const [stylePrefixText, setStylePrefixText] = useState('')
-  const [strippedStyleTail, setStrippedStyleTail] = useState('')
   const [editorOpen, setEditorOpen] = useState(false)
   const [editorExporting, setEditorExporting] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<CoursewareAsset | null>(null)
@@ -107,7 +278,11 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
   }, [coursewareId, pageNum])
 
   useEffect(() => {
-    setMediaGenPrompt(''); setMediaRefUrl(''); setMediaStyleKey(''); setStylePrefixText(''); setStrippedStyleTail('')
+    /**
+     * 参考图与当前页面运行态强相关，不进入文字草稿。
+     * 图片生成文字表单由统一Hook按照页码自动切换和恢复。
+     */
+    setMediaRefUrl('')
   }, [pageNum, mediaTab])
 
   // ==================== 共享处理函数 ====================
@@ -289,9 +464,34 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
                 </>
               )}
             </div>
-            <textarea value={mediaGenPrompt} onChange={e => setMediaGenPrompt(e.target.value)}
+            <textarea
+              value={mediaGenPrompt}
+              onChange={e =>
+                setMediaGenPrompt(
+                  e.target.value,
+                )
+              }
+              onKeyDown={e => {
+                mediaImageDraft.handleKeyDown(
+                  e,
+                )
+              }}
               placeholder="从左侧建议点「→ 填入右侧」，或在此手动描述要生成的图片；可点上方风格按钮美化"
               rows={5} style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: '1px solid ' + C.border, fontSize: 13, resize: 'vertical', outline: 'none', boxSizing: 'border-box' }} disabled={mediaGenerating} />
+
+            <div
+              style={{
+                marginTop: 5,
+                fontSize: 10,
+                color: C.textMuted,
+                lineHeight: 1.5,
+              }}
+            >
+              当前页图片描述与画风设置已自动保存 ·
+              生成失败不会清除 ·
+              Ctrl/Command+Z恢复误删
+            </div>
+
             <div style={{ marginTop: 8 }}>
               <span style={{ fontSize: 12, color: '#6B7280', marginRight: 8 }}>图片比例:</span>
               <select value={mediaSize} onChange={e => setMediaSize(e.target.value)}
@@ -339,6 +539,12 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
                   const res = await generateCWImage(coursewareId, pageNum, mediaGenPrompt.trim(), undefined, mediaSize, mediaRefUrl || undefined)
                   setMediaMessage('✅ 图片生成成功！')
                   setMediaAssets(prev => [makeAsset(coursewareId, { id: res.asset_id, oss_url: res.url, generation_prompt: mediaGenPrompt }), ...prev])
+
+                  /**
+                   * 图片已成功生成并返回正式资产后，才提交清空表单。
+                   * commit保留撤销快照，Ctrl+Z仍可恢复刚刚使用的描述。
+                   */
+                  mediaImageDraft.commit()
                 } catch (e) { setMediaMessage('❌ 生成失败: ' + (e instanceof Error ? e.message : '未知错误')) }
                 finally { setMediaGenerating(false) }
               }}

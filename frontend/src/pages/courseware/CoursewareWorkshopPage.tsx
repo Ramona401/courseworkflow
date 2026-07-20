@@ -211,7 +211,7 @@ export default function CoursewareWorkshopPage() {
       // P0-1: 预览页只检查第1页（封面页）
       const hasPreview = (d.pages || []).some(p => p.html_content && p.page_number === 1)
       const targetStep = statusToStep(d.status, hasNav, hasPreview)
-      // 修复"确认课件不跳转"：如果当前已在Step5（由goToStep(5)或onDone设置），
+      // 修复"进入微调不跳转"：如果当前已在Step5（由goToStep(5)或onDone设置），
       // 且后端status对应的目标步骤也是5（preview/confirmed/in_pipeline），不回退。
       // 如果当前在Step5但后端status对应更早步骤（如generating竞态），也不回退——
       // 避免全自动装配onDone先goToStep(5)再loadCourseware异步拉回的竞态问题。
@@ -307,7 +307,7 @@ export default function CoursewareWorkshopPage() {
           // 预览框只单向前移到"已到达的最大页号"：既有"在推进"的反馈，又不会因乱序到达而来回乱跳
           setBuildPreviewNum(prev => d.page_number > prev ? d.page_number : prev)
         },
-        // P2 需求②：完成后——全部成功才不动（停在批量生成页让老师自行点"确认课件→"）；
+        // P2 需求②：完成后——全部成功才不动（停在批量生成页让老师自行点"进入微调→"）；
         //   有失败页则明确提示并【留在批量生成页】，老师可对失败页点"继续生成"自动补齐，
         //   不再自动跳到确认提交页（避免带着缺页进入下一步）。loadCourseware 会刷新真实状态与页面。
         onGenDone: d => {
@@ -582,7 +582,7 @@ export default function CoursewareWorkshopPage() {
           {/* 场景C：全部页面已生成完毕 */}
           {!buildRunning && cwRemainingCount === 0 && cwTotalCount > 0 && <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
             <button onClick={() => openSlideshow()} style={{ padding: '10px 24px', borderRadius: 8, border: '1px solid #7C3AED', background: 'rgba(124,58,237,0.06)', color: '#7C3AED', fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>🖥️ 全屏放映</button>
-            <button onClick={() => { goToStep(5); loadCourseware() }} style={{ padding: '10px 24px', borderRadius: 8, border: 'none', background: 'linear-gradient(135deg, #059669, #10B981)', color: '#fff', fontSize: 14, fontWeight: 600, cursor: 'pointer', boxShadow: '0 2px 8px rgba(5,150,105,0.3)' }}>确认课件 →</button>
+            <button onClick={() => { goToStep(5); loadCourseware() }} style={{ padding: '10px 24px', borderRadius: 8, border: 'none', background: 'linear-gradient(135deg, #059669, #10B981)', color: '#fff', fontSize: 14, fontWeight: 600, cursor: 'pointer', boxShadow: '0 2px 8px rgba(5,150,105,0.3)' }}>进入微调 →</button>
           </div>}
           {/* 生成进行中：显示进度 + 可中途停止（已生成页面会保留，可稍后继续） */}
           {buildRunning && <div style={{ textAlign: 'center', padding: 20, color: C.textMuted, fontSize: 14 }}>

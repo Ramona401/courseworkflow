@@ -14,6 +14,8 @@
  * "生成中"运行态展示（previewPages由父级持有不丢，回来可重新生成或等轮询恢复）。
  */
 import { useState } from 'react'
+import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import type { Dispatch, SetStateAction, MutableRefObject } from 'react'
 import { generateCWPreview, saveCWNavTemplate, refineNav, subscribeCWIndexSSE } from '@/api/coursewares'
 import type { CoursewareDetail } from '@/api/coursewares'
@@ -37,12 +39,23 @@ interface Props {
 }
 
 export default function NavConfirmStep({ coursewareId, courseware, previewPages, setPreviewPages, buildRunning, sseRef, goToStep, loadCourseware, refreshPagesOnly, onSlideshow, onFullscreen }: Props) {
+  const { user } = useAuth()
+
   // ==================== Step3专属状态（5b-2自主页面整体迁入） ====================
   const [previewGenRunning, setPreviewGenRunning] = useState(false)
   const [previewGenMessage, setPreviewGenMessage] = useState('')
   const [navSaving, setNavSaving] = useState(false)
   // P0-2: 导航栏微调状态
-  const [navRefineInput, setNavRefineInput] = useState('')
+  const navRefineDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'courseware-navigation',
+    resourceId: coursewareId,
+    field: 'refine-instruction',
+    initialValue: '',
+    maxHistory: 40,
+  })
+  const navRefineInput = navRefineDraft.value
+  const setNavRefineInput = navRefineDraft.setValue
   const [navRefining, setNavRefining] = useState(false)
 
   // Step 3: 生成预览页（P0-1: 仅封面1页）
@@ -78,8 +91,11 @@ export default function NavConfirmStep({ coursewareId, courseware, previewPages,
     setNavRefining(true)
     try {
       await refineNav(coursewareId, navRefineInput.trim())
-      loadCourseware()
-      setNavRefineInput('')
+      // 导航栏微调只更新封面预览，仍停留在确认导航栏步骤。
+      // 不重新加载课件状态，避免hasNavTemplate触发自动跳到批量生成。
+      refreshPagesOnly()
+      // 后端成功完成微调后才提交草稿；失败时保留原文。
+      navRefineDraft.commit()
       setPreviewGenMessage('\u2705 导航栏微调完成')
     } catch (e) { setPreviewGenMessage('\u274c 微调失败: ' + (e instanceof Error ? e.message : '未知错误')) } finally { setNavRefining(false) }
   }
@@ -132,13 +148,19 @@ export default function NavConfirmStep({ coursewareId, courseware, previewPages,
         <div style={{ display: 'flex', gap: 10 }}>
           <input value={navRefineInput} onChange={e => setNavRefineInput(e.target.value)}
             placeholder="例如：Logo再大一点、页码改成右对齐、背景色改为深蓝..."
-            onKeyDown={e => { if (e.key === 'Enter' && !navRefining) handleRefineNav() }}
+            onKeyDown={e => {
+              if (navRefineDraft.handleKeyDown(e)) return
+              if (e.key === 'Enter' && !navRefining) handleRefineNav()
+            }}
             style={{ flex: 1, padding: '10px 14px', borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 14, outline: 'none' }}
             disabled={navRefining} />
           <button onClick={handleRefineNav} disabled={navRefining || !navRefineInput.trim()}
             style={{ padding: '10px 20px', borderRadius: 8, border: 'none', background: navRefineInput.trim() && !navRefining ? '#7C3AED' : '#E5E7EB', color: navRefineInput.trim() && !navRefining ? '#fff' : '#9CA3AF', fontSize: 14, fontWeight: 600, cursor: navRefineInput.trim() && !navRefining ? 'pointer' : 'default', whiteSpace: 'nowrap' }}>
             {navRefining ? '⏳ 微调中...' : '🎨 AI微调'}
           </button>
+        </div>
+        <div style={{ marginTop: 6, fontSize: 11, color: C.textMuted }}>
+          修改意见已自动保存 · 微调失败不会清除 · Ctrl/Command+Z恢复误删
         </div>
       </div>
     )}

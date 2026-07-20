@@ -1,26 +1,51 @@
 /**
- * AssistantEditModal.tsx — AI 助手编辑/新建弹窗
+ * AssistantEditModal.tsx — AI助手新建与编辑弹窗
  *
- * 三种模式(mode 决定标题/source/默认字段):
- *   create-personal 新建我的助手 / create-group 新建本校助手 / edit 编辑现有助手
- * edit 模式 mount 时 getAssistant(id) 拉完整 prompt;提交后 onSaved 回调透传 ID 给父组件。
+ * 支持三种模式：
+ *   - create-personal：新建个人助手；
+ *   - create-group：新建共享助手；
+ *   - edit：编辑现有助手。
  *
- * Prompt 编辑区双 Tab(v114):[📝 手动编辑] textarea + [💬 AI 帮我写] DesignerPanel;
- *   切 Tab 不清 state;DesignerPanel onApplyDraft 回写 fullPrompt 并自动切回 manual。
+ * 教育域适配：
+ *   - 新建助手使用当前登录用户教育域；
+ *   - 编辑助手优先使用助手自身education_domain资源快照；
+ *   - K12、职业教育、成人教育使用同一套层级工具；
+ *   - 具体层级可参与自动匹配；
+ *   - 学段和不限值只供手动选择；
+ *   - 职一、职二、职三保存为中职规范值。
  *
- * share_policy(本次新增):仅【共享助手】(source=group/system)显示 SharePolicyPicker——
- *   edit 时 loadedSource 为 group/system 显示并回填;create-group 显示默认 use_only;
- *   create-personal 不显示(个人助手别人看不到,策略无意义)。能编辑者(属主/组长/校管/admin)
- *   均可改策略(Yuhan 拍板:组长既能维护内容,顺手改策略也无妨)。提交时共享助手带该字段。
- *
- * 重构:样式/数据常量外移至 editModalStyles.ts,三档选择器抽至 SharePolicyPicker.tsx,
- *   以控制本文件行数在 600 红线内。
- *
- * Props:open / mode / assistantId?(edit必填) / defaultScene? / defaultSubject? /
- *   defaultGrade? / onClose / onSaved?(id, source)
+ * Prompt编辑区包含：
+ *   - 手动编辑；
+ *   - AI帮我写。
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react'
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  useMemo,
+} from 'react'
+import type {
+  Dispatch,
+  SetStateAction,
+} from 'react'
+import { useAuth } from '@/store/auth'
+import {
+  useEducationProfile,
+} from '@/hooks/useEducationProfile'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
+import { useSubjects } from '@/hooks/useSubjects'
+import {
+  fallbackEducationProfile,
+  type EducationDomain,
+} from '@/education-domain/types'
+import {
+  getAssistantLevelOptions,
+  getEducationLevelLabel,
+  isAutomaticEducationLevel,
+  normalizeEducationLevelValue,
+} from '@/education-domain/options'
 import {
   getAssistant,
   createAssistant,
@@ -37,504 +62,1319 @@ import {
 import AssistantDesignerPanel from './AssistantDesignerPanel'
 import SharePolicyPicker from './SharePolicyPicker'
 import {
-  C, QUICK_EMOJIS, SUBJECTS, MAX_PROMPT_LEN, labelStyle, inputStyle,
+  C,
+  QUICK_EMOJIS,
+  MAX_PROMPT_LEN,
+  labelStyle,
+  inputStyle,
 } from './editModalStyles'
 
-/** Tab 类型(v114 新增) */
-type EditTab = 'manual' | 'designer'
+type EditTab =
+  | 'manual'
+  | 'designer'
 
-/** 备课工坊单助手运行时实际注入上限；完整原稿仍按原存储上限保存。 */
-const WORKSHOP_RUNTIME_PROMPT_LEN = 8000
+const WORKSHOP_RUNTIME_PROMPT_LEN =
+  8000
 
-/** 助手创建入口可选的具体学科，主动排除历史“空值=不限”选项。 */
-const ASSISTANT_SUBJECTS = SUBJECTS.filter(
-  item => item.trim() !== '',
-)
-
-/** 助手创建入口只允许一年级至高三的12个具体年级。 */
-const ASSISTANT_GRADES: string[] = [
-  '一年级',
-  '二年级',
-  '三年级',
-  '四年级',
-  '五年级',
-  '六年级',
-  '七年级',
-  '八年级',
-  '九年级',
-  '高一',
-  '高二',
-  '高三',
-]
+const VALID_SHARE_POLICIES:
+  AssistantSharePolicy[] = [
+    'use_only',
+    'open',
+    'locked',
+  ]
 
 /**
- * 存量具体年级同义值映射。
+ * 资源教育域只允许三个具体教学域参与助手表单。
  *
- * 合法的单一年级可以自动回填到当前标准名称；
- * “小学低段”“高中”“1-6”“10-12”等学段或范围值不在映射中，
- * 编辑时会留空并要求老师重新选择。
+ * system/common/mixed等其它值使用当前管理页面教育域作展示兜底，
+ * 真正的权限与资源隔离仍由后端执行。
  */
-const ASSISTANT_GRADE_ALIASES: Record<string, string> = {
-  '1': '一年级',
-  '1年级': '一年级',
-  '一年级': '一年级',
-  '2': '二年级',
-  '2年级': '二年级',
-  '二年级': '二年级',
-  '3': '三年级',
-  '3年级': '三年级',
-  '三年级': '三年级',
-  '4': '四年级',
-  '4年级': '四年级',
-  '四年级': '四年级',
-  '5': '五年级',
-  '5年级': '五年级',
-  '五年级': '五年级',
-  '6': '六年级',
-  '6年级': '六年级',
-  '六年级': '六年级',
-  '7': '七年级',
-  '7年级': '七年级',
-  '七年级': '七年级',
-  '初一': '七年级',
-  '8': '八年级',
-  '8年级': '八年级',
-  '八年级': '八年级',
-  '初二': '八年级',
-  '9': '九年级',
-  '9年级': '九年级',
-  '九年级': '九年级',
-  '初三': '九年级',
-  '10': '高一',
-  '10年级': '高一',
-  '十年级': '高一',
-  '高一': '高一',
-  '11': '高二',
-  '11年级': '高二',
-  '十一年级': '高二',
-  '高二': '高二',
-  '12': '高三',
-  '12年级': '高三',
-  '十二年级': '高三',
-  '高三': '高三',
+function resolveAssistantFormDomain(
+  value: unknown,
+  fallback: EducationDomain,
+): EducationDomain {
+  if (
+    value === 'k12' ||
+    value === 'vocational' ||
+    value === 'adult'
+  ) {
+    return value
+  }
+
+  return fallback
 }
 
-function normalizeAssistantSubject(value?: string): string {
-  const trimmed = (value || '').trim()
-  return ASSISTANT_SUBJECTS.includes(trimmed)
+function normalizeAssistantSubject(
+  value: string | undefined,
+  subjectOptions: string[],
+): string {
+  const trimmed =
+    (value || '').trim()
+
+  return subjectOptions.includes(
+    trimmed,
+  )
     ? trimmed
     : ''
 }
 
-function normalizeAssistantGrade(value?: string): string {
-  const trimmed = (value || '').trim()
-  return ASSISTANT_GRADE_ALIASES[trimmed] || ''
+function assistantGradeHint(
+  domain: EducationDomain,
+  gradeLabel: string,
+  grade: string,
+): string {
+  const displayLabel =
+    getEducationLevelLabel(
+      domain,
+      grade,
+    )
+
+  if (
+    isAutomaticEducationLevel(
+      domain,
+      grade,
+    )
+  ) {
+    return `${displayLabel}属于具体${gradeLabel}。课程、具体层级和阶段严格一致时，可被平台自动匹配。`
+  }
+
+  return `${displayLabel || '不限层级'}只供老师手动选择，不会被平台自动挂载。`
 }
 
-/* ==================== Props 类型 ==================== */
+/* ==================== 表单草稿 ==================== */
 
-export type AssistantEditMode = 'create-personal' | 'create-group' | 'edit'
+interface AssistantEditFormDraft {
+  name: string
+  avatar: string
+  description: string
+  subject: string
+  gradeRange: string
+  scenes: AssistantScene[]
+  fullPrompt: string
+  sharePolicy: AssistantSharePolicy
+}
+
+function createAssistantEditInitialForm(
+  defaultScene: AssistantScene | undefined,
+  defaultSubject: string | undefined,
+  defaultGrade: string | undefined,
+  subjectOptions: string[],
+  domain: EducationDomain,
+): AssistantEditFormDraft {
+  return {
+    name: '',
+    avatar: '🤖',
+    description: '',
+    subject:
+      normalizeAssistantSubject(
+        defaultSubject,
+        subjectOptions,
+      ),
+    gradeRange:
+      normalizeEducationLevelValue(
+        domain,
+        defaultGrade,
+      ),
+    scenes:
+      defaultScene
+        ? [defaultScene]
+        : [],
+    fullPrompt: '',
+    sharePolicy:
+      DEFAULT_SHARE_POLICY,
+  }
+}
+
+function parseAssistantEditForm(
+  raw: string,
+  fallback: AssistantEditFormDraft,
+): AssistantEditFormDraft {
+  if (!raw.trim()) {
+    return {
+      ...fallback,
+      scenes: [...fallback.scenes],
+    }
+  }
+
+  try {
+    const parsed =
+      JSON.parse(raw) as
+        Partial<AssistantEditFormDraft>
+
+    const scenes =
+      Array.isArray(parsed.scenes)
+        ? parsed.scenes.filter(
+            (
+              scene,
+            ): scene is AssistantScene =>
+              typeof scene ===
+                'string' &&
+              scene in
+                ASSISTANT_SCENE_LABELS,
+          )
+        : [...fallback.scenes]
+
+    const sharePolicy =
+      VALID_SHARE_POLICIES.includes(
+        parsed.sharePolicy as
+          AssistantSharePolicy,
+      )
+        ? parsed.sharePolicy as
+            AssistantSharePolicy
+        : fallback.sharePolicy
+
+    return {
+      name:
+        typeof parsed.name ===
+          'string'
+          ? parsed.name
+          : fallback.name,
+      avatar:
+        typeof parsed.avatar ===
+          'string'
+          ? parsed.avatar
+          : fallback.avatar,
+      description:
+        typeof parsed.description ===
+          'string'
+          ? parsed.description
+          : fallback.description,
+      subject:
+        typeof parsed.subject ===
+          'string'
+          ? parsed.subject
+          : fallback.subject,
+      gradeRange:
+        typeof parsed.gradeRange ===
+          'string'
+          ? parsed.gradeRange
+          : fallback.gradeRange,
+      scenes,
+      fullPrompt:
+        typeof parsed.fullPrompt ===
+          'string'
+          ? parsed.fullPrompt
+          : fallback.fullPrompt,
+      sharePolicy,
+    }
+  } catch {
+    return {
+      ...fallback,
+      scenes: [...fallback.scenes],
+    }
+  }
+}
+
+/* ==================== Props ==================== */
+
+export type AssistantEditMode =
+  | 'create-personal'
+  | 'create-group'
+  | 'edit'
 
 export interface AssistantEditModalProps {
   open: boolean
   mode: AssistantEditMode
-  /** edit 模式下必填:要编辑的助手 ID */
   assistantId?: string
-  /** create 模式下的默认场景(从 Selector 当前 scene 透传) */
   defaultScene?: AssistantScene
-  /** create 模式下的默认学科 */
   defaultSubject?: string
-  /** create 模式下的默认年级 */
   defaultGrade?: string
-  /** 关闭回调 */
   onClose: () => void
-  /** 保存成功回调(可选):参数为新/更新的助手 ID 和来源,便于父组件刷新列表或切换选中 */
-  onSaved?: (id: string, source: AssistantSource) => void
+  onSaved?: (
+    id: string,
+    source: AssistantSource,
+  ) => void
 }
 
 /* ==================== 主组件 ==================== */
 
-export default function AssistantEditModal(props: AssistantEditModalProps) {
-  const { open, mode, assistantId, defaultScene, defaultSubject, defaultGrade, onClose, onSaved } = props
+export default function AssistantEditModal(
+  props: AssistantEditModalProps,
+) {
+  const {
+    open,
+    mode,
+    assistantId,
+    defaultScene,
+    defaultSubject,
+    defaultGrade,
+    onClose,
+    onSaved,
+  } = props
 
-  // ==================== 表单状态 ====================
-  const [name, setName]               = useState('')
-  const [avatar, setAvatar]           = useState('🤖')
-  const [description, setDescription] = useState('')
-  const [subject, setSubject]         = useState('')
-  const [gradeRange, setGradeRange]   = useState('')
-  // 编辑存量无效资源时显示原值，提示老师重新选择具体条件。
-  const [legacySubjectValue, setLegacySubjectValue] = useState('')
-  const [legacyGradeValue, setLegacyGradeValue] = useState('')
-  const [scenes, setScenes]           = useState<AssistantScene[]>([])
-  const [fullPrompt, setFullPrompt]   = useState('')
-  const promptChars = Array.from(fullPrompt).length
-  // share_policy:仅共享助手有意义;create-personal 不展示也不提交
-  const [sharePolicy, setSharePolicy] = useState<AssistantSharePolicy>(DEFAULT_SHARE_POLICY)
-  // edit 模式下拉到的原始 source(用于 onSaved 回调传回 + 判断是否显示策略选择器)
-  const [loadedSource, setLoadedSource] = useState<AssistantSource | null>(null)
+  const { user } = useAuth()
 
-  // ==================== UI 状态 ====================
-  const [loading, setLoading]   = useState(false)  // 加载详情中
-  const [saving, setSaving]     = useState(false)  // 提交保存中
-  const [loadErr, setLoadErr]   = useState<string | null>(null)
-  const [activeTab, setActiveTab] = useState<EditTab>('manual')  // v114:Tab 切换
+  const {
+    domain: currentDomain,
+    profile: currentProfile,
+  } = useEducationProfile()
 
-  // ==================== ref ====================
-  const promptRef = useRef<HTMLTextAreaElement>(null)
+  const {
+    subjects: subjectOptions,
+    loading: subjectsLoading,
+    empty: subjectsEmpty,
+  } = useSubjects()
 
-  // ==================== 重置表单(关闭或模式切换时调用) ====================
-  const resetForm = useCallback(() => {
-    setName('')
-    setAvatar('🤖')
-    setDescription('')
+  /**
+   * 编辑模式优先使用资源自身教育域。
+   *
+   * 这样平台管理员编辑职业教育助手时，
+   * 不会因为管理页面是mixed而只看到K12年级。
+   */
+  const [
+    loadedEducationDomain,
+    setLoadedEducationDomain,
+  ] = useState<
+    EducationDomain | null
+  >(null)
 
-    const rawDefaultSubject = (defaultSubject || '').trim()
-    const normalizedSubject = normalizeAssistantSubject(
-      rawDefaultSubject,
+  const effectiveDomain =
+    loadedEducationDomain ||
+    currentDomain
+
+  const effectiveProfile =
+    effectiveDomain ===
+      currentDomain
+      ? currentProfile
+      : fallbackEducationProfile(
+          effectiveDomain,
+        )
+
+  const levelOptions = useMemo(
+    () => getAssistantLevelOptions(
+      effectiveDomain,
+    ),
+    [effectiveDomain],
+  )
+
+  const specificLevelOptions =
+    useMemo(
+      () => levelOptions.filter(
+        option => option.automatic,
+      ),
+      [levelOptions],
     )
-    setSubject(normalizedSubject)
-    setLegacySubjectValue(
-      rawDefaultSubject && !normalizedSubject
-        ? rawDefaultSubject
-        : '',
+
+  const broadLevelOptions =
+    useMemo(
+      () => levelOptions.filter(
+        option => !option.automatic,
+      ),
+      [levelOptions],
     )
 
-    const rawDefaultGrade = (defaultGrade || '').trim()
-    const normalizedGrade = normalizeAssistantGrade(
-      rawDefaultGrade,
-    )
-    setGradeRange(normalizedGrade)
-    setLegacyGradeValue(
-      rawDefaultGrade && !normalizedGrade
-        ? rawDefaultGrade
-        : '',
+  const levelValues = useMemo(
+    () => levelOptions.map(
+      option => option.value,
+    ),
+    [levelOptions],
+  )
+
+  const [
+    serverInitialForm,
+    setServerInitialForm,
+  ] = useState<
+    AssistantEditFormDraft
+  >(() =>
+    createAssistantEditInitialForm(
+      defaultScene,
+      defaultSubject,
+      defaultGrade,
+      subjectOptions,
+      currentDomain,
+    ),
+  )
+
+  const formResourceID =
+    mode === 'edit'
+      ? `edit:${assistantId || 'missing'}`
+      : [
+          mode,
+          currentDomain,
+          defaultScene ||
+            'no-scene',
+          (defaultSubject || '')
+            .trim() ||
+            'no-subject',
+          normalizeEducationLevelValue(
+            currentDomain,
+            defaultGrade,
+          ) ||
+            'no-grade',
+        ].join('|')
+
+  const formDraft =
+    useProtectedDraft({
+      userId: user?.id,
+      scope: 'assistant-edit',
+      resourceId:
+        formResourceID,
+      field: 'form',
+      initialValue:
+        JSON.stringify(
+          serverInitialForm,
+        ),
+      maxHistory: 20,
+    })
+
+  const form =
+    parseAssistantEditForm(
+      formDraft.value,
+      serverInitialForm,
     )
 
-    setScenes(defaultScene ? [defaultScene] : [])
-    setFullPrompt('')
-    setSharePolicy(DEFAULT_SHARE_POLICY)
-    setLoadedSource(null)
-    setLoadErr(null)
-    setActiveTab('manual')  // v114:每次打开默认手动 Tab
-  }, [defaultScene, defaultSubject, defaultGrade])
+  const setForm: Dispatch<
+    SetStateAction<
+      AssistantEditFormDraft
+    >
+  > = useCallback(
+    next => {
+      formDraft.setValue(
+        previousText => {
+          const previous =
+            parseAssistantEditForm(
+              previousText,
+              serverInitialForm,
+            )
 
-  // ==================== open 时初始化 ====================
-  // create 模式:重置为默认值
-  // edit 模式:拉详情填表单
+          const resolved =
+            typeof next ===
+              'function'
+              ? next(previous)
+              : next
+
+          return JSON.stringify(
+            resolved,
+          )
+        },
+      )
+    },
+    [
+      formDraft.setValue,
+      serverInitialForm,
+    ],
+  )
+
+  const {
+    name,
+    avatar,
+    description,
+    subject,
+    gradeRange,
+    scenes,
+    fullPrompt,
+    sharePolicy,
+  } = form
+
+  const setName = (
+    value: string,
+  ) =>
+    setForm(previous => ({
+      ...previous,
+      name: value,
+    }))
+
+  const setAvatar = (
+    value: string,
+  ) =>
+    setForm(previous => ({
+      ...previous,
+      avatar: value,
+    }))
+
+  const setDescription = (
+    value: string,
+  ) =>
+    setForm(previous => ({
+      ...previous,
+      description: value,
+    }))
+
+  const setSubject = (
+    value: string,
+  ) =>
+    setForm(previous => ({
+      ...previous,
+      subject: value,
+    }))
+
+  const setGradeRange = (
+    value: string,
+  ) =>
+    setForm(previous => ({
+      ...previous,
+      gradeRange: value,
+    }))
+
+  const setFullPrompt = (
+    value: string,
+  ) =>
+    setForm(previous => ({
+      ...previous,
+      fullPrompt: value,
+    }))
+
+  const setSharePolicy = (
+    value: AssistantSharePolicy,
+  ) =>
+    setForm(previous => ({
+      ...previous,
+      sharePolicy: value,
+    }))
+
+  const setScenes: Dispatch<
+    SetStateAction<
+      AssistantScene[]
+    >
+  > = next =>
+    setForm(previous => ({
+      ...previous,
+      scenes:
+        typeof next ===
+          'function'
+          ? next(
+              previous.scenes,
+            )
+          : next,
+    }))
+
+  const promptChars =
+    Array.from(
+      fullPrompt,
+    ).length
+
+  /* ==================== 存量异常提示 ==================== */
+
+  const [
+    legacySubjectValue,
+    setLegacySubjectValue,
+  ] = useState('')
+
+  const [
+    legacyGradeValue,
+    setLegacyGradeValue,
+  ] = useState('')
+
+  const [
+    loadedSource,
+    setLoadedSource,
+  ] = useState<
+    AssistantSource | null
+  >(null)
+
+  /* ==================== UI状态 ==================== */
+
+  const [loading, setLoading] =
+    useState(false)
+
+  const [saving, setSaving] =
+    useState(false)
+
+  const [loadErr, setLoadErr] =
+    useState<string | null>(null)
+
+  const [activeTab, setActiveTab] =
+    useState<EditTab>('manual')
+
+  const promptRef =
+    useRef<HTMLTextAreaElement>(
+      null,
+    )
+
+  /* ==================== 重置新建表单 ==================== */
+
+  const resetForm =
+    useCallback(() => {
+      const rawSubject =
+        (defaultSubject || '').trim()
+
+      const normalizedSubject =
+        normalizeAssistantSubject(
+          rawSubject,
+          subjectOptions,
+        )
+
+      const rawGrade =
+        (defaultGrade || '').trim()
+
+      const normalizedGrade =
+        normalizeEducationLevelValue(
+          currentDomain,
+          rawGrade,
+        )
+
+      setLoadedEducationDomain(
+        currentDomain,
+      )
+
+      setServerInitialForm(
+        createAssistantEditInitialForm(
+          defaultScene,
+          defaultSubject,
+          defaultGrade,
+          subjectOptions,
+          currentDomain,
+        ),
+      )
+
+      setLegacySubjectValue(
+        rawSubject &&
+        !normalizedSubject
+          ? rawSubject
+          : '',
+      )
+
+      setLegacyGradeValue(
+        rawGrade &&
+        !normalizedGrade
+          ? rawGrade
+          : '',
+      )
+
+      setLoadedSource(null)
+      setLoadErr(null)
+      setActiveTab('manual')
+    }, [
+      defaultScene,
+      defaultSubject,
+      defaultGrade,
+      subjectOptions,
+      currentDomain,
+    ])
+
+  /* ==================== 打开与加载详情 ==================== */
+
   useEffect(() => {
-    if (!open) return
+    if (
+      !open ||
+      subjectsLoading
+    ) {
+      return
+    }
 
-    if (mode === 'edit' && assistantId) {
+    if (
+      mode === 'edit' &&
+      assistantId
+    ) {
       setLoading(true)
       setLoadErr(null)
-      setActiveTab('manual')  // edit 打开默认在手动 Tab
-      getAssistant(assistantId)
-        .then(data => {
-          setName(data.name || '')
-          setAvatar(data.avatar_emoji || '🤖')
-          setDescription(data.description || '')
+      setActiveTab('manual')
 
-          const rawSubject = (data.subject || '').trim()
-          const normalizedSubject = normalizeAssistantSubject(
-            rawSubject,
+      getAssistant(
+        assistantId,
+      )
+        .then(data => {
+          const resourceDomain =
+            resolveAssistantFormDomain(
+              (
+                data as
+                  typeof data & {
+                    education_domain?: string
+                  }
+              ).education_domain,
+              currentDomain,
+            )
+
+          const rawSubject =
+            (data.subject || '')
+              .trim()
+
+          const normalizedSubject =
+            normalizeAssistantSubject(
+              rawSubject,
+              subjectOptions,
+            )
+
+          const rawGrade =
+            (data.grade_range || '')
+              .trim()
+
+          const normalizedGrade =
+            normalizeEducationLevelValue(
+              resourceDomain,
+              rawGrade,
+            )
+
+          setLoadedEducationDomain(
+            resourceDomain,
           )
-          setSubject(normalizedSubject)
+
+          setServerInitialForm({
+            name:
+              data.name || '',
+            avatar:
+              data.avatar_emoji ||
+              '🤖',
+            description:
+              data.description ||
+              '',
+            subject:
+              normalizedSubject,
+            gradeRange:
+              normalizedGrade,
+            scenes:
+              parseAssistantScenes(
+                data.scenes,
+              ),
+            fullPrompt:
+              data.full_prompt || '',
+            sharePolicy:
+              data.share_policy ||
+              DEFAULT_SHARE_POLICY,
+          })
+
           setLegacySubjectValue(
-            rawSubject && !normalizedSubject
+            rawSubject &&
+            !normalizedSubject
               ? rawSubject
               : '',
           )
 
-          const rawGrade = (data.grade_range || '').trim()
-          const normalizedGrade = normalizeAssistantGrade(
-            rawGrade,
-          )
-          setGradeRange(normalizedGrade)
           setLegacyGradeValue(
-            rawGrade && !normalizedGrade
+            rawGrade &&
+            !normalizedGrade
               ? rawGrade
               : '',
           )
 
-          // scenes 详情接口返回的是 JSONB 字符串,需要 parse
-          setScenes(parseAssistantScenes(data.scenes))
-          setFullPrompt(data.full_prompt || '')
-          // 回填 share_policy(后端保证有值,兜底 use_only 防脏)
-          setSharePolicy(data.share_policy || DEFAULT_SHARE_POLICY)
-          setLoadedSource(data.source as AssistantSource)
+          setLoadedSource(
+            data.source,
+          )
+
           setLoading(false)
         })
-        .catch(e => {
-          const msg = e instanceof Error ? e.message : '加载助手详情失败'
-          setLoadErr(msg)
+        .catch(error => {
+          setLoadErr(
+            error instanceof Error
+              ? error.message
+              : '加载助手详情失败',
+          )
           setLoading(false)
         })
     } else {
-      // create 模式
       resetForm()
     }
-  // assistantId/mode 变化时重新初始化,resetForm 已通过依赖收集
-  }, [open, mode, assistantId, resetForm])
+  }, [
+    open,
+    mode,
+    assistantId,
+    resetForm,
+    subjectsLoading,
+    subjectOptions,
+    currentDomain,
+  ])
 
-  // ==================== ESC 关闭 ====================
+  /**
+   * 新建模式或恢复本地草稿时，确保层级属于当前有效教育域。
+   *
+   * 编辑模式的服务器值已按资源教育域规范化；
+   * 无法识别的存量值保留在legacyGradeValue中提示重新选择。
+   */
+  useEffect(() => {
+    if (
+      !open ||
+      loading ||
+      levelOptions.length === 0
+    ) {
+      return
+    }
+
+    setForm(current => {
+      const raw =
+        current.gradeRange.trim()
+
+      if (
+        raw === '' &&
+        levelValues.includes('')
+      ) {
+        return current
+      }
+
+      const normalized =
+        normalizeEducationLevelValue(
+          effectiveDomain,
+          raw,
+        )
+
+      const nextGrade =
+        normalized &&
+        levelValues.includes(
+          normalized,
+        )
+          ? normalized
+          : specificLevelOptions[0]
+              ?.value ||
+            broadLevelOptions[0]
+              ?.value ||
+            ''
+
+      if (
+        nextGrade ===
+        current.gradeRange
+      ) {
+        return current
+      }
+
+      return {
+        ...current,
+        gradeRange: nextGrade,
+      }
+    })
+  }, [
+    open,
+    loading,
+    effectiveDomain,
+    levelOptions,
+    levelValues,
+    specificLevelOptions,
+    broadLevelOptions,
+    setForm,
+  ])
+
   useEffect(() => {
     if (!open) return
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    document.addEventListener('keydown', handler)
-    return () => document.removeEventListener('keydown', handler)
-  }, [open, onClose])
 
-  // ==================== 场景 checkbox 切换 ====================
-  const toggleScene = (scene: AssistantScene) => {
-    setScenes(prev => {
-      if (prev.includes(scene)) return prev.filter(s => s !== scene)
-      return [...prev, scene]
-    })
+    const handler = (
+      event: KeyboardEvent,
+    ) => {
+      if (
+        event.key === 'Escape'
+      ) {
+        onClose()
+      }
+    }
+
+    document.addEventListener(
+      'keydown',
+      handler,
+    )
+
+    return () =>
+      document.removeEventListener(
+        'keydown',
+        handler,
+      )
+  }, [
+    open,
+    onClose,
+  ])
+
+  const toggleScene = (
+    scene: AssistantScene,
+  ) => {
+    setScenes(previous =>
+      previous.includes(scene)
+        ? previous.filter(
+            item => item !== scene,
+          )
+        : [...previous, scene],
+    )
   }
 
-  // ==================== DesignerPanel 回调:把 AI 草稿应用到 fullPrompt ====================
-  // v114:用户点"✓ 应用到编辑"→ 写入 fullPrompt state + 自动切回 manual Tab
-  const handleApplyDraft = useCallback((draft: string) => {
-    setFullPrompt(draft)
-    setActiveTab('manual')
-  }, [])
+  const handleApplyDraft =
+    useCallback((draft: string) => {
+      setForm(previous => ({
+        ...previous,
+        fullPrompt: draft,
+      }))
 
-  // ==================== 是否显示分享策略选择器 ====================
-  // 共享助手才显示:edit 时 loadedSource 为 group/system;create-group 模式本就是共享助手。
-  // create-personal 不显示(个人助手别人看不到,策略无意义)。
+      setActiveTab('manual')
+    }, [setForm])
+
   const showPolicyPicker =
     mode === 'create-group' ||
-    (mode === 'edit' && (loadedSource === 'group' || loadedSource === 'system'))
+    (
+      mode === 'edit' &&
+      (
+        loadedSource === 'group' ||
+        loadedSource === 'system'
+      )
+    )
 
-  // ==================== 表单校验 ====================
-  /** 返回错误提示字符串,null 表示校验通过 */
-  const validate = (): string | null => {
-    if (!name.trim()) return '请填写助手名称'
+  /* ==================== 校验 ==================== */
 
-    if (!subject.trim()) {
-      return '请选择助手适用的具体学科'
-    }
-    if (!ASSISTANT_SUBJECTS.includes(subject.trim())) {
-      return '适用学科必须从当前学科清单中选择'
+  const validate =
+    (): string | null => {
+      if (!name.trim()) {
+        return '请填写助手名称'
+      }
+
+      if (!subject.trim()) {
+        return `请选择助手适用的具体${effectiveProfile.subject_label}`
+      }
+
+      if (
+        !subjectOptions.includes(
+          subject.trim(),
+        )
+      ) {
+        return `适用${effectiveProfile.subject_label}必须从当前课程清单中选择`
+      }
+
+      if (
+        !levelValues.includes(
+          gradeRange.trim(),
+        )
+      ) {
+        return `请选择当前教育域支持的${effectiveProfile.grade_label}或通用层级`
+      }
+
+      if (!fullPrompt.trim()) {
+        return '请填写系统提示词；若在AI页签生成了草稿，请先应用到编辑'
+      }
+
+      if (scenes.length === 0) {
+        return '请至少勾选一个适用场景'
+      }
+
+      if (
+        fullPrompt.length >
+        MAX_PROMPT_LEN
+      ) {
+        return `系统提示词过长（${fullPrompt.length}字符），上限${MAX_PROMPT_LEN}字符`
+      }
+
+      return null
     }
 
-    if (!gradeRange.trim()) {
-      return '请选择助手适用的具体年级'
-    }
-    if (!ASSISTANT_GRADES.includes(gradeRange.trim())) {
-      return '适用年级必须选择一年级至高三中的一个具体年级'
-    }
+  /* ==================== 提交 ==================== */
 
-    if (!fullPrompt.trim()) return '请填写系统提示词(Prompt)\n如在 AI Tab 生成了草稿,请先点"✓ 应用到编辑"把草稿写入表单'
-    if (scenes.length === 0) return '请至少勾选一个适用场景'
-    if (fullPrompt.length > MAX_PROMPT_LEN) {
-      return `系统提示词过长(${fullPrompt.length} 字符),上限 ${MAX_PROMPT_LEN} 字符`
-    }
-    return null
-  }
-
-  // ==================== 提交 ====================
   const handleSubmit = async () => {
-    const err = validate()
-    if (err) { alert(err); return }
+    const validationError =
+      validate()
+
+    if (validationError) {
+      alert(validationError)
+      return
+    }
+
     if (saving) return
 
     setSaving(true)
+
     try {
-      if (mode === 'edit' && assistantId) {
-        // 编辑模式:全量更新
-        const req: UpdateAIAssistantRequest = {
+      if (
+        mode === 'edit' &&
+        assistantId
+      ) {
+        const request:
+          UpdateAIAssistantRequest = {
           name: name.trim(),
-          avatar_emoji: avatar || '🤖',
-          description: description.trim(),
-          full_prompt: fullPrompt,
-          subject: subject.trim(),
-          grade_range: gradeRange.trim(),
-          scenes: scenes,
-          // 仅共享助手带 share_policy;个人助手不带(后端会忽略/兜底)
-          ...(showPolicyPicker ? { share_policy: sharePolicy } : {}),
+          avatar_emoji:
+            avatar || '🤖',
+          description:
+            description.trim(),
+          full_prompt:
+            fullPrompt,
+          subject:
+            subject.trim(),
+          grade_range:
+            gradeRange.trim(),
+          scenes,
+          ...(showPolicyPicker
+            ? {
+                share_policy:
+                  sharePolicy,
+              }
+            : {}),
         }
-        await updateAssistant(assistantId, req)
-        onSaved?.(assistantId, loadedSource || 'personal')
+
+        await updateAssistant(
+          assistantId,
+          request,
+        )
+
+        formDraft.clear()
+
+        onSaved?.(
+          assistantId,
+          loadedSource ||
+            'personal',
+        )
+
         onClose()
       } else {
-        // 新建模式
-        const source: AssistantSource = mode === 'create-group' ? 'group' : 'personal'
-        const req: CreateAIAssistantRequest = {
+        const source:
+          AssistantSource =
+          mode ===
+            'create-group'
+            ? 'group'
+            : 'personal'
+
+        const request:
+          CreateAIAssistantRequest = {
           name: name.trim(),
-          avatar_emoji: avatar || '🤖',
-          description: description.trim(),
+          avatar_emoji:
+            avatar || '🤖',
+          description:
+            description.trim(),
           source,
-          full_prompt: fullPrompt,
-          subject: subject.trim(),
-          grade_range: gradeRange.trim(),
-          scenes: scenes,
-          // create-group 是共享助手,带 share_policy;create-personal 不带
-          ...(showPolicyPicker ? { share_policy: sharePolicy } : {}),
+          full_prompt:
+            fullPrompt,
+          subject:
+            subject.trim(),
+          grade_range:
+            gradeRange.trim(),
+          scenes,
+          ...(showPolicyPicker
+            ? {
+                share_policy:
+                  sharePolicy,
+              }
+            : {}),
         }
-        const created = await createAssistant(req)
-        onSaved?.(created.id, created.source as AssistantSource)
+
+        const created =
+          await createAssistant(
+            request,
+          )
+
+        formDraft.clear()
+
+        onSaved?.(
+          created.id,
+          created.source,
+        )
+
         onClose()
       }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : '保存失败,请重试'
-      alert(msg)
+    } catch (error) {
+      alert(
+        error instanceof Error
+          ? error.message
+          : '保存失败，请重试',
+      )
     } finally {
       setSaving(false)
     }
   }
 
-  // ==================== 未 open 不渲染 ====================
   if (!open) return null
 
-  // ==================== 标题推断 ====================
   const modalTitle =
-    mode === 'edit'            ? (name ? `✏️ 编辑 — ${name}` : '✏️ 编辑助手') :
-    mode === 'create-group'    ? '🏫 新建本校助手' :
-                                 '➕ 新建我的助手'
+    mode === 'edit'
+      ? name
+        ? `✏️ 编辑 — ${name}`
+        : '✏️ 编辑助手'
+      : mode === 'create-group'
+        ? '🏫 新建共享助手'
+        : '➕ 新建我的助手'
 
   return (
     <div
       onClick={onClose}
       style={{
-        position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-        background: 'rgba(17,24,39,0.5)',
+        position: 'fixed',
+        inset: 0,
+        background:
+          'rgba(17,24,39,0.5)',
         zIndex: 10000,
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
         padding: '24px',
       }}
     >
-      {/* 弹窗本体(阻止冒泡让点击内部不关闭) */}
       <div
-        onClick={e => e.stopPropagation()}
+        onClick={event =>
+          event.stopPropagation()
+        }
         style={{
-          // v114:AI Tab 左右分栏宽度需求,整体宽度从 720px 放到 960px
-          width: '960px', maxWidth: '100%', maxHeight: '92vh',
-          background: C.card, borderRadius: '12px',
-          boxShadow: '0 24px 64px rgba(0,0,0,0.18)',
-          display: 'flex', flexDirection: 'column',
+          width: '960px',
+          maxWidth: '100%',
+          maxHeight: '92vh',
+          background: C.card,
+          borderRadius: '12px',
+          boxShadow:
+            '0 24px 64px rgba(0,0,0,0.18)',
+          display: 'flex',
+          flexDirection: 'column',
           overflow: 'hidden',
         }}
       >
-        {/* ========== 顶部标题栏 ========== */}
         <div style={{
-          padding: '16px 20px', borderBottom: `1px solid ${C.border}`,
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          background: 'linear-gradient(135deg,rgba(79,123,232,0.06),rgba(129,140,248,0.04))',
+          padding: '16px 20px',
+          borderBottom:
+            `1px solid ${C.border}`,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent:
+            'space-between',
+          background:
+            'linear-gradient(135deg,rgba(79,123,232,0.06),rgba(129,140,248,0.04))',
           flexShrink: 0,
         }}>
-          <span style={{ fontSize: '15px', fontWeight: 700, color: C.text }}>
+          <span style={{
+            fontSize: '15px',
+            fontWeight: 700,
+            color: C.text,
+          }}>
             {modalTitle}
           </span>
+
           <button
+            type="button"
             onClick={onClose}
             style={{
-              background: 'none', border: 'none', cursor: 'pointer',
-              fontSize: '20px', color: C.textMuted, padding: '0 4px',
+              background: 'none',
+              border: 'none',
+              cursor: 'pointer',
+              fontSize: '20px',
+              color: C.textMuted,
+              padding: '0 4px',
               lineHeight: 1,
             }}
-          >×</button>
+          >
+            ×
+          </button>
         </div>
 
-        {/* ========== 主体表单区(可滚动) ========== */}
-        <div style={{ flex: 1, overflow: 'auto', padding: '20px 24px' }}>
-          {/* 加载中 */}
-          {loading && (
-            <div style={{ padding: '40px 0', textAlign: 'center', color: C.textMuted }}>
+        <div style={{
+          flex: 1,
+          overflow: 'auto',
+          padding: '20px 24px',
+        }}>
+          {(loading ||
+            subjectsLoading) && (
+            <div style={{
+              padding: '40px 0',
+              textAlign: 'center',
+              color: C.textMuted,
+            }}>
               加载助手详情中...
             </div>
           )}
 
-          {/* 加载失败 */}
-          {loadErr && !loading && (
+          {loadErr &&
+           !loading && (
             <div style={{
-              padding: '12px', borderRadius: '8px',
-              background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.2)',
-              color: C.danger, fontSize: '13px', marginBottom: '12px',
+              padding: '12px',
+              borderRadius: '8px',
+              background:
+                'rgba(239,68,68,0.06)',
+              border:
+                '1px solid rgba(239,68,68,0.2)',
+              color: C.danger,
+              fontSize: '13px',
+              marginBottom: '12px',
             }}>
               ⚠️ {loadErr}
             </div>
           )}
 
-          {/* 表单(加载成功或 create 模式下才显示) */}
-          {!loading && !loadErr && (
+          {!loading &&
+           !subjectsLoading &&
+           !loadErr && (
             <>
-              {/* ---- 通用字段:名称 + emoji ---- */}
-              <div style={{ marginBottom: '16px' }}>
+              {/* 名称与图标 */}
+              <div style={{
+                marginBottom: '16px',
+              }}>
                 <label style={labelStyle}>
-                  名称 <span style={{ color: C.danger }}>*</span>
+                  名称
+                  {' '}
+                  <span style={{
+                    color: C.danger,
+                  }}>
+                    *
+                  </span>
                 </label>
-                <div style={{ display: 'flex', gap: '8px' }}>
+
+                <div style={{
+                  display: 'flex',
+                  gap: '8px',
+                }}>
                   <input
                     type="text"
                     value={avatar}
-                    onChange={e => setAvatar(e.target.value)}
+                    onChange={event =>
+                      setAvatar(
+                        event.target.value,
+                      )
+                    }
+                    onKeyDown={event =>
+                      formDraft.handleKeyDown(
+                        event,
+                      )
+                    }
                     placeholder="🤖"
                     maxLength={4}
-                    style={{ ...inputStyle, width: '50px', textAlign: 'center', fontSize: '18px' }}
+                    style={{
+                      ...inputStyle,
+                      width: '50px',
+                      textAlign: 'center',
+                      fontSize: '18px',
+                    }}
                   />
+
                   <input
                     type="text"
                     value={name}
-                    onChange={e => setName(e.target.value)}
-                    placeholder="例如:小学AI严苛审核员"
+                    onChange={event =>
+                      setName(
+                        event.target.value,
+                      )
+                    }
+                    onKeyDown={event =>
+                      formDraft.handleKeyDown(
+                        event,
+                      )
+                    }
+                    placeholder="例如：实训任务设计助手"
                     maxLength={100}
-                    style={{ ...inputStyle, flex: 1 }}
+                    style={{
+                      ...inputStyle,
+                      flex: 1,
+                    }}
                   />
                 </div>
-                {/* 快捷 emoji */}
-                <div style={{ marginTop: '6px', display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
-                  {QUICK_EMOJIS.map(e => (
-                    <button
-                      key={e}
-                      type="button"
-                      onClick={() => setAvatar(e)}
-                      style={{
-                        width: '28px', height: '28px', borderRadius: '6px',
-                        border: `1px solid ${avatar === e ? C.primary : C.border}`,
-                        background: avatar === e ? C.primaryLight : '#fff',
-                        cursor: 'pointer', fontSize: '14px',
-                      }}
-                    >{e}</button>
-                  ))}
+
+                <div style={{
+                  marginTop: '6px',
+                  display: 'flex',
+                  gap: '4px',
+                  flexWrap: 'wrap',
+                }}>
+                  {QUICK_EMOJIS.map(
+                    emoji => (
+                      <button
+                        key={emoji}
+                        type="button"
+                        onClick={() =>
+                          setAvatar(
+                            emoji,
+                          )
+                        }
+                        style={{
+                          width: '28px',
+                          height: '28px',
+                          borderRadius:
+                            '6px',
+                          border:
+                            `1px solid ${
+                              avatar ===
+                              emoji
+                                ? C.primary
+                                : C.border
+                            }`,
+                          background:
+                            avatar === emoji
+                              ? C.primaryLight
+                              : '#fff',
+                          cursor:
+                            'pointer',
+                          fontSize:
+                            '14px',
+                        }}
+                      >
+                        {emoji}
+                      </button>
+                    ),
+                  )}
                 </div>
               </div>
 
-              {/* ---- 通用字段:描述 ---- */}
-              <div style={{ marginBottom: '16px' }}>
-                <label style={labelStyle}>描述 <span style={{ color: C.textMuted, fontWeight: 400 }}>(选填,用户选择时可见)</span></label>
+              {/* 描述 */}
+              <div style={{
+                marginBottom: '16px',
+              }}>
+                <label style={labelStyle}>
+                  描述
+                  <span style={{
+                    color: C.textMuted,
+                    fontWeight: 400,
+                  }}>
+                    {' '}（选填）
+                  </span>
+                </label>
+
                 <input
                   type="text"
                   value={description}
-                  onChange={e => setDescription(e.target.value)}
-                  placeholder="一句话说清这个助手的风格定位"
+                  onChange={event =>
+                    setDescription(
+                      event.target.value,
+                    )
+                  }
+                  onKeyDown={event =>
+                    formDraft.handleKeyDown(
+                      event,
+                    )
+                  }
+                  placeholder="一句话说明助手的定位"
                   maxLength={500}
-                  style={{ ...inputStyle, width: '100%' }}
+                  style={{
+                    ...inputStyle,
+                    width: '100%',
+                  }}
                 />
               </div>
 
-              {/* ---- 通用字段:学科 + 具体年级 ---- */}
-              <div style={{ display: 'flex', gap: '12px', marginBottom: '16px' }}>
+              {/* 课程和层级 */}
+              <div style={{
+                display: 'flex',
+                gap: '12px',
+                marginBottom: '16px',
+              }}>
                 <div style={{ flex: 1 }}>
                   <label style={labelStyle}>
-                    适用学科 <span style={{ color: C.danger }}>*</span>
+                    适用
+                    {effectiveProfile.subject_label}
+                    {' '}
+                    <span style={{
+                      color: C.danger,
+                    }}>
+                      *
+                    </span>
                   </label>
+
                   <select
                     value={subject}
-                    onChange={e => {
-                      setSubject(e.target.value)
+                    disabled={
+                      subjectsLoading ||
+                      subjectsEmpty
+                    }
+                    onChange={event => {
+                      setSubject(
+                        event.target.value,
+                      )
                       setLegacySubjectValue('')
                     }}
-                    style={{ ...inputStyle, width: '100%', cursor: 'pointer' }}
+                    style={{
+                      ...inputStyle,
+                      width: '100%',
+                      cursor: 'pointer',
+                    }}
                   >
-                    <option value="">请选择具体学科</option>
-                    {ASSISTANT_SUBJECTS.map(s => (
-                      <option key={s} value={s}>{s}</option>
-                    ))}
+                    <option value="">
+                      请选择具体
+                      {effectiveProfile.subject_label}
+                    </option>
+
+                    {subjectOptions.map(
+                      option => (
+                        <option
+                          key={option}
+                          value={option}
+                        >
+                          {option}
+                        </option>
+                      ),
+                    )}
                   </select>
+
+                  {subjectsEmpty &&
+                   !subjectsLoading && (
+                    <div style={{
+                      marginTop: '6px',
+                      fontSize: '11px',
+                      lineHeight: 1.5,
+                      color: C.danger,
+                    }}>
+                      当前组织尚未配置可用
+                      {effectiveProfile.subject_label}。
+                    </div>
+                  )}
 
                   {legacySubjectValue && (
                     <div style={{
@@ -543,31 +1383,93 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
                       lineHeight: 1.5,
                       color: '#92400E',
                     }}>
-                      ⚠️ 原适用学科“{legacySubjectValue}”不在当前学科清单中，
-                      请重新选择后保存。
+                      ⚠️ 原适用
+                      {effectiveProfile.subject_label}
+                      “{legacySubjectValue}”
+                      不在当前课程清单中，请重新选择。
                     </div>
                   )}
                 </div>
 
                 <div style={{ flex: 1 }}>
                   <label style={labelStyle}>
-                    适用具体年级 <span style={{ color: C.danger }}>*</span>
+                    适用
+                    {effectiveProfile.grade_label}
                   </label>
+
                   <select
                     value={gradeRange}
-                    onChange={e => {
-                      setGradeRange(e.target.value)
+                    onChange={event => {
+                      setGradeRange(
+                        event.target.value,
+                      )
                       setLegacyGradeValue('')
                     }}
-                    style={{ ...inputStyle, width: '100%', cursor: 'pointer' }}
+                    style={{
+                      ...inputStyle,
+                      width: '100%',
+                      cursor: 'pointer',
+                    }}
                   >
-                    <option value="">请选择一年级至高三</option>
-                    {ASSISTANT_GRADES.map(grade => (
-                      <option key={grade} value={grade}>
-                        {grade}
-                      </option>
-                    ))}
+                    <optgroup
+                      label={`具体${effectiveProfile.grade_label}（可自动匹配）`}
+                    >
+                      {specificLevelOptions.map(
+                        option => (
+                          <option
+                            key={
+                              option.value
+                            }
+                            value={
+                              option.value
+                            }
+                          >
+                            {option.label}
+                          </option>
+                        ),
+                      )}
+                    </optgroup>
+
+                    {broadLevelOptions.length >
+                     0 && (
+                      <optgroup label="通用层级（仅手动选择）">
+                        {broadLevelOptions.map(
+                          option => (
+                            <option
+                              key={
+                                option.value ||
+                                '__empty__'
+                              }
+                              value={
+                                option.value
+                              }
+                            >
+                              {option.label}
+                            </option>
+                          ),
+                        )}
+                      </optgroup>
+                    )}
                   </select>
+
+                  <div style={{
+                    marginTop: '6px',
+                    fontSize: '11px',
+                    lineHeight: 1.55,
+                    color:
+                      isAutomaticEducationLevel(
+                        effectiveDomain,
+                        gradeRange,
+                      )
+                        ? '#166534'
+                        : '#64748B',
+                  }}>
+                    {assistantGradeHint(
+                      effectiveDomain,
+                      effectiveProfile.grade_label,
+                      gradeRange,
+                    )}
+                  </div>
 
                   {legacyGradeValue && (
                     <div style={{
@@ -576,184 +1478,333 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
                       lineHeight: 1.5,
                       color: '#92400E',
                     }}>
-                      ⚠️ 原年级“{legacyGradeValue}”不是单一具体年级，
-                      不会参与自动匹配。请重新选择后保存。
+                      ⚠️ 原
+                      {effectiveProfile.grade_label}
+                      “{legacyGradeValue}”
+                      不属于当前教育域，请重新选择。
                     </div>
                   )}
                 </div>
               </div>
 
-              {/* ---- 通用字段:适用场景(多选) ---- */}
-              <div style={{ marginBottom: '16px' }}>
+              {/* 场景 */}
+              <div style={{
+                marginBottom: '16px',
+              }}>
                 <label style={labelStyle}>
-                  适用场景 <span style={{ color: C.danger }}>*</span>
-                  <span style={{ color: C.textMuted, fontWeight: 400 }}> (至少选 1 个)</span>
+                  适用场景
+                  {' '}
+                  <span style={{
+                    color: C.danger,
+                  }}>
+                    *
+                  </span>
                 </label>
+
                 <div style={{
-                  display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)',
-                  gap: '6px', marginTop: '4px',
+                  display: 'grid',
+                  gridTemplateColumns:
+                    'repeat(3, 1fr)',
+                  gap: '6px',
+                  marginTop: '4px',
                 }}>
-                  {(Object.entries(ASSISTANT_SCENE_LABELS) as [AssistantScene, string][]).map(([scene, label]) => {
-                    const checked = scenes.includes(scene)
-                    return (
-                      <label
-                        key={scene}
-                        style={{
-                          display: 'flex', alignItems: 'center', gap: '6px',
-                          padding: '7px 10px', borderRadius: '6px',
-                          border: `1px solid ${checked ? C.primary : C.border}`,
-                          background: checked ? C.primaryLight : '#fff',
-                          cursor: 'pointer', fontSize: '13px', color: C.text,
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={() => toggleScene(scene)}
-                          style={{ cursor: 'pointer', accentColor: C.primary }}
-                        />
-                        {label}
-                      </label>
-                    )
-                  })}
+                  {(
+                    Object.entries(
+                      ASSISTANT_SCENE_LABELS,
+                    ) as [
+                      AssistantScene,
+                      string,
+                    ][]
+                  ).map(
+                    ([
+                      scene,
+                      label,
+                    ]) => {
+                      const checked =
+                        scenes.includes(
+                          scene,
+                        )
+
+                      return (
+                        <label
+                          key={scene}
+                          style={{
+                            display:
+                              'flex',
+                            alignItems:
+                              'center',
+                            gap: '6px',
+                            padding:
+                              '7px 10px',
+                            borderRadius:
+                              '6px',
+                            border:
+                              `1px solid ${
+                                checked
+                                  ? C.primary
+                                  : C.border
+                              }`,
+                            background:
+                              checked
+                                ? C.primaryLight
+                                : '#fff',
+                            cursor:
+                              'pointer',
+                            fontSize:
+                              '13px',
+                            color: C.text,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() =>
+                              toggleScene(
+                                scene,
+                              )
+                            }
+                            style={{
+                              cursor:
+                                'pointer',
+                              accentColor:
+                                C.primary,
+                            }}
+                          />
+
+                          {label}
+                        </label>
+                      )
+                    },
+                  )}
                 </div>
               </div>
 
-              {/* ---- share_policy 分享策略选择器(仅共享助手显示) ---- */}
               {showPolicyPicker && (
                 <SharePolicyPicker
                   value={sharePolicy}
-                  onChange={setSharePolicy}
+                  onChange={
+                    setSharePolicy
+                  }
                 />
               )}
 
-              {/* ---- v114:Prompt 编辑区(手动/AI 双 Tab) ---- */}
-              <div style={{ marginBottom: '8px' }}>
-                {/* Tab 标题行 + 字符数统计 */}
-                <div
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center',
-                    marginBottom: '6px',
-                  }}
-                >
-                  <label style={{ ...labelStyle, marginBottom: 0 }}>
-                    系统提示词 Prompt <span style={{ color: C.danger }}>*</span>
+              {/* Prompt编辑区 */}
+              <div style={{
+                marginBottom: '8px',
+              }}>
+                <div style={{
+                  display: 'flex',
+                  justifyContent:
+                    'space-between',
+                  alignItems: 'center',
+                  marginBottom: '6px',
+                }}>
+                  <label style={{
+                    ...labelStyle,
+                    marginBottom: 0,
+                  }}>
+                    系统提示词 Prompt
+                    {' '}
+                    <span style={{
+                      color: C.danger,
+                    }}>
+                      *
+                    </span>
                   </label>
-                  <span
-                    style={{
-                      fontSize: '11px',
-                      fontWeight: 400,
-                      color: fullPrompt.length > MAX_PROMPT_LEN
+
+                  <span style={{
+                    fontSize: '11px',
+                    color:
+                      fullPrompt.length >
+                      MAX_PROMPT_LEN
                         ? C.danger
-                        : promptChars > WORKSHOP_RUNTIME_PROMPT_LEN
+                        : promptChars >
+                            WORKSHOP_RUNTIME_PROMPT_LEN
                           ? C.accent
                           : C.textMuted,
-                    }}
-                  >
-                    {promptChars.toLocaleString()} Unicode字符 · 存储上限 {MAX_PROMPT_LEN.toLocaleString()}
+                  }}>
+                    {promptChars.toLocaleString()}
+                    {' '}
+                    Unicode字符
                   </span>
                 </div>
 
-                {/* Tab 切换按钮条 */}
-                <div
-                  style={{
-                    display: 'flex',
-                    gap: '4px',
-                    marginBottom: '8px',
-                    padding: '4px',
-                    background: C.bg,
-                    borderRadius: '8px',
-                    border: `1px solid ${C.border}`,
-                    width: 'fit-content',
-                  }}
-                >
+                <div style={{
+                  display: 'flex',
+                  gap: '4px',
+                  marginBottom: '8px',
+                  padding: '4px',
+                  background: C.bg,
+                  borderRadius: '8px',
+                  border:
+                    `1px solid ${C.border}`,
+                  width: 'fit-content',
+                }}>
                   <button
                     type="button"
-                    onClick={() => setActiveTab('manual')}
+                    onClick={() =>
+                      setActiveTab(
+                        'manual',
+                      )
+                    }
                     style={{
-                      padding: '6px 14px',
-                      borderRadius: '6px',
+                      padding:
+                        '6px 14px',
+                      borderRadius:
+                        '6px',
                       border: 'none',
-                      background: activeTab === 'manual' ? C.card : 'transparent',
-                      color: activeTab === 'manual' ? C.primary : C.textSec,
+                      background:
+                        activeTab ===
+                        'manual'
+                          ? C.card
+                          : 'transparent',
+                      color:
+                        activeTab ===
+                        'manual'
+                          ? C.primary
+                          : C.textSec,
                       fontSize: '12px',
-                      fontWeight: activeTab === 'manual' ? 700 : 500,
+                      fontWeight:
+                        activeTab ===
+                        'manual'
+                          ? 700
+                          : 500,
                       cursor: 'pointer',
-                      boxShadow: activeTab === 'manual' ? '0 1px 3px rgba(0,0,0,0.06)' : 'none',
                     }}
                   >
                     📝 手动编辑
                   </button>
+
                   <button
                     type="button"
-                    onClick={() => setActiveTab('designer')}
+                    onClick={() =>
+                      setActiveTab(
+                        'designer',
+                      )
+                    }
                     style={{
-                      padding: '6px 14px',
-                      borderRadius: '6px',
+                      padding:
+                        '6px 14px',
+                      borderRadius:
+                        '6px',
                       border: 'none',
-                      background: activeTab === 'designer' ? C.card : 'transparent',
-                      color: activeTab === 'designer' ? C.primary : C.textSec,
+                      background:
+                        activeTab ===
+                        'designer'
+                          ? C.card
+                          : 'transparent',
+                      color:
+                        activeTab ===
+                        'designer'
+                          ? C.primary
+                          : C.textSec,
                       fontSize: '12px',
-                      fontWeight: activeTab === 'designer' ? 700 : 500,
+                      fontWeight:
+                        activeTab ===
+                        'designer'
+                          ? 700
+                          : 500,
                       cursor: 'pointer',
-                      boxShadow: activeTab === 'designer' ? '0 1px 3px rgba(0,0,0,0.06)' : 'none',
                     }}
                   >
-                    💬 AI 帮我写
+                    💬 AI帮我写
                   </button>
                 </div>
 
-                {/* Tab 内容:手动编辑(原有 textarea) */}
-                {activeTab === 'manual' && (
+                {activeTab ===
+                 'manual' && (
                   <>
                     <textarea
                       ref={promptRef}
                       value={fullPrompt}
-                      onChange={e => setFullPrompt(e.target.value)}
-                      placeholder="在此粘贴/编写完整的系统提示词...&#10;示例:&#10;你是一位严苛的小学AI课程审核员,以五位专家视角对教案进行分析。...&#10;&#10;💡 也可以切到「💬 AI 帮我写」让 AI 帮您起草"
+                      onChange={event =>
+                        setFullPrompt(
+                          event.target
+                            .value,
+                        )
+                      }
+                      onKeyDown={event =>
+                        formDraft.handleKeyDown(
+                          event,
+                        )
+                      }
+                      placeholder="在此编写或粘贴完整系统提示词..."
                       rows={16}
                       style={{
-                        width: '100%', padding: '10px 12px',
-                        borderRadius: '8px',
-                        border: `1px solid ${fullPrompt.length > MAX_PROMPT_LEN ? C.danger : C.border}`,
-                        fontSize: '12px', lineHeight: 1.6,
-                        fontFamily: 'Menlo, Monaco, Consolas, monospace',
-                        color: C.text, outline: 'none', boxSizing: 'border-box',
-                        resize: 'vertical', minHeight: '280px', maxHeight: '500px',
+                        width: '100%',
+                        padding:
+                          '10px 12px',
+                        borderRadius:
+                          '8px',
+                        border:
+                          `1px solid ${
+                            fullPrompt.length >
+                            MAX_PROMPT_LEN
+                              ? C.danger
+                              : C.border
+                          }`,
+                        fontSize:
+                          '12px',
+                        lineHeight: 1.6,
+                        fontFamily:
+                          'Menlo, Monaco, Consolas, monospace',
+                        color: C.text,
+                        outline: 'none',
+                        boxSizing:
+                          'border-box',
+                        resize:
+                          'vertical',
+                        minHeight:
+                          '280px',
+                        maxHeight:
+                          '500px',
                         background: C.bg,
                       }}
                     />
-                    <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px', lineHeight: 1.6 }}>
-                      💡 完整原稿可以较长并完整保存；推荐运行版控制在2000—5000字符，
-                      复杂学科或地方规范较多时可到6000字符。
-                    </div>
-                    {promptChars > WORKSHOP_RUNTIME_PROMPT_LEN && (
+
+                    {promptChars >
+                     WORKSHOP_RUNTIME_PROMPT_LEN && (
                       <div style={{
-                        marginTop: '8px', padding: '9px 12px', borderRadius: '8px',
-                        background: 'rgba(245,158,11,0.08)',
-                        border: '1px solid rgba(245,158,11,0.28)',
-                        color: '#92400E', fontSize: '12px', lineHeight: 1.6,
+                        marginTop: '8px',
+                        padding:
+                          '9px 12px',
+                        borderRadius:
+                          '8px',
+                        background:
+                          'rgba(245,158,11,0.08)',
+                        border:
+                          '1px solid rgba(245,158,11,0.28)',
+                        color:
+                          '#92400E',
+                        fontSize:
+                          '12px',
+                        lineHeight:
+                          1.6,
                       }}>
-                        ⚠️ 当前提示词为 <b>{promptChars.toLocaleString()}</b> 个Unicode字符。
-                        完整内容仍会保存，但备课工坊每轮最多注入前
-                        <b> {WORKSHOP_RUNTIME_PROMPT_LEN.toLocaleString()} </b>
-                        个字符。建议让AI删除重复背景和案例复述，优先保留教学方法、地方要求、
-                        成长引导、自检规则和与老师协商的边界。
+                        ⚠️ 完整提示词会保存，但备课工坊每轮最多注入前
+                        {' '}
+                        <b>
+                          {WORKSHOP_RUNTIME_PROMPT_LEN.toLocaleString()}
+                        </b>
+                        {' '}
+                        个Unicode字符。
                       </div>
                     )}
                   </>
                 )}
 
-                {/* Tab 内容:AI 帮我写(DesignerPanel) */}
-                {activeTab === 'designer' && (
+                {activeTab ===
+                 'designer' && (
                   <AssistantDesignerPanel
                     subject={subject}
                     grade={gradeRange}
                     scenes={scenes}
-                    initialDraft={fullPrompt}
-                    onApplyDraft={handleApplyDraft}
+                    initialDraft={
+                      fullPrompt
+                    }
+                    onApplyDraft={
+                      handleApplyDraft
+                    }
                   />
                 )}
               </div>
@@ -761,35 +1812,80 @@ export default function AssistantEditModal(props: AssistantEditModalProps) {
           )}
         </div>
 
-        {/* ========== 底部操作栏 ========== */}
         <div style={{
-          padding: '12px 20px', borderTop: `1px solid ${C.border}`,
-          display: 'flex', justifyContent: 'flex-end', gap: '8px',
-          background: C.bg, flexShrink: 0,
+          padding: '12px 20px',
+          borderTop:
+            `1px solid ${C.border}`,
+          display: 'flex',
+          justifyContent: 'flex-end',
+          gap: '8px',
+          background: C.bg,
+          flexShrink: 0,
         }}>
           <button
+            type="button"
             onClick={onClose}
             disabled={saving}
             style={{
-              padding: '8px 16px', borderRadius: '7px',
-              border: `1px solid ${C.borderMid}`, background: '#fff',
-              color: C.textSec, fontSize: '13px', cursor: saving ? 'not-allowed' : 'pointer',
-              opacity: saving ? 0.5 : 1,
-            }}
-          >取消</button>
-          <button
-            onClick={handleSubmit}
-            disabled={saving || loading || !!loadErr}
-            style={{
-              padding: '8px 20px', borderRadius: '7px',
-              border: 'none',
-              background: saving || loading || loadErr ? C.borderMid : C.primary,
-              color: saving || loading || loadErr ? C.textMuted : '#fff',
-              fontSize: '13px', fontWeight: 600,
-              cursor: saving || loading || loadErr ? 'not-allowed' : 'pointer',
+              padding: '8px 16px',
+              borderRadius: '7px',
+              border:
+                `1px solid ${C.borderMid}`,
+              background: '#fff',
+              color: C.textSec,
+              fontSize: '13px',
+              cursor:
+                saving
+                  ? 'not-allowed'
+                  : 'pointer',
+              opacity:
+                saving ? 0.5 : 1,
             }}
           >
-            {saving ? '保存中...' : '💾 保存'}
+            取消
+          </button>
+
+          <button
+            type="button"
+            onClick={() =>
+              void handleSubmit()
+            }
+            disabled={
+              saving ||
+              loading ||
+              subjectsLoading ||
+              subjectsEmpty ||
+              Boolean(loadErr)
+            }
+            style={{
+              padding: '8px 20px',
+              borderRadius: '7px',
+              border: 'none',
+              background:
+                saving ||
+                loading ||
+                loadErr
+                  ? C.borderMid
+                  : C.primary,
+              color:
+                saving ||
+                loading ||
+                loadErr
+                  ? C.textMuted
+                  : '#fff',
+              fontSize: '13px',
+              fontWeight: 600,
+              cursor:
+                saving ||
+                loading ||
+                loadErr
+                  ? 'not-allowed'
+                  : 'pointer',
+            }}
+          >
+            {saving
+              ? '保存中...'
+              : '💾 保存'}
           </button>
         </div>
       </div>

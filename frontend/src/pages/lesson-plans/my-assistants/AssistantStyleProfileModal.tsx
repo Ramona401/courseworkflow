@@ -23,6 +23,7 @@ import {
   type ChangeEvent,
   type CSSProperties,
 } from 'react'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import {
   getLessonPlans,
   type LessonPlan,
@@ -188,16 +189,83 @@ export default function AssistantStyleProfileModal(
     onUseProfile,
   } = props
 
-  const [sourceMode, setSourceMode] = useState<SourceMode>('platform')
+  /**
+   * 草稿按照当前用户、学科和年级隔离。
+   */
+  const draftResourceID = [
+    subject.trim() || 'all-subjects',
+    grade.trim() || 'all-grades',
+  ].join('|')
+
+  const sourceModeDraft = useProtectedDraft({
+    userId: currentUserID,
+    scope: 'assistant-style-profile',
+    resourceId: draftResourceID,
+    field: 'source-mode',
+    initialValue: 'platform',
+    maxHistory: 12,
+  })
+
+  const sourceMode: SourceMode =
+    sourceModeDraft.value === 'file'
+    || sourceModeDraft.value === 'paste'
+      ? sourceModeDraft.value
+      : 'platform'
+
+  const setSourceMode = (
+    value: SourceMode,
+  ) => {
+    sourceModeDraft.setValue(value)
+  }
 
   const [plans, setPlans] = useState<LessonPlan[]>([])
   const [plansLoading, setPlansLoading] = useState(false)
   const [plansError, setPlansError] = useState('')
-  const [selectedPlanID, setSelectedPlanID] = useState('')
+
+  const selectedPlanDraft = useProtectedDraft({
+    userId: currentUserID,
+    scope: 'assistant-style-profile',
+    resourceId: draftResourceID,
+    field: 'selected-plan-id',
+    initialValue: '',
+    maxHistory: 12,
+  })
+
+  const selectedPlanID =
+    selectedPlanDraft.value
+
+  const setSelectedPlanID =
+    selectedPlanDraft.setValue
 
   const [materials, setMaterials] = useState<MaterialDraft[]>([])
-  const [pasteTitle, setPasteTitle] = useState('')
-  const [pasteText, setPasteText] = useState('')
+
+  const pasteTitleDraft = useProtectedDraft({
+    userId: currentUserID,
+    scope: 'assistant-style-profile',
+    resourceId: draftResourceID,
+    field: 'paste-title',
+    initialValue: '',
+    maxHistory: 30,
+  })
+
+  const pasteTitle =
+    pasteTitleDraft.value
+  const setPasteTitle =
+    pasteTitleDraft.setValue
+
+  const pasteTextDraft = useProtectedDraft({
+    userId: currentUserID,
+    scope: 'assistant-style-profile',
+    resourceId: draftResourceID,
+    field: 'paste-text',
+    initialValue: '',
+    maxHistory: 20,
+  })
+
+  const pasteText =
+    pasteTextDraft.value
+  const setPasteText =
+    pasteTextDraft.setValue
 
   const [fileBusy, setFileBusy] = useState(false)
   const [generating, setGenerating] = useState(false)
@@ -205,7 +273,20 @@ export default function AssistantStyleProfileModal(
 
   const [profileResult, setProfileResult] =
     useState<StyleProfileResponse | null>(null)
-  const [profileText, setProfileText] = useState('')
+
+  const profileTextDraft = useProtectedDraft({
+    userId: currentUserID,
+    scope: 'assistant-style-profile',
+    resourceId: draftResourceID,
+    field: 'profile-text',
+    initialValue: '',
+    maxHistory: 20,
+  })
+
+  const profileText =
+    profileTextDraft.value
+  const setProfileText =
+    profileTextDraft.setValue
 
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -227,14 +308,14 @@ export default function AssistantStyleProfileModal(
   useEffect(() => {
     if (!open) return
 
-    setSourceMode('platform')
+    /**
+     * 安全文字输入由useProtectedDraft自动恢复。
+     *
+     * 材料列表和上传文件正文仍按原设计只保留在当前弹窗生命周期。
+     */
     setMaterials([])
-    setSelectedPlanID('')
-    setPasteTitle('')
-    setPasteText('')
     setErrorMsg('')
     setProfileResult(null)
-    setProfileText('')
 
     if (!currentUserID) {
       setPlans([])
@@ -259,9 +340,16 @@ export default function AssistantStyleProfileModal(
         const items = response.lesson_plans || []
         setPlans(items)
 
-        if (items.length > 0) {
-          setSelectedPlanID(items[0].id)
-        }
+        setSelectedPlanID(
+          previous =>
+            previous
+            && items.some(
+              item =>
+                item.id === previous,
+            )
+              ? previous
+              : items[0]?.id || '',
+        )
       })
       .catch(error => {
         if (cancelled) return
@@ -461,8 +549,12 @@ export default function AssistantStyleProfileModal(
     })
 
     if (added) {
-      setPasteTitle('')
-      setPasteText('')
+      /**
+       * 文字已经加入当前材料列表。
+       * commit清空输入，同时保留Ctrl+Z恢复快照。
+       */
+      pasteTitleDraft.commit()
+      pasteTextDraft.commit()
     }
   }
 
@@ -530,6 +622,13 @@ export default function AssistantStyleProfileModal(
     }
 
     onUseProfile(profile)
+
+    sourceModeDraft.clear()
+    selectedPlanDraft.clear()
+    pasteTitleDraft.clear()
+    pasteTextDraft.clear()
+    profileTextDraft.clear()
+    setProfileResult(null)
   }
 
   return (
@@ -834,7 +933,8 @@ export default function AssistantStyleProfileModal(
                         marginTop: '7px',
                       }}
                     >
-                      文件只在浏览器中提取文字，原始文件不会上传或保存。
+                      文件只在浏览器中提取文字，原始文件和提取正文都不会进入草稿缓存。
+                      关闭弹窗或刷新后，需要重新选择文件。
                     </div>
                   </>
                 )}
@@ -850,6 +950,11 @@ export default function AssistantStyleProfileModal(
                       onChange={event => {
                         setPasteTitle(event.target.value)
                       }}
+                      onKeyDown={event => {
+                        pasteTitleDraft.handleKeyDown(
+                          event,
+                        )
+                      }}
                       placeholder="例如：七年级学科教研要求"
                       disabled={busy}
                       style={{
@@ -864,6 +969,11 @@ export default function AssistantStyleProfileModal(
                       onChange={event => {
                         setPasteText(event.target.value)
                       }}
+                      onKeyDown={event => {
+                        pasteTextDraft.handleKeyDown(
+                          event,
+                        )
+                      }}
                       placeholder="粘贴教案、学校教研要求、评课意见或反面样例……"
                       rows={6}
                       disabled={busy}
@@ -875,6 +985,19 @@ export default function AssistantStyleProfileModal(
                         fontFamily: 'inherit',
                       }}
                     />
+
+                    <div
+                      style={{
+                        marginTop: '6px',
+                        color: C.textMuted,
+                        fontSize: '10px',
+                        lineHeight: 1.5,
+                      }}
+                    >
+                      粘贴文字已自动保存 ·
+                      关闭或刷新后可恢复 ·
+                      Ctrl/Command+Z恢复误删
+                    </div>
 
                     <div
                       style={{
@@ -1107,7 +1230,7 @@ export default function AssistantStyleProfileModal(
               </button>
             </div>
 
-            {profileResult && (
+            {(profileResult || profileText.trim()) && (
               <section
                 style={{
                   minWidth: 0,
@@ -1144,16 +1267,22 @@ export default function AssistantStyleProfileModal(
                       color: C.textSec,
                     }}
                   >
-                    {profileResult.material_count}份材料
-                    {' · '}
-                    {profileResult.total_characters.toLocaleString()}
-                    个字符
-                    {' · '}
-                    {confidenceLabel(profileResult.confidence)}
+                    {profileResult ? (
+                      <>
+                        {profileResult.material_count}份材料
+                        {' · '}
+                        {profileResult.total_characters.toLocaleString()}
+                        个字符
+                        {' · '}
+                        {confidenceLabel(profileResult.confidence)}
+                      </>
+                    ) : (
+                      <>已恢复未确认的画像草稿</>
+                    )}
                   </div>
                 </div>
 
-                {profileResult.warnings?.length > 0 && (
+                {profileResult && profileResult.warnings?.length > 0 && (
                   <div
                     style={{
                       padding: '9px 12px',
@@ -1177,6 +1306,11 @@ export default function AssistantStyleProfileModal(
                   value={profileText}
                   onChange={event => {
                     setProfileText(event.target.value)
+                  }}
+                  onKeyDown={event => {
+                    profileTextDraft.handleKeyDown(
+                      event,
+                    )
                   }}
                   style={{
                     flex: 1,
@@ -1232,7 +1366,9 @@ export default function AssistantStyleProfileModal(
                       fontSize: '10px',
                     }}
                   >
-                    画像会进入现有对话画布，仍可继续讨论和修改。
+                    画像正文已自动保存 ·
+                    Ctrl/Command+Z恢复误删 ·
+                    确认后进入现有对话画布。
                   </div>
                 </div>
               </section>

@@ -206,6 +206,12 @@ func (h *LessonPlanGenHandler) StreamPlan(w http.ResponseWriter, r *http.Request
 		http.Error(w, utils.MsgMissingLessonPlanID, http.StatusBadRequest)
 		return
 	}
+	finishSSEHandshake, handshakeOK := beginSSEHandshake(w)
+	if !handshakeOK {
+		return
+	}
+	defer finishSSEHandshake()
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "不支持SSE流", http.StatusInternalServerError)
@@ -219,6 +225,8 @@ func (h *LessonPlanGenHandler) StreamPlan(w http.ResponseWriter, r *http.Request
 
 	ch := services.GlobalLPSSEHub.Subscribe(planID)
 	defer services.GlobalLPSSEHub.Unsubscribe(planID, ch)
+
+	finishSSEHandshake()
 
 	writeLPSSEEvent(w, flusher, models.LPSSEEvent{
 		EventType: models.LPSSEConnected,
@@ -277,27 +285,71 @@ func extractPlanIDForSSE(path string) string {
 	return id
 }
 
-func (h *LessonPlanGenHandler) handleGenError(w http.ResponseWriter, err error) {
+func (h *LessonPlanGenHandler) handleGenError(
+	w http.ResponseWriter,
+	err error,
+) {
 	switch {
+	case errors.Is(err, services.ErrLPGenServiceDraining):
+		utils.Fail(w, http.StatusServiceUnavailable, err.Error())
+
+	case errors.Is(err, services.ErrLPGenTaskRunning):
+		utils.Fail(w, http.StatusConflict, err.Error())
+
 	case errors.Is(err, services.ErrLPGenSubjectRequired),
 		errors.Is(err, services.ErrLPGenGradeRequired),
-		errors.Is(err, services.ErrLPGenTopicRequired):
+		errors.Is(err, services.ErrLPGenTopicRequired),
+		errors.Is(err, services.ErrLPGenImportContentRequired),
+		errors.Is(err, services.ErrLPGenImportSourceInvalid),
+		errors.Is(err, services.ErrLPTextbookSelectionInvalid):
 		utils.BadRequest(w, err.Error())
+
 	case errors.Is(err, services.ErrLPGenUnauthorized),
-		errors.Is(err, services.ErrLPGenNotEditable):
+		errors.Is(err, services.ErrLPGenNotEditable),
+		errors.Is(err, services.ErrLPCreationEducationDomainRequired),
+		errors.Is(err, services.ErrLPCreationEducationDomainConflict),
+		errors.Is(err, services.ErrLPTextbookEducationDomainDenied):
 		utils.Fail(w, http.StatusForbidden, err.Error())
+
+	case errors.Is(err, services.ErrLPCreationEducationDomainResolveFailed):
+		lpGenHandlerLog.Error(
+			"教案创建教育域解析失败",
+			"error", err,
+		)
+		utils.InternalError(
+			w,
+			"教育域解析失败，请稍后重试",
+		)
+
 	case errors.Is(err, services.ErrLPGenPlanNotFound):
 		utils.Fail(w, http.StatusNotFound, err.Error())
+
+	case errors.Is(err, services.ErrLPGenImportReviewStageRequired):
+		lpGenHandlerLog.Error(
+			"导入流程缺少AI评审阶段",
+			"error", err,
+		)
+		utils.InternalError(
+			w,
+			"导入流程配置异常，请联系管理员",
+		)
+
 	default:
-		lpGenHandlerLog.Error("教案生成操作失败", "error", err)
-		utils.InternalError(w, "操作失败，请稍后重试")
+		lpGenHandlerLog.Error(
+			"教案生成操作失败",
+			"error", err,
+		)
+		utils.InternalError(
+			w,
+			"操作失败，请稍后重试",
+		)
 	}
 }
 
-// ==================== POST /plans/import-existing（v108新增）====================
+// ==================== POST /plans/import-existing ====================
 
-// ImportExistingPlan 导入已有教案
-// 前端负责解析Word/PDF，将纯文本+元信息POST到此接口
+// ImportExistingPlan 导入已有教案。
+// 前端负责解析Word/PDF，后端只接收纯文本和元信息。
 func (h *LessonPlanGenHandler) ImportExistingPlan(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)

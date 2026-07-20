@@ -7,6 +7,8 @@
  *   autoFixMessage 独立于 sseMessage，不会被 loadCourseware 冲掉，持久显示修正结果。
  */
 import { useState, useEffect } from 'react'
+import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import type { Dispatch, SetStateAction, MutableRefObject } from 'react'
 import {
   getCourseware, generateCWIndex, generateCWIndexFromTopic, generateCWIndexFromPPT,
@@ -34,13 +36,57 @@ interface Props {
 }
 
 export default function SchemeSteps({ coursewareId, courseware, isAdmin, activeStep, pages, setPages, sseRef, goToStep, loadCourseware, onCoursewareUpdate }: Props) {
+  const { user } = useAuth()
+
   const [generating, setGenerating] = useState(false)
   const [sseMessage, setSseMessage] = useState('')
   const [confirming, setConfirming] = useState(false)
   const [presets, setPresets] = useState<SchemePreset[]>([])
-  const [selectedPreset, setSelectedPreset] = useState('auto')
-  const [customPromptHint, setCustomPromptHint] = useState('')  // 自定义预设：老师自己写的课件结构描述
-  const [refineFeedback, setRefineFeedback] = useState('')
+
+  /**
+   * 课件方案入口草稿按当前用户和课件ID隔离。
+   *
+   * 结构预设和自定义结构说明会保留，便于返回本步骤后继续生成；
+   * 整体方案修改意见仅在AI成功完成修改后提交清空。
+   */
+  const presetDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'courseware-scheme',
+    resourceId: coursewareId,
+    field: 'preset',
+    initialValue: 'auto',
+    maxHistory: 12,
+  })
+  const selectedPreset =
+    presetDraft.value || 'auto'
+  const setSelectedPreset =
+    presetDraft.setValue
+
+  const customPromptDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'courseware-scheme',
+    resourceId: coursewareId,
+    field: 'custom-prompt',
+    initialValue: '',
+    maxHistory: 30,
+  })
+  const customPromptHint =
+    customPromptDraft.value
+  const setCustomPromptHint =
+    customPromptDraft.setValue
+
+  const refineFeedbackDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'courseware-scheme',
+    resourceId: coursewareId,
+    field: 'refine-feedback',
+    initialValue: '',
+    maxHistory: 40,
+  })
+  const refineFeedback =
+    refineFeedbackDraft.value
+  const setRefineFeedback =
+    refineFeedbackDraft.setValue
   const [refining, setRefining] = useState(false)
   // AI自动修正后自动重新校验的标记（修正完成递增，AlignmentReportCard的key变化触发重挂载重拉）
   const [alignmentRecheckKey, setAlignmentRecheckKey] = useState(0)
@@ -51,6 +97,13 @@ export default function SchemeSteps({ coursewareId, courseware, isAdmin, activeS
   useEffect(() => {
     getSchemePresets().then(p => setPresets(p)).catch(() => {})
   }, [])
+
+  // 已缓存的预设已下线时，安全回退到自动方案。
+  useEffect(() => {
+    if (presets.length === 0) return
+    if (presets.some(preset => preset.key === selectedPreset)) return
+    setSelectedPreset('auto')
+  }, [presets, selectedPreset, setSelectedPreset])
 
   // 生成中10秒兜底轮询
   useEffect(() => {
@@ -122,7 +175,10 @@ export default function SchemeSteps({ coursewareId, courseware, isAdmin, activeS
         onIndexDone: d => {
           setSseMessage('✅ ' + d.message)
           setRefining(false)
-          setRefineFeedback('')
+          // 自动对齐修正不消费老师手工输入框；手工修改成功后才提交草稿。
+          if (!autoRecheck) {
+            refineFeedbackDraft.commit()
+          }
           loadCourseware()
           // AI自动修正后：显示成功提示并触发重新校验
           if (autoRecheck) {
@@ -188,10 +244,19 @@ export default function SchemeSteps({ coursewareId, courseware, isAdmin, activeS
       )}
       {/* 自定义预设：选中custom时显示环节搭建器 */}
       {selectedPreset === 'custom' && !generating && (
-        <CustomSchemeBuilder
-          value={customPromptHint}
-          onChange={setCustomPromptHint}
-        />
+        <div
+          onKeyDown={event => {
+            customPromptDraft.handleKeyDown(event)
+          }}
+        >
+          <CustomSchemeBuilder
+            value={customPromptHint}
+            onChange={setCustomPromptHint}
+          />
+          <div style={{ marginTop: 6, fontSize: 11, color: C.textMuted }}>
+            已自动保存自定义结构 · Ctrl/Command+Z恢复误删
+          </div>
+        </div>
       )}
       <MsgBar msg={sseMessage} />
       {generating && pages.length > 0 && <div style={{ marginBottom: 16 }}><div style={{ fontSize: 13, color: C.textMuted, marginBottom: 8 }}>已生成 {pages.length} 页方案...</div><IndexEditor coursewareId={coursewareId} pages={pages} onPagesChange={setPages} isAdmin={isAdmin} indexOverview={courseware.index_overview} /></div>}
@@ -242,12 +307,18 @@ export default function SchemeSteps({ coursewareId, courseware, isAdmin, activeS
           <div style={{ display: 'flex', gap: 10 }}>
             <input value={refineFeedback} onChange={e => setRefineFeedback(e.target.value)}
               placeholder="例如：小学生不需要学习目标页、增加互动练习、减少纯文字页面..."
-              onKeyDown={e => { if (e.key === 'Enter' && refineFeedback.trim()) handleRefineIndex() }}
+              onKeyDown={e => {
+                if (refineFeedbackDraft.handleKeyDown(e)) return
+                if (e.key === 'Enter' && refineFeedback.trim()) handleRefineIndex()
+              }}
               style={{ flex: 1, padding: '10px 14px', borderRadius: 8, border: '1px solid ' + C.border, fontSize: 14, outline: 'none' }} />
             <button onClick={handleRefineIndex} disabled={!refineFeedback.trim()}
               style={{ padding: '10px 20px', borderRadius: 8, border: 'none', background: refineFeedback.trim() ? '#7C3AED' : '#E5E7EB', color: refineFeedback.trim() ? '#fff' : '#9CA3AF', fontSize: 14, fontWeight: 600, cursor: refineFeedback.trim() ? 'pointer' : 'default', whiteSpace: 'nowrap' }}>
               🤖 AI修改方案
             </button>
+          </div>
+          <div style={{ marginTop: 6, fontSize: 11, color: C.textMuted }}>
+            修改意见已自动保存 · AI修改成功后清除 · Ctrl/Command+Z恢复误删
           </div>
         </div>
       )}

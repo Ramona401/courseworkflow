@@ -142,7 +142,7 @@ export default function AssistantSwitcher({
         <div style={{ padding: '6px 8px 8px', fontSize: '12px', color: C.textSec }}>
           为「{subject} · {grade}」选择备课助手
           <span style={{ display: 'block', marginTop: '2px', fontSize: '11px', color: C.textSec, opacity: 0.8 }}>
-            切换下一轮起生效，已有对话不变
+            当前年级优先，可手动选择同学科其它年级、学段或不限年级助手；切换从下一轮起生效
           </span>
         </div>
 
@@ -196,7 +196,7 @@ export default function AssistantSwitcher({
         )}
         {!loading && !error && options.length === 0 && (
           <div style={{ padding: '16px', textAlign: 'center', fontSize: '12px', color: C.textSec }}>
-            当前学科和具体年级暂无可选助手，将使用系统默认
+            当前学科和阶段暂无可选助手，将使用系统默认
           </div>
         )}
         {!loading &&
@@ -231,14 +231,12 @@ export default function AssistantSwitcher({
                     <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '6px', background: badge.bg, color: badge.color }}>
                       {a.source_label}
                     </span>
-                    {a.grade_range && (
-                      <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '6px', background: 'rgba(107,114,128,0.08)', color: '#6B7280' }}>
-                        {a.grade_range}
-                      </span>
-                    )}
+                    <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '6px', background: 'rgba(107,114,128,0.08)', color: '#6B7280' }}>
+                      {a.grade_range || '不限年级'}
+                    </span>
                     {a.is_default_here && !active && (
                       <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '6px', background: 'rgba(245,158,11,0.12)', color: '#B45309' }}>
-                        推荐
+                        场景默认
                       </span>
                     )}
                   </span>

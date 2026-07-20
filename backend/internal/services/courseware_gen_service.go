@@ -26,17 +26,17 @@ package services
 //   - courseware_gen_lesson_context.go：教案正文取数+按页定向匹配+校准段拼接
 
 import (
-        "context"
-        "fmt"
-        "strings"
-        "sync"
-        "time"
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
 
-        "tedna/internal/ai"
-        "tedna/internal/config"
-        "tedna/internal/logger"
-        "tedna/internal/models"
-        "tedna/internal/repository"
+	"tedna/internal/ai"
+	"tedna/internal/config"
+	"tedna/internal/logger"
+	"tedna/internal/models"
+	"tedna/internal/repository"
 )
 
 // cwGenLog 课件HTML生成模块级结构化日志器
@@ -44,47 +44,78 @@ var cwGenLog = logger.WithModule("cw_gen")
 
 // P2：单页 AI 生成失败时的自动重试参数
 //
-//      cwGenMaxAttempts —— 单页最多尝试次数（1 次原始 + 重试，共 3 次尝试 = 重试2次）
-//      cwGenRetryBaseDelay —— 重试基础间隔，第 n 次重试前等待 n*base（1s、2s），扛中转商偶发 HTTP 500
-//      重试只在该页失败时发生，且在该页自身 goroutine 内串行进行，不阻塞其他并发页 → 成功页速度不受影响
+//	cwGenMaxAttempts —— 单页最多尝试次数（1 次原始 + 重试，共 3 次尝试 = 重试2次）
+//	cwGenRetryBaseDelay —— 重试基础间隔，第 n 次重试前等待 n*base（1s、2s），扛中转商偶发 HTTP 500
+//	重试只在该页失败时发生，且在该页自身 goroutine 内串行进行，不阻塞其他并发页 → 成功页速度不受影响
 const (
-        cwGenMaxAttempts    = 3
-        cwGenRetryBaseDelay = 1 * time.Second
+	cwGenMaxAttempts    = 3
+	cwGenRetryBaseDelay = 1 * time.Second
 )
 
 // ==================== 课件HTML生成服务 ====================
 
 // CoursewareGenService 课件HTML逐页AI生成服务
 type CoursewareGenService struct {
-        cfg *config.Config
+	cfg *config.Config
 }
 
 // NewCoursewareGenService 创建课件HTML生成服务
 func NewCoursewareGenService(cfg *config.Config) *CoursewareGenService {
-        return &CoursewareGenService{cfg: cfg}
+	return &CoursewareGenService{cfg: cfg}
+}
+
+// loadOwnerRuntimeCourseware 为课件整课生成链执行作者专属后台二次校验。
+//
+// Handler在启动异步任务前已经预检；本方法再次按ID加载正式课件，防止
+// 内部调用绕过Handler，或预检后课件权限与教育域快照发生变化。
+func (s *CoursewareGenService) loadOwnerRuntimeCourseware(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+) (
+	*models.Courseware,
+	*CoursewareActorContext,
+	error,
+) {
+	courseware, scopedActor, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				coursewareID,
+				actor,
+			)
+	if err != nil {
+		s.broadcastError(
+			coursewareID,
+			err.Error(),
+		)
+		return nil, nil, err
+	}
+
+	return courseware, scopedActor, nil
 }
 
 // ==================== 风格配置解析结构 ====================
 
 // cwStyleConfig 从课件style_config JSON中解析的风格配置
 type cwStyleConfig struct {
-        TemplateID         string `json:"template_id"`
-        LogoURL            string `json:"logo_url"`
-        OrgName            string `json:"org_name"`
-        CustomPrimaryColor string `json:"custom_primary_color"`
+	TemplateID         string `json:"template_id"`
+	LogoURL            string `json:"logo_url"`
+	OrgName            string `json:"org_name"`
+	CustomPrimaryColor string `json:"custom_primary_color"`
 }
 
 // cwTemplateInfo 模板的关键信息（用于注入AI提示词）
 type cwTemplateInfo struct {
-        Name           string            // 模板名称
-        StyleCategory  string            // 风格类别
-        CSSVariables   map[string]string // CSS变量键值对
-        ColorScheme    map[string]string // 配色方案键值对
-        SamplePages    []string          // 任务2新增：模板样例页HTML数组（分页参考注入生成提示词）
-        CoverBgURL     string            // 批次1新增：课件级老师选择的封面背景URL（图库快照，空=未选）
-        ContentBgURL   string            // 批次1新增：课件级老师选择的内页背景URL（空=未选）
-        FontSchemeCode string            // 字体F1新增：课件级老师选择的字体方案code（空=未选）
-        PageBgSettings map[int]*repository.PageBgSetting // 页级背景覆盖设置（页号→设置，nil=未加载）
+	Name           string                            // 模板名称
+	StyleCategory  string                            // 风格类别
+	CSSVariables   map[string]string                 // CSS变量键值对
+	ColorScheme    map[string]string                 // 配色方案键值对
+	SamplePages    []string                          // 任务2新增：模板样例页HTML数组（分页参考注入生成提示词）
+	CoverBgURL     string                            // 批次1新增：课件级老师选择的封面背景URL（图库快照，空=未选）
+	ContentBgURL   string                            // 批次1新增：课件级老师选择的内页背景URL（空=未选）
+	FontSchemeCode string                            // 字体F1新增：课件级老师选择的字体方案code（空=未选）
+	PageBgSettings map[int]*repository.PageBgSetting // 页级背景覆盖设置（页号→设置，nil=未加载）
 }
 
 // ==================== Step 1: 生成预览页（仅封面P1） ====================
@@ -94,210 +125,303 @@ type cwTemplateInfo struct {
 // 生成完成后不改变课件状态（仍为generating），等老师确认导航栏
 //
 // 说明：本方法只生成1页封面，无并发改造价值，迭代二P1保持原串行不动。
-func (s *CoursewareGenService) GeneratePreviewPages(ctx context.Context, coursewareID string, userID string) error {
-        startTime := time.Now()
+func (s *CoursewareGenService) GeneratePreviewPages(ctx context.Context, coursewareID string, actor *CoursewareActorContext) error {
+	startTime := time.Now()
 
-        // ---- 1. 获取课件信息并校验 ----
-        cw, err := repository.GetCoursewareByID(ctx, coursewareID)
-        if err != nil {
-                s.broadcastError(coursewareID, "课件不存在: "+err.Error())
-                return fmt.Errorf("课件不存在: %w", err)
-        }
-        if cw.UserID != userID {
-                s.broadcastError(coursewareID, "无权操作此课件")
-                return fmt.Errorf("无权操作此课件")
-        }
-        if cw.Status != models.CoursewareStatusGenerating {
-                s.broadcastError(coursewareID, "当前状态不允许生成预览: "+cw.Status)
-                return fmt.Errorf("当前状态不允许生成预览: %s", cw.Status)
-        }
+	// ---- 1. 作者专属运行权限与教育域二次校验 ----
+	cw, scopedActor, err :=
+		s.loadOwnerRuntimeCourseware(
+			ctx,
+			coursewareID,
+			actor,
+		)
+	if err != nil {
+		return err
+	}
+	userID := scopedActor.UserID
 
-        // ---- 2. 获取全部页面方案 ----
-        pages, err := repository.ListCoursewarePages(ctx, coursewareID)
-        if err != nil || len(pages) == 0 {
-                s.broadcastError(coursewareID, "课件没有页面方案，请先生成索引")
-                return fmt.Errorf("课件页面为空")
-        }
+	if cw.Status != models.CoursewareStatusGenerating {
+		s.broadcastError(coursewareID, "当前状态不允许生成预览: "+cw.Status)
+		return fmt.Errorf("当前状态不允许生成预览: %s", cw.Status)
+	}
 
-        // P0-1：只取第1页（封面页）
-        previewCount := 1
-        previewPages := pages[:previewCount]
+	// 重新生成封面预览意味着导航栏仍处于待确认状态。
+	// 清除历史nav_template_html，防止旧确认状态使前端自动跳到批量生成。
+	if strings.TrimSpace(cw.NavTemplateHTML) != "" {
+		if clearErr := repository.UpdateCoursewareNavTemplate(ctx, coursewareID, ""); clearErr != nil {
+			s.broadcastError(coursewareID, "清除旧导航栏确认状态失败: "+clearErr.Error())
+			return fmt.Errorf("清除旧导航栏确认状态失败: %w", clearErr)
+		}
+		cw.NavTemplateHTML = ""
+	}
 
-        // ---- 3. 解析风格配置 + 加载模板 ----
-        styleCfg := s.parseStyleConfig(cw.StyleConfig)
-        tplInfo, err := s.loadTemplateInfo(ctx, styleCfg.TemplateID)
-        if err != nil {
-                cwGenLog.Warn("加载模板失败，使用默认风格", "error", err, "courseware_id", coursewareID)
-                tplInfo = s.defaultTemplateInfo()
-        }
+	// ---- 2. 获取全部页面方案 ----
+	pages, err := repository.ListCoursewarePages(ctx, coursewareID)
+	if err != nil || len(pages) == 0 {
+		s.broadcastError(coursewareID, "课件没有页面方案，请先生成索引")
+		return fmt.Errorf("课件页面为空")
+	}
 
-        logoURL, orgName := s.resolveLogoAndOrg(ctx, cw, styleCfg)
+	// P0-1：只取第1页（封面页）
+	previewCount := 1
+	previewPages := pages[:previewCount]
 
-        // 批次1（背景图库）：把课件级老师选择的背景URL挂进生成上下文（三级优先级第一级）
-        s.attachUserBackground(ctx, cw, tplInfo)
+	// ---- 3. 解析风格配置 + 加载模板 ----
+	styleCfg := s.parseStyleConfig(cw.StyleConfig)
+	tplInfo, err := s.loadTemplateInfo(ctx, styleCfg.TemplateID)
+	if err != nil {
+		cwGenLog.Warn("加载模板失败，使用默认风格", "error", err, "courseware_id", coursewareID)
+		tplInfo = s.defaultTemplateInfo()
+	}
 
-        // 教案原文校准（本次）：取一次教案正文，供本页定向匹配注入（非教案来源返空串，行为不变）
-        lessonContext := loadLessonPlanContextForGen(ctx, cw)
+	logoURL, orgName := s.resolveLogoAndOrg(ctx, cw, styleCfg)
 
-        // ---- 4. 加载生成提示词 ----
-        genPrompt, err := repository.GetCurrentPromptByKey("prompt_courseware_generate")
-        if err != nil {
-                s.broadcastError(coursewareID, "加载生成提示词失败: "+err.Error())
-                return fmt.Errorf("加载生成提示词失败: %w", err)
-        }
+	// 批次1（背景图库）：把课件级老师选择的背景URL挂进生成上下文（三级优先级第一级）
+	s.attachUserBackground(ctx, cw, tplInfo)
 
-        // ---- 5. 获取AI配置 ----
-        aiCfg, err := ai.GetEffectiveConfig(
-                s.cfg.GetAESKey(), "courseware_generate",
-                s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
-        )
-        if err != nil {
-                s.broadcastError(coursewareID, "获取AI配置失败: "+err.Error())
-                return fmt.Errorf("获取AI配置失败: %w", err)
-        }
+	// 教案原文校准（本次）：取一次教案正文，供本页定向匹配注入（非教案来源返空串，行为不变）
+	lessonContext := loadLessonPlanContextForGen(ctx, cw)
 
-        totalPages := len(pages)
+	// ---- 4. 加载生成提示词 ----
+	genPrompt, err := repository.GetCurrentPromptByKey("prompt_courseware_generate")
+	if err != nil {
+		s.broadcastError(coursewareID, "加载生成提示词失败: "+err.Error())
+		return fmt.Errorf("加载生成提示词失败: %w", err)
+	}
 
-        // ---- 6. 广播开始事件 ----
-        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                EventType: CWSSEGenStart,
-                Data: map[string]interface{}{
-                        "courseware_id": coursewareID,
-                        "total_pages":   previewCount,
-                        "template":      tplInfo.Name,
-                        "message":       "正在生成封面预览页，请稍候...",
-                        "is_preview":    true,
-                },
-        })
+	// ---- 5. 获取AI配置 ----
+	aiCfg, err := ai.GetEffectiveConfig(
+		s.cfg.GetAESKey(), "courseware_generate",
+		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		s.broadcastError(coursewareID, "获取AI配置失败: "+err.Error())
+		return fmt.Errorf("获取AI配置失败: %w", err)
+	}
 
-        // ---- 7. 生成封面页 ----
-        // v198：解析操作者所属学校ID，供模型境内/境外分流判定（封面预览，操作者=userID）
-        previewSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
-        successCount := 0
-        failCount := 0
-        var errors []string
+	totalPages := len(pages)
 
-        for i, page := range previewPages {
-                pageNum := i + 1
-                cwGenLog.Info("生成预览页", "page_num", pageNum, "title", page.Title, "courseware_id", coursewareID)
+	// ---- 6. 广播开始事件 ----
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEGenStart,
+		Data: map[string]interface{}{
+			"courseware_id": coursewareID,
+			"total_pages":   previewCount,
+			"template":      tplInfo.Name,
+			"message":       "正在生成封面预览页，请稍候...",
+			"is_preview":    true,
+		},
+	})
 
-                // 广播进度
-                GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                        EventType: CWSSEGenProgress,
-                        Data: map[string]interface{}{
-                                "current_page": pageNum,
-                                "total_pages":  previewCount,
-                                "page_title":   page.Title,
-                                "message":      fmt.Sprintf("正在生成封面预览页：%s", page.Title),
-                        },
-                })
+	// ---- 7. 生成封面页 ----
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（封面预览，操作者=userID）
+	previewSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
+	successCount := 0
+	failCount := 0
+	var errors []string
 
-                // 匹配组件
-                matchedComps := s.matchComponentsForPage(ctx, page, cw.Subject, cw.Grade)
+	for i, page := range previewPages {
+		pageNum := i + 1
+		cwGenLog.Info("生成预览页", "page_num", pageNum, "title", page.Title, "courseware_id", coursewareID)
 
-                // 构建用户提示词（预览模式：AI自由生成导航栏，用标记包裹）
-                // 教案原文校准（本次）：末参传 lessonContext，函数内按页定向匹配注入教案相关片段
-                userPrompt := s.buildPreviewUserPrompt(page, pageNum, totalPages, tplInfo, logoURL, orgName, matchedComps, cw, lessonContext)
+		// 广播进度
+		GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+			EventType: CWSSEGenProgress,
+			Data: map[string]interface{}{
+				"current_page": pageNum,
+				"total_pages":  previewCount,
+				"page_title":   page.Title,
+				"message":      fmt.Sprintf("正在生成封面预览页：%s", page.Title),
+			},
+		})
 
-                // 调用AI生成
-                traceCtx := &ai.TraceContext{SceneCode: "courseware_generate", UserID: &userID, SchoolID: schoolIDPtr(previewSchoolID)}
-                result, aiErr := ai.CallAI(aiCfg, genPrompt.Content, userPrompt, traceCtx)
-                if aiErr != nil {
-                        errMsg := fmt.Sprintf("封面预览AI生成失败: %v", aiErr)
-                        cwGenLog.Error("封面预览AI生成失败", "error", aiErr, "courseware_id", coursewareID, "page_num", pageNum)
-                        errors = append(errors, errMsg)
-                        failCount++
-                        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                                EventType: CWSSEGenProgress,
-                                Data: map[string]interface{}{
-                                        "current_page": pageNum,
-                                        "total_pages":  previewCount,
-                                        "page_title":   page.Title,
-                                        "error":        errMsg,
-                                        "message":      "⚠️ 封面预览生成失败",
-                                },
-                        })
-                        continue
-                }
+		// 匹配组件
+		matchedComps := s.matchComponentsForPage(ctx, page, cw.Subject, cw.Grade)
+		var htmlContent string
+		modelUsed := ""
+		tokensUsed := 0
 
-                // 提取HTML
-                htmlContent := s.extractHTMLFromAIOutput(result.Content)
-                // 背景兜底注入（修复）：封面预览路径不走 assembleFullPage，单独接入官方背景强制注入，
-                // 确保确认导航栏页看到的封面必然带模板背景图，不再依赖AI是否采纳。
-                htmlContent = s.applyTemplateBackground(htmlContent, tplInfo, pageNum)
-                if htmlContent == "" {
-                        errMsg := "封面预览AI输出未包含有效HTML"
-                        cwGenLog.Warn("封面预览AI输出未包含有效HTML", "courseware_id", coursewareID, "page_num", pageNum)
-                        errors = append(errors, errMsg)
-                        failCount++
-                        continue
-                }
+		// 有模板首页样例时，必须走硬母版：
+		// 模板DOM、CSS、布局、动画与已有导航栏均不由AI重写。
+		if len(tplInfo.SamplePages) > 0 && strings.TrimSpace(tplInfo.SamplePages[0]) != "" {
+			masterHTML, masterModel, masterTokens, masterErr := s.buildTemplateMasterPreview(
+				ctx,
+				cw,
+				page,
+				tplInfo,
+				logoURL,
+				orgName,
+				totalPages,
+				userID,
+				previewSchoolID,
+				aiCfg,
+			)
+			if masterErr != nil {
+				errMsg := fmt.Sprintf("模板首页严格复刻失败: %v", masterErr)
+				cwGenLog.Error(
+					"模板首页严格复刻失败",
+					"error", masterErr,
+					"courseware_id", coursewareID,
+					"page_num", pageNum,
+					"template", tplInfo.Name,
+				)
+				errors = append(errors, errMsg)
+				failCount++
+				GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+					EventType: CWSSEGenProgress,
+					Data: map[string]interface{}{
+						"current_page": pageNum,
+						"total_pages":  previewCount,
+						"page_title":   page.Title,
+						"error":        errMsg,
+						"message":      "⚠️ 模板首页严格复刻失败，未退回自由重画",
+					},
+				})
+				continue
+			}
 
-                // 构建匹配组件ID列表
-                matchedIDs := s.buildMatchedComponentIDs(matchedComps)
+			htmlContent = masterHTML
+			modelUsed = masterModel
+			tokensUsed = masterTokens
+		} else {
+			// 模板没有首页样例时，保留原AI生成兜底能力。
+			userPrompt := s.buildPreviewUserPrompt(
+				page,
+				pageNum,
+				totalPages,
+				tplInfo,
+				logoURL,
+				orgName,
+				matchedComps,
+				cw,
+				lessonContext,
+			)
 
-                // 写入数据库
-                if dbErr := repository.UpdateCWPageHTML(ctx, page.ID, htmlContent, "", matchedIDs, models.CWPageStatusGenerated); dbErr != nil {
-                        errMsg := fmt.Sprintf("封面预览保存HTML失败: %v", dbErr)
-                        cwGenLog.Error("封面预览保存HTML失败", "error", dbErr, "courseware_id", coursewareID, "page_num", pageNum)
-                        errors = append(errors, errMsg)
-                        failCount++
-                        continue
-                }
+			traceCtx := &ai.TraceContext{
+				SceneCode: "courseware_generate",
+				UserID:    &userID,
+				SchoolID:  schoolIDPtr(previewSchoolID),
+			}
 
-                successCount++
-                cwGenLog.Info("封面预览生成成功", "model", result.ModelUsed, "tokens", result.TokensUsed, "courseware_id", coursewareID)
+			result, aiErr := ai.CallAI(
+				aiCfg,
+				genPrompt.Content,
+				userPrompt,
+				traceCtx,
+			)
+			if aiErr != nil {
+				errMsg := fmt.Sprintf("封面预览AI生成失败: %v", aiErr)
+				cwGenLog.Error(
+					"封面预览AI生成失败",
+					"error", aiErr,
+					"courseware_id", coursewareID,
+					"page_num", pageNum,
+				)
+				errors = append(errors, errMsg)
+				failCount++
 
-                // 广播单页完成
-                GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                        EventType: CWSSEGenPage,
-                        Data: map[string]interface{}{
-                                "page_number":  pageNum,
-                                "page_id":      page.ID,
-                                "title":        page.Title,
-                                "html_content": htmlContent,
-                                "model_used":   result.ModelUsed,
-                                "tokens_used":  result.TokensUsed,
-                        },
-                })
-        }
+				GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+					EventType: CWSSEGenProgress,
+					Data: map[string]interface{}{
+						"current_page": pageNum,
+						"total_pages":  previewCount,
+						"page_title":   page.Title,
+						"error":        errMsg,
+						"message":      "⚠️ 封面预览生成失败",
+					},
+				})
+				continue
+			}
 
-        // ---- 8. 预览生成完成（不改变课件状态） ----
-        elapsed := time.Since(startTime)
-        cwGenLog.Info("封面预览生成完成",
-                "courseware_id", coursewareID,
-                "success", successCount,
-                "fail", failCount,
-                "elapsed_ms", elapsed.Milliseconds(),
-        )
+			htmlContent = s.extractHTMLFromAIOutput(result.Content)
+			modelUsed = result.ModelUsed
+			tokensUsed = result.TokensUsed
+		}
 
-        // 小修：message 按成败分情况说真话。失败(failCount>0)时把真实原因（errors 首条，
-        //   如"积分余额不足/超时/HTTP 500"）拼进 message，让前端直接显示真实原因，
-        //   不再无论成败都报"生成完成"误导老师（曾导致老师以为成功、对着空白预览区一脸懵）。
-        previewMsg := "封面预览生成完成！请确认导航栏样式后继续。"
-        if failCount > 0 {
-                reason := "AI生成失败"
-                if len(errors) > 0 && errors[0] != "" {
-                        reason = errors[0]
-                }
-                previewMsg = fmt.Sprintf("封面预览生成失败：%s。请稍后重试，若持续失败请联系管理员。", reason)
-        }
+		// 背景和字体继续走后端确定性出口。
+		// 该出口只补背景/字体，不允许AI重写模板DOM布局。
+		htmlContent = s.applyTemplateBackground(
+			htmlContent,
+			tplInfo,
+			pageNum,
+		)
+		if strings.TrimSpace(htmlContent) == "" {
+			errMsg := "封面预览未形成有效HTML"
+			cwGenLog.Warn(
+				"封面预览未形成有效HTML",
+				"courseware_id", coursewareID,
+				"page_num", pageNum,
+			)
+			errors = append(errors, errMsg)
+			failCount++
+			continue
+		}
 
-        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                EventType: CWSSEGenDone,
-                Data: map[string]interface{}{
-                        "courseware_id": coursewareID,
-                        "success_count": successCount,
-                        "fail_count":    failCount,
-                        "total_pages":   previewCount,
-                        "elapsed_ms":    elapsed.Milliseconds(),
-                        "errors":        errors,
-                        "is_preview":    true,
-                        "message":       previewMsg,
-                },
-        })
+		// 构建匹配组件ID列表
+		matchedIDs := s.buildMatchedComponentIDs(matchedComps)
 
-        return nil
+		// 写入数据库
+		if dbErr := repository.UpdateCWPageHTML(ctx, page.ID, htmlContent, "", matchedIDs, models.CWPageStatusGenerated); dbErr != nil {
+			errMsg := fmt.Sprintf("封面预览保存HTML失败: %v", dbErr)
+			cwGenLog.Error("封面预览保存HTML失败", "error", dbErr, "courseware_id", coursewareID, "page_num", pageNum)
+			errors = append(errors, errMsg)
+			failCount++
+			continue
+		}
+
+		successCount++
+		cwGenLog.Info("封面预览生成成功", "model", modelUsed, "tokens", tokensUsed, "courseware_id", coursewareID)
+
+		// 广播单页完成
+		GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+			EventType: CWSSEGenPage,
+			Data: map[string]interface{}{
+				"page_number":  pageNum,
+				"page_id":      page.ID,
+				"title":        page.Title,
+				"html_content": htmlContent,
+				"model_used":   modelUsed,
+				"tokens_used":  tokensUsed,
+			},
+		})
+	}
+
+	// ---- 8. 预览生成完成（不改变课件状态） ----
+	elapsed := time.Since(startTime)
+	cwGenLog.Info("封面预览生成完成",
+		"courseware_id", coursewareID,
+		"success", successCount,
+		"fail", failCount,
+		"elapsed_ms", elapsed.Milliseconds(),
+	)
+
+	// 小修：message 按成败分情况说真话。失败(failCount>0)时把真实原因（errors 首条，
+	//   如"积分余额不足/超时/HTTP 500"）拼进 message，让前端直接显示真实原因，
+	//   不再无论成败都报"生成完成"误导老师（曾导致老师以为成功、对着空白预览区一脸懵）。
+	previewMsg := "封面预览生成完成！请确认导航栏样式后继续。"
+	if failCount > 0 {
+		reason := "AI生成失败"
+		if len(errors) > 0 && errors[0] != "" {
+			reason = errors[0]
+		}
+		previewMsg = fmt.Sprintf("封面预览生成失败：%s。请稍后重试，若持续失败请联系管理员。", reason)
+	}
+
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEGenDone,
+		Data: map[string]interface{}{
+			"courseware_id": coursewareID,
+			"success_count": successCount,
+			"fail_count":    failCount,
+			"total_pages":   previewCount,
+			"elapsed_ms":    elapsed.Milliseconds(),
+			"errors":        errors,
+			"is_preview":    true,
+			"message":       previewMsg,
+		},
+	})
+
+	return nil
 }
 
 // ==================== Step 2: 生成剩余页面（后端硬拼接导航栏，受控并发） ====================
@@ -308,15 +432,15 @@ func (s *CoursewareGenService) GeneratePreviewPages(ctx context.Context, coursew
 // 而不是直接在 goroutine 里改共享计数器。计数与"单页完成"SSE 广播统一在持锁段做，
 // 既保证 successCount/failCount/genErrors 无数据竞争，又让前端进度按页落地不丢事件。
 type cwGenPageResult struct {
-        progressNum int    // 本次批量内的序号（1..N，用于进度文案）
-        pageNum     int    // 课件内真实页码
-        pageID      string // 页面ID
-        title       string // 页标题
-        ok          bool   // 是否成功
-        fullHTML    string // 成功时：拼接导航栏后的完整页面HTML
-        modelUsed   string // 成功时：使用的模型
-        tokensUsed  int    // 成功时：消耗tokens
-        errMsg      string // 失败时：错误信息
+	progressNum int    // 本次批量内的序号（1..N，用于进度文案）
+	pageNum     int    // 课件内真实页码
+	pageID      string // 页面ID
+	title       string // 页标题
+	ok          bool   // 是否成功
+	fullHTML    string // 成功时：拼接导航栏后的完整页面HTML
+	modelUsed   string // 成功时：使用的模型
+	tokensUsed  int    // 成功时：消耗tokens
+	errMsg      string // 失败时：错误信息
 }
 
 // GenerateRemainingPages 生成剩余页面（AI只生成内容区HTML，后端硬拼接导航栏）
@@ -331,363 +455,479 @@ type cwGenPageResult struct {
 //     「单页完成/失败」在汇总持锁段广播，保证计数与事件一致、顺序稳定
 //   - 单页失败不影响其他页（隔离性），页面按 page.ID 独立落库（无写库竞争）
 //   - 并发数配置为 1 即完全退化为原串行行为（零风险回滚）
-func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, coursewareID string, userID string) error {
-        startTime := time.Now()
+func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, coursewareID string, actor *CoursewareActorContext) error {
+	startTime := time.Now()
 
-        // 防并发：同一课件同时只允许一个批量生成任务，避免连点/多标签页重复生成、重复扣 token、写库竞争
-        if _, busy := cwGenRunning.LoadOrStore(coursewareID, struct{}{}); busy {
-                s.broadcastError(coursewareID, "该课件正在生成中，请勿重复触发")
-                return fmt.Errorf("课件正在生成中: %s", coursewareID)
-        }
-        defer cwGenRunning.Delete(coursewareID)
+	// 作者专属运行权限与教育域二次校验必须先于运行锁，
+	// 避免无权调用者短暂占用某课件的生成锁。
+	cw, scopedActor, err :=
+		s.loadOwnerRuntimeCourseware(
+			ctx,
+			coursewareID,
+			actor,
+		)
+	if err != nil {
+		return err
+	}
+	userID := scopedActor.UserID
 
-        // ---- 1. 获取课件信息并校验 ----
-        cw, err := repository.GetCoursewareByID(ctx, coursewareID)
-        if err != nil {
-                s.broadcastError(coursewareID, "课件不存在: "+err.Error())
-                return fmt.Errorf("课件不存在: %w", err)
-        }
-        if cw.UserID != userID {
-                s.broadcastError(coursewareID, "无权操作此课件")
-                return fmt.Errorf("无权操作此课件")
-        }
-        if cw.Status != models.CoursewareStatusGenerating && cw.Status != models.CoursewareStatusPreview {
-                s.broadcastError(coursewareID, "当前状态不允许生成课件: "+cw.Status)
-                return fmt.Errorf("当前状态不允许生成课件: %s", cw.Status)
-        }
-        // 必须已保存导航栏模板
-        if strings.TrimSpace(cw.NavTemplateHTML) == "" {
-                s.broadcastError(coursewareID, "请先确认导航栏样式")
-                return fmt.Errorf("导航栏模板未保存，请先确认导航栏样式")
-        }
+	// 防并发：同一课件同时只允许一个批量生成任务，避免连点/多标签页重复生成、重复扣 token、写库竞争
+	if _, busy := cwGenRunning.LoadOrStore(
+		coursewareID,
+		struct{}{},
+	); busy {
+		s.broadcastError(
+			coursewareID,
+			"该课件正在生成中，请勿重复触发",
+		)
+		return fmt.Errorf(
+			"课件正在生成中: %s",
+			coursewareID,
+		)
+	}
+	defer cwGenRunning.Delete(coursewareID)
 
-        // ---- 2. 获取全部页面方案 ----
-        pages, err := repository.ListCoursewarePages(ctx, coursewareID)
-        if err != nil || len(pages) == 0 {
-                s.broadcastError(coursewareID, "课件没有页面方案")
-                return fmt.Errorf("课件页面为空")
-        }
+	// ---- 1. 状态校验 ----
+	if cw.Status != models.CoursewareStatusGenerating && cw.Status != models.CoursewareStatusPreview {
+		s.broadcastError(coursewareID, "当前状态不允许生成课件: "+cw.Status)
+		return fmt.Errorf("当前状态不允许生成课件: %s", cw.Status)
+	}
+	// 必须已保存导航栏模板
+	if strings.TrimSpace(cw.NavTemplateHTML) == "" {
+		s.broadcastError(coursewareID, "请先确认导航栏样式")
+		return fmt.Errorf("导航栏模板未保存，请先确认导航栏样式")
+	}
 
-        // 找出尚未生成HTML的页面（跳过已生成的预览页）
-        var remainingPages []*models.CoursewarePage
-        for _, p := range pages {
-                if p.HTMLContent == "" {
-                        remainingPages = append(remainingPages, p)
-                }
-        }
+	// ---- 2. 获取全部页面方案 ----
+	pages, err := repository.ListCoursewarePages(ctx, coursewareID)
+	if err != nil || len(pages) == 0 {
+		s.broadcastError(coursewareID, "课件没有页面方案")
+		return fmt.Errorf("课件页面为空")
+	}
 
-        if len(remainingPages) == 0 {
-                // 所有页面都已生成，直接完成
-                _ = repository.UpdateCoursewareStatus(ctx, coursewareID, models.CoursewareStatusPreview)
-                GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                        EventType: CWSSEGenDone,
-                        Data: map[string]interface{}{
-                                "courseware_id": coursewareID,
-                                "success_count": len(pages),
-                                "fail_count":    0,
-                                "total_pages":   len(pages),
-                                "message":       "所有页面已生成完毕！",
-                        },
-                })
-                return nil
-        }
+	// 找出尚未生成HTML的页面（跳过已生成的预览页）
+	var remainingPages []*models.CoursewarePage
+	for _, p := range pages {
+		if p.HTMLContent == "" {
+			remainingPages = append(remainingPages, p)
+		}
+	}
 
-        // ---- 3. 解析风格配置 + 加载模板 ----
-        styleCfg := s.parseStyleConfig(cw.StyleConfig)
-        tplInfo, err := s.loadTemplateInfo(ctx, styleCfg.TemplateID)
-        if err != nil {
-                cwGenLog.Warn("加载模板失败，使用默认风格", "error", err, "courseware_id", coursewareID)
-                tplInfo = s.defaultTemplateInfo()
-        }
+	if len(remainingPages) == 0 {
+		// 所有页面都已生成，直接完成
+		_ = repository.UpdateCoursewareStatus(ctx, coursewareID, models.CoursewareStatusPreview)
+		GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+			EventType: CWSSEGenDone,
+			Data: map[string]interface{}{
+				"courseware_id": coursewareID,
+				"success_count": len(pages),
+				"fail_count":    0,
+				"total_pages":   len(pages),
+				"message":       "所有页面已生成完毕！",
+			},
+		})
+		return nil
+	}
 
-        logoURL, orgName := s.resolveLogoAndOrg(ctx, cw, styleCfg)
+	// ---- 3. 解析风格配置 + 加载模板 ----
+	styleCfg := s.parseStyleConfig(cw.StyleConfig)
+	tplInfo, err := s.loadTemplateInfo(ctx, styleCfg.TemplateID)
+	if err != nil {
+		cwGenLog.Warn("加载模板失败，使用默认风格", "error", err, "courseware_id", coursewareID)
+		tplInfo = s.defaultTemplateInfo()
+	}
 
-        // 批次1（背景图库）：把课件级老师选择的背景URL挂进生成上下文（三级优先级第一级）
-        s.attachUserBackground(ctx, cw, tplInfo)
+	logoURL, orgName := s.resolveLogoAndOrg(ctx, cw, styleCfg)
 
-        // 教案原文校准（本次）：取一次教案正文，供各页定向匹配注入（非教案来源返空串，行为不变）。
-        //   入口取一次、全页共用；并发 goroutine 只读此字符串，天然并发安全，不新增每页查库开销。
-        lessonContext := loadLessonPlanContextForGen(ctx, cw)
+	// 批次1（背景图库）：把课件级老师选择的背景URL挂进生成上下文（三级优先级第一级）
+	s.attachUserBackground(ctx, cw, tplInfo)
 
-        // ---- 4. 加载生成提示词 ----
-        genPrompt, err := repository.GetCurrentPromptByKey("prompt_courseware_generate")
-        if err != nil {
-                s.broadcastError(coursewareID, "加载生成提示词失败: "+err.Error())
-                return fmt.Errorf("加载生成提示词失败: %w", err)
-        }
+	// 教案原文校准（本次）：取一次教案正文，供各页定向匹配注入（非教案来源返空串，行为不变）。
+	//   入口取一次、全页共用；并发 goroutine 只读此字符串，天然并发安全，不新增每页查库开销。
+	lessonContext := loadLessonPlanContextForGen(ctx, cw)
 
-        // ---- 5. 获取AI配置 ----
-        aiCfg, err := ai.GetEffectiveConfig(
-                s.cfg.GetAESKey(), "courseware_generate",
-                s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
-        )
-        if err != nil {
-                s.broadcastError(coursewareID, "获取AI配置失败: "+err.Error())
-                return fmt.Errorf("获取AI配置失败: %w", err)
-        }
+	// ---- 4. 加载生成提示词 ----
+	genPrompt, err := repository.GetCurrentPromptByKey("prompt_courseware_generate")
+	if err != nil {
+		s.broadcastError(coursewareID, "加载生成提示词失败: "+err.Error())
+		return fmt.Errorf("加载生成提示词失败: %w", err)
+	}
 
-        totalPages := len(pages)
-        navTemplate := cw.NavTemplateHTML
-        remainingCount := len(remainingPages)
+	// ---- 5. 获取AI配置 ----
+	aiCfg, err := ai.GetEffectiveConfig(
+		s.cfg.GetAESKey(), "courseware_generate",
+		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		s.broadcastError(coursewareID, "获取AI配置失败: "+err.Error())
+		return fmt.Errorf("获取AI配置失败: %w", err)
+	}
 
-        // ---- 6. 解析并发数（兜底再保险：config 已保证≥1，此处再防御一次） ----
-        concurrency := s.cfg.CoursewareGenConcurrency
-        if concurrency < 1 {
-                concurrency = 1
-        }
-        if concurrency > remainingCount {
-                concurrency = remainingCount // 并发数不超过待生成页数，避免开多余goroutine
-        }
+	totalPages := len(pages)
+	navTemplate := cw.NavTemplateHTML
+	remainingCount := len(remainingPages)
 
-        // ---- 7. 广播开始事件 ----
-        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                EventType: CWSSEGenStart,
-                Data: map[string]interface{}{
-                        "courseware_id": coursewareID,
-                        "total_pages":   remainingCount,
-                        "template":      tplInfo.Name,
-                        "concurrency":   concurrency,
-                        "message":       fmt.Sprintf("开始生成剩余 %d 页课件（导航栏已固定，并发 %d）...", remainingCount, concurrency),
-                        "is_preview":    false,
-                },
-        })
+	// ---- 6. 解析并发数（兜底再保险：config 已保证≥1，此处再防御一次） ----
+	concurrency := s.cfg.CoursewareGenConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > remainingCount {
+		concurrency = remainingCount // 并发数不超过待生成页数，避免开多余goroutine
+	}
 
-        // ---- 8. 注册取消信号 ----
-        cancelCh := make(chan struct{})
-        cwGenCancelMap.Store(coursewareID, cancelCh)
-        defer cwGenCancelMap.Delete(coursewareID)
+	// ---- 7. 广播开始事件 ----
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEGenStart,
+		Data: map[string]interface{}{
+			"courseware_id": coursewareID,
+			"total_pages":   remainingCount,
+			"template":      tplInfo.Name,
+			"concurrency":   concurrency,
+			"message":       fmt.Sprintf("开始生成剩余 %d 页课件（导航栏已固定，并发 %d）...", remainingCount, concurrency),
+			"is_preview":    false,
+		},
+	})
 
-        // ---- 9. 受控并发生成 ----
-        // v198：解析操作者所属学校ID，供模型境内/境外分流判定（批量生成，操作者=userID；提到 goroutine 外解析一次，并发页共用）
-        remainingSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
-        // 共享计数器 + 错误收集，全部用 mu 保护
-        var (
-                mu           sync.Mutex
-                successCount int
-                failCount    int
-                genErrors    []string
-                cancelled    bool // 是否因取消信号提前结束
-        )
+	// ---- 8. 注册取消信号 ----
+	cancelCh := make(chan struct{})
+	cwGenCancelMap.Store(coursewareID, cancelCh)
+	defer cwGenCancelMap.Delete(coursewareID)
 
-        // 信号量：容量=concurrency，限制同时在跑的 goroutine 数
-        sem := make(chan struct{}, concurrency)
-        var wg sync.WaitGroup
+	// ---- 9. 受控并发生成 ----
+	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（批量生成，操作者=userID；提到 goroutine 外解析一次，并发页共用）
+	remainingSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
+	// 共享计数器 + 错误收集，全部用 mu 保护
+	var (
+		mu           sync.Mutex
+		successCount int
+		failCount    int
+		genErrors    []string
+		cancelled    bool // 是否因取消信号提前结束
+	)
 
-        for i, page := range remainingPages {
-                // 派发前先看是否已取消：已取消则不再派发后续页
-                select {
-                case <-cancelCh:
-                        mu.Lock()
-                        cancelled = true
-                        mu.Unlock()
-                default:
-                }
-                mu.Lock()
-                stop := cancelled
-                mu.Unlock()
-                if stop {
-                        break
-                }
+	// 信号量：容量=concurrency，限制同时在跑的 goroutine 数
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
 
-                wg.Add(1)
-                sem <- struct{}{} // 占用一个并发名额（满则阻塞，天然限流）
+	for i, page := range remainingPages {
+		// 派发前先看是否已取消：已取消则不再派发后续页
+		select {
+		case <-cancelCh:
+			mu.Lock()
+			cancelled = true
+			mu.Unlock()
+		default:
+		}
+		mu.Lock()
+		stop := cancelled
+		mu.Unlock()
+		if stop {
+			break
+		}
 
-                go func(idx int, p *models.CoursewarePage) {
-                        defer wg.Done()
-                        defer func() { <-sem }() // 释放并发名额
+		wg.Add(1)
+		sem <- struct{}{} // 占用一个并发名额（满则阻塞，天然限流）
 
-                        progressNum := idx + 1
-                        pageNum := p.PageNumber
+		go func(idx int, p *models.CoursewarePage) {
+			defer wg.Done()
+			defer func() { <-sem }() // 释放并发名额
 
-                        // goroutine 内再次检查取消信号：取消后已占名额的页直接跳过，不再烧 token
-                        select {
-                        case <-cancelCh:
-                                mu.Lock()
-                                cancelled = true
-                                mu.Unlock()
-                                return
-                        default:
-                        }
+			progressNum := idx + 1
+			pageNum := p.PageNumber
 
-                        // 广播进度（Hub内有锁，并发安全）——本页开始生成
-                        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                                EventType: CWSSEGenProgress,
-                                Data: map[string]interface{}{
-                                        "current_page": progressNum,
-                                        "total_pages":  remainingCount,
-                                        "page_title":   p.Title,
-                                        "message":      fmt.Sprintf("正在生成 P%d：%s（本次进度 %d/%d）", pageNum, p.Title, progressNum, remainingCount),
-                                },
-                        })
+			// goroutine 内再次检查取消信号：取消后已占名额的页直接跳过，不再烧 token
+			select {
+			case <-cancelCh:
+				mu.Lock()
+				cancelled = true
+				mu.Unlock()
+				return
+			default:
+			}
 
-                        res := cwGenPageResult{progressNum: progressNum, pageNum: pageNum, pageID: p.ID, title: p.Title}
+			// 广播进度（Hub内有锁，并发安全）——本页开始生成
+			GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+				EventType: CWSSEGenProgress,
+				Data: map[string]interface{}{
+					"current_page": progressNum,
+					"total_pages":  remainingCount,
+					"page_title":   p.Title,
+					"message":      fmt.Sprintf("正在生成 P%d：%s（本次进度 %d/%d）", pageNum, p.Title, progressNum, remainingCount),
+				},
+			})
 
-                        cwGenLog.Info("生成批量页",
-                                "progress", fmt.Sprintf("%d/%d", progressNum, remainingCount),
-                                "page_num", pageNum,
-                                "title", p.Title,
-                                "courseware_id", coursewareID,
-                        )
+			res := cwGenPageResult{progressNum: progressNum, pageNum: pageNum, pageID: p.ID, title: p.Title}
 
-                        // 匹配组件（纯查询，并发安全）
-                        matchedComps := s.matchComponentsForPage(ctx, p, cw.Subject, cw.Grade)
+			cwGenLog.Info("生成批量页",
+				"progress", fmt.Sprintf("%d/%d", progressNum, remainingCount),
+				"page_num", pageNum,
+				"title", p.Title,
+				"courseware_id", coursewareID,
+			)
 
-                        // 构建用户提示词（批量模式：AI只生成内容区，不含导航栏）
-                        // 教案原文校准（本次）：末参传入口取好的 lessonContext（只读，并发安全），
-                        //   函数内对本页做定向匹配，注入与本页最相关的教案原文片段。
-                        userPrompt := s.buildBatchUserPrompt(p, pageNum, totalPages, tplInfo, logoURL, orgName, matchedComps, cw, lessonContext)
+			// 匹配组件（纯查询，并发安全）
+			matchedComps := s.matchComponentsForPage(ctx, p, cw.Subject, cw.Grade)
 
-                        // 调用AI生成（每页独立 traceCtx，无共享）；P2：失败自动重试最多 cwGenMaxAttempts 次
-                        //   重试仅发生在该页失败时，串行在本 goroutine 内重试，不阻塞其他并发页 → 成功页速度不变。
-                        traceCtx := &ai.TraceContext{SceneCode: "courseware_generate", UserID: &userID, SchoolID: schoolIDPtr(remainingSchoolID)}
-                        var result *ai.CallResult
-                        var aiErr error
-                        for attempt := 1; attempt <= cwGenMaxAttempts; attempt++ {
-                                // 每次尝试前再检查取消信号：取消后不再浪费 AI 调用
-                                select {
-                                case <-cancelCh:
-                                        mu.Lock()
-                                        cancelled = true
-                                        mu.Unlock()
-                                        return
-                                default:
-                                }
-                                result, aiErr = ai.CallAI(aiCfg, genPrompt.Content, userPrompt, traceCtx)
-                                if aiErr == nil {
-                                        if attempt > 1 {
-                                                cwGenLog.Info("批量页AI重试成功",
-                                                        "courseware_id", coursewareID, "page_num", pageNum, "attempt", attempt)
-                                        }
-                                        break // 成功，跳出重试循环
-                                }
-                                // 本次失败：记录并在还有重试机会时退避后重试
-                                cwGenLog.Warn("批量页AI生成失败，准备重试",
-                                        "error", aiErr, "courseware_id", coursewareID, "page_num", pageNum,
-                                        "attempt", attempt, "max_attempts", cwGenMaxAttempts)
-                                if attempt < cwGenMaxAttempts {
-                                        // 退避间隔随重试次数递增（1s、2s），扛中转商偶发 HTTP 500
-                                        time.Sleep(time.Duration(attempt) * cwGenRetryBaseDelay)
-                                }
-                        }
-                        if aiErr != nil {
-                                // 重试 cwGenMaxAttempts 次仍失败，才真正计入失败
-                                res.errMsg = fmt.Sprintf("第%d页AI生成失败(已重试%d次): %v", pageNum, cwGenMaxAttempts-1, aiErr)
-                                cwGenLog.Error("批量页AI生成最终失败", "error", aiErr, "courseware_id", coursewareID, "page_num", pageNum, "attempts", cwGenMaxAttempts)
-                                s.collectPageResult(coursewareID, &mu, &successCount, &failCount, &genErrors, res, remainingCount)
-                                return
-                        }
+			// 构建用户提示词（批量模式：AI只生成内容区，不含导航栏）
+			// 教案原文校准（本次）：末参传入口取好的 lessonContext（只读，并发安全），
+			//   函数内对本页做定向匹配，注入与本页最相关的教案原文片段。
+			userPrompt := s.buildBatchUserPrompt(p, pageNum, totalPages, tplInfo, logoURL, orgName, matchedComps, cw, lessonContext)
 
-                        // 提取AI输出的内容区HTML
-                        contentHTML := s.extractHTMLFromAIOutput(result.Content)
-                        if contentHTML == "" {
-                                res.errMsg = fmt.Sprintf("第%d页AI输出未包含有效HTML", pageNum)
-                                cwGenLog.Warn("批量页AI输出未包含有效HTML", "courseware_id", coursewareID, "page_num", pageNum)
-                                s.collectPageResult(coursewareID, &mu, &successCount, &failCount, &genErrors, res, remainingCount)
-                                return
-                        }
+			// 调用AI生成（每页独立 traceCtx，无共享）。
+			// API调用失败、空HTML或互动契约未落实，都会在本页goroutine内自动纠偏重试。
+			traceCtx := &ai.TraceContext{
+				SceneCode: "courseware_generate",
+				UserID:    &userID,
+				SchoolID:  schoolIDPtr(remainingSchoolID),
+			}
+			var aiErr error
+			modelUsed := ""
+			tokensUsed := 0
+			fullPageHTML := ""
+			attemptPrompt := userPrompt
 
-                        // P0-1核心：后端硬拼接导航栏 + 内容区 → 完整页面（纯函数，并发安全）
-                        fullPageHTML := s.assembleFullPage(contentHTML, navTemplate, pageNum, totalPages, tplInfo)
+			for attempt := 1; attempt <= cwGenMaxAttempts; attempt++ {
+				// 每次尝试前再检查取消信号：取消后不再浪费AI调用。
+				select {
+				case <-cancelCh:
+					mu.Lock()
+					cancelled = true
+					mu.Unlock()
+					return
+				default:
+				}
 
-                        // 构建匹配组件ID列表
-                        matchedIDs := s.buildMatchedComponentIDs(matchedComps)
+				callResult, callErr := ai.CallAI(
+					aiCfg,
+					genPrompt.Content,
+					attemptPrompt,
+					traceCtx,
+				)
+				aiErr = callErr
 
-                        // 写入数据库（按 page.ID 独立行 UPDATE，pgxpool 并发安全，无行竞争）
-                        if dbErr := repository.UpdateCWPageHTML(ctx, p.ID, fullPageHTML, "", matchedIDs, models.CWPageStatusGenerated); dbErr != nil {
-                                res.errMsg = fmt.Sprintf("第%d页保存HTML失败: %v", pageNum, dbErr)
-                                cwGenLog.Error("批量页保存HTML失败", "error", dbErr, "courseware_id", coursewareID, "page_num", pageNum)
-                                s.collectPageResult(coursewareID, &mu, &successCount, &failCount, &genErrors, res, remainingCount)
-                                return
-                        }
+				if aiErr == nil &&
+					(callResult == nil ||
+						strings.TrimSpace(callResult.Content) == "") {
+					aiErr = fmt.Errorf("AI返回空内容")
+				}
 
-                        // 成功
-                        res.ok = true
-                        res.fullHTML = fullPageHTML
-                        res.modelUsed = result.ModelUsed
-                        res.tokensUsed = result.TokensUsed
-                        cwGenLog.Info("批量页生成成功",
-                                "progress", fmt.Sprintf("%d/%d", progressNum, remainingCount),
-                                "page_num", pageNum,
-                                "model", result.ModelUsed,
-                                "tokens", result.TokensUsed,
-                                "courseware_id", coursewareID,
-                        )
-                        s.collectPageResult(coursewareID, &mu, &successCount, &failCount, &genErrors, res, remainingCount)
-                }(i, page)
-        }
+				if aiErr == nil {
+					contentHTML := s.extractHTMLFromAIOutput(
+						callResult.Content,
+					)
+					if strings.TrimSpace(contentHTML) == "" {
+						aiErr = fmt.Errorf(
+							"AI输出未包含有效HTML",
+						)
+					} else {
+						// 只检查AI生成的内容区，不检查系统拼接的导航栏。
+						// 否则导航栏自身的翻页按钮可能让click页面错误通过验收。
+						interactionCheck :=
+							validateGeneratedPageInteraction(
+								p.InteractionType,
+								contentHTML,
+							)
 
-        // 等待所有已派发的 goroutine 完成（已派发的页会跑完，未派发的因取消而不再派发）
-        wg.Wait()
+						if interactionCheck.OK {
+							fullPageHTML = s.assembleFullPage(
+								contentHTML,
+								navTemplate,
+								pageNum,
+								totalPages,
+								tplInfo,
+							)
+							modelUsed = callResult.ModelUsed
+							tokensUsed = callResult.TokensUsed
 
-        // ---- 10. 完成（含取消分支） ----
-        elapsed := time.Since(startTime)
+							if attempt > 1 {
+								cwGenLog.Info(
+									"批量页互动契约纠偏重试成功",
+									"courseware_id", coursewareID,
+									"page_num", pageNum,
+									"interaction_type", p.InteractionType,
+									"attempt", attempt,
+								)
+							}
+							break
+						}
 
-        mu.Lock()
-        finalSuccess := successCount
-        finalFail := failCount
-        finalErrors := append([]string(nil), genErrors...)
-        wasCancelled := cancelled
-        mu.Unlock()
+						aiErr = fmt.Errorf(
+							"互动方式未落实: %s",
+							interactionCheck.Reason,
+						)
+						attemptPrompt =
+							buildCWInteractionRepairPrompt(
+								userPrompt,
+								p,
+								interactionCheck,
+							)
 
-        // 只要有任意页成功落库，就把状态推进到 preview（与原串行行为一致）
-        if finalSuccess > 0 {
-                _ = repository.UpdateCoursewareStatus(ctx, coursewareID, models.CoursewareStatusPreview)
-        }
+						cwGenLog.Warn(
+							"批量页互动契约验收失败，准备自动纠偏重试",
+							"courseware_id", coursewareID,
+							"page_num", pageNum,
+							"interaction_type", p.InteractionType,
+							"reason", interactionCheck.Reason,
+							"detail", interactionCheck.Detail,
+							"attempt", attempt,
+							"max_attempts", cwGenMaxAttempts,
+						)
+					}
+				}
 
-        if wasCancelled {
-                cwGenLog.Info("课件生成被取消",
-                        "courseware_id", coursewareID,
-                        "success", finalSuccess,
-                        "fail", finalFail,
-                        "elapsed_ms", elapsed.Milliseconds(),
-                )
-                GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                        EventType: CWSSEGenDone,
-                        Data: map[string]interface{}{
-                                "courseware_id": coursewareID,
-                                "success_count": finalSuccess,
-                                "fail_count":    finalFail,
-                                "total_pages":   remainingCount,
-                                "elapsed_ms":    elapsed.Milliseconds(),
-                                "errors":        finalErrors,
-                                "is_preview":    false,
-                                "cancelled":     true,
-                                "message":       fmt.Sprintf("已停止生成，已完成 %d 页", finalSuccess),
-                        },
-                })
-                return nil
-        }
+				if aiErr != nil {
+					cwGenLog.Warn(
+						"批量页生成尝试失败，准备重试",
+						"error", aiErr,
+						"courseware_id", coursewareID,
+						"page_num", pageNum,
+						"interaction_type", p.InteractionType,
+						"attempt", attempt,
+						"max_attempts", cwGenMaxAttempts,
+					)
 
-        cwGenLog.Info("课件剩余页面生成完成",
-                "courseware_id", coursewareID,
-                "success", finalSuccess,
-                "fail", finalFail,
-                "concurrency", concurrency,
-                "elapsed_ms", elapsed.Milliseconds(),
-        )
+					if attempt < cwGenMaxAttempts {
+						time.Sleep(
+							time.Duration(attempt) *
+								cwGenRetryBaseDelay,
+						)
+					}
+				}
+			}
 
-        // 小修：批量生成 message 也按成败给真实信息。有失败页时把首条真实原因带上，
-        //   与封面预览保持一致的"说真话"口径，便于前端/老师定位（如积分余额不足/超时）。
-        doneMsg := fmt.Sprintf("课件生成完成！成功 %d 页，失败 %d 页", finalSuccess, finalFail)
-        if finalFail > 0 && len(finalErrors) > 0 && finalErrors[0] != "" {
-                doneMsg = fmt.Sprintf("课件生成完成：成功 %d 页，失败 %d 页（失败原因：%s）", finalSuccess, finalFail, finalErrors[0])
-        }
+			if strings.TrimSpace(fullPageHTML) == "" {
+				if aiErr == nil {
+					aiErr = fmt.Errorf(
+						"未形成通过互动契约验收的有效HTML",
+					)
+				}
 
-        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                EventType: CWSSEGenDone,
-                Data: map[string]interface{}{
-                        "courseware_id": coursewareID,
-                        "success_count": finalSuccess,
-                        "fail_count":    finalFail,
-                        "total_pages":   remainingCount,
-                        "elapsed_ms":    elapsed.Milliseconds(),
-                        "errors":        finalErrors,
-                        "is_preview":    false,
-                        "message":       doneMsg,
-                },
-        })
+				res.errMsg = fmt.Sprintf(
+					"第%d页生成失败(共尝试%d次): %v",
+					pageNum,
+					cwGenMaxAttempts,
+					aiErr,
+				)
+				cwGenLog.Error(
+					"批量页生成最终失败",
+					"error", aiErr,
+					"courseware_id", coursewareID,
+					"page_num", pageNum,
+					"interaction_type", p.InteractionType,
+					"attempts", cwGenMaxAttempts,
+				)
+				s.collectPageResult(
+					coursewareID,
+					&mu,
+					&successCount,
+					&failCount,
+					&genErrors,
+					res,
+					remainingCount,
+				)
+				return
+			}
 
-        return nil
+			// 构建匹配组件ID列表
+			matchedIDs := s.buildMatchedComponentIDs(matchedComps)
+
+			// 写入数据库（按 page.ID 独立行 UPDATE，pgxpool 并发安全，无行竞争）
+			if dbErr := repository.UpdateCWPageHTML(ctx, p.ID, fullPageHTML, "", matchedIDs, models.CWPageStatusGenerated); dbErr != nil {
+				res.errMsg = fmt.Sprintf("第%d页保存HTML失败: %v", pageNum, dbErr)
+				cwGenLog.Error("批量页保存HTML失败", "error", dbErr, "courseware_id", coursewareID, "page_num", pageNum)
+				s.collectPageResult(coursewareID, &mu, &successCount, &failCount, &genErrors, res, remainingCount)
+				return
+			}
+
+			// 成功
+			res.ok = true
+			res.fullHTML = fullPageHTML
+			res.modelUsed = modelUsed
+			res.tokensUsed = tokensUsed
+			cwGenLog.Info("批量页生成成功",
+				"progress", fmt.Sprintf("%d/%d", progressNum, remainingCount),
+				"page_num", pageNum,
+				"model", modelUsed,
+				"tokens", tokensUsed,
+				"courseware_id", coursewareID,
+			)
+			s.collectPageResult(coursewareID, &mu, &successCount, &failCount, &genErrors, res, remainingCount)
+		}(i, page)
+	}
+
+	// 等待所有已派发的 goroutine 完成（已派发的页会跑完，未派发的因取消而不再派发）
+	wg.Wait()
+
+	// ---- 10. 完成（含取消分支） ----
+	elapsed := time.Since(startTime)
+
+	mu.Lock()
+	finalSuccess := successCount
+	finalFail := failCount
+	finalErrors := append([]string(nil), genErrors...)
+	wasCancelled := cancelled
+	mu.Unlock()
+
+	// 只要有任意页成功落库，就把状态推进到 preview（与原串行行为一致）
+	if finalSuccess > 0 {
+		_ = repository.UpdateCoursewareStatus(ctx, coursewareID, models.CoursewareStatusPreview)
+	}
+
+	if wasCancelled {
+		cwGenLog.Info("课件生成被取消",
+			"courseware_id", coursewareID,
+			"success", finalSuccess,
+			"fail", finalFail,
+			"elapsed_ms", elapsed.Milliseconds(),
+		)
+		GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+			EventType: CWSSEGenDone,
+			Data: map[string]interface{}{
+				"courseware_id": coursewareID,
+				"success_count": finalSuccess,
+				"fail_count":    finalFail,
+				"total_pages":   remainingCount,
+				"elapsed_ms":    elapsed.Milliseconds(),
+				"errors":        finalErrors,
+				"is_preview":    false,
+				"cancelled":     true,
+				"message":       fmt.Sprintf("已停止生成，已完成 %d 页", finalSuccess),
+			},
+		})
+		return nil
+	}
+
+	cwGenLog.Info("课件剩余页面生成完成",
+		"courseware_id", coursewareID,
+		"success", finalSuccess,
+		"fail", finalFail,
+		"concurrency", concurrency,
+		"elapsed_ms", elapsed.Milliseconds(),
+	)
+
+	// 小修：批量生成 message 也按成败给真实信息。有失败页时把首条真实原因带上，
+	//   与封面预览保持一致的"说真话"口径，便于前端/老师定位（如积分余额不足/超时）。
+	doneMsg := fmt.Sprintf("课件生成完成！成功 %d 页，失败 %d 页", finalSuccess, finalFail)
+	if finalFail > 0 && len(finalErrors) > 0 && finalErrors[0] != "" {
+		doneMsg = fmt.Sprintf("课件生成完成：成功 %d 页，失败 %d 页（失败原因：%s）", finalSuccess, finalFail, finalErrors[0])
+	}
+
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEGenDone,
+		Data: map[string]interface{}{
+			"courseware_id": coursewareID,
+			"success_count": finalSuccess,
+			"fail_count":    finalFail,
+			"total_pages":   remainingCount,
+			"elapsed_ms":    elapsed.Milliseconds(),
+			"errors":        finalErrors,
+			"is_preview":    false,
+			"message":       doneMsg,
+		},
+	})
+
+	return nil
 }
 
 // collectPageResult 汇总单页生成结果（持锁段统一更新计数器 + 广播单页完成/失败事件）
@@ -696,49 +936,49 @@ func (s *CoursewareGenService) GenerateRemainingPages(ctx context.Context, cours
 // 保证 successCount/failCount/genErrors 无数据竞争；同时把「单页完成」SSE 放在锁内，
 // 既与计数一致，又避免多 goroutine 同时构造大 HTML 事件时的顺序错乱。
 func (s *CoursewareGenService) collectPageResult(
-        coursewareID string,
-        mu *sync.Mutex,
-        successCount *int,
-        failCount *int,
-        genErrors *[]string,
-        res cwGenPageResult,
-        remainingCount int,
+	coursewareID string,
+	mu *sync.Mutex,
+	successCount *int,
+	failCount *int,
+	genErrors *[]string,
+	res cwGenPageResult,
+	remainingCount int,
 ) {
-        mu.Lock()
-        defer mu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
 
-        if res.ok {
-                *successCount++
-                // 广播单页完成（返回拼接后的完整HTML给前端显示）
-                GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                        EventType: CWSSEGenPage,
-                        Data: map[string]interface{}{
-                                "page_number":  res.pageNum,
-                                "page_id":      res.pageID,
-                                "title":        res.title,
-                                "html_content": res.fullHTML,
-                                "model_used":   res.modelUsed,
-                                "tokens_used":  res.tokensUsed,
-                        },
-                })
-                return
-        }
+	if res.ok {
+		*successCount++
+		// 广播单页完成（返回拼接后的完整HTML给前端显示）
+		GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+			EventType: CWSSEGenPage,
+			Data: map[string]interface{}{
+				"page_number":  res.pageNum,
+				"page_id":      res.pageID,
+				"title":        res.title,
+				"html_content": res.fullHTML,
+				"model_used":   res.modelUsed,
+				"tokens_used":  res.tokensUsed,
+			},
+		})
+		return
+	}
 
-        // 失败：计数 + 收集错误 + 广播失败进度
-        *failCount++
-        if res.errMsg != "" {
-                *genErrors = append(*genErrors, res.errMsg)
-        }
-        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                EventType: CWSSEGenProgress,
-                Data: map[string]interface{}{
-                        "current_page": res.progressNum,
-                        "total_pages":  remainingCount,
-                        "page_title":   res.title,
-                        "error":        res.errMsg,
-                        "message":      fmt.Sprintf("⚠️ 第 %d 页生成失败，继续其他页", res.pageNum),
-                },
-        })
+	// 失败：计数 + 收集错误 + 广播失败进度
+	*failCount++
+	if res.errMsg != "" {
+		*genErrors = append(*genErrors, res.errMsg)
+	}
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEGenProgress,
+		Data: map[string]interface{}{
+			"current_page": res.progressNum,
+			"total_pages":  remainingCount,
+			"page_title":   res.title,
+			"error":        res.errMsg,
+			"message":      fmt.Sprintf("⚠️ 第 %d 页生成失败，继续其他页", res.pageNum),
+		},
+	})
 }
 
 // ==================== P0-5: 中途中断生成 ====================
@@ -754,26 +994,50 @@ var cwGenCancelMap sync.Map
 // 迭代二P1：并发改造后取消语义不变——关闭 cancelCh 后，
 // 尚未派发的页不再派发，已占名额但未开跑 AI 的 goroutine 也会 select 命中后跳过；
 // 已经在跑 AI 的页会自然跑完（不强杀正在进行的 HTTP 调用），符合预期。
-func (s *CoursewareGenService) CancelGenerate(coursewareID string) {
-        if ch, ok := cwGenCancelMap.Load(coursewareID); ok {
-                select {
-                case <-ch.(chan struct{}):
-                        // 已经关闭了
-                default:
-                        close(ch.(chan struct{}))
-                        cwGenLog.Info("发送取消信号", "courseware_id", coursewareID)
-                }
-        } else {
-                cwGenLog.Warn("没有正在进行的生成任务", "courseware_id", coursewareID)
-        }
+func (s *CoursewareGenService) CancelGenerate(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+) error {
+	if _, _, err := s.loadOwnerRuntimeCourseware(
+		ctx,
+		coursewareID,
+		actor,
+	); err != nil {
+		return err
+	}
+
+	if ch, ok := cwGenCancelMap.Load(
+		coursewareID,
+	); ok {
+		select {
+		case <-ch.(chan struct{}):
+			// 已经关闭
+		default:
+			close(ch.(chan struct{}))
+			cwGenLog.Info(
+				"发送取消信号",
+				"courseware_id",
+				coursewareID,
+			)
+		}
+	} else {
+		cwGenLog.Warn(
+			"没有正在进行的生成任务",
+			"courseware_id",
+			coursewareID,
+		)
+	}
+
+	return nil
 }
 
 // ==================== SSE错误广播 ====================
 
 // broadcastError 广播错误事件
 func (s *CoursewareGenService) broadcastError(coursewareID string, message string) {
-        GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
-                EventType: CWSSEError,
-                Data:      map[string]interface{}{"message": message},
-        })
+	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
+		EventType: CWSSEError,
+		Data:      map[string]interface{}{"message": message},
+	})
 }

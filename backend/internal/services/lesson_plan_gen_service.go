@@ -10,12 +10,11 @@ package services
 //   本次纯位置搬移，逻辑零改动；同时删除无人调用的 GetStageService 死方法。
 //
 // 本文件职责（核心会话流程）：
-//   1. StartConversation     — 创建教案+阶段初始化+配方上下文注入+发起AI开场白
-//   2. genStageOpeningMessage — 生成首阶段开场白（吃老师×学科助手偏好）
-//   3. Chat                  — 处理教师输入→（异步）流式AI回复（异步体在 lesson_plan_gen_chat_async.go）
-//   4. resolveAssistantPrompt — 解析应注入第4层的助手 full_prompt（偏好→技能路由兜底）
-//   5. GetConversation       — 获取教案对话历史
-//   （纯辅助方法见 lesson_plan_gen_helpers.go）
+//   1. genStageOpeningMessage — 生成首阶段开场白（吃老师×学科助手偏好）
+//   2. Chat                   — 处理教师输入→（异步）流式AI回复（异步体在 lesson_plan_gen_chat_async.go）
+//   3. resolveAssistantPrompt — 解析应注入第4层的助手 full_prompt（偏好→技能路由兜底）
+//   4. GetConversation        — 获取教案对话历史
+//   （StartConversation见 lesson_plan_gen_start.go；纯辅助方法见 lesson_plan_gen_helpers.go）
 //
 // v110(TE-DNA 3.0 P0 STEP 3)改动:
 //   - LessonPlanGenService 新增 assistantService 字段(可选,运行时通过 SetAssistantService 注入)
@@ -56,7 +55,6 @@ package services
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -120,192 +118,10 @@ func (s *LessonPlanGenService) SetTextbookServiceForStage(ts *TextbookService) {
 }
 
 // ==================== 1. 开始备课会话 ====================
-
-// StartConversation 创建教案+阶段初始化+配方上下文注入+发起AI开场白
-func (s *LessonPlanGenService) StartConversation(
-	ctx context.Context,
-	req *models.StartConversationRequest,
-	authorID string,
-) (*models.LessonPlan, *models.ConversationMessage, error) {
-	if strings.TrimSpace(req.Subject) == "" {
-		return nil, nil, ErrLPGenSubjectRequired
-	}
-	if strings.TrimSpace(req.Grade) == "" {
-		return nil, nil, ErrLPGenGradeRequired
-	}
-	if strings.TrimSpace(req.Topic) == "" {
-		return nil, nil, ErrLPGenTopicRequired
-	}
-	dur := req.DurationMinutes
-	if dur <= 0 {
-		dur = 45
-	}
-
-	// ==================== 配方三态解析与自动挂载 ====================
-	// recipe_mode由normalizeStartRecipeSelection统一解释：
-	//   auto     → 根据学校默认、教研组共享和学科规则自动选择；
-	//   selected → 使用老师明确传入的recipe_id；
-	//   none     → 老师明确不使用配方，禁止自动匹配。
-	//
-	// 旧客户端不传recipe_mode时保持兼容：
-	// 有recipe_id视为selected，无recipe_id视为auto。
-	recipeSelectionMode := normalizeStartRecipeSelection(req)
-
-	// 老师显式选择的配方同样必须通过学科和具体年级复核。
-	// 校验失败时只清除错误配方，不自动换用另一份配方。
-	if recipeSelectionMode == models.RecipeSelectionModeSelected &&
-		req.RecipeID != "" {
-		if _, recipeErr := loadRecipeForLesson(
-			ctx,
-			req.RecipeID,
-			req.Subject,
-			req.Grade,
-		); recipeErr != nil {
-			lpGenLog.Warn(
-				"老师选择的配方与当前学科或具体年级不匹配，已禁止挂载",
-				"author", authorID,
-				"subject", req.Subject,
-				"grade", req.Grade,
-				"recipe_id", req.RecipeID,
-				"error", recipeErr,
-			)
-			req.RecipeID = ""
-		}
-	}
-
-	if recipeSelectionMode == models.RecipeSelectionModeAuto {
-		if resolvedRecipeID := s.ResolveDefaultRecipe(
-			ctx,
-			authorID,
-			req.Subject,
-			req.Grade,
-		); resolvedRecipeID != "" {
-			req.RecipeID = resolvedRecipeID
-			lpGenLog.Info(
-				"开始备课自动挂载配方",
-				"author", authorID,
-				"subject", req.Subject,
-				"topic", req.Topic,
-				"recipe_id", resolvedRecipeID,
-				"recipe_mode", recipeSelectionMode,
-			)
-		}
-	} else if recipeSelectionMode == models.RecipeSelectionModeNone {
-		lpGenLog.Info(
-			"老师明确选择不使用配方",
-			"author", authorID,
-			"subject", req.Subject,
-			"topic", req.Topic,
-			"recipe_mode", recipeSelectionMode,
-		)
-	}
-
-	title := fmt.Sprintf("%s %s — %s", req.Grade, req.Subject, req.Topic)
-	lp := &models.LessonPlan{
-		Title:           title,
-		Subject:         req.Subject,
-		Grade:           req.Grade,
-		Topic:           req.Topic,
-		DurationMinutes: dur,
-		Status:          models.LPStatusDraft,
-		Visibility:      models.LPVisibilityPersonal,
-		AuthorID:        authorID,
-		ConversationLog: "[]",
-	}
-	if req.GroupID != "" {
-		lp.GroupID = &req.GroupID
-	}
-	if req.RecipeID != "" {
-		lp.RecipeID = &req.RecipeID
-	}
-
-	// 迭代7B：备课工坊勾选的课本图片ID列表落库（写入 lesson_plans.textbook_page_ids，
-	// 供 LoadStagePromptContextV2 在各阶段提示词中注入课本原文，让 AI 参考真实教材内容）
-	if len(req.TextbookPageIDs) > 0 {
-		if tbIDsJSON, mErr := json.Marshal(req.TextbookPageIDs); mErr == nil {
-			lp.TextbookPageIDs = string(tbIDsJSON)
-		} else {
-			lpGenLog.Warn("课本图片ID序列化失败，忽略关联", "error", mErr)
-		}
-	}
-
-	if err := repository.CreateLessonPlan(ctx, lp); err != nil {
-		return nil, nil, fmt.Errorf("创建教案失败: %w", err)
-	}
-	lpGenLog.Info("开始备课会话", "plan_id", lp.ID, "topic", req.Topic, "author", authorID, "recipe_id", req.RecipeID)
-
-	// 统一走阶段化流程
-	recipeStagesConfig := ""
-	if req.RecipeID != "" {
-		recipe, err := repository.GetRecipeByID(ctx, req.RecipeID)
-		if err == nil {
-			recipeStagesConfig = recipe.StagesConfig
-		}
-	}
-
-	snapshots, err := s.stageService.InitStagesForPlan(ctx, lp.ID, recipeStagesConfig, req.RecipeID)
-	if err != nil {
-		lpGenLog.Error("阶段初始化失败", "plan_id", lp.ID, "error", err)
-		return nil, nil, fmt.Errorf("阶段初始化失败: %w", err)
-	}
-
-	lp.CurrentStage = snapshots[0].StageCode
-	configJSON, _ := json.Marshal(snapshots)
-	lp.StageConfig = string(configJSON)
-	lpGenLog.Info("阶段初始化成功", "plan_id", lp.ID, "stages_count", len(snapshots), "first_stage", snapshots[0].StageCode)
-
-	// 生成阶段化开场白
-	// 对话式备课·助手轻量选择入口 Phase 1：开场白也吃老师×学科偏好——
-	// genStageOpeningMessage 内部会先解析偏好助手 prompt 并注入第4层（详见该函数）。
-	var openingMsg *models.ConversationMessage
-	openingMsg, err = s.genStageOpeningMessage(ctx, lp, snapshots, authorID)
-	if err != nil {
-		lpGenLog.Warn("阶段开场白生成失败，使用默认开场", "plan_id", lp.ID, "error", err)
-		openingMsg = buildDefaultOpeningMessage(req)
-	}
-
-	// 将本次配方选择方式写入开场消息metadata。
-	// ConversationMessage会整体进入conversation_log，因此无需新增数据库字段，
-	// SSE实时消息、断线补齐和历史恢复都能读取同一份确定性状态。
-	if openingMsg.Metadata == nil {
-		openingMsg.Metadata = make(map[string]interface{})
-	}
-	openingMsg.Metadata[recipeSelectionModeMetadataKey] = string(
-		recipeSelectionMode,
-	)
-
-	// 推送阶段开始事件
-	go func() {
-		GlobalLPSSEHub.Broadcast(lp.ID, models.LPSSEEvent{
-			EventType: models.LPSSEStageStarted,
-			PlanID:    lp.ID,
-			StageData: &models.StageEventData{
-				StageCode:   snapshots[0].StageCode,
-				StageName:   snapshots[0].StageName,
-				StageOrder:  snapshots[0].StageOrder,
-				TotalStages: len(snapshots),
-			},
-		})
-	}()
-
-	// 记录配方使用
-	if req.RecipeID != "" {
-		go func() {
-			_ = repository.RecordRecipeUsage(context.Background(), req.RecipeID, lp.ID, authorID)
-		}()
-	}
-
-	// 迭代7B：若关联了课本图但其中有未成功识别（无 OCR 文字）的，
-	// 由后端确定性地在开场白末尾拼一句点名提醒（不依赖 AI 自由发挥，必然出现、措辞精确）。
-	// 覆盖 AI 开场白成功与降级两条路径（两者最终都汇合到 openingMsg）。
-	s.appendUnrecognizedTextbookNotice(ctx, req, openingMsg)
-
-	if err2 := s.appendMessage(ctx, lp.ID, openingMsg); err2 != nil {
-		lpGenLog.Warn("写入开场消息失败", "plan_id", lp.ID, "error", err2)
-	}
-
-	return lp, openingMsg, nil
-}
+//
+// StartConversation及其“教育域硬闸 + 显式写域 + 失败补偿”编排，
+// 已拆分到lesson_plan_gen_start.go，避免本核心文件继续超过600行。
+// 本文件保留开场白生成、对话轮次、助手解析和对话历史读取能力。
 
 // genStageOpeningMessage 阶段模式下生成第一阶段的AI开场白
 //
@@ -390,6 +206,20 @@ func (s *LessonPlanGenService) Chat(
 		return err
 	}
 
+	// 在写入老师消息之前登记任务。
+	// draining或重复任务被拒绝时，不会留下只有用户消息、没有AI回复的半轮对话。
+	task, taskErr := startLessonPlanAITask(lp.ID)
+	if taskErr != nil {
+		return taskErr
+	}
+
+	taskLaunched := false
+	defer func() {
+		if !taskLaunched {
+			task.Done()
+		}
+	}()
+
 	// v84改动：只加载当前阶段的对话消息（Working Memory）
 	currentStageMsgs, err := repository.GetCurrentStageMessages(ctx, lp.ID)
 	if err != nil {
@@ -434,25 +264,66 @@ func (s *LessonPlanGenService) Chat(
 	// v168/v169:全委托标志(按阶段在 processChatStageAsync 内判定)
 	fullGenerate := req.FullGenerate
 
-	// 子轮一·B：取本轮客户端轮次序号，透传给异步处理体，使本轮所有 SSE 事件都带上它。
+	// 子轮一·B：取本轮客户端轮次序号，透传给异步处理体。
 	turnID := req.ClientTurnID
-	go func() {
-		bgCtx := context.Background()
-		s.processChatStageAsync(
-			bgCtx,
-			lp,
-			userMsg,
-			currentStageMsgs,
-			req,
-			assistantPrompt,
-			assistantLabel,
-			assistantResolution.Receipt,
-			fullGenerate,
-			turnID,
-		)
-	}()
+
+	s.runLessonPlanAITask(
+		task,
+		lp.ID,
+		turnID,
+		"chat",
+		func() {
+			s.processChatStageAsync(
+				context.Background(),
+				lp,
+				userMsg,
+				currentStageMsgs,
+				req,
+				assistantPrompt,
+				assistantLabel,
+				assistantResolution.Receipt,
+				fullGenerate,
+				turnID,
+			)
+		},
+	)
+	taskLaunched = true
 
 	return nil
+}
+
+// applyLessonPlanEducationDomainToAssistantActor 把具体教案的资源教育域快照写入助手Actor。
+//
+// 教案是本轮教学运行的事实主体。无论操作者是普通教师还是mixed管理员，
+// 进入同一份具体教案后，都必须使用lesson_plans.education_domain创建时快照，
+// 不能继续使用登录用户当前组织域，更不能让mixed绕过具体教学域隔离。
+//
+// 当前教案正常只会保存k12、vocational或adult。若读取到空值、非法值、
+// common或mixed，函数会主动清空Actor.EducationDomain，使后续候选列表和
+// 按ID加载统一fail-closed，绝不错误回退K12。
+func applyLessonPlanEducationDomainToAssistantActor(
+	actor *AssistantActorContext,
+	lp *models.LessonPlan,
+) {
+	if actor == nil {
+		return
+	}
+
+	// 先清空登录用户原教育域，确保异常教案快照不会沿用mixed或其它旧值。
+	actor.EducationDomain = ""
+
+	if lp == nil {
+		return
+	}
+
+	lessonDomain := strings.ToLower(
+		strings.TrimSpace(lp.EducationDomain),
+	)
+	if !models.IsTeachingEducationDomain(lessonDomain) {
+		return
+	}
+
+	actor.EducationDomain = lessonDomain
 }
 
 // resolveAssistantPrompt 将 assistant_id 解析为 full_prompt
@@ -463,16 +334,16 @@ func (s *LessonPlanGenService) Chat(
 // 1）老师手动传了 assistant_id（assistantID 非空）→ 用该指定助手（最高优先，老师对当下最有发言权）。
 // 2）老师没传（assistantID 为空）→ 查老师×学科偏好表 repository.GetPref(callerID, lp.Subject)：
 //
-//	2a）查到记录且 prefID 非空        → 用偏好里的助手（老师之前为该学科选定的）。
-//	2b）查到记录且 prefID == ""       → 老师显式选了「系统默认(纯骨架)」→ 直接返回空串，
-//	                                    【绝不再走 RouteDefaultAssistant 兜底】（尊重显式选择）。
-//	2c）查询出真实 DB 错误            → 记 Warn，降级到步骤3兜底（不阻塞对话）。
-//	2d）无记录（从没选过）            → 落到步骤3兜底。
+//      2a）查到记录且 prefID 非空        → 用偏好里的助手（老师之前为该学科选定的）。
+//      2b）查到记录且 prefID == ""       → 老师显式选了「系统默认(纯骨架)」→ 直接返回空串，
+//                                          【绝不再走 RouteDefaultAssistant 兜底】（尊重显式选择）。
+//      2c）查询出真实 DB 错误            → 记 Warn，降级到步骤3兜底（不阻塞对话）。
+//      2d）无记录（从没选过）            → 落到步骤3兜底。
 //
 // 3）RouteDefaultAssistant（降为末位兜底）按「场景+学科+学段+可见性」自动解析默认助手：
 //
-//	3a）命中 → 用它。
-//	3b）空串 → 返回空串（= 不替换第4层，沿用阶段原生角色，老行为）。
+//      3a）命中 → 用它。
+//      3b）空串 → 返回空串（= 不替换第4层，沿用阶段原生角色，老行为）。
 //
 // 无论走哪条路，拿到最终 assistantID 后都经【同一条】加载路径
 // （LoadActiveAssistantForUse：可见性校验 + is_active 校验 + 使用量埋点）取 full_prompt，
@@ -482,6 +353,17 @@ func (s *LessonPlanGenService) Chat(
 //
 // 静默降级：assistantService 未注入 / 用户反查失败 / 助手加载失败 / full_prompt 为空 /
 // 无可见默认助手 → 一律返回空串，绝不报错给老师、绝不阻塞对话。
+
+// resolveAssistantPrompt 解析本轮应叠加的助手提示词。
+//
+// 最终优先级：
+//  1. 专家模式当轮明确指定：手动通道；
+//  2. 对话模式老师×学科偏好：手动通道；
+//  3. 老师明确选择系统默认：不挂助手；
+//  4. 无有效偏好时由RouteDefaultAssistant严格自动匹配。
+//
+// 手动通道：active + 可见性 + 同学科 + 当前场景，忽略具体年级。
+// 自动通道：学科 + 具体年级 + 当前场景全部严格一致。
 func (s *LessonPlanGenService) resolveAssistantPrompt(
 	ctx context.Context,
 	lp *models.LessonPlan,
@@ -510,24 +392,60 @@ func (s *LessonPlanGenService) resolveAssistantPrompt(
 		callerID,
 		user.Role,
 	)
+	// B2-B：使用教案教育域快照覆盖助手Actor。
+	// 列表候选、手动助手、偏好助手和自动助手均消费同一个Actor，
+	// 因此在任何助手解析发生之前统一覆盖一次即可完成运行链收口。
+	applyLessonPlanEducationDomainToAssistantActor(
+		actor,
+		lp,
+	)
+
 	scene := stageCodeToAssistantScene(
 		lp.CurrentStage,
 	)
 
-	load := func(id string) (*models.AIAssistant, error) {
+	loadManual := func(
+		id string,
+	) (*models.AIAssistant, error) {
 		assistant, loadErr :=
-			s.assistantService.LoadActiveAssistantForLessonUse(
-				ctx,
-				actor,
-				id,
-				lp.Subject,
-				lp.Grade,
-				scene,
-			)
+			s.assistantService.
+				LoadActiveAssistantForManualLessonUse(
+					ctx,
+					actor,
+					id,
+					lp.Subject,
+					scene,
+				)
 		if loadErr != nil {
 			return nil, loadErr
 		}
-		if strings.TrimSpace(assistant.FullPrompt) == "" {
+		if strings.TrimSpace(
+			assistant.FullPrompt,
+		) == "" {
+			return nil, errors.New("助手内容为空")
+		}
+		return assistant, nil
+	}
+
+	loadAuto := func(
+		id string,
+	) (*models.AIAssistant, error) {
+		assistant, loadErr :=
+			s.assistantService.
+				LoadActiveAssistantForLessonUse(
+					ctx,
+					actor,
+					id,
+					lp.Subject,
+					lp.Grade,
+					scene,
+				)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if strings.TrimSpace(
+			assistant.FullPrompt,
+		) == "" {
 			return nil, errors.New("助手内容为空")
 		}
 		return assistant, nil
@@ -536,10 +454,11 @@ func (s *LessonPlanGenService) resolveAssistantPrompt(
 	assistantID = strings.TrimSpace(assistantID)
 
 	if assistantID != "" {
-		assistant, loadErr := load(assistantID)
+		assistant, loadErr :=
+			loadManual(assistantID)
 		if loadErr != nil {
 			lpGenLog.Warn(
-				"显式助手不适用于当前课程，使用系统阶段骨架",
+				"老师指定的助手当前不可用，使用系统阶段骨架",
 				"assistant_id", assistantID,
 				"subject", lp.Subject,
 				"grade", lp.Grade,
@@ -571,18 +490,19 @@ func (s *LessonPlanGenService) resolveAssistantPrompt(
 			return "", ""
 		}
 
-		assistant, loadErr := load(prefID)
+		assistant, loadErr := loadManual(prefID)
 		if loadErr == nil {
 			return assistant.FullPrompt, assistant.Name
 		}
 
 		lpGenLog.Info(
-			"老师助手偏好不适用于当前课程，继续自动匹配",
+			"老师助手偏好不适用于当前学科或阶段，继续自动匹配",
 			"plan_id", lp.ID,
 			"pref_assistant_id", prefID,
 			"subject", lp.Subject,
 			"grade", lp.Grade,
 			"scene", scene,
+			"error", loadErr,
 		)
 	}
 
@@ -598,10 +518,10 @@ func (s *LessonPlanGenService) resolveAssistantPrompt(
 		return "", ""
 	}
 
-	assistant, loadErr := load(defaultID)
+	assistant, loadErr := loadAuto(defaultID)
 	if loadErr != nil {
 		lpGenLog.Warn(
-			"自动助手最终复核失败，使用系统阶段骨架",
+			"自动助手最终严格复核失败，使用系统阶段骨架",
 			"assistant_id", defaultID,
 			"subject", lp.Subject,
 			"grade", lp.Grade,

@@ -61,6 +61,11 @@
  *   - 展开后渲染 KBAuthorizedPanel：管理"谁能进知识库压缩系统"（/kb-admin/curriculum 隐藏入口）。
  *   - 白名单不绑角色，仅认成员名单（后端 RequireKBAuthorized 中间件）。
  *
+ * 上下文7补齐：
+ *   - 学校卡片显示education_domain对应的中文教育类型；
+ *   - 未知、缺失或异常历史值明确显示“教育类型未配置”，不静默回退为K12；
+ *   - 区域卡片不展示学校教育类型。
+ *
  * FE-AD-01修复：添加searchTimer的useEffect卸载清理，防止组件卸载后触发setState
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
@@ -128,6 +133,30 @@ function ColCard({ title, count, onAdd, addLabel, loading, empty, children }: {
       </div>
     </div>
   )
+}
+
+// ==================== 学校教育类型展示 ====================
+
+/**
+ * 将后端返回的组织教育域转换为学校卡片中文标签。
+ *
+ * 不使用默认K12兜底：
+ *   - k12 / vocational / adult显示对应中文；
+ *   - mixed、缺失或未知历史值明确显示“教育类型未配置”。
+ */
+function schoolEducationDomainLabel(
+  domain: OrgListItem['education_domain'],
+): string {
+  switch (domain) {
+    case 'k12':
+      return '中小学'
+    case 'vocational':
+      return '职业教育'
+    case 'adult':
+      return '成人教育'
+    default:
+      return '教育类型未配置'
+  }
 }
 
 // ==================== 主组件 ====================
@@ -800,7 +829,7 @@ export default function AdminPage() {
                       <StatusBadge status={s.status} />
                     </div>
                     <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '8px' }}>
-                      {s.admin_user_name ? `管理员：${s.admin_user_name}` : '暂无管理员'} · {s.group_count} 个教研组
+                      {s.admin_user_name ? `管理员：${s.admin_user_name}` : '暂无管理员'} · {schoolEducationDomainLabel(s.education_domain)} · {s.group_count} 个教研组
                     </div>
                     <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }} onClick={e => e.stopPropagation()}>
                       {isFullAdmin && (

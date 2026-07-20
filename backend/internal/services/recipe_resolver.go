@@ -3,44 +3,48 @@ package services
 // recipe_resolver.go — 对话模式配方自动解析器
 //
 // 【背景与确诊】
-//   专家模式 StartForm 显式传 recipe_id，故 lp.RecipeID 非空，配方的「教案结构(lesson_structure)+
-//   流程(stages_config)+学情/风格/学校要求」经 LoadStagePromptContextV2 全量注入，AI 拿到完整骨架。
-//   对话模式 handleStart 调 startConversation 时【根本不传 recipe_id】，lp.RecipeID 恒为 nil，
-//   于是上述三类配方上下文【全部不注入】，AI 只剩裸五阶段空骨架——这正是 yingjun 截图里
-//   「九大板块不全、五环节塌成四环节、知识加油站过长、创想家工坊缺失」的真相。
+// 专家模式StartForm显式传recipe_id，配方的教案结构、阶段流程、
+// 学情、教学风格和学校要求会通过既有阶段装配链完整注入。
 //
-// 【设计原则（Yuhan 四条原则的落地）】
-//   原则1（老师个性化 > 默认 harness）：靠「把配方挂上去」自动实现——配方一旦挂载，其
-//       教案结构/流程经 MergeStages + BuildLessonStructurePrompt 直接重写阶段骨架（第3.5层硬指令），
-//       天然高于助手 overlay（第4层只能补风格）。无需任何新的 override 机制。
-//   原则2+3+4（学校管理员/组长配方自然关联、可配默认、按学科）：本解析器三级 fail-open 解析。
+// 对话模式没有显式recipe_id时，需要按学校默认和老师所属范围
+// 自动解析一份配方，否则会退回纯系统阶段骨架。
 //
-// 【解析顺序】当对话模式 StartConversation 没拿到显式 recipe_id 时，按下列顺序解析一个配方ID：
-//   第①级：学校管理员在 organizations.settings 配置的默认配方
-//           - 优先 default_recipe_by_subject[subject]（按学科精确匹配）
-//           - 否则 default_recipe_id（全学科兜底默认）
-//   第②级：老师所属 group/school 范围下、按学科匹配的一份 active 配方
-//           （取 scope_ref_id ∈ {老师的教研组ID集合 ∪ 学校ID} 且 subject 匹配的最新一条）
-//   第③级：空串 —— 退回当前纯骨架行为（零风险，与改造前完全一致）
+// 【自动解析顺序】
+// 当StartConversation的recipe_mode为auto时，按以下顺序解析：
 //
-// 【fail-open 铁律】任何一步出错（DB 异常 / 配方已删 / settings 解析失败 / 学校归属查不到）
-//   一律返回空串，绝不报错、绝不阻塞建会话。最坏情况 == 改造前的现状（纯骨架），不会更差。
+//  1. 学校管理员在organizations.settings中配置的默认配方：
+//     - 优先default_recipe_by_subject[subject]；
+//     - 其次default_recipe_id全学科默认。
+//  2. 老师所属教研组或学校范围内，同学科、同具体年级的最新active配方。
+//  3. 没有合法配方时返回空串，调用方退回纯系统骨架。
 //
-// 【与专家模式的关系】本解析器仅在 req.RecipeID 为空时被调用；显式 recipe_id 永远最高优先，
-//   专家模式一字不受影响。解析出的 recipeID 回填 req.RecipeID 后，复用专家模式【完全相同】的
-//   下游（lp.RecipeID 赋值 + recipeStagesConfig + InitStagesForPlan + RecordRecipeUsage），
-//   保证对话模式老师拿到与专家模式测试一致的好结果。
+// 【教育域规则】
+// 自动解析发生在lesson_plan创建之前，此时尚无lesson_plan.education_domain快照。
+// 因此本文件通过BuildActorFromClaims解析作者当前确定性教学Actor：
 //
-// 【类型注意·v203.1 修复】teaching_recipes.scope_ref_id 列在 PostgreSQL 里是 uuid 类型，
-//   而本解析器收集的 scopeRefIDs 来自 GetSchoolIDByUserID（内部 ::text 转出的 string）与
-//   GetUserTeachingGroups（.ID 为 string），是 text 切片。直接 `scope_ref_id = ANY($text[])`
-//   会触发 `operator does not exist: uuid = text` 错误，被 fail-open 吞掉致第②级永远落空。
-//   故 SQL 用 `scope_ref_id::text = ANY($3)` 列侧转 text 比较（与入参 text 切片吻合，
-//   且比参数侧 ::uuid[] 更健壮——脏 ID 只是匹配不上而非整条报错）。
+//   - k12教学上下文只能自动使用k12或common配方；
+//   - vocational教学上下文只能自动使用vocational或common配方；
+//   - adult教学上下文只能自动使用adult或common配方；
+//   - mixed只用于跨域管理，不能直接作为具体教学运行域；
+//   - common、空值和非法当前域同样不能作为教学运行域。
+//
+// 教案创建完成后，数据库会写入lesson_plan.education_domain快照。
+// 后续已有教案运行由strict_resource_match.go使用该快照再次复核，
+// 因而形成“创建前按作者当前教学域过滤、创建后按教案快照域运行”的双层防线。
+//
+// 【fail-open业务退化与fail-closed授权】
+// 数据库异常、组织设置异常、配方已删除或没有匹配时，返回空串退回纯骨架，
+// 不阻断老师创建会话；但教育域不确定时绝不猜测或回退k12，
+// 而是严格不自动挂载任何配方。
+//
+// 【类型注意】
+// teaching_recipes.scope_ref_id是uuid，scopeRefIDs是字符串切片。
+// SQL必须使用scope_ref_id::text = ANY($3)，避免uuid=text操作符错误。
 
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"tedna/internal/database"
 	"tedna/internal/models"
@@ -49,49 +53,98 @@ import (
 )
 
 // recipeAutoMountActiveStatus 配方有效状态值。
-// models/recipe.go 全程用字面量 "active"/"archived"（无导出常量），此处本地定义一个常量，
-// 避免在判断处散落魔法字符串，且与 recipe_repo.go 的软删过滤口径一致。
+//
+// models/recipe.go目前没有导出的active状态常量，
+// 因而在本自动解析模块内保留单一常量，避免散落魔法字符串。
 const recipeAutoMountActiveStatus = "active"
 
-// organizationSettings 仅解析本解析器关心的两个键，其余键忽略。
-// 对应 organizations.settings JSONB（同一份 settings 里还有 portal_modules 等其他键，互不影响）。
+// organizationSettings 只解析自动配方功能关心的两个组织设置键。
+//
+// organizations.settings中可能还包含门户模块等其它配置，
+// JSON反序列化会自动忽略本结构未声明的字段。
 type organizationSettings struct {
-	// DefaultRecipeID 学校级全学科兜底默认配方ID（学校管理员配置）。
+	// DefaultRecipeID 是学校级全学科默认配方ID。
 	DefaultRecipeID string `json:"default_recipe_id"`
-	// DefaultRecipeBySubject 学校级按学科默认配方映射，键为学科名，值为配方ID。
+
+	// DefaultRecipeBySubject 是“学科名称→默认配方ID”的映射。
 	DefaultRecipeBySubject map[string]string `json:"default_recipe_by_subject"`
 }
 
-// ResolveDefaultRecipe 为对话模式解析一个应自动挂载的配方ID。
+// ResolveDefaultRecipe 为对话模式解析一份应自动挂载的配方ID。
 //
-// 入参：
-//   - authorID：发起备课的老师用户ID（解析其所属学校/教研组用）
-//   - subject ：本次备课学科（按学科匹配默认配方与共享配方）
+// 公开签名保持不变，避免扩大调用链修改范围。
 //
-// 返回：解析到的配方ID；任何失败/无匹配均返回空串（fail-open，调用方据空串退回纯骨架）。
+// 自动解析发生在教案创建前，因此本函数先读取作者角色，再通过
+// BuildActorFromClaims解析作者当前的学校、教研组和具体教学教育域。
 //
-// 本方法挂在 LessonPlanGenService 上，便于复用其已注入的依赖与日志器 lpGenLog。
+// 任一条件不确定时返回空串，让调用方退回纯骨架：
+//   - 作者不存在或角色读取失败；
+//   - Actor无法构造；
+//   - 当前教育域不是k12、vocational或adult；
+//   - 没有合法学校默认或共享配方。
 func (s *LessonPlanGenService) ResolveDefaultRecipe(
 	ctx context.Context,
 	authorID string,
 	subject string,
 	grade string,
 ) string {
-	if authorID == "" || subject == "" || grade == "" {
+	authorID = strings.TrimSpace(authorID)
+	subject = strings.TrimSpace(subject)
+	grade = strings.TrimSpace(grade)
+
+	if authorID == "" ||
+		subject == "" ||
+		grade == "" {
 		return ""
 	}
 
-	schoolID, schoolErr := repository.GetSchoolIDByUserID(
+	author, err := repository.FindUserByID(
 		ctx,
 		authorID,
 	)
-	if schoolErr != nil {
-		lpGenLog.Warn(
-			"配方自动解析:查询老师所属学校失败,跳过学校默认配方级",
-			"author", authorID,
-			"error", schoolErr,
-		)
+	if err != nil || author == nil {
+		if err != nil {
+			lpGenLog.Warn(
+				"配方自动解析:读取作者身份失败,退回纯骨架",
+				"author", authorID,
+				"error", err,
+			)
+		}
+		return ""
 	}
+
+	actor := BuildActorFromClaims(
+		ctx,
+		authorID,
+		author.Role,
+	)
+	if actor == nil {
+		lpGenLog.Warn(
+			"配方自动解析:无法构造作者教学Actor,退回纯骨架",
+			"author", authorID,
+		)
+		return ""
+	}
+
+	currentEducationDomain := strings.ToLower(
+		strings.TrimSpace(actor.EducationDomain),
+	)
+
+	// mixed只用于跨域管理，不能作为具体教学运行域。
+	// common只允许作为资源域，也不能作为当前教学域。
+	// 空值和非法值不得通过NormalizeEducationDomain回退成k12。
+	if !models.IsTeachingEducationDomain(
+		currentEducationDomain,
+	) {
+		lpGenLog.Info(
+			"配方自动解析:作者没有确定的具体教学域,不自动挂载配方",
+			"author", authorID,
+			"education_domain", currentEducationDomain,
+		)
+		return ""
+	}
+
+	schoolID := strings.TrimSpace(actor.SchoolID)
 
 	if schoolID != "" {
 		if recipeID := s.resolveSchoolDefaultRecipe(
@@ -99,12 +152,14 @@ func (s *LessonPlanGenService) ResolveDefaultRecipe(
 			schoolID,
 			subject,
 			grade,
+			currentEducationDomain,
 		); recipeID != "" {
 			lpGenLog.Info(
 				"配方自动解析:命中学校管理员默认配方",
 				"author", authorID,
 				"subject", subject,
 				"grade", grade,
+				"education_domain", currentEducationDomain,
 				"school_id", schoolID,
 				"recipe_id", recipeID,
 			)
@@ -112,9 +167,8 @@ func (s *LessonPlanGenService) ResolveDefaultRecipe(
 		}
 	}
 
-	scopeRefIDs := s.collectScopeRefIDs(
-		ctx,
-		authorID,
+	scopeRefIDs := collectRecipeAutoMountScopeRefIDs(
+		actor.MyGroupIDs,
 		schoolID,
 	)
 	if len(scopeRefIDs) > 0 {
@@ -123,12 +177,14 @@ func (s *LessonPlanGenService) ResolveDefaultRecipe(
 			scopeRefIDs,
 			subject,
 			grade,
+			currentEducationDomain,
 		); recipeID != "" {
 			lpGenLog.Info(
-				"配方自动解析:命中group/school共享配方",
+				"配方自动解析:命中group或school共享配方",
 				"author", authorID,
 				"subject", subject,
 				"grade", grade,
+				"education_domain", currentEducationDomain,
 				"recipe_id", recipeID,
 			)
 			return recipeID
@@ -136,25 +192,37 @@ func (s *LessonPlanGenService) ResolveDefaultRecipe(
 	}
 
 	lpGenLog.Info(
-		"配方自动解析:没有同学科同具体年级配方,退回纯骨架",
+		"配方自动解析:没有同域同学科同具体年级配方,退回纯骨架",
 		"author", authorID,
 		"subject", subject,
 		"grade", grade,
+		"education_domain", currentEducationDomain,
 	)
+
 	return ""
 }
 
-// resolveSchoolDefaultRecipe 读取指定学校 settings 中的默认配方配置并校验有效性。
-// 优先按学科精确匹配（default_recipe_by_subject[subject]），否则取全学科兜底（default_recipe_id）。
-// 解析到的配方ID会校验：配方存在 + status=active + subject 与本次一致（防跨学科误挂）。
-// 任何一步失败均返回空串。
+// resolveSchoolDefaultRecipe 读取指定学校settings中的默认配方并校验。
+//
+// 优先读取default_recipe_by_subject[subject]，没有配置时再读取
+// default_recipe_id全学科默认值。
+//
+// 候选配方必须同时满足：
+//   - 配方存在；
+//   - status为active；
+//   - 学科和具体年级严格匹配；
+//   - 配方教育域等于当前教学域或为common。
 func (s *LessonPlanGenService) resolveSchoolDefaultRecipe(
 	ctx context.Context,
 	schoolID string,
 	subject string,
 	grade string,
+	currentEducationDomain string,
 ) string {
-	org, err := repository.GetOrganizationByID(ctx, schoolID)
+	org, err := repository.GetOrganizationByID(
+		ctx,
+		schoolID,
+	)
 	if err != nil || org == nil {
 		if err != nil {
 			lpGenLog.Warn(
@@ -165,7 +233,9 @@ func (s *LessonPlanGenService) resolveSchoolDefaultRecipe(
 		}
 		return ""
 	}
-	if org.Settings == "" || org.Settings == "{}" {
+
+	if strings.TrimSpace(org.Settings) == "" ||
+		strings.TrimSpace(org.Settings) == "{}" {
 		return ""
 	}
 
@@ -183,14 +253,20 @@ func (s *LessonPlanGenService) resolveSchoolDefaultRecipe(
 	}
 
 	candidate := ""
+
 	if settings.DefaultRecipeBySubject != nil {
-		if value, ok := settings.DefaultRecipeBySubject[subject]; ok {
-			candidate = value
+		if value, ok :=
+			settings.DefaultRecipeBySubject[subject]; ok {
+			candidate = strings.TrimSpace(value)
 		}
 	}
+
 	if candidate == "" {
-		candidate = settings.DefaultRecipeID
+		candidate = strings.TrimSpace(
+			settings.DefaultRecipeID,
+		)
 	}
+
 	if candidate == "" {
 		return ""
 	}
@@ -200,72 +276,82 @@ func (s *LessonPlanGenService) resolveSchoolDefaultRecipe(
 		candidate,
 		subject,
 		grade,
+		currentEducationDomain,
 	)
 }
 
-// collectScopeRefIDs 收集老师可见的共享配方归属ID集合（去重）：
-//   - 老师所属全部教研组的 group ID
-//   - 老师所属学校的 school ID
+// collectRecipeAutoMountScopeRefIDs 收集自动共享配方查询所需的归属ID。
 //
-// 任一查询失败仅 Warn 不中断，尽力收集；最终可能返回空切片（调用方据空跳过第②级）。
-func (s *LessonPlanGenService) collectScopeRefIDs(ctx context.Context, authorID string, schoolID string) []string {
+// 来源包括：
+//   - BuildActorFromClaims解析出的全部所属教研组ID；
+//   - Actor当前确定性教学学校ID。
+//
+// 本函数只做去空、清洗和去重，不重新访问数据库，
+// 避免Actor解析后再次形成另一套学校或教研组口径。
+func collectRecipeAutoMountScopeRefIDs(
+	groupIDs []string,
+	schoolID string,
+) []string {
 	seen := make(map[string]struct{})
-	var ids []string
+	ids := make([]string, 0, len(groupIDs)+1)
 
 	addID := func(id string) {
+		id = strings.TrimSpace(id)
 		if id == "" {
 			return
 		}
-		if _, ok := seen[id]; ok {
+
+		if _, exists := seen[id]; exists {
 			return
 		}
+
 		seen[id] = struct{}{}
 		ids = append(ids, id)
 	}
 
-	// 教研组ID集合
-	groups, gErr := repository.GetUserTeachingGroups(ctx, authorID)
-	if gErr != nil {
-		lpGenLog.Warn("配方自动解析:查询老师教研组失败,跳过教研组共享配方", "author", authorID, "error", gErr)
-	} else {
-		for _, g := range groups {
-			if g != nil {
-				addID(g.ID)
-			}
-		}
+	for _, groupID := range groupIDs {
+		addID(groupID)
 	}
 
-	// 学校ID
 	addID(schoolID)
 
 	return ids
 }
 
-// resolveSharedRecipeBySubject 在给定 scope_ref_id 集合内，查一份 group/school 范围、
-// 指定学科、status=active 的配方ID（按更新时间倒序取最新一条）。
+// resolveSharedRecipeBySubject 在老师可见的group和school范围内，
+// 查询一份同学科、同具体年级、同教育域或common的最新active配方。
 //
-// 这是一个独立的轻量数据访问（不复用 recipe_repo_market.go 的 ListMarketRecipes——
-// 那是"全网市场排行榜按综合分排序"语义，与"给定老师可见范围内取一份确定配方"语义不同）。
-// 直接内聚在本文件，避免改动 recipe_repo.go 大文件，降低爆炸半径。
+// SQL执行第一层过滤：
+//   - status=active；
+//   - scope为group或school；
+//   - scope_ref_id属于Actor可见归属；
+//   - subject严格一致；
+//   - education_domain为当前具体教学域或common。
 //
-// scope 取值用 models.RecipeScopeGroup/School 常量构造为数组参数（scope = ANY($2)），
-// 既避免 SQL 字面量拼接、又用上 models 常量保证与全局口径一致。
+// Go扫描后再次调用ResourceEducationDomainMatches复核，
+// 防止未来SQL调整形成跨教育域旁路。
 //
-// ⚠ v203.1 类型修复：scope_ref_id 列是 uuid 类型，入参 scopeRefIDs 是 text 切片，
-//
-//	必须用 `scope_ref_id::text = ANY($3)` 列侧转 text 比较，否则 pgx 抛
-//	`operator does not exist: uuid = text`，被下方 err 兜底吞掉致第②级恒落空。
-//
-// 任何 DB 错误（含 pgx.ErrNoRows 无匹配）返回空串（fail-open）。
+// 任意数据库错误或没有命中时返回空串，调用方退回纯骨架。
 func resolveSharedRecipeBySubject(
 	ctx context.Context,
 	scopeRefIDs []string,
 	subject string,
 	grade string,
+	currentEducationDomain string,
 ) string {
+	subject = strings.TrimSpace(subject)
+	grade = strings.TrimSpace(grade)
+
+	normalizedDomain := strings.ToLower(
+		strings.TrimSpace(currentEducationDomain),
+	)
+
 	if len(scopeRefIDs) == 0 ||
 		subject == "" ||
-		grade == "" {
+		grade == "" ||
+		!models.IsTeachingEducationDomain(
+			normalizedDomain,
+		) {
 		return ""
 	}
 
@@ -275,12 +361,18 @@ func resolveSharedRecipeBySubject(
 	}
 
 	const query = `
-		SELECT id, grade_range
+		SELECT id,
+		       grade_range,
+		       education_domain
 		FROM teaching_recipes
 		WHERE status = $1
 		  AND scope = ANY($2)
 		  AND scope_ref_id::text = ANY($3)
 		  AND subject = $4
+		  AND (
+		        education_domain = $5
+		        OR education_domain = $6
+		  )
 		ORDER BY updated_at DESC
 	`
 
@@ -291,8 +383,17 @@ func resolveSharedRecipeBySubject(
 		scopeValues,
 		scopeRefIDs,
 		subject,
+		normalizedDomain,
+		models.EducationDomainCommon,
 	)
 	if err != nil {
+		lpGenLog.Warn(
+			"配方自动解析:查询共享配方失败,退回纯骨架",
+			"subject", subject,
+			"grade", grade,
+			"education_domain", normalizedDomain,
+			"error", err,
+		)
 		return ""
 	}
 	defer rows.Close()
@@ -300,48 +401,106 @@ func resolveSharedRecipeBySubject(
 	for rows.Next() {
 		var recipeID string
 		var recipeGrade string
+		var recipeEducationDomain string
 
 		if err := rows.Scan(
 			&recipeID,
 			&recipeGrade,
+			&recipeEducationDomain,
 		); err != nil {
+			lpGenLog.Warn(
+				"配方自动解析:扫描共享配方失败,退回纯骨架",
+				"error", err,
+			)
 			return ""
+		}
+
+		// SQL过滤后的第二层确定性复核。
+		if !models.ResourceEducationDomainMatches(
+			recipeEducationDomain,
+			normalizedDomain,
+		) {
+			continue
 		}
 
 		if utils.IsStrictGradeMatch(
 			recipeGrade,
 			grade,
 		) {
-			return recipeID
+			return strings.TrimSpace(recipeID)
 		}
+	}
+
+	if err := rows.Err(); err != nil {
+		lpGenLog.Warn(
+			"配方自动解析:遍历共享配方失败,退回纯骨架",
+			"error", err,
+		)
 	}
 
 	return ""
 }
 
-// validateRecipeForAutoMount 校验一个候选配方ID是否可用于自动挂载：
-//   - 配方存在（GetRecipeByID 不报错）
-//   - status == active（未被软删）
-//   - subject == 本次备课学科（防跨学科误挂，例如管理员把数学配方配到语文默认上）
+// validateRecipeForAutoMount 校验学校设置指定的候选配方。
 //
-// 全部通过返回该ID，否则返回空串（fail-open）。
+// 学校默认配方按ID读取，必须执行以下第二层校验：
+//   - 配方存在且active；
+//   - 配方学科和具体年级与本次教案严格一致；
+//   - 配方教育域与当前具体教学域兼容。
+//
+// 任一条件不满足均返回空串，不自动挂载。
 func validateRecipeForAutoMount(
 	ctx context.Context,
 	recipeID string,
 	subject string,
 	grade string,
+	currentEducationDomain string,
 ) string {
-	recipe, err := repository.GetRecipeByID(ctx, recipeID)
+	recipeID = strings.TrimSpace(recipeID)
+	subject = strings.TrimSpace(subject)
+	grade = strings.TrimSpace(grade)
+
+	normalizedDomain := strings.ToLower(
+		strings.TrimSpace(currentEducationDomain),
+	)
+
+	if recipeID == "" ||
+		subject == "" ||
+		grade == "" ||
+		!models.IsTeachingEducationDomain(
+			normalizedDomain,
+		) {
+		return ""
+	}
+
+	recipe, err := repository.GetRecipeByID(
+		ctx,
+		recipeID,
+	)
 	if err != nil {
 		lpGenLog.Warn(
-			"配方自动解析:学校默认配方无效(已删/不存在)",
+			"配方自动解析:学校默认配方无效或不存在",
 			"recipe_id", recipeID,
 			"error", err,
 		)
 		return ""
 	}
+
 	if recipe == nil ||
 		recipe.Status != recipeAutoMountActiveStatus {
+		return ""
+	}
+
+	if !models.ResourceEducationDomainMatches(
+		recipe.EducationDomain,
+		normalizedDomain,
+	) {
+		lpGenLog.Info(
+			"配方自动解析:学校默认配方教育域不匹配,跳过",
+			"recipe_id", recipeID,
+			"recipe_education_domain", recipe.EducationDomain,
+			"current_education_domain", normalizedDomain,
+		)
 		return ""
 	}
 

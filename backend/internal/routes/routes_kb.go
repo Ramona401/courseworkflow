@@ -63,7 +63,7 @@ func registerKBRoutes(
 				case http.MethodGet:
 					compressHandler.ListJobs(w, r)
 				case http.MethodPost:
-					compressHandler.CreateJob(w, r)
+					compressHandler.CreateJobTracked(w, r)
 				default:
 					http.Error(w, `{"code":-1,"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
 				}

@@ -73,7 +73,7 @@ func (h *AIAssistantHandler) resolveActor(r *http.Request) (*services.AssistantA
 
 // ==================== 1. GET /ai-assistants 列表 ====================
 
-// List GET /api/v1/ai-assistants?scene=xxx&subject=xxx&grade=xxx&only_active=1
+// List GET /api/v1/ai-assistants?scene=xxx&subject=xxx&grade=xxx&only_active=1&lesson_plan_id=xxx
 func (h *AIAssistantHandler) List(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
@@ -90,7 +90,126 @@ func (h *AIAssistantHandler) List(w http.ResponseWriter, r *http.Request) {
 	scene := strings.TrimSpace(q.Get("scene"))
 	subject := strings.TrimSpace(q.Get("subject"))
 	gradeRange := strings.TrimSpace(q.Get("grade"))
+	lessonPlanID := strings.TrimSpace(
+		q.Get("lesson_plan_id"),
+	)
 	onlyActive := q.Get("only_active") != "0" // 默认只返回激活的
+
+	// B2-B：候选列表使用教案教育域快照。
+	//
+	// lesson_plan_id只在具体教案页面传入：
+	//   - mixed管理员进入具体教案后，候选范围收敛到该教案域或common；
+	//   - 普通教师仍必须先具有可信的具体教学域，且必须与教案快照一致；
+	//   - 管理页和其它未传教案ID的页面完全保留原有Actor语义。
+	if lessonPlanID != "" {
+		lp, planErr := repository.GetLessonPlanByID(
+			r.Context(),
+			lessonPlanID,
+		)
+		if planErr != nil {
+			if errors.Is(
+				planErr,
+				repository.ErrLessonPlanNotFound,
+			) {
+				utils.Fail(
+					w,
+					http.StatusNotFound,
+					"教案不存在或已被删除",
+				)
+				return
+			}
+
+			utils.InternalError(
+				w,
+				"读取教案教育域失败",
+			)
+			return
+		}
+
+		lessonDomain := strings.ToLower(
+			strings.TrimSpace(
+				lp.EducationDomain,
+			),
+		)
+		if !models.IsTeachingEducationDomain(
+			lessonDomain,
+		) {
+			utils.InternalError(
+				w,
+				"教案教育域快照无效，暂不能加载助手",
+			)
+			return
+		}
+
+		actorDomain := strings.ToLower(
+			strings.TrimSpace(
+				actor.EducationDomain,
+			),
+		)
+
+		// mixed用于管理页面，可以进入任意合法教学域教案。
+		// 普通角色必须先解析出可信具体教学域，并且与教案快照完全一致。
+		switch {
+		case actorDomain == models.EducationDomainMixed:
+			// 管理角色允许进入具体教案，随后立即收敛到lessonDomain。
+
+		case models.IsTeachingEducationDomain(
+			actorDomain,
+		) && actorDomain == lessonDomain:
+			// 普通教学角色与教案快照一致。
+
+		default:
+			utils.Forbidden(
+				w,
+				"当前账号教育域与该教案不一致",
+			)
+			return
+		}
+
+		planSubject := strings.TrimSpace(
+			lp.Subject,
+		)
+		planGrade := strings.TrimSpace(
+			lp.Grade,
+		)
+
+		if planSubject == "" {
+			utils.BadRequest(
+				w,
+				"教案缺少学科，无法加载助手",
+			)
+			return
+		}
+
+		// 客户端可以不传学科和年级；一旦传入，必须与数据库记录一致。
+		// 这样不能拿一份职教教案ID，却伪造另一学科或年级查询助手。
+		if subject != "" &&
+			subject != planSubject {
+			utils.BadRequest(
+				w,
+				"请求学科与教案记录不一致，请刷新页面后重试",
+			)
+			return
+		}
+
+		if gradeRange != "" &&
+			gradeRange != planGrade {
+			utils.BadRequest(
+				w,
+				"请求年级与教案记录不一致，请刷新页面后重试",
+			)
+			return
+		}
+
+		actor.EducationDomain = lessonDomain
+		subject = planSubject
+
+		// 手动候选页面通常不传grade，以保留跨年级手动选择；
+		// 只有调用方本来要求年级过滤时，才使用数据库中的真实年级继续过滤。
+		if gradeRange != "" {
+			gradeRange = planGrade
+		}
+	}
 
 	resp, err := h.service.ListAssistants(r.Context(), actor, scene, subject, gradeRange, onlyActive)
 	if err != nil {

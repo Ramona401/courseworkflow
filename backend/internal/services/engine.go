@@ -1,25 +1,31 @@
 package services
 
-// 并发执行引擎：Pipeline执行队列 + AI信号量限流 + 优雅关闭
-// v33改进：ExecFunc 改为 func() error，Worker 根据返回值区分业务失败和系统故障(panic)
-// 统计说明：
-//   - TotalCompleted：ExecFunc 返回 nil 的任务数（业务成功）
-//   - TotalBusinessFailed：ExecFunc 返回 error 的任务数（业务失败，如Pipeline执行失败）
-//   - TotalFailed：Worker panic 的任务数（系统故障，需要立即关注）
-// Phase8日志升级：
-//   - 引擎启动/关闭 → INFO
-//   - Worker任务开始/完成 → DEBUG（高频，生产环境默认不输出）
-//   - Worker panic → ERROR（需要立即关注）
-//   - 业务失败 → WARN（需要关注但不紧急）
-//   - 队列已满/引擎已关闭 → WARN
+// 并发执行引擎：Pipeline执行队列 + AI信号量限流 + 统一优雅关闭
+//
+// 运行职责：
+//   - 接收Pipeline、重试和验收任务；
+//   - 通过固定数量Worker执行任务；
+//   - 通过AI信号量限制Pipeline内部AI调用并发；
+//   - 维护提交、运行、成功、业务失败和panic统计。
+//
+// 关闭职责：
+//   - Engine不再自行监听SIGTERM/SIGINT；
+//   - Engine不再调用os.Exit，避免跳过main及其他模块的defer；
+//   - main.go是全系统唯一的信号入口；
+//   - main收到关闭信号后调用ShutdownDefaultEngine；
+//   - Stop拒绝新任务并关闭队列入口；
+//   - Worker继续排空已进入队列及正在执行的任务；
+//   - WaitContext等待全部Worker退出或由调用方统一控制超时。
+//
+// 并发安全修复：
+//   旧Submit先检查ctx、随后向taskChan发送，Stop可能恰好在两步之间关闭channel，
+//   存在send on closed channel竞态。当前Submit与Stop共用Engine.mu串行保护
+//   running状态和channel关闭，保证不会向已关闭队列发送。
 
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 	"time"
 
 	"tedna/internal/logger"
@@ -31,16 +37,57 @@ const (
 	DefaultMaxWorkers       = 3
 	DefaultMaxAIConcurrency = 2
 	DefaultQueueSize        = 50
-	// GracefulShutdownTimeout 优雅关闭等待超时
-	GracefulShutdownTimeout = 30 * time.Second
+
+	// GracefulShutdownTimeout 供保留的Wait()兼容方法使用。
+	//
+	// 生产进程由main.go传入统一的12分钟上下文调用WaitContext；
+	// 该常量保持相同口径，供其他旧调用方在没有外部context时安全等待。
+	GracefulShutdownTimeout = 12 * time.Minute
 )
 
 // 模块日志
 var engineLog = logger.WithModule("engine")
 
+// ==================== 默认生产Engine登记 ====================
+
+// defaultEngine 是routes.Setup创建的生产Engine。
+//
+// 当前生产进程只创建一个Pipeline Engine。通过包级登记，让main.go无需改变
+// routes.Setup返回签名，也能在关闭阶段取得该Engine并等待任务排空。
+var (
+	defaultEngineMu sync.RWMutex
+	defaultEngine   *Engine
+)
+
+// registerDefaultEngine 登记生产默认Engine。
+// NewEngine每次创建后调用；生产环境只有一个实例，测试环境以后创建的实例覆盖之前实例。
+func registerDefaultEngine(engine *Engine) {
+	defaultEngineMu.Lock()
+	defaultEngine = engine
+	defaultEngineMu.Unlock()
+}
+
+// ShutdownDefaultEngine 停止并等待默认生产Engine。
+//
+// ctx由main.go统一创建，HTTP Shutdown与Engine排空共享同一个总期限。
+// 未登记Engine时视为无需关闭，直接返回nil。
+func ShutdownDefaultEngine(ctx context.Context) error {
+	defaultEngineMu.RLock()
+	engine := defaultEngine
+	defaultEngineMu.RUnlock()
+
+	if engine == nil {
+		engineLog.Info("未登记默认Engine，跳过Engine排空")
+		return nil
+	}
+
+	engine.Stop()
+	return engine.WaitContext(ctx)
+}
+
 // ==================== 任务类型定义 ====================
 
-// TaskType 任务类型枚举
+// TaskType 任务类型枚举。
 type TaskType string
 
 const (
@@ -49,49 +96,52 @@ const (
 	TaskTypeVerify   TaskType = "verify"
 )
 
-// EngineTask 引擎任务（投递到队列的工作单元）
-// v33改进：ExecFunc 返回 error，允许 Worker 区分业务失败和系统故障
-//   返回 nil → 业务成功，计入 TotalCompleted
-//   返回 error → 业务失败（Pipeline执行失败等），计入 TotalBusinessFailed
-//   panic → 系统故障，计入 TotalFailed（由 recover 捕获）
+// EngineTask 引擎任务。
+//
+// ExecFunc返回值语义：
+//   - nil：业务成功；
+//   - error：业务失败；
+//   - panic：系统故障，由Worker recover捕获。
 type EngineTask struct {
-	Type       TaskType     // 任务类型
-	PipelineID string       // Pipeline ID
-	ExecFunc   func() error // 实际执行函数（闭包，由调用方构造，返回error表示业务失败）
+	Type       TaskType
+	PipelineID string
+	ExecFunc   func() error
 }
 
 // ==================== Engine 并发引擎 ====================
 
-// Engine 并发执行引擎
+// Engine 并发执行引擎。
 type Engine struct {
 	taskChan    chan *EngineTask
 	aiSemaphore chan struct{}
 	maxWorkers  int
 	maxAI       int
 	queueSize   int
+
 	wg          sync.WaitGroup
-	running     bool
-	mu          sync.Mutex
-	stats       *EngineStats
-	ctx         context.Context
-	cancel      context.CancelFunc
-	stopOnce    sync.Once
+	workersDone chan struct{}
+
+	running  bool
+	mu       sync.Mutex
+	stats    *EngineStats
+	ctx      context.Context
+	cancel   context.CancelFunc
+	stopOnce sync.Once
 }
 
-// EngineStats 引擎运行统计
-// v33改进：新增 TotalBusinessFailed 区分业务失败和系统故障
+// EngineStats 引擎运行统计。
 type EngineStats struct {
 	mu                  sync.Mutex
 	TotalSubmitted      int64 `json:"total_submitted"`
-	TotalCompleted      int64 `json:"total_completed"`        // ExecFunc 返回 nil（业务成功）
-	TotalBusinessFailed int64 `json:"total_business_failed"`  // ExecFunc 返回 error（业务失败）
-	TotalFailed         int64 `json:"total_failed"`           // Worker panic（系统故障）
+	TotalCompleted      int64 `json:"total_completed"`
+	TotalBusinessFailed int64 `json:"total_business_failed"`
+	TotalFailed         int64 `json:"total_failed"`
 	CurrentRunning      int64 `json:"current_running"`
 	CurrentAIActive     int64 `json:"current_ai_active"`
 	QueueLength         int   `json:"queue_length"`
 }
 
-// NewEngine 创建并启动并发引擎
+// NewEngine 创建并启动并发引擎。
 func NewEngine(maxWorkers, maxAIConcurrency, queueSize int) *Engine {
 	if maxWorkers <= 0 {
 		maxWorkers = DefaultMaxWorkers
@@ -105,22 +155,31 @@ func NewEngine(maxWorkers, maxAIConcurrency, queueSize int) *Engine {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	e := &Engine{
+	engine := &Engine{
 		taskChan:    make(chan *EngineTask, queueSize),
 		aiSemaphore: make(chan struct{}, maxAIConcurrency),
 		maxWorkers:  maxWorkers,
 		maxAI:       maxAIConcurrency,
 		queueSize:   queueSize,
+		workersDone: make(chan struct{}),
 		stats:       &EngineStats{},
 		ctx:         ctx,
 		cancel:      cancel,
 	}
 
-	e.start()
-	return e
+	engine.start()
+
+	// start已经完成全部wg.Add，此时才启动等待协程，避免Wait与Add并发误用。
+	go func() {
+		engine.wg.Wait()
+		close(engine.workersDone)
+	}()
+
+	registerDefaultEngine(engine)
+	return engine
 }
 
-// start 启动所有Worker goroutine
+// start 启动所有Worker。
 func (e *Engine) start() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -136,7 +195,6 @@ func (e *Engine) start() {
 		go e.worker(workerID)
 	}
 
-	// INFO：引擎启动是重要事件，记录配置参数
 	engineLog.Info("并发引擎已启动",
 		"max_workers", e.maxWorkers,
 		"max_ai_concurrency", e.maxAI,
@@ -144,8 +202,10 @@ func (e *Engine) start() {
 	)
 }
 
-// worker 单个Worker的执行循环
-// v33改进：根据 ExecFunc 返回值区分业务成功/业务失败/系统故障(panic)
+// worker 单个Worker执行循环。
+//
+// taskChan关闭后，range仍会继续读取并处理channel缓冲区中已经接收的全部任务；
+// 只有队列真正排空后Worker才退出，因此Stop不会丢弃已提交任务。
 func (e *Engine) worker(workerID int) {
 	defer e.wg.Done()
 
@@ -156,57 +216,52 @@ func (e *Engine) worker(workerID int) {
 
 		startTime := time.Now()
 
-		// DEBUG：任务开始（高频事件，生产环境通常不需要）
 		engineLog.Debug("Worker开始执行任务",
 			"worker_id", workerID,
 			"task_type", string(task.Type),
 			"pipeline_id", task.PipelineID,
 		)
 
-		// 执行任务，捕获panic和业务错误
 		var taskErr error
 		var panicked bool
+
 		func() {
 			defer func() {
-				if r := recover(); r != nil {
+				if recovered := recover(); recovered != nil {
 					panicked = true
-					// ERROR：panic需要立即关注，包含完整上下文
+
 					engineLog.Error("Worker任务发生panic",
 						"worker_id", workerID,
 						"task_type", string(task.Type),
 						"pipeline_id", task.PipelineID,
-						"panic_value", fmt.Sprintf("%v", r),
+						"panic_value", fmt.Sprintf("%v", recovered),
 					)
+
 					e.stats.mu.Lock()
 					e.stats.TotalFailed++
 					e.stats.mu.Unlock()
 				}
 			}()
+
 			taskErr = task.ExecFunc()
 		}()
 
 		elapsed := time.Since(startTime)
 
-		// 更新统计：区分成功/业务失败/panic
 		e.stats.mu.Lock()
 		e.stats.CurrentRunning--
 		if !panicked {
 			if taskErr != nil {
-				// 业务失败：ExecFunc 返回了 error（Pipeline执行失败、验收失败等）
 				e.stats.TotalBusinessFailed++
 			} else {
-				// 业务成功：ExecFunc 返回 nil
 				e.stats.TotalCompleted++
 			}
 		}
-		// panic 情况已在 recover 中处理，不重复计数
 		e.stats.mu.Unlock()
 
-		// 日志：根据结果选择级别
 		if panicked {
-			// panic 已在 recover 中记录 ERROR，这里不重复
+			// panic已在recover中记录。
 		} else if taskErr != nil {
-			// WARN：业务失败需要关注但不紧急（错误详情已由业务层记录）
 			engineLog.Warn("Worker任务业务失败",
 				"worker_id", workerID,
 				"task_type", string(task.Type),
@@ -215,7 +270,6 @@ func (e *Engine) worker(workerID int) {
 				"error", taskErr.Error(),
 			)
 		} else {
-			// DEBUG：任务成功完成（高频事件）
 			engineLog.Debug("Worker任务完成",
 				"worker_id", workerID,
 				"task_type", string(task.Type),
@@ -225,26 +279,33 @@ func (e *Engine) worker(workerID int) {
 		}
 	}
 
-	// INFO：Worker退出（通常只在引擎关闭时发生）
 	engineLog.Info("Worker已退出",
 		"worker_id", workerID,
-		"reason", "引擎关闭",
+		"reason", "任务队列已关闭并排空",
 	)
 }
 
 // ==================== 任务提交 ====================
 
-// Submit 提交任务到执行队列（非阻塞）
+// Submit 非阻塞提交任务。
+//
+// running检查和channel发送由同一把mu保护，Stop关闭channel时也持有该锁，
+// 因此不会出现检查时仍运行、发送前channel却被关闭的竞态。
 func (e *Engine) Submit(task *EngineTask) bool {
-	// 引擎关闭后不接受新任务
-	select {
-	case <-e.ctx.Done():
-		engineLog.Warn("引擎已关闭，拒绝新任务",
+	if task == nil || task.ExecFunc == nil {
+		engineLog.Warn("拒绝无效任务")
+		return false
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if !e.running {
+		engineLog.Warn("引擎正在关闭，拒绝新任务",
 			"task_type", string(task.Type),
 			"pipeline_id", task.PipelineID,
 		)
 		return false
-	default:
 	}
 
 	select {
@@ -253,7 +314,6 @@ func (e *Engine) Submit(task *EngineTask) bool {
 		e.stats.TotalSubmitted++
 		e.stats.mu.Unlock()
 
-		// DEBUG：任务提交成功（高频事件）
 		engineLog.Debug("任务已提交到队列",
 			"task_type", string(task.Type),
 			"pipeline_id", task.PipelineID,
@@ -261,8 +321,8 @@ func (e *Engine) Submit(task *EngineTask) bool {
 			"queue_capacity", e.queueSize,
 		)
 		return true
+
 	default:
-		// WARN：队列满是需要关注的异常情况
 		engineLog.Warn("任务队列已满，任务被拒绝",
 			"task_type", string(task.Type),
 			"pipeline_id", task.PipelineID,
@@ -274,7 +334,7 @@ func (e *Engine) Submit(task *EngineTask) bool {
 
 // ==================== AI信号量控制 ====================
 
-// AcquireAI 获取AI调用信号量（阻塞直到获取成功）
+// AcquireAI 获取AI调用信号量。
 func (e *Engine) AcquireAI() {
 	e.aiSemaphore <- struct{}{}
 
@@ -283,7 +343,7 @@ func (e *Engine) AcquireAI() {
 	e.stats.mu.Unlock()
 }
 
-// ReleaseAI 释放AI调用信号量
+// ReleaseAI 释放AI调用信号量。
 func (e *Engine) ReleaseAI() {
 	<-e.aiSemaphore
 
@@ -294,62 +354,79 @@ func (e *Engine) ReleaseAI() {
 
 // ==================== 优雅关闭 ====================
 
-// Stop 触发引擎优雅关闭（幂等）
+// Stop 触发Engine关闭，幂等。
+//
+// 关闭动作：
+//   1. running=false，使后续Submit立即被拒绝；
+//   2. cancel内部context，为未来需要感知关闭的功能保留信号；
+//   3. close(taskChan)，不再接收新任务；
+//   4. 已在队列中的任务仍由Worker继续处理直至排空。
 func (e *Engine) Stop() {
 	e.stopOnce.Do(func() {
 		e.stats.mu.Lock()
 		currentRunning := e.stats.CurrentRunning
+		currentAIActive := e.stats.CurrentAIActive
+		queueLength := len(e.taskChan)
 		e.stats.mu.Unlock()
 
-		// INFO：关闭是重要生命周期事件
-		engineLog.Info("开始优雅关闭引擎",
+		engineLog.Info("开始优雅关闭Engine",
 			"current_running_tasks", currentRunning,
+			"current_ai_active", currentAIActive,
+			"queued_tasks", queueLength,
 		)
+
+		e.mu.Lock()
+		e.running = false
 		e.cancel()
 		close(e.taskChan)
+		e.mu.Unlock()
 	})
 }
 
-// Wait 等待所有Worker完成当前任务（带超时保护）
-func (e *Engine) Wait() {
-	done := make(chan struct{})
-	go func() {
-		e.wg.Wait()
-		close(done)
-	}()
+// WaitContext 等待全部Worker完成当前和已排队任务。
+//
+// 不自行创建超时，不结束进程；超时策略由main统一控制。
+func (e *Engine) WaitContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	select {
-	case <-done:
-		engineLog.Info("所有Worker已退出，引擎关闭完成")
-	case <-time.After(GracefulShutdownTimeout):
-		engineLog.Warn("优雅关闭等待超时，强制退出",
-			"timeout", GracefulShutdownTimeout.String(),
+	case <-e.workersDone:
+		engineLog.Info("所有Worker已退出，Engine关闭完成")
+		return nil
+
+	case <-ctx.Done():
+		engineLog.Warn("Engine排空等待超时",
+			"error", ctx.Err(),
 		)
+		return ctx.Err()
 	}
 }
 
-// StartGracefulShutdown 监听系统信号，收到后执行优雅关闭
-func (e *Engine) StartGracefulShutdown() {
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+// Wait 保留旧调用兼容，内部使用默认12分钟超时。
+func (e *Engine) Wait() {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		GracefulShutdownTimeout,
+	)
+	defer cancel()
 
-	go func() {
-		sig := <-sigChan
-		// INFO：收到系统信号是重要事件
-		engineLog.Info("收到系统信号，开始优雅关闭",
-			"signal", sig.String(),
-		)
-		e.Stop()
-		e.Wait()
-		engineLog.Info("优雅关闭完成，进程退出")
-		os.Exit(0)
-	}()
+	_ = e.WaitContext(ctx)
+}
+
+// StartGracefulShutdown 保留旧接线兼容。
+//
+// routes.Setup目前仍调用本方法。为避免本批完整覆盖超大routes.go，本方法改为明确的
+// 兼容空操作：不注册signal.Notify、不启动goroutine、不调用os.Exit。
+// 真正的系统信号处理和Engine关闭由main.go统一负责。
+func (e *Engine) StartGracefulShutdown() {
+	engineLog.Info("Engine关闭信号已交由main统一管理")
 }
 
 // ==================== 状态查询 ====================
 
-// GetStats 获取引擎运行统计（线程安全）
-// v33改进：新增 TotalBusinessFailed 字段
+// GetStats 获取Engine运行统计。
 func (e *Engine) GetStats() EngineStats {
 	e.stats.mu.Lock()
 	defer e.stats.mu.Unlock()
@@ -365,12 +442,12 @@ func (e *Engine) GetStats() EngineStats {
 	}
 }
 
-// IsQueueFull 检查任务队列是否已满
+// IsQueueFull 检查任务队列是否已满。
 func (e *Engine) IsQueueFull() bool {
 	return len(e.taskChan) >= e.queueSize
 }
 
-// GetQueueLength 获取当前队列中等待的任务数
+// GetQueueLength 获取等待中的任务数。
 func (e *Engine) GetQueueLength() int {
 	return len(e.taskChan)
 }

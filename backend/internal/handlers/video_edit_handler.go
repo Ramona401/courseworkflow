@@ -1,399 +1,387 @@
 package handlers
 
-// video_edit_handler.go — 课件视频编辑HTTP处理器
+// video_edit_handler.go — 课件视频与音频FFmpeg处理器
 //
-// S-V1 新增（迭代3.5子专项S：剪辑系统字幕配音收尾）：
-//   POST /api/v1/coursewares/{id}/videos/mix-narration   — 配音混入成片（TTS旁白按时间轴混音）
+// 正式路由：
+//   POST /api/v1/coursewares/{id}/videos/concat
+//   POST /api/v1/coursewares/{id}/videos/trim
+//   POST /api/v1/coursewares/{id}/videos/advanced-concat
+//   POST /api/v1/coursewares/{id}/videos/mute
+//   POST /api/v1/coursewares/{id}/videos/extract-audio
+//   POST /api/v1/coursewares/{id}/videos/mix-narration
+//   POST /api/v1/coursewares/{id}/videos/trim-audio
 //
-// v0.42.4 新增：
-//   POST /api/v1/coursewares/{id}/videos/mute           — 视频静音（去除音轨）
-//   POST /api/v1/coursewares/{id}/videos/extract-audio   — 音轨分离（提取MP3）
-//
-// v0.42.1 原有：
-//   POST /api/v1/coursewares/{id}/videos/concat          — 多视频拼接
-//   POST /api/v1/coursewares/{id}/videos/trim            — 视频裁剪
-//   POST /api/v1/coursewares/{id}/videos/advanced-concat  — 高级拼接(含转场)
+// Handler先执行作者控制预检，再解析受限JSON正文；Service仍会重新
+// 加载正式课件，并在FFmpeg执行前后和资产写库前再次授权。
 
 import (
-	"encoding/json"
 	"net/http"
-	"strings"
 
-	"tedna/internal/middleware"
 	"tedna/internal/services"
 	"tedna/internal/utils"
 )
 
-// VideoEditHandler 视频编辑处理器
+// VideoEditHandler 视频与音频编辑处理器。
 type VideoEditHandler struct {
 	editService *services.VideoEditService
 }
 
-// NewVideoEditHandler 创建视频编辑处理器
-func NewVideoEditHandler(editService *services.VideoEditService) *VideoEditHandler {
-	return &VideoEditHandler{editService: editService}
+// NewVideoEditHandler 创建视频编辑处理器。
+func NewVideoEditHandler(
+	editService *services.VideoEditService,
+) *VideoEditHandler {
+	return &VideoEditHandler{
+		editService: editService,
+	}
 }
 
-// ==================== 视频拼接 ====================
-
-// ConcatVideos POST /api/v1/coursewares/{id}/videos/concat
-// 请求体: { "asset_ids": ["id1", "id2", "id3"] }
-func (h *VideoEditHandler) ConcatVideos(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
-		return
-	}
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
-		return
-	}
-
-	cwID := extractVideoEditCoursewareID(r.URL.Path, "/videos/concat")
-	if cwID == "" {
-		utils.BadRequest(w, "路径参数错误")
+// ConcatVideos 顺序拼接多个视频。
+func (h *VideoEditHandler) ConcatVideos(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	coursewareID, ok :=
+		h.prepareVideoEditRequest(
+			w,
+			r,
+			"/videos/concat",
+		)
+	if !ok {
 		return
 	}
 
-	var req struct {
+	actor, ok :=
+		h.preflightVideoEditOwner(
+			w,
+			r,
+			coursewareID,
+		)
+	if !ok {
+		return
+	}
+
+	var body struct {
 		AssetIDs []string `json:"asset_ids"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
-		return
-	}
-	if len(req.AssetIDs) < 2 {
-		utils.BadRequest(w, "至少需要选择2个视频进行拼接")
+
+	if err := decodeVideoEditJSON(
+		w,
+		r,
+		&body,
+	); err != nil {
+		writeVideoEditDecodeError(w, err)
 		return
 	}
 
-	svcReq := &services.ConcatVideosRequest{
-		CoursewareID: cwID,
-		AssetIDs:     req.AssetIDs,
-		UserID:       claims.UserID,
-	}
-
-	resp, err := h.editService.ConcatVideos(r.Context(), svcReq)
+	response, err :=
+		h.editService.ConcatVideos(
+			r.Context(),
+			&services.ConcatVideosRequest{
+				CoursewareID: coursewareID,
+				AssetIDs:     body.AssetIDs,
+				Actor:        actor,
+			},
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		writeVideoEditError(w, err)
 		return
 	}
-	utils.Success(w, resp)
+
+	utils.Success(w, response)
 }
 
-// ==================== 视频裁剪 ====================
-
-// TrimVideo POST /api/v1/coursewares/{id}/videos/trim
-// 请求体: { "asset_id": "uuid", "start_sec": 1.5, "end_sec": 4.0 }
-func (h *VideoEditHandler) TrimVideo(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
-		return
-	}
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
-		return
-	}
-
-	cwID := extractVideoEditCoursewareID(r.URL.Path, "/videos/trim")
-	if cwID == "" {
-		utils.BadRequest(w, "路径参数错误")
+// TrimVideo 裁剪单个视频。
+func (h *VideoEditHandler) TrimVideo(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	coursewareID, ok :=
+		h.prepareVideoEditRequest(
+			w,
+			r,
+			"/videos/trim",
+		)
+	if !ok {
 		return
 	}
 
-	var req struct {
+	actor, ok :=
+		h.preflightVideoEditOwner(
+			w,
+			r,
+			coursewareID,
+		)
+	if !ok {
+		return
+	}
+
+	var body struct {
 		AssetID  string  `json:"asset_id"`
 		StartSec float64 `json:"start_sec"`
 		EndSec   float64 `json:"end_sec"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
-		return
-	}
-	if req.AssetID == "" {
-		utils.BadRequest(w, "asset_id不能为空")
+
+	if err := decodeVideoEditJSON(
+		w,
+		r,
+		&body,
+	); err != nil {
+		writeVideoEditDecodeError(w, err)
 		return
 	}
 
-	svcReq := &services.TrimVideoRequest{
-		CoursewareID: cwID,
-		AssetID:      req.AssetID,
-		StartSec:     req.StartSec,
-		EndSec:       req.EndSec,
-		UserID:       claims.UserID,
-	}
-
-	resp, err := h.editService.TrimVideo(r.Context(), svcReq)
+	response, err :=
+		h.editService.TrimVideo(
+			r.Context(),
+			&services.TrimVideoRequest{
+				CoursewareID: coursewareID,
+				AssetID:      body.AssetID,
+				StartSec:     body.StartSec,
+				EndSec:       body.EndSec,
+				Actor:        actor,
+			},
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		writeVideoEditError(w, err)
 		return
 	}
-	utils.Success(w, resp)
+
+	utils.Success(w, response)
 }
 
-// ==================== 高级拼接 ====================
-
-// AdvancedConcat POST /api/v1/coursewares/{id}/videos/advanced-concat
-// 请求体: { "clips": [{ "asset_id": "...", "start_sec": 0, "end_sec": 3.5, "transition": "fade", "trans_dur": 0.5 }, ...] }
-func (h *VideoEditHandler) AdvancedConcat(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
-		return
-	}
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
-		return
-	}
-
-	cwID := extractVideoEditCoursewareID(r.URL.Path, "/videos/advanced-concat")
-	if cwID == "" {
-		utils.BadRequest(w, "路径参数错误")
+// AdvancedConcat 执行独立裁剪与转场拼接。
+func (h *VideoEditHandler) AdvancedConcat(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	coursewareID, ok :=
+		h.prepareVideoEditRequest(
+			w,
+			r,
+			"/videos/advanced-concat",
+		)
+	if !ok {
 		return
 	}
 
-	var req struct {
+	actor, ok :=
+		h.preflightVideoEditOwner(
+			w,
+			r,
+			coursewareID,
+		)
+	if !ok {
+		return
+	}
+
+	var body struct {
 		Clips []services.VideoClip `json:"clips"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
-		return
-	}
-	if len(req.Clips) < 1 {
-		utils.BadRequest(w, "至少需要1个视频片段")
+
+	if err := decodeVideoEditJSON(
+		w,
+		r,
+		&body,
+	); err != nil {
+		writeVideoEditDecodeError(w, err)
 		return
 	}
 
-	svcReq := &services.AdvancedConcatRequest{
-		CoursewareID: cwID,
-		Clips:        req.Clips,
-		UserID:       claims.UserID,
-	}
-
-	resp, err := h.editService.AdvancedConcat(r.Context(), svcReq)
+	response, err :=
+		h.editService.AdvancedConcat(
+			r.Context(),
+			&services.AdvancedConcatRequest{
+				CoursewareID: coursewareID,
+				Clips:        body.Clips,
+				Actor:        actor,
+			},
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		writeVideoEditError(w, err)
 		return
 	}
-	utils.Success(w, resp)
+
+	utils.Success(w, response)
 }
 
-// ==================== 视频静音（v0.42.4新增） ====================
-
-// MuteVideo POST /api/v1/coursewares/{id}/videos/mute
-// 请求体: { "asset_id": "uuid" }
-// 去除视频音轨，生成新的静音视频资产
-func (h *VideoEditHandler) MuteVideo(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
-		return
-	}
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
-		return
-	}
-
-	cwID := extractVideoEditCoursewareID(r.URL.Path, "/videos/mute")
-	if cwID == "" {
-		utils.BadRequest(w, "路径参数错误")
+// MuteVideo 为视频替换静默音轨。
+func (h *VideoEditHandler) MuteVideo(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	coursewareID, actor, assetID, ok :=
+		h.prepareSingleAssetVideoEdit(
+			w,
+			r,
+			"/videos/mute",
+		)
+	if !ok {
 		return
 	}
 
-	var req struct {
-		AssetID string `json:"asset_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
-		return
-	}
-	if req.AssetID == "" {
-		utils.BadRequest(w, "asset_id不能为空")
-		return
-	}
-
-	resp, err := h.editService.MuteVideo(r.Context(), &services.MuteVideoRequest{
-		CoursewareID: cwID,
-		AssetID:      req.AssetID,
-		UserID:       claims.UserID,
-	})
+	response, err :=
+		h.editService.MuteVideo(
+			r.Context(),
+			&services.MuteVideoRequest{
+				CoursewareID: coursewareID,
+				AssetID:      assetID,
+				Actor:        actor,
+			},
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		writeVideoEditError(w, err)
 		return
 	}
-	utils.Success(w, resp)
+
+	utils.Success(w, response)
 }
 
-// ==================== 音轨分离（v0.42.4新增） ====================
-
-// ExtractAudio POST /api/v1/coursewares/{id}/videos/extract-audio
-// 请求体: { "asset_id": "uuid" }
-// 从视频中分离音频轨道，输出MP3文件
-func (h *VideoEditHandler) ExtractAudio(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
-		return
-	}
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
-		return
-	}
-
-	cwID := extractVideoEditCoursewareID(r.URL.Path, "/videos/extract-audio")
-	if cwID == "" {
-		utils.BadRequest(w, "路径参数错误")
+// ExtractAudio 从视频中提取MP3音轨。
+func (h *VideoEditHandler) ExtractAudio(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	coursewareID, actor, assetID, ok :=
+		h.prepareSingleAssetVideoEdit(
+			w,
+			r,
+			"/videos/extract-audio",
+		)
+	if !ok {
 		return
 	}
 
-	var req struct {
-		AssetID string `json:"asset_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
-		return
-	}
-	if req.AssetID == "" {
-		utils.BadRequest(w, "asset_id不能为空")
-		return
-	}
-
-	resp, err := h.editService.ExtractAudio(r.Context(), &services.ExtractAudioRequest{
-		CoursewareID: cwID,
-		AssetID:      req.AssetID,
-		UserID:       claims.UserID,
-	})
+	response, err :=
+		h.editService.ExtractAudio(
+			r.Context(),
+			&services.ExtractAudioRequest{
+				CoursewareID: coursewareID,
+				AssetID:      assetID,
+				Actor:        actor,
+			},
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		writeVideoEditError(w, err)
 		return
 	}
-	utils.Success(w, resp)
+
+	utils.Success(w, response)
 }
 
-// ==================== 配音混入成片（S-V1新增） ====================
-
-// MixNarration POST /api/v1/coursewares/{id}/videos/mix-narration
-// 请求体: { "asset_id": "成片视频资产ID", "subtitle_id": "字幕轨ID", "gain": 1.0 }
-// 把字幕轨中已生成的TTS配音按各字幕条 start_sec 定位混入视频，产出新视频资产。
-// gain 为可选旁白增益（0.1~3.0，默认1.0），视频流零重编码（-c:v copy）。
-func (h *VideoEditHandler) MixNarration(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
-		return
-	}
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
-		return
-	}
-
-	cwID := extractVideoEditCoursewareID(r.URL.Path, "/videos/mix-narration")
-	if cwID == "" {
-		utils.BadRequest(w, "路径参数错误")
+// MixNarration 将字幕TTS旁白混入视频。
+func (h *VideoEditHandler) MixNarration(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	coursewareID, ok :=
+		h.prepareVideoEditRequest(
+			w,
+			r,
+			"/videos/mix-narration",
+		)
+	if !ok {
 		return
 	}
 
-	var req struct {
+	actor, ok :=
+		h.preflightVideoEditOwner(
+			w,
+			r,
+			coursewareID,
+		)
+	if !ok {
+		return
+	}
+
+	var body struct {
 		AssetID    string  `json:"asset_id"`
 		SubtitleID string  `json:"subtitle_id"`
 		Gain       float64 `json:"gain"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
-		return
-	}
-	if req.AssetID == "" {
-		utils.BadRequest(w, "asset_id不能为空")
-		return
-	}
-	if req.SubtitleID == "" {
-		utils.BadRequest(w, "subtitle_id不能为空")
+
+	if err := decodeVideoEditJSON(
+		w,
+		r,
+		&body,
+	); err != nil {
+		writeVideoEditDecodeError(w, err)
 		return
 	}
 
-	resp, err := h.editService.MixNarration(r.Context(), &services.MixNarrationRequest{
-		CoursewareID: cwID,
-		AssetID:      req.AssetID,
-		SubtitleID:   req.SubtitleID,
-		Gain:         req.Gain,
-		UserID:       claims.UserID,
-	})
+	response, err :=
+		h.editService.MixNarration(
+			r.Context(),
+			&services.MixNarrationRequest{
+				CoursewareID: coursewareID,
+				AssetID:      body.AssetID,
+				SubtitleID:   body.SubtitleID,
+				Gain:         body.Gain,
+				Actor:        actor,
+			},
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		writeVideoEditError(w, err)
 		return
 	}
-	utils.Success(w, resp)
+
+	utils.Success(w, response)
 }
 
-
-// ==================== 音频裁剪（课件音频剪辑器专用） ====================
-
-// TrimAudio POST /api/v1/coursewares/{id}/videos/trim-audio
-// 请求体: { "asset_id": "uuid", "start_sec": 1.5, "end_sec": 30.0 }
-// 裁剪指定音频资产的起止时间段，生成新的音频资产（不重编码，速度极快）
-func (h *VideoEditHandler) TrimAudio(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
-		return
-	}
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
-		return
-	}
-
-	cwID := extractVideoEditCoursewareID(r.URL.Path, "/videos/trim-audio")
-	if cwID == "" {
-		utils.BadRequest(w, "路径参数错误")
+// TrimAudio 裁剪课件音频资产。
+func (h *VideoEditHandler) TrimAudio(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	coursewareID, ok :=
+		h.prepareVideoEditRequest(
+			w,
+			r,
+			"/videos/trim-audio",
+		)
+	if !ok {
 		return
 	}
 
-	var req struct {
+	actor, ok :=
+		h.preflightVideoEditOwner(
+			w,
+			r,
+			coursewareID,
+		)
+	if !ok {
+		return
+	}
+
+	var body struct {
 		AssetID  string  `json:"asset_id"`
 		StartSec float64 `json:"start_sec"`
 		EndSec   float64 `json:"end_sec"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
-		return
-	}
-	if req.AssetID == "" {
-		utils.BadRequest(w, "asset_id不能为空")
+
+	if err := decodeVideoEditJSON(
+		w,
+		r,
+		&body,
+	); err != nil {
+		writeVideoEditDecodeError(w, err)
 		return
 	}
 
-	svcReq := &services.TrimAudioRequest{
-		CoursewareID: cwID,
-		AssetID:      req.AssetID,
-		StartSec:     req.StartSec,
-		EndSec:       req.EndSec,
-		UserID:       claims.UserID,
-	}
-
-	resp, err := h.editService.TrimAudio(r.Context(), svcReq)
+	response, err :=
+		h.editService.TrimAudio(
+			r.Context(),
+			&services.TrimAudioRequest{
+				CoursewareID: coursewareID,
+				AssetID:      body.AssetID,
+				StartSec:     body.StartSec,
+				EndSec:       body.EndSec,
+				Actor:        actor,
+			},
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		writeVideoEditError(w, err)
 		return
 	}
-	utils.Success(w, resp)
-}
 
-// ==================== 路径解析 ====================
-
-// extractVideoEditCoursewareID 从 /api/v1/coursewares/{id}/videos/{action} 提取课件ID
-func extractVideoEditCoursewareID(path string, suffix string) string {
-	if !strings.HasSuffix(path, suffix) && !strings.HasSuffix(path, suffix+"/") {
-		return ""
-	}
-	trimmed := strings.TrimSuffix(strings.TrimSuffix(path, "/"), suffix)
-	const prefix = "/api/v1/coursewares/"
-	if !strings.HasPrefix(trimmed, prefix) {
-		return ""
-	}
-	cwID := trimmed[len(prefix):]
-	if cwID == "" || strings.Contains(cwID, "/") {
-		return ""
-	}
-	return cwID
+	utils.Success(w, response)
 }

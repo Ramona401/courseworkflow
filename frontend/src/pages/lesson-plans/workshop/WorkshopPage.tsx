@@ -33,6 +33,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
+import { useEducationProfile } from '@/hooks/useEducationProfile'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import {
   startConversation, sendChatMessage, triggerAIReview, applyAISuggestions,
   publishLessonPlanPersonal, updateLessonPlan, createLessonPlanSSE, getLessonPlan, getConversation,
@@ -60,6 +62,7 @@ import { ResumingView, StartScreen } from './components/WorkshopStartScreen'
 import { getAssessmentResult } from '@/api/assessment'
 // 迭代7B：备课中展示本次关联的课本图
 import { getTextbook, type TextbookDetail } from '@/api/textbooks'
+import ProtectedTextbookImage from '@/components/textbooks/ProtectedTextbookImage'
 import ImportPlanModal from './components/ImportPlanModal'
 // v112 (P0 STEP 8):引入 AI 助手选择器和场景类型
 import AssistantSelector from '@/components/ai-assistants/AssistantSelector'
@@ -68,6 +71,7 @@ import type { AssistantScene } from '@/api/ai-assistants'
 import { deleteAssistant } from '@/api/ai-assistants'
 // v113 (P0 STEP 6):引入 AI 助手编辑弹窗
 import AssistantEditModal, { type AssistantEditMode } from '@/components/ai-assistants/AssistantEditModal'
+import { getContextReceiptDisplayMessageIds } from './components/context-receipt/contextReceiptVisibility'
 
 const STAGE_SEP_PREFIX = '__STAGE_SEP__'
 
@@ -98,7 +102,12 @@ const STAGE_CODE_TO_SCENE: Record<string, AssistantScene> = {
 }
 
 export default function WorkshopPage() {
-  const { token } = useAuth()
+  const { token, user } = useAuth()
+  const {
+    isK12,
+    profile,
+    ready: educationReady,
+  } = useEducationProfile()
   const navigate  = useNavigate()
   const location  = useLocation()
 
@@ -119,7 +128,6 @@ export default function WorkshopPage() {
   const [messages, setMessages]     = useState<ConversationMessage[]>([])
   const [isThinking, setIsThinking] = useState(false)
   const [streaming, setStreaming]   = useState<StreamingState | null>(null)
-  const [inputText, setInputText]   = useState('')
   const [selectedComponentIds, setSelectedComponentIds] = useState<Set<string>>(new Set())
 
   const [planContent, setPlanContent]       = useState('')
@@ -131,6 +139,30 @@ export default function WorkshopPage() {
 
   const [stageItems, setStageItems]     = useState<StageProgressItem[]>([])
   const [currentStage, setCurrentStage] = useState<string>('')
+
+  /**
+   * 专家模式对话草稿按“当前用户 + 教案 + 阶段”隔离。
+   *
+   * 在不同阶段之间切换时，每个阶段可保留自己的未发送内容；
+   * 刷新、离开页面或网络失败后仍可恢复。
+   */
+  const inputDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'lesson-plan-expert-conversation',
+    resourceId: [
+      plan?.id
+      || effectivePlanId
+      || 'no-active-plan',
+      currentStage || 'general',
+    ].join('|'),
+    field: 'message',
+    initialValue: '',
+    maxHistory: 40,
+  })
+
+  const inputText = inputDraft.value
+  const setInputText = inputDraft.setValue
+
   const [isStageMode, setIsStageMode]   = useState(false)
   const isStageModeRef = useRef(false)
   const [needsAssessment, setNeedsAssessment] = useState<boolean | null>(null)
@@ -216,6 +248,15 @@ export default function WorkshopPage() {
   // 解析 plan.textbook_page_ids（JSON数组字符串），批量 getTextbook 拿缩略图+章节名。
   // plan 为空或无关联时清空。查询失败静默忽略，不影响备课主流程。
   useEffect(() => {
+    // 当前教育域不是K12时，不读取任何课本详情。
+    //
+    // 即使sessionStorage恢复了历史教案，或教案中残留旧的
+    // textbook_page_ids，也不能向课本详情接口发送请求。
+    if (!isK12) {
+      setLinkedTextbooks([])
+      return
+    }
+
     const ids = (() => {
       try {
         const raw = plan?.textbook_page_ids
@@ -232,7 +273,7 @@ export default function WorkshopPage() {
         setLinkedTextbooks(list.filter((t): t is TextbookDetail => t !== null))
       })
     return () => { cancelled = true }
-  }, [plan])
+  }, [isK12, plan])
 
   useEffect(() => {
     // B-P1-22: 自由滚动——仅当用户当前贴近底部(容差120px)时才自动跟随到最新；
@@ -524,13 +565,48 @@ export default function WorkshopPage() {
       setMessages([resp.opening_message])
       setPhase('chatting')
       sessionStorage.setItem('workshop_active_plan_id', resp.plan.id)
-      // 教材版本落库（专家模式起步选）：仅当老师选定版本(非 null/undefined)才写库。
-      // 独立 try-catch 吞错——失败不阻断主流程。落库后 analyze/design 阶段注入层据该版本精确匹配。
-      if (coursePublisher !== null && coursePublisher !== undefined) {
+      /**
+       * 创建完成后写入课程大纲挂载三态。
+       *
+       * K12：
+       *   - 保持首屏出版社选择结果；
+       *   - null/undefined表示老师未选择，不挂载课程大纲。
+       *
+       * vocational/adult：
+       *   - 首屏不显示出版社；
+       *   - 自动写入空字符串，表示挂载同域普通课程大纲；
+       *   - 后端运行时按照教案教育域快照、学科和学习层级匹配；
+       *   - 不会读取或泄漏K12出版社大纲。
+       *
+       * mixed、教育域未就绪或非法：
+       *   - 不自动挂载，保持fail-closed。
+       */
+      const isOrdinaryNonK12 =
+        educationReady &&
+        (
+          profile.code === 'vocational' ||
+          profile.code === 'adult'
+        )
+
+      const outlineMountPublisher =
+        isOrdinaryNonK12
+          ? ''
+          : coursePublisher
+
+      if (
+        outlineMountPublisher !== null &&
+        outlineMountPublisher !== undefined
+      ) {
         try {
-          await setLessonPlanCourseOutlinePublisher(resp.plan.id, coursePublisher)
-        } catch (cpubErr) {
-          console.error('教材版本关联失败:', cpubErr)
+          await setLessonPlanCourseOutlinePublisher(
+            resp.plan.id,
+            outlineMountPublisher,
+          )
+        } catch (outlineError) {
+          console.error(
+            '课程大纲关联失败:',
+            outlineError,
+          )
         }
       }
       connectSSE(resp.plan.id)
@@ -546,49 +622,116 @@ export default function WorkshopPage() {
   // v88增强:消息发送增加重试机制
   // v112 (P0 STEP 8):发送消息时透传 assistant_id 给后端
   const handleSend = async () => {
-    if (!plan || (!inputText.trim() && selectedComponentIds.size === 0)) return
+    if (
+      !plan
+      || (
+        !inputText.trim()
+        && selectedComponentIds.size === 0
+      )
+    ) {
+      return
+    }
+
     const msgText = inputText.trim()
-    setInputText('')
+    const localMessageID =
+      `local_${Date.now()}`
 
     const localMsg: ConversationMessage = {
-      id: `local_${Date.now()}`, role: 'user' as const, type: 'text' as const,
-      content: msgText || `已选择${selectedComponentIds.size}个组件`,
-      created_at: new Date().toISOString(),
+      id: localMessageID,
+      role: 'user' as const,
+      type: 'text' as const,
+      content:
+        msgText
+        || `已选择${selectedComponentIds.size}个组件`,
+      created_at:
+        new Date().toISOString(),
     }
-    setMessages(prev => [...prev, localMsg])
+
+    setMessages(previous => [
+      ...previous,
+      localMsg,
+    ])
     setIsThinking(true)
 
-    const componentIds = Array.from(selectedComponentIds)
+    const componentIds =
+      Array.from(selectedComponentIds)
+
     let lastErr: unknown = null
-    for (let attempt = 0; attempt <= SEND_RETRY_MAX; attempt++) {
+
+    for (
+      let attempt = 0;
+      attempt <= SEND_RETRY_MAX;
+      attempt++
+    ) {
       try {
-        // v112:assistant_id 透传,null 表示走后端兜底默认 prompt
         await sendChatMessage(plan.id, {
           message: msgText,
-          selected_components: componentIds,
-          assistant_id: assistantId,
+          selected_components:
+            componentIds,
+          assistant_id:
+            assistantId,
         })
-        setSelectedComponentIds(new Set())
+
+        /**
+         * 后端已正式接受本轮消息后才提交清空草稿。
+         * commit保留一个空值历史节点，Ctrl+Z仍可恢复刚发送内容。
+         */
+        inputDraft.commit()
+        setSelectedComponentIds(
+          new Set(),
+        )
         lastErr = null
         break
-      } catch (err) {
-        lastErr = err
-        if (attempt < SEND_RETRY_MAX) {
-          console.warn(`[Send] 发送失败,${1}秒后重试第${attempt + 1}次...`)
-          await new Promise(resolve => setTimeout(resolve, 1000))
+      } catch (error) {
+        lastErr = error
+
+        if (
+          attempt < SEND_RETRY_MAX
+        ) {
+          console.warn(
+            `[Send] 发送失败,1秒后重试第${attempt + 1}次...`,
+          )
+
+          await new Promise(
+            resolve =>
+              setTimeout(
+                resolve,
+                1000,
+              ),
+          )
         }
       }
     }
 
     if (lastErr) {
       setIsThinking(false)
-      console.error('发送消息失败(含重试):', lastErr)
-      setMessages(prev => [...prev, {
-        id: `send_err_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
-        content: '⚠️ 消息发送失败,请检查网络后重试。你刚才的内容已保留在输入框中。',
-        created_at: new Date().toISOString(),
-      }])
-      setInputText(msgText)
+
+      console.error(
+        '发送消息失败(含重试):',
+        lastErr,
+      )
+
+      /**
+       * 请求最终失败时撤回本地用户气泡。
+       * 输入框从未被清空，因此老师可以直接重新发送。
+       */
+      setMessages(previous => [
+        ...previous.filter(
+          message =>
+            message.id
+            !== localMessageID,
+        ),
+        {
+          id:
+            `send_err_${Date.now()}`,
+          role: 'assistant' as const,
+          type: 'text' as const,
+          content:
+            '⚠️ 消息发送失败，请检查网络后重试。输入内容已经保留。',
+          created_at:
+            new Date().toISOString(),
+        },
+      ])
     }
   }
 
@@ -771,7 +914,6 @@ export default function WorkshopPage() {
     setAiSuggestsComplete(false)
     setIsThinking(false)
     setStreaming(null)
-    setInputText('')
     setSelectedComponentIds(new Set())
     setSseConnectionState('connected')
     setRevisionBannerDismissed(false)
@@ -1101,7 +1243,7 @@ export default function WorkshopPage() {
               <button onClick={() => navigate('/lesson-plans/recipes')} style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px', color: C.textMuted, background: 'none', border: `1px dashed ${C.border}`, borderRadius: '6px', padding: '6px 8px', cursor: 'pointer', width: '100%', justifyContent: 'center' }}>📦 添加配方</button>
             )}
             {/* 迭代7B：本次参考的课本图缩略展示——让老师明确知道这次备课 AI 参考了哪些课本页 */}
-            {linkedTextbooks.length > 0 && (
+            {isK12 && linkedTextbooks.length > 0 && (
               <div style={{ marginTop: '8px', padding: '8px 10px', background: 'rgba(16,185,129,0.06)', borderRadius: '8px', border: '1px solid rgba(16,185,129,0.15)' }}>
                 <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '6px' }}>📷 参考课本（{linkedTextbooks.length}张）</div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
@@ -1109,8 +1251,17 @@ export default function WorkshopPage() {
                     <div key={tb.id} title={`${tb.chapter || tb.textbook_name}${tb.has_ocr ? '（已识别）' : '（未识别，AI无法参考）'}`}
                       onClick={() => navigate('/lesson-plans/textbooks')}
                       style={{ position: 'relative', cursor: 'pointer', borderRadius: '4px', overflow: 'hidden', border: tb.has_ocr ? '1px solid #10B981' : '1px solid #E5E7EB' }}>
-                      <img src={tb.image_url} alt="" style={{ width: '36px', height: '36px', objectFit: 'cover', display: 'block' }}
-                        onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
+                      <ProtectedTextbookImage
+                        textbookId={tb.id}
+                        alt={tb.file_name || tb.textbook_name}
+                        style={{
+                          width: '36px',
+                          height: '36px',
+                          objectFit: 'cover',
+                          display: 'block',
+                        }}
+                        fallback="📷"
+                      />
                       {!tb.has_ocr && (
                         <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'rgba(239,68,68,0.85)', color: '#fff', fontSize: '8px', textAlign: 'center', lineHeight: 1.4 }}>未识别</div>
                       )}
@@ -1254,63 +1405,218 @@ export default function WorkshopPage() {
               🔄 已恢复历史对话,可继续备课
             </div>
           )}
+
           {(() => {
-            const targetStage = viewingStage || currentStage
-            let filteredMsgs = messages
-            if (isStageMode && targetStage && stageItems.length > 0) {
-              let startIdx = -1
-              let endIdx   = messages.length
-              for (let i = 0; i < messages.length; i++) {
-                const m = messages[i]
-                if ((m.role as string) === 'system' && m.content.startsWith(STAGE_SEP_PREFIX)) {
-                  const rest = m.content.slice(STAGE_SEP_PREFIX.length)
-                  const sepStageName = rest.split('__')[0] || ''
-                  const matchItem = stageItems.find(s => s.stage_name === sepStageName || s.stage_code === sepStageName)
-                  if (matchItem && matchItem.stage_code === targetStage) {
-                    startIdx = i
-                  } else if (startIdx >= 0 && endIdx === messages.length) {
-                    endIdx = i
+            const targetStage =
+              viewingStage || currentStage
+
+            let filteredMessages = messages
+
+            if (
+              isStageMode &&
+              targetStage &&
+              stageItems.length > 0
+            ) {
+              let startIndex = -1
+              let endIndex = messages.length
+
+              for (
+                let index = 0;
+                index < messages.length;
+                index++
+              ) {
+                const message = messages[index]
+
+                if (
+                  (
+                    message.role as string
+                  ) === 'system' &&
+                  message.content.startsWith(
+                    STAGE_SEP_PREFIX,
+                  )
+                ) {
+                  const rest =
+                    message.content.slice(
+                      STAGE_SEP_PREFIX.length,
+                    )
+
+                  const separatorStageName =
+                    rest.split('__')[0] || ''
+
+                  const matchedStage =
+                    stageItems.find(
+                      stage =>
+                        stage.stage_name ===
+                          separatorStageName ||
+                        stage.stage_code ===
+                          separatorStageName,
+                    )
+
+                  if (
+                    matchedStage &&
+                    matchedStage.stage_code ===
+                      targetStage
+                  ) {
+                    startIndex = index
+                  } else if (
+                    startIndex >= 0 &&
+                    endIndex === messages.length
+                  ) {
+                    endIndex = index
                   }
                 }
               }
-              if (startIdx >= 0) {
-                filteredMsgs = messages.slice(startIdx, endIdx)
-              } else if (targetStage === stageItems[0]?.stage_code) {
-                const firstSepIdx = messages.findIndex(m => (m.role as string) === 'system' && m.content.startsWith(STAGE_SEP_PREFIX))
-                filteredMsgs = firstSepIdx >= 0 ? messages.slice(0, firstSepIdx) : messages
+
+              if (startIndex >= 0) {
+                filteredMessages =
+                  messages.slice(
+                    startIndex,
+                    endIndex,
+                  )
+              } else if (
+                targetStage ===
+                stageItems[0]?.stage_code
+              ) {
+                const firstSeparatorIndex =
+                  messages.findIndex(
+                    message =>
+                      (
+                        message.role as string
+                      ) === 'system' &&
+                      message.content.startsWith(
+                        STAGE_SEP_PREFIX,
+                      ),
+                  )
+
+                filteredMessages =
+                  firstSeparatorIndex >= 0
+                    ? messages.slice(
+                        0,
+                        firstSeparatorIndex,
+                      )
+                    : messages
               }
             }
-            return filteredMsgs.filter(m => {
-              if (m.role === 'user' && m.content.startsWith('我们进入') && m.content.includes('阶段了。请先简要介绍')) return false
-              if (m.role === 'user' && m.content === '请对上一阶段完成的教案进行全面专业评审,直接输出评审报告,包含各维度评分和改进建议。') return false
-              return true
-            })
-          })().map(msg => {
-            if ((msg.role as string) === 'system' && msg.content.startsWith(STAGE_SEP_PREFIX)) {
-              const rest = msg.content.slice(STAGE_SEP_PREFIX.length)
-              const [stageName, aiRole] = rest.split('__')
-              // v121 任务C:反查阶段代码 + 上一阶段名,让三段式分段条完整激活
-              // - nextStageCode:通过 stage_name 反查对应的 stage_code,匹配 STAGE_CODE_EMOJI 图标
-              // - prevStageName:取 stage_order 比当前小 1 的阶段名,渲染顶部"✅ XX 阶段已完成"收束条
-              const nextStageItem = stageItems.find(s => s.stage_name === stageName)
-              const nextStageCode = nextStageItem?.stage_code
-              const prevStageItem = nextStageItem
-                ? stageItems.find(s => s.stage_order === nextStageItem.stage_order - 1)
-                : null
-              return (
-                <StageSeparatorBubble
-                  key={msg.id}
-                  stageName={stageName || ''}
-                  aiRole={aiRole || ''}
-                  nextStageCode={nextStageCode}
-                  prevStageName={prevStageItem?.stage_name}
-                />
+
+            const displayMessages =
+              filteredMessages.filter(
+                message => {
+                  if (
+                    message.role === 'user' &&
+                    message.content.startsWith(
+                      '我们进入',
+                    ) &&
+                    message.content.includes(
+                      '阶段了。请先简要介绍',
+                    )
+                  ) {
+                    return false
+                  }
+
+                  if (
+                    message.role === 'user' &&
+                    message.content ===
+                      '请对上一阶段完成的教案进行全面专业评审,直接输出评审报告,包含各维度评分和改进建议。'
+                  ) {
+                    return false
+                  }
+
+                  return true
+                },
               )
-            }
-            return msg.role === 'assistant'
-              ? <AIBubble key={msg.id} msg={msg} streaming={false} onSelectComponent={handleSelectComponent} selectedComponentIds={selectedComponentIds} />
-              : <UserBubble key={msg.id} msg={msg} />
-          })}
+
+            const visibleReceiptMessageIDs =
+              getContextReceiptDisplayMessageIds(
+                displayMessages,
+              )
+
+            return displayMessages.map(
+              message => {
+                if (
+                  (
+                    message.role as string
+                  ) === 'system' &&
+                  message.content.startsWith(
+                    STAGE_SEP_PREFIX,
+                  )
+                ) {
+                  const rest =
+                    message.content.slice(
+                      STAGE_SEP_PREFIX.length,
+                    )
+                  const [
+                    stageName,
+                    aiRole,
+                  ] = rest.split('__')
+
+                  const nextStageItem =
+                    stageItems.find(
+                      stage =>
+                        stage.stage_name ===
+                        stageName,
+                    )
+
+                  const nextStageCode =
+                    nextStageItem?.stage_code
+
+                  const previousStageItem =
+                    nextStageItem
+                      ? stageItems.find(
+                          stage =>
+                            stage.stage_order ===
+                            nextStageItem.stage_order -
+                              1,
+                        )
+                      : null
+
+                  return (
+                    <StageSeparatorBubble
+                      key={message.id}
+                      stageName={
+                        stageName || ''
+                      }
+                      aiRole={aiRole || ''}
+                      nextStageCode={
+                        nextStageCode
+                      }
+                      prevStageName={
+                        previousStageItem
+                          ?.stage_name
+                      }
+                    />
+                  )
+                }
+
+                return message.role ===
+                  'assistant'
+                  ? (
+                      <AIBubble
+                        key={message.id}
+                        msg={message}
+                        streaming={false}
+                        onSelectComponent={
+                          handleSelectComponent
+                        }
+                        selectedComponentIds={
+                          selectedComponentIds
+                        }
+                        showContextReceipt={
+                          visibleReceiptMessageIDs.has(
+                            message.id,
+                          )
+                        }
+                      />
+                    )
+                  : (
+                      <UserBubble
+                        key={message.id}
+                        msg={message}
+                      />
+                    )
+              },
+            )
+          })()}
+
           {streaming && (
             <AIBubble key={streaming.id} msg={{ id: streaming.id, role: 'assistant', type: 'text', content: streaming.content, created_at: new Date().toISOString() }} streaming={true} onSelectComponent={handleSelectComponent} selectedComponentIds={selectedComponentIds} />
           )}
@@ -1353,8 +1659,12 @@ export default function WorkshopPage() {
 
         <div style={{ padding: '14px 20px', borderTop: `1px solid ${C.border}`, background: C.card }}>
           <div style={{ display: 'flex', gap: '10px', alignItems: 'flex-end', background: '#F9FAFB', borderRadius: '12px', border: `1px solid ${C.border}`, padding: '10px 12px' }}>
-            <textarea value={inputText} onChange={e => setInputText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }} placeholder={isBusy ? 'AI处理中...' : sseConnectionState === 'disconnected' ? '网络已断开,请先重连...' : '告诉AI你的想法... (Enter发送,Shift+Enter换行)'} rows={2} disabled={isBusy} style={{ flex: 1, background: 'transparent', border: 'none', outline: 'none', fontSize: '15px', color: C.text, resize: 'none', fontFamily: 'inherit', lineHeight: 1.6, opacity: isBusy ? 0.5 : 1 }} />
+            <textarea value={inputText} onChange={e => setInputText(e.target.value)} onKeyDown={e => { if (inputDraft.handleKeyDown(e)) return; if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }} placeholder={isBusy ? 'AI处理中...' : sseConnectionState === 'disconnected' ? '网络已断开,请先重连...' : '告诉AI你的想法... (Enter发送,Shift+Enter换行)'} rows={2} disabled={isBusy} style={{ flex: 1, background: 'transparent', border: 'none', outline: 'none', fontSize: '15px', color: C.text, resize: 'none', fontFamily: 'inherit', lineHeight: 1.6, opacity: isBusy ? 0.5 : 1 }} />
             <button onClick={handleSend} disabled={isBusy || (!inputText.trim() && selectedComponentIds.size === 0)} style={{ width: '36px', height: '36px', flexShrink: 0, borderRadius: '50%', border: 'none', background: isBusy || (!inputText.trim() && selectedComponentIds.size === 0) ? '#E5E7EB' : C.primary, color: '#fff', cursor: 'pointer', fontSize: '16px', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 200ms ease' }}>→</button>
+          </div>
+
+          <div style={{ marginTop: '5px', fontSize: '10px', color: C.textMuted, textAlign: 'center', lineHeight: 1.5 }}>
+            已自动保存当前阶段草稿 · 发送失败不会清除 · Ctrl/Command+Z恢复误删
           </div>
 
           <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap', alignItems: 'center' }}>

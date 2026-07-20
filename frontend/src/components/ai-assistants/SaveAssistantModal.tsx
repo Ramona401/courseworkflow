@@ -1,55 +1,47 @@
 /**
- * SaveAssistantModal.tsx — 「存为我的助手」确认弹窗(提示词工坊 阶段A)
+ * SaveAssistantModal.tsx — 对话式创作完成后的助手保存确认弹窗
  *
- * 角色:
- *   老师/教研员/管理员在 MyAssistantsPage 里和 AI 聊出一版 full_prompt 草稿后,
- *   点"存为我的助手",弹出本弹窗做最后确认——填名称 + 选「存到谁的货架」+
- *   (共享货架时)选「分享策略」+ 勾选适用场景 + 确认学科,然后落库。
+ * 表单负责确认：
+ *   - 助手名称；
+ *   - 发布货架；
+ *   - 分享策略；
+ *   - 当前教育域课程；
+ *   - 当前教育域具体层级、学段或不限值；
+ *   - 适用备课场景。
  *
- * ════════════ 身份分层(里程碑一:教研组级分享打通) ════════════
- *   同一份草稿,不同身份能把它"摆到不同的货架上"。货架不再按 userRole 静态判断,
- *   而是打开弹窗时调 getMyPublishGroups() 拿真实可发布范围,动态展示:
- *     - 👤 只给我自己用(personal)        : 所有人恒有
- *     - 👥 发布到教研组(group + group_id) : 我是某组 lead/backbone 时显示,需选具体组
- *     - 🏫 推荐给全校老师(group,无 group_id): 学校管理员(senior_operator/admin)显示
- *     - 🏛️ 全平台通用(system)             : 仅 admin 显示
- *   关键:教研组级助手只对该组成员可见;全校级对全校可见。两档都走 source='group',
- *   靠 group_id 是否携带区分(后端 service 据此落库 + 判可见)。
- *   组员想改组助手 → fork 成自己的 personal 再改,原版不动(本弹窗不涉及编辑)。
+ * 教育域层级规则：
+ *   - 具体层级可以参与自动严格匹配；
+ *   - K12小学/初中/高中只供手动选择；
+ *   - 中职不限年级只供手动选择；
+ *   - 成人不限层级只供手动选择；
+ *   - 页面显示“职一”，提交值为“中职Ⅰ年级”。
  *
- * ════════════ 分享策略(share_policy,本次新增) ════════════
- *   决定"别人拿到这个共享助手后,能不能复制带走、能不能改":
- *     🤝 仅可用(use_only,默认): 别人只能用,不能复制带走,也不能改(保护标准与产权)
- *     🔓 可复制(open):          别人可以用,也可以复制一份到自己名下修改
- *     🔒 仅自己(locked):        只有你自己能看到和使用(挂共享位但实际私有)
- *   ⚠ 仅当选了【共享货架】(教研组/全校/系统)时才显示此选择器——
- *     个人货架(personal)只有自己看得到,谈"能不能被别人复制/改"无意义,故隐藏保持极简。
- *   选"可复制"时下方弹黄色提醒,确保发布者明确知道自己在开放复制。
- *   提交:personal 货架不传 share_policy(后端兜底 use_only);共享货架传用户所选。
- *
- * 为什么单独成文件:
- *   MyAssistantsPage 主体已含「对话组合器 + 相关助手侧栏」两大块,逼近 600 行红线。
- *   把这个确认弹窗抽出来,主页面与本弹窗都稳在红线内,且弹窗逻辑内聚便于单独维护。
- *
- * 设计要点(对齐 Yuhan 拍板):
- *   - 不让老师面对"一堆选项框"。普通老师只问三件事:名字、场景、学科(货架与策略对其隐藏)。
- *   - 货架文案说人话:不写 personal/group/system,写"只给我自己用 / 发布到教研组 / 推荐给全校老师 / 全平台通用"。
- *   - 学科默认 = 老师在页面顶部选的"我主要教"学科(defaultSubject),可改但通常不用动。
- *   - emoji/description 不在这里问——给默认值(emoji 🤖, description 空),想精修去助手编辑弹窗。
- *   - 草稿(full_prompt)只读(只展示字符数),要改正文回对话区继续聊。
- *
- * Props 契约:
- *   open           - 是否显示
- *   draft          - 已聊出的完整 full_prompt 草稿(只读,落库用)
- *   userRole       - 当前用户角色(保留以兼容父组件,货架展示已改为接口驱动,不再依赖它)
- *   defaultSubject - 默认学科(取自页面顶部"我主要教",可空)
- *   defaultScene   - 默认勾选的场景(取自 designer 当前场景,可空;空则默认勾全部工坊场景)
- *   onClose        - 关闭回调
- *   onSaved        - 保存成功回调,传回新助手 id 和最终 source(父组件据此刷新/提示)
+ * 本组件不再维护独立K12年级副本，所有层级统一消费：
+ *   education-domain/options.ts
  */
 
-import { useState, useEffect } from 'react'
-import { DEFAULT_SUBJECTS } from '@/constants/subjects'
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+} from 'react'
+import type {
+  Dispatch,
+  SetStateAction,
+} from 'react'
+import { useAuth } from '@/store/auth'
+import {
+  useEducationProfile,
+} from '@/hooks/useEducationProfile'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
+import { useSubjects } from '@/hooks/useSubjects'
+import {
+  getAssistantLevelOptions,
+  getEducationLevelLabel,
+  isAutomaticEducationLevel,
+  normalizeEducationLevelValue,
+} from '@/education-domain/options'
 import {
   createAssistant,
   getMyPublishGroups,
@@ -65,116 +57,296 @@ import {
   type PublishGroup,
 } from '@/api/ai-assistants'
 
-/* ==================== 样式常量(与 EditModal/Selector/DesignerPanel 保持一致) ==================== */
+/* ==================== 样式 ==================== */
+
 const C = {
-  primary:      '#4F7BE8',
-  primaryLight: 'rgba(79,123,232,0.08)',
-  accent:       '#F59E0B',
-  success:      '#10B981',
-  danger:       '#EF4444',
-  text:         '#1F2937',
-  textSec:      '#6B7280',
-  textMuted:    '#9CA3AF',
-  bg:           '#FAFBFC',
-  card:         '#FFFFFF',
-  border:       '#F3F4F6',
-  borderMid:    '#E5E7EB',
+  primary: '#4F7BE8',
+  primaryLight:
+    'rgba(79,123,232,0.08)',
+  accent: '#F59E0B',
+  success: '#10B981',
+  danger: '#EF4444',
+  text: '#1F2937',
+  textSec: '#6B7280',
+  textMuted: '#9CA3AF',
+  bg: '#FAFBFC',
+  card: '#FFFFFF',
+  border: '#F3F4F6',
+  borderMid: '#E5E7EB',
 }
 
-/** 学科可选项(与 AssistantEditModal 的 SUBJECTS 保持一致,避免循环依赖写死) */
-const SUBJECTS = ['', ...DEFAULT_SUBJECTS]  // 空=不限；单一真相源（方案甲，v231）
+/** 工坊全部默认场景。 */
+const WORKSHOP_SCENES:
+  AssistantScene[] = [
+    'workshop_analyze',
+    'workshop_design',
+    'workshop_write',
+    'workshop_review',
+    'workshop_revise',
+  ]
 
-/** 标准学段值，与助手列表仓储的NormalizeGradeToSegment口径对齐 */
-const GRADE_SEGMENTS = ['', '小学', '初中', '高中']
+/** 与后端提示词存储上限一致。 */
+const MAX_PROMPT_LEN =
+  128 * 1024
 
-/** 工坊全部场景(defaultScene 为空时的兜底默认勾选——覆盖备课全链路 5 阶段) */
-const WORKSHOP_SCENES: AssistantScene[] = [
-  'workshop_analyze', 'workshop_design', 'workshop_write', 'workshop_review', 'workshop_revise',
-]
+/** 备课工坊单助手运行时注入上限。 */
+const WORKSHOP_RUNTIME_PROMPT_LEN =
+  8000
 
-/** prompt 长度上限(与后端 maxAssistantPromptLen 对齐) */
-const MAX_PROMPT_LEN = 128 * 1024
+/** 分享策略展示顺序。 */
+const SHARE_POLICY_ORDER:
+  AssistantSharePolicy[] = [
+    'use_only',
+    'open',
+    'locked',
+  ]
 
-/**
- * 备课工坊运行时单助手注入上限。
- * 完整原稿仍可保存；超过此值时，工坊会使用前8000个Unicode字符并记录告警。
- */
-const WORKSHOP_RUNTIME_PROMPT_LEN = 8000
+/* ==================== 发布货架 ==================== */
 
-/** 分享策略选择器里展示的三档顺序(默认 use_only 居首,最保护) */
-const SHARE_POLICY_ORDER: AssistantSharePolicy[] = ['use_only', 'open', 'locked']
+type ShelfKey =
+  | 'personal'
+  | 'group_teaching'
+  | 'group_school'
+  | 'system'
 
-/* ==================== 货架(shelf)定义 ==================== */
-//
-// 里程碑一:货架内部 key 扩为 4 档(group 来源细分教研组级/全校级两档),
-// 提交时再映射回后端的 source + group_id。
-
-/** 货架内部 key(不直接等于后端 source,group 拆两档) */
-type ShelfKey = 'personal' | 'group_teaching' | 'group_school' | 'system'
-
-/** 单个货架选项的展示信息 */
 interface ShelfOption {
   key: ShelfKey
   emoji: string
-  label: string      // 人话标题
-  hint: string       // 一句话说明给谁用
+  label: string
+  hint: string
 }
 
-/** 全部货架选项的展示文案(按 key 取用) */
-const SHELF_OPTIONS: Record<ShelfKey, ShelfOption> = {
-  personal:       { key: 'personal',       emoji: '👤', label: '只给我自己用',   hint: '存进「我的助手」,只有你能看到和使用' },
-  group_teaching: { key: 'group_teaching', emoji: '👥', label: '发布到教研组',   hint: '只推荐给所选教研组的老师,组内备课时可选用' },
-  group_school:   { key: 'group_school',   emoji: '🏫', label: '推荐给全校老师', hint: '作为本校推荐助手,全校老师备课时都能选用' },
-  system:         { key: 'system',         emoji: '🏛️', label: '全平台通用',     hint: '作为系统助手,所有学校所有老师都能用' },
-}
+const SHELF_OPTIONS:
+  Record<ShelfKey, ShelfOption> = {
+    personal: {
+      key: 'personal',
+      emoji: '👤',
+      label: '只给我自己用',
+      hint: '存进我的助手，只有你能看到和使用',
+    },
+    group_teaching: {
+      key: 'group_teaching',
+      emoji: '👥',
+      label: '发布到教研组',
+      hint: '只推荐给所选教研组的老师',
+    },
+    group_school: {
+      key: 'group_school',
+      emoji: '🏫',
+      label: '推荐给全校老师',
+      hint: '本校老师备课时都能选用',
+    },
+    system: {
+      key: 'system',
+      emoji: '🏛️',
+      label: '全平台通用',
+      hint: '所有学校的老师都能使用',
+    },
+  }
 
-/**
- * 把货架 key 映射为后端创建请求的 source + group_id
- *   personal       → source=personal
- *   group_teaching → source=group + group_id=选中教研组
- *   group_school   → source=group(不带 group_id,全校级)
- *   system         → source=system
- */
 function shelfToSourceAndGroup(
   shelf: ShelfKey,
   selectedGroupID: string,
-): { source: AssistantSource; groupID?: string } {
+): {
+  source: AssistantSource
+  groupID?: string
+} {
   switch (shelf) {
-    case 'personal':       return { source: 'personal' }
-    case 'group_teaching': return { source: 'group', groupID: selectedGroupID }
-    case 'group_school':   return { source: 'group' }
-    case 'system':         return { source: 'system' }
+    case 'personal':
+      return {
+        source: 'personal',
+      }
+
+    case 'group_teaching':
+      return {
+        source: 'group',
+        groupID:
+          selectedGroupID,
+      }
+
+    case 'group_school':
+      return {
+        source: 'group',
+      }
+
+    case 'system':
+      return {
+        source: 'system',
+      }
   }
 }
 
-/** 是否为"共享货架"(非 personal)——只有共享货架才显示分享策略选择器 */
-function isSharedShelf(shelf: ShelfKey): boolean {
+function isSharedShelf(
+  shelf: ShelfKey,
+): boolean {
   return shelf !== 'personal'
 }
 
-/* ==================== Props 类型 ==================== */
+/* ==================== 受保护表单 ==================== */
+
+interface SaveAssistantFormDraft {
+  name: string
+  subject: string
+  gradeRange: string
+  scenes: AssistantScene[]
+  shelf: ShelfKey
+  sharePolicy: AssistantSharePolicy
+  selectedGroupID: string
+}
+
+function hashSaveAssistantDraftIdentity(
+  value: string,
+): string {
+  let hash = 2166136261
+
+  for (
+    let index = 0;
+    index < value.length;
+    index += 1
+  ) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(
+      hash,
+      16777619,
+    )
+  }
+
+  return (hash >>> 0).toString(36)
+}
+
+function createSaveAssistantInitialForm(
+  defaultSubject: string | undefined,
+  defaultScene: AssistantScene | undefined,
+  defaultGrade: string | undefined,
+  subjectOptions: string[],
+  normalizedDefaultGrade: string,
+): SaveAssistantFormDraft {
+  const rawSubject =
+    (defaultSubject || '').trim()
+
+  return {
+    name: '',
+    subject:
+      subjectOptions.includes(
+        rawSubject,
+      )
+        ? rawSubject
+        : '',
+    gradeRange:
+      normalizedDefaultGrade ||
+      (defaultGrade || '').trim(),
+    scenes:
+      defaultScene
+        ? [defaultScene]
+        : [...WORKSHOP_SCENES],
+    shelf: 'personal',
+    sharePolicy:
+      DEFAULT_SHARE_POLICY,
+    selectedGroupID: '',
+  }
+}
+
+function parseSaveAssistantForm(
+  raw: string,
+  fallback: SaveAssistantFormDraft,
+): SaveAssistantFormDraft {
+  if (!raw.trim()) {
+    return {
+      ...fallback,
+      scenes: [...fallback.scenes],
+    }
+  }
+
+  try {
+    const parsed =
+      JSON.parse(raw) as
+        Partial<SaveAssistantFormDraft>
+
+    const scenes =
+      Array.isArray(parsed.scenes)
+        ? parsed.scenes.filter(
+            (
+              scene,
+            ): scene is AssistantScene =>
+              typeof scene ===
+                'string' &&
+              scene in
+                ASSISTANT_SCENE_LABELS,
+          )
+        : [...fallback.scenes]
+
+    const shelf: ShelfKey =
+      parsed.shelf ===
+        'group_teaching' ||
+      parsed.shelf ===
+        'group_school' ||
+      parsed.shelf === 'system'
+        ? parsed.shelf
+        : 'personal'
+
+    const sharePolicy:
+      AssistantSharePolicy =
+      parsed.sharePolicy ===
+        'open' ||
+      parsed.sharePolicy ===
+        'locked'
+        ? parsed.sharePolicy
+        : DEFAULT_SHARE_POLICY
+
+    return {
+      name:
+        typeof parsed.name ===
+          'string'
+          ? parsed.name
+          : fallback.name,
+      subject:
+        typeof parsed.subject ===
+          'string'
+          ? parsed.subject
+          : fallback.subject,
+      gradeRange:
+        typeof parsed.gradeRange ===
+          'string'
+          ? parsed.gradeRange
+          : fallback.gradeRange,
+      scenes,
+      shelf,
+      sharePolicy,
+      selectedGroupID:
+        typeof parsed.selectedGroupID ===
+          'string'
+          ? parsed.selectedGroupID
+          : fallback.selectedGroupID,
+    }
+  } catch {
+    return {
+      ...fallback,
+      scenes: [...fallback.scenes],
+    }
+  }
+}
+
+/* ==================== Props ==================== */
 
 export interface SaveAssistantModalProps {
   open: boolean
-  /** 已聊出的完整 full_prompt 草稿(只读) */
   draft: string
-  /** 当前用户角色(保留以兼容父组件;货架展示已改为接口驱动,不再依赖此值) */
   userRole?: string
-  /** 默认学科(取自页面顶部"我主要教") */
   defaultSubject?: string
-  /** 默认勾选的场景(取自 designer 当前场景) */
   defaultScene?: AssistantScene
-  /** 默认学段，小学/初中/高中；空表示不限 */
   defaultGrade?: string
-  /** 关闭回调 */
   onClose: () => void
-  /** 保存成功回调,传回新助手 ID 和最终 source */
-  onSaved: (id: string, source: AssistantSource) => void
+  onSaved: (
+    id: string,
+    source: AssistantSource,
+  ) => void
 }
 
 /* ==================== 主组件 ==================== */
 
-export default function SaveAssistantModal(props: SaveAssistantModalProps) {
+export default function SaveAssistantModal(
+  props: SaveAssistantModalProps,
+) {
   const {
     open,
     draft,
@@ -184,457 +356,1423 @@ export default function SaveAssistantModal(props: SaveAssistantModalProps) {
     onClose,
     onSaved,
   } = props
-  const draftChars = Array.from(draft).length
 
-  // ==================== 表单状态 ====================
-  const [name, setName]       = useState('')
-  const [subject, setSubject] = useState('')
-  const [gradeRange, setGradeRange] = useState('')
-  const [scenes, setScenes]   = useState<AssistantScene[]>([])
-  const [shelf, setShelf]     = useState<ShelfKey>('personal') // 货架:默认存为我的
-  const [sharePolicy, setSharePolicy] = useState<AssistantSharePolicy>(DEFAULT_SHARE_POLICY) // 分享策略:默认仅可用
-  const [saving, setSaving]   = useState(false)
-  const [err, setErr]         = useState<string | null>(null)
+  const draftChars =
+    Array.from(draft).length
 
-  // ==================== 可发布范围(来自 /my-groups 接口) ====================
-  const [shelfKeys, setShelfKeys]           = useState<ShelfKey[]>(['personal']) // 当前用户可选货架
-  const [publishGroups, setPublishGroups]   = useState<PublishGroup[]>([])       // 可发布的教研组
-  const [selectedGroupID, setSelectedGroupID] = useState('')                     // 教研组级时选中的组
-  const [loadingScope, setLoadingScope]     = useState(false)                    // 拉取可发布范围中
+  const { user } = useAuth()
 
-  // 是否需要显示货架选择(只有可选 >1 个时才显示;普通老师只有 personal 不显示)
-  const showShelfPicker = shelfKeys.length > 1
-  // 是否显示分享策略选择器(仅当选了共享货架时;personal 货架无意义不显示)
-  const showPolicyPicker = isSharedShelf(shelf)
+  const {
+    domain,
+    profile,
+  } = useEducationProfile()
 
-  // ==================== open 时初始化表单 + 拉取可发布范围 ====================
+  const {
+    subjects: subjectOptions,
+    loading: subjectsLoading,
+    empty: subjectsEmpty,
+  } = useSubjects()
+
+  const levelOptions = useMemo(
+    () => getAssistantLevelOptions(
+      domain,
+    ),
+    [domain],
+  )
+
+  const specificLevelOptions =
+    useMemo(
+      () => levelOptions.filter(
+        option => option.automatic,
+      ),
+      [levelOptions],
+    )
+
+  const broadLevelOptions =
+    useMemo(
+      () => levelOptions.filter(
+        option => !option.automatic,
+      ),
+      [levelOptions],
+    )
+
+  const levelValues = useMemo(
+    () => levelOptions.map(
+      option => option.value,
+    ),
+    [levelOptions],
+  )
+
+  const normalizedDefaultGrade =
+    normalizeEducationLevelValue(
+      domain,
+      defaultGrade,
+    )
+
+  const initialForm = useMemo(
+    () => createSaveAssistantInitialForm(
+      defaultSubject,
+      defaultScene,
+      defaultGrade,
+      subjectOptions,
+      normalizedDefaultGrade,
+    ),
+    [
+      defaultSubject,
+      defaultScene,
+      defaultGrade,
+      subjectOptions,
+      normalizedDefaultGrade,
+    ],
+  )
+
+  /**
+   * 草稿按Prompt内容和教育域双重隔离。
+   *
+   * 切换账号或从K12切换到职业教育时，
+   * 不会错误恢复其它教育域的层级选择。
+   */
+  const formDraft =
+    useProtectedDraft({
+      userId: user?.id,
+      scope: 'assistant-save',
+      resourceId:
+        `${domain}:` +
+        hashSaveAssistantDraftIdentity(
+          draft,
+        ),
+      field: 'form',
+      initialValue:
+        JSON.stringify(
+          initialForm,
+        ),
+      maxHistory: 20,
+    })
+
+  const form =
+    parseSaveAssistantForm(
+      formDraft.value,
+      initialForm,
+    )
+
+  const setForm: Dispatch<
+    SetStateAction<
+      SaveAssistantFormDraft
+    >
+  > = useCallback(
+    next => {
+      formDraft.setValue(
+        previousText => {
+          const previous =
+            parseSaveAssistantForm(
+              previousText,
+              initialForm,
+            )
+
+          const resolved =
+            typeof next ===
+              'function'
+              ? next(previous)
+              : next
+
+          return JSON.stringify(
+            resolved,
+          )
+        },
+      )
+    },
+    [
+      formDraft.setValue,
+      initialForm,
+    ],
+  )
+
+  const {
+    name,
+    subject,
+    gradeRange,
+    scenes,
+    shelf,
+    sharePolicy,
+    selectedGroupID,
+  } = form
+
+  const setName = (value: string) =>
+    setForm(previous => ({
+      ...previous,
+      name: value,
+    }))
+
+  const setSubject = (
+    value: string,
+  ) =>
+    setForm(previous => ({
+      ...previous,
+      subject: value,
+    }))
+
+  const setGradeRange = (
+    value: string,
+  ) =>
+    setForm(previous => ({
+      ...previous,
+      gradeRange: value,
+    }))
+
+  const setShelf = (
+    value: ShelfKey,
+  ) =>
+    setForm(previous => ({
+      ...previous,
+      shelf: value,
+    }))
+
+  const setSharePolicy = (
+    value: AssistantSharePolicy,
+  ) =>
+    setForm(previous => ({
+      ...previous,
+      sharePolicy: value,
+    }))
+
+  const setSelectedGroupID = (
+    value: string,
+  ) =>
+    setForm(previous => ({
+      ...previous,
+      selectedGroupID: value,
+    }))
+
+  const setScenes: Dispatch<
+    SetStateAction<
+      AssistantScene[]
+    >
+  > = next =>
+    setForm(previous => ({
+      ...previous,
+      scenes:
+        typeof next ===
+          'function'
+          ? next(
+              previous.scenes,
+            )
+          : next,
+    }))
+
+  /* ==================== 课程与层级修正 ==================== */
+
+  useEffect(() => {
+    if (
+      !open ||
+      subjectsLoading
+    ) {
+      return
+    }
+
+    const rawDefault =
+      (defaultSubject || '').trim()
+
+    const preferredSubject =
+      subjectOptions.includes(
+        rawDefault,
+      )
+        ? rawDefault
+        : ''
+
+    setForm(current => {
+      const nextSubject =
+        subjectOptions.includes(
+          current.subject,
+        )
+          ? current.subject
+          : preferredSubject
+
+      if (
+        nextSubject ===
+        current.subject
+      ) {
+        return current
+      }
+
+      return {
+        ...current,
+        subject: nextSubject,
+      }
+    })
+  }, [
+    open,
+    subjectsLoading,
+    subjectOptions,
+    defaultSubject,
+    setForm,
+  ])
+
+  /**
+   * 清理跨教育域草稿或历史别名。
+   *
+   * 当前值能规范化时使用规范值；
+   * 无法规范化时回退到当前教育域第一个具体层级。
+   */
+  useEffect(() => {
+    if (
+      !open ||
+      levelOptions.length === 0
+    ) {
+      return
+    }
+
+    setForm(current => {
+      const raw =
+        current.gradeRange.trim()
+
+      if (
+        raw === '' &&
+        levelValues.includes('')
+      ) {
+        return current
+      }
+
+      const normalized =
+        normalizeEducationLevelValue(
+          domain,
+          raw,
+        )
+
+      const nextGrade =
+        normalized &&
+        levelValues.includes(
+          normalized,
+        )
+          ? normalized
+          : specificLevelOptions[0]
+              ?.value ||
+            broadLevelOptions[0]
+              ?.value ||
+            ''
+
+      if (
+        nextGrade ===
+        current.gradeRange
+      ) {
+        return current
+      }
+
+      return {
+        ...current,
+        gradeRange: nextGrade,
+      }
+    })
+  }, [
+    open,
+    domain,
+    levelOptions,
+    levelValues,
+    specificLevelOptions,
+    broadLevelOptions,
+    setForm,
+  ])
+
+  /* ==================== 运行状态 ==================== */
+
+  const [saving, setSaving] =
+    useState(false)
+
+  const [errorMessage, setErrorMessage] =
+    useState<string | null>(null)
+
+  const [shelfKeys, setShelfKeys] =
+    useState<ShelfKey[]>([
+      'personal',
+    ])
+
+  const [
+    publishGroups,
+    setPublishGroups,
+  ] = useState<PublishGroup[]>([])
+
+  const [
+    loadingScope,
+    setLoadingScope,
+  ] = useState(false)
+
+  const showShelfPicker =
+    shelfKeys.length > 1
+
+  const showPolicyPicker =
+    isSharedShelf(shelf)
+
+  /* ==================== 打开时加载发布范围 ==================== */
+
   useEffect(() => {
     if (!open) return
-    // 基础表单初始化
-    setName('')
-    setSubject(defaultSubject || '')
-    setGradeRange(defaultGrade || '')
-    setScenes(defaultScene ? [defaultScene] : [...WORKSHOP_SCENES])
-    setShelf('personal')              // 货架默认 personal(无论什么身份,默认"先存给自己"最安全)
-    setSharePolicy(DEFAULT_SHARE_POLICY) // 策略默认仅可用(最保护)
-    setSelectedGroupID('')
-    setErr(null)
-    setSaving(false)
 
-    // 拉取可发布范围:据返回标志位 + groups 动态拼货架
+    setErrorMessage(null)
+    setSaving(false)
+    setShelfKeys(['personal'])
+    setPublishGroups([])
+
     let cancelled = false
+
     setLoadingScope(true)
+
     getMyPublishGroups()
-      .then((res) => {
+      .then(response => {
         if (cancelled) return
-        const keys: ShelfKey[] = ['personal'] // personal 恒在最前
-        if (res.can_publish_group && res.groups.length > 0) keys.push('group_teaching')
-        if (res.can_publish_school) keys.push('group_school')
-        if (res.can_publish_system) keys.push('system')
-        setShelfKeys(keys)
-        setPublishGroups(res.groups || [])
-        // 教研组下拉默认选第一个组,供老师选了"发布到教研组"时直接可用
-        if (res.groups && res.groups.length > 0) {
-          setSelectedGroupID(res.groups[0].id)
+
+        const keys:
+          ShelfKey[] = [
+            'personal',
+          ]
+
+        if (
+          response.can_publish_group &&
+          response.groups.length > 0
+        ) {
+          keys.push(
+            'group_teaching',
+          )
         }
+
+        if (
+          response.can_publish_school
+        ) {
+          keys.push(
+            'group_school',
+          )
+        }
+
+        if (
+          response.can_publish_system
+        ) {
+          keys.push('system')
+        }
+
+        setShelfKeys(keys)
+        setPublishGroups(
+          response.groups || [],
+        )
+
+        setForm(current => ({
+          ...current,
+          shelf:
+            keys.includes(
+              current.shelf,
+            )
+              ? current.shelf
+              : 'personal',
+          selectedGroupID:
+            current.selectedGroupID &&
+            response.groups.some(
+              group =>
+                group.id ===
+                current.selectedGroupID,
+            )
+              ? current.selectedGroupID
+              : response.groups[0]
+                  ?.id || '',
+        }))
       })
       .catch(() => {
-        // 拉取失败:保守只给 personal(不阻断保存,普通场景本就只有 personal)
         if (cancelled) return
-        setShelfKeys(['personal'])
+
+        setShelfKeys([
+          'personal',
+        ])
         setPublishGroups([])
+
+        setForm(current => ({
+          ...current,
+          shelf: 'personal',
+          selectedGroupID: '',
+        }))
       })
       .finally(() => {
-        if (!cancelled) setLoadingScope(false)
+        if (!cancelled) {
+          setLoadingScope(false)
+        }
       })
 
-    return () => { cancelled = true }
-  }, [open, defaultSubject, defaultScene, defaultGrade])
+    return () => {
+      cancelled = true
+    }
+  }, [
+    open,
+    domain,
+    setForm,
+  ])
 
-  // ==================== ESC 关闭 ====================
   useEffect(() => {
     if (!open) return
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !saving) onClose()
-    }
-    document.addEventListener('keydown', handler)
-    return () => document.removeEventListener('keydown', handler)
-  }, [open, saving, onClose])
 
-  // ==================== 场景多选切换 ====================
-  const toggleScene = (scene: AssistantScene) => {
-    setScenes(prev => (prev.includes(scene) ? prev.filter(s => s !== scene) : [...prev, scene]))
+    const handler = (
+      event: KeyboardEvent,
+    ) => {
+      if (
+        event.key === 'Escape' &&
+        !saving
+      ) {
+        onClose()
+      }
+    }
+
+    document.addEventListener(
+      'keydown',
+      handler,
+    )
+
+    return () =>
+      document.removeEventListener(
+        'keydown',
+        handler,
+      )
+  }, [
+    open,
+    saving,
+    onClose,
+  ])
+
+  const toggleScene = (
+    scene: AssistantScene,
+  ) => {
+    setScenes(previous =>
+      previous.includes(scene)
+        ? previous.filter(
+            item => item !== scene,
+          )
+        : [...previous, scene],
+    )
   }
 
-  // ==================== 提交保存 ====================
+  /* ==================== 层级提示 ==================== */
+
+  const gradeHint = (
+    value: string,
+  ): string => {
+    const label =
+      getEducationLevelLabel(
+        domain,
+        value,
+      )
+
+    if (
+      isAutomaticEducationLevel(
+        domain,
+        value,
+      )
+    ) {
+      return `${label}属于具体${profile.grade_label}，课程、层级和阶段严格一致时可以自动匹配。`
+    }
+
+    return `${label || '不限层级'}只供老师手动选择，不会被平台自动挂载。`
+  }
+
+  /* ==================== 保存 ==================== */
+
   const handleSave = async () => {
     if (saving) return
-    // 校验(与后端校验口径一致,前置拦截给友好提示)
-    if (!name.trim()) { setErr('请给助手起个名字,方便以后认出它'); return }
-    if (!draft.trim()) { setErr('草稿还是空的,请先在左侧和 AI 聊出一版'); return }
-    if (scenes.length === 0) { setErr('请至少勾选一个适用场景'); return }
-    if (draft.length > MAX_PROMPT_LEN) {
-      setErr(`提示词过长(${draft.length} 字符),上限 ${MAX_PROMPT_LEN} 字符`)
+
+    if (subjectsLoading) {
+      setErrorMessage(
+        '课程目录仍在加载，请稍后再试',
+      )
       return
     }
 
-    // 货架兜底:若当前选中的货架不在允许范围内(理论不会),强制回退 personal
-    const finalShelf: ShelfKey = shelfKeys.includes(shelf) ? shelf : 'personal'
-
-    // 教研组级必须选中一个组
-    if (finalShelf === 'group_teaching' && !selectedGroupID) {
-      setErr('请选择要发布到哪个教研组')
+    if (subjectsEmpty) {
+      setErrorMessage(
+        '当前组织尚未配置可用课程，暂时不能保存助手',
+      )
       return
     }
 
-    const { source, groupID } = shelfToSourceAndGroup(finalShelf, selectedGroupID)
+    if (!name.trim()) {
+      setErrorMessage(
+        '请给助手起个名字，方便以后识别',
+      )
+      return
+    }
+
+    if (
+      !subject.trim() ||
+      !subjectOptions.includes(
+        subject.trim(),
+      )
+    ) {
+      setErrorMessage(
+        `请选择助手适用的具体${profile.subject_label}`,
+      )
+      return
+    }
+
+    if (
+      !levelValues.includes(
+        gradeRange.trim(),
+      )
+    ) {
+      setErrorMessage(
+        `请选择当前教育域支持的${profile.grade_label}或通用层级`,
+      )
+      return
+    }
+
+    if (!draft.trim()) {
+      setErrorMessage(
+        '草稿还是空的，请先和AI聊出一版',
+      )
+      return
+    }
+
+    if (scenes.length === 0) {
+      setErrorMessage(
+        '请至少勾选一个适用场景',
+      )
+      return
+    }
+
+    if (
+      draft.length >
+      MAX_PROMPT_LEN
+    ) {
+      setErrorMessage(
+        `提示词过长（${draft.length}字符），上限${MAX_PROMPT_LEN}字符`,
+      )
+      return
+    }
+
+    const finalShelf:
+      ShelfKey =
+      shelfKeys.includes(shelf)
+        ? shelf
+        : 'personal'
+
+    if (
+      finalShelf ===
+        'group_teaching' &&
+      !selectedGroupID
+    ) {
+      setErrorMessage(
+        '请选择要发布到哪个教研组',
+      )
+      return
+    }
+
+    const {
+      source,
+      groupID,
+    } = shelfToSourceAndGroup(
+      finalShelf,
+      selectedGroupID,
+    )
 
     setSaving(true)
-    setErr(null)
+    setErrorMessage(null)
+
     try {
-      const req: CreateAIAssistantRequest = {
+      const request:
+        CreateAIAssistantRequest = {
         name: name.trim(),
         avatar_emoji: '🤖',
         description: '',
-        source,                 // 后端会按角色+教研组身份再校验
+        source,
         full_prompt: draft,
         subject: subject.trim(),
-        grade_range: gradeRange.trim(),
+        grade_range:
+          gradeRange.trim(),
         scenes,
-        ...(groupID ? { group_id: groupID } : {}), // 仅教研组级携带 group_id
-        // 分享策略:仅共享货架携带用户所选;personal 不传,后端兜底 use_only
-        ...(isSharedShelf(finalShelf) ? { share_policy: sharePolicy } : {}),
+        ...(groupID
+          ? {
+              group_id: groupID,
+            }
+          : {}),
+        ...(isSharedShelf(
+          finalShelf,
+        )
+          ? {
+              share_policy:
+                sharePolicy,
+            }
+          : {}),
       }
-      const created = await createAssistant(req)
-      onSaved(created.id, (created.source as AssistantSource) || source)
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : '保存失败,请重试')
+
+      const created =
+        await createAssistant(
+          request,
+        )
+
+      formDraft.clear()
+
+      onSaved(
+        created.id,
+        created.source ||
+          source,
+      )
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : '保存失败，请重试',
+      )
       setSaving(false)
     }
   }
 
-  // ==================== 未 open 不渲染 ====================
   if (!open) return null
 
   return (
     <div
-      onClick={() => { if (!saving) onClose() }}
+      onClick={() => {
+        if (!saving) onClose()
+      }}
       style={{
-        position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-        background: 'rgba(17,24,39,0.5)',
-        zIndex: 10001, // 高于对话区可能的浮层
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        position: 'fixed',
+        inset: 0,
+        background:
+          'rgba(17,24,39,0.5)',
+        zIndex: 10001,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
         padding: '24px',
       }}
     >
-      {/* 弹窗本体(阻止冒泡) */}
       <div
-        onClick={e => e.stopPropagation()}
+        onClick={event =>
+          event.stopPropagation()
+        }
         style={{
-          width: '540px', maxWidth: '100%', maxHeight: '90vh',
-          background: C.card, borderRadius: '14px',
-          boxShadow: '0 24px 64px rgba(0,0,0,0.18)',
-          display: 'flex', flexDirection: 'column', overflow: 'hidden',
+          width: '540px',
+          maxWidth: '100%',
+          maxHeight: '90vh',
+          background: C.card,
+          borderRadius: '14px',
+          boxShadow:
+            '0 24px 64px rgba(0,0,0,0.18)',
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden',
         }}
       >
-        {/* 标题栏 */}
         <div style={{
-          padding: '16px 20px', borderBottom: `1px solid ${C.border}`,
-          background: 'linear-gradient(135deg,rgba(16,185,129,0.06),rgba(16,185,129,0.02))',
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0,
+          padding: '16px 20px',
+          borderBottom:
+            `1px solid ${C.border}`,
+          background:
+            'linear-gradient(135deg,rgba(16,185,129,0.06),rgba(16,185,129,0.02))',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent:
+            'space-between',
+          flexShrink: 0,
         }}>
-          <span style={{ fontSize: '15px', fontWeight: 700, color: C.text }}>
+          <span style={{
+            fontSize: '15px',
+            fontWeight: 700,
+            color: C.text,
+          }}>
             💾 保存这个助手
           </span>
+
           <button
-            onClick={() => { if (!saving) onClose() }}
-            style={{ background: 'none', border: 'none', cursor: saving ? 'not-allowed' : 'pointer', fontSize: '20px', color: C.textMuted, lineHeight: 1 }}
-          >×</button>
+            type="button"
+            onClick={() => {
+              if (!saving) onClose()
+            }}
+            style={{
+              background: 'none',
+              border: 'none',
+              cursor: saving
+                ? 'not-allowed'
+                : 'pointer',
+              fontSize: '20px',
+              color: C.textMuted,
+              lineHeight: 1,
+            }}
+          >
+            ×
+          </button>
         </div>
 
-        {/* 表单区 */}
-        <div style={{ flex: 1, overflow: 'auto', padding: '20px 24px' }}>
-          {/* 草稿信息提示 */}
+        <div style={{
+          flex: 1,
+          overflow: 'auto',
+          padding: '20px 24px',
+        }}>
           <div style={{
-            marginBottom: '16px', padding: '10px 12px', borderRadius: '8px',
-            background: C.primaryLight, border: '1px solid rgba(79,123,232,0.15)',
-            fontSize: '12px', color: C.textSec, lineHeight: 1.6,
+            marginBottom: '16px',
+            padding: '10px 12px',
+            borderRadius: '8px',
+            background: C.primaryLight,
+            border:
+              '1px solid rgba(79,123,232,0.15)',
+            fontSize: '12px',
+            color: C.textSec,
+            lineHeight: 1.6,
           }}>
-            ✨ 已聊出一版提示词草稿(<b style={{ color: C.primary }}>{draftChars.toLocaleString()}</b> 字符)。
-            填好下面的信息就能保存,之后备课时随时能选用。
+            ✨ 已生成一版提示词草稿（
+            <b style={{
+              color: C.primary,
+            }}>
+              {draftChars.toLocaleString()}
+            </b>
+            个字符）。填写以下信息后即可保存。
           </div>
 
-          {draftChars > WORKSHOP_RUNTIME_PROMPT_LEN && (
+          {draftChars >
+           WORKSHOP_RUNTIME_PROMPT_LEN && (
             <div style={{
-              marginBottom: '16px', padding: '10px 12px', borderRadius: '8px',
-              background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.28)',
-              color: '#92400E', fontSize: '12px', lineHeight: 1.6,
+              marginBottom: '16px',
+              padding: '10px 12px',
+              borderRadius: '8px',
+              background:
+                'rgba(245,158,11,0.08)',
+              border:
+                '1px solid rgba(245,158,11,0.28)',
+              color: '#92400E',
+              fontSize: '12px',
+              lineHeight: 1.6,
             }}>
-              ⚠️ 当前草稿为 <b>{draftChars.toLocaleString()}</b> 个Unicode字符。
-              完整原稿仍会保存，但备课工坊单次运行最多注入前
-              <b> {WORKSHOP_RUNTIME_PROMPT_LEN.toLocaleString()} </b>
-              个字符。建议回到左侧让AI压缩重复解释，保留教学方法、地方要求、成长目标和自检规则。
+              ⚠️ 完整原稿会保存，但备课工坊单次最多注入前
+              {' '}
+              <b>
+                {WORKSHOP_RUNTIME_PROMPT_LEN.toLocaleString()}
+              </b>
+              {' '}
+              个Unicode字符。
             </div>
           )}
 
           {/* 名称 */}
-          <div style={{ marginBottom: '16px' }}>
+          <div style={{
+            marginBottom: '16px',
+          }}>
             <label style={labelStyle}>
-              助手名称 <span style={{ color: C.danger }}>*</span>
+              助手名称
+              {' '}
+              <span style={{
+                color: C.danger,
+              }}>
+                *
+              </span>
             </label>
+
             <input
               type="text"
               value={name}
-              onChange={e => setName(e.target.value)}
-              placeholder="例如:我的初中AI严苛审核员"
+              onChange={event =>
+                setName(
+                  event.target.value,
+                )
+              }
+              onKeyDown={event =>
+                formDraft.handleKeyDown(
+                  event,
+                )
+              }
+              placeholder="例如：我的实训任务设计助手"
               maxLength={100}
               autoFocus
-              style={{ ...inputStyle, width: '100%' }}
+              style={{
+                ...inputStyle,
+                width: '100%',
+              }}
             />
           </div>
 
-          {/* 货架选择(可选货架 >1 时显示;普通老师只有 personal 不显示,保持极简) */}
+          {/* 货架 */}
           {showShelfPicker && (
-            <div style={{ marginBottom: '16px' }}>
+            <div style={{
+              marginBottom: '16px',
+            }}>
               <label style={labelStyle}>
-                保存到哪里 <span style={{ color: C.danger }}>*</span>
-                <span style={{ color: C.textMuted, fontWeight: 400 }}> (这决定谁能用到这个助手)</span>
+                保存到哪里
+                {' '}
+                <span style={{
+                  color: C.danger,
+                }}>
+                  *
+                </span>
               </label>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '4px' }}>
-                {shelfKeys.map(sk => {
-                  const opt = SHELF_OPTIONS[sk]
-                  const checked = shelf === sk
-                  return (
-                    <div key={sk}>
+
+              <div style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '6px',
+                marginTop: '4px',
+              }}>
+                {shelfKeys.map(
+                  shelfKey => {
+                    const option =
+                      SHELF_OPTIONS[
+                        shelfKey
+                      ]
+
+                    const checked =
+                      shelf === shelfKey
+
+                    return (
+                      <div key={shelfKey}>
+                        <label style={{
+                          display: 'flex',
+                          alignItems:
+                            'flex-start',
+                          gap: '8px',
+                          padding:
+                            '10px 12px',
+                          borderRadius:
+                            '8px',
+                          border:
+                            `1.5px solid ${
+                              checked
+                                ? C.primary
+                                : C.border
+                            }`,
+                          background:
+                            checked
+                              ? C.primaryLight
+                              : '#fff',
+                          cursor:
+                            'pointer',
+                        }}>
+                          <input
+                            type="radio"
+                            name="shelf"
+                            checked={checked}
+                            onChange={() =>
+                              setShelf(
+                                shelfKey,
+                              )
+                            }
+                            style={{
+                              cursor:
+                                'pointer',
+                              accentColor:
+                                C.primary,
+                              marginTop:
+                                '2px',
+                            }}
+                          />
+
+                          <div style={{
+                            flex: 1,
+                          }}>
+                            <div style={{
+                              fontSize:
+                                '13px',
+                              fontWeight:
+                                600,
+                              color: C.text,
+                            }}>
+                              {option.emoji}
+                              {' '}
+                              {option.label}
+                            </div>
+
+                            <div style={{
+                              fontSize:
+                                '11px',
+                              color:
+                                C.textSec,
+                              marginTop:
+                                '2px',
+                              lineHeight:
+                                1.5,
+                            }}>
+                              {option.hint}
+                            </div>
+                          </div>
+                        </label>
+
+                        {shelfKey ===
+                          'group_teaching' &&
+                         checked && (
+                          <div style={{
+                            margin:
+                              '6px 0 2px 28px',
+                          }}>
+                            <select
+                              value={
+                                selectedGroupID
+                              }
+                              onChange={
+                                event =>
+                                  setSelectedGroupID(
+                                    event
+                                      .target
+                                      .value,
+                                  )
+                              }
+                              style={{
+                                ...inputStyle,
+                                width:
+                                  '100%',
+                                cursor:
+                                  'pointer',
+                              }}
+                            >
+                              {publishGroups.map(
+                                group => (
+                                  <option
+                                    key={
+                                      group.id
+                                    }
+                                    value={
+                                      group.id
+                                    }
+                                  >
+                                    {group.name}
+                                    {group.role ===
+                                      'lead'
+                                      ? '（组长）'
+                                      : '（骨干）'}
+                                    {group.school_name
+                                      ? ` · ${group.school_name}`
+                                      : ''}
+                                  </option>
+                                ),
+                              )}
+                            </select>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  },
+                )}
+              </div>
+            </div>
+          )}
+
+          {loadingScope &&
+           !showShelfPicker && (
+            <div style={{
+              marginBottom: '16px',
+              fontSize: '12px',
+              color: C.textMuted,
+            }}>
+              正在确认发布范围…
+            </div>
+          )}
+
+          {/* 分享策略 */}
+          {showPolicyPicker && (
+            <div style={{
+              marginBottom: '16px',
+            }}>
+              <label style={labelStyle}>
+                别人能怎么用
+              </label>
+
+              <div style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '6px',
+                marginTop: '4px',
+              }}>
+                {SHARE_POLICY_ORDER.map(
+                  policy => {
+                    const checked =
+                      sharePolicy ===
+                      policy
+
+                    return (
                       <label
+                        key={policy}
                         style={{
-                          display: 'flex', alignItems: 'flex-start', gap: '8px',
-                          padding: '10px 12px', borderRadius: '8px',
-                          border: `1.5px solid ${checked ? C.primary : C.border}`,
-                          background: checked ? C.primaryLight : '#fff',
-                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems:
+                            'flex-start',
+                          gap: '8px',
+                          padding:
+                            '10px 12px',
+                          borderRadius:
+                            '8px',
+                          border:
+                            `1.5px solid ${
+                              checked
+                                ? C.accent
+                                : C.border
+                            }`,
+                          background:
+                            checked
+                              ? 'rgba(245,158,11,0.06)'
+                              : '#fff',
+                          cursor:
+                            'pointer',
                         }}
                       >
                         <input
                           type="radio"
-                          name="shelf"
+                          name="share_policy"
                           checked={checked}
-                          onChange={() => setShelf(sk)}
-                          style={{ cursor: 'pointer', accentColor: C.primary, marginTop: '2px' }}
+                          onChange={() =>
+                            setSharePolicy(
+                              policy,
+                            )
+                          }
+                          style={{
+                            cursor:
+                              'pointer',
+                            accentColor:
+                              C.accent,
+                            marginTop:
+                              '2px',
+                          }}
                         />
-                        <div style={{ flex: 1 }}>
-                          <div style={{ fontSize: '13px', fontWeight: 600, color: C.text }}>
-                            {opt.emoji} {opt.label}
+
+                        <div style={{
+                          flex: 1,
+                        }}>
+                          <div style={{
+                            fontSize:
+                              '13px',
+                            fontWeight:
+                              600,
+                            color: C.text,
+                          }}>
+                            {SHARE_POLICY_EMOJI[policy]}
+                            {' '}
+                            {SHARE_POLICY_LABELS[policy]}
                           </div>
-                          <div style={{ fontSize: '11px', color: C.textSec, marginTop: '2px', lineHeight: 1.5 }}>
-                            {opt.hint}
+
+                          <div style={{
+                            fontSize:
+                              '11px',
+                            color: C.textSec,
+                            marginTop:
+                              '2px',
+                            lineHeight:
+                              1.5,
+                          }}>
+                            {SHARE_POLICY_HINTS[policy]}
                           </div>
                         </div>
                       </label>
-
-                      {/* 选中"发布到教研组"时,在该项下方展开教研组下拉 */}
-                      {sk === 'group_teaching' && checked && (
-                        <div style={{ margin: '6px 0 2px 28px' }}>
-                          <select
-                            value={selectedGroupID}
-                            onChange={e => setSelectedGroupID(e.target.value)}
-                            style={{ ...inputStyle, width: '100%', cursor: 'pointer' }}
-                          >
-                            {publishGroups.map(g => (
-                              <option key={g.id} value={g.id}>
-                                {g.name}
-                                {g.role === 'lead' ? '(组长)' : '(骨干)'}
-                                {g.school_name ? ` · ${g.school_name}` : ''}
-                              </option>
-                            ))}
-                          </select>
-                          <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px', lineHeight: 1.5 }}>
-                            发布后,该教研组的老师在备课时都能选到这个助手。
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )
-                })}
+                    )
+                  },
+                )}
               </div>
             </div>
           )}
 
-          {/* 可发布范围加载中提示(仅在尚未确定货架且加载中时短暂出现) */}
-          {loadingScope && !showShelfPicker && (
-            <div style={{ marginBottom: '16px', fontSize: '12px', color: C.textMuted }}>
-              正在确认你的发布范围…
-            </div>
-          )}
+          {/* 课程 */}
+          <div style={{
+            marginBottom: '16px',
+          }}>
+            <label style={labelStyle}>
+              适用
+              {profile.subject_label}
+              {' '}
+              <span style={{
+                color: C.danger,
+              }}>
+                *
+              </span>
+            </label>
 
-          {/* ==================== 分享策略选择器(仅共享货架显示) ==================== */}
-          {showPolicyPicker && (
-            <div style={{ marginBottom: '16px' }}>
-              <label style={labelStyle}>
-                别人能怎么用 <span style={{ color: C.danger }}>*</span>
-                <span style={{ color: C.textMuted, fontWeight: 400 }}> (决定别人能不能复制、能不能改)</span>
-              </label>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '4px' }}>
-                {SHARE_POLICY_ORDER.map(p => {
-                  const checked = sharePolicy === p
+            <select
+              value={subject}
+              disabled={
+                subjectsLoading ||
+                subjectsEmpty
+              }
+              onChange={event =>
+                setSubject(
+                  event.target.value,
+                )
+              }
+              style={{
+                ...inputStyle,
+                width: '100%',
+                cursor: 'pointer',
+              }}
+            >
+              <option value="">
+                请选择具体
+                {profile.subject_label}
+              </option>
+
+              {subjectOptions.map(
+                option => (
+                  <option
+                    key={option}
+                    value={option}
+                  >
+                    {option}
+                  </option>
+                ),
+              )}
+            </select>
+
+            {subjectsEmpty &&
+             !subjectsLoading && (
+              <div style={{
+                marginTop: '6px',
+                fontSize: '11px',
+                color: C.danger,
+                lineHeight: 1.5,
+              }}>
+                当前组织尚未配置可用
+                {profile.subject_label}。
+              </div>
+            )}
+          </div>
+
+          {/* 学习层级 */}
+          <div style={{
+            marginBottom: '16px',
+          }}>
+            <label style={labelStyle}>
+              适用
+              {profile.grade_label}
+              <span style={{
+                color: C.textMuted,
+                fontWeight: 400,
+              }}>
+                {' '}（影响自动或手动匹配）
+              </span>
+            </label>
+
+            <select
+              value={gradeRange}
+              onChange={event =>
+                setGradeRange(
+                  event.target.value,
+                )
+              }
+              style={{
+                ...inputStyle,
+                width: '100%',
+                cursor: 'pointer',
+              }}
+            >
+              <optgroup
+                label={`具体${profile.grade_label}（可自动匹配）`}
+              >
+                {specificLevelOptions.map(
+                  option => (
+                    <option
+                      key={option.value}
+                      value={option.value}
+                    >
+                      {option.label}
+                    </option>
+                  ),
+                )}
+              </optgroup>
+
+              {broadLevelOptions.length >
+               0 && (
+                <optgroup label="通用层级（仅手动选择）">
+                  {broadLevelOptions.map(
+                    option => (
+                      <option
+                        key={
+                          option.value ||
+                          '__empty__'
+                        }
+                        value={
+                          option.value
+                        }
+                      >
+                        {option.label}
+                      </option>
+                    ),
+                  )}
+                </optgroup>
+              )}
+            </select>
+
+            <div style={{
+              marginTop: '6px',
+              fontSize: '11px',
+              color:
+                isAutomaticEducationLevel(
+                  domain,
+                  gradeRange,
+                )
+                  ? '#166534'
+                  : C.textMuted,
+              lineHeight: 1.55,
+            }}>
+              {gradeHint(gradeRange)}
+            </div>
+          </div>
+
+          {/* 场景 */}
+          <div style={{
+            marginBottom: '8px',
+          }}>
+            <label style={labelStyle}>
+              适用场景
+              {' '}
+              <span style={{
+                color: C.danger,
+              }}>
+                *
+              </span>
+            </label>
+
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns:
+                'repeat(2, 1fr)',
+              gap: '6px',
+              marginTop: '4px',
+            }}>
+              {(
+                Object.entries(
+                  ASSISTANT_SCENE_LABELS,
+                ) as [
+                  AssistantScene,
+                  string,
+                ][]
+              ).map(
+                ([
+                  scene,
+                  label,
+                ]) => {
+                  const checked =
+                    scenes.includes(
+                      scene,
+                    )
+
                   return (
                     <label
-                      key={p}
+                      key={scene}
                       style={{
-                        display: 'flex', alignItems: 'flex-start', gap: '8px',
-                        padding: '10px 12px', borderRadius: '8px',
-                        border: `1.5px solid ${checked ? C.accent : C.border}`,
-                        background: checked ? 'rgba(245,158,11,0.06)' : '#fff',
-                        cursor: 'pointer',
+                        display:
+                          'flex',
+                        alignItems:
+                          'center',
+                        gap: '6px',
+                        padding:
+                          '7px 10px',
+                        borderRadius:
+                          '6px',
+                        border:
+                          `1px solid ${
+                            checked
+                              ? C.primary
+                              : C.border
+                          }`,
+                        background:
+                          checked
+                            ? C.primaryLight
+                            : '#fff',
+                        cursor:
+                          'pointer',
+                        fontSize:
+                          '13px',
+                        color: C.text,
                       }}
                     >
                       <input
-                        type="radio"
-                        name="share_policy"
+                        type="checkbox"
                         checked={checked}
-                        onChange={() => setSharePolicy(p)}
-                        style={{ cursor: 'pointer', accentColor: C.accent, marginTop: '2px' }}
+                        onChange={() =>
+                          toggleScene(
+                            scene,
+                          )
+                        }
+                        style={{
+                          cursor:
+                            'pointer',
+                          accentColor:
+                            C.primary,
+                        }}
                       />
-                      <div style={{ flex: 1 }}>
-                        <div style={{ fontSize: '13px', fontWeight: 600, color: C.text }}>
-                          {SHARE_POLICY_EMOJI[p]} {SHARE_POLICY_LABELS[p]}
-                          {p === DEFAULT_SHARE_POLICY && (
-                            <span style={{ fontSize: '10px', fontWeight: 400, color: C.textMuted }}> (默认 · 推荐)</span>
-                          )}
-                        </div>
-                        <div style={{ fontSize: '11px', color: C.textSec, marginTop: '2px', lineHeight: 1.5 }}>
-                          {SHARE_POLICY_HINTS[p]}
-                        </div>
-                      </div>
+
+                      {label}
                     </label>
                   )
-                })}
-              </div>
-
-              {/* 选"可复制"时的黄色提醒:确保发布者明确知道自己在开放复制 */}
-              {sharePolicy === 'open' && (
-                <div style={{
-                  marginTop: '8px', padding: '9px 12px', borderRadius: '8px',
-                  background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)',
-                  color: '#92400E', fontSize: '12px', lineHeight: 1.6,
-                }}>
-                  ⚠️ 选了「可复制」后,任何能看到这个助手的老师都可以复制一份带走并自行修改。
-                  如果这是你想保护的标准或产权,建议改回「仅可用」。
-                </div>
+                },
               )}
             </div>
-          )}
-
-          {/* 学科 */}
-          <div style={{ marginBottom: '16px' }}>
-            <label style={labelStyle}>
-              适用学科 <span style={{ color: C.textMuted, fontWeight: 400 }}>(默认取你主要教的科目,可改)</span>
-            </label>
-            <select
-              value={subject}
-              onChange={e => setSubject(e.target.value)}
-              style={{ ...inputStyle, width: '100%', cursor: 'pointer' }}
-            >
-              {SUBJECTS.map(s => (
-                <option key={s} value={s}>{s || '(不限学科)'}</option>
-              ))}
-            </select>
           </div>
 
-          {/* 学段 */}
-          <div style={{ marginBottom: '16px' }}>
-            <label style={labelStyle}>
-              适用学段
-              <span style={{ color: C.textMuted, fontWeight: 400 }}>
-                {' '}(用于自动匹配，可改)
-              </span>
-            </label>
-            <select
-              value={gradeRange}
-              onChange={e => setGradeRange(e.target.value)}
-              style={{ ...inputStyle, width: '100%', cursor: 'pointer' }}
-            >
-              {GRADE_SEGMENTS.map(g => (
-                <option key={g} value={g}>
-                  {g || '(不限学段)'}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {/* 场景多选 */}
-          <div style={{ marginBottom: '8px' }}>
-            <label style={labelStyle}>
-              适用场景 <span style={{ color: C.danger }}>*</span>
-              <span style={{ color: C.textMuted, fontWeight: 400 }}> (这个助手在哪些备课环节出现,至少选 1 个)</span>
-            </label>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '6px', marginTop: '4px' }}>
-              {(Object.entries(ASSISTANT_SCENE_LABELS) as [AssistantScene, string][]).map(([scene, label]) => {
-                const checked = scenes.includes(scene)
-                return (
-                  <label
-                    key={scene}
-                    style={{
-                      display: 'flex', alignItems: 'center', gap: '6px',
-                      padding: '7px 10px', borderRadius: '6px',
-                      border: `1px solid ${checked ? C.primary : C.border}`,
-                      background: checked ? C.primaryLight : '#fff',
-                      cursor: 'pointer', fontSize: '13px', color: C.text,
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={() => toggleScene(scene)}
-                      style={{ cursor: 'pointer', accentColor: C.primary }}
-                    />
-                    {label}
-                  </label>
-                )
-              })}
-            </div>
-          </div>
-
-          {/* 错误提示 */}
-          {err && (
+          {errorMessage && (
             <div style={{
-              marginTop: '14px', padding: '10px 12px', borderRadius: '8px',
-              background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.2)',
-              color: C.danger, fontSize: '13px',
+              marginTop: '14px',
+              padding: '10px 12px',
+              borderRadius: '8px',
+              background:
+                'rgba(239,68,68,0.06)',
+              border:
+                '1px solid rgba(239,68,68,0.2)',
+              color: C.danger,
+              fontSize: '13px',
             }}>
-              ⚠️ {err}
+              ⚠️ {errorMessage}
             </div>
           )}
         </div>
 
-        {/* 底部操作栏 */}
         <div style={{
-          padding: '12px 20px', borderTop: `1px solid ${C.border}`,
-          display: 'flex', justifyContent: 'flex-end', gap: '8px',
-          background: C.bg, flexShrink: 0,
+          padding: '12px 20px',
+          borderTop:
+            `1px solid ${C.border}`,
+          display: 'flex',
+          justifyContent: 'flex-end',
+          gap: '8px',
+          background: C.bg,
+          flexShrink: 0,
         }}>
           <button
-            onClick={() => { if (!saving) onClose() }}
-            disabled={saving}
-            style={{
-              padding: '8px 16px', borderRadius: '7px',
-              border: `1px solid ${C.borderMid}`, background: '#fff',
-              color: C.textSec, fontSize: '13px',
-              cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.5 : 1,
+            type="button"
+            onClick={() => {
+              if (!saving) onClose()
             }}
-          >取消</button>
-          <button
-            onClick={handleSave}
             disabled={saving}
             style={{
-              padding: '8px 20px', borderRadius: '7px', border: 'none',
-              background: saving ? C.borderMid : C.success,
-              color: saving ? C.textMuted : '#fff',
-              fontSize: '13px', fontWeight: 600,
-              cursor: saving ? 'not-allowed' : 'pointer',
+              padding: '8px 16px',
+              borderRadius: '7px',
+              border:
+                `1px solid ${C.borderMid}`,
+              background: '#fff',
+              color: C.textSec,
+              fontSize: '13px',
+              cursor: saving
+                ? 'not-allowed'
+                : 'pointer',
+              opacity:
+                saving ? 0.5 : 1,
             }}
           >
-            {saving ? '保存中...' : '✓ 保存助手'}
+            取消
+          </button>
+
+          <button
+            type="button"
+            onClick={() =>
+              void handleSave()
+            }
+            disabled={
+              saving ||
+              subjectsLoading ||
+              subjectsEmpty
+            }
+            style={{
+              padding: '8px 20px',
+              borderRadius: '7px',
+              border: 'none',
+              background:
+                saving
+                  ? C.borderMid
+                  : C.success,
+              color:
+                saving
+                  ? C.textMuted
+                  : '#fff',
+              fontSize: '13px',
+              fontWeight: 600,
+              cursor:
+                saving
+                  ? 'not-allowed'
+                  : 'pointer',
+            }}
+          >
+            {saving
+              ? '保存中...'
+              : '✓ 保存助手'}
           </button>
         </div>
       </div>
@@ -644,16 +1782,25 @@ export default function SaveAssistantModal(props: SaveAssistantModalProps) {
 
 /* ==================== 样式辅助 ==================== */
 
-const labelStyle: React.CSSProperties = {
-  display: 'block',
-  fontSize: '12px', fontWeight: 600, color: C.textSec,
-  marginBottom: '4px',
-}
+const labelStyle:
+  React.CSSProperties = {
+    display: 'block',
+    fontSize: '12px',
+    fontWeight: 600,
+    color: C.textSec,
+    marginBottom: '4px',
+  }
 
-const inputStyle: React.CSSProperties = {
-  padding: '8px 10px', borderRadius: '6px',
-  border: `1px solid ${C.border}`,
-  fontSize: '13px', color: C.text,
-  outline: 'none', boxSizing: 'border-box',
-  fontFamily: 'inherit', background: '#fff',
-}
+const inputStyle:
+  React.CSSProperties = {
+    padding: '8px 10px',
+    borderRadius: '6px',
+    border:
+      `1px solid ${C.border}`,
+    fontSize: '13px',
+    color: C.text,
+    outline: 'none',
+    boxSizing: 'border-box',
+    fontFamily: 'inherit',
+    background: '#fff',
+  }

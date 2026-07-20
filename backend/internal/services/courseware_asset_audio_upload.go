@@ -44,13 +44,13 @@ const (
 // cwAudioAllowedMimeTypes 允许的音频 MIME 类型白名单
 // 浏览器 <audio> 标签可直接播放的常见格式
 var cwAudioAllowedMimeTypes = map[string]bool{
-	"audio/mpeg":    true, // .mp3 — 最常见
-	"audio/wav":     true, // .wav — 无损格式
-	"audio/ogg":     true, // .ogg — 开源格式
-	"audio/aac":     true, // .aac — 苹果系常用
-	"audio/flac":    true, // .flac — 无损格式
-	"audio/x-m4a":   true, // .m4a — 苹果音频容器
-	"audio/mp4":     true, // .m4a — 部分浏览器返回此MIME
+	"audio/mpeg":  true, // .mp3 — 最常见
+	"audio/wav":   true, // .wav — 无损格式
+	"audio/ogg":   true, // .ogg — 开源格式
+	"audio/aac":   true, // .aac — 苹果系常用
+	"audio/flac":  true, // .flac — 无损格式
+	"audio/x-m4a": true, // .m4a — 苹果音频容器
+	"audio/mp4":   true, // .m4a — 部分浏览器返回此MIME
 }
 
 // cwAudioMimeToExt 音频 MIME → 文件扩展名映射
@@ -69,9 +69,9 @@ var cwAudioMimeToExt = map[string]string{
 
 // UploadAudioAssetRequest 音频上传请求参数
 type UploadAudioAssetRequest struct {
-	CoursewareID string // 课件 ID
-	PageNumber   int    // 关联页码（用于 page_id 外键写入，便于按页统计）
-	UserID       string // 操作者 ID（用于权限校验）
+	CoursewareID string                  // 课件 ID
+	PageNumber   int                     // 关联页码（用于 page_id 外键写入，便于按页统计）
+	Actor        *CoursewareActorContext // 可信作者Actor
 }
 
 // UploadAudioAssetResponse 音频上传响应
@@ -106,13 +106,19 @@ func (s *CoursewareAssetService) UploadAudioAsset(
 	file multipart.File,
 	header *multipart.FileHeader,
 ) (*UploadAudioAssetResponse, error) {
-	// ========== 1. 校验课件存在性和用户所有权 ==========
-	cw, err := repository.GetCoursewareByID(ctx, req.CoursewareID)
-	if err != nil {
-		return nil, fmt.Errorf("课件不存在: %w", err)
+	// ========== 1. 正式课件作者与教育域二次校验 ==========
+	if req == nil {
+		return nil, ErrCoursewareActorRequired
 	}
-	if cw.UserID != req.UserID {
-		return nil, fmt.Errorf("无权操作此课件")
+
+	if _, _, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				req.CoursewareID,
+				req.Actor,
+			); err != nil {
+		return nil, err
 	}
 
 	// ========== 2. 校验文件大小（20MB） ==========
@@ -229,10 +235,10 @@ func (s *CoursewareAssetService) UploadAudioAsset(
 
 	asset := &models.CoursewareAsset{
 		CoursewareID:     req.CoursewareID,
-		PageID:           &page.ID,  // 关联页面便于按页统计
-		PlaceholderID:    "",        // 音频不替换占位符
+		PageID:           &page.ID, // 关联页面便于按页统计
+		PlaceholderID:    "",       // 音频不替换占位符
 		AssetType:        models.CWAssetTypeAudio,
-		GenerationPrompt: "",        // 手动上传无生成提示词
+		GenerationPrompt: "", // 手动上传无生成提示词
 		OssURL:           assetURL,
 		FileSize:         written,
 		MimeType:         mimeType,

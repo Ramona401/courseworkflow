@@ -8,11 +8,19 @@ package repository
 //   - INSERT/SELECT/UPDATE/Scan 全链路贯通 semester(学期) + unit(单元) 两列
 //   - ListTextbookPages 签名新增 semester/unit 两个筛选参数，支持按学期/单元归档查询
 //   - 排序改为 grade_range → semester → unit → textbook_name → page_number，归档展示更有序
+//
+// 上下文15新增：K12课本模块Repository最终防线
+//   - 新增显式educationDomain参数的K12专用读写包装函数
+//   - 只有k12可以进入真实课本SQL；vocational/adult/mixed/common/空值/非法值均拒绝
+//   - 列表专用包装对非K12返回成功空集，不执行数据库查询
+//   - 详情、上传、更新、删除、OCR和批量挂载查询对非K12返回明确错误
+//   - 保留原有无域函数供存量内部调用，正式HTTP与挂载链必须改走K12专用包装
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -23,8 +31,27 @@ import (
 // ==================== 错误常量 ====================
 
 var (
-	ErrTextbookNotFound = errors.New("课本页面不存在")
+	ErrTextbookNotFound                   = errors.New("课本页面不存在")
+	ErrTextbookEducationDomainUnsupported = errors.New("当前教育域不支持课本能力")
 )
+
+// ==================== K12教育域最终防线 ====================
+
+// isK12TextbookEducationDomain 判断调用方传入的可信教育域是否严格为K12。
+//
+// 注意：这里不能使用NormalizeEducationDomain，因为该函数会把空值或非法值兼容回退为K12，
+// 权限边界必须fail-closed，只接受明确的k12。
+func isK12TextbookEducationDomain(educationDomain string) bool {
+	return strings.EqualFold(strings.TrimSpace(educationDomain), models.EducationDomainK12)
+}
+
+// ensureK12TextbookEducationDomain 为详情与写操作提供Repository最终防线。
+func ensureK12TextbookEducationDomain(educationDomain string) error {
+	if !isK12TextbookEducationDomain(educationDomain) {
+		return ErrTextbookEducationDomainUnsupported
+	}
+	return nil
+}
 
 // ==================== 创建 ====================
 
@@ -58,6 +85,14 @@ func CreateTextbookPage(ctx context.Context, page *models.TextbookPage) error {
 	return nil
 }
 
+// CreateTextbookPageForEducationDomain 仅允许可信K12调用方创建课本页面。
+func CreateTextbookPageForEducationDomain(ctx context.Context, page *models.TextbookPage, educationDomain string) error {
+	if err := ensureK12TextbookEducationDomain(educationDomain); err != nil {
+		return err
+	}
+	return CreateTextbookPage(ctx, page)
+}
+
 // ==================== 查询 ====================
 
 // GetTextbookPageByID 根据ID查询课本页面完整信息
@@ -89,6 +124,21 @@ func GetTextbookPageByID(ctx context.Context, id string) (*models.TextbookPage, 
 		return nil, fmt.Errorf("查询课本页面失败: %w", err)
 	}
 	return p, nil
+}
+
+// GetTextbookPageByIDForEducationDomain 仅允许可信K12调用方按ID读取课本详情。
+func GetTextbookPageByIDForEducationDomain(ctx context.Context, id string, educationDomain string) (*models.TextbookPage, error) {
+	if err := ensureK12TextbookEducationDomain(educationDomain); err != nil {
+		return nil, err
+	}
+	page, err := GetTextbookPageByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(page.Status) != "active" {
+		return nil, ErrTextbookNotFound
+	}
+	return page, nil
 }
 
 // ==================== 列表查询 ====================
@@ -185,10 +235,36 @@ func ListTextbookPages(ctx context.Context, callerID string, subject string, gra
 		item.ImageURL = "/uploads/textbooks/" + filePath
 		items = append(items, item)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("遍历课本页面列表失败: %w", err)
+	}
 	if items == nil {
 		items = []*models.TextbookListItem{}
 	}
 	return items, total, nil
+}
+
+// ListTextbookPagesForEducationDomain 按可信教育域查询课本页面列表。
+//
+// 非K12调用方返回成功空数组和total=0，不执行数据库查询；
+// K12调用方进入原有真实列表SQL，数据库错误继续向上返回，不能伪装为空列表。
+func ListTextbookPagesForEducationDomain(
+	ctx context.Context,
+	callerID string,
+	educationDomain string,
+	subject string,
+	gradeRange string,
+	semester string,
+	unit string,
+	textbookName string,
+	scope string,
+	limit int,
+	offset int,
+) ([]*models.TextbookListItem, int, error) {
+	if !isK12TextbookEducationDomain(educationDomain) {
+		return []*models.TextbookListItem{}, 0, nil
+	}
+	return ListTextbookPages(ctx, callerID, subject, gradeRange, semester, unit, textbookName, scope, limit, offset)
 }
 
 // ==================== 更新 ====================
@@ -225,6 +301,14 @@ func UpdateTextbookPage(ctx context.Context, id string, req *models.UpdateTextbo
 	return nil
 }
 
+// UpdateTextbookPageForEducationDomain 仅允许可信K12调用方更新课本元数据。
+func UpdateTextbookPageForEducationDomain(ctx context.Context, id string, req *models.UpdateTextbookRequest, educationDomain string) error {
+	if err := ensureK12TextbookEducationDomain(educationDomain); err != nil {
+		return err
+	}
+	return UpdateTextbookPage(ctx, id, req)
+}
+
 // ==================== 删除 ====================
 
 // DeleteTextbookPage 软删除课本页面
@@ -241,6 +325,14 @@ func DeleteTextbookPage(ctx context.Context, id string) error {
 		return ErrTextbookNotFound
 	}
 	return nil
+}
+
+// DeleteTextbookPageForEducationDomain 仅允许可信K12调用方删除课本页面。
+func DeleteTextbookPageForEducationDomain(ctx context.Context, id string, educationDomain string) error {
+	if err := ensureK12TextbookEducationDomain(educationDomain); err != nil {
+		return err
+	}
+	return DeleteTextbookPage(ctx, id)
 }
 
 // ==================== OCR缓存回填 ====================
@@ -260,6 +352,14 @@ func UpdateTextbookOCR(ctx context.Context, id string, ocrText string, ocrModel 
 		return ErrTextbookNotFound
 	}
 	return nil
+}
+
+// UpdateTextbookOCRForEducationDomain 仅允许可信K12调用方回填OCR结果。
+func UpdateTextbookOCRForEducationDomain(ctx context.Context, id string, ocrText string, ocrModel string, educationDomain string) error {
+	if err := ensureK12TextbookEducationDomain(educationDomain); err != nil {
+		return err
+	}
+	return UpdateTextbookOCR(ctx, id, ocrText, ocrModel)
 }
 
 // ==================== 使用计数 ====================
@@ -313,8 +413,21 @@ func GetTextbookPagesByIDs(ctx context.Context, ids []string) ([]*models.Textboo
 		}
 		items = append(items, p)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历课本页面行失败: %w", err)
+	}
 	if items == nil {
 		items = []*models.TextbookPage{}
 	}
 	return items, nil
+}
+
+// GetTextbookPagesByIDsForEducationDomain 仅允许可信K12调用方批量读取课本页面。
+//
+// 该函数用于教案挂载校验与后续运行时注入，防止伪造ID绕过HTTP列表入口。
+func GetTextbookPagesByIDsForEducationDomain(ctx context.Context, ids []string, educationDomain string) ([]*models.TextbookPage, error) {
+	if err := ensureK12TextbookEducationDomain(educationDomain); err != nil {
+		return nil, err
+	}
+	return GetTextbookPagesByIDs(ctx, ids)
 }

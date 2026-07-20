@@ -1,25 +1,31 @@
 /**
- * OrgFormModal.tsx — 区域/学校 新建/编辑弹窗
+ * OrgFormModal.tsx — 区域/学校新建与编辑弹窗
  *
- * 账户与权限修复批新增（Logo移除链路③，本次）：
- *   根治"移除Logo假移除"——此前"移除"按钮只清本地 logoUrl state，保存请求没有任何
- *   logo 字段，后端无从得知移除意图，刷新后 Logo 依旧存在。本次改动：
- *     - 新增 clearLogo 状态；编辑模式点"移除" → 清预览 + clearLogo=true；
- *     - 编辑模式重新上传成功 → clearLogo=false（编辑模式上传是即时落库的，
- *       防"先移除再上传"在保存时被误清）；
- *     - 保存时（编辑模式）若 clearLogo 为 true，请求体携带 clear_logo:true，
- *       后端 UpdateOrganization 在常规更新成功后清空 organizations.logo_url；
- *     - 创建模式服务器上本无 Logo，"移除"仅清本地预览，不发 clear_logo。
+ * 上下文7：
+ *   - 新建学校必须主动选择教育类型；
+ *   - 初始值为空，不默认K12；
+ *   - 仅允许中小学、职业教育、成人教育；
+ *   - 区域表单不提供可编辑教育域；
+ *   - 编辑学校只读显示创建时确定的教育类型。
  *
- * v172新增：编辑学校时，可勾选"门户可见板块"（备课/课件/审核三选项）。
- *   - 仅 school 类型、edit 模式 显示该区块（区域不挂用户，无需配置）
- *   - 打开时调 getAdminOrg(id) 读取该组织完整 settings（列表项不含 settings）
- *   - 保存时把 portal_modules 合并进原 settings 一并提交，不丢失其它已有配置
- *   - 缺省（从未配置）视为三板块全开
+ * 其它既有能力：
+ *   - 编辑学校门户板块配置；
+ *   - 组织Logo上传与移除；
+ *   - 主管理员选择。
  */
-import { useState, useEffect } from 'react'
-import { createAdminOrg, updateAdminOrg, uploadOrgLogo, getAdminOrg } from '@/api/admin'
-import type { OrgListItem, CreateOrgRequest, UpdateOrgRequest } from '@/api/admin'
+import { useEffect, useState } from 'react'
+import {
+  createAdminOrg,
+  getAdminOrg,
+  updateAdminOrg,
+  uploadOrgLogo,
+} from '@/api/admin'
+import type {
+  CreateOrgRequest,
+  OrgListItem,
+  TeachingEducationDomain,
+  UpdateOrgRequest,
+} from '@/api/admin'
 import { C } from './adminConstants'
 import { UserSearchPicker } from './UserSearchPicker'
 
@@ -27,328 +33,1029 @@ interface OrgFormModalProps {
   mode: 'create' | 'edit'
   type: 'region' | 'school'
   initial?: OrgListItem
-  regions: OrgListItem[]          // 新建学校时选择所属区域用
+  regions: OrgListItem[]
   onClose: () => void
   onSaved: () => void
 }
 
-/* 门户板块定义（key 必须与 PortalPage entries 的 key 一致） */
-const PORTAL_MODULE_OPTIONS: { key: string; label: string; desc: string }[] = [
-  { key: 'lesson_plan', label: '📝 备课工坊', desc: 'AI辅助教案开发' },
-  { key: 'courseware',  label: '🎨 课件工坊', desc: 'AI辅助课件生成' },
-  { key: 'workflow',    label: '🖥️ 课件审核', desc: '课件质量评估·审核·验收' },
+const PORTAL_MODULE_OPTIONS: {
+  key: string
+  label: string
+  desc: string
+}[] = [
+  {
+    key: 'lesson_plan',
+    label: '📝 备课工坊',
+    desc: 'AI辅助教案开发',
+  },
+  {
+    key: 'courseware',
+    label: '🎨 课件工坊',
+    desc: 'AI辅助课件生成',
+  },
+  {
+    key: 'workflow',
+    label: '🖥️ 课件审核',
+    desc: '课件质量评估·审核·验收',
+  },
 ]
 
-const ALL_MODULE_KEYS = PORTAL_MODULE_OPTIONS.map(o => o.key)
+const ALL_MODULE_KEYS =
+  PORTAL_MODULE_OPTIONS.map(option => option.key)
 
-/**
- * 从 settings 字符串解析 portal_modules，缺省/缺 key 一律按 true。
- * 返回一个三 key 齐全的 map，便于复选框直接绑定。
- */
-function parsePortalModules(settings: string | undefined): Record<string, boolean> {
+const EDUCATION_DOMAIN_OPTIONS: {
+  value: TeachingEducationDomain
+  label: string
+  desc: string
+}[] = [
+  {
+    value: 'k12',
+    label: '中小学',
+    desc: '义务教育与普通高中课程体系',
+  },
+  {
+    value: 'vocational',
+    label: '职业教育',
+    desc: '中职、高职及职业技能课程体系',
+  },
+  {
+    value: 'adult',
+    label: '成人教育',
+    desc: '成人学习、继续教育与培训体系',
+  },
+]
+
+function isTeachingEducationDomain(
+  value: string | undefined,
+): value is TeachingEducationDomain {
+  return value === 'k12' ||
+    value === 'vocational' ||
+    value === 'adult'
+}
+
+function educationDomainLabel(
+  value: string | undefined,
+): string {
+  const matched =
+    EDUCATION_DOMAIN_OPTIONS.find(
+      option => option.value === value,
+    )
+
+  if (matched) {
+    return matched.label
+  }
+  if (value === 'mixed') {
+    return '跨域管理'
+  }
+
+  return '未配置'
+}
+
+function parsePortalModules(
+  settings: string | undefined,
+): Record<string, boolean> {
   const result: Record<string, boolean> = {}
-  for (const k of ALL_MODULE_KEYS) result[k] = true // 默认全开
-  if (!settings) return result
+
+  for (const key of ALL_MODULE_KEYS) {
+    result[key] = true
+  }
+
+  if (!settings) {
+    return result
+  }
+
   try {
-    const obj = JSON.parse(settings)
-    const pm = obj?.portal_modules
-    if (pm && typeof pm === 'object') {
-      for (const k of ALL_MODULE_KEYS) {
-        if (k in pm) result[k] = pm[k] !== false
+    const parsed = JSON.parse(settings)
+    const modules = parsed?.portal_modules
+
+    if (modules && typeof modules === 'object') {
+      for (const key of ALL_MODULE_KEYS) {
+        if (key in modules) {
+          result[key] = modules[key] !== false
+        }
       }
     }
   } catch {
-    // 解析失败 → 保持全开
+    // 非法历史settings保持全部开启，不阻断组织编辑。
   }
+
   return result
 }
 
-/**
- * 把 portal_modules 合并进原 settings，序列化返回。
- * 保留原 settings 里的其它键，仅覆盖 portal_modules。
- */
-function mergePortalModules(originalSettings: string | undefined, modules: Record<string, boolean>): string {
-  let obj: Record<string, unknown> = {}
+function mergePortalModules(
+  originalSettings: string | undefined,
+  modules: Record<string, boolean>,
+): string {
+  let parsed: Record<string, unknown> = {}
+
   if (originalSettings) {
     try {
-      const parsed = JSON.parse(originalSettings)
-      if (parsed && typeof parsed === 'object') obj = parsed as Record<string, unknown>
+      const value = JSON.parse(originalSettings)
+      if (value && typeof value === 'object') {
+        parsed = value as Record<string, unknown>
+      }
     } catch {
-      obj = {}
+      parsed = {}
     }
   }
-  obj.portal_modules = modules
-  return JSON.stringify(obj)
+
+  parsed.portal_modules = modules
+  return JSON.stringify(parsed)
 }
 
 export function OrgFormModal({
-  mode, type, initial, regions, onClose, onSaved,
+  mode,
+  type,
+  initial,
+  regions,
+  onClose,
+  onSaved,
 }: OrgFormModalProps) {
-  const [name, setName]           = useState(initial?.name || '')
-  const [parentId, setParentId]   = useState(initial?.parent_id || '')
-  const [adminId, setAdminId]     = useState(initial?.admin_user_id || '')
-  const [adminName, setAdminName] = useState(initial?.admin_user_name || '')
-  const [saving, setSaving]       = useState(false)
-  const [logoUrl, setLogoUrl]     = useState(initial?.logo_url || '')
-  const [logoUploading, setLogoUploading] = useState(false)
-  // Logo移除链路③：待清除标记。编辑模式点"移除"置 true，保存时携带 clear_logo
-  const [clearLogo, setClearLogo] = useState(false)
-  const [error, setError]         = useState('')
+  const [name, setName] =
+    useState(initial?.name || '')
+  const [parentId, setParentId] =
+    useState(initial?.parent_id || '')
+  const [adminId, setAdminId] =
+    useState(initial?.admin_user_id || '')
+  const [adminName, setAdminName] =
+    useState(initial?.admin_user_name || '')
 
-  // v172：门户板块开关相关状态
-  // 是否显示板块配置区：仅 school + edit
-  const showModuleConfig = type === 'school' && mode === 'edit'
-  const [originalSettings, setOriginalSettings] = useState<string>('') // 该组织原始 settings（保存时合并用）
-  const [modules, setModules] = useState<Record<string, boolean>>(() => {
-    const init: Record<string, boolean> = {}
-    for (const k of ALL_MODULE_KEYS) init[k] = true
-    return init
-  })
-  const [modulesLoading, setModulesLoading] = useState(false)
+  // 新建学校必须主动选择，不设置K12默认值。
+  const [educationDomain, setEducationDomain] =
+    useState<TeachingEducationDomain | ''>(() => {
+      if (
+        mode === 'edit' &&
+        isTeachingEducationDomain(
+          initial?.education_domain,
+        )
+      ) {
+        return initial.education_domain
+      }
 
-  // 打开时（编辑学校）拉取完整 settings，初始化复选框
+      return ''
+    })
+
+  const [saving, setSaving] = useState(false)
+  const [logoUrl, setLogoUrl] =
+    useState(initial?.logo_url || '')
+  const [logoUploading, setLogoUploading] =
+    useState(false)
+  const [clearLogo, setClearLogo] =
+    useState(false)
+  const [error, setError] = useState('')
+
+  const showModuleConfig =
+    type === 'school' && mode === 'edit'
+
+  const [originalSettings, setOriginalSettings] =
+    useState<string>('')
+  const [modules, setModules] =
+    useState<Record<string, boolean>>(() => {
+      const initialModules: Record<string, boolean> = {}
+
+      for (const key of ALL_MODULE_KEYS) {
+        initialModules[key] = true
+      }
+
+      return initialModules
+    })
+  const [modulesLoading, setModulesLoading] =
+    useState(false)
+
   useEffect(() => {
-    if (!showModuleConfig || !initial?.id) return
+    if (!showModuleConfig || !initial?.id) {
+      return
+    }
+
     let cancelled = false
     setModulesLoading(true)
+
     getAdminOrg(initial.id)
-      .then(full => {
-        if (cancelled) return
-        const settings = full.settings || ''
+      .then(fullOrganization => {
+        if (cancelled) {
+          return
+        }
+
+        const settings =
+          fullOrganization.settings || ''
+
         setOriginalSettings(settings)
-        setModules(parsePortalModules(settings))
+        setModules(
+          parsePortalModules(settings),
+        )
+
+        if (
+          isTeachingEducationDomain(
+            fullOrganization.education_domain,
+          )
+        ) {
+          setEducationDomain(
+            fullOrganization.education_domain,
+          )
+        }
       })
       .catch(() => {
-        // 读取失败时保持默认全开，不阻塞编辑
+        // 读取失败时保留列表传入值与默认门户配置。
       })
       .finally(() => {
-        if (!cancelled) setModulesLoading(false)
+        if (!cancelled) {
+          setModulesLoading(false)
+        }
       })
-    return () => { cancelled = true }
-  }, [showModuleConfig, initial?.id])
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    showModuleConfig,
+    initial?.id,
+  ])
 
   const title = mode === 'create'
-    ? (type === 'region' ? '新建区域' : '新建学校')
-    : (type === 'region' ? '编辑区域' : '编辑学校')
+    ? (
+      type === 'region'
+        ? '新建区域'
+        : '新建学校'
+    )
+    : (
+      type === 'region'
+        ? '编辑区域'
+        : '编辑学校'
+    )
 
   const inputStyle: React.CSSProperties = {
-    width: '100%', padding: '10px 14px', borderRadius: '8px',
-    border: `1px solid ${C.border}`, fontSize: '14px',
-    outline: 'none', boxSizing: 'border-box',
+    width: '100%',
+    padding: '10px 14px',
+    borderRadius: '8px',
+    border: `1px solid ${C.border}`,
+    fontSize: '14px',
+    outline: 'none',
+    boxSizing: 'border-box',
   }
 
   const toggleModule = (key: string) => {
-    setModules(prev => ({ ...prev, [key]: !prev[key] }))
+    setModules(previous => ({
+      ...previous,
+      [key]: !previous[key],
+    }))
   }
 
   const handleSave = async () => {
-    if (!name.trim()) { setError('请输入名称'); return }
-    if (type === 'school' && !parentId) { setError('请选择所属区域'); return }
+    if (!name.trim()) {
+      setError('请输入名称')
+      return
+    }
+
+    if (type === 'school' && !parentId) {
+      setError('请选择所属区域')
+      return
+    }
+
+    if (
+      type === 'school' &&
+      mode === 'create' &&
+      !educationDomain
+    ) {
+      setError('请选择教育类型')
+      return
+    }
+
     try {
-      setSaving(true); setError('')
+      setSaving(true)
+      setError('')
+
       if (mode === 'create') {
-        const req: CreateOrgRequest = {
-          name: name.trim(), type,
-          parent_id: type === 'school' ? parentId : null,
-          admin_user_id: adminId || null,
+        const request: CreateOrgRequest = {
+          name: name.trim(),
+          type,
+          parent_id:
+            type === 'school'
+              ? parentId
+              : null,
+          admin_user_id:
+            adminId || null,
         }
-        await createAdminOrg(req)
+
+        // 区域请求不发送education_domain，
+        // 后端和数据库统一强制mixed。
+        if (
+          type === 'school' &&
+          educationDomain
+        ) {
+          request.education_domain =
+            educationDomain
+        }
+
+        await createAdminOrg(request)
       } else {
-        const req: UpdateOrgRequest = { name: name.trim(), admin_user_id: adminId || null }
-        // v172：编辑学校时，把板块开关合并进 settings 一并提交
+        const request: UpdateOrgRequest = {
+          name: name.trim(),
+          admin_user_id:
+            adminId || null,
+        }
+
         if (showModuleConfig) {
-          req.settings = mergePortalModules(originalSettings, modules)
+          request.settings =
+            mergePortalModules(
+              originalSettings,
+              modules,
+            )
         }
-        // Logo移除链路③：用户点过"移除"且未重新上传 → 携带清除标记
+
         if (clearLogo) {
-          req.clear_logo = true
+          request.clear_logo = true
         }
-        await updateAdminOrg(initial!.id, req)
+
+        await updateAdminOrg(
+          initial!.id,
+          request,
+        )
       }
-      onSaved(); onClose()
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : '操作失败')
-    } finally { setSaving(false) }
+
+      onSaved()
+      onClose()
+    } catch (caught: unknown) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : '操作失败',
+      )
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
     <div
       style={{
-        position: 'fixed', inset: 0, zIndex: 10500,
-        background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(4px)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        position: 'fixed',
+        inset: 0,
+        zIndex: 10500,
+        background: 'rgba(0,0,0,0.4)',
+        backdropFilter: 'blur(4px)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
       }}
-      onClick={e => { if (e.target === e.currentTarget) onClose() }}>
-      <div style={{
-        background: C.white, borderRadius: '20px', width: '480px',
-        maxHeight: '90vh', overflowY: 'auto', boxShadow: '0 20px 60px rgba(0,0,0,0.2)',
-      }}>
-        {/* 头部 */}
-        <div style={{
-          padding: '20px 24px', borderBottom: `1px solid ${C.border}`,
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          position: 'sticky', top: 0, background: C.white, zIndex: 1,
-        }}>
-          <div style={{ fontSize: '16px', fontWeight: 700, color: C.text }}>{title}</div>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '20px', color: C.textMuted }}>×</button>
+      onClick={event => {
+        if (event.target === event.currentTarget) {
+          onClose()
+        }
+      }}
+    >
+      <div
+        style={{
+          background: C.white,
+          borderRadius: '20px',
+          width: '480px',
+          maxHeight: '90vh',
+          overflowY: 'auto',
+          boxShadow: '0 20px 60px rgba(0,0,0,0.2)',
+        }}
+      >
+        <div
+          style={{
+            padding: '20px 24px',
+            borderBottom: `1px solid ${C.border}`,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            position: 'sticky',
+            top: 0,
+            background: C.white,
+            zIndex: 1,
+          }}
+        >
+          <div
+            style={{
+              fontSize: '16px',
+              fontWeight: 700,
+              color: C.text,
+            }}
+          >
+            {title}
+          </div>
+
+          <button
+            onClick={onClose}
+            style={{
+              background: 'none',
+              border: 'none',
+              cursor: 'pointer',
+              fontSize: '20px',
+              color: C.textMuted,
+            }}
+          >
+            ×
+          </button>
         </div>
 
-        {/* 表单 */}
         <div style={{ padding: '24px' }}>
           {error && (
-            <div style={{ padding: '10px 14px', borderRadius: '8px', marginBottom: '14px', background: C.dangerLight, color: C.danger, fontSize: '13px' }}>
+            <div
+              style={{
+                padding: '10px 14px',
+                borderRadius: '8px',
+                marginBottom: '14px',
+                background: C.dangerLight,
+                color: C.danger,
+                fontSize: '13px',
+              }}
+            >
               {error}
             </div>
           )}
 
-          {/* 名称 */}
           <div style={{ marginBottom: '14px' }}>
-            <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '6px' }}>
-              {type === 'region' ? '区域名称' : '学校名称'} <span style={{ color: C.danger }}>*</span>
+            <label
+              style={{
+                display: 'block',
+                fontSize: '13px',
+                fontWeight: 600,
+                color: C.text,
+                marginBottom: '6px',
+              }}
+            >
+              {type === 'region'
+                ? '区域名称'
+                : '学校名称'}
+              {' '}
+              <span style={{ color: C.danger }}>
+                *
+              </span>
             </label>
+
             <input
-              value={name} onChange={e => setName(e.target.value)} placeholder="请输入名称"
+              value={name}
+              onChange={event =>
+                setName(event.target.value)}
+              placeholder="请输入名称"
               style={inputStyle}
-              onFocus={e => { e.currentTarget.style.borderColor = C.primary }}
-              onBlur={e => { e.currentTarget.style.borderColor = C.border }}
+              onFocus={event => {
+                event.currentTarget.style.borderColor =
+                  C.primary
+              }}
+              onBlur={event => {
+                event.currentTarget.style.borderColor =
+                  C.border
+              }}
             />
           </div>
 
-          {/* 所属区域（新建学校时显示）*/}
-          {type === 'school' && mode === 'create' && (
+          {type === 'school' &&
+            mode === 'create' && (
             <div style={{ marginBottom: '14px' }}>
-              <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '6px' }}>
-                所属区域 <span style={{ color: C.danger }}>*</span>
+              <label
+                style={{
+                  display: 'block',
+                  fontSize: '13px',
+                  fontWeight: 600,
+                  color: C.text,
+                  marginBottom: '6px',
+                }}
+              >
+                所属区域
+                {' '}
+                <span style={{ color: C.danger }}>
+                  *
+                </span>
               </label>
+
               <select
-                value={parentId} onChange={e => setParentId(e.target.value)}
-                style={{ ...inputStyle, background: C.white }}>
-                <option value="">请选择区域</option>
-                {regions.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+                value={parentId}
+                onChange={event =>
+                  setParentId(event.target.value)}
+                style={{
+                  ...inputStyle,
+                  background: C.white,
+                }}
+              >
+                <option value="">
+                  请选择区域
+                </option>
+
+                {regions.map(region => (
+                  <option
+                    key={region.id}
+                    value={region.id}
+                  >
+                    {region.name}
+                  </option>
+                ))}
               </select>
             </div>
           )}
 
-          {/* Logo上传（编辑模式 或 创建学校时显示） */}
-          {(mode === 'edit' || type === 'school') && (
+          {type === 'school' &&
+            mode === 'create' && (
             <div style={{ marginBottom: '14px' }}>
-              <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '6px' }}>
-                {type === 'region' ? '区域Logo' : '学校Logo'}（可选）
+              <label
+                style={{
+                  display: 'block',
+                  fontSize: '13px',
+                  fontWeight: 600,
+                  color: C.text,
+                  marginBottom: '6px',
+                }}
+              >
+                教育类型
+                {' '}
+                <span style={{ color: C.danger }}>
+                  *
+                </span>
               </label>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                {logoUrl ? (
-                  <img src={logoUrl} alt="Logo" style={{ width: 48, height: 48, objectFit: 'contain', borderRadius: '8px', border: `1px solid ${C.border}` }} />
-                ) : (
-                  <div style={{ width: 48, height: 48, borderRadius: '8px', border: `2px dashed ${C.border}`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '20px', color: C.textMuted }}>🖼️</div>
-                )}
-                <label style={{ padding: '6px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, background: C.bg, fontSize: '13px', color: C.text, cursor: logoUploading ? 'default' : 'pointer' }}>
-                  {logoUploading ? '上传中...' : logoUrl ? '更换Logo' : '上传Logo'}
-                  <input type="file" accept="image/jpeg,image/png,image/webp,image/svg+xml" style={{ display: 'none' }}
-                    disabled={logoUploading}
-                    onChange={async (e) => {
-                      const file = e.target.files?.[0]
-                      if (!file) return
-                      if (file.size > 2 * 1024 * 1024) { setError('Logo文件不能超过2MB'); return }
-                      // 编辑模式直接上传到服务器
-                      if (mode === 'edit' && initial?.id) {
-                        try {
-                          setLogoUploading(true)
-                          const result = await uploadOrgLogo(initial.id, file)
-                          setLogoUrl(result.url)
-                          // 链路③：重新上传成功（已即时落库）→ 撤销待清除标记，防保存时误清
-                          setClearLogo(false)
-                        } catch (err) { setError(err instanceof Error ? err.message : '上传失败') }
-                        finally { setLogoUploading(false) }
-                      } else {
-                        // 创建模式：先预览，创建成功后再上传（或提示先创建再编辑上传）
-                        const reader = new FileReader()
-                        reader.onload = () => setLogoUrl(reader.result as string)
-                        reader.readAsDataURL(file)
-                        setError('提示：Logo将在创建组织后可上传，请先创建再编辑上传Logo')
-                      }
-                      e.target.value = ''
-                    }} />
-                </label>
-                {logoUrl && (
-                  <button onClick={() => {
-                    // 链路③：清预览；编辑模式额外置待清除标记（保存时携带 clear_logo 落库）。
-                    // 创建模式服务器上本无 Logo，仅清本地预览即可。
-                    setLogoUrl('')
-                    if (mode === 'edit') setClearLogo(true)
-                  }} style={{ padding: '4px 10px', borderRadius: '6px', border: `1px solid ${C.border}`, background: 'transparent', fontSize: '12px', color: C.textMuted, cursor: 'pointer' }}>移除</button>
-                )}
-              </div>
-              {/* 链路③：待清除状态提示，让用户明白"点保存才真正移除" */}
-              {clearLogo && mode === 'edit' && !logoUrl && (
-                <div style={{ fontSize: '11px', color: C.danger, marginTop: '4px' }}>Logo将在点击"保存"后移除。</div>
-              )}
-              <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px' }}>支持JPG/PNG/WEBP/SVG，最大2MB。上传后在课件生成时自动使用。</div>
-            </div>
-          )}
 
-          {/* v172：门户可见板块配置（仅 school + edit 显示） */}
-          {showModuleConfig && (
-            <div style={{ marginBottom: '14px' }}>
-              <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: C.text, marginBottom: '6px' }}>
-                门户可见板块
-              </label>
-              <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '8px' }}>
-                勾选本校老师在首页能进入的工作区。取消勾选后，本校非管理员看不到该入口、也无法直接访问。系统管理员不受此限制。
+              <select
+                value={educationDomain}
+                onChange={event =>
+                  setEducationDomain(
+                    event.target.value as
+                      TeachingEducationDomain | '',
+                  )}
+                style={{
+                  ...inputStyle,
+                  background: C.white,
+                }}
+              >
+                <option value="">
+                  请选择教育类型
+                </option>
+
+                {EDUCATION_DOMAIN_OPTIONS.map(
+                  option => (
+                    <option
+                      key={option.value}
+                      value={option.value}
+                    >
+                      {option.label}
+                    </option>
+                  ),
+                )}
+              </select>
+
+              <div
+                style={{
+                  fontSize: '11px',
+                  color: C.textMuted,
+                  marginTop: '5px',
+                  lineHeight: 1.5,
+                }}
+              >
+                创建后将作为本校课程、教案和课件的教育域基础。
+                当前步骤不允许选择“跨域管理”。
               </div>
-              {modulesLoading ? (
-                <div style={{ fontSize: '12px', color: C.textMuted, padding: '8px 0' }}>正在读取当前配置...</div>
-              ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                  {PORTAL_MODULE_OPTIONS.map(opt => {
-                    const checked = modules[opt.key] !== false
-                    return (
-                      <label key={opt.key} style={{
-                        display: 'flex', alignItems: 'center', gap: '10px',
-                        padding: '10px 12px', borderRadius: '8px',
-                        border: `1px solid ${checked ? C.primary : C.border}`,
-                        background: checked ? C.bg : C.white,
-                        cursor: 'pointer', transition: 'all 150ms ease',
-                      }}>
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={() => toggleModule(opt.key)}
-                          style={{ width: 16, height: 16, cursor: 'pointer', accentColor: C.primary }}
-                        />
-                        <div style={{ flex: 1 }}>
-                          <div style={{ fontSize: '13px', fontWeight: 600, color: C.text }}>{opt.label}</div>
-                          <div style={{ fontSize: '11px', color: C.textMuted }}>{opt.desc}</div>
-                        </div>
-                      </label>
-                    )
-                  })}
+
+              {educationDomain && (
+                <div
+                  style={{
+                    marginTop: '7px',
+                    padding: '8px 10px',
+                    borderRadius: '8px',
+                    background: C.primaryLight,
+                    color: C.primary,
+                    fontSize: '12px',
+                  }}
+                >
+                  {
+                    EDUCATION_DOMAIN_OPTIONS.find(
+                      option =>
+                        option.value ===
+                        educationDomain,
+                    )?.desc
+                  }
                 </div>
               )}
             </div>
           )}
 
-          {/* 管理员搜索选择 */}
+          {type === 'school' &&
+            mode === 'edit' && (
+            <div style={{ marginBottom: '14px' }}>
+              <label
+                style={{
+                  display: 'block',
+                  fontSize: '13px',
+                  fontWeight: 600,
+                  color: C.text,
+                  marginBottom: '6px',
+                }}
+              >
+                教育类型
+              </label>
+
+              <div
+                style={{
+                  padding: '10px 14px',
+                  borderRadius: '8px',
+                  border: `1px solid ${C.border}`,
+                  background: C.bg,
+                  fontSize: '14px',
+                  color: educationDomain
+                    ? C.text
+                    : C.danger,
+                  fontWeight: 600,
+                }}
+              >
+                {educationDomainLabel(
+                  educationDomain ||
+                    initial?.education_domain,
+                )}
+              </div>
+
+              <div
+                style={{
+                  fontSize: '11px',
+                  color: C.textMuted,
+                  marginTop: '5px',
+                }}
+              >
+                教育类型在创建学校时确定，本表单仅只读展示。
+              </div>
+            </div>
+          )}
+
+          {type === 'region' && (
+            <div
+              style={{
+                marginBottom: '14px',
+                padding: '10px 12px',
+                borderRadius: '8px',
+                background: C.bg,
+                border: `1px solid ${C.border}`,
+                fontSize: '12px',
+                color: C.textSec,
+                lineHeight: 1.5,
+              }}
+            >
+              区域属于跨域管理组织，教育域由系统固定为
+              <strong> mixed</strong>，不提供手动选择。
+            </div>
+          )}
+
+          {(mode === 'edit' ||
+            type === 'school') && (
+            <div style={{ marginBottom: '14px' }}>
+              <label
+                style={{
+                  display: 'block',
+                  fontSize: '13px',
+                  fontWeight: 600,
+                  color: C.text,
+                  marginBottom: '6px',
+                }}
+              >
+                {type === 'region'
+                  ? '区域Logo'
+                  : '学校Logo'}
+                （可选）
+              </label>
+
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '12px',
+                }}
+              >
+                {logoUrl ? (
+                  <img
+                    src={logoUrl}
+                    alt="Logo"
+                    style={{
+                      width: 48,
+                      height: 48,
+                      objectFit: 'contain',
+                      borderRadius: '8px',
+                      border: `1px solid ${C.border}`,
+                    }}
+                  />
+                ) : (
+                  <div
+                    style={{
+                      width: 48,
+                      height: 48,
+                      borderRadius: '8px',
+                      border: `2px dashed ${C.border}`,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      fontSize: '20px',
+                      color: C.textMuted,
+                    }}
+                  >
+                    🖼️
+                  </div>
+                )}
+
+                <label
+                  style={{
+                    padding: '6px 14px',
+                    borderRadius: '8px',
+                    border: `1px solid ${C.border}`,
+                    background: C.bg,
+                    fontSize: '13px',
+                    color: C.text,
+                    cursor: logoUploading
+                      ? 'default'
+                      : 'pointer',
+                  }}
+                >
+                  {logoUploading
+                    ? '上传中...'
+                    : logoUrl
+                      ? '更换Logo'
+                      : '上传Logo'}
+
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp,image/svg+xml"
+                    style={{ display: 'none' }}
+                    disabled={logoUploading}
+                    onChange={async event => {
+                      const file =
+                        event.target.files?.[0]
+
+                      if (!file) {
+                        return
+                      }
+
+                      if (
+                        file.size >
+                        2 * 1024 * 1024
+                      ) {
+                        setError(
+                          'Logo文件不能超过2MB',
+                        )
+                        return
+                      }
+
+                      if (
+                        mode === 'edit' &&
+                        initial?.id
+                      ) {
+                        try {
+                          setLogoUploading(true)
+
+                          const result =
+                            await uploadOrgLogo(
+                              initial.id,
+                              file,
+                            )
+
+                          setLogoUrl(result.url)
+                          setClearLogo(false)
+                        } catch (caught) {
+                          setError(
+                            caught instanceof Error
+                              ? caught.message
+                              : '上传失败',
+                          )
+                        } finally {
+                          setLogoUploading(false)
+                        }
+                      } else {
+                        const reader =
+                          new FileReader()
+
+                        reader.onload = () =>
+                          setLogoUrl(
+                            reader.result as string,
+                          )
+
+                        reader.readAsDataURL(file)
+
+                        setError(
+                          '提示：Logo将在创建组织后可上传，请先创建再编辑上传Logo',
+                        )
+                      }
+
+                      event.target.value = ''
+                    }}
+                  />
+                </label>
+
+                {logoUrl && (
+                  <button
+                    onClick={() => {
+                      setLogoUrl('')
+
+                      if (mode === 'edit') {
+                        setClearLogo(true)
+                      }
+                    }}
+                    style={{
+                      padding: '4px 10px',
+                      borderRadius: '6px',
+                      border: `1px solid ${C.border}`,
+                      background: 'transparent',
+                      fontSize: '12px',
+                      color: C.textMuted,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    移除
+                  </button>
+                )}
+              </div>
+
+              {clearLogo &&
+                mode === 'edit' &&
+                !logoUrl && (
+                <div
+                  style={{
+                    fontSize: '11px',
+                    color: C.danger,
+                    marginTop: '4px',
+                  }}
+                >
+                  Logo将在点击“保存”后移除。
+                </div>
+              )}
+
+              <div
+                style={{
+                  fontSize: '11px',
+                  color: C.textMuted,
+                  marginTop: '4px',
+                }}
+              >
+                支持JPG/PNG/WEBP/SVG，最大2MB。
+              </div>
+            </div>
+          )}
+
+          {showModuleConfig && (
+            <div style={{ marginBottom: '14px' }}>
+              <label
+                style={{
+                  display: 'block',
+                  fontSize: '13px',
+                  fontWeight: 600,
+                  color: C.text,
+                  marginBottom: '6px',
+                }}
+              >
+                门户可见板块
+              </label>
+
+              <div
+                style={{
+                  fontSize: '11px',
+                  color: C.textMuted,
+                  marginBottom: '8px',
+                }}
+              >
+                勾选本校老师在首页能进入的工作区。
+                系统管理员不受此限制。
+              </div>
+
+              {modulesLoading ? (
+                <div
+                  style={{
+                    fontSize: '12px',
+                    color: C.textMuted,
+                    padding: '8px 0',
+                  }}
+                >
+                  正在读取当前配置...
+                </div>
+              ) : (
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '8px',
+                  }}
+                >
+                  {PORTAL_MODULE_OPTIONS.map(
+                    option => {
+                      const checked =
+                        modules[option.key] !== false
+
+                      return (
+                        <label
+                          key={option.key}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '10px',
+                            padding: '10px 12px',
+                            borderRadius: '8px',
+                            border:
+                              `1px solid ${
+                                checked
+                                  ? C.primary
+                                  : C.border
+                              }`,
+                            background:
+                              checked
+                                ? C.bg
+                                : C.white,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() =>
+                              toggleModule(
+                                option.key,
+                              )}
+                            style={{
+                              width: 16,
+                              height: 16,
+                              cursor: 'pointer',
+                              accentColor: C.primary,
+                            }}
+                          />
+
+                          <div style={{ flex: 1 }}>
+                            <div
+                              style={{
+                                fontSize: '13px',
+                                fontWeight: 600,
+                                color: C.text,
+                              }}
+                            >
+                              {option.label}
+                            </div>
+
+                            <div
+                              style={{
+                                fontSize: '11px',
+                                color: C.textMuted,
+                              }}
+                            >
+                              {option.desc}
+                            </div>
+                          </div>
+                        </label>
+                      )
+                    },
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           <UserSearchPicker
             label="管理员（可选）"
-            value={adminId} valueName={adminName}
-            onChange={(id, n) => { setAdminId(id); setAdminName(n) }}
+            value={adminId}
+            valueName={adminName}
+            onChange={(id, selectedName) => {
+              setAdminId(id)
+              setAdminName(selectedName)
+            }}
             placeholder="搜索并选择管理员用户..."
           />
 
-          {/* 操作按钮 */}
-          <div style={{ display: 'flex', gap: '10px', marginTop: '4px' }}>
-            <button onClick={onClose} style={{ flex: 1, padding: '10px', borderRadius: '10px', border: `1px solid ${C.border}`, background: C.bg, fontSize: '14px', color: C.textSec, cursor: 'pointer' }}>
+          <div
+            style={{
+              display: 'flex',
+              gap: '10px',
+              marginTop: '4px',
+            }}
+          >
+            <button
+              onClick={onClose}
+              style={{
+                flex: 1,
+                padding: '10px',
+                borderRadius: '10px',
+                border: `1px solid ${C.border}`,
+                background: C.bg,
+                fontSize: '14px',
+                color: C.textSec,
+                cursor: 'pointer',
+              }}
+            >
               取消
             </button>
+
             <button
-              onClick={handleSave} disabled={saving}
+              onClick={handleSave}
+              disabled={saving}
               style={{
-                flex: 2, padding: '10px', borderRadius: '10px', border: 'none',
-                background: saving ? C.textMuted : `linear-gradient(135deg,${C.primary},#7C3AED)`,
-                color: '#fff', fontSize: '14px', fontWeight: 600,
-                cursor: saving ? 'not-allowed' : 'pointer',
-              }}>
-              {saving ? '保存中...' : (mode === 'create' ? '创建' : '保存')}
+                flex: 2,
+                padding: '10px',
+                borderRadius: '10px',
+                border: 'none',
+                background: saving
+                  ? C.textMuted
+                  : `linear-gradient(135deg,${C.primary},#7C3AED)`,
+                color: '#fff',
+                fontSize: '14px',
+                fontWeight: 600,
+                cursor: saving
+                  ? 'not-allowed'
+                  : 'pointer',
+              }}
+            >
+              {saving
+                ? '保存中...'
+                : mode === 'create'
+                  ? '创建'
+                  : '保存'}
             </button>
           </div>
         </div>

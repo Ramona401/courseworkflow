@@ -6,7 +6,7 @@ package integration
 //
 // 提示词CRUD（5个）：
 //   1. 列表查询（初始无数据）→ 空列表
-//   2. 创建提示词（通过Update接口创建首个版本）→ 成功
+//   2. 更新已有提示词槽位（通过Update接口创建新版本）→ 成功
 //   3. 按key查询 → 返回正确内容
 //   4. 更新提示词 → 版本号递增为2
 //   5. 更新内容为空 → 400
@@ -24,8 +24,8 @@ package integration
 //
 // 注意：
 //   - 提示词表初始为空（CleanAndSeed不插入提示词种子数据）
-//   - 使用 prompt_a 作为测试key（属于ValidPromptKeys）
-//   - Update接口会自动创建新版本（如果key不存在则创建v1）
+//   - 当前业务规则采用“数据库中已存在即为合法key”，Update接口不能凭空创建新key
+//   - 需要测试更新、版本历史或回滚时，先用seedPromptSlot插入V1槽位，再通过API创建V2
 
 import (
 	"context"
@@ -37,9 +37,32 @@ import (
 
 // ==================== 辅助函数 ====================
 
-// createTestPromptViaAPI 通过Update接口创建测试提示词（首个版本）
-// 返回创建的提示词ID
-func createTestPromptViaAPI(t *testing.T, serverURL string, token string, key string, content string) string {
+// seedPromptSlot 直接插入一个V1提示词槽位。
+//
+// 当前业务规则以“数据库里已存在即为合法key”为准，Update接口只负责创建新版本，
+// 不再允许通过一个从未出现过的key凭空创建首个版本。测试在调用Update前必须先造V1。
+func seedPromptSlot(t *testing.T, key string, content string) string {
+	t.Helper()
+
+	var promptID string
+	err := database.DB.QueryRow(
+		context.Background(),
+		`INSERT INTO prompts (prompt_key, content, version, is_current, created_by, created_at)
+		 VALUES ($1, $2, 1, true, $3, now())
+		 RETURNING id`,
+		key,
+		content,
+		SeedAdminID,
+	).Scan(&promptID)
+	if err != nil {
+		t.Fatalf("插入提示词V1槽位失败 (key=%s): %v", key, err)
+	}
+
+	return promptID
+}
+
+// updateTestPromptViaAPI 通过Update接口为已有槽位创建下一个版本，并返回新版本ID。
+func updateTestPromptViaAPI(t *testing.T, serverURL string, token string, key string, content string) string {
 	t.Helper()
 
 	body := map[string]interface{}{
@@ -57,7 +80,7 @@ func createTestPromptViaAPI(t *testing.T, serverURL string, token string, key st
 	ParseData(t, apiResp, &promptData)
 
 	if promptData.ID == "" {
-		t.Fatal("创建提示词成功但ID为空")
+		t.Fatal("更新提示词成功但新版本ID为空")
 	}
 
 	return promptData.ID
@@ -86,14 +109,15 @@ func TestPrompt_ListEmpty(t *testing.T) {
 	}
 }
 
-// TestPrompt_CreateViaUpdate 通过Update接口创建首个版本 → 成功
+// TestPrompt_CreateViaUpdate 通过Update接口为已有槽位创建新版本 → 成功
 func TestPrompt_CreateViaUpdate(t *testing.T) {
 	server, _ := SetupTestServer(t)
 	CleanAndSeed(t)
 
 	token := LoginAsAdmin(t, server.URL)
 
-	promptID := createTestPromptViaAPI(t, server.URL, token, "prompt_a", "这是Scanner扫描定位提示词的测试内容V1")
+	seedPromptSlot(t, "prompt_a", "Scanner初始提示词V1")
+	promptID := updateTestPromptViaAPI(t, server.URL, token, "prompt_a", "这是Scanner扫描定位提示词的测试内容V2")
 
 	// 验证DB中存在
 	var count int
@@ -107,7 +131,7 @@ func TestPrompt_CreateViaUpdate(t *testing.T) {
 		t.Error("创建提示词后DB中应有1条is_current=true记录")
 	}
 
-	// 验证版本号为1
+	// 验证Update在已有V1基础上创建V2
 	var version int
 	err = database.DB.QueryRow(context.Background(),
 		`SELECT version FROM prompts WHERE id = $1`, promptID,
@@ -115,8 +139,8 @@ func TestPrompt_CreateViaUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("查询提示词版本失败: %v", err)
 	}
-	if version != 1 {
-		t.Errorf("首个版本号应为1，实际 %d", version)
+	if version != 2 {
+		t.Errorf("更新后版本号应为2，实际 %d", version)
 	}
 }
 
@@ -127,7 +151,8 @@ func TestPrompt_GetByKey(t *testing.T) {
 
 	token := LoginAsAdmin(t, server.URL)
 
-	createTestPromptViaAPI(t, server.URL, token, "prompt_b", "Evaluator评估打分提示词内容")
+	seedPromptSlot(t, "prompt_b", "Evaluator初始提示词V1")
+	updateTestPromptViaAPI(t, server.URL, token, "prompt_b", "Evaluator评估打分提示词内容")
 
 	// 按key查询
 	resp, apiResp := DoGet(t, server.URL+"/api/v1/prompts/prompt_b", token)
@@ -164,10 +189,8 @@ func TestPrompt_UpdateVersion(t *testing.T) {
 
 	token := LoginAsAdmin(t, server.URL)
 
-	// 创建V1
-	createTestPromptViaAPI(t, server.URL, token, "prompt_c", "Translator V1内容")
-
-	// 更新为V2
+	// 先造合法V1槽位，再通过API更新为V2
+	seedPromptSlot(t, "prompt_c", "Translator V1内容")
 	body := map[string]interface{}{
 		"content": "Translator V2更新后内容",
 	}
@@ -208,9 +231,10 @@ func TestPrompt_UpdateEmptyContent(t *testing.T) {
 	CleanAndSeed(t)
 
 	token := LoginAsAdmin(t, server.URL)
+	seedPromptSlot(t, "prompt_a", "Scanner初始提示词V1")
 
 	body := map[string]interface{}{
-		"content": "   ",
+		"content": "",
 	}
 	resp, _ := DoPut(t, server.URL+"/api/v1/prompts/prompt_a", body, token)
 	AssertHTTPStatus(t, resp, http.StatusBadRequest)
@@ -225,10 +249,9 @@ func TestPrompt_VersionHistory(t *testing.T) {
 
 	token := LoginAsAdmin(t, server.URL)
 
-	// 创建V1 + V2
-	createTestPromptViaAPI(t, server.URL, token, "prompt_d", "Reviewer V1")
-	body := map[string]interface{}{"content": "Reviewer V2"}
-	DoPut(t, server.URL+"/api/v1/prompts/prompt_d", body, token)
+	// 先造V1，再通过API创建V2
+	seedPromptSlot(t, "prompt_d", "Reviewer V1")
+	updateTestPromptViaAPI(t, server.URL, token, "prompt_d", "Reviewer V2")
 
 	// 查询版本历史
 	resp, apiResp := DoGet(t, server.URL+"/api/v1/prompts/prompt_d/versions", token)
@@ -269,12 +292,9 @@ func TestPrompt_Rollback(t *testing.T) {
 
 	token := LoginAsAdmin(t, server.URL)
 
-	// 创建V1
-	v1ID := createTestPromptViaAPI(t, server.URL, token, "prompt_e", "Meta V1")
-
-	// 创建V2
-	body := map[string]interface{}{"content": "Meta V2"}
-	DoPut(t, server.URL+"/api/v1/prompts/prompt_e", body, token)
+	// 直接造V1槽位，再通过API创建V2
+	v1ID := seedPromptSlot(t, "prompt_e", "Meta V1")
+	updateTestPromptViaAPI(t, server.URL, token, "prompt_e", "Meta V2")
 
 	// 回滚到V1
 	rollbackBody := map[string]interface{}{
@@ -303,8 +323,8 @@ func TestPrompt_RollbackAlreadyCurrent(t *testing.T) {
 
 	token := LoginAsAdmin(t, server.URL)
 
-	// 创建V1（当前就是V1）
-	v1ID := createTestPromptViaAPI(t, server.URL, token, "prompt_f", "Generator V1")
+	// 直接造V1槽位（当前就是V1）
+	v1ID := seedPromptSlot(t, "prompt_f", "Generator V1")
 
 	// 尝试回滚到当前版本 → 400
 	rollbackBody := map[string]interface{}{

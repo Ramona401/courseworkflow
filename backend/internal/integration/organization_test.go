@@ -54,9 +54,10 @@ func createRegionViaAPI(t *testing.T, serverURL string, token string, name strin
 func createSchoolViaAPI(t *testing.T, serverURL string, token string, name string, parentID string) string {
 	t.Helper()
 	body := map[string]interface{}{
-		"name":      name,
-		"type":      "school",
-		"parent_id": parentID,
+		"name":             name,
+		"type":             "school",
+		"parent_id":        parentID,
+		"education_domain": "k12",
 	}
 	resp, apiResp := DoPost(t, serverURL+"/api/v1/lesson-plans/organizations", body, token)
 	AssertHTTPStatus(t, resp, http.StatusOK)
@@ -380,157 +381,164 @@ func TestGroupMember_RemoveAndMyGroups(t *testing.T) {
 
 // queryOrgPrimaryAdmin 查某组织当前 admin_user_id（可能为 NULL）
 func queryOrgPrimaryAdmin(t *testing.T, orgID string) *string {
-        t.Helper()
-        var adminID *string
-        err := database.DB.QueryRow(context.Background(),
-                `SELECT admin_user_id FROM organizations WHERE id = $1`, orgID,
-        ).Scan(&adminID)
-        if err != nil {
-                t.Fatalf("查询组织主管理员失败: %v", err)
-        }
-        return adminID
+	t.Helper()
+	var adminID *string
+	err := database.DB.QueryRow(context.Background(),
+		`SELECT admin_user_id FROM organizations WHERE id = $1`, orgID,
+	).Scan(&adminID)
+	if err != nil {
+		t.Fatalf("查询组织主管理员失败: %v", err)
+	}
+	return adminID
 }
 
 // TestOrgAdmin_AppointListRemove 任命→列出→移除全链路 + 首次回填/移除置空
 func TestOrgAdmin_AppointListRemove(t *testing.T) {
-        server, _ := SetupTestServer(t)
-        CleanAndSeed(t)
+	server, _ := SetupTestServer(t)
+	CleanAndSeed(t)
 
-        adminToken := LoginAsAdmin(t, server.URL)
-        regionID := createRegionViaAPI(t, server.URL, adminToken, "回填测试区")
-        schoolID := createSchoolViaAPI(t, server.URL, adminToken, "回填测试校", regionID)
+	adminToken := LoginAsAdmin(t, server.URL)
+	regionID := createRegionViaAPI(t, server.URL, adminToken, "回填测试区")
+	schoolID := createSchoolViaAPI(t, server.URL, adminToken, "回填测试校", regionID)
 
-        adminsURL := server.URL + "/api/v1/lesson-plans/organizations/" + schoolID + "/admins"
+	adminsURL := server.URL + "/api/v1/lesson-plans/organizations/" + schoolID + "/admins"
 
-        // 初始列出应为空
-        resp0, api0 := DoGet(t, adminsURL, adminToken)
-        AssertHTTPStatus(t, resp0, http.StatusOK)
-        AssertAPICode(t, api0, 0)
-        var list0 struct {
-                Total int `json:"total"`
-        }
-        ParseData(t, api0, &list0)
-        if list0.Total != 0 {
-                t.Errorf("初始管理员列表应为空，实际 %d", list0.Total)
-        }
+	// 初始列出应为空
+	resp0, api0 := DoGet(t, adminsURL, adminToken)
+	AssertHTTPStatus(t, resp0, http.StatusOK)
+	AssertAPICode(t, api0, 0)
+	var list0 struct {
+		Total int `json:"total"`
+	}
+	ParseData(t, api0, &list0)
+	if list0.Total != 0 {
+		t.Errorf("初始管理员列表应为空，实际 %d", list0.Total)
+	}
 
-        // 任命 operator1 为 school_admin（首个，应回填主字段）
-        appointBody := map[string]interface{}{"user_id": SeedOperatorID, "role_type": "school_admin"}
-        respA, apiA := DoPost(t, adminsURL, appointBody, adminToken)
-        AssertHTTPStatus(t, respA, http.StatusOK)
-        AssertAPICode(t, apiA, 0)
+	// 任命 operator1 为 school_admin（首个，应回填主字段）
+	appointBody := map[string]interface{}{"user_id": SeedOperatorID, "role_type": "school_admin"}
+	respA, apiA := DoPost(t, adminsURL, appointBody, adminToken)
+	AssertHTTPStatus(t, respA, http.StatusOK)
+	AssertAPICode(t, apiA, 0)
 
-        // 列出应有1个
-        _, api1 := DoGet(t, adminsURL, adminToken)
-        var list1 struct {
-                Total int `json:"total"`
-        }
-        ParseData(t, api1, &list1)
-        if list1.Total != 1 {
-                t.Errorf("任命后管理员列表应有1个，实际 %d", list1.Total)
-        }
+	// 列出应有1个
+	_, api1 := DoGet(t, adminsURL, adminToken)
+	var list1 struct {
+		Total int `json:"total"`
+	}
+	ParseData(t, api1, &list1)
+	if list1.Total != 1 {
+		t.Errorf("任命后管理员列表应有1个，实际 %d", list1.Total)
+	}
 
-        // 主字段应回填成 operator1
-        primary := queryOrgPrimaryAdmin(t, schoolID)
-        if primary == nil || *primary != SeedOperatorID {
-                t.Errorf("首次任命后 admin_user_id 应回填为 operator1，实际 %v", primary)
-        }
+	// 主字段应回填成 operator1
+	primary := queryOrgPrimaryAdmin(t, schoolID)
+	if primary == nil || *primary != SeedOperatorID {
+		t.Errorf("首次任命后 admin_user_id 应回填为 operator1，实际 %v", primary)
+	}
 
-        // 移除 operator1（最后一名，主字段应置空）
-        respR, apiR := DoDelete(t, adminsURL+"/"+SeedOperatorID, adminToken)
-        AssertHTTPStatus(t, respR, http.StatusOK)
-        AssertAPICode(t, apiR, 0)
+	// 移除 operator1（最后一名，主字段应置空）
+	respR, apiR := DoDelete(t, adminsURL+"/"+SeedOperatorID, adminToken)
+	AssertHTTPStatus(t, respR, http.StatusOK)
+	AssertAPICode(t, apiR, 0)
 
-        primaryAfter := queryOrgPrimaryAdmin(t, schoolID)
-        if primaryAfter != nil {
-                t.Errorf("移除最后一名管理员后 admin_user_id 应置空，实际 %v", *primaryAfter)
-        }
+	primaryAfter := queryOrgPrimaryAdmin(t, schoolID)
+	if primaryAfter != nil {
+		t.Errorf("移除最后一名管理员后 admin_user_id 应置空，实际 %v", *primaryAfter)
+	}
 }
 
 // TestOrgAdmin_SecondAppointNoOverwriteAndBackfill 任命第二个不覆盖 + 移除主管理员补位
 func TestOrgAdmin_SecondAppointNoOverwriteAndBackfill(t *testing.T) {
-        server, _ := SetupTestServer(t)
-        CleanAndSeed(t)
+	server, _ := SetupTestServer(t)
+	CleanAndSeed(t)
 
-        adminToken := LoginAsAdmin(t, server.URL)
-        regionID := createRegionViaAPI(t, server.URL, adminToken, "补位测试区")
-        schoolID := createSchoolViaAPI(t, server.URL, adminToken, "补位测试校", regionID)
-        adminsURL := server.URL + "/api/v1/lesson-plans/organizations/" + schoolID + "/admins"
+	adminToken := LoginAsAdmin(t, server.URL)
+	regionID := createRegionViaAPI(t, server.URL, adminToken, "补位测试区")
+	schoolID := createSchoolViaAPI(t, server.URL, adminToken, "补位测试校", regionID)
+	adminsURL := server.URL + "/api/v1/lesson-plans/organizations/" + schoolID + "/admins"
 
-        // 任命 operator1（首个 → 回填主字段）
-        DoPost(t, adminsURL, map[string]interface{}{"user_id": SeedOperatorID, "role_type": "school_admin"}, adminToken)
-        // 任命 viewer1（第二个 → 不应覆盖主字段）
-        DoPost(t, adminsURL, map[string]interface{}{"user_id": SeedViewerID, "role_type": "school_admin"}, adminToken)
+	// 任命 operator1（首个 → 回填主字段）
+	DoPost(t, adminsURL, map[string]interface{}{"user_id": SeedOperatorID, "role_type": "school_admin"}, adminToken)
+	// 任命 viewer1（第二个 → 不应覆盖主字段）
+	DoPost(t, adminsURL, map[string]interface{}{"user_id": SeedViewerID, "role_type": "school_admin"}, adminToken)
 
-        primary := queryOrgPrimaryAdmin(t, schoolID)
-        if primary == nil || *primary != SeedOperatorID {
-                t.Errorf("任命第二个管理员后主字段应仍是 operator1（不覆盖），实际 %v", primary)
-        }
+	primary := queryOrgPrimaryAdmin(t, schoolID)
+	if primary == nil || *primary != SeedOperatorID {
+		t.Errorf("任命第二个管理员后主字段应仍是 operator1（不覆盖），实际 %v", primary)
+	}
 
-        // 移除主管理员 operator1 → 应自动补位到 viewer1
-        respR, apiR := DoDelete(t, adminsURL+"/"+SeedOperatorID, adminToken)
-        AssertHTTPStatus(t, respR, http.StatusOK)
-        AssertAPICode(t, apiR, 0)
+	// 移除主管理员 operator1 → 应自动补位到 viewer1
+	respR, apiR := DoDelete(t, adminsURL+"/"+SeedOperatorID, adminToken)
+	AssertHTTPStatus(t, respR, http.StatusOK)
+	AssertAPICode(t, apiR, 0)
 
-        primaryAfter := queryOrgPrimaryAdmin(t, schoolID)
-        if primaryAfter == nil || *primaryAfter != SeedViewerID {
-                t.Errorf("移除主管理员后应补位到 viewer1，实际 %v", primaryAfter)
-        }
+	primaryAfter := queryOrgPrimaryAdmin(t, schoolID)
+	if primaryAfter == nil || *primaryAfter != SeedViewerID {
+		t.Errorf("移除主管理员后应补位到 viewer1，实际 %v", primaryAfter)
+	}
 }
 
 // TestOrgAdmin_TypeMismatch 给 school 组织任命 region_admin → 400 类型不匹配
 func TestOrgAdmin_TypeMismatch(t *testing.T) {
-        server, _ := SetupTestServer(t)
-        CleanAndSeed(t)
+	server, _ := SetupTestServer(t)
+	CleanAndSeed(t)
 
-        adminToken := LoginAsAdmin(t, server.URL)
-        regionID := createRegionViaAPI(t, server.URL, adminToken, "类型测试区")
-        schoolID := createSchoolViaAPI(t, server.URL, adminToken, "类型测试校", regionID)
-        adminsURL := server.URL + "/api/v1/lesson-plans/organizations/" + schoolID + "/admins"
+	adminToken := LoginAsAdmin(t, server.URL)
+	regionID := createRegionViaAPI(t, server.URL, adminToken, "类型测试区")
+	schoolID := createSchoolViaAPI(t, server.URL, adminToken, "类型测试校", regionID)
+	adminsURL := server.URL + "/api/v1/lesson-plans/organizations/" + schoolID + "/admins"
 
-        resp, _ := DoPost(t, adminsURL, map[string]interface{}{"user_id": SeedOperatorID, "role_type": "region_admin"}, adminToken)
-        AssertHTTPStatus(t, resp, http.StatusBadRequest)
+	resp, _ := DoPost(t, adminsURL, map[string]interface{}{"user_id": SeedOperatorID, "role_type": "region_admin"}, adminToken)
+	AssertHTTPStatus(t, resp, http.StatusBadRequest)
 }
 
 // TestOrgAdmin_RegionAdminInScope region_admin 在辖区内任命学校管理员 → 成功
 // 种子无 region_admin 用户，测试内用 SQL 造一个 role=region_admin 的用户并给他区域。
 func TestOrgAdmin_RegionAdminInScope(t *testing.T) {
-        server, _ := SetupTestServer(t)
-        CleanAndSeed(t)
+	server, _ := SetupTestServer(t)
+	CleanAndSeed(t)
 
-        adminToken := LoginAsAdmin(t, server.URL)
-        regionID := createRegionViaAPI(t, server.URL, adminToken, "辖区测试区")
-        schoolID := createSchoolViaAPI(t, server.URL, adminToken, "辖区内学校", regionID)
+	adminToken := LoginAsAdmin(t, server.URL)
+	regionID := createRegionViaAPI(t, server.URL, adminToken, "辖区测试区")
+	schoolID := createSchoolViaAPI(t, server.URL, adminToken, "辖区内学校", regionID)
 
-        // 造一个 region_admin 用户（users.role=region_admin，这样登录 JWT 带此角色）
-        raID := "10000000-0000-0000-0000-0000000000aa"
-        raPass := "region123"
-        hash, err := utils.HashPassword(raPass)
-        if err != nil {
-                t.Fatalf("哈希密码失败: %v", err)
-        }
-        _, err = database.DB.Exec(context.Background(),
-                `INSERT INTO users (id, username, display_name, password_hash, role, status, created_at, updated_at)
+	// 造一个 region_admin 用户（users.role=region_admin，这样登录 JWT 带此角色）
+	raID := "10000000-0000-0000-0000-0000000000aa"
+	raPass := "region123"
+	hash, err := utils.HashPassword(raPass)
+	if err != nil {
+		t.Fatalf("哈希密码失败: %v", err)
+	}
+	_, err = database.DB.Exec(context.Background(),
+		`INSERT INTO users (id, username, display_name, password_hash, role, status, created_at, updated_at)
                  VALUES ($1,'region_admin_t','区域管理员T',$2,'region_admin','active',now(),now())`,
-                raID, hash,
-        )
-        if err != nil {
-                t.Fatalf("造 region_admin 用户失败: %v", err)
-        }
-        // 把该区域任命给他（organization_admins 里登记其管辖区域）
-        _, err = database.DB.Exec(context.Background(),
-                `INSERT INTO organization_admins (org_id, user_id, role_type, created_by)
-                 VALUES ($1,$2,'region_admin',NULL)`,
-                regionID, raID,
-        )
-        if err != nil {
-                t.Fatalf("登记区域管辖失败: %v", err)
-        }
+		raID, hash,
+	)
+	if err != nil {
+		t.Fatalf("造 region_admin 用户失败: %v", err)
+	}
+	// 把该区域任命给他（organization_admins 里登记其管辖区域）
+	_, err = database.DB.Exec(context.Background(),
+		`INSERT INTO organization_admins (
+                        org_id,
+                        user_id,
+                        role_type,
+                        education_domain,
+                        created_by
+                 )
+                 VALUES ($1, $2, 'region_admin', 'k12', NULL)`,
+		regionID,
+		raID,
+	)
+	if err != nil {
+		t.Fatalf("登记区域管辖失败: %v", err)
+	}
 
-        // 该 region_admin 登录，任命辖区内学校的 school_admin → 应成功
-        raToken := LoginAs(t, server.URL, "region_admin_t", raPass)
-        adminsURL := server.URL + "/api/v1/lesson-plans/organizations/" + schoolID + "/admins"
-        resp, api := DoPost(t, adminsURL, map[string]interface{}{"user_id": SeedOperatorID, "role_type": "school_admin"}, raToken)
-        AssertHTTPStatus(t, resp, http.StatusOK)
-        AssertAPICode(t, api, 0)
+	// 该 region_admin 登录，任命辖区内学校的 school_admin → 应成功
+	raToken := LoginAs(t, server.URL, "region_admin_t", raPass)
+	adminsURL := server.URL + "/api/v1/lesson-plans/organizations/" + schoolID + "/admins"
+	resp, api := DoPost(t, adminsURL, map[string]interface{}{"user_id": SeedOperatorID, "role_type": "school_admin"}, raToken)
+	AssertHTTPStatus(t, resp, http.StatusOK)
+	AssertAPICode(t, api, 0)
 }

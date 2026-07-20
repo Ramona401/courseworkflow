@@ -81,50 +81,105 @@ func (h *AssessmentHandler) ChatAssessment(w http.ResponseWriter, r *http.Reques
 // ==================== 提交前测结果 ====================
 
 // SubmitAssessment POST /api/v1/lesson-plans/assessment/submit
-func (h *AssessmentHandler) SubmitAssessment(w http.ResponseWriter, r *http.Request) {
+func (h *AssessmentHandler) SubmitAssessment(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			utils.MsgMethodPostOnly,
+		)
 		return
 	}
-	claims, ok := middleware.GetClaims(r.Context())
+
+	actor, ok := buildRecipeActor(w, r)
 	if !ok {
-		utils.Unauthorized(w, utils.MsgUnauthorized)
 		return
 	}
+
 	var req struct {
 		models.AssessmentSubmitRequest
 		ConversationLog []models.AssessmentMessage `json:"conversation_log"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, utils.MsgBadRequestBody)
+
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			utils.MsgBadRequestBody,
+		)
 		return
 	}
-	resp, err := h.assessmentSvc.SubmitAssessment(r.Context(), claims.UserID, &req.AssessmentSubmitRequest, req.ConversationLog)
+
+	resp, err :=
+		h.assessmentSvc.
+			SubmitAssessmentForActor(
+				r.Context(),
+				actor,
+				&req.AssessmentSubmitRequest,
+				req.ConversationLog,
+			)
 	if err != nil {
+		if err == services.ErrRecipeUnauthorized {
+			utils.Fail(
+				w,
+				http.StatusForbidden,
+				"当前账号没有确定的教学教育域，不能生成个人备课配方",
+			)
+			return
+		}
+
 		utils.InternalError(w, err.Error())
 		return
 	}
+
 	utils.Success(w, resp)
 }
 
 // ==================== 跳过前测 ====================
 
 // SkipAssessment POST /api/v1/lesson-plans/assessment/skip
-func (h *AssessmentHandler) SkipAssessment(w http.ResponseWriter, r *http.Request) {
+func (h *AssessmentHandler) SkipAssessment(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			utils.MsgMethodPostOnly,
+		)
 		return
 	}
-	claims, ok := middleware.GetClaims(r.Context())
+
+	actor, ok := buildRecipeActor(w, r)
 	if !ok {
-		utils.Unauthorized(w, utils.MsgUnauthorized)
 		return
 	}
-	resp, err := h.assessmentSvc.SkipAssessment(r.Context(), claims.UserID)
+
+	resp, err :=
+		h.assessmentSvc.
+			SkipAssessmentForActor(
+				r.Context(),
+				actor,
+			)
 	if err != nil {
+		if err == services.ErrRecipeUnauthorized {
+			utils.Fail(
+				w,
+				http.StatusForbidden,
+				"当前账号没有确定的教学教育域，不能生成个人备课配方",
+			)
+			return
+		}
+
 		utils.InternalError(w, err.Error())
 		return
 	}
+
 	utils.Success(w, resp)
 }
 
@@ -152,20 +207,43 @@ func (h *AssessmentHandler) GetAssessmentResult(w http.ResponseWriter, r *http.R
 // ==================== 自动生成配方 ====================
 
 // AutoGenerateRecipe POST /api/v1/lesson-plans/assessment/auto-recipe
-func (h *AssessmentHandler) AutoGenerateRecipe(w http.ResponseWriter, r *http.Request) {
+func (h *AssessmentHandler) AutoGenerateRecipe(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			utils.MsgMethodPostOnly,
+		)
 		return
 	}
-	claims, ok := middleware.GetClaims(r.Context())
+
+	actor, ok := buildRecipeActor(w, r)
 	if !ok {
-		utils.Unauthorized(w, utils.MsgUnauthorized)
 		return
 	}
-	resp, err := h.assessmentSvc.AutoGenerateRecipeFromProfile(r.Context(), claims.UserID)
+
+	resp, err :=
+		h.assessmentSvc.
+			AutoGenerateRecipeFromProfileForActor(
+				r.Context(),
+				actor,
+			)
 	if err != nil {
+		if err == services.ErrRecipeUnauthorized {
+			utils.Fail(
+				w,
+				http.StatusForbidden,
+				"当前账号没有确定的教学教育域，不能生成个人备课配方",
+			)
+			return
+		}
+
 		utils.InternalError(w, err.Error())
 		return
 	}
+
 	utils.Success(w, resp)
 }

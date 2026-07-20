@@ -31,6 +31,11 @@ import (
 //  3. 显式系统默认纯骨架；
 //  4. 技能路由自动匹配；
 //  5. 无匹配或加载失败时静默降级。
+
+// resolveAssistantPromptForReceipt 解析助手并保留真实来源信息。
+//
+// 手动指定和老师偏好忽略具体年级；
+// 自动助手继续严格匹配具体年级。
 func (s *LessonPlanGenService) resolveAssistantPromptForReceipt(
 	ctx context.Context,
 	lp *models.LessonPlan,
@@ -40,23 +45,30 @@ func (s *LessonPlanGenService) resolveAssistantPromptForReceipt(
 	result := &models.AssistantPromptResolution{
 		Receipt: &models.AssistantContextReceipt{
 			Status: models.ContextReceiptNotFound,
-			Reason: "本轮未匹配到同学科同具体年级的可用助手，使用系统阶段骨架",
+			Reason: "本轮没有严格匹配到可用自动助手，使用系统阶段骨架",
 		},
 	}
 
 	if s.assistantService == nil {
-		result.Receipt.Status = models.ContextReceiptUnavailable
-		result.Receipt.Reason = "助手服务当前不可用，已使用系统阶段骨架"
+		result.Receipt.Status =
+			models.ContextReceiptUnavailable
+		result.Receipt.Reason =
+			"助手服务当前不可用，已使用系统阶段骨架"
 		return result
 	}
 	if lp == nil {
 		return result
 	}
 
-	user, err := repository.FindUserByID(ctx, callerID)
+	user, err := repository.FindUserByID(
+		ctx,
+		callerID,
+	)
 	if err != nil {
-		result.Receipt.Status = models.ContextReceiptUnavailable
-		result.Receipt.Reason = "无法确认助手可见范围，已使用系统阶段骨架"
+		result.Receipt.Status =
+			models.ContextReceiptUnavailable
+		result.Receipt.Reason =
+			"无法确认助手可见范围，已使用系统阶段骨架"
 		return result
 	}
 
@@ -65,67 +77,98 @@ func (s *LessonPlanGenService) resolveAssistantPromptForReceipt(
 		callerID,
 		user.Role,
 	)
+	// B2-B：上下文回执使用教案教育域快照覆盖助手Actor。
+	// 回执解析必须与正式助手注入使用完全相同的教育域，
+	// 避免出现正式链路拒绝、回执却显示已读取，或反向不一致。
+	applyLessonPlanEducationDomainToAssistantActor(
+		actor,
+		lp,
+	)
+
 	scene := stageCodeToAssistantScene(
 		lp.CurrentStage,
 	)
 
-	load := func(
-		id string,
+	setLoaded := func(
+		assistant *models.AIAssistant,
 		mode string,
-	) (*models.AIAssistant, error) {
-		assistant, loadErr :=
-			s.assistantService.LoadActiveAssistantForLessonUse(
-				ctx,
-				actor,
-				id,
-				lp.Subject,
-				lp.Grade,
-				scene,
-			)
-		if loadErr != nil {
-			return nil, loadErr
-		}
-
-		if strings.TrimSpace(assistant.FullPrompt) == "" {
-			return nil, errors.New("助手内容为空")
-		}
-
+	) {
 		result.Prompt = assistant.FullPrompt
-		result.Receipt.Status = models.ContextReceiptLoaded
+		result.Receipt.Status =
+			models.ContextReceiptLoaded
 		result.Receipt.SelectionMode = mode
 		result.Receipt.ID = assistant.ID
 		result.Receipt.Name = assistant.Name
 		result.Receipt.Source = assistant.Source
 		result.Receipt.Reason = ""
+	}
 
-		lpGenLog.Info(
-			"上下文回执-助手已解析",
-			"plan_id", lp.ID,
-			"assistant_id", assistant.ID,
-			"assistant_name", assistant.Name,
-			"selection_mode", mode,
-			"source", assistant.Source,
-			"subject", lp.Subject,
-			"grade", lp.Grade,
-			"scene", scene,
-		)
+	loadManual := func(
+		id string,
+		mode string,
+	) error {
+		assistant, loadErr :=
+			s.assistantService.
+				LoadActiveAssistantForManualLessonUse(
+					ctx,
+					actor,
+					id,
+					lp.Subject,
+					scene,
+				)
+		if loadErr != nil {
+			return loadErr
+		}
+		if strings.TrimSpace(
+			assistant.FullPrompt,
+		) == "" {
+			return errors.New("助手内容为空")
+		}
 
-		return assistant, nil
+		setLoaded(assistant, mode)
+		return nil
+	}
+
+	loadAuto := func(
+		id string,
+		mode string,
+	) error {
+		assistant, loadErr :=
+			s.assistantService.
+				LoadActiveAssistantForLessonUse(
+					ctx,
+					actor,
+					id,
+					lp.Subject,
+					lp.Grade,
+					scene,
+				)
+		if loadErr != nil {
+			return loadErr
+		}
+		if strings.TrimSpace(
+			assistant.FullPrompt,
+		) == "" {
+			return errors.New("助手内容为空")
+		}
+
+		setLoaded(assistant, mode)
+		return nil
 	}
 
 	assistantID = strings.TrimSpace(assistantID)
 
-	// 当轮显式选择拥有最高优先级。
-	// 若不匹配当前课程，直接使用系统骨架，不能偷偷换成其它助手。
 	if assistantID != "" {
-		if _, loadErr := load(
+		if loadErr := loadManual(
 			assistantID,
 			"manual",
 		); loadErr != nil {
-			result.Receipt.Status = models.ContextReceiptUnavailable
+			result.Receipt.Status =
+				models.ContextReceiptUnavailable
 			result.Receipt.SelectionMode = "manual"
 			result.Receipt.ID = assistantID
-			result.Receipt.Reason = "老师指定的助手不适用于当前学科、具体年级或阶段，已使用系统阶段骨架"
+			result.Receipt.Reason =
+				"老师指定的助手已停用、无权使用，或不适用于当前学科和阶段"
 		}
 		return result
 	}
@@ -147,23 +190,24 @@ func (s *LessonPlanGenService) resolveAssistantPromptForReceipt(
 		prefID = strings.TrimSpace(prefID)
 
 		if prefID == "" {
-			result.Receipt.Status = models.ContextReceiptExplicitNone
-			result.Receipt.SelectionMode = "explicit_none"
-			result.Receipt.Reason = "老师已明确选择系统默认，不注入额外助手"
+			result.Receipt.Status =
+				models.ContextReceiptExplicitNone
+			result.Receipt.SelectionMode =
+				"explicit_none"
+			result.Receipt.Reason =
+				"老师已明确选择系统默认，不注入额外助手"
 			return result
 		}
 
-		if _, loadErr := load(
+		if loadErr := loadManual(
 			prefID,
 			"preference",
 		); loadErr == nil {
 			return result
 		}
 
-		// 存量偏好在当前年级或阶段不适用时不删除，
-		// 继续寻找当前课程真正适用的自动助手。
 		lpGenLog.Info(
-			"老师助手偏好不适用于当前学科、具体年级或阶段，继续自动匹配",
+			"老师助手偏好不适用于当前学科或阶段，继续自动匹配",
 			"plan_id", lp.ID,
 			"pref_assistant_id", prefID,
 			"subject", lp.Subject,
@@ -184,14 +228,16 @@ func (s *LessonPlanGenService) resolveAssistantPromptForReceipt(
 		return result
 	}
 
-	if _, loadErr := load(
+	if loadErr := loadAuto(
 		defaultID,
 		"auto",
 	); loadErr != nil {
-		result.Receipt.Status = models.ContextReceiptUnavailable
+		result.Receipt.Status =
+			models.ContextReceiptUnavailable
 		result.Receipt.SelectionMode = "auto"
 		result.Receipt.ID = defaultID
-		result.Receipt.Reason = "自动匹配的助手当前不可用，已使用系统阶段骨架"
+		result.Receipt.Reason =
+			"自动匹配的助手当前不可用，已使用系统阶段骨架"
 	}
 
 	return result
@@ -296,20 +342,21 @@ func (s *WorkshopStageService) loadReceiptStageAndRecipe(
 		return nil, nil
 	}
 
-	// 与正式提示词装配使用完全相同的严格配方规则。
-	// 配方不适用当前学科或具体年级时，recipe保持nil。
+	// 与正式提示词装配使用完全相同的配方三态规则：
+	//   auto严格学科和具体年级；
+	//   selected校验active与老师可见范围；
+	//   none不加载配方。
 	var recipe *models.TeachingRecipe
 	validRecipeID := ""
 
 	if lp.RecipeID != nil &&
 		strings.TrimSpace(*lp.RecipeID) != "" {
-		candidate, recipeErr := loadRecipeForLesson(
-			ctx,
-			*lp.RecipeID,
-			lp.Subject,
-			lp.Grade,
-		)
-		if recipeErr == nil {
+		candidate, _, recipeErr :=
+			loadRecipeForPlanUse(
+				ctx,
+				lp,
+			)
+		if recipeErr == nil && candidate != nil {
 			recipe = candidate
 			validRecipeID = candidate.ID
 		}
@@ -424,11 +471,16 @@ func buildRecipeReceipt(
 
 	recipeID := strings.TrimSpace(*lp.RecipeID)
 	if recipe == nil {
+		reason := "自动关联的配方当前无法读取，或已不再严格匹配本教案的学科和具体年级，本轮已忽略"
+		if selectionMode == models.RecipeSelectionModeSelected {
+			reason = "老师选择的配方已停用、删除或当前账号已无权使用，本轮未读取"
+		}
+
 		return &models.MaterialContextReceipt{
 			Status:        models.ContextReceiptUnavailable,
 			SelectionMode: modeText,
 			ID:            recipeID,
-			Reason:        "已关联配方，但当前无法读取或不适用于本教案的学科和具体年级，本轮已忽略",
+			Reason:        reason,
 		}
 	}
 
@@ -585,7 +637,8 @@ func buildCourseOutlineReceipt(
 	stageCode string,
 	unitPlanLoaded bool,
 ) *models.MaterialContextReceipt {
-	if stageCode != "analyze" && stageCode != "design" {
+	if stageCode != "analyze" &&
+		stageCode != "design" {
 		return &models.MaterialContextReceipt{
 			Status: models.ContextReceiptNotApplicable,
 			Reason: "课程大纲只在教学分析和教学设计阶段读取",
@@ -599,52 +652,96 @@ func buildCourseOutlineReceipt(
 		}
 	}
 
-	if lp.CourseOutlinePublisher == nil {
+	if lp == nil {
 		return &models.MaterialContextReceipt{
-			Status: models.ContextReceiptNotLinked,
-			Reason: "老师没有选择课程大纲教材版本",
+			Status: models.ContextReceiptUnavailable,
+			Reason: "教案数据为空，无法确认课程大纲",
 		}
 	}
 
-	candidates, err := repository.ListActiveOutlinesBySubject(
+	if lp.CourseOutlinePublisher == nil {
+		return &models.MaterialContextReceipt{
+			Status: models.ContextReceiptNotLinked,
+			Reason: "本轮没有挂载课程大纲",
+		}
+	}
+
+	hits, err := ResolveLessonPlanCourseOutlines(
 		ctx,
-		lp.Subject,
+		lp,
 	)
 	if err != nil {
+		if errors.Is(
+			err,
+			ErrOutlinePublisherNotAllowed,
+		) || errors.Is(
+			err,
+			ErrOutlineEducationDomainRequired,
+		) || errors.Is(
+			err,
+			ErrOutlineEducationDomainMismatch,
+		) {
+			return &models.MaterialContextReceipt{
+				Status: models.ContextReceiptForbidden,
+				Reason: "课程大纲挂载与教案教育域不一致，本轮未读取",
+			}
+		}
+
 		return &models.MaterialContextReceipt{
 			Status: models.ContextReceiptUnavailable,
 			Reason: "课程大纲候选读取失败",
 		}
 	}
 
-	hits := MatchOutlinesByPublisher(
-		lp.Grade,
-		*lp.CourseOutlinePublisher,
-		candidates,
-	)
 	if len(hits) == 0 {
+		reason := "当前学科和学习层级没有匹配到可用课程大纲"
+
+		if strings.ToLower(
+			strings.TrimSpace(
+				lp.EducationDomain,
+			),
+		) == models.EducationDomainK12 {
+			reason = "所选教材版本与学段没有匹配到可用大纲"
+		}
+
 		return &models.MaterialContextReceipt{
 			Status: models.ContextReceiptUnavailable,
-			Reason: "所选教材版本与学段没有匹配到可用大纲",
+			Reason: reason,
 		}
 	}
 
-	if strings.TrimSpace(BuildCourseOutlinesContext(hits)) == "" {
+	if strings.TrimSpace(
+		BuildCourseOutlinesContext(hits),
+	) == "" {
 		return &models.MaterialContextReceipt{
 			Status: models.ContextReceiptUnavailable,
 			Reason: "匹配到课程大纲，但没有可注入内容",
 		}
 	}
 
-	titles := make([]string, 0, len(hits))
+	titles := make(
+		[]string,
+		0,
+		len(hits),
+	)
 	for _, item := range hits {
-		titles = appendUniqueReceiptTitle(titles, item.Title)
+		if item == nil {
+			continue
+		}
+
+		titles = appendUniqueReceiptTitle(
+			titles,
+			item.Title,
+		)
 	}
 
 	return &models.MaterialContextReceipt{
 		Status: models.ContextReceiptLoaded,
 		Count:  len(hits),
-		Titles: limitReceiptTitles(titles, 5),
+		Titles: limitReceiptTitles(
+			titles,
+			5,
+		),
 	}
 }
 

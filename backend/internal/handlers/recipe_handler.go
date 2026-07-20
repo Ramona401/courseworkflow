@@ -27,189 +27,315 @@ func NewRecipeHandler(rs *services.RecipeService, cs *services.ComponentService)
 	return &RecipeHandler{recipeService: rs, compService: cs}
 }
 
+// buildRecipeActor 从当前JWT构造可信配方Actor。
+func buildRecipeActor(
+	w http.ResponseWriter,
+	r *http.Request,
+) (*services.AssistantActorContext, bool) {
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok ||
+		claims == nil ||
+		strings.TrimSpace(claims.UserID) == "" {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		return nil, false
+	}
+
+	actor := services.BuildActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+	if actor == nil {
+		utils.InternalError(
+			w,
+			"解析当前用户配方权限范围失败",
+		)
+		return nil, false
+	}
+
+	return actor, true
+}
+
 // ==================== 列表 ====================
 
-func (h *RecipeHandler) ListRecipes(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+// ListRecipes 查询当前Actor可信范围内的普通配方列表。
+func (h *RecipeHandler) ListRecipes(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
 		return
 	}
-	q := r.URL.Query()
-	resp, err := h.recipeService.ListRecipes(r.Context(), claims.UserID, q.Get("scope"), q.Get("scope_ref_id"), q.Get("subject"), q.Get("grade_range"), atoi(q.Get("limit")), atoi(q.Get("offset")))
+
+	query := r.URL.Query()
+
+	resp, err := h.recipeService.ListRecipesForActor(
+		r.Context(),
+		actor,
+		query.Get("scope"),
+		query.Get("scope_ref_id"),
+		query.Get("subject"),
+		query.Get("grade_range"),
+		atoi(query.Get("limit")),
+		atoi(query.Get("offset")),
+	)
 	if err != nil {
-		utils.InternalError(w, "查询配方列表失败")
+		handleRecipeError(w, err)
 		return
 	}
+
 	utils.Success(w, resp)
 }
 
 // ==================== 创建 ====================
 
-func (h *RecipeHandler) CreateRecipe(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+// CreateRecipe 创建当前具体教学域下的个人配方。
+func (h *RecipeHandler) CreateRecipe(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
 		return
 	}
+
 	var req models.CreateRecipeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, utils.MsgBadRequestArgs)
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			utils.MsgBadRequestArgs,
+		)
 		return
 	}
-	recipe, err := h.recipeService.CreateRecipe(r.Context(), &req, claims.UserID)
+
+	recipe, err :=
+		h.recipeService.
+			CreateRecipeForActor(
+				r.Context(),
+				actor,
+				&req,
+			)
 	if err != nil {
 		handleRecipeError(w, err)
 		return
 	}
+
 	utils.Success(w, recipe)
 }
 
 // ==================== 详情 ====================
 
+// GetRecipe 获取当前Actor有权查看的配方详情。
 func (h *RecipeHandler) GetRecipe(w http.ResponseWriter, r *http.Request) {
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
+		return
+	}
+
 	recipeID := extractRecipeID(r.URL.Path)
 	if recipeID == "" {
 		utils.BadRequest(w, utils.MsgInvalidRecipeID)
 		return
 	}
-	resp, err := h.recipeService.GetRecipe(r.Context(), recipeID)
+
+	resp, err := h.recipeService.GetRecipeForActor(
+		r.Context(),
+		actor,
+		recipeID,
+	)
 	if err != nil {
 		handleRecipeError(w, err)
 		return
 	}
+
 	utils.Success(w, resp)
 }
 
 // ==================== 更新 ====================
 
+// UpdateRecipe 更新作者本人且教育域兼容的配方。
 func (h *RecipeHandler) UpdateRecipe(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
 		return
 	}
+
 	recipeID := extractRecipeID(r.URL.Path)
 	if recipeID == "" {
 		utils.BadRequest(w, utils.MsgInvalidRecipeID)
 		return
 	}
+
 	var req models.UpdateRecipeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestArgs)
 		return
 	}
-	if err := h.recipeService.UpdateRecipe(r.Context(), recipeID, &req, claims.UserID); err != nil {
+
+	if err := h.recipeService.UpdateRecipeForActor(
+		r.Context(),
+		actor,
+		recipeID,
+		&req,
+	); err != nil {
 		handleRecipeError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]string{"message": "更新成功"})
 }
 
 // ==================== 删除 ====================
 
+// DeleteRecipe 删除作者本人且教育域兼容的配方。
 func (h *RecipeHandler) DeleteRecipe(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
 		return
 	}
+
 	recipeID := extractRecipeID(r.URL.Path)
 	if recipeID == "" {
 		utils.BadRequest(w, utils.MsgInvalidRecipeID)
 		return
 	}
-	if err := h.recipeService.DeleteRecipe(r.Context(), recipeID, claims.UserID); err != nil {
+
+	if err := h.recipeService.DeleteRecipeForActor(
+		r.Context(),
+		actor,
+		recipeID,
+	); err != nil {
 		handleRecipeError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]string{"message": "删除成功"})
 }
 
 // ==================== Fork ====================
 
+// ForkRecipe Fork当前Actor有权查看的配方。
 func (h *RecipeHandler) ForkRecipe(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
 		return
 	}
+
 	recipeID := extractRecipeMiddleID(r.URL.Path)
 	if recipeID == "" {
 		utils.BadRequest(w, utils.MsgInvalidRecipeID)
 		return
 	}
-	forked, err := h.recipeService.ForkRecipe(r.Context(), recipeID, claims.UserID)
+
+	forked, err := h.recipeService.ForkRecipeForActor(
+		r.Context(),
+		actor,
+		recipeID,
+	)
 	if err != nil {
 		handleRecipeError(w, err)
 		return
 	}
+
 	utils.Success(w, forked)
 }
 
 // ==================== 共享 ====================
 
+// ShareRecipe 将作者本人的配方共享到合法目标。
 func (h *RecipeHandler) ShareRecipe(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
 		return
 	}
+
 	recipeID := extractRecipeMiddleID(r.URL.Path)
 	if recipeID == "" {
 		utils.BadRequest(w, utils.MsgInvalidRecipeID)
 		return
 	}
+
 	var req models.ShareRecipeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestArgs)
 		return
 	}
-	if err := h.recipeService.ShareRecipe(r.Context(), recipeID, &req, claims.UserID); err != nil {
+
+	if err := h.recipeService.ShareRecipeForActor(
+		r.Context(),
+		actor,
+		recipeID,
+		&req,
+	); err != nil {
 		handleRecipeError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]string{"message": "共享成功"})
 }
 
 // ==================== 更新学情 ====================
 
+// UpdateStudentProfile 更新作者本人配方的学情记录。
 func (h *RecipeHandler) UpdateStudentProfile(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
 		return
 	}
+
 	recipeID := extractRecipeMiddleID(r.URL.Path)
 	if recipeID == "" {
 		utils.BadRequest(w, utils.MsgInvalidRecipeID)
 		return
 	}
+
 	var req models.UpdateStudentProfileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestArgs)
 		return
 	}
-	if err := h.recipeService.UpdateStudentProfile(r.Context(), recipeID, req.StudentProfile, claims.UserID); err != nil {
+
+	if err := h.recipeService.UpdateStudentProfileForActor(
+		r.Context(),
+		actor,
+		recipeID,
+		req.StudentProfile,
+	); err != nil {
 		handleRecipeError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]string{"message": "学情更新成功"})
 }
 
 // ==================== 预览AI上下文 ====================
 
+// PreviewContext 预览当前Actor有权查看的配方上下文。
 func (h *RecipeHandler) PreviewContext(w http.ResponseWriter, r *http.Request) {
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
+		return
+	}
+
 	recipeID := extractRecipeMiddleID(r.URL.Path)
 	if recipeID == "" {
 		utils.BadRequest(w, utils.MsgInvalidRecipeID)
 		return
 	}
-	preview, err := h.recipeService.PreviewContext(r.Context(), recipeID)
+
+	preview, err := h.recipeService.PreviewContextForActor(
+		r.Context(),
+		actor,
+		recipeID,
+	)
 	if err != nil {
 		handleRecipeError(w, err)
 		return
 	}
+
 	utils.Success(w, preview)
 }
 
@@ -276,29 +402,62 @@ func (h *RecipeHandler) ValidateFlow(w http.ResponseWriter, r *http.Request) {
 
 // ==================== 配方效果统计 ====================
 
+// GetRecipeStats 获取作者本人或admin有权查看的效果统计。
 func (h *RecipeHandler) GetRecipeStats(w http.ResponseWriter, r *http.Request) {
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
+		return
+	}
+
 	recipeID := extractRecipeMiddleID(r.URL.Path)
 	if recipeID == "" {
 		utils.BadRequest(w, utils.MsgInvalidRecipeID)
 		return
 	}
-	resp, err := h.recipeService.GetRecipeStats(r.Context(), recipeID)
+
+	resp, err := h.recipeService.GetRecipeStatsForActor(
+		r.Context(),
+		actor,
+		recipeID,
+	)
 	if err != nil {
 		handleRecipeError(w, err)
 		return
 	}
+
 	utils.Success(w, resp)
 }
 
 // ==================== 配方市场排行榜 ====================
 
-func (h *RecipeHandler) ListMarketRecipes(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	resp, err := h.recipeService.ListMarketRecipes(r.Context(), q.Get("subject"), q.Get("grade_range"), q.Get("sort_by"), atoi(q.Get("limit")), atoi(q.Get("offset")))
-	if err != nil {
-		utils.InternalError(w, "查询配方市场失败")
+// ListMarketRecipes 查询当前Actor可见的配方市场排行榜。
+func (h *RecipeHandler) ListMarketRecipes(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	actor, ok := buildRecipeActor(w, r)
+	if !ok {
 		return
 	}
+
+	query := r.URL.Query()
+
+	resp, err :=
+		h.recipeService.
+			ListMarketRecipesForActor(
+				r.Context(),
+				actor,
+				query.Get("subject"),
+				query.Get("grade_range"),
+				query.Get("sort_by"),
+				atoi(query.Get("limit")),
+				atoi(query.Get("offset")),
+			)
+	if err != nil {
+		handleRecipeError(w, err)
+		return
+	}
+
 	utils.Success(w, resp)
 }
 

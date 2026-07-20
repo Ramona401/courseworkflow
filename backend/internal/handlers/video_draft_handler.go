@@ -1,152 +1,451 @@
 package handlers
 
-// video_draft_handler.go — 视频编辑器草稿HTTP处理器(v0.42.5)
+// video_draft_handler.go — 视频编辑器草稿HTTP处理器
 //
-// 接口:
-//   POST   /api/v1/coursewares/{id}/video-drafts            — 保存草稿
-//   GET    /api/v1/coursewares/{id}/video-drafts             — 列出草稿
-//   DELETE /api/v1/coursewares/{id}/video-drafts/{draft_id}  — 删除草稿
+// 路由：
+//   POST   /api/v1/coursewares/{id}/video-drafts
+//   GET    /api/v1/coursewares/{id}/video-drafts
+//   DELETE /api/v1/coursewares/{id}/video-drafts/{draft_id}
+//
+// Handler职责：
+//   - 严格解析路径与HTTP方法；
+//   - 从JWT读取可信操作者身份；
+//   - 保存入口在解析正文前完成课件微调权限预检；
+//   - 限制请求体大小并解析JSON；
+//   - 调用VideoDraftService执行正式权限与业务治理；
+//   - 映射稳定HTTP错误，不向浏览器泄露数据库内部错误。
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 
 	"tedna/internal/middleware"
-	"tedna/internal/repository"
+	"tedna/internal/services"
 	"tedna/internal/utils"
 )
 
-// VideoDraftHandler 视频编辑器草稿处理器
-type VideoDraftHandler struct{}
+// VideoDraftHandler 视频编辑器草稿处理器。
+type VideoDraftHandler struct {
+	draftService *services.VideoDraftService
+}
 
-// NewVideoDraftHandler 创建草稿处理器
-func NewVideoDraftHandler() *VideoDraftHandler { return &VideoDraftHandler{} }
+// NewVideoDraftHandler 创建视频草稿处理器。
+//
+// 保持无参数构造函数，避免改变现有路由接线。
+func NewVideoDraftHandler() *VideoDraftHandler {
+	return &VideoDraftHandler{
+		draftService: services.NewVideoDraftService(),
+	}
+}
 
-// HandleDrafts 统一路由分发
-func (h *VideoDraftHandler) HandleDrafts(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimRight(r.URL.Path, "/")
-	if strings.HasSuffix(path, "/video-drafts") {
+// videoDraftRouteKind 表示视频草稿路径类型。
+type videoDraftRouteKind int
+
+const (
+	videoDraftRouteInvalid videoDraftRouteKind = iota
+	videoDraftRouteCollection
+	videoDraftRouteItem
+)
+
+// parseVideoDraftPath 严格解析正式视频草稿路径。
+//
+// 只接受：
+//   - /api/v1/coursewares/{courseware_id}/video-drafts
+//   - /api/v1/coursewares/{courseware_id}/video-drafts/{draft_id}
+func parseVideoDraftPath(
+	path string,
+) (
+	string,
+	string,
+	videoDraftRouteKind,
+) {
+	const prefix = "/api/v1/coursewares/"
+
+	trimmed := strings.TrimRight(path, "/")
+	if !strings.HasPrefix(trimmed, prefix) {
+		return "", "", videoDraftRouteInvalid
+	}
+
+	rest := strings.TrimPrefix(trimmed, prefix)
+	parts := strings.Split(rest, "/")
+
+	if len(parts) == 2 &&
+		parts[0] != "" &&
+		parts[1] == "video-drafts" {
+		return parts[0], "", videoDraftRouteCollection
+	}
+
+	if len(parts) == 3 &&
+		parts[0] != "" &&
+		parts[1] == "video-drafts" &&
+		parts[2] != "" {
+		return parts[0], parts[2], videoDraftRouteItem
+	}
+
+	return "", "", videoDraftRouteInvalid
+}
+
+// requireVideoDraftActor 从请求上下文构造可信课件操作者。
+func requireVideoDraftActor(
+	w http.ResponseWriter,
+	r *http.Request,
+) (
+	*services.CoursewareActorContext,
+	bool,
+) {
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return nil, false
+	}
+
+	return services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	), true
+}
+
+// HandleDrafts 统一执行严格路由分发。
+func (h *VideoDraftHandler) HandleDrafts(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	_, _, routeKind := parseVideoDraftPath(r.URL.Path)
+
+	switch routeKind {
+	case videoDraftRouteCollection:
 		switch r.Method {
 		case http.MethodGet:
 			h.ListDrafts(w, r)
+
 		case http.MethodPost:
 			h.SaveDraft(w, r)
+
 		default:
-			utils.Fail(w, http.StatusMethodNotAllowed, "仅支持 GET/POST")
+			utils.Fail(
+				w,
+				http.StatusMethodNotAllowed,
+				"仅支持GET或POST",
+			)
 		}
-		return
-	}
-	if r.Method == http.MethodDelete && strings.Contains(path, "/video-drafts/") {
+
+	case videoDraftRouteItem:
+		if r.Method != http.MethodDelete {
+			utils.Fail(
+				w,
+				http.StatusMethodNotAllowed,
+				"草稿详情仅支持DELETE",
+			)
+			return
+		}
+
 		h.DeleteDraft(w, r)
-		return
+
+	default:
+		utils.Fail(
+			w,
+			http.StatusNotFound,
+			"未找到视频草稿路由",
+		)
 	}
-	utils.Fail(w, http.StatusNotFound, "未找到路由")
 }
 
-// SaveDraft POST /api/v1/coursewares/{id}/video-drafts
-func (h *VideoDraftHandler) SaveDraft(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+// SaveDraft 保存视频编辑器草稿。
+func (h *VideoDraftHandler) SaveDraft(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if r.Method != http.MethodPost {
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST",
+		)
 		return
 	}
-	cwID := extractDraftCoursewareID(r.URL.Path)
-	if cwID == "" {
-		utils.BadRequest(w, "缺少课件ID")
+
+	coursewareID, _, routeKind :=
+		parseVideoDraftPath(r.URL.Path)
+
+	if routeKind != videoDraftRouteCollection ||
+		coursewareID == "" {
+		utils.BadRequest(
+			w,
+			"无效的课件草稿路径",
+		)
 		return
 	}
-	var req struct {
-		Name      string          `json:"name"`
-		ClipsData json.RawMessage `json:"clips_data"`
-		ClipCount int             `json:"clip_count"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+
+	actor, ok := requireVideoDraftActor(w, r)
+	if !ok {
 		return
 	}
-	if len(req.ClipsData) == 0 || req.ClipCount <= 0 {
-		utils.BadRequest(w, "草稿数据不能为空")
-		return
-	}
-	// 超过10个时自动删除最旧的
-	count, _ := repository.CountVideoDrafts(r.Context(), cwID, claims.UserID)
-	if count >= 10 {
-		_ = repository.DeleteOldestVideoDraft(r.Context(), cwID, claims.UserID)
-	}
-	id, createdAt, err := repository.CreateVideoDraft(r.Context(), cwID, claims.UserID, req.Name, string(req.ClipsData), req.ClipCount)
+
+	// 在读取最多2MB正文前先完成课件微调权限预检。
+	//
+	// 该预检只用于尽早拒绝无权请求，不替代Service正式写库前
+	// 重新加载课件并再次授权。
+	scopedActor, err := h.draftService.PreflightSaveDraft(
+		r.Context(),
+		coursewareID,
+		actor,
+	)
 	if err != nil {
-		utils.InternalError(w, "保存草稿失败: "+err.Error())
+		writeVideoDraftError(w, err)
 		return
 	}
-	utils.Success(w, map[string]interface{}{"id": id, "created_at": createdAt, "message": "草稿保存成功"})
-}
 
-// ListDrafts GET /api/v1/coursewares/{id}/video-drafts
-func (h *VideoDraftHandler) ListDrafts(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
-		return
-	}
-	cwID := extractDraftCoursewareID(r.URL.Path)
-	if cwID == "" {
-		utils.BadRequest(w, "缺少课件ID")
-		return
-	}
-	drafts, err := repository.ListVideoDrafts(r.Context(), cwID, claims.UserID)
+	input, err := decodeVideoDraftSaveInput(w, r)
 	if err != nil {
-		utils.InternalError(w, "查询草稿失败: "+err.Error())
+		var maxBytesError *http.MaxBytesError
+
+		if errors.As(err, &maxBytesError) {
+			utils.Fail(
+				w,
+				http.StatusRequestEntityTooLarge,
+				"视频草稿请求体不能超过2MB",
+			)
+			return
+		}
+
+		utils.BadRequest(
+			w,
+			"视频草稿请求格式错误",
+		)
 		return
 	}
-	utils.Success(w, map[string]interface{}{"drafts": drafts, "total": len(drafts)})
+
+	draft, err := h.draftService.SaveDraft(
+		r.Context(),
+		coursewareID,
+		scopedActor,
+		input,
+	)
+	if err != nil {
+		writeVideoDraftError(w, err)
+		return
+	}
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"id":         draft.ID,
+			"created_at": draft.CreatedAt,
+			"message":    "草稿保存成功",
+		},
+	)
 }
 
-// DeleteDraft DELETE /api/v1/coursewares/{id}/video-drafts/{draft_id}
-func (h *VideoDraftHandler) DeleteDraft(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
-		return
+// decodeVideoDraftSaveInput 限制请求体并确保只包含一个JSON对象。
+func decodeVideoDraftSaveInput(
+	w http.ResponseWriter,
+	r *http.Request,
+) (
+	*services.VideoDraftSaveInput,
+	error,
+) {
+	r.Body = http.MaxBytesReader(
+		w,
+		r.Body,
+		services.VideoDraftMaxBodyBytes,
+	)
+
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	input := &services.VideoDraftSaveInput{}
+	if err := decoder.Decode(input); err != nil {
+		return nil, err
 	}
-	draftID := extractDraftID(r.URL.Path)
-	if draftID == "" {
-		utils.BadRequest(w, "缺少草稿ID")
-		return
+
+	var extra interface{}
+
+	err := decoder.Decode(&extra)
+	if !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New(
+				"请求体包含多个JSON值",
+			)
+		}
+
+		return nil, err
 	}
-	if err := repository.DeleteVideoDraft(r.Context(), draftID, claims.UserID); err != nil {
-		utils.InternalError(w, "删除草稿失败: "+err.Error())
-		return
-	}
-	utils.Success(w, map[string]string{"message": "草稿已删除"})
+
+	return input, nil
 }
 
-// extractDraftCoursewareID 从 /api/v1/coursewares/{id}/video-drafts[/...] 提取课件ID
-func extractDraftCoursewareID(path string) string {
-	const prefix = "/api/v1/coursewares/"
-	const marker = "/video-drafts"
-	trimmed := strings.TrimRight(path, "/")
-	idx := strings.Index(trimmed, marker)
-	if idx < 0 || !strings.HasPrefix(trimmed, prefix) {
-		return ""
+// ListDrafts 列出当前用户在指定课件中的草稿。
+func (h *VideoDraftHandler) ListDrafts(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if r.Method != http.MethodGet {
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET",
+		)
+		return
 	}
-	cwPart := trimmed[len(prefix):idx]
-	if cwPart == "" || strings.Contains(cwPart, "/") {
-		return ""
+
+	coursewareID, _, routeKind :=
+		parseVideoDraftPath(r.URL.Path)
+
+	if routeKind != videoDraftRouteCollection ||
+		coursewareID == "" {
+		utils.BadRequest(
+			w,
+			"无效的课件草稿路径",
+		)
+		return
 	}
-	return cwPart
+
+	actor, ok := requireVideoDraftActor(w, r)
+	if !ok {
+		return
+	}
+
+	drafts, err := h.draftService.ListDrafts(
+		r.Context(),
+		coursewareID,
+		actor,
+	)
+	if err != nil {
+		writeVideoDraftError(w, err)
+		return
+	}
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"drafts": drafts,
+			"total":  len(drafts),
+		},
+	)
 }
 
-// extractDraftID 从 /api/v1/coursewares/{id}/video-drafts/{draft_id} 提取草稿ID
-func extractDraftID(path string) string {
-	const marker = "/video-drafts/"
-	idx := strings.LastIndex(path, marker)
-	if idx < 0 {
-		return ""
+// DeleteDraft 删除当前路径课件中的本人草稿。
+func (h *VideoDraftHandler) DeleteDraft(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if r.Method != http.MethodDelete {
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持DELETE",
+		)
+		return
 	}
-	rest := strings.TrimRight(path[idx+len(marker):], "/")
-	if rest == "" || strings.Contains(rest, "/") {
-		return ""
+
+	coursewareID, draftID, routeKind :=
+		parseVideoDraftPath(r.URL.Path)
+
+	if routeKind != videoDraftRouteItem ||
+		coursewareID == "" ||
+		draftID == "" {
+		utils.BadRequest(
+			w,
+			"无效的视频草稿路径",
+		)
+		return
 	}
-	return rest
+
+	actor, ok := requireVideoDraftActor(w, r)
+	if !ok {
+		return
+	}
+
+	if err := h.draftService.DeleteDraft(
+		r.Context(),
+		coursewareID,
+		draftID,
+		actor,
+	); err != nil {
+		writeVideoDraftError(w, err)
+		return
+	}
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "草稿已删除",
+		},
+	)
+}
+
+// writeVideoDraftError 映射视频草稿稳定业务错误。
+func writeVideoDraftError(
+	w http.ResponseWriter,
+	err error,
+) {
+	switch {
+	case errors.Is(
+		err,
+		services.ErrCoursewareAccessNotFound,
+	),
+		errors.Is(
+			err,
+			services.ErrVideoDraftNotFound,
+		):
+		utils.Fail(
+			w,
+			http.StatusNotFound,
+			err.Error(),
+		)
+
+	case errors.Is(
+		err,
+		services.ErrCoursewareActorRequired,
+	),
+		errors.Is(
+			err,
+			services.ErrCoursewareViewDenied,
+		),
+		errors.Is(
+			err,
+			services.ErrCoursewareEditDenied,
+		),
+		errors.Is(
+			err,
+			services.ErrCoursewareEducationDomainMismatch,
+		):
+		utils.Fail(
+			w,
+			http.StatusForbidden,
+			err.Error(),
+		)
+
+	case errors.Is(
+		err,
+		services.ErrVideoDraftInputInvalid,
+	):
+		utils.BadRequest(
+			w,
+			err.Error(),
+		)
+
+	case errors.Is(
+		err,
+		services.ErrCoursewareEducationDomainInvalid,
+	),
+		errors.Is(
+			err,
+			services.ErrCoursewareRuntimeDomainRequired,
+		):
+		utils.InternalError(
+			w,
+			"课件运行环境异常，请联系管理员",
+		)
+
+	default:
+		utils.InternalError(
+			w,
+			"视频草稿服务异常，请稍后重试",
+		)
+	}
 }

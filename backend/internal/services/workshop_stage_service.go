@@ -570,39 +570,44 @@ func (s *WorkshopStageService) LoadStagePromptContextV2(
 	assistantPrompt string,
 	recentUserText string, // 技能路由 Phase1:透传给 BuildStageSystemPromptV2 第3层精排;空串→保底
 ) (string, error) {
-	// 运行时重新校验lesson_plans.recipe_id。
+
+	// 根据本会话的配方三态重新加载lesson_plans.recipe_id。
 	//
-	// 存量教案可能已经关联了跨学科、跨年级或学段级配方。
-	// 这里不修改数据库，只在本轮提示词装配中忽略不适用配方，
-	// 防止错误配方继续提供阶段定义、教案结构、流程模式和上下文。
+	// auto继续执行学科和具体年级严格校验；
+	// selected执行active与老师可见范围校验，不再限制学科和年级；
+	// none明确不加载配方。
+	//
+	// 这里不修改数据库。配方已停用、删除或老师失去使用权限时，
+	// 本轮安全忽略并由上下文回执向老师说明。
 	var recipe *models.TeachingRecipe
 	validRecipeID := ""
 
 	if lp.RecipeID != nil &&
 		strings.TrimSpace(*lp.RecipeID) != "" {
-		candidate, recipeErr := loadRecipeForLesson(
-			ctx,
-			*lp.RecipeID,
-			lp.Subject,
-			lp.Grade,
-		)
+		candidate, selectionMode, recipeErr :=
+			loadRecipeForPlanUse(
+				ctx,
+				lp,
+			)
+
 		if recipeErr != nil {
 			wsLog.Warn(
-				"教案关联配方不适用于当前学科或具体年级，本轮忽略",
+				"教案关联配方当前不可用，本轮忽略",
 				"plan_id", lp.ID,
 				"stage", stageCode,
 				"recipe_id", *lp.RecipeID,
+				"recipe_mode", selectionMode,
 				"subject", lp.Subject,
 				"grade", lp.Grade,
 				"error", recipeErr,
 			)
-		} else {
+		} else if candidate != nil {
 			recipe = candidate
 			validRecipeID = candidate.ID
 		}
 	}
 
-	// 只有严格有效的配方才能启用配方自定义阶段。
+	// 只有按本会话选择方式验证有效的配方才能启用配方自定义阶段。
 	isCustomStage := false
 	if recipe != nil &&
 		lp.StageConfig != "" &&
@@ -705,7 +710,7 @@ func (s *WorkshopStageService) LoadStagePromptContextV2(
 		)
 	}
 
-	// 只有严格有效的配方才能提供全局上下文、教案结构和备课模式。
+	// 只有按本会话选择方式验证有效的配方才能提供全局上下文、教案结构和备课模式。
 	promptMode := models.PromptModeGuided
 	lessonStructure := ""
 
@@ -759,26 +764,41 @@ func (s *WorkshopStageService) LoadStagePromptContextV2(
 		recentUserText,
 	)
 
-	// 迭代7B：注入老师勾选的课本原文（新增一层，置于系统提示词末尾）
-	// 数据来源：lesson_plans.textbook_page_ids（备课工坊新建时勾选并落库）。
-	// 仅在 textbookService 已注入、且本教案确有关联课本时拼接；任何缺失都静默跳过，
-	// 不影响原有六层提示词。课本原文用 OCR 文字（未识别的页会带"未识别"占位提示）。
-	if s.textbookService != nil && strings.TrimSpace(lp.TextbookPageIDs) != "" && lp.TextbookPageIDs != "[]" {
-		var tbIDs []string
-		if uErr := json.Unmarshal([]byte(lp.TextbookPageIDs), &tbIDs); uErr == nil && len(tbIDs) > 0 {
-			tbContext := s.textbookService.BuildTextbookContext(ctx, tbIDs)
-			if strings.TrimSpace(tbContext) != "" {
-				basePrompt += "\n" + tbContext
-				wsLog.Info("已注入课本原文上下文",
-					"plan_id", lp.ID, "stage", stageCode, "textbook_count", len(tbIDs))
-			}
+	// 上下文15：按照教案正式数据库快照注入K12课本原文。
+	//
+	// BuildLessonPlanTextbookContext会在每轮AI调用前重新验证：
+	//   - lesson_plans.education_domain必须严格为k12；
+	//   - textbook_page_ids必须是合法JSON数组且无重复；
+	//   - 所有页面必须存在、为active；
+	//   - 页面学科和年级必须与教案快照一致；
+	//   - 伪造、归档或跨属性ID整体拒绝。
+	//
+	// 数据库错误和异常关联必须向上返回并终止本轮AI调用，
+	// 不能再静默伪装成“没有关联课本”。
+	if strings.TrimSpace(lp.TextbookPageIDs) != "" &&
+		lp.TextbookPageIDs != "[]" {
+		textbookContext, textbookErr :=
+			BuildLessonPlanTextbookContext(
+				ctx,
+				lp,
+			)
+		if textbookErr != nil {
+			return "", fmt.Errorf(
+				"加载课本原文上下文失败: %w",
+				textbookErr,
+			)
 		}
-	} else if strings.TrimSpace(lp.TextbookPageIDs) != "" && lp.TextbookPageIDs != "[]" {
-		// 防御性告警：教案确实关联了课本图，却因 textbookService 未注入而无法注入课本原文。
-		// 这正是迭代7B曾踩过的"双实例导致 textbookService==nil"坑——一旦再发生，
-		// 这条 Warn 会在日志里立刻暴露，不必再靠老师反馈"AI说看不到课本"才发现。
-		wsLog.Warn("应注入课本但课本服务未注入（textbookService==nil），本次跳过课本原文注入",
-			"plan_id", lp.ID, "stage", stageCode, "textbook_page_ids", lp.TextbookPageIDs)
+
+		if strings.TrimSpace(textbookContext) != "" {
+			basePrompt += "\n" + textbookContext
+
+			wsLog.Info(
+				"已通过K12运行时硬闸注入课本原文上下文",
+				"plan_id", lp.ID,
+				"stage", stageCode,
+				"education_domain", lp.EducationDomain,
+			)
+		}
 	}
 
 	// 单元方案注入层（大单元备课·批次二·注入）——置于课本层之后、课程大纲层之前。
@@ -812,49 +832,114 @@ func (s *WorkshopStageService) LoadStagePromptContextV2(
 		}
 	}
 
-	// 课程大纲注入（大单元备课能力·批次一·注入）
-	// 仅在「教学分析 analyze」「教学设计 design」两阶段注入——撰写/评审/修订不需要全册大纲，省 token 又不干扰。
-	// 匹配：按学科粗筛同学科 active 大纲，再用「学段范围覆盖」打分取最贴合一份；一份都没命中 → 静默跳过
-	//（正常单课备课，不报错不提示，符合"没匹配上就不注入"的设计）。
+	// 课程大纲注入（上下文16教育域硬闸）
 	//
-	// 大单元备课·批次二「让位」：若本教案已成功注入 active 单元方案（unitPlanInjected=true），
-	// 则 analyze/design 两阶段不再注入课程大纲——有大单元就不要大纲（Yuhan 决策）。
-	// 单元方案是更具体的「本课所属大单元的纲」，与册级大纲并存会冗余且抢 token，故让位。
-	if (stageCode == "analyze" || stageCode == "design") && !unitPlanInjected {
-		if strings.TrimSpace(lp.Subject) != "" && strings.TrimSpace(lp.Grade) != "" {
-			candidates, coErr := repository.ListActiveOutlinesBySubject(ctx, lp.Subject)
-			if coErr != nil {
-				wsLog.Warn("查询课程大纲候选失败，跳过大纲注入",
-					"plan_id", lp.ID, "stage", stageCode, "subject", lp.Subject, "error", coErr)
-			} else if lp.CourseOutlinePublisher == nil {
-				// 教材版本增强（Yuhan 决策）：大纲注入改为「老师在备课首屏显式选定教材版本」。
-				// CourseOutlinePublisher == nil 表示老师没选版本 / 没关联大纲 → 静默不注入，
-				// 不再像旧逻辑那样自动按学段匹配。没选版本就是不注入，正常单课备课。
-				wsLog.Info("教案未选定课程大纲教材版本，跳过大纲注入",
-					"plan_id", lp.ID, "stage", stageCode, "subject", lp.Subject, "plan_grade", lp.Grade)
-			} else if hits := MatchOutlinesByPublisher(lp.Grade, *lp.CourseOutlinePublisher, candidates); len(hits) > 0 {
-				// 版本精确注入（Yuhan 决策）：只注入 publisher == 老师选定版本 的大纲，零跨版本兜底。
-				// 选定版本下、学段相交命中的大纲多份全注入（同年级上下册等）。
-				// *lp.CourseOutlinePublisher 为空串=老师选了"通用/不限版本"，则精确匹配 publisher 为空串的大纲。
-				if outlineCtx := BuildCourseOutlinesContext(hits); strings.TrimSpace(outlineCtx) != "" {
-					basePrompt += outlineCtx
-					// 收集命中大纲的标题，便于日志核对"到底注入了哪几份"
-					hitTitles := make([]string, 0, len(hits))
-					for _, h := range hits {
-						hitTitles = append(hitTitles, h.Title)
+	// 仅在analyze/design阶段、且没有更具体的单元方案时执行。
+	//
+	// BuildLessonPlanCourseOutlineContext统一保证：
+	//   - 使用lesson_plans.education_domain正式快照；
+	//   - 查询只命中同教育域资源；
+	//   - K12保持出版社精确匹配；
+	//   - vocational/adult只允许空出版社普通大纲；
+	//   - 非K12具名出版社和非法快照直接报错；
+	//   - 数据库失败向上传递，不伪装成没有大纲。
+	if (stageCode == "analyze" ||
+		stageCode == "design") &&
+		!unitPlanInjected {
+		if lp.CourseOutlinePublisher == nil {
+			wsLog.Info(
+				"教案未挂载课程大纲，跳过大纲注入",
+				"plan_id",
+				lp.ID,
+				"stage",
+				stageCode,
+				"subject",
+				lp.Subject,
+				"education_domain",
+				lp.EducationDomain,
+			)
+		} else {
+			outlineContext,
+				hits,
+				outlineErr :=
+				BuildLessonPlanCourseOutlineContext(
+					ctx,
+					lp,
+				)
+			if outlineErr != nil {
+				return "", fmt.Errorf(
+					"加载课程大纲上下文失败: %w",
+					outlineErr,
+				)
+			}
+
+			if strings.TrimSpace(
+				outlineContext,
+			) != "" {
+				basePrompt += outlineContext
+
+				hitTitles := make(
+					[]string,
+					0,
+					len(hits),
+				)
+				for _, hit := range hits {
+					if hit == nil {
+						continue
 					}
-					wsLog.Info("已注入课程大纲上下文（多份）",
-						"plan_id", lp.ID, "stage", stageCode,
-						"subject", lp.Subject, "plan_grade", lp.Grade,
-						"outline_count", len(hits),
-						"outline_titles", strings.Join(hitTitles, " | "))
+
+					hitTitles = append(
+						hitTitles,
+						hit.Title,
+					)
 				}
+
+				wsLog.Info(
+					"已通过教育域硬闸注入课程大纲",
+					"plan_id",
+					lp.ID,
+					"stage",
+					stageCode,
+					"subject",
+					lp.Subject,
+					"plan_grade",
+					lp.Grade,
+					"education_domain",
+					lp.EducationDomain,
+					"outline_count",
+					len(hits),
+					"outline_titles",
+					strings.Join(
+						hitTitles,
+						" | ",
+					),
+				)
+			} else {
+				wsLog.Info(
+					"当前教育域下没有匹配课程大纲",
+					"plan_id",
+					lp.ID,
+					"stage",
+					stageCode,
+					"subject",
+					lp.Subject,
+					"plan_grade",
+					lp.Grade,
+					"education_domain",
+					lp.EducationDomain,
+				)
 			}
 		}
-	} else if (stageCode == "analyze" || stageCode == "design") && unitPlanInjected {
-		// 让位日志：明确记录"因已注入单元方案而跳过课程大纲"，便于核对优先级生效。
-		wsLog.Info("已注入单元方案，课程大纲让位（本阶段不注入大纲）",
-			"plan_id", lp.ID, "stage", stageCode)
+	} else if (stageCode == "analyze" ||
+		stageCode == "design") &&
+		unitPlanInjected {
+		wsLog.Info(
+			"已注入单元方案，课程大纲让位",
+			"plan_id",
+			lp.ID,
+			"stage",
+			stageCode,
+		)
 	}
 
 	// 班级学情注入层（差异化教学·批次3·注入）——置于课程大纲层之后、return 之前。

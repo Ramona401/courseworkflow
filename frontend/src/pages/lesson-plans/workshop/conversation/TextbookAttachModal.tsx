@@ -17,6 +17,8 @@ import {
   type TextbookListItem,
 } from '@/api/textbooks'
 import { useAuth } from '@/store/auth'
+import { useEducationProfile } from '@/hooks/useEducationProfile'
+import ProtectedTextbookImage from '@/components/textbooks/ProtectedTextbookImage'
 
 /* ==================== 颜色常量 ==================== */
 const C = {
@@ -42,6 +44,7 @@ interface Props {
 
 export default function TextbookAttachModal({ planId, subject, grade, currentPageIds, onSuccess, onCancel }: Props) {
   const { user } = useAuth()
+  const { isK12 } = useEducationProfile()
 
   // 列表 + 选择
   const [pages, setPages] = useState<TextbookListItem[]>([])
@@ -69,6 +72,14 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
 
   // ==================== 加载课本列表（按当前教案学科+年级过滤）====================
   const loadPages = useCallback(async () => {
+    // 当前教育域不为K12时不发送课本列表请求。
+    // 后端仍保留独立硬闸，前端判断只用于避免无意义请求。
+    if (!isK12) {
+      setPages([])
+      setLoading(false)
+      return
+    }
+
     setLoading(true)
     try {
       const params: Record<string, string | number> = { limit: 200 }
@@ -78,7 +89,7 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
       setPages(resp.pages || [])
     } catch { showToast('加载课本列表失败', 'error') }
     finally { setLoading(false) }
-  }, [subject, grade])
+  }, [isK12, subject, grade])
 
   useEffect(() => { loadPages() }, [loadPages])
 
@@ -89,6 +100,12 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
 
   // ==================== 批量上传（页码自动递增，上传后自动选中+自动OCR）====================
   const handleUpload = async () => {
+    // 非K12不能通过缓存弹窗触发课本上传。
+    if (!isK12) {
+      showToast('当前教育域暂无课本能力', 'error')
+      return
+    }
+
     if (upFiles.length === 0 || !upName.trim()) {
       showToast('请选择图片并填写教材名称', 'error'); return
     }
@@ -140,6 +157,12 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
   // ==================== 删除自己上传的图 ====================
   const handleDelete = async (e: React.MouseEvent, item: TextbookListItem) => {
     e.stopPropagation()
+    // 非K12不能通过缓存弹窗触发课本删除。
+    if (!isK12) {
+      showToast('当前教育域暂无课本能力', 'error')
+      return
+    }
+
     if (!confirm(`确定删除自己上传的「${item.file_name}」？删除后无法恢复。`)) return
     setDeletingId(item.id)
     try {
@@ -155,6 +178,12 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
   // ==================== 单张手动OCR ====================
   const handleOCR = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation()
+    // 非K12不能通过缓存弹窗触发OCR。
+    if (!isK12) {
+      showToast('当前教育域暂无课本能力', 'error')
+      return
+    }
+
     setOcrRunningId(id)
     try {
       await triggerTextbookOCR(id)
@@ -167,6 +196,11 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
 
   // ==================== 确认关联（保持原回调签名：只传ID数组）====================
   const handleConfirm = () => {
+    if (!isK12) {
+      showToast('当前教育域暂无课本能力', 'error')
+      return
+    }
+
     onSuccess(selectedIds)
   }
 
@@ -180,6 +214,122 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
     background: active ? C.primaryLight : 'transparent', color: active ? C.primary : C.textSec,
     fontSize: '12px', fontWeight: active ? 600 : 400, cursor: 'pointer',
   })
+
+  if (!isK12) {
+    return (
+      <div
+        style={{
+          position: 'fixed',
+          inset: 0,
+          background: 'rgba(0,0,0,0.6)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 10000,
+        }}
+        onClick={event => {
+          if (event.target === event.currentTarget) {
+            onCancel()
+          }
+        }}
+      >
+        <div
+          style={{
+            width: '520px',
+            maxWidth: 'calc(100vw - 32px)',
+            background: C.card,
+            borderRadius: '16px',
+            boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
+            overflow: 'hidden',
+          }}
+        >
+          <div
+            style={{
+              padding: '16px 24px',
+              borderBottom: `1px solid ${C.border}`,
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+            }}
+          >
+            <div
+              style={{
+                fontSize: '16px',
+                fontWeight: 700,
+                color: C.text,
+              }}
+            >
+              📷 关联课本图片
+            </div>
+
+            <button
+              onClick={onCancel}
+              style={{
+                border: 'none',
+                background: 'none',
+                cursor: 'pointer',
+                fontSize: '20px',
+                color: C.textMuted,
+              }}
+            >
+              ✕
+            </button>
+          </div>
+
+          <div
+            style={{
+              padding: '64px 24px',
+              textAlign: 'center',
+            }}
+          >
+            <div
+              style={{
+                fontSize: '42px',
+                marginBottom: '14px',
+              }}
+            >
+              📚
+            </div>
+
+            <div
+              style={{
+                fontSize: '16px',
+                fontWeight: 700,
+                color: C.text,
+              }}
+            >
+              当前教育域暂无课本能力
+            </div>
+          </div>
+
+          <div
+            style={{
+              padding: '14px 24px',
+              borderTop: `1px solid ${C.border}`,
+              display: 'flex',
+              justifyContent: 'flex-end',
+            }}
+          >
+            <button
+              onClick={onCancel}
+              style={{
+                padding: '8px 20px',
+                borderRadius: '8px',
+                border: 'none',
+                background: C.primary,
+                color: '#fff',
+                fontSize: '13px',
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              关闭
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}
@@ -314,8 +464,16 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
                     )}
                     {/* 缩略图 */}
                     <div style={{ height: '110px', background: C.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
-                      <img src={item.image_url} alt={item.file_name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
-                        onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
+                      <ProtectedTextbookImage
+                        textbookId={item.id}
+                        alt={item.file_name}
+                        style={{
+                          maxWidth: '100%',
+                          maxHeight: '100%',
+                          objectFit: 'contain',
+                        }}
+                        fallback="📷"
+                      />
                     </div>
                     {/* 信息 */}
                     <div style={{ padding: '8px 10px' }}>
@@ -358,12 +516,18 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
           <span style={{ fontSize: '13px', color: C.textSec }}>已选 {selectedIds.length} 张课本页</span>
           <div style={{ display: 'flex', gap: '10px' }}>
             <button onClick={onCancel} style={{ padding: '8px 18px', borderRadius: '8px', border: `1px solid ${C.border}`, background: 'transparent', color: C.textSec, fontSize: '13px', cursor: 'pointer' }}>取消</button>
-            <button onClick={handleConfirm} disabled={selectedIds.length === 0} style={{
+            <button onClick={handleConfirm} style={{
               padding: '8px 22px', borderRadius: '8px', border: 'none',
-              background: selectedIds.length === 0 ? C.border : C.primary,
-              color: selectedIds.length === 0 ? C.textMuted : '#fff',
-              fontSize: '13px', fontWeight: 600, cursor: selectedIds.length === 0 ? 'not-allowed' : 'pointer',
-            }}>{selectedIds.length === 0 ? '请至少选择1张课本页' : `确认关联 (${selectedIds.length})`}</button>
+              background: C.primary,
+              color: '#fff',
+              fontSize: '13px', fontWeight: 600, cursor: 'pointer',
+            }}>
+              {selectedIds.length === 0
+                ? currentPageIds.length > 0
+                  ? '解除全部关联'
+                  : '确认不关联课本'
+                : `确认关联 (${selectedIds.length})`}
+            </button>
           </div>
         </div>
 

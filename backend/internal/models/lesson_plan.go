@@ -32,6 +32,7 @@ type LessonPlan struct {
 	AuthorID               string     `json:"author_id"`                // 作者用户ID
 	GroupID                *string    `json:"group_id"`                 // 所属教研组ID
 	SchoolID               *string    `json:"school_id"`                // 所属学校ID
+	EducationDomain        string     `json:"education_domain"`         // 教育域快照：k12/vocational/adult/common，创建后不可随用户或组织换域而改变
 	ForkedFrom             *string    `json:"forked_from"`              // fork来源教案ID
 	ForkCount              int        `json:"fork_count"`               // 被fork次数
 	TemplateID             *string    `json:"template_id"`              // 使用的提示词模板ID

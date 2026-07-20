@@ -28,6 +28,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -56,6 +57,85 @@ func NewCoursewareAssetHandler(assetService *services.CoursewareAssetService, os
 	}
 }
 
+// requireCoursewareAssetOwnerActor 在进入作者私有素材库前构造可信Actor并完成预检。
+//
+// 上传接口必须在ParseMultipartForm之前调用，避免无权请求先消耗内存或临时磁盘。
+func requireCoursewareAssetOwnerActor(
+	w http.ResponseWriter,
+	r *http.Request,
+	coursewareID string,
+	userID string,
+	role string,
+) (*services.CoursewareActorContext, bool) {
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		userID,
+		role,
+	)
+
+	_, scopedActor, err :=
+		(&services.CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				r.Context(),
+				coursewareID,
+				actor,
+			)
+	if err != nil {
+		handleCoursewareAccessError(
+			w,
+			err,
+			"课件素材操作授权失败",
+		)
+		return nil, false
+	}
+
+	return scopedActor, true
+}
+
+// handleCoursewareAssetServiceError 保留原素材业务错误正文，
+// 仅把可信Actor和教育域授权错误交给统一课件访问错误映射。
+func handleCoursewareAssetServiceError(
+	w http.ResponseWriter,
+	err error,
+) {
+	switch {
+	case errors.Is(
+		err,
+		services.ErrCoursewareActorRequired,
+	),
+		errors.Is(
+			err,
+			services.ErrCoursewareAccessNotFound,
+		),
+		errors.Is(
+			err,
+			services.ErrCoursewareOwnerRuntimeDenied,
+		),
+		errors.Is(
+			err,
+			services.ErrCoursewareEducationDomainInvalid,
+		),
+		errors.Is(
+			err,
+			services.ErrCoursewareEducationDomainMismatch,
+		),
+		errors.Is(
+			err,
+			services.ErrCoursewareRuntimeDomainRequired,
+		):
+		handleCoursewareAccessError(
+			w,
+			err,
+			"课件素材操作授权失败",
+		)
+	default:
+		utils.InternalError(
+			w,
+			err.Error(),
+		)
+	}
+}
+
 // ==================== AI生成图片 ====================
 
 // GenerateImage POST /api/v1/coursewares/{id}/pages/{num}/generate-image
@@ -66,54 +146,92 @@ func NewCoursewareAssetHandler(assetService *services.CoursewareAssetService, os
 //	  "size": "2560x1440",           // 可选:图片尺寸,默认1920x1920
 //	  "ref_image_url": "/uploads/courseware-assets/xxx/p1/xxx.jpg"  // 可选:参考图URL
 //	}
-func (h *CoursewareAssetHandler) GenerateImage(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) GenerateImage(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	cwID, pageNum := extractCWAssetPageActionPath(r.URL.Path, "/generate-image")
-	if cwID == "" || pageNum <= 0 {
+	coursewareID, pageNumber :=
+		extractCWAssetPageActionPath(
+			r.URL.Path,
+			"/generate-image",
+		)
+	if coursewareID == "" || pageNumber <= 0 {
 		utils.BadRequest(w, "路径参数错误")
 		return
 	}
 
-	var req struct {
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
+		return
+	}
+
+	var request struct {
 		Prompt        string `json:"prompt"`
 		PlaceholderID string `json:"placeholder_id"`
 		Size          string `json:"size"`
 		RefImageURL   string `json:"ref_image_url"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+
+	if err := json.NewDecoder(r.Body).Decode(
+		&request,
+	); err != nil {
+		utils.BadRequest(
+			w,
+			"请求参数格式错误",
+		)
 		return
 	}
-	if req.Prompt == "" {
-		utils.BadRequest(w, "图片生成提示词不能为空")
+	if strings.TrimSpace(request.Prompt) == "" {
+		utils.BadRequest(
+			w,
+			"图片生成提示词不能为空",
+		)
 		return
 	}
 
-	svcReq := &services.GenerateImageServiceRequest{
-		CoursewareID:  cwID,
-		PageNumber:    pageNum,
-		PlaceholderID: req.PlaceholderID,
-		Prompt:        req.Prompt,
-		Size:          req.Size,
-		RefImageURL:   req.RefImageURL,
-		UserID:        claims.UserID,
-	}
-
-	resp, err := h.assetService.GenerateImage(r.Context(), svcReq)
+	response, err := h.assetService.GenerateImage(
+		r.Context(),
+		&services.GenerateImageServiceRequest{
+			CoursewareID:  coursewareID,
+			PageNumber:    pageNumber,
+			PlaceholderID: request.PlaceholderID,
+			Prompt:        request.Prompt,
+			Size:          request.Size,
+			RefImageURL:   request.RefImageURL,
+			Actor:         actor,
+		},
+	)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
 		return
 	}
-	utils.Success(w, resp)
+
+	utils.Success(w, response)
 }
 
 // ==================== 手动上传图片 ====================
@@ -121,50 +239,88 @@ func (h *CoursewareAssetHandler) GenerateImage(w http.ResponseWriter, r *http.Re
 // UploadImage POST /api/v1/coursewares/{id}/pages/{num}/upload-image
 // Content-Type: multipart/form-data
 // 字段: file(图片) + placeholder_id(可选)
-func (h *CoursewareAssetHandler) UploadImage(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) UploadImage(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	cwID, pageNum := extractCWAssetPageActionPath(r.URL.Path, "/upload-image")
-	if cwID == "" || pageNum <= 0 {
+	coursewareID, pageNumber :=
+		extractCWAssetPageActionPath(
+			r.URL.Path,
+			"/upload-image",
+		)
+	if coursewareID == "" || pageNumber <= 0 {
 		utils.BadRequest(w, "路径参数错误")
 		return
 	}
 
-	if err := r.ParseMultipartForm(6 << 20); err != nil {
-		utils.BadRequest(w, "文件解析失败: "+err.Error())
+	// 必须先授权，再解析multipart。
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
+		return
+	}
+
+	if err := r.ParseMultipartForm(
+		6 << 20,
+	); err != nil {
+		utils.BadRequest(
+			w,
+			"文件解析失败: "+err.Error(),
+		)
 		return
 	}
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		utils.BadRequest(w, "缺少文件字段 file")
+		utils.BadRequest(
+			w,
+			"缺少文件字段 file",
+		)
 		return
 	}
 	defer file.Close()
 
-	placeholderID := r.FormValue("placeholder_id")
-
-	svcReq := &services.UploadAssetRequest{
-		CoursewareID:  cwID,
-		PageNumber:    pageNum,
-		PlaceholderID: placeholderID,
-		UserID:        claims.UserID,
-	}
-
-	resp, err := h.assetService.UploadAsset(r.Context(), svcReq, file, header)
+	response, err := h.assetService.UploadAsset(
+		r.Context(),
+		&services.UploadAssetRequest{
+			CoursewareID:  coursewareID,
+			PageNumber:    pageNumber,
+			PlaceholderID: r.FormValue("placeholder_id"),
+			Actor:         actor,
+		},
+		file,
+		header,
+	)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
 		return
 	}
-	utils.Success(w, resp)
+
+	utils.Success(w, response)
 }
 
 // ==================== v0.42.5 手动上传视频 ====================
@@ -185,73 +341,107 @@ func (h *CoursewareAssetHandler) UploadImage(w http.ResponseWriter, r *http.Requ
 // detail JSONB 含 courseware_id/page_number/asset_id/file_size/mime_type/original_filename,
 // 便于后续审计追溯"谁在什么时候上传了什么视频"。审计日志是 fire-and-forget,
 // 写入失败不影响上传响应。
-func (h *CoursewareAssetHandler) UploadVideo(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) UploadVideo(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	// 路径解析: 复用图片上传相同的工具函数
-	cwID, pageNum := extractCWAssetPageActionPath(r.URL.Path, "/upload-video")
-	if cwID == "" || pageNum <= 0 {
+	coursewareID, pageNumber :=
+		extractCWAssetPageActionPath(
+			r.URL.Path,
+			"/upload-video",
+		)
+	if coursewareID == "" || pageNumber <= 0 {
 		utils.BadRequest(w, "路径参数错误")
 		return
 	}
 
-	// 视频文件较大,10MB 内存缓冲(超出部分自动落盘到 /tmp)
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
-		utils.BadRequest(w, "视频文件解析失败: "+err.Error())
+	// 大体积视频必须先授权，再解析multipart。
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
+		return
+	}
+
+	if err := r.ParseMultipartForm(
+		10 << 20,
+	); err != nil {
+		utils.BadRequest(
+			w,
+			"视频文件解析失败: "+err.Error(),
+		)
 		return
 	}
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		utils.BadRequest(w, "缺少文件字段 file")
+		utils.BadRequest(
+			w,
+			"缺少文件字段 file",
+		)
 		return
 	}
 	defer file.Close()
 
-	// 保存原始文件名供审计日志使用(header 在 defer file.Close 后不能再访问 underlying)
-	// header 本身是 *multipart.FileHeader,字段是值类型,这里安全
 	originalFilename := header.Filename
 
-	svcReq := &services.UploadVideoAssetRequest{
-		CoursewareID: cwID,
-		PageNumber:   pageNum,
-		UserID:       claims.UserID,
-	}
-
-	resp, err := h.assetService.UploadVideoAsset(r.Context(), svcReq, file, header)
+	response, err :=
+		h.assetService.UploadVideoAsset(
+			r.Context(),
+			&services.UploadVideoAssetRequest{
+				CoursewareID: coursewareID,
+				PageNumber:   pageNumber,
+				Actor:        actor,
+			},
+			file,
+			header,
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
 		return
 	}
 
-	// ========== P2.4: 上传成功后异步写入审计日志 ==========
-	// 操作名 "courseware.video_upload" 已在 audit_repo.go 的 actionNameMap 注册为"上传视频"
-	// detail JSONB 字段帮助后续审计/统计/合规检查
-	// WriteAuditLog 是 fire-and-forget 异步,失败仅 logger 记录不影响主响应
 	repository.WriteAuditLog(
 		claims.UserID,
 		"courseware.video_upload",
 		map[string]interface{}{
-			"courseware_id":     cwID,
-			"page_number":       pageNum,
-			"asset_id":          resp.AssetID,
-			"file_size":         resp.FileSize,
-			"mime_type":         resp.MimeType,
+			"courseware_id":     coursewareID,
+			"page_number":       pageNumber,
+			"asset_id":          response.AssetID,
+			"file_size":         response.FileSize,
+			"mime_type":         response.MimeType,
 			"original_filename": originalFilename,
-			"stored_filename":   resp.FileName,
+			"stored_filename":   response.FileName,
 		},
-		repository.GetClientIP(r.RemoteAddr),
+		repository.GetClientIP(
+			r.RemoteAddr,
+		),
 	)
 
-	utils.Success(w, resp)
+	utils.Success(w, response)
 }
 
 // ==================== 手动上传音频 ====================
@@ -266,207 +456,409 @@ func (h *CoursewareAssetHandler) UploadVideo(w http.ResponseWriter, r *http.Requ
 //   - 音频上传后加入素材库，老师可上云获取公网链接
 //   - 存储路径: /uploads/courseware-assets/{cwID}/audios/
 //   - 上传成功后写入审计日志（courseware.audio_upload）
-func (h *CoursewareAssetHandler) UploadAudio(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) UploadAudio(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	// 路径解析: 复用图片上传相同的工具函数
-	cwID, pageNum := extractCWAssetPageActionPath(r.URL.Path, "/upload-audio")
-	if cwID == "" || pageNum <= 0 {
+	coursewareID, pageNumber :=
+		extractCWAssetPageActionPath(
+			r.URL.Path,
+			"/upload-audio",
+		)
+	if coursewareID == "" || pageNumber <= 0 {
 		utils.BadRequest(w, "路径参数错误")
 		return
 	}
 
-	// 音频文件，10MB 内存缓冲（超出部分自动落盘到 /tmp）
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
-		utils.BadRequest(w, "音频文件解析失败: "+err.Error())
+	// 音频必须先授权，再解析multipart。
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
+		return
+	}
+
+	if err := r.ParseMultipartForm(
+		10 << 20,
+	); err != nil {
+		utils.BadRequest(
+			w,
+			"音频文件解析失败: "+err.Error(),
+		)
 		return
 	}
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		utils.BadRequest(w, "缺少文件字段 file")
+		utils.BadRequest(
+			w,
+			"缺少文件字段 file",
+		)
 		return
 	}
 	defer file.Close()
 
 	originalFilename := header.Filename
 
-	svcReq := &services.UploadAudioAssetRequest{
-		CoursewareID: cwID,
-		PageNumber:   pageNum,
-		UserID:       claims.UserID,
-	}
-
-	resp, err := h.assetService.UploadAudioAsset(r.Context(), svcReq, file, header)
+	response, err :=
+		h.assetService.UploadAudioAsset(
+			r.Context(),
+			&services.UploadAudioAssetRequest{
+				CoursewareID: coursewareID,
+				PageNumber:   pageNumber,
+				Actor:        actor,
+			},
+			file,
+			header,
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
 		return
 	}
 
-	// 上传成功后异步写入审计日志
 	repository.WriteAuditLog(
 		claims.UserID,
 		"courseware.audio_upload",
 		map[string]interface{}{
-			"courseware_id":     cwID,
-			"page_number":       pageNum,
-			"asset_id":          resp.AssetID,
-			"file_size":         resp.FileSize,
-			"mime_type":         resp.MimeType,
+			"courseware_id":     coursewareID,
+			"page_number":       pageNumber,
+			"asset_id":          response.AssetID,
+			"file_size":         response.FileSize,
+			"mime_type":         response.MimeType,
 			"original_filename": originalFilename,
-			"stored_filename":   resp.FileName,
+			"stored_filename":   response.FileName,
 		},
-		repository.GetClientIP(r.RemoteAddr),
+		repository.GetClientIP(
+			r.RemoteAddr,
+		),
 	)
 
-	utils.Success(w, resp)
+	utils.Success(w, response)
 }
 
 // ==================== 查询资产列表 ====================
 
 // ListPageAssets GET /api/v1/coursewares/{id}/pages/{num}/assets
-func (h *CoursewareAssetHandler) ListPageAssets(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) ListPageAssets(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	cwID, pageNum := extractCWAssetPageActionPath(r.URL.Path, "/assets")
-	if cwID == "" || pageNum <= 0 {
+	coursewareID, pageNumber :=
+		extractCWAssetPageActionPath(
+			r.URL.Path,
+			"/assets",
+		)
+	if coursewareID == "" || pageNumber <= 0 {
 		utils.BadRequest(w, "路径参数错误")
 		return
 	}
 
-	assets, err := h.assetService.ListPageAssets(r.Context(), cwID, pageNum, claims.UserID)
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
+		return
+	}
+
+	assets, err := h.assetService.ListPageAssets(
+		r.Context(),
+		coursewareID,
+		pageNumber,
+		actor,
+	)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
 		return
 	}
 	if assets == nil {
 		assets = []*models.CoursewareAsset{}
 	}
-	utils.Success(w, map[string]interface{}{
-		"assets": assets,
-		"total":  len(assets),
-	})
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"assets": assets,
+			"total":  len(assets),
+		},
+	)
 }
 
 // ListCoursewareAssets GET /api/v1/coursewares/{id}/assets
-func (h *CoursewareAssetHandler) ListCoursewareAssets(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) ListCoursewareAssets(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	cwID := extractCoursewareMiddleID(r.URL.Path, "/assets")
-	if cwID == "" {
+	coursewareID := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/assets",
+	)
+	if coursewareID == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
 
-	assets, err := h.assetService.ListCoursewareAssets(r.Context(), cwID, claims.UserID)
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
+		return
+	}
+
+	assets, err :=
+		h.assetService.ListCoursewareAssets(
+			r.Context(),
+			coursewareID,
+			actor,
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
 		return
 	}
 	if assets == nil {
 		assets = []*models.CoursewareAsset{}
 	}
-	utils.Success(w, map[string]interface{}{
-		"assets": assets,
-		"total":  len(assets),
-	})
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"assets": assets,
+			"total":  len(assets),
+		},
+	)
 }
 
 // ==================== 删除资产 ====================
 
 // DeleteAsset DELETE /api/v1/coursewares/{id}/assets/{asset_id}
-func (h *CoursewareAssetHandler) DeleteAsset(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) DeleteAsset(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodDelete {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持DELETE请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	assetID := extractCWAssetID(r.URL.Path)
-	if assetID == "" {
-		utils.BadRequest(w, "缺少资产ID")
+	coursewareID :=
+		extractCWAssetCoursewareID(
+			r.URL.Path,
+		)
+	assetID := extractCWAssetID(
+		r.URL.Path,
+	)
+
+	if coursewareID == "" || assetID == "" {
+		utils.BadRequest(
+			w,
+			"课件ID或资产ID无效",
+		)
 		return
 	}
 
-	if err := h.assetService.DeleteAsset(r.Context(), assetID, claims.UserID); err != nil {
-		utils.InternalError(w, err.Error())
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
 		return
 	}
-	utils.Success(w, map[string]string{"message": "资产删除成功"})
+
+	if err := h.assetService.DeleteAsset(
+		r.Context(),
+		coursewareID,
+		assetID,
+		actor,
+	); err != nil {
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
+		return
+	}
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "资产删除成功",
+		},
+	)
 }
 
 // ==================== 插入图片到HTML ====================
 
 // InsertImage POST /api/v1/coursewares/{id}/pages/{num}/insert-image
 // 请求体: { "asset_id": "uuid" }
-func (h *CoursewareAssetHandler) InsertImage(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) InsertImage(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	cwID, pageNum := extractCWAssetPageActionPath(r.URL.Path, "/insert-image")
-	if cwID == "" || pageNum <= 0 {
+	coursewareID, pageNumber :=
+		extractCWAssetPageActionPath(
+			r.URL.Path,
+			"/insert-image",
+		)
+	if coursewareID == "" || pageNumber <= 0 {
 		utils.BadRequest(w, "路径参数错误")
 		return
 	}
 
-	var req struct {
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
+		return
+	}
+
+	var request struct {
 		AssetID string `json:"asset_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+
+	if err := json.NewDecoder(r.Body).Decode(
+		&request,
+	); err != nil {
+		utils.BadRequest(
+			w,
+			"请求参数格式错误",
+		)
 		return
 	}
-	if req.AssetID == "" {
-		utils.BadRequest(w, "asset_id不能为空")
+	if strings.TrimSpace(request.AssetID) == "" {
+		utils.BadRequest(
+			w,
+			"asset_id不能为空",
+		)
 		return
 	}
 
-	updatedHTML, err := h.assetService.InsertImageToPage(r.Context(), cwID, pageNum, req.AssetID, claims.UserID)
+	updatedHTML, err :=
+		h.assetService.InsertImageToPage(
+			r.Context(),
+			coursewareID,
+			pageNumber,
+			strings.TrimSpace(
+				request.AssetID,
+			),
+			actor,
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
 		return
 	}
 
-	utils.Success(w, map[string]interface{}{
-		"page_number":  pageNum,
-		"html_content": updatedHTML,
-		"message":      "图片已插入页面",
-	})
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"page_number":  pageNumber,
+			"html_content": updatedHTML,
+			"message":      "图片已插入页面",
+		},
+	)
 }
 
 // ==================== v0.42.1 AI生成视频(异步提交) ====================
@@ -482,82 +874,166 @@ func (h *CoursewareAssetHandler) InsertImage(w http.ResponseWriter, r *http.Requ
 // 视频锚点轮:两步流"先出首帧图→确认→生视频"时，前端把已确认首帧图的 URL 作为 ref_image_url、
 // 首帧图的资产ID作为 source_frame_asset_id 一并传入。前者实现图生视频锁定风格人物，
 // 后者由 service 写入视频资产 metadata 建立"视频←首帧图"血缘。
-func (h *CoursewareAssetHandler) GenerateVideo(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) GenerateVideo(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	cwID, pageNum := extractCWAssetPageActionPath(r.URL.Path, "/generate-video")
-	if cwID == "" || pageNum <= 0 {
+	coursewareID, pageNumber :=
+		extractCWAssetPageActionPath(
+			r.URL.Path,
+			"/generate-video",
+		)
+	if coursewareID == "" || pageNumber <= 0 {
 		utils.BadRequest(w, "路径参数错误")
 		return
 	}
 
-	var req struct {
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
+		return
+	}
+
+	var request struct {
 		Prompt             string `json:"prompt"`
 		RefImageURL        string `json:"ref_image_url"`
-		SourceFrameAssetID string `json:"source_frame_asset_id"` // 视频锚点轮:首帧图资产ID(可选,两步流溯源用)
+		SourceFrameAssetID string `json:"source_frame_asset_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求参数格式错误")
+
+	if err := json.NewDecoder(r.Body).Decode(
+		&request,
+	); err != nil {
+		utils.BadRequest(
+			w,
+			"请求参数格式错误",
+		)
 		return
 	}
-	if req.Prompt == "" {
-		utils.BadRequest(w, "视频描述提示词不能为空")
+	if strings.TrimSpace(request.Prompt) == "" {
+		utils.BadRequest(
+			w,
+			"视频描述提示词不能为空",
+		)
 		return
 	}
 
-	svcReq := &services.GenerateVideoServiceRequest{
-		CoursewareID:       cwID,
-		PageNumber:         pageNum,
-		Prompt:             req.Prompt,
-		RefImageURL:        req.RefImageURL,
-		UserID:             claims.UserID,
-		SourceFrameAssetID: req.SourceFrameAssetID, // 透传首帧溯源ID
-	}
-
-	resp, err := h.assetService.GenerateVideo(r.Context(), svcReq)
+	response, err := h.assetService.GenerateVideo(
+		r.Context(),
+		&services.GenerateVideoServiceRequest{
+			CoursewareID: coursewareID,
+			PageNumber:   pageNumber,
+			Prompt: strings.TrimSpace(
+				request.Prompt,
+			),
+			RefImageURL: strings.TrimSpace(
+				request.RefImageURL,
+			),
+			Actor: actor,
+			SourceFrameAssetID: strings.TrimSpace(
+				request.SourceFrameAssetID,
+			),
+		},
+	)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
 		return
 	}
-	utils.Success(w, resp)
+
+	utils.Success(w, response)
 }
 
 // ==================== v0.42.1 查询视频生成状态 ====================
 
 // QueryVideoStatus GET /api/v1/coursewares/{id}/assets/{asset_id}/video-status
 // 前端轮询此接口,直到返回 status=uploaded(成功)或 status=failed(失败)
-func (h *CoursewareAssetHandler) QueryVideoStatus(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) QueryVideoStatus(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	// 从路径 /api/v1/coursewares/{id}/assets/{asset_id}/video-status 提取 asset_id
-	assetID := extractCWVideoStatusAssetID(r.URL.Path)
-	if assetID == "" {
-		utils.BadRequest(w, "缺少资产ID")
+	coursewareID :=
+		extractCWAssetCoursewareID(
+			r.URL.Path,
+		)
+	assetID :=
+		extractCWVideoStatusAssetID(
+			r.URL.Path,
+		)
+
+	if coursewareID == "" || assetID == "" {
+		utils.BadRequest(
+			w,
+			"课件ID或资产ID无效",
+		)
 		return
 	}
 
-	resp, err := h.assetService.QueryVideoStatus(r.Context(), assetID, claims.UserID)
-	if err != nil {
-		utils.InternalError(w, err.Error())
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
 		return
 	}
-	utils.Success(w, resp)
+
+	response, err :=
+		h.assetService.QueryVideoStatus(
+			r.Context(),
+			coursewareID,
+			assetID,
+			actor,
+		)
+	if err != nil {
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
+		return
+	}
+
+	utils.Success(w, response)
 }
 
 // ==================== v0.42.10 上传资产到阿里云OSS ====================
@@ -572,75 +1048,70 @@ func (h *CoursewareAssetHandler) QueryVideoStatus(w http.ResponseWriter, r *http
 //	  "oss_public_url": "https://20260525zuo.oss-cn-beijing.aliyuncs.com/courseware-assets/xxx/p1/xxx.jpg",
 //	  "message": "上传云盘成功"
 //	}
-func (h *CoursewareAssetHandler) UploadToOSS(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) UploadToOSS(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	// 从路径 /api/v1/coursewares/{id}/assets/{asset_id}/upload-oss 提取 asset_id
-	assetID := extractUploadOSSAssetID(r.URL.Path)
-	if assetID == "" {
-		utils.BadRequest(w, "缺少资产ID")
+	coursewareID :=
+		extractCWAssetCoursewareID(
+			r.URL.Path,
+		)
+	assetID :=
+		extractUploadOSSAssetID(
+			r.URL.Path,
+		)
+
+	if coursewareID == "" || assetID == "" {
+		utils.BadRequest(
+			w,
+			"课件ID或资产ID无效",
+		)
 		return
 	}
 
-	// 1. 查询资产记录
-	asset, err := repository.GetCWAssetByID(r.Context(), assetID)
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
+		return
+	}
+
+	result, err :=
+		h.assetService.UploadCoursewareAssetToOSS(
+			r.Context(),
+			coursewareID,
+			assetID,
+			actor,
+		)
 	if err != nil {
-		utils.InternalError(w, "资产不存在: "+err.Error())
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
 		return
 	}
 
-	// 2. 权限校验：只有课件所有者可以上传
-	cw, err := repository.GetCoursewareByID(r.Context(), asset.CoursewareID)
-	if err != nil {
-		utils.InternalError(w, "课件不存在: "+err.Error())
-		return
-	}
-	if cw.UserID != claims.UserID {
-		utils.Fail(w, http.StatusForbidden, "无权操作此课件")
-		return
-	}
-
-	// 3. 检查资产URL是否为本地路径
-	if asset.OssURL == "" || !strings.HasPrefix(asset.OssURL, "/uploads/") {
-		utils.BadRequest(w, "资产没有本地文件或已经是外部URL")
-		return
-	}
-
-	// 4. 调用OSS上传服务
-	publicURL, err := h.ossService.UploadAssetToOSS(asset.OssURL)
-	if err != nil {
-		utils.InternalError(w, "上传云盘失败: "+err.Error())
-		return
-	}
-
-	// v0.42.11: 回写公网URL到数据库 public_oss_url 列,持久化保存
-	// 用于:1)前端常驻显示"已上云+复制URL"  2)删图时识别需连带删OSS
-	// 回写失败仅记日志不阻断(URL已成功返回前端,用户当下可用)
-	if updErr := repository.UpdateCWAssetPublicURL(r.Context(), assetID, publicURL); updErr != nil {
-		utils.Success(w, map[string]interface{}{
-			"asset_id":       assetID,
-			"local_url":      asset.OssURL,
-			"oss_public_url": publicURL,
-			"message":        "上传云盘成功(URL持久化失败,不影响使用)",
-		})
-		return
-	}
-
-	// 5. 返回结果
-	utils.Success(w, map[string]interface{}{
-		"asset_id":       assetID,
-		"local_url":      asset.OssURL,
-		"oss_public_url": publicURL,
-		"message":        "上传云盘成功",
-	})
+	utils.Success(w, result)
 }
 
 // ==================== 批次4c+: AI 写详细生图/视频提示词 ====================
@@ -650,65 +1121,135 @@ func (h *CoursewareAssetHandler) UploadToOSS(w http.ResponseWriter, r *http.Requ
 // 图片多提示词改造：响应由旧版 {prompt:string} 改为 {prompts:[{caption,prompt}]}，
 //
 //	AI 按本页配图需求自主判断该页要几张图(1-N 条)，前端渲染为可勾选的建议卡片列表。
-func (h *CoursewareAssetHandler) SuggestImagePrompt(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) SuggestImagePrompt(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	cwID, pageNum := extractCWAssetPageActionPath(r.URL.Path, "/suggest-image-prompt")
-	if cwID == "" || pageNum <= 0 {
+
+	coursewareID, pageNumber :=
+		extractCWAssetPageActionPath(
+			r.URL.Path,
+			"/suggest-image-prompt",
+		)
+	if coursewareID == "" || pageNumber <= 0 {
 		utils.BadRequest(w, "路径参数错误")
 		return
 	}
-	items, err := h.assetService.SuggestImagePrompt(r.Context(), cwID, pageNum, claims.UserID)
-	if err != nil {
-		utils.InternalError(w, err.Error())
+
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
 		return
 	}
-	// 物料存储: AI 出图片建议后顺手写库(best-effort, 失败不阻断响应), 之后进页可先读库零AI
-	if len(items) > 0 {
-		if b, mErr := json.Marshal(items); mErr == nil {
-			_ = repository.UpdatePageImageSuggestions(r.Context(), cwID, pageNum, string(b))
-		}
+
+	items, err :=
+		h.assetService.SuggestImagePrompt(
+			r.Context(),
+			coursewareID,
+			pageNumber,
+			actor,
+		)
+	if err != nil {
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
+		return
 	}
-	utils.Success(w, map[string]interface{}{"prompts": items})
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"prompts": items,
+		},
+	)
 }
 
 // SuggestVideoPrompt POST /api/v1/coursewares/{id}/pages/{num}/suggest-video-prompt
 // 视频分镜(本轮): 返回分镜数组 {storyboards:[{scene,image_prompt,video_prompt,narration}]},
 // AI 按本页内容自主拆 1-N 个分镜, 每镜各有首帧图提示词/图生视频提示词/台词, 前端渲染为可切换的镜头卡片。
-func (h *CoursewareAssetHandler) SuggestVideoPrompt(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareAssetHandler) SuggestVideoPrompt(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	cwID, pageNum := extractCWAssetPageActionPath(r.URL.Path, "/suggest-video-prompt")
-	if cwID == "" || pageNum <= 0 {
+
+	coursewareID, pageNumber :=
+		extractCWAssetPageActionPath(
+			r.URL.Path,
+			"/suggest-video-prompt",
+		)
+	if coursewareID == "" || pageNumber <= 0 {
 		utils.BadRequest(w, "路径参数错误")
 		return
 	}
-	items, err := h.assetService.SuggestVideoPrompt(r.Context(), cwID, pageNum, claims.UserID)
-	if err != nil {
-		utils.InternalError(w, err.Error())
+
+	actor, allowed :=
+		requireCoursewareAssetOwnerActor(
+			w,
+			r,
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if !allowed {
 		return
 	}
-	// 物料存储: AI 拆视频分镜后顺手写库(best-effort, 失败不阻断响应), 之后进页可先读库零AI
-	if len(items) > 0 {
-		if b, mErr := json.Marshal(items); mErr == nil {
-			_ = repository.UpdatePageVideoStoryboards(r.Context(), cwID, pageNum, string(b))
-		}
+
+	items, err :=
+		h.assetService.SuggestVideoPrompt(
+			r.Context(),
+			coursewareID,
+			pageNumber,
+			actor,
+		)
+	if err != nil {
+		handleCoursewareAssetServiceError(
+			w,
+			err,
+		)
+		return
 	}
-	utils.Success(w, map[string]interface{}{"storyboards": items})
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"storyboards": items,
+		},
+	)
 }
 
 // ==================== 路径解析辅助函数 ====================
@@ -739,6 +1280,38 @@ func extractCWAssetPageActionPath(path string, action string) (string, int) {
 		return "", 0
 	}
 	return coursewareID, num
+}
+
+// extractCWAssetCoursewareID 从包含/assets/的课件素材路径提取课件ID。
+func extractCWAssetCoursewareID(
+	path string,
+) string {
+	const prefix = "/api/v1/coursewares/"
+	const marker = "/assets/"
+
+	if !strings.HasPrefix(path, prefix) {
+		return ""
+	}
+
+	rest := strings.TrimPrefix(
+		path,
+		prefix,
+	)
+	index := strings.Index(
+		rest,
+		marker,
+	)
+	if index <= 0 {
+		return ""
+	}
+
+	coursewareID := rest[:index]
+	if coursewareID == "" ||
+		strings.Contains(coursewareID, "/") {
+		return ""
+	}
+
+	return coursewareID
 }
 
 // extractCWAssetID 从 /api/v1/coursewares/{id}/assets/{asset_id} 提取资产ID

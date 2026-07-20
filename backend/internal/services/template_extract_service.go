@@ -1,14 +1,17 @@
 package services
 
-// template_extract_service.go — 课件风格模板 AI 提取服务(v139.1-fix)
+// template_extract_service.go — 课件风格模板AI提取服务。
 //
-// 功能:
-//   用户粘贴一页或多页 HTML 代码,AI 分析后提取一套可复用的视觉风格模板,
-//   入库为草稿(is_draft=true, scope=personal)。
+// 当前版本的核心原则：
 //
-// v139.1-fix 修改:
-//   - log.Printf 全部替换为 logger.WithModule 结构化日志
-//   - 新增 sanitizeNonASCIIForJSON 在 JSON 解析前预处理非 ASCII 字符(防 é/′/¨ 等导致解析失败)
+//   1. 老师提交的HTML是模板母版的唯一事实源。
+//   2. AI只负责识别配色、字体、圆角、阴影、间距、风格类别和描述。
+//   3. AI返回的sample_pages不再写入数据库，防止AI重画导致DOM、CSS、脚本和交互失真。
+//   4. 原始母版最多保留20页、总计60万字符。
+//   5. 页面较多时只抽取最多8个代表页供AI分析，原始20页仍全部完整入库。
+//   6. 分析副本会省略base64图片和脚本正文，但仅影响AI输入，不影响正式母版。
+//
+// 同步入口和异步SSE入口共用完全相同的母版保真规则。
 
 import (
 	"context"
@@ -24,73 +27,85 @@ import (
 	"tedna/internal/repository"
 )
 
-// 模块级日志器
+// 模块级日志器。
 var extractLog = logger.WithModule("template_extract")
 
-// ==================== SSE 事件类型常量(模板提取专用, v145) ====================
-
+// 模板提取专用SSE事件。
 const (
-	CWSSEExtractStart    = "extract_start"    // 提取任务开始
-	CWSSEExtractProgress = "extract_progress" // 提取阶段进度
-	CWSSEExtractDone     = "extract_done"     // 提取完成,含草稿数据
-	CWSSEExtractError    = "extract_error"    // 提取失败
+	CWSSEExtractStart    = "extract_start"
+	CWSSEExtractProgress = "extract_progress"
+	CWSSEExtractDone     = "extract_done"
+	CWSSEExtractError    = "extract_error"
 )
 
-// HTML 总长度上限(包级常量,供同步/异步方法共用)
-const maxTotalHTMLLen = 200000
+// templateExtractionPreserveContract 追加到数据库系统提示词之后。
+//
+// 数据库里的历史提示词可能仍要求AI生成sample_pages。
+// 本补充契约明确改为只分析风格，避免AI为多页母版输出大量重写HTML。
+// 即使模型仍返回sample_pages，服务层也会确定性忽略该字段。
+const templateExtractionPreserveContract = `
+【TE-DNA源页面保真补充契约·最高优先级】
 
-// ==================== 服务结构体 ====================
+1. 用户提供的每一页HTML都是不可重写的原始模板母版。
+2. 你的任务只是分析视觉规律，不得重新设计、改写或压缩原始页面。
+3. 请正常返回suggested_name、suggested_description、suggested_category、
+   color_scheme、css_variables和extraction_notes。
+4. sample_pages字段必须返回空数组[]。平台会确定性保存用户提交的完整原始页面。
+5. 不要在输出中复述任何完整HTML，以免造成输出截断和页面损失。
+`
 
-// TemplateExtractService 课件风格模板 AI 提取服务
+// TemplateExtractService 课件风格模板AI提取服务。
 type TemplateExtractService struct {
 	cfg *config.Config
 }
 
-// NewTemplateExtractService 构造函数
+// NewTemplateExtractService 创建模板提取服务。
 func NewTemplateExtractService(cfg *config.Config) *TemplateExtractService {
 	return &TemplateExtractService{cfg: cfg}
 }
 
-// ==================== 入口方法:ExtractFromHTML ====================
-
-// ExtractFromHTML 从用户粘贴的 HTML 代码中提取风格模板
+// ExtractFromHTML 同步提取入口。
+//
+// 该入口仍保留供内部兼容调用使用；正式前端当前主要使用异步SSE入口。
 func (s *TemplateExtractService) ExtractFromHTML(
 	ctx context.Context,
 	userID string,
 	samplePages []string,
 	sourceType string,
 ) (*models.ExtractTemplateResponse, error) {
-
-	// -------- 1. 输入校验 --------
-	if len(samplePages) == 0 {
-		return nil, fmt.Errorf("请至少提供一页 HTML 代码")
+	// 1. 准备并校验原始母版。
+	cleanedPages, totalHTMLLen, err := prepareTemplateSourcePages(samplePages)
+	if err != nil {
+		return nil, err
 	}
-	cleanedPages := s.cleanSamplePages(samplePages)
-	if len(cleanedPages) == 0 {
-		return nil, fmt.Errorf("提供的 HTML 内容为空,请粘贴有效的 HTML 代码")
-	}
-	totalHTMLLen := 0
-	for _, p := range cleanedPages {
-		totalHTMLLen += len(p)
-	}
-	if totalHTMLLen > maxTotalHTMLLen {
-		return nil, fmt.Errorf("HTML 总长度 %d 字符超出上限 %d 字符,请精简后再试", totalHTMLLen, maxTotalHTMLLen)
-	}
-
 	if sourceType == "" {
 		sourceType = "paste"
 	}
 
-	// -------- 2. 构建 AI 用户提示词 --------
-	userPrompt := s.buildExtractUserPrompt(cleanedPages)
+	// 2. 只为AI构造代表页分析副本。
+	analysisPages := selectTemplateAnalysisPages(
+		cleanedPages,
+		templateAnalysisMaxPages,
+		templateAnalysisMaxRunesPerPage,
+	)
+	userPrompt := s.buildExtractUserPrompt(
+		analysisPages,
+		len(cleanedPages),
+		totalHTMLLen,
+	)
 
-	// -------- 3. 加载系统提示词 --------
-	sysPromptObj, err := repository.GetCurrentPromptByKey("prompt_courseware_template_extract")
+	// 3. 加载并补充系统提示词。
+	sysPromptObj, err := repository.GetCurrentPromptByKey(
+		"prompt_courseware_template_extract",
+	)
 	if err != nil {
-		return nil, fmt.Errorf("加载 AI 提取提示词失败: %w", err)
+		return nil, fmt.Errorf("加载AI提取提示词失败: %w", err)
 	}
+	systemPrompt := strings.TrimSpace(sysPromptObj.Content) +
+		"\n\n" +
+		strings.TrimSpace(templateExtractionPreserveContract)
 
-	// -------- 4. 获取 AI 配置(courseware_template_extract 场景) --------
+	// 4. 获取AI配置。
 	aiCfg, err := ai.GetEffectiveConfig(
 		s.cfg.GetAESKey(),
 		"courseware_template_extract",
@@ -99,59 +114,162 @@ func (s *TemplateExtractService) ExtractFromHTML(
 		s.cfg.AIDefaultModel,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("获取 AI 配置失败: %w", err)
+		return nil, fmt.Errorf("获取AI配置失败: %w", err)
 	}
 
-	// -------- 5. 调用 AI(非流式,等待完整 JSON) --------
+	// 5. 调用AI。
 	traceCtx := &ai.TraceContext{
 		SceneCode: "courseware_template_extract",
 		UserID:    &userID,
 	}
 	callStart := time.Now()
-	result, err := ai.CallAI(aiCfg, sysPromptObj.Content, userPrompt, traceCtx)
+	result, err := ai.CallAI(aiCfg, systemPrompt, userPrompt, traceCtx)
 	if err != nil {
-		return nil, fmt.Errorf("AI 调用失败: %w", err)
+		return nil, fmt.Errorf("AI调用失败: %w", err)
 	}
 	callElapsed := time.Since(callStart)
-	extractLog.Info("AI 调用完成", "user", userID, "model", result.ModelUsed, "tokens", result.TokensUsed, "elapsed", callElapsed.String())
 
-	// -------- 6. 解析 AI 输出 JSON(四重兜底) --------
+	extractLog.Info(
+		"AI调用完成",
+		"user", userID,
+		"model", result.ModelUsed,
+		"tokens", result.TokensUsed,
+		"elapsed", callElapsed.String(),
+		"original_pages", len(cleanedPages),
+		"analysis_pages", len(analysisPages),
+	)
+
+	// 6. 解析AI风格分析结果。
 	extracted, err := s.parseAIOutput(result.Content)
 	if err != nil {
-		extractLog.Error("JSON 解析失败", "raw_output_head", truncateForLog(result.Content, 500))
-		return nil, fmt.Errorf("AI 输出解析失败: %w", err)
+		extractLog.Error(
+			"JSON解析失败",
+			"raw_output_head", truncateForLog(result.Content, 500),
+		)
+		return nil, fmt.Errorf("AI输出解析失败: %w", err)
 	}
-
-	// AI 自己表示无法分析
 	if extracted.Error != "" {
-		return nil, fmt.Errorf("AI 无法从输入提取风格: %s", extracted.Error)
+		return nil, fmt.Errorf("AI无法从输入提取风格: %s", extracted.Error)
 	}
-
-	// -------- 7. 校验关键字段 --------
 	if err := s.validateExtracted(extracted); err != nil {
-		extractLog.Warn("校验失败", "error", err, "name", extracted.SuggestedName, "category", extracted.SuggestedCategory, "css_vars_count", len(extracted.CSSVariables), "sample_pages_count", len(extracted.SamplePages))
-		return nil, fmt.Errorf("AI 提取结果不完整: %w", err)
+		return nil, fmt.Errorf("AI提取结果不完整: %w", err)
 	}
 
-	// -------- 8. 序列化为 JSON 字符串,准备入库 --------
-	colorSchemeJSON, _ := json.Marshal(extracted.ColorScheme)
-	cssVarsJSON, _ := json.Marshal(extracted.CSSVariables)
-	samplePagesJSON, _ := json.Marshal(extracted.SamplePages)
+	// 7. 按保真原则构造并保存草稿。
+	tpl, err := s.persistExtractedTemplate(
+		ctx,
+		userID,
+		sourceType,
+		cleanedPages,
+		totalHTMLLen,
+		analysisPages,
+		extracted,
+		result.ModelUsed,
+		result.TokensUsed,
+	)
+	if err != nil {
+		return nil, err
+	}
 
-	// 风格类别兜底:AI 给的值不合法时,设为 minimalist
+	return &models.ExtractTemplateResponse{
+		TemplateID:      tpl.ID,
+		SuggestedName:   tpl.Name,
+		SuggestedDesc:   tpl.Description,
+		SuggestedCat:    tpl.StyleCategory,
+		ExtractionNotes: extracted.ExtractionNotes,
+		Message:         "AI已完成风格分析，原始模板页面已完整保留",
+	}, nil
+}
+
+// buildExtractUserPrompt 构建只用于风格分析的AI输入。
+//
+// originalPageCount是实际完整入库页数；analysisPages只是送给AI观察的代表页。
+func (s *TemplateExtractService) buildExtractUserPrompt(
+	analysisPages []templateAnalysisPage,
+	originalPageCount int,
+	totalHTMLLen int,
+) string {
+	var sb strings.Builder
+
+	sb.WriteString("# 模板风格分析任务\n\n")
+	sb.WriteString(fmt.Sprintf(
+		"用户共提交%d页原始HTML，总计%d字符。\n",
+		originalPageCount,
+		totalHTMLLen,
+	))
+	sb.WriteString(fmt.Sprintf(
+		"平台已完整保存全部原始页面。本次只提供其中%d个代表页供你分析风格。\n",
+		len(analysisPages),
+	))
+	sb.WriteString("不要重写页面，不要复述HTML，不要生成新的页面结构。\n\n")
+
+	for _, page := range analysisPages {
+		sb.WriteString(fmt.Sprintf(
+			"=== 原模板第%d页代表样例（推断页型：%s）开始 ===\n",
+			page.SourcePageNumber,
+			page.RoleLabel,
+		))
+		sb.WriteString(page.HTML)
+		sb.WriteString(fmt.Sprintf(
+			"\n=== 原模板第%d页代表样例结束 ===\n\n",
+			page.SourcePageNumber,
+		))
+	}
+
+	sb.WriteString("# 输出要求\n\n")
+	sb.WriteString("请只提取统一视觉规律，包括配色、字体、圆角、阴影、间距、装饰语言和风格类别。\n")
+	sb.WriteString("sample_pages必须返回空数组[]，原始母版页由平台直接保存。\n")
+	sb.WriteString("严格按照系统提示词约定的JSON格式输出，不要代码围栏或解释文字。")
+
+	return sb.String()
+}
+
+// persistExtractedTemplate 将AI分析结果与完整原始母版组装后写入数据库。
+func (s *TemplateExtractService) persistExtractedTemplate(
+	ctx context.Context,
+	userID string,
+	sourceType string,
+	cleanedPages []string,
+	totalHTMLLen int,
+	analysisPages []templateAnalysisPage,
+	extracted *models.AIExtractedTemplate,
+	modelUsed string,
+	tokensUsed int,
+) (*models.CoursewareTemplate, error) {
+	colorSchemeJSON, err := json.Marshal(extracted.ColorScheme)
+	if err != nil {
+		return nil, fmt.Errorf("序列化配色方案失败: %w", err)
+	}
+
+	cssVarsJSON, err := json.Marshal(extracted.CSSVariables)
+	if err != nil {
+		return nil, fmt.Errorf("序列化CSS变量失败: %w", err)
+	}
+
+	// 关键改变：正式sample_pages永远来自老师提交的cleanedPages，
+	// 不使用AI输出的extracted.SamplePages。
+	samplePagesJSON, err := json.Marshal(cleanedPages)
+	if err != nil {
+		return nil, fmt.Errorf("序列化原始母版页面失败: %w", err)
+	}
+
 	category := extracted.SuggestedCategory
 	if !models.IsValidCWStyleCategory(category) {
-		extractLog.Warn("AI 返回的 category 不合法,兜底为 minimalist", "category", category)
+		extractLog.Warn(
+			"AI返回的风格类别不合法，兜底为minimalist",
+			"category", category,
+		)
 		category = models.CWStyleMinimalist
 	}
 
-	// 名称兜底:AI 没给名称时用时间戳
 	name := strings.TrimSpace(extracted.SuggestedName)
 	if name == "" {
-		name = fmt.Sprintf("AI 提取草稿 %s", time.Now().Format("01-02 15:04"))
+		name = fmt.Sprintf(
+			"AI提取草稿 %s",
+			time.Now().Format("01-02 15:04"),
+		)
 	}
 
-	// -------- 9. 构造草稿模板对象 --------
 	tpl := &models.CoursewareTemplate{
 		Name:          name,
 		Description:   strings.TrimSpace(extracted.SuggestedDescription),
@@ -162,192 +280,157 @@ func (s *TemplateExtractService) ExtractFromHTML(
 		UserID:        &userID,
 	}
 
-	// 来源元信息
 	sourceMeta := map[string]interface{}{
-		"source_type":          sourceType,
-		"original_html_length": totalHTMLLen,
-		"sample_pages_count":   len(cleanedPages),
-		"extracted_at":         time.Now().Format(time.RFC3339),
-		"ai_model_used":        result.ModelUsed,
-		"ai_tokens_used":       result.TokensUsed,
-		"ai_extraction_notes":  extracted.ExtractionNotes,
+		"source_type":                  sourceType,
+		"original_html_length":         totalHTMLLen,
+		"sample_pages_count":           len(cleanedPages),
+		"analysis_pages_count":         len(analysisPages),
+		"page_roles":                   buildTemplatePageRoleMeta(cleanedPages),
+		"extracted_at":                 time.Now().Format(time.RFC3339),
+		"ai_model_used":                modelUsed,
+		"ai_tokens_used":               tokensUsed,
+		"ai_extraction_notes":          extracted.ExtractionNotes,
+		"ai_output_sample_pages_count": len(extracted.SamplePages),
+		"source_pages_preserved":       true,
 	}
 
-	// -------- 10. 入库为草稿 --------
 	if err := repository.CreateDraftTemplate(ctx, tpl, sourceMeta); err != nil {
 		return nil, fmt.Errorf("草稿入库失败: %w", err)
 	}
 
-	extractLog.Info("草稿创建成功", "id", tpl.ID, "name", tpl.Name, "category", tpl.StyleCategory, "pages", len(cleanedPages), "user", userID)
+	extractLog.Info(
+		"原始母版保真草稿创建成功",
+		"id", tpl.ID,
+		"name", tpl.Name,
+		"category", tpl.StyleCategory,
+		"pages", len(cleanedPages),
+		"total_html_len", totalHTMLLen,
+		"user", userID,
+	)
 
-	// -------- 11. 构造响应 --------
-	return &models.ExtractTemplateResponse{
-		TemplateID:      tpl.ID,
-		SuggestedName:   tpl.Name,
-		SuggestedDesc:   tpl.Description,
-		SuggestedCat:    tpl.StyleCategory,
-		ExtractionNotes: extracted.ExtractionNotes,
-		Message:         "AI 已提取风格模板,您可以继续微调或保存",
-	}, nil
+	return tpl, nil
 }
 
-// ==================== 输入清理 ====================
-
-// cleanSamplePages 清理用户输入的样例页面
-func (s *TemplateExtractService) cleanSamplePages(pages []string) []string {
-	var result []string
-	for _, p := range pages {
-		trimmed := strings.TrimSpace(p)
-		if trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
-}
-
-// ==================== AI 提示词构建 ====================
-
-// buildExtractUserPrompt 构建 AI 用户提示词
-func (s *TemplateExtractService) buildExtractUserPrompt(samplePages []string) string {
-	var sb strings.Builder
-	sb.WriteString("请从以下 HTML 代码中提取统一的视觉风格模板。\n\n")
-	sb.WriteString(fmt.Sprintf("共 %d 页 HTML,逐页分析后给出统一风格:\n\n", len(samplePages)))
-
-	for i, page := range samplePages {
-		sb.WriteString(fmt.Sprintf("=== 第 %d 页 HTML 开始 ===\n", i+1))
-		sb.WriteString(page)
-		sb.WriteString("\n=== 第 ")
-		sb.WriteString(fmt.Sprintf("%d 页 HTML 结束 ===\n\n", i+1))
-	}
-
-	sb.WriteString("请按照系统提示词约定的 JSON 格式输出,只输出 JSON 对象,不要任何说明文字或代码块标记。")
-	return sb.String()
-}
-
-// ==================== AI 输出解析(四重兜底) ====================
-
-// parseAIOutput 解析 AI 返回的 JSON,四重兜底容错
-//
-// 在尝试 JSON 解析前,先对字符串做非 ASCII 预处理(sanitizeNonASCIIForJSON),
-// 将 é/′/¨/™ 等拉丁特殊字符转义为 \uXXXX 格式,防止 json.Unmarshal 失败
-func (s *TemplateExtractService) parseAIOutput(aiOutput string) (*models.AIExtractedTemplate, error) {
+// parseAIOutput 解析AI返回的JSON，执行多重容错。
+func (s *TemplateExtractService) parseAIOutput(
+	aiOutput string,
+) (*models.AIExtractedTemplate, error) {
 	text := strings.TrimSpace(aiOutput)
 	text = cwStripCodeFences(text)
 
-	// AI 输出含大量嵌套 HTML 时,ai.ExtractJSON 的括号配对会被 HTML 中的 { } 误导
-	// 直接判断:若开头是 { 结尾是 },就当作纯 JSON 用,不再"提取"
 	var jsonStr string
 	if strings.HasPrefix(text, "{") && strings.HasSuffix(text, "}") {
 		jsonStr = text
 	} else if extracted, ok := ai.ExtractJSON(text); ok && extracted != "" {
 		jsonStr = extracted
 	} else {
-		return nil, fmt.Errorf("未能从 AI 输出中找到 JSON 对象")
+		return nil, fmt.Errorf("未能从AI输出中找到JSON对象")
 	}
 
-	// 非 ASCII 预处理:将 JSON 字符串值中的非 ASCII 拉丁字符转义为 \uXXXX
-	// 这是对付 AI 不听话输出 é/′/¨ 等特殊字符的根治方案
 	jsonStr = sanitizeNonASCIIForJSON(jsonStr)
 
-	extractLog.Info("JSON 字符串长度(预处理后)", "length", len(jsonStr))
-
-	// 尝试 1: 直接 Unmarshal
 	var extracted models.AIExtractedTemplate
-	if err1 := json.Unmarshal([]byte(jsonStr), &extracted); err1 == nil {
+	if err := json.Unmarshal([]byte(jsonStr), &extracted); err == nil {
 		return &extracted, nil
 	}
 
-	// 尝试 2: 清理中文标点(仅对外层结构,不动 HTML 字符串值)
 	cleaned := cwCleanChinesePunctuation(jsonStr)
-	if err2 := json.Unmarshal([]byte(cleaned), &extracted); err2 == nil {
-		extractLog.Info("JSON 解析第2重(中文标点清理后)成功")
+	if err := json.Unmarshal([]byte(cleaned), &extracted); err == nil {
+		extractLog.Info("JSON经中文标点清理后解析成功")
 		return &extracted, nil
 	}
 
-	// 尝试 3: 修复未转义引号
 	fixed := cwFixJSONQuotes(cleaned)
-	if err3 := json.Unmarshal([]byte(fixed), &extracted); err3 == nil {
-		extractLog.Info("JSON 解析第3重(引号修复后)成功")
+	if err := json.Unmarshal([]byte(fixed), &extracted); err == nil {
+		extractLog.Info("JSON经引号修复后解析成功")
 		return &extracted, nil
 	}
 
-	// 尝试 4: 字段级宽容提取(只取核心字段)
-	extracted = models.AIExtractedTemplate{}
-	extracted.SuggestedName = extractStringField(cleaned, "suggested_name")
-	extracted.SuggestedDescription = extractStringField(cleaned, "suggested_description")
-	extracted.SuggestedCategory = extractStringField(cleaned, "suggested_category")
-	extracted.ExtractionNotes = extractStringField(cleaned, "extraction_notes")
+	extracted = models.AIExtractedTemplate{
+		SuggestedName:        extractStringField(cleaned, "suggested_name"),
+		SuggestedDescription: extractStringField(cleaned, "suggested_description"),
+		SuggestedCategory:    extractStringField(cleaned, "suggested_category"),
+		ExtractionNotes:      extractStringField(cleaned, "extraction_notes"),
+		Error:                extractStringField(cleaned, "error"),
+	}
 
-	if cs := extractObjectField(cleaned, "color_scheme"); cs != "" {
-		_ = json.Unmarshal([]byte(cs), &extracted.ColorScheme)
+	if value := extractObjectField(cleaned, "color_scheme"); value != "" {
+		_ = json.Unmarshal([]byte(value), &extracted.ColorScheme)
 	}
-	if cv := extractObjectField(cleaned, "css_variables"); cv != "" {
-		_ = json.Unmarshal([]byte(cv), &extracted.CSSVariables)
+	if value := extractObjectField(cleaned, "css_variables"); value != "" {
+		_ = json.Unmarshal([]byte(value), &extracted.CSSVariables)
 	}
-	if sp := extractArrayField(cleaned, "sample_pages"); sp != "" {
-		_ = json.Unmarshal([]byte(sp), &extracted.SamplePages)
+	if value := extractArrayField(cleaned, "sample_pages"); value != "" {
+		_ = json.Unmarshal([]byte(value), &extracted.SamplePages)
 	}
 
 	if extracted.SuggestedName == "" && len(extracted.ColorScheme) == 0 {
-		return nil, fmt.Errorf("四重兜底解析全部失败,AI 输出可能严重畸形")
+		return nil, fmt.Errorf("多重兜底解析全部失败，AI输出可能严重畸形")
 	}
-	extractLog.Warn("JSON 解析:字段级宽容提取成功(部分字段可能缺失)")
+
+	extractLog.Warn("JSON使用字段级宽容提取成功")
 	return &extracted, nil
 }
 
-// ==================== AI 输出校验 ====================
-
-// validateExtracted 校验 AI 提取结果的关键字段完整性
-func (s *TemplateExtractService) validateExtracted(e *models.AIExtractedTemplate) error {
-	requiredColorKeys := []string{"primary", "secondary", "background", "accent", "text"}
-	for _, k := range requiredColorKeys {
-		if e.ColorScheme[k] == "" {
-			return fmt.Errorf("color_scheme.%s 缺失", k)
+// validateExtracted 只校验风格数据。
+//
+// sample_pages不再由AI负责生成，因此不再要求AI输出非空页面数组。
+func (s *TemplateExtractService) validateExtracted(
+	extracted *models.AIExtractedTemplate,
+) error {
+	requiredColorKeys := []string{
+		"primary",
+		"secondary",
+		"background",
+		"accent",
+		"text",
+	}
+	for _, key := range requiredColorKeys {
+		if strings.TrimSpace(extracted.ColorScheme[key]) == "" {
+			return fmt.Errorf("color_scheme.%s缺失", key)
 		}
 	}
 
 	requiredCSSKeys := []string{
-		"--cw-primary", "--cw-secondary", "--cw-bg", "--cw-accent", "--cw-text",
-		"--cw-font-heading", "--cw-font-body", "--cw-radius", "--cw-shadow",
+		"--cw-primary",
+		"--cw-secondary",
+		"--cw-bg",
+		"--cw-accent",
+		"--cw-text",
+		"--cw-font-heading",
+		"--cw-font-body",
+		"--cw-radius",
+		"--cw-shadow",
 	}
-	for _, k := range requiredCSSKeys {
-		if e.CSSVariables[k] == "" {
-			return fmt.Errorf("css_variables.%s 缺失", k)
+	for _, key := range requiredCSSKeys {
+		if strings.TrimSpace(extracted.CSSVariables[key]) == "" {
+			return fmt.Errorf("css_variables.%s缺失", key)
 		}
-	}
-
-	validPages := 0
-	for _, p := range e.SamplePages {
-		if strings.TrimSpace(p) != "" {
-			validPages++
-		}
-	}
-	if validPages == 0 {
-		return fmt.Errorf("sample_pages 数组为空或全部为空字符串")
 	}
 
 	return nil
 }
 
-// ==================== 字段级宽容提取辅助函数 ====================
-
-// extractStringField 从 JSON 字符串中宽容提取一个字符串字段
+// extractStringField 从可能畸形的JSON中宽容提取字符串字段。
 func extractStringField(jsonStr string, key string) string {
 	keyPattern := fmt.Sprintf("\"%s\"", key)
 	idx := strings.Index(jsonStr, keyPattern)
 	if idx < 0 {
 		return ""
 	}
+
 	rest := jsonStr[idx+len(keyPattern):]
 	colonIdx := strings.Index(rest, ":")
 	if colonIdx < 0 {
 		return ""
 	}
+
 	rest = strings.TrimSpace(rest[colonIdx+1:])
 	if !strings.HasPrefix(rest, "\"") {
 		return ""
 	}
 	rest = rest[1:]
+
 	var sb strings.Builder
 	for i := 0; i < len(rest); i++ {
 		if rest[i] == '\\' && i+1 < len(rest) {
@@ -361,176 +444,185 @@ func extractStringField(jsonStr string, key string) string {
 		}
 		sb.WriteByte(rest[i])
 	}
+
 	return ""
 }
 
-// extractObjectField 从 JSON 字符串中提取一个对象字段
+// extractObjectField 从可能畸形的JSON中提取对象字段。
 func extractObjectField(jsonStr string, key string) string {
 	keyPattern := fmt.Sprintf("\"%s\"", key)
 	idx := strings.Index(jsonStr, keyPattern)
 	if idx < 0 {
 		return ""
 	}
+
 	rest := jsonStr[idx+len(keyPattern):]
 	colonIdx := strings.Index(rest, ":")
 	if colonIdx < 0 {
 		return ""
 	}
+
 	rest = strings.TrimSpace(rest[colonIdx+1:])
 	if !strings.HasPrefix(rest, "{") {
 		return ""
 	}
-	depth := 0
-	for i := 0; i < len(rest); i++ {
-		if rest[i] == '{' {
-			depth++
-		} else if rest[i] == '}' {
-			depth--
-			if depth == 0 {
-				return rest[:i+1]
-			}
-		}
-	}
-	return ""
-}
 
-// extractArrayField 从 JSON 字符串中提取一个数组字段
-func extractArrayField(jsonStr string, key string) string {
-	keyPattern := fmt.Sprintf("\"%s\"", key)
-	idx := strings.Index(jsonStr, keyPattern)
-	if idx < 0 {
-		return ""
-	}
-	rest := jsonStr[idx+len(keyPattern):]
-	colonIdx := strings.Index(rest, ":")
-	if colonIdx < 0 {
-		return ""
-	}
-	rest = strings.TrimSpace(rest[colonIdx+1:])
-	if !strings.HasPrefix(rest, "[") {
-		return ""
-	}
 	depth := 0
 	inString := false
-	escape := false
+	escaped := false
+
 	for i := 0; i < len(rest); i++ {
-		c := rest[i]
-		if escape {
-			escape = false
+		char := rest[i]
+
+		if escaped {
+			escaped = false
 			continue
 		}
-		if c == '\\' {
-			escape = true
+		if char == '\\' {
+			escaped = true
 			continue
 		}
-		if c == '"' {
+		if char == '"' {
 			inString = !inString
 			continue
 		}
 		if inString {
 			continue
 		}
-		if c == '[' {
+
+		switch char {
+		case '{':
 			depth++
-		} else if c == ']' {
+		case '}':
 			depth--
 			if depth == 0 {
 				return rest[:i+1]
 			}
 		}
 	}
+
 	return ""
 }
 
-// ==================== 非 ASCII 预处理(v139.1-fix 新增) ====================
+// extractArrayField 从可能畸形的JSON中提取数组字段。
+func extractArrayField(jsonStr string, key string) string {
+	keyPattern := fmt.Sprintf("\"%s\"", key)
+	idx := strings.Index(jsonStr, keyPattern)
+	if idx < 0 {
+		return ""
+	}
 
-// sanitizeNonASCIIForJSON 对 JSON 字符串中的非 ASCII 拉丁字符做 \uXXXX 转义
-//
-// 问题背景:
-//   AI 输出的 JSON 中偶尔包含 é(U+00E9)、′(U+2032)、¨(U+00A8)、™(U+2122) 等字符,
-//   这些字符本身是合法 UTF-8,但在部分 JSON 解析场景下(特别是嵌套 HTML 的 JSON 字符串值中)
-//   可能导致 json.Unmarshal 失败(如 "invalid character 'é' after array element")。
-//
-// 策略:
-//   遍历 JSON 字符串,在 JSON 字符串值内部(引号之间),将非 ASCII 且非 CJK 的字符
-//   转义为 \uXXXX 格式。CJK 字符(中日韩)保持原样(提示词要求"中文保留")。
-//
-// 范围:
-//   - 转义: U+0080 ~ U+2FFF 中非 CJK 的拉丁/符号字符
-//   - 保留: ASCII(U+0000~U+007F)、CJK(U+3000~U+9FFF, U+F900~U+FAFF)、
-//           CJK扩展(U+20000+)、已有 \uXXXX 转义
-func sanitizeNonASCIIForJSON(s string) string {
-	runes := []rune(s)
+	rest := jsonStr[idx+len(keyPattern):]
+	colonIdx := strings.Index(rest, ":")
+	if colonIdx < 0 {
+		return ""
+	}
+
+	rest = strings.TrimSpace(rest[colonIdx+1:])
+	if !strings.HasPrefix(rest, "[") {
+		return ""
+	}
+
+	depth := 0
+	inString := false
+	escaped := false
+
+	for i := 0; i < len(rest); i++ {
+		char := rest[i]
+
+		if escaped {
+			escaped = false
+			continue
+		}
+		if char == '\\' {
+			escaped = true
+			continue
+		}
+		if char == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+
+		switch char {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return rest[:i+1]
+			}
+		}
+	}
+
+	return ""
+}
+
+// sanitizeNonASCIIForJSON 转义JSON字符串值中的非ASCII非CJK字符。
+func sanitizeNonASCIIForJSON(source string) string {
+	runes := []rune(source)
+
 	var sb strings.Builder
-	sb.Grow(len(s) + len(s)/10) // 预分配略大空间
+	sb.Grow(len(source) + len(source)/10)
 
 	inString := false
 	escaped := false
 
-	for _, r := range runes {
+	for _, char := range runes {
 		if escaped {
-			sb.WriteRune(r)
+			sb.WriteRune(char)
 			escaped = false
 			continue
 		}
-		if r == '\\' && inString {
-			sb.WriteRune(r)
+		if char == '\\' && inString {
+			sb.WriteRune(char)
 			escaped = true
 			continue
 		}
-		if r == '"' {
+		if char == '"' {
 			inString = !inString
-			sb.WriteRune(r)
+			sb.WriteRune(char)
 			continue
 		}
 
-		// 只在 JSON 字符串值内部处理
-		if inString && r > 0x7F && !isCJKRune(r) {
-			// 非 ASCII 且非 CJK → 转义为 \uXXXX
-			// 对于 BMP 之外的字符(>0xFFFF),用 surrogate pair
-			if r <= 0xFFFF {
-				sb.WriteString(fmt.Sprintf("\\u%04X", r))
+		if inString && char > 0x7F && !isCJKRune(char) {
+			if char <= 0xFFFF {
+				sb.WriteString(fmt.Sprintf("\\u%04X", char))
 			} else {
-				// UTF-16 surrogate pair
-				r -= 0x10000
-				hi := 0xD800 + (r>>10)&0x3FF
-				lo := 0xDC00 + r&0x3FF
-				sb.WriteString(fmt.Sprintf("\\u%04X\\u%04X", hi, lo))
+				char -= 0x10000
+				high := 0xD800 + (char>>10)&0x3FF
+				low := 0xDC00 + char&0x3FF
+				sb.WriteString(fmt.Sprintf("\\u%04X\\u%04X", high, low))
 			}
 			continue
 		}
 
-		sb.WriteRune(r)
+		sb.WriteRune(char)
 	}
+
 	return sb.String()
 }
 
-// isCJKRune 判断是否为 CJK 字符(中日韩统一表意文字及常见标点)
-// 这些字符在 JSON 中合法且应保持原样输出
-func isCJKRune(r rune) bool {
-	return (r >= 0x3000 && r <= 0x9FFF) || // CJK 统一表意文字 + 符号标点
-		(r >= 0xF900 && r <= 0xFAFF) || // CJK 兼容表意文字
-		(r >= 0xFE30 && r <= 0xFE4F) || // CJK 兼容形式
-		(r >= 0xFF00 && r <= 0xFFEF) || // 全角ASCII/半角片假名
-		(r >= 0x20000 && r <= 0x2FA1F) // CJK 扩展B~F + 兼容补充
+// isCJKRune 判断是否为中日韩文字或常见全角符号。
+func isCJKRune(char rune) bool {
+	return (char >= 0x3000 && char <= 0x9FFF) ||
+		(char >= 0xF900 && char <= 0xFAFF) ||
+		(char >= 0xFE30 && char <= 0xFE4F) ||
+		(char >= 0xFF00 && char <= 0xFFEF) ||
+		(char >= 0x20000 && char <= 0x2FA1F)
 }
 
-// ==================== 日志辅助 ====================
-
-// truncateForLog 截断字符串供日志使用
-func truncateForLog(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
+// truncateForLog 截断日志文本。
+func truncateForLog(source string, maxLen int) string {
+	if len(source) <= maxLen {
+		return source
 	}
-	return s[:maxLen] + "...(truncated)"
+	return source[:maxLen] + "...(truncated)"
 }
 
-// ==================== 异步提取入口(v145 新增, SSE 推送) ====================
-
-// ExtractFromHTMLAsync 异步版 AI 风格模板提取,通过 SSE 广播进度
-//
-// 此方法被 handler 异步调用(go func + 800ms 延迟等前端 SSE 连接建立)
-// SSE Key 格式: "extract_" + userID (提取时还没有 templateID,用户维度天然唯一)
+// ExtractFromHTMLAsync 异步SSE模板提取入口。
 func (s *TemplateExtractService) ExtractFromHTMLAsync(
 	ctx context.Context,
 	userID string,
@@ -539,55 +631,77 @@ func (s *TemplateExtractService) ExtractFromHTMLAsync(
 ) {
 	sseKey := "extract_" + userID
 
-	// 便捷广播函数
-	broadcast := func(msg string) {
+	broadcast := func(message string) {
 		GlobalCWSSEHub.Broadcast(sseKey, CWSSEEvent{
 			EventType: CWSSEExtractProgress,
-			Data:      map[string]interface{}{"message": msg},
+			Data: map[string]interface{}{
+				"message": message,
+			},
 		})
 	}
-	broadcastErr := func(msg string) {
-		extractLog.Error("提取失败(异步)", "key", sseKey, "error", msg)
+
+	broadcastErr := func(message string) {
+		extractLog.Error(
+			"模板提取失败",
+			"key", sseKey,
+			"error", message,
+		)
 		GlobalCWSSEHub.Broadcast(sseKey, CWSSEEvent{
 			EventType: CWSSEExtractError,
-			Data:      map[string]interface{}{"message": msg},
+			Data: map[string]interface{}{
+				"message": message,
+			},
 		})
 	}
 
-	// -------- 广播开始 --------
 	GlobalCWSSEHub.Broadcast(sseKey, CWSSEEvent{
 		EventType: CWSSEExtractStart,
-		Data:      map[string]interface{}{"message": "\U0001f50d 正在预处理 HTML 输入..."},
+		Data: map[string]interface{}{
+			"message": "🔍 正在校验并保留原始模板页面...",
+		},
 	})
 
-	// -------- 1. 输入校验 --------
-	cleanedPages := s.cleanSamplePages(samplePages)
-	if len(cleanedPages) == 0 {
-		broadcastErr("提供的 HTML 内容为空,请粘贴有效的 HTML 代码")
-		return
-	}
-	totalHTMLLen := 0
-	for _, p := range cleanedPages {
-		totalHTMLLen += len(p)
-	}
-	if totalHTMLLen > maxTotalHTMLLen {
-		broadcastErr(fmt.Sprintf("HTML 总长度 %d 字符超出上限 %d 字符", totalHTMLLen, maxTotalHTMLLen))
+	// 1. 准备完整原始母版。
+	cleanedPages, totalHTMLLen, err := prepareTemplateSourcePages(samplePages)
+	if err != nil {
+		broadcastErr(err.Error())
 		return
 	}
 	if sourceType == "" {
 		sourceType = "paste"
 	}
 
-	// -------- 2. 构建提示词 --------
-	broadcast("\U0001f4dd 正在构建 AI 分析指令...")
-	userPrompt := s.buildExtractUserPrompt(cleanedPages)
-	sysPromptObj, err := repository.GetCurrentPromptByKey("prompt_courseware_template_extract")
+	// 2. 生成代表页分析副本。
+	analysisPages := selectTemplateAnalysisPages(
+		cleanedPages,
+		templateAnalysisMaxPages,
+		templateAnalysisMaxRunesPerPage,
+	)
+
+	broadcast(fmt.Sprintf(
+		"📚 已完整保留%d页原始母版，正在选择%d个代表页分析...",
+		len(cleanedPages),
+		len(analysisPages),
+	))
+
+	userPrompt := s.buildExtractUserPrompt(
+		analysisPages,
+		len(cleanedPages),
+		totalHTMLLen,
+	)
+
+	sysPromptObj, err := repository.GetCurrentPromptByKey(
+		"prompt_courseware_template_extract",
+	)
 	if err != nil {
-		broadcastErr("加载 AI 提取提示词失败: " + err.Error())
+		broadcastErr("加载AI提取提示词失败: " + err.Error())
 		return
 	}
+	systemPrompt := strings.TrimSpace(sysPromptObj.Content) +
+		"\n\n" +
+		strings.TrimSpace(templateExtractionPreserveContract)
 
-	// -------- 3. 获取 AI 配置 --------
+	// 3. 获取AI配置。
 	aiCfg, err := ai.GetEffectiveConfig(
 		s.cfg.GetAESKey(),
 		"courseware_template_extract",
@@ -596,89 +710,81 @@ func (s *TemplateExtractService) ExtractFromHTMLAsync(
 		s.cfg.AIDefaultModel,
 	)
 	if err != nil {
-		broadcastErr("获取 AI 配置失败: " + err.Error())
+		broadcastErr("获取AI配置失败: " + err.Error())
 		return
 	}
 
-	// -------- 4. 调用 AI(耗时最长的步骤) --------
-	broadcast("\U0001f916 AI 深度分析中,正在识别配色、字体、布局风格...(约 3-8 分钟)")
+	// 4. AI只分析风格。
+	broadcast("🤖 AI正在分析代表页的配色、字体、间距和视觉规律...")
+
 	traceCtx := &ai.TraceContext{
 		SceneCode: "courseware_template_extract",
 		UserID:    &userID,
 	}
 	callStart := time.Now()
-	result, err := ai.CallAI(aiCfg, sysPromptObj.Content, userPrompt, traceCtx)
+	result, err := ai.CallAI(aiCfg, systemPrompt, userPrompt, traceCtx)
 	if err != nil {
-		broadcastErr("AI 调用失败: " + err.Error())
+		broadcastErr("AI调用失败: " + err.Error())
 		return
 	}
 	callElapsed := time.Since(callStart)
-	extractLog.Info("AI 调用完成(异步)", "user", userID, "model", result.ModelUsed,
-		"tokens", result.TokensUsed, "elapsed", callElapsed.String())
 
-	// -------- 5. 解析 AI 输出 --------
-	broadcast(fmt.Sprintf("\U0001f527 AI 输出完成(耗时 %d 秒),正在解析风格数据...", int(callElapsed.Seconds())))
+	extractLog.Info(
+		"AI风格分析完成",
+		"user", userID,
+		"model", result.ModelUsed,
+		"tokens", result.TokensUsed,
+		"elapsed", callElapsed.String(),
+		"original_pages", len(cleanedPages),
+		"analysis_pages", len(analysisPages),
+	)
+
+	// 5. 解析风格数据。
+	broadcast(fmt.Sprintf(
+		"🔧 AI分析完成（耗时%d秒），正在解析风格参数...",
+		int(callElapsed.Seconds()),
+	))
+
 	extracted, err := s.parseAIOutput(result.Content)
 	if err != nil {
-		extractLog.Error("JSON 解析失败(异步)", "raw_output_head", truncateForLog(result.Content, 500))
-		broadcastErr("AI 输出解析失败: " + err.Error())
+		extractLog.Error(
+			"异步JSON解析失败",
+			"raw_output_head", truncateForLog(result.Content, 500),
+		)
+		broadcastErr("AI输出解析失败: " + err.Error())
 		return
 	}
 	if extracted.Error != "" {
-		broadcastErr("AI 无法从输入提取风格: " + extracted.Error)
+		broadcastErr("AI无法从输入提取风格: " + extracted.Error)
 		return
 	}
-
-	// -------- 6. 校验关键字段 --------
 	if err := s.validateExtracted(extracted); err != nil {
-		extractLog.Warn("校验失败(异步)", "error", err)
-		broadcastErr("AI 提取结果不完整: " + err.Error())
+		broadcastErr("AI提取结果不完整: " + err.Error())
 		return
 	}
 
-	// -------- 7. 序列化+入库 --------
-	broadcast("\U0001f4be 正在保存草稿模板...")
-	colorSchemeJSON, _ := json.Marshal(extracted.ColorScheme)
-	cssVarsJSON, _ := json.Marshal(extracted.CSSVariables)
-	samplePagesJSON, _ := json.Marshal(extracted.SamplePages)
+	// 6. 保存AI风格参数和完整原始母版。
+	broadcast(fmt.Sprintf(
+		"💾 正在保存风格参数和全部%d页原始母版...",
+		len(cleanedPages),
+	))
 
-	category := extracted.SuggestedCategory
-	if !models.IsValidCWStyleCategory(category) {
-		category = models.CWStyleMinimalist
-	}
-	name := strings.TrimSpace(extracted.SuggestedName)
-	if name == "" {
-		name = fmt.Sprintf("AI 提取草稿 %s", time.Now().Format("01-02 15:04"))
-	}
-
-	tpl := &models.CoursewareTemplate{
-		Name:          name,
-		Description:   strings.TrimSpace(extracted.SuggestedDescription),
-		StyleCategory: category,
-		ColorScheme:   string(colorSchemeJSON),
-		CSSVariables:  string(cssVarsJSON),
-		SamplePages:   string(samplePagesJSON),
-		UserID:        &userID,
-	}
-	sourceMeta := map[string]interface{}{
-		"source_type":          sourceType,
-		"original_html_length": totalHTMLLen,
-		"sample_pages_count":   len(cleanedPages),
-		"extracted_at":         time.Now().Format(time.RFC3339),
-		"ai_model_used":        result.ModelUsed,
-		"ai_tokens_used":       result.TokensUsed,
-		"ai_extraction_notes":  extracted.ExtractionNotes,
-	}
-
-	if err := repository.CreateDraftTemplate(ctx, tpl, sourceMeta); err != nil {
-		broadcastErr("草稿入库失败: " + err.Error())
+	tpl, err := s.persistExtractedTemplate(
+		ctx,
+		userID,
+		sourceType,
+		cleanedPages,
+		totalHTMLLen,
+		analysisPages,
+		extracted,
+		result.ModelUsed,
+		result.TokensUsed,
+	)
+	if err != nil {
+		broadcastErr(err.Error())
 		return
 	}
 
-	extractLog.Info("草稿创建成功(异步)", "id", tpl.ID, "name", tpl.Name,
-		"category", tpl.StyleCategory, "user", userID)
-
-	// -------- 8. 广播完成 --------
 	GlobalCWSSEHub.Broadcast(sseKey, CWSSEEvent{
 		EventType: CWSSEExtractDone,
 		Data: map[string]interface{}{
@@ -687,8 +793,9 @@ func (s *TemplateExtractService) ExtractFromHTMLAsync(
 			"suggested_desc":     tpl.Description,
 			"suggested_category": tpl.StyleCategory,
 			"extraction_notes":   extracted.ExtractionNotes,
-			"message":            "\u2728 AI 已提取风格模板,您可以继续微调或保存",
+			"page_count":         len(cleanedPages),
+			"source_preserved":   true,
+			"message":            "✨ 风格分析完成，原始模板页面已完整保留",
 		},
 	})
 }
-

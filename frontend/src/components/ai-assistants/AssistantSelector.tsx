@@ -31,6 +31,7 @@
  *   onChange     - 选中变化回调,传入 ID 或 null
  *   subject?     - 可选:学科精准匹配
  *   grade?       - 可选:年级精准匹配
+ *   lessonPlanId?- 可选:具体教案ID，使用教案快照域过滤候选
  *   onView?      - 可选:点击查看详情回调
  *   onEdit?      - 可选:点击编辑回调(个人助手)
  *   onCreateNew? - 可选:点击新建个人助手回调
@@ -73,6 +74,98 @@ const C = {
 const PANEL_WIDTH = 360
 const PANEL_MAX_HEIGHT = 520
 
+
+/**
+ * 将常见具体年级表达归一化为1—12。
+ * 学段、范围和空值返回空字符串。
+ */
+function normalizeSpecificGrade(
+  value?: string,
+): string {
+  const grade = (value || '').trim()
+
+  const aliases: Record<string, string> = {
+    '1': '1', '1年级': '1', '一年级': '1',
+    '2': '2', '2年级': '2', '二年级': '2',
+    '3': '3', '3年级': '3', '三年级': '3',
+    '4': '4', '4年级': '4', '四年级': '4',
+    '5': '5', '5年级': '5', '五年级': '5',
+    '6': '6', '6年级': '6', '六年级': '6',
+    '7': '7', '7年级': '7', '七年级': '7', '初一': '7',
+    '8': '8', '8年级': '8', '八年级': '8', '初二': '8',
+    '9': '9', '9年级': '9', '九年级': '9', '初三': '9',
+    '10': '10', '10年级': '10', '十年级': '10', '高一': '10',
+    '11': '11', '11年级': '11', '十一年级': '11', '高二': '11',
+    '12': '12', '12年级': '12', '十二年级': '12', '高三': '12',
+  }
+
+  return aliases[grade] || ''
+}
+
+function normalizeGradeSegment(
+  value?: string,
+): string {
+  const grade = (value || '').trim()
+
+  if (
+    grade === '小学' ||
+    grade === '初中' ||
+    grade === '高中'
+  ) {
+    return grade
+  }
+
+  const specific = normalizeSpecificGrade(grade)
+  if (!specific) return ''
+
+  const number = Number(specific)
+  if (number >= 1 && number <= 6) return '小学'
+  if (number >= 7 && number <= 9) return '初中'
+  if (number >= 10 && number <= 12) return '高中'
+
+  return ''
+}
+
+/**
+ * 专家模式手动候选年级排序：
+ * 0=同具体年级，1=同学段或不限，2=其它学段。
+ */
+function manualAssistantGradeRank(
+  candidateGrade: string,
+  currentGrade?: string,
+): number {
+  const candidateSpecific =
+    normalizeSpecificGrade(candidateGrade)
+  const currentSpecific =
+    normalizeSpecificGrade(currentGrade)
+
+  if (
+    candidateSpecific &&
+    currentSpecific &&
+    candidateSpecific === currentSpecific
+  ) {
+    return 0
+  }
+
+  if (!candidateGrade.trim()) return 1
+
+  const candidateSegment =
+    normalizeGradeSegment(candidateGrade)
+  const currentSegment =
+    normalizeGradeSegment(currentGrade)
+
+  if (
+    candidateSegment &&
+    currentSegment &&
+    candidateSegment === currentSegment
+  ) {
+    return 1
+  }
+
+  return 2
+}
+
+
 /* ==================== Props 类型 ==================== */
 
 export interface AssistantSelectorProps {
@@ -86,6 +179,12 @@ export interface AssistantSelectorProps {
   subject?: string
   /** 可选:年级精准匹配过滤 */
   grade?: string
+  /**
+   * 可选:具体教案ID。
+   * 传入后，候选列表按该教案教育域快照过滤；
+   * 不传时保持登录用户当前教育域语义。
+   */
+  lessonPlanId?: string
   /** 可选:点击查看详情回调(不传则不显示该按钮) */
   onView?: (id: string) => void
   /** 可选:点击编辑回调(不传则不显示该按钮,仅对 personal 助手显示) */
@@ -263,7 +362,20 @@ function miniBtnStyle(filled: boolean, color: string = C.textSec): React.CSSProp
 /* ==================== 主组件 ==================== */
 
 export default function AssistantSelector(props: AssistantSelectorProps) {
-  const { scene, value, onChange, subject, grade, onView, onEdit, onDelete, onCreateNew, disabled, compact } = props
+  const {
+    scene,
+    value,
+    onChange,
+    subject,
+    grade,
+    lessonPlanId,
+    onView,
+    onEdit,
+    onDelete,
+    onCreateNew,
+    disabled,
+    compact,
+  } = props
 
   const [assistants, setAssistants] = useState<AIAssistantListItem[]>([])
   const [loading, setLoading]       = useState(false)
@@ -280,34 +392,91 @@ export default function AssistantSelector(props: AssistantSelectorProps) {
   // v121 Bug 1 修复:下拉面板 ref,用于 handleScroll 识别面板内滚动
   const panelRefV121 = useRef<HTMLDivElement>(null)
 
+
   // ==================== 加载助手列表 ====================
   const loadAssistants = useCallback(async () => {
-    setLoading(true); setError(null)
+    setLoading(true)
+    setError(null)
+
     try {
-      const list = await listAssistants({ scene, subject, grade })
-      // 注意:listAssistants 返回 {assistants:[...], total:N} 结构,需解构出 assistants 数组
-      setAssistants(list.assistants || [])
+      // 专家模式是老师手动选择，不向通用列表接口传grade。
+      // 后端实际使用时仍会再次校验active、可见性、学科和场景。
+      const list = await listAssistants({
+        scene,
+        subject,
+        lesson_plan_id: lessonPlanId,
+      })
+
+      const rawItems = list.assistants || []
+
+      // 有当前课程年级时，按手动相关性排序。
+      // 同时只给精准年级的场景默认助手保留“推荐”徽标，
+      // 避免跨年级候选被误解为平台自动推荐。
+      const nextItems = grade
+        ? [...rawItems]
+            .map(item => ({
+              ...item,
+              is_default_here:
+                item.is_default_here &&
+                manualAssistantGradeRank(
+                  item.grade_range,
+                  grade,
+                ) === 0,
+            }))
+            .sort((a, b) =>
+              manualAssistantGradeRank(
+                a.grade_range,
+                grade,
+              ) -
+              manualAssistantGradeRank(
+                b.grade_range,
+                grade,
+              )
+            )
+        : rawItems
+
+      setAssistants(nextItems)
     } catch (e: unknown) {
       console.error('加载 AI 助手列表失败:', e)
-      setError(e instanceof Error ? e.message : '加载失败')
+      setError(
+        e instanceof Error
+          ? e.message
+          : '加载失败',
+      )
       setAssistants([])
     } finally {
       setLoading(false)
     }
-  }, [scene, subject, grade])
+  }, [
+    scene,
+    subject,
+    grade,
+    lessonPlanId,
+  ])
 
   useEffect(() => { loadAssistants() }, [loadAssistants])
 
-  // ==================== 首次加载自动选中默认助手 ====================
-  // 规则:若当前 value=null 且列表里存在 is_default_here=true 的项,自动选中第一个
+
+  // ==================== 非备课场景保留旧默认选择行为 ====================
+  //
+  // 备课工坊传入grade时，value=null必须始终表示：
+  // “交给后端按学科+具体年级+场景严格自动匹配”。
+  // 不能从当前宽松手动候选中由前端自动挑选一项。
+  //
+  // 未传grade的其它旧场景继续保留原先的场景默认自动选中。
   useEffect(() => {
+    if (grade) return
     if (value !== null) return
     if (assistants.length === 0) return
-    const defaultOne = assistants.find(a => a.is_default_here)
+
+    const defaultOne = assistants.find(
+      assistant => assistant.is_default_here,
+    )
     if (defaultOne) onChange(defaultOne.id)
-  // 仅依赖助手列表变化,不依赖 value 避免循环
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [assistants])
+
+    // 只依赖助手列表和grade变化。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assistants, grade])
 
   /**
    * v112 新增:计算下拉面板的 fixed 定位坐标
@@ -445,7 +614,9 @@ export default function AssistantSelector(props: AssistantSelectorProps) {
       ? '加载中…'
       : error
         ? '加载失败,点击重试'
-        : '选择 AI 助手…'
+        : grade
+          ? '自动匹配（严格）'
+          : '选择 AI 助手…'
 
   const triggerPadding = compact ? '6px 10px' : '8px 12px'
   const triggerFontSize = compact ? '12px' : '13px'
@@ -528,7 +699,14 @@ export default function AssistantSelector(props: AssistantSelectorProps) {
             borderBottom: `1px solid ${C.border}`,
             paddingBottom: '8px',
           }}>
-            <span>场景:{ASSISTANT_SCENE_LABELS[scene] || scene}</span>
+            <span>
+              场景:{ASSISTANT_SCENE_LABELS[scene] || scene}
+              {grade && (
+                <span style={{ display: 'block', marginTop: '2px', fontSize: '10px' }}>
+                  当前年级优先，也可手动选择同学段或其它年级助手
+                </span>
+              )}
+            </span>
             <button
               onClick={() => loadAssistants()}
               title="刷新列表"
@@ -631,7 +809,7 @@ export default function AssistantSelector(props: AssistantSelectorProps) {
                       border: `1px solid ${C.border}`, background: '#fff',
                       color: C.textSec, fontSize: '12px', cursor: 'pointer',
                     }}
-                  >✕ 清除选择</button>
+                  >{grade ? '↺ 恢复严格自动匹配' : '✕ 清除选择'}</button>
                 )}
                 {onCreateNew && (
                   <button

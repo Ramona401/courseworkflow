@@ -249,17 +249,40 @@ func cwExtractVAOCICharSection(vaoci string) string {
 //	  ②【已锚定人物形象】(C 角色段) — 人物外貌留白交给图生图；
 //	  ③【锚点图参考提示词】(锚点图 generation_prompt 非空时) — 参考画风措辞。
 //	系统提示词 v5 据这三段决定"严格采用锚定风格 / 不写详细人物外貌 / 参考锚点画风措辞"。
-func (s *CoursewareAssetService) buildImagePromptUserInputFromHTML(ctx context.Context, coursewareID string, pageNum int, userID string) (string, int, error) {
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+func (s *CoursewareAssetService) buildImagePromptUserInputFromHTML(
+	ctx context.Context,
+	coursewareID string,
+	pageNum int,
+	actor *CoursewareActorContext,
+) (
+	string,
+	int,
+	*CoursewareActorContext,
+	error,
+) {
+	cw, scopedActor, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				coursewareID,
+				actor,
+			)
 	if err != nil {
-		return "", 0, fmt.Errorf("课件不存在: %w", err)
+		return "", 0, nil, err
 	}
-	if cw.UserID != userID {
-		return "", 0, fmt.Errorf("无权操作此课件")
-	}
-	page, err := repository.GetCoursewarePageByNumber(ctx, coursewareID, pageNum)
+
+	page, err :=
+		repository.GetCoursewarePageByNumber(
+			ctx,
+			coursewareID,
+			pageNum,
+		)
 	if err != nil {
-		return "", 0, fmt.Errorf("页面不存在: 课件=%s 页码=%d", coursewareID, pageNum)
+		return "", 0, nil, fmt.Errorf(
+			"页面不存在: 课件=%s 页码=%d",
+			coursewareID,
+			pageNum,
+		)
 	}
 
 	// 先在【剥SVG后、尚未截断】的原始 HTML 上精确数占位，保证计数不受截断影响、不被 SVG 干扰。
@@ -329,7 +352,7 @@ func (s *CoursewareAssetService) buildImagePromptUserInputFromHTML(ctx context.C
 	// n<=0（无真实占位）时返回空串，交由系统提示词的"无占位返回空数组"分支处理。
 	b.WriteString(cwBuildImgCountConstraint(imgCount))
 	b.WriteString("\n请严格按系统提示词的规则, 仅为 HTML 中真实存在的图片占位产出提示词; 无图片占位则返回空数组。")
-	return b.String(), imgCount, nil
+	return b.String(), imgCount, scopedActor, nil
 }
 
 // buildMediaPromptUserInput 校验权限并把本页方案+课件信息拼成喂给 AI 的用户输入（视频物料专用）
@@ -343,17 +366,39 @@ func (s *CoursewareAssetService) buildImagePromptUserInputFromHTML(ctx context.C
 // 三段措辞针对"视频两步法"调整：明确风格人物锁定在首帧图、video_prompt 不必重述。
 // prompt_courseware_video_prompt v2 据这三段是否存在决定各物料的分工。
 // 未设锚点则三段全跳过，AI 走"未锚定"分支自行决定首帧图画风与人物外貌。
-func (s *CoursewareAssetService) buildMediaPromptUserInput(ctx context.Context, coursewareID string, pageNum int, userID string) (string, error) {
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+func (s *CoursewareAssetService) buildMediaPromptUserInput(
+	ctx context.Context,
+	coursewareID string,
+	pageNum int,
+	actor *CoursewareActorContext,
+) (
+	string,
+	*CoursewareActorContext,
+	error,
+) {
+	cw, scopedActor, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				coursewareID,
+				actor,
+			)
 	if err != nil {
-		return "", fmt.Errorf("课件不存在: %w", err)
+		return "", nil, err
 	}
-	if cw.UserID != userID {
-		return "", fmt.Errorf("无权操作此课件")
-	}
-	page, err := repository.GetCoursewarePageByNumber(ctx, coursewareID, pageNum)
+
+	page, err :=
+		repository.GetCoursewarePageByNumber(
+			ctx,
+			coursewareID,
+			pageNum,
+		)
 	if err != nil {
-		return "", fmt.Errorf("页面不存在: 课件=%s 页码=%d", coursewareID, pageNum)
+		return "", nil, fmt.Errorf(
+			"页面不存在: 课件=%s 页码=%d",
+			coursewareID,
+			pageNum,
+		)
 	}
 
 	var b strings.Builder
@@ -414,7 +459,95 @@ func (s *CoursewareAssetService) buildMediaPromptUserInput(ctx context.Context, 
 		b.WriteString(fmt.Sprintf("- 交互类型：%s\n", page.InteractionType))
 	}
 	b.WriteString("\n请严格基于以上本页教学需求产出物料，不要编造与本页无关的内容。")
-	return b.String(), nil
+	return b.String(), scopedActor, nil
+}
+
+// persistCoursewareImagePromptSuggestions 在已授权Service内部保存配图建议。
+//
+// 落库属于缓存和复用增强，失败只记录日志，不影响老师取得本次AI结果。
+func persistCoursewareImagePromptSuggestions(
+	ctx context.Context,
+	coursewareID string,
+	pageNum int,
+	items []ImagePromptItem,
+) {
+	if len(items) == 0 {
+		return
+	}
+
+	data, err := json.Marshal(items)
+	if err != nil {
+		cwAssetLog.Warn(
+			"配图建议JSON序列化失败",
+			"courseware_id",
+			coursewareID,
+			"page_number",
+			pageNum,
+			"error",
+			err,
+		)
+		return
+	}
+
+	if err := repository.UpdatePageImageSuggestions(
+		ctx,
+		coursewareID,
+		pageNum,
+		string(data),
+	); err != nil {
+		cwAssetLog.Warn(
+			"配图建议落库失败(不影响响应)",
+			"courseware_id",
+			coursewareID,
+			"page_number",
+			pageNum,
+			"error",
+			err,
+		)
+	}
+}
+
+// persistCoursewareVideoPromptSuggestions 在已授权Service内部保存视频分镜。
+func persistCoursewareVideoPromptSuggestions(
+	ctx context.Context,
+	coursewareID string,
+	pageNum int,
+	items []VideoStoryboardItem,
+) {
+	if len(items) == 0 {
+		return
+	}
+
+	data, err := json.Marshal(items)
+	if err != nil {
+		cwAssetLog.Warn(
+			"视频分镜JSON序列化失败",
+			"courseware_id",
+			coursewareID,
+			"page_number",
+			pageNum,
+			"error",
+			err,
+		)
+		return
+	}
+
+	if err := repository.UpdatePageVideoStoryboards(
+		ctx,
+		coursewareID,
+		pageNum,
+		string(data),
+	); err != nil {
+		cwAssetLog.Warn(
+			"视频分镜落库失败(不影响响应)",
+			"courseware_id",
+			coursewareID,
+			"page_number",
+			pageNum,
+			"error",
+			err,
+		)
+	}
 }
 
 // SuggestImagePrompt 生成【一条或多条】详细、可控的生图提示词
@@ -423,93 +556,244 @@ func (s *CoursewareAssetService) buildMediaPromptUserInput(ctx context.Context, 
 //
 // 数量校验(本轮)：拿到后端数出的占位数 imgCount 后，与 AI 实际返回条数比对，不一致记 Warn 便于追踪
 // "多占位漏写"是否复发；数量吻合记 Info。校验只记日志不阻断（AI 少写仍返回已有的，好过整体失败）。
-func (s *CoursewareAssetService) SuggestImagePrompt(ctx context.Context, coursewareID string, pageNum int, userID string) ([]ImagePromptItem, error) {
-	// 配图提示词依据【当前页 HTML 实际图片占位】(有占位才给, 无占位 AI 返回空数组)
-	userInput, imgCount, err := s.buildImagePromptUserInputFromHTML(ctx, coursewareID, pageNum, userID)
+func (s *CoursewareAssetService) SuggestImagePrompt(
+	ctx context.Context,
+	coursewareID string,
+	pageNum int,
+	actor *CoursewareActorContext,
+) ([]ImagePromptItem, error) {
+	userInput, imgCount, scopedActor, err :=
+		s.buildImagePromptUserInputFromHTML(
+			ctx,
+			coursewareID,
+			pageNum,
+			actor,
+		)
 	if err != nil {
 		return nil, err
 	}
-	sysPrompt, err := repository.GetCurrentPromptByKey("prompt_courseware_image_prompt")
+
+	systemPrompt, err :=
+		repository.GetCurrentPromptByKey(
+			"prompt_courseware_image_prompt",
+		)
 	if err != nil {
-		return nil, fmt.Errorf("加载配图提示词模板失败: %w", err)
-	}
-	aiCfg, err := ai.GetEffectiveConfig(
-		s.cfg.GetAESKey(), sceneCWMediaPrompt,
-		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("获取AI配置失败: %w", err)
-	}
-	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（AI写配图提示词，操作者=userID）
-	imgPromptSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
-	traceCtx := &ai.TraceContext{SceneCode: sceneCWMediaPrompt, UserID: &userID, SchoolID: schoolIDPtr(imgPromptSchoolID)}
-	result, aiErr := ai.CallAI(aiCfg, sysPrompt.Content, userInput, traceCtx)
-	if aiErr != nil {
-		return nil, fmt.Errorf("AI生成提示词失败: %w", aiErr)
+		return nil, fmt.Errorf(
+			"加载配图提示词模板失败: %w",
+			err,
+		)
 	}
 
-	items := cwParseImagePromptsJSON(result.Content)
-	// 兜底：JSON 数组解析不出任何条目时，整段当作单条 prompt
+	aiConfig, err := ai.GetEffectiveConfig(
+		s.cfg.GetAESKey(),
+		sceneCWMediaPrompt,
+		s.cfg.AIAPIBaseURL,
+		s.cfg.AIAPIKey,
+		s.cfg.AIDefaultModel,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"获取AI配置失败: %w",
+			err,
+		)
+	}
+
+	userID := scopedActor.UserID
+	schoolID, _ :=
+		repository.GetSchoolIDByUserID(
+			ctx,
+			userID,
+		)
+
+	traceContext := &ai.TraceContext{
+		SceneCode: sceneCWMediaPrompt,
+		UserID:    &userID,
+		SchoolID:  schoolIDPtr(schoolID),
+	}
+
+	result, aiErr := ai.CallAI(
+		aiConfig,
+		systemPrompt.Content,
+		userInput,
+		traceContext,
+	)
+	if aiErr != nil {
+		return nil, fmt.Errorf(
+			"AI生成提示词失败: %w",
+			aiErr,
+		)
+	}
+
+	items := cwParseImagePromptsJSON(
+		result.Content,
+	)
+
 	if len(items) == 0 {
-		fallback := cwStripPromptWrappers(result.Content)
+		fallback := cwStripPromptWrappers(
+			result.Content,
+		)
 		if fallback != "" {
-			items = []ImagePromptItem{{Caption: "", Prompt: fallback}}
+			items = []ImagePromptItem{
+				{
+					Caption: "",
+					Prompt:  fallback,
+				},
+			}
 		}
 	}
 	if len(items) == 0 {
-		return nil, fmt.Errorf("AI未返回有效提示词")
+		return nil, fmt.Errorf(
+			"AI未返回有效提示词",
+		)
 	}
-	// 数量校验：占位数与返回条数不一致时记 Warn（多占位漏写复发的信号），一致记 Info。
-	// 仅当 imgCount>=1 时校验（imgCount==0 即无真实占位，AI 返回空数组是预期，已被上面兜底逻辑覆盖）。
-	if imgCount >= 1 && len(items) != imgCount {
-		cwAssetLog.Warn("AI配图提示词条数与占位数不一致",
-			"courseware_id", coursewareID, "page_number", pageNum,
-			"expected_placeholders", imgCount, "got_prompts", len(items))
+
+	if imgCount >= 1 &&
+		len(items) != imgCount {
+		cwAssetLog.Warn(
+			"AI配图提示词条数与占位数不一致",
+			"courseware_id",
+			coursewareID,
+			"page_number",
+			pageNum,
+			"expected_placeholders",
+			imgCount,
+			"got_prompts",
+			len(items),
+		)
 	} else {
-		cwAssetLog.Info("AI配图提示词生成成功",
-			"courseware_id", coursewareID, "page_number", pageNum,
-			"placeholders", imgCount, "count", len(items))
+		cwAssetLog.Info(
+			"AI配图提示词生成成功",
+			"courseware_id",
+			coursewareID,
+			"page_number",
+			pageNum,
+			"placeholders",
+			imgCount,
+			"count",
+			len(items),
+		)
 	}
+
+	persistCoursewareImagePromptSuggestions(
+		ctx,
+		coursewareID,
+		pageNum,
+		items,
+	)
+
 	return items, nil
 }
 
 // SuggestVideoPrompt 生成视频分镜数组(每镜含 scene/image_prompt/video_prompt/narration)
 // AI 按本页内容自主拆 1-cwMaxVideoStoryboards 个分镜; 解析失败兜底为单分镜(整段当 video_prompt);
 // 始终保证返回至少一个分镜, 否则报错。
-func (s *CoursewareAssetService) SuggestVideoPrompt(ctx context.Context, coursewareID string, pageNum int, userID string) ([]VideoStoryboardItem, error) {
-	userInput, err := s.buildMediaPromptUserInput(ctx, coursewareID, pageNum, userID)
+func (s *CoursewareAssetService) SuggestVideoPrompt(
+	ctx context.Context,
+	coursewareID string,
+	pageNum int,
+	actor *CoursewareActorContext,
+) ([]VideoStoryboardItem, error) {
+	userInput, scopedActor, err :=
+		s.buildMediaPromptUserInput(
+			ctx,
+			coursewareID,
+			pageNum,
+			actor,
+		)
 	if err != nil {
 		return nil, err
 	}
-	sysPrompt, err := repository.GetCurrentPromptByKey("prompt_courseware_video_prompt")
+
+	systemPrompt, err :=
+		repository.GetCurrentPromptByKey(
+			"prompt_courseware_video_prompt",
+		)
 	if err != nil {
-		return nil, fmt.Errorf("加载配视频提示词模板失败: %w", err)
+		return nil, fmt.Errorf(
+			"加载配视频提示词模板失败: %w",
+			err,
+		)
 	}
-	aiCfg, err := ai.GetEffectiveConfig(
-		s.cfg.GetAESKey(), sceneCWMediaPrompt,
-		s.cfg.AIAPIBaseURL, s.cfg.AIAPIKey, s.cfg.AIDefaultModel,
+
+	aiConfig, err := ai.GetEffectiveConfig(
+		s.cfg.GetAESKey(),
+		sceneCWMediaPrompt,
+		s.cfg.AIAPIBaseURL,
+		s.cfg.AIAPIKey,
+		s.cfg.AIDefaultModel,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("获取AI配置失败: %w", err)
+		return nil, fmt.Errorf(
+			"获取AI配置失败: %w",
+			err,
+		)
 	}
-	// v198：解析操作者所属学校ID，供模型境内/境外分流判定（AI写视频物料提示词，操作者=userID）
-	vidPromptSchoolID, _ := repository.GetSchoolIDByUserID(ctx, userID)
-	traceCtx := &ai.TraceContext{SceneCode: sceneCWMediaPrompt, UserID: &userID, SchoolID: schoolIDPtr(vidPromptSchoolID)}
-	result, aiErr := ai.CallAI(aiCfg, sysPrompt.Content, userInput, traceCtx)
+
+	userID := scopedActor.UserID
+	schoolID, _ :=
+		repository.GetSchoolIDByUserID(
+			ctx,
+			userID,
+		)
+
+	traceContext := &ai.TraceContext{
+		SceneCode: sceneCWMediaPrompt,
+		UserID:    &userID,
+		SchoolID:  schoolIDPtr(schoolID),
+	}
+
+	result, aiErr := ai.CallAI(
+		aiConfig,
+		systemPrompt.Content,
+		userInput,
+		traceContext,
+	)
 	if aiErr != nil {
-		return nil, fmt.Errorf("AI生成视频物料失败: %w", aiErr)
+		return nil, fmt.Errorf(
+			"AI生成视频物料失败: %w",
+			aiErr,
+		)
 	}
-	items := cwParseVideoStoryboardsJSON(result.Content)
-	// 容错: 解析不出任何分镜时, 整段当作 1 个分镜的 video_prompt 兜底
+
+	items := cwParseVideoStoryboardsJSON(
+		result.Content,
+	)
+
 	if len(items) == 0 {
-		if fb := cwStripPromptWrappers(result.Content); fb != "" {
-			items = []VideoStoryboardItem{{VideoPrompt: fb}}
+		fallback := cwStripPromptWrappers(
+			result.Content,
+		)
+		if fallback != "" {
+			items = []VideoStoryboardItem{
+				{
+					VideoPrompt: fallback,
+				},
+			}
 		}
 	}
 	if len(items) == 0 {
-		return nil, fmt.Errorf("AI未返回有效视频物料")
+		return nil, fmt.Errorf(
+			"AI未返回有效视频物料",
+		)
 	}
-	cwAssetLog.Info("AI视频分镜物料生成成功", "courseware_id", coursewareID, "page_number", pageNum, "count", len(items))
+
+	cwAssetLog.Info(
+		"AI视频分镜物料生成成功",
+		"courseware_id",
+		coursewareID,
+		"page_number",
+		pageNum,
+		"count",
+		len(items),
+	)
+
+	persistCoursewareVideoPromptSuggestions(
+		ctx,
+		coursewareID,
+		pageNum,
+		items,
+	)
+
 	return items, nil
 }
 

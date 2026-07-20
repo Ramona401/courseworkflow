@@ -1,20 +1,20 @@
 package services
 
-// course_outline_service.go — 课程大纲业务逻辑（大单元备课能力·批次一 + 教材版本增强）
+// course_outline_service.go — 课程大纲业务逻辑
 //
-// 职责：
-//   1. 列表：按角色解析可见范围（admin 全量 / 其余按所属教研组 + 本校过滤；全局 system 人人可见）
-//   2. 写操作归属校验（canManageScope）：
-//        admin            → 任意大纲可改
-//        senior_operator  → 仅本校 school 范围大纲可改
-//        lead/backbone    → 仅自己担任组长/骨干的教研组的 group 范围大纲可改
-//        system(全局)      → 仅 admin
-//   3. 创建时校验目标归属合法（不能往不属于自己的组/校建大纲）；system 由后端填占位归属ID
-//   4. 教材版本(publisher)：CRUD 透传，创建/更新写入；新增「按学科+年级查可用版本列表」，
-//      供备课首屏的教材版本选择器使用（只列出该学科年级真实存在大纲的版本）。
-//
-// 复用现有：repository.GetUserTeachingGroups / IsGroupLeadOrBackbone /
-//          GetSchoolByAdminUserID（与 data_scope.go 同口径）。
+// 上下文16教育域收口：
+//   1. 所有入口只接收userID，不再信任JWT中的role；
+//   2. 每次请求实时读取users.role并严格解析唯一具体教学域；
+//   3. 列表只返回操作者当前教育域内、且原有数据范围可见的资源；
+//   4. mixed、异常域、无教学组织和跨域冲突在普通列表及出版社接口返回安全空数组；
+//   5. admin保留K12课程大纲管理能力，但出版社选择接口仍返回空数组；
+//   6. K12普通教学身份的出版社列表保持原行为；
+//   7. vocational/adult出版社列表固定返回空数组；
+//   8. 创建、更新、删除必须同时满足资源归属域与操作者实时域一致；
+//   9. vocational/adult可以创建和编辑普通课程大纲，但publisher必须为空；
+//  10. 通过直接API伪造人教版等具名出版社会被Service拒绝；
+//  11. 详情执行同域和可见范围校验，跨域ID按不存在处理，防止资源探测；
+//  12. Handler根据本服务返回的教育域决定是否输出publisher字段。
 
 import (
 	"context"
@@ -27,219 +27,724 @@ import (
 	"tedna/internal/repository"
 )
 
-var courseOutlineLog = logger.WithModule("services.course_outline")
-
-// 业务错误（供 handler 映射 HTTP 码）
-var (
-	ErrOutlineFieldRequired = errors.New("学科、年级、册次、标题、正文均为必填")
-	ErrOutlineScopeInvalid  = errors.New("归属类型非法")
-	ErrOutlineNoPermission  = errors.New("您没有权限管理该归属的课程大纲")
+var courseOutlineLog = logger.WithModule(
+	"services.course_outline",
 )
 
-// CourseOutlineService 课程大纲服务
+var (
+	ErrOutlineFieldRequired = errors.New(
+		"学科、年级、册次、标题、正文均为必填",
+	)
+	ErrOutlineScopeInvalid = errors.New(
+		"归属类型非法",
+	)
+	ErrOutlineNoPermission = errors.New(
+		"您没有权限管理该归属的课程大纲",
+	)
+)
+
+// CourseOutlineService 课程大纲服务。
 type CourseOutlineService struct{}
 
-// NewCourseOutlineService 创建服务
+// NewCourseOutlineService 创建服务。
 func NewCourseOutlineService() *CourseOutlineService {
 	return &CourseOutlineService{}
 }
 
-// ListOutlines 列出当前用户可见的课程大纲
+// ListOutlines 列出当前用户同教育域且可见的课程大纲。
 //
-//	admin → 全量；其余 → 全局(system) + 自己所属教研组 + 本校
-func (s *CourseOutlineService) ListOutlines(ctx context.Context, role, userID string) ([]*models.CourseOutlineListItem, error) {
-	if role == models.RoleAdmin {
-		return repository.ListCourseOutlines(ctx, true, nil, nil)
+// 普通mixed、异常域、无教学组织或跨域冲突返回成功空列表。
+// admin使用受限K12管理兼容域，保留现有K12基础数据管理能力。
+// 数据库和基础设施错误仍向上传递。
+func (s *CourseOutlineService) ListOutlines(
+	ctx context.Context,
+	userID string,
+) (
+	[]*models.CourseOutlineListItem,
+	string,
+	error,
+) {
+	actor, err := resolveCourseOutlineActor(
+		ctx,
+		userID,
+	)
+	if err != nil {
+		if isCourseOutlineSafeEmptyDomainError(
+			err,
+		) {
+			return []*models.CourseOutlineListItem{},
+				"",
+				nil
+		}
+
+		return nil, "", err
 	}
 
-	// 收集该用户所属的全部教研组ID（备课要看本组大纲，所有成员都可读）
-	groups, gErr := repository.GetUserTeachingGroups(ctx, userID)
-	if gErr != nil {
-		courseOutlineLog.Warn("查询用户教研组失败", "user", userID, "error", gErr)
-	}
-	groupIDs := make([]string, 0, len(groups))
-	for _, g := range groups {
-		groupIDs = append(groupIDs, g.ID)
+	groupIDs := s.resolveUserGroupIDs(
+		ctx,
+		actor.UserID,
+	)
+	schoolIDs := s.resolveUserSchoolIDs(
+		ctx,
+		actor.Role,
+		actor.UserID,
+	)
+
+	items, err := repository.ListCourseOutlines(
+		ctx,
+		actor.Role == models.RoleAdmin,
+		groupIDs,
+		schoolIDs,
+		actor.EducationDomain,
+	)
+	if err != nil {
+		return nil, "", err
 	}
 
-	// 本校ID（用于看本校 school 范围大纲）
-	schoolIDs := s.resolveUserSchoolIDs(ctx, role, userID)
+	if items == nil {
+		items = []*models.CourseOutlineListItem{}
+	}
 
-	return repository.ListCourseOutlines(ctx, false, groupIDs, schoolIDs)
+	return items,
+		actor.EducationDomain,
+		nil
 }
 
-// ListAvailablePublishers 查某学科+年级下「真实存在大纲」的可选教材版本列表
+// GetOutline 获取单条大纲并执行教育域与可见范围校验。
 //
-// 供备课首屏的教材版本选择器使用（Yuhan 决策：首屏选版本，没大纲就不关联）：
-//   - 只返回该学科、且大纲年级与教案年级「学段相交」的大纲所拥有的版本；
-//   - 版本严格去重；空串版本（通用/不限版本）若存在则作为一个独立可选项一并返回；
-//   - 一份相交大纲都没有 → 返回空切片（前端据此不显示版本选择、不关联大纲）。
+// 跨域、不可见或归属异常统一返回“课程大纲不存在”，
+// 避免通过ID枚举探测其它教育域资源。
+func (s *CourseOutlineService) GetOutline(
+	ctx context.Context,
+	userID string,
+	id string,
+) (
+	*models.CourseOutline,
+	string,
+	error,
+) {
+	actor, err := resolveCourseOutlineActor(
+		ctx,
+		userID,
+	)
+	if err != nil {
+		return nil, "", err
+	}
+
+	outline, err :=
+		repository.GetCourseOutlineByID(
+			ctx,
+			strings.TrimSpace(id),
+		)
+	if err != nil {
+		return nil, "", err
+	}
+
+	resourceDomain, err :=
+		resolveCourseOutlineResourceDomain(
+			ctx,
+			outline.Scope,
+			outline.ScopeTargetID,
+		)
+	if err != nil {
+		courseOutlineLog.Warn(
+			"课程大纲详情归属教育域解析失败",
+			"outline_id", outline.ID,
+			"scope", outline.Scope,
+			"scope_target_id",
+			outline.ScopeTargetID,
+			"error", err,
+		)
+
+		return nil,
+			"",
+			repository.ErrCourseOutlineNotFound
+	}
+
+	if resourceDomain !=
+		actor.EducationDomain {
+		return nil,
+			"",
+			repository.ErrCourseOutlineNotFound
+	}
+
+	if !s.canViewScope(
+		ctx,
+		actor,
+		outline.Scope,
+		outline.ScopeTargetID,
+	) {
+		return nil,
+			"",
+			repository.ErrCourseOutlineNotFound
+	}
+
+	return outline,
+		actor.EducationDomain,
+		nil
+}
+
+// ListAvailablePublishers 查询K12学科和年级真实存在的课程大纲版本。
 //
-// 注意：不做任何跨版本兜底——这里只如实汇报"该学科该年级到底有哪些版本的大纲可用"，
-// 老师选哪个版本，注入层就严格只注入哪个版本（见 course_outline_match.go 的版本过滤）。
+// 安全空列表：
+//   - vocational；
+//   - adult；
+//   - admin等mixed管理身份；
+//   - 无教学组织；
+//   - 教育域异常；
+//   - 跨域冲突。
 //
-// 返回的字符串切片里，空串("")代表"通用/不限版本"，前端负责把空串显示成"通用/不限版本"。
-func (s *CourseOutlineService) ListAvailablePublishers(ctx context.Context, subject, grade string) ([]string, error) {
+// 只有普通K12教学身份继续查询数据库。
+func (s *CourseOutlineService) ListAvailablePublishers(
+	ctx context.Context,
+	userID string,
+	subject string,
+	grade string,
+) ([]string, error) {
 	subject = strings.TrimSpace(subject)
 	grade = strings.TrimSpace(grade)
+
 	if subject == "" || grade == "" {
 		return []string{}, nil
 	}
 
-	// 按学科粗筛全部 active 大纲，再用与注入同口径的「学段相交」过滤出真正适用本年级的大纲
-	candidates, err := repository.ListActiveOutlinesBySubject(ctx, subject)
+	actor, err := resolveCourseOutlineActor(
+		ctx,
+		userID,
+	)
+	if err != nil {
+		if isCourseOutlineSafeEmptyDomainError(
+			err,
+		) {
+			return []string{}, nil
+		}
+
+		return nil, err
+	}
+
+	// admin虽然为K12课程大纲管理保留兼容域，
+	// 但其本质仍是mixed管理身份，不应获得普通备课出版社选择结果。
+	if actor.MixedManagement {
+		return []string{}, nil
+	}
+
+	if actor.EducationDomain !=
+		models.EducationDomainK12 {
+		return []string{}, nil
+	}
+
+	candidates, err :=
+		repository.
+			ListActiveOutlinesBySubjectAndEducationDomain(
+				ctx,
+				subject,
+				actor.EducationDomain,
+			)
 	if err != nil {
 		return nil, err
 	}
-	hits := MatchOutlines(grade, candidates)
+
+	hits := MatchOutlines(
+		grade,
+		candidates,
+	)
 	if len(hits) == 0 {
 		return []string{}, nil
 	}
 
-	// 去重收集版本（含空串=通用）
-	seen := make(map[string]struct{}, len(hits))
-	var publishers []string
-	for _, o := range hits {
-		p := o.Publisher
-		if _, ok := seen[p]; ok {
+	seen := make(
+		map[string]struct{},
+		len(hits),
+	)
+	publishers := make(
+		[]string,
+		0,
+		len(hits),
+	)
+
+	for _, outline := range hits {
+		publisher := strings.TrimSpace(
+			outline.Publisher,
+		)
+		if _, exists := seen[publisher]; exists {
 			continue
 		}
-		seen[p] = struct{}{}
-		publishers = append(publishers, p)
+
+		seen[publisher] = struct{}{}
+		publishers = append(
+			publishers,
+			publisher,
+		)
 	}
 
-	// 稳定排序：空串(通用)永远排最后，其余按字典序，保证前端下拉顺序稳定
-	sort.SliceStable(publishers, func(i, j int) bool {
-		if publishers[i] == "" {
-			return false
-		}
-		if publishers[j] == "" {
-			return true
-		}
-		return publishers[i] < publishers[j]
-	})
+	sort.SliceStable(
+		publishers,
+		func(i int, j int) bool {
+			if publishers[i] == "" {
+				return false
+			}
+			if publishers[j] == "" {
+				return true
+			}
+
+			return publishers[i] <
+				publishers[j]
+		},
+	)
+
 	return publishers, nil
 }
 
-// CreateOutline 创建课程大纲（含字段校验 + 归属合法性校验）
-func (s *CourseOutlineService) CreateOutline(ctx context.Context, role, userID string, req *models.CreateCourseOutlineRequest) (*models.CourseOutline, error) {
-	if !models.IsValidCourseOutlineScope(req.Scope) {
-		return nil, ErrOutlineScopeInvalid
+// CreateOutline 创建课程大纲。
+func (s *CourseOutlineService) CreateOutline(
+	ctx context.Context,
+	userID string,
+	req *models.CreateCourseOutlineRequest,
+) (
+	*models.CourseOutline,
+	string,
+	error,
+) {
+	if req == nil {
+		return nil,
+			"",
+			ErrOutlineFieldRequired
 	}
 
-	// 全局大纲无具体归属，后端统一填占位ID（满足 scope_target_id NOT NULL 与唯一索引去重）
-	if req.Scope == models.CourseOutlineScopeSystem {
-		req.ScopeTargetID = models.CourseOutlineSystemTargetID
+	actor, err := resolveCourseOutlineActor(
+		ctx,
+		userID,
+	)
+	if err != nil {
+		return nil, "", err
 	}
 
-	if strings.TrimSpace(req.Subject) == "" || strings.TrimSpace(req.Grade) == "" ||
-		strings.TrimSpace(req.Volume) == "" || strings.TrimSpace(req.Title) == "" ||
-		strings.TrimSpace(req.Content) == "" || strings.TrimSpace(req.ScopeTargetID) == "" {
-		return nil, ErrOutlineFieldRequired
+	req.Scope = strings.TrimSpace(
+		req.Scope,
+	)
+	req.ScopeTargetID = strings.TrimSpace(
+		req.ScopeTargetID,
+	)
+
+	if !models.IsValidCourseOutlineScope(
+		req.Scope,
+	) {
+		return nil,
+			"",
+			ErrOutlineScopeInvalid
 	}
 
-	// 归属校验：不能往不属于自己的组/校建大纲；system 仅 admin
-	if !s.canManageScope(ctx, role, userID, req.Scope, req.ScopeTargetID) {
-		return nil, ErrOutlineNoPermission
+	if req.Scope ==
+		models.CourseOutlineScopeSystem {
+		req.ScopeTargetID =
+			models.CourseOutlineSystemTargetID
 	}
 
-	o := &models.CourseOutline{
+	req.Subject = strings.TrimSpace(
+		req.Subject,
+	)
+	req.Grade = strings.TrimSpace(
+		req.Grade,
+	)
+	req.Volume = strings.TrimSpace(
+		req.Volume,
+	)
+	req.Title = strings.TrimSpace(
+		req.Title,
+	)
+
+	if req.Subject == "" ||
+		req.Grade == "" ||
+		req.Volume == "" ||
+		req.Title == "" ||
+		strings.TrimSpace(
+			req.Content,
+		) == "" ||
+		req.ScopeTargetID == "" {
+		return nil,
+			"",
+			ErrOutlineFieldRequired
+	}
+
+	resourceDomain, err :=
+		resolveCourseOutlineResourceDomain(
+			ctx,
+			req.Scope,
+			req.ScopeTargetID,
+		)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if resourceDomain !=
+		actor.EducationDomain {
+		return nil,
+			"",
+			ErrOutlineEducationDomainMismatch
+	}
+
+	if !s.canManageScope(
+		ctx,
+		actor,
+		req.Scope,
+		req.ScopeTargetID,
+	) {
+		return nil,
+			"",
+			ErrOutlineNoPermission
+	}
+
+	publisher, err :=
+		normalizeCourseOutlinePublisherForDomain(
+			actor.EducationDomain,
+			req.Publisher,
+		)
+	if err != nil {
+		return nil, "", err
+	}
+
+	outline := &models.CourseOutline{
 		Scope:         req.Scope,
 		ScopeTargetID: req.ScopeTargetID,
-		Subject:       strings.TrimSpace(req.Subject),
-		Grade:         strings.TrimSpace(req.Grade),
-		Volume:        strings.TrimSpace(req.Volume),
-		Publisher:     strings.TrimSpace(req.Publisher), // 教材版本（空=通用/不限版本）
-		Title:         strings.TrimSpace(req.Title),
+		Subject:       req.Subject,
+		Grade:         req.Grade,
+		Volume:        req.Volume,
+		Publisher:     publisher,
+		Title:         req.Title,
 		Content:       req.Content,
-		SourceType:    models.CourseOutlineSourcePaste,
-		CreatedBy:     userID,
+		SourceType:
+			models.CourseOutlineSourcePaste,
+		CreatedBy: actor.UserID,
 	}
-	if err := repository.CreateCourseOutline(ctx, o); err != nil {
-		return nil, err
+
+	if err := repository.CreateCourseOutline(
+		ctx,
+		outline,
+	); err != nil {
+		return nil, "", err
 	}
-	return o, nil
+
+	return outline,
+		actor.EducationDomain,
+		nil
 }
 
-// UpdateOutline 更新大纲（先查出归属再校验写权限）
-func (s *CourseOutlineService) UpdateOutline(ctx context.Context, role, userID, id string, req *models.UpdateCourseOutlineRequest) error {
-	existing, err := repository.GetCourseOutlineByID(ctx, id)
-	if err != nil {
-		return err
-	}
-	if !s.canManageScope(ctx, role, userID, existing.Scope, existing.ScopeTargetID) {
-		return ErrOutlineNoPermission
-	}
-	if strings.TrimSpace(req.Subject) == "" || strings.TrimSpace(req.Grade) == "" ||
-		strings.TrimSpace(req.Volume) == "" || strings.TrimSpace(req.Title) == "" ||
-		strings.TrimSpace(req.Content) == "" {
+// UpdateOutline 更新课程大纲。
+func (s *CourseOutlineService) UpdateOutline(
+	ctx context.Context,
+	userID string,
+	id string,
+	req *models.UpdateCourseOutlineRequest,
+) error {
+	if req == nil {
 		return ErrOutlineFieldRequired
 	}
-	// 版本规范化：去空白后写回（空=通用/不限版本，允许；不强校验是否在预置清单内）
-	req.Publisher = strings.TrimSpace(req.Publisher)
-	return repository.UpdateCourseOutline(ctx, id, req)
-}
 
-// DeleteOutline 软删除大纲（先查归属再校验写权限）
-func (s *CourseOutlineService) DeleteOutline(ctx context.Context, role, userID, id string) error {
-	existing, err := repository.GetCourseOutlineByID(ctx, id)
+	actor, err := resolveCourseOutlineActor(
+		ctx,
+		userID,
+	)
 	if err != nil {
 		return err
 	}
-	if !s.canManageScope(ctx, role, userID, existing.Scope, existing.ScopeTargetID) {
+
+	existing, err :=
+		repository.GetCourseOutlineByID(
+			ctx,
+			strings.TrimSpace(id),
+		)
+	if err != nil {
+		return err
+	}
+
+	resourceDomain, err :=
+		resolveCourseOutlineResourceDomain(
+			ctx,
+			existing.Scope,
+			existing.ScopeTargetID,
+		)
+	if err != nil {
+		return err
+	}
+
+	if resourceDomain !=
+		actor.EducationDomain {
+		return ErrOutlineEducationDomainMismatch
+	}
+
+	if !s.canManageScope(
+		ctx,
+		actor,
+		existing.Scope,
+		existing.ScopeTargetID,
+	) {
 		return ErrOutlineNoPermission
 	}
-	return repository.DeleteCourseOutline(ctx, id)
+
+	req.Subject = strings.TrimSpace(
+		req.Subject,
+	)
+	req.Grade = strings.TrimSpace(
+		req.Grade,
+	)
+	req.Volume = strings.TrimSpace(
+		req.Volume,
+	)
+	req.Title = strings.TrimSpace(
+		req.Title,
+	)
+
+	if req.Subject == "" ||
+		req.Grade == "" ||
+		req.Volume == "" ||
+		req.Title == "" ||
+		strings.TrimSpace(
+			req.Content,
+		) == "" {
+		return ErrOutlineFieldRequired
+	}
+
+	publisher, err :=
+		normalizeCourseOutlinePublisherForDomain(
+			actor.EducationDomain,
+			req.Publisher,
+		)
+	if err != nil {
+		return err
+	}
+	req.Publisher = publisher
+
+	return repository.UpdateCourseOutline(
+		ctx,
+		existing.ID,
+		req,
+	)
 }
 
-// canManageScope 写权限归属校验（增删改统一入口）
-//
-//	admin            → 任意
-//	senior_operator  → 仅 school 范围且 target 是自己学校
-//	lead/backbone    → 仅 group 范围且自己是该组 lead/backbone
-//	system(全局)      → 仅 admin（普通角色一律拒绝）
-func (s *CourseOutlineService) canManageScope(ctx context.Context, role, userID, scope, targetID string) bool {
-	if role == models.RoleAdmin {
+// DeleteOutline 软删除课程大纲。
+func (s *CourseOutlineService) DeleteOutline(
+	ctx context.Context,
+	userID string,
+	id string,
+) error {
+	actor, err := resolveCourseOutlineActor(
+		ctx,
+		userID,
+	)
+	if err != nil {
+		return err
+	}
+
+	existing, err :=
+		repository.GetCourseOutlineByID(
+			ctx,
+			strings.TrimSpace(id),
+		)
+	if err != nil {
+		return err
+	}
+
+	resourceDomain, err :=
+		resolveCourseOutlineResourceDomain(
+			ctx,
+			existing.Scope,
+			existing.ScopeTargetID,
+		)
+	if err != nil {
+		return err
+	}
+
+	if resourceDomain !=
+		actor.EducationDomain {
+		return ErrOutlineEducationDomainMismatch
+	}
+
+	if !s.canManageScope(
+		ctx,
+		actor,
+		existing.Scope,
+		existing.ScopeTargetID,
+	) {
+		return ErrOutlineNoPermission
+	}
+
+	return repository.DeleteCourseOutline(
+		ctx,
+		existing.ID,
+	)
+}
+
+// canViewScope 判断用户是否拥有资源读取范围。
+func (s *CourseOutlineService) canViewScope(
+	ctx context.Context,
+	actor *courseOutlineActor,
+	scope string,
+	targetID string,
+) bool {
+	if actor == nil {
+		return false
+	}
+
+	if actor.Role == models.RoleAdmin {
 		return true
 	}
 
 	switch scope {
 	case models.CourseOutlineScopeSystem:
-		// 全局大纲仅 admin 可管；admin 已在函数开头 return true，故此处非 admin 一律拒绝
-		return false
-
-	case models.CourseOutlineScopeSchool:
-		// 仅校管可管学校级，且必须是自己绑定的学校
-		if role != models.RoleSeniorOperator {
-			return false
-		}
-		school, err := repository.GetSchoolByAdminUserID(ctx, userID)
-		if err != nil || school == nil {
-			return false
-		}
-		return school.ID == targetID
+		return actor.EducationDomain ==
+			models.EducationDomainK12
 
 	case models.CourseOutlineScopeGroup:
-		// 组长/骨干可管自己组的 group 级大纲
-		isLeadOrBackbone, err := repository.IsGroupLeadOrBackbone(ctx, targetID, userID)
-		if err != nil {
-			courseOutlineLog.Warn("校验组长/骨干权限失败", "group", targetID, "user", userID, "error", err)
-			return false
+		for _, groupID :=
+			range s.resolveUserGroupIDs(
+				ctx,
+				actor.UserID,
+			) {
+			if groupID == targetID {
+				return true
+			}
 		}
-		return isLeadOrBackbone
+
+	case models.CourseOutlineScopeSchool:
+		for _, schoolID :=
+			range s.resolveUserSchoolIDs(
+				ctx,
+				actor.Role,
+				actor.UserID,
+			) {
+			if schoolID == targetID {
+				return true
+			}
+		}
 	}
+
 	return false
 }
 
-// resolveUserSchoolIDs 解析用户可见的学校ID（用于列表过滤本校 school 大纲）
-//
-//	senior_operator → 其绑定的学校；其余角色 → 暂返空（普通老师本步不依赖看 school 级，留待注入阶段细化）
-func (s *CourseOutlineService) resolveUserSchoolIDs(ctx context.Context, role, userID string) []string {
-	if role == models.RoleSeniorOperator {
-		school, err := repository.GetSchoolByAdminUserID(ctx, userID)
-		if err == nil && school != nil && school.ID != "" {
-			return []string{school.ID}
+// canManageScope 判断用户是否拥有资源写权限。
+func (s *CourseOutlineService) canManageScope(
+	ctx context.Context,
+	actor *courseOutlineActor,
+	scope string,
+	targetID string,
+) bool {
+	if actor == nil {
+		return false
+	}
+
+	if actor.Role == models.RoleAdmin {
+		return true
+	}
+
+	switch scope {
+	case models.CourseOutlineScopeSystem:
+		return false
+
+	case models.CourseOutlineScopeSchool:
+		if actor.Role !=
+			models.RoleSeniorOperator {
+			return false
+		}
+
+		school, err :=
+			repository.GetSchoolByAdminUserID(
+				ctx,
+				actor.UserID,
+			)
+		if err != nil ||
+			school == nil {
+			return false
+		}
+
+		return school.ID == targetID
+
+	case models.CourseOutlineScopeGroup:
+		allowed, err :=
+			repository.IsGroupLeadOrBackbone(
+				ctx,
+				targetID,
+				actor.UserID,
+			)
+		if err != nil {
+			courseOutlineLog.Warn(
+				"校验课程大纲教研组管理权限失败",
+				"group", targetID,
+				"user", actor.UserID,
+				"error", err,
+			)
+			return false
+		}
+
+		return allowed
+	}
+
+	return false
+}
+
+// resolveUserGroupIDs 解析用户所属教研组ID。
+func (s *CourseOutlineService) resolveUserGroupIDs(
+	ctx context.Context,
+	userID string,
+) []string {
+	groups, err :=
+		repository.GetUserTeachingGroups(
+			ctx,
+			userID,
+		)
+	if err != nil {
+		courseOutlineLog.Warn(
+			"查询用户课程大纲可见教研组失败",
+			"user", userID,
+			"error", err,
+		)
+		return []string{}
+	}
+
+	groupIDs := make(
+		[]string,
+		0,
+		len(groups),
+	)
+	for _, group := range groups {
+		if group != nil &&
+			strings.TrimSpace(group.ID) != "" {
+			groupIDs = append(
+				groupIDs,
+				group.ID,
+			)
 		}
 	}
-	return []string{}
+
+	return groupIDs
+}
+
+// resolveUserSchoolIDs 解析现有课程大纲列表允许读取的学校ID。
+//
+// 保持原有范围：只有senior_operator读取其管理学校的school级大纲。
+func (s *CourseOutlineService) resolveUserSchoolIDs(
+	ctx context.Context,
+	role string,
+	userID string,
+) []string {
+	if role !=
+		models.RoleSeniorOperator {
+		return []string{}
+	}
+
+	school, err :=
+		repository.GetSchoolByAdminUserID(
+			ctx,
+			userID,
+		)
+	if err != nil ||
+		school == nil ||
+		strings.TrimSpace(
+			school.ID,
+		) == "" {
+		return []string{}
+	}
+
+	return []string{
+		school.ID,
+	}
 }

@@ -41,17 +41,28 @@ import (
 //  4. 调用AI（courseware_scheme场景，降级scanner）重新生成方案JSON
 //  5. 解析JSON，尽量保留层1索引，仅更新层2用户字段
 //  6. 写入数据库并SSE广播
-func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID string, userID string, feedback string) error {
-	// ---- 1. 获取课件 ----
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+func (s *CoursewareIndexService) RefineIndex(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+	feedback string,
+) error {
+	// ---- 1. 可信Actor二次授权并重新加载正式课件 ----
+	cw, scopedActor, err :=
+		loadOwnedCoursewareForSchemeMutation(
+			ctx,
+			coursewareID,
+			actor,
+		)
 	if err != nil {
-		s.broadcastError(coursewareID, "课件不存在: "+err.Error())
-		return fmt.Errorf("课件不存在: %w", err)
+		s.broadcastError(
+			coursewareID,
+			"课件授权失败: "+err.Error(),
+		)
+		return err
 	}
-	if cw.UserID != userID {
-		s.broadcastError(coursewareID, "无权操作此课件")
-		return fmt.Errorf("无权操作此课件")
-	}
+
+	userID := scopedActor.UserID
 
 	// 获取当前全部页面（修改方案的基础）
 	pages, err := repository.ListCoursewarePages(ctx, coursewareID)
@@ -61,7 +72,22 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 	}
 
 	// ---- 2. 按来源取原文上下文 + 课件基本信息 ----
-	title, subject, grade, sourceContext := s.buildRefineSourceContext(ctx, cw)
+	title,
+		subject,
+		grade,
+		sourceContext,
+		sourceErr :=
+		s.buildRefineSourceContext(
+			ctx,
+			cw,
+		)
+	if sourceErr != nil {
+		s.broadcastError(
+			coursewareID,
+			"关联原始内容教育域异常",
+		)
+		return sourceErr
+	}
 
 	GlobalCWSSEHub.Broadcast(coursewareID, CWSSEEvent{
 		EventType: CWSSEIndexStart,
@@ -162,7 +188,7 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 	// 双重保留策略确保最高保留率：
 	//   策略A（优先）：前端修正指令含"⚠️ 【严格要求】仅修改以下页面"时，从中提取问题页码集，
 	//     不在集合中的页直接保留全部旧数据（含HTML），无需字段比对，不受AI微调措辞影响。
-	//   策略B（兜底）：无法提取页码集时（手动输入修改意见等场景），回退到三字段精确比对。
+	//   策略B（兜底）：无法提取页码集时（手动输入修改意见等场景），回退到全部生成字段精确比对。
 	// 两策略对问题页的处理相同：用AI新方案字段，但不保留HTML（需重新生成）。
 
 	// 从修正指令中提取问题页码集（前端 buildFixInstruction 格式："仅修改以下页面的方案：P3、P5、P8"）
@@ -185,13 +211,17 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 		newTitle := strings.TrimSpace(sc.Title)
 		newPurpose := strings.TrimSpace(sc.Purpose)
 		newSummary := strings.TrimSpace(sc.ContentSummary)
+		newInteraction := strings.TrimSpace(sc.InteractionType)
+		newVisual := strings.TrimSpace(sc.VisualFormat)
+		newMedia := strings.TrimSpace(sc.MediaRequirements)
+		newComplexity := cwClamp(sc.EstimatedComplexity, 1, 5)
 
 		// 检查旧页是否存在
 		oldPage, hasOld := oldPageMap[pn]
 
 		// 判定该页是否属于"不需要改"——满足任一即为"应保留"：
 		//   策略A：有页码集且该页不在集合中
-		//   策略B：无页码集且三字段精确相同
+		//   策略B：无页码集且标题、目的、概要、互动、视觉、多媒体与丰富度全部相同
 		shouldPreserve := false
 		if hasOld && strings.TrimSpace(oldPage.HTMLContent) != "" {
 			if usePageNumStrategy {
@@ -199,10 +229,14 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 				_, isAffected := affectedPages[pn]
 				shouldPreserve = !isAffected
 			} else {
-				// 策略B兜底：三字段精确比对
+				// 策略B兜底：全部生成字段精确比对，任一互动或视觉字段变化都必须清除旧HTML
 				shouldPreserve = oldPage.Title == newTitle &&
 					oldPage.Purpose == newPurpose &&
-					oldPage.ContentSummary == newSummary
+					oldPage.ContentSummary == newSummary &&
+					oldPage.InteractionType == newInteraction &&
+					oldPage.VisualFormat == newVisual &&
+					oldPage.MediaRequirements == newMedia &&
+					oldPage.EstimatedComplexity == newComplexity
 			}
 		}
 
@@ -211,7 +245,7 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 			page := &models.CoursewarePage{
 				CoursewareID:        coursewareID,
 				PageNumber:          pn,
-				Title:               oldPage.Title,    // 用旧标题（策略A下AI可能微调了措辞，但该页不在问题集，应保留原样）
+				Title:               oldPage.Title, // 用旧标题（策略A下AI可能微调了措辞，但该页不在问题集，应保留原样）
 				Purpose:             oldPage.Purpose,
 				ContentSummary:      oldPage.ContentSummary,
 				InteractionType:     oldPage.InteractionType,
@@ -237,10 +271,10 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 				Title:               newTitle,
 				Purpose:             newPurpose,
 				ContentSummary:      newSummary,
-				InteractionType:     strings.TrimSpace(sc.InteractionType),
-				VisualFormat:        strings.TrimSpace(sc.VisualFormat),
-				MediaRequirements:   strings.TrimSpace(sc.MediaRequirements),
-				EstimatedComplexity: cwClamp(sc.EstimatedComplexity, 1, 5),
+				InteractionType:     newInteraction,
+				VisualFormat:        newVisual,
+				MediaRequirements:   newMedia,
+				EstimatedComplexity: newComplexity,
 				Status:              models.CWPageStatusPending,
 			}
 			// 层1索引仍保留（与方案变更无关）
@@ -272,7 +306,7 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 		coursewareID, cw.SourceType, len(pages), len(newPages), htmlPreserved, htmlCleared, usePageNumStrategy, callResult.ModelUsed, callResult.TokensUsed, cwTruncate(feedback, 50))
 
 	// ---- 7. 保存并广播（保留原有概述不变）----
-	if err := s.saveAndBroadcast(ctx, coursewareID, cw.IndexOverview, newPages); err != nil {
+	if err := s.saveAndBroadcast(ctx, coursewareID, scopedActor, cw.IndexOverview, newPages); err != nil {
 		return err
 	}
 
@@ -300,7 +334,16 @@ func (s *CoursewareIndexService) RefineIndex(ctx context.Context, coursewareID s
 //   - 其它(topic/ppt/3d/html)：取课件基本信息，sourceContext 为空
 //
 // 本函数在 index 服务内部完成 docx 读取，不调用 PPT/Doc 服务，避免循环依赖。
-func (s *CoursewareIndexService) buildRefineSourceContext(ctx context.Context, cw *models.Courseware) (string, string, string, string) {
+func (s *CoursewareIndexService) buildRefineSourceContext(
+	ctx context.Context,
+	cw *models.Courseware,
+) (
+	string,
+	string,
+	string,
+	string,
+	error,
+) {
 	title := cw.Title
 	subject := cw.Subject
 	grade := cw.Grade
@@ -311,6 +354,13 @@ func (s *CoursewareIndexService) buildRefineSourceContext(ctx context.Context, c
 		if cw.LessonPlanID != nil && *cw.LessonPlanID != "" {
 			lp, err := repository.GetLessonPlanByID(ctx, *cw.LessonPlanID)
 			if err == nil && lp != nil {
+				if domainErr :=
+					validateCoursewareLinkedLessonPlanDomain(
+						cw,
+						lp,
+					); domainErr != nil {
+					return "", "", "", "", domainErr
+				}
 				if strings.TrimSpace(lp.Title) != "" {
 					title = lp.Title
 				}
@@ -338,7 +388,7 @@ func (s *CoursewareIndexService) buildRefineSourceContext(ctx context.Context, c
 		}
 	}
 
-	return title, subject, grade, sourceContext
+	return title, subject, grade, sourceContext, nil
 }
 
 // readDocxFullText 读取.docx文件的全部正文文本（index服务内部独立实现，无服务间依赖）

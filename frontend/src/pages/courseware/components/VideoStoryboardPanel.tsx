@@ -14,6 +14,8 @@
  * 另保留底部「手动直接生成(文生视频)」次要入口，给只想快出一段、不走分镜的场景。
  */
 import { useState, useEffect, useRef } from 'react'
+import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import { generateCWImage, generateCWVideo, getStoredVideoStoryboards, listPageAssets, queryVideoStatus, saveVideoStoryboards, suggestVideoPrompt } from '@/api/coursewares'
 import type { VideoStoryboardItem, CoursewareAsset } from '@/api/coursewares'
 import { C } from './courseware-workshop/workshopConstants'
@@ -54,7 +56,30 @@ export default function VideoStoryboardPanel({ coursewareId, pageNum, styleAncho
   const submittedPromptRef = useRef('')
   const saveTimerRef = useRef<number | null>(null)
 
-  const [manualPrompt, setManualPrompt] = useState('')
+  const { user } = useAuth()
+
+  /**
+   * 仅保护底部手动文生视频描述。
+   *
+   * AI分镜中的提示词已经通过saveVideoStoryboards保存到后端，
+   * 不再重复写入sessionStorage。
+   */
+  const manualPromptDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'courseware-video-manual',
+    resourceId: [
+      coursewareId,
+      `page-${pageNum}`,
+    ].join('|'),
+    field: 'prompt',
+    initialValue: '',
+    maxHistory: 30,
+  })
+
+  const manualPrompt =
+    manualPromptDraft.value
+  const setManualPrompt =
+    manualPromptDraft.setValue
 
   // 切页/挂载：先清空分镜与生成态（防上一页串到新页，不自动调 AI）；
   // 再检测本页是否有「未完成(generating)的视频」——刷新/切走会中断轮询、留下卡在 generating 的孤儿任务，
@@ -62,7 +87,7 @@ export default function VideoStoryboardPanel({ coursewareId, pageNum, styleAncho
   useEffect(() => {
     setShots([]); setActiveIdx(0); setMsg('')
     setVideoResult(null); setVideoAssetId(''); setVideoPolling(false); setVideoSubmitting(false)
-    setFrameGenIdx(-1); setManualPrompt('')
+    setFrameGenIdx(-1)
     if (!coursewareId || pageNum <= 0) return
     let cancelled = false
     listPageAssets(coursewareId, pageNum)
@@ -231,8 +256,22 @@ export default function VideoStoryboardPanel({ coursewareId, pageNum, styleAncho
     submittedPromptRef.current = p
     setVideoSubmitting(true); setMsg(''); setVideoResult(null)
     try {
-      const res = await generateCWVideo(coursewareId, pageNum, p, undefined, undefined)
-      setVideoAssetId(res.asset_id); setVideoSubmitting(false); setVideoPolling(true)
+      const res = await generateCWVideo(
+        coursewareId,
+        pageNum,
+        p,
+        undefined,
+        undefined,
+      )
+
+      /**
+       * 接口返回资产ID代表异步视频任务已正式创建。
+       * 此时才提交清空输入；失败分支不会触碰草稿。
+       */
+      manualPromptDraft.commit()
+      setVideoAssetId(res.asset_id)
+      setVideoSubmitting(false)
+      setVideoPolling(true)
       setMsg('✅ ' + res.message)
     } catch (e) {
       setMsg('❌ 提交失败: ' + (e instanceof Error ? e.message : '未知错误')); setVideoSubmitting(false)
@@ -334,8 +373,36 @@ export default function VideoStoryboardPanel({ coursewareId, pageNum, styleAncho
       <details style={{ marginTop: 14 }}>
         <summary style={{ fontSize: 12, color: C.textSecondary, cursor: 'pointer' }}>或：手动直接生成一段（文生视频，不分镜、无首帧）</summary>
         <div style={{ marginTop: 8 }}>
-          <textarea value={manualPrompt} onChange={e => setManualPrompt(e.target.value)} rows={3} disabled={genBusy} style={taField}
-            placeholder="直接描述想要的视频，例如：一位教师在讲台前微笑讲课，绿色黑板，教室明亮温馨" />
+          <textarea
+            value={manualPrompt}
+            onChange={e =>
+              setManualPrompt(
+                e.target.value,
+              )
+            }
+            onKeyDown={e => {
+              manualPromptDraft.handleKeyDown(
+                e,
+              )
+            }}
+            rows={3}
+            disabled={genBusy}
+            style={taField}
+            placeholder="直接描述想要的视频，例如：一位教师在讲台前微笑讲课，绿色黑板，教室明亮温馨"
+          />
+          <div
+            style={{
+              marginTop: 5,
+              fontSize: 10,
+              color: '#9CA3AF',
+              lineHeight: 1.5,
+            }}
+          >
+            当前页视频描述已自动保存 ·
+            提交失败不会清除 ·
+            Ctrl/Command+Z恢复误删
+          </div>
+
           <button onClick={handleManualGen} disabled={genBusy || !manualPrompt.trim()}
             style={{ marginTop: 6, padding: '8px 14px', borderRadius: 8, border: 'none', background: (!genBusy && manualPrompt.trim()) ? '#6B7280' : '#E5E7EB', color: (!genBusy && manualPrompt.trim()) ? '#fff' : '#9CA3AF', fontSize: 13, fontWeight: 600, cursor: (!genBusy && manualPrompt.trim()) ? 'pointer' : 'default', width: '100%' }}>
             {videoSubmitting ? '⏳ 提交中...' : videoPolling ? '⏳ 生成中...' : '🎬 直接生成视频'}

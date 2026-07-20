@@ -52,6 +52,12 @@ func (h *SSEHandler) StreamPipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	finishSSEHandshake, handshakeOK := beginSSEHandshake(w)
+	if !handshakeOK {
+		return
+	}
+	defer finishSSEHandshake()
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "不支持SSE流", http.StatusInternalServerError)
@@ -67,6 +73,8 @@ func (h *SSEHandler) StreamPipeline(w http.ResponseWriter, r *http.Request) {
 
 	ch := services.GlobalSSEHub.Subscribe(pipelineID)
 	defer services.GlobalSSEHub.Unsubscribe(pipelineID, ch)
+
+	finishSSEHandshake()
 
 	connectEvent := services.SSEEvent{
 		EventType:  "connected",

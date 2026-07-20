@@ -7,6 +7,7 @@
  */
 
 import { useNavigate } from 'react-router-dom'
+import { useEducationProfile } from '@/hooks/useEducationProfile'
 import type {
   ConversationMessage,
   RecipeSelectionMode,
@@ -71,6 +72,7 @@ export function StartScreen({
   onStart, onImportSuccess,
 }: StartScreenProps) {
   const navigate = useNavigate()
+  const { isK12 } = useEducationProfile()
 
   return (
     <div style={{ height: 'calc(100vh - 120px)', overflow: 'hidden', margin: '-28px -32px', display: 'flex', flexDirection: 'column' }}>
@@ -111,7 +113,9 @@ export function StartScreen({
                   <div style={{ fontSize: '13px', color: C.textSec, lineHeight: 1.7 }}>
                     告诉AI要上什么课<br />
                     AI全程陪你从零设计教案<br />
-                    可选配方、关联课本图片
+                    {isK12
+                      ? '可选配方、关联课本图片'
+                      : '可选配方、按当前教育域设计'}
                   </div>
                 </div>
                 <div style={{ marginTop: 'auto', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', fontWeight: 600, color: C.primary }}>
@@ -148,7 +152,12 @@ export function StartScreen({
                 { icon: '📦', text: '配方管理', path: '/lesson-plans/recipes' },
                 { icon: '📚', text: '教案库',   path: '/lesson-plans/library' },
                 { icon: '📷', text: '课本管理', path: '/lesson-plans/textbooks' },
-              ].map(item => (
+              ].filter(
+                item =>
+                  isK12 ||
+                  item.path !==
+                    '/lesson-plans/textbooks',
+              ).map(item => (
                 <button key={item.path} onClick={() => navigate(item.path)}
                   style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: C.textSec, background: 'transparent', border: 'none', padding: '6px 12px', borderRadius: '8px', cursor: 'pointer', transition: 'all 150ms ease' }}
                   onMouseEnter={e => { const el = e.currentTarget as HTMLButtonElement; el.style.background = C.primaryLight; el.style.color = C.primary }}

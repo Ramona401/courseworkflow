@@ -15,6 +15,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
+import { useSubjects } from '@/hooks/useSubjects'
 import { createCourseware } from '@/api/coursewares'
 import {
   getLessonPlans, deleteLessonPlan,
@@ -24,7 +25,7 @@ import {
 } from '@/api/lesson-plans'
 
 // ---- 子组件 ----
-import { C, STATUS_FILTERS, SUBJECTS, GRADES } from './components/myPlansConstants'
+import { C, STATUS_FILTERS, GRADES } from './components/myPlansConstants'
 import { PlanCard, SkeletonCard, EmptyState } from './components/MyPlanCards'
 
 // ==================== 教研组选择弹窗 ====================
@@ -170,6 +171,17 @@ export default function MyPlansPage() {
   const { user }  = useAuth()
   const navigate  = useNavigate()
 
+  /**
+   * 学科筛选读取当前用户教育域和教学组织的课程目录。
+   * “全部”只作为筛选哨兵，不会写入教案数据。
+   */
+  const {
+    subjects: subjectOptions,
+    loading: subjectsLoading,
+  } = useSubjects({
+    withAll: true,
+  })
+
   const [plans, setPlans]     = useState<LessonPlan[]>([])
   const [total, setTotal]     = useState(0)
   const [loading, setLoading] = useState(true)
@@ -178,6 +190,26 @@ export default function MyPlansPage() {
   const [statusFilter,  setStatusFilter]  = useState<string>('all')
   const [subjectFilter, setSubjectFilter] = useState('全部')
   const [gradeFilter,   setGradeFilter]   = useState('全部')
+
+  /**
+   * 课程目录刷新或账号教育域变化后，
+   * 清理已经不属于当前目录的筛选值。
+   */
+  useEffect(() => {
+    if (subjectsLoading) return
+
+    if (
+      !subjectOptions.includes(
+        subjectFilter,
+      )
+    ) {
+      setSubjectFilter('全部')
+    }
+  }, [
+    subjectsLoading,
+    subjectOptions,
+    subjectFilter,
+  ])
 
   const [loadingId, setLoadingId] = useState<string | null>(null)
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null)
@@ -361,7 +393,7 @@ export default function MyPlansPage() {
 
         <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
           {[
-            { label: '学科', value: subjectFilter, options: SUBJECTS, onChange: setSubjectFilter },
+            { label: '学科', value: subjectFilter, options: subjectOptions, onChange: setSubjectFilter },
             { label: '年级', value: gradeFilter,   options: GRADES,   onChange: setGradeFilter   },
           ].map(({ label, value, options, onChange }) => (
             <div key={label} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>

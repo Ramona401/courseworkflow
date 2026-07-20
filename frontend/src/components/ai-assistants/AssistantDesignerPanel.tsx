@@ -48,6 +48,8 @@ import {
   type DesignChatSSEConnection,
 } from '@/api/ai-assistants'
 import { renderMarkdown } from '@/pages/lesson-plans/plan-detail/components/planDetailConstants'
+import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 
 /* ==================== 样式常量(与 EditModal/Selector 保持一致) ==================== */
 const C = {
@@ -140,17 +142,81 @@ interface ChatMessage {
   isError?: boolean
 }
 
+
+/**
+ * 为已有Prompt生成不包含正文内容的稳定短标识。
+ *
+ * 该标识只用于区分不同助手编辑草稿，
+ * sessionStorage键中不会出现Prompt原文。
+ */
+function hashDesignerDraftIdentity(
+  value: string,
+): string {
+  let hash = 2166136261
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+
+  return (hash >>> 0).toString(36)
+}
+
 /* ==================== 主组件 ==================== */
 
 export default function AssistantDesignerPanel(props: AssistantDesignerPanelProps) {
   const { subject, grade, scenes, initialDraft, onApplyDraft, applyButtonLabel, applyHintText, injectedInput, fillHeight, collapsibleDraft } = props
 
+  const { user } = useAuth()
+
+  /**
+   * 草稿资源标识：
+   * 1. 学科；
+   * 2. 年级；
+   * 3. 场景集合；
+   * 4. 新建或已有Prompt的稳定哈希。
+   *
+   * 不把Prompt正文写进sessionStorage键。
+   */
+  const designerDraftResourceID = [
+    subject || 'all-subjects',
+    grade || 'all-grades',
+    [...scenes].sort().join(',') || 'all-scenes',
+    initialDraft.trim()
+      ? `existing-${hashDesignerDraftIdentity(initialDraft)}`
+      : 'new',
+  ].join('|')
+
+  const {
+    value: input,
+    setValue: setInput,
+    commit: commitInputDraft,
+    handleKeyDown: handleInputDraftKeyDown,
+  } = useProtectedDraft({
+    userId: user?.id,
+    scope: 'assistant-designer',
+    resourceId: designerDraftResourceID,
+    field: 'message',
+    initialValue: '',
+    maxHistory: 40,
+  })
+
+  const {
+    value: localDraft,
+    setValue: setLocalDraft,
+  } = useProtectedDraft({
+    userId: user?.id,
+    scope: 'assistant-designer',
+    resourceId: designerDraftResourceID,
+    field: 'prompt-draft',
+    initialValue: initialDraft,
+    maxHistory: 40,
+  })
+
   // ==================== state ====================
   const [messages, setMessages]       = useState<ChatMessage[]>([])
-  const [input, setInput]             = useState('')
   const [isStreaming, setIsStreaming] = useState(false)
   const [statusTip, setStatusTip]     = useState('')          // "🔍 AI 正在查组件库..." 之类瞬时提示
-  const [localDraft, setLocalDraft]   = useState(initialDraft)// AI 生成的草稿,独立于 Modal 的 fullPrompt
   const [errorMsg, setErrorMsg]       = useState('')          // 顶部错误横幅
   const [draftCollapsed, setDraftCollapsed] = useState(false)  // 草稿区折叠态(仅 collapsibleDraft 时有意义)
 
@@ -205,8 +271,9 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
       { role: 'assistant', content: '' },
     ])
 
-    // 3. 清输入框 + 进入 streaming 态
-    setInput('')
+    // 3. 清输入框 + 进入 streaming 态。
+    // 使用commit而不是直接setInput('')，保留一份可撤销快照。
+    commitInputDraft()
     setIsStreaming(true)
     setStatusTip('')
 
@@ -305,7 +372,7 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
 
     // 6. 发送后输入框聚焦(下一轮对话可以直接打字)
     setTimeout(() => inputRef.current?.focus(), 50)
-  }, [input, isStreaming, messages, subject, grade, scenes, localDraft])
+  }, [input, isStreaming, messages, subject, grade, scenes, localDraft, commitInputDraft])
 
   // ==================== 切换组件参考折叠态 ====================
   const toggleComponents = (msgIndex: number) => {
@@ -674,6 +741,10 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => {
+                if (handleInputDraftKeyDown(e)) {
+                  return
+                }
+
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()
                   handleSend()
@@ -725,7 +796,7 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
               textAlign: 'center',
             }}
           >
-            Enter 发送 · Shift+Enter 换行
+            已自动保存草稿 · Enter发送 · Shift+Enter换行 · Ctrl/Command+Z恢复误删
           </div>
         </div>
       </div>

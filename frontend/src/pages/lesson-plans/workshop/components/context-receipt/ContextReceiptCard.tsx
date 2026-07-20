@@ -1,8 +1,13 @@
 /**
- * ContextReceiptCard.tsx — AI消息下方的“本轮备课依据”折叠卡片
+ * ContextReceiptCard.tsx — AI消息下方的“本轮已读取”折叠卡片
  *
- * 默认只展示简要摘要，不打断老师阅读AI正文；
- * 展开后展示真正使用的依据，以及未使用或未生效的材料与原因。
+ * 默认只显示一行摘要，不打断老师阅读AI正文。
+ *
+ * 展开后仅展示：
+ *   1. 本轮真正读取成功的教学资源；
+ *   2. 已关联或已选择但读取失败的警告。
+ *
+ * 普通的未关联、不适用、稍后读取、已让位和明确不使用不展示。
  */
 
 import { useMemo, useState } from 'react'
@@ -19,7 +24,11 @@ interface ContextReceiptCardProps {
 
 const TONE_STYLE: Record<
   ContextReceiptTone,
-  { color: string; background: string; border: string }
+  {
+    color: string
+    background: string
+    border: string
+  }
 > = {
   positive: {
     color: '#166534',
@@ -38,14 +47,19 @@ const TONE_STYLE: Record<
   },
 }
 
-function ReceiptItemRow({ item }: { item: ContextReceiptViewItem }) {
+function ReceiptItemRow({
+  item,
+}: {
+  item: ContextReceiptViewItem
+}) {
   const style = TONE_STYLE[item.tone]
 
   return (
     <div
       style={{
         display: 'grid',
-        gridTemplateColumns: '92px minmax(0, 1fr)',
+        gridTemplateColumns:
+          '92px minmax(0, 1fr)',
         gap: '10px',
         padding: '8px 0',
         borderBottom: '1px solid #EEF2F7',
@@ -62,6 +76,7 @@ function ReceiptItemRow({ item }: { item: ContextReceiptViewItem }) {
         >
           {item.title}
         </div>
+
         <span
           style={{
             display: 'inline-flex',
@@ -85,7 +100,9 @@ function ReceiptItemRow({ item }: { item: ContextReceiptViewItem }) {
           minWidth: 0,
           fontSize: '12px',
           lineHeight: 1.65,
-          color: item.used ? '#475569' : '#64748B',
+          color: item.tone === 'warning'
+            ? '#92400E'
+            : '#475569',
           wordBreak: 'break-word',
         }}
       >
@@ -98,28 +115,50 @@ function ReceiptItemRow({ item }: { item: ContextReceiptViewItem }) {
 export default function ContextReceiptCard({
   receipt,
 }: ContextReceiptCardProps) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] =
+    useState(false)
 
   const view = useMemo(
-    () => receipt ? buildContextReceiptView(receipt) : null,
+    () =>
+      receipt
+        ? buildContextReceiptView(receipt)
+        : null,
     [receipt],
   )
 
-  if (!receipt || !view) return null
+  if (
+    !receipt ||
+    !view ||
+    (
+      view.usedItems.length === 0 &&
+      view.warningItems.length === 0
+    )
+  ) {
+    return null
+  }
+
+  const hasWarning =
+    view.warningItems.length > 0
 
   return (
     <div
       style={{
         marginTop: '8px',
-        border: '1px solid #DCE5F2',
+        border: `1px solid ${
+          hasWarning ? '#FDE68A' : '#DCE5F2'
+        }`,
         borderRadius: '10px',
-        background: 'linear-gradient(135deg, #F8FAFF, #FBFDFF)',
+        background: hasWarning
+          ? 'linear-gradient(135deg, #FFFBEB, #FFFDF7)'
+          : 'linear-gradient(135deg, #F8FAFF, #FBFDFF)',
         overflow: 'hidden',
       }}
     >
       <button
         type="button"
-        onClick={() => setExpanded(value => !value)}
+        onClick={() =>
+          setExpanded(value => !value)
+        }
         aria-expanded={expanded}
         style={{
           width: '100%',
@@ -142,32 +181,47 @@ export default function ContextReceiptCard({
             lineHeight: 1.5,
           }}
         >
-          🧭
+          {hasWarning ? '⚠️' : '🧭'}
         </span>
 
-        <span style={{ flex: 1, minWidth: 0 }}>
+        <span
+          style={{
+            flex: 1,
+            minWidth: 0,
+          }}
+        >
           <span
             style={{
               display: 'block',
               fontSize: '12px',
               fontWeight: 650,
-              color: '#334155',
+              color: hasWarning
+                ? '#92400E'
+                : '#334155',
               marginBottom: '2px',
             }}
           >
-            本轮备课依据
+            {hasWarning
+              ? '本轮资源读取情况'
+              : '本轮已读取'}
           </span>
+
           <span
             style={{
               display: 'block',
               fontSize: '11px',
               lineHeight: 1.55,
-              color: '#64748B',
+              color: hasWarning
+                ? '#92400E'
+                : '#64748B',
               whiteSpace: 'normal',
               wordBreak: 'break-word',
             }}
           >
-            {view.summary.replace(/^本轮备课依据：/, '')}
+            {view.summary.replace(
+              /^本轮已读取：/,
+              '',
+            )}
           </span>
         </span>
 
@@ -179,49 +233,65 @@ export default function ContextReceiptCard({
             paddingTop: '2px',
           }}
         >
-          {expanded ? '收起 ▲' : '查看详情 ▼'}
+          {expanded
+            ? '收起 ▲'
+            : '查看详情 ▼'}
         </span>
       </button>
 
       {expanded && (
         <div
           style={{
-            borderTop: '1px solid #E5EBF4',
+            borderTop:
+              '1px solid #E5EBF4',
             padding: '4px 12px 10px',
           }}
         >
-          <div
-            style={{
-              padding: '10px 0 2px',
-              fontSize: '11px',
-              fontWeight: 700,
-              color: '#166534',
-              letterSpacing: '0.2px',
-            }}
-          >
-            本轮已使用
-          </div>
-
-          {view.usedItems.map(item => (
-            <ReceiptItemRow key={item.key} item={item} />
-          ))}
-
-          {view.unusedItems.length > 0 && (
+          {view.usedItems.length > 0 && (
             <>
               <div
                 style={{
-                  padding: '13px 0 2px',
+                  padding: '10px 0 2px',
                   fontSize: '11px',
                   fontWeight: 700,
-                  color: '#64748B',
+                  color: '#166534',
                   letterSpacing: '0.2px',
                 }}
               >
-                本轮未使用或未生效
+                本轮已读取
               </div>
 
-              {view.unusedItems.map(item => (
-                <ReceiptItemRow key={item.key} item={item} />
+              {view.usedItems.map(item => (
+                <ReceiptItemRow
+                  key={item.key}
+                  item={item}
+                />
+              ))}
+            </>
+          )}
+
+          {view.warningItems.length > 0 && (
+            <>
+              <div
+                style={{
+                  padding:
+                    view.usedItems.length > 0
+                      ? '13px 0 2px'
+                      : '10px 0 2px',
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  color: '#92400E',
+                  letterSpacing: '0.2px',
+                }}
+              >
+                需要注意
+              </div>
+
+              {view.warningItems.map(item => (
+                <ReceiptItemRow
+                  key={item.key}
+                  item={item}
+                />
               ))}
             </>
           )}
@@ -230,13 +300,15 @@ export default function ContextReceiptCard({
             style={{
               marginTop: '9px',
               paddingTop: '8px',
-              borderTop: '1px dashed #DCE5F2',
+              borderTop:
+                '1px dashed #DCE5F2',
               fontSize: '10px',
               lineHeight: 1.55,
               color: '#94A3B8',
             }}
           >
-            此回执由系统根据本轮真实装配过程生成，不展示内部提示词正文。
+            此处只展示本轮实际读取的教学资源和真实读取失败；
+            完整系统回执仍保留在消息记录中。
           </div>
         </div>
       )}

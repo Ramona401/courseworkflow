@@ -141,6 +141,12 @@ func (h *KBCompressHandler) ProgressStream(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	finishSSEHandshake, handshakeOK := beginSSEHandshake(w)
+	if !handshakeOK {
+		return
+	}
+	defer finishSSEHandshake()
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -154,6 +160,8 @@ func (h *KBCompressHandler) ProgressStream(w http.ResponseWriter, r *http.Reques
 
 	ch := services.GlobalKBSSEHub.Subscribe(id)
 	defer services.GlobalKBSSEHub.Unsubscribe(id, ch)
+
+	finishSSEHandshake()
 
 	writeKBSSEEvent(w, flusher, services.KBSSEConnected, map[string]string{
 		"job_id":  id,

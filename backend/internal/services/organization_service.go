@@ -1,41 +1,24 @@
 package services
 
-// organization_service.go — 组织与教研组管理业务逻辑层
+// organization_service.go
 //
-// 账户与权限修复批改动（B10 + Logo移除链路② + 教研组缺省保留）：
-//   1) UpdateOrganization："settings / status 缺省保留现值"（B10，根治禁用/启用抹掉
-//      学校 portal_modules、编辑已禁用组织被静默启用两个数据损坏缺陷）；
-//   2) UpdateOrganization：处理 req.ClearLogo（Logo移除链路②）——常规字段更新成功后
-//      调 repository.UpdateOrganizationLogo(id, "") 清空 logo_url，根治"移除Logo只清
-//      前端state、从不落库"的假移除；
-//   3) UpdateTeachingGroup：与组织侧同口径的"settings / status 缺省保留现值"
-//      （教研组编辑弹窗从不传这两字段，repo 全量覆盖+空值兜底会抹 settings/误启用）。
+// 职责：
+//   - 区域、学校CRUD；
+//   - 组织数据范围过滤；
+//   - 教研组CRUD；
+//   - 教研组成员管理。
 //
-// 组织列表越权修复（Phase 6 验收期补漏）：
-//   ListOrganizations / ListTeachingGroups 新增 scope DataScope 参数，按调用者数据范围过滤：
-//     - admin           → 全量（scope.IsAdmin）
-//     - region_admin    → 仅 scope.OrgIDs（已含辖区区域 + 辖区学校）内的组织
-//     - senior_operator → 仅本校（scope.OrgIDs）+ 本校所属父区域（额外并入，保证组织三栏可用：
-//                         区域栏只读展示上级区域 → 点进去看到本校 → 本校教研组）
-//     - 其它/Blocked    → 空集
-//   教研组列表按"请求的 school_id 是否在可见学校集内"校验，越权（传别校 school_id）返回空集。
-//   过滤在 service 内存层做（组织/教研组数据量小，O(n) 可接受，无需改 repo SQL）。
+// 上下文7新增创建规则：
+//   - 创建学校必须主动选择k12/vocational/adult；
+//   - 不允许空值、mixed、common或非法值；
+//   - 创建区域忽略客户端教育域并强制写mixed；
+//   - 创建响应返回数据库最终写入的education_domain。
 //
-// v122 方案B 改动:
-//   - AddGroupMember: 成功后顺便 upsert school_members(保险机制)
-//     语义: 加入本校教研组 = 本校成员
-//     作用: 未来通过教研组加入的新老师也会自动在 school_members 中留痕
-//
-// v109 原改动:
-//   - 支持多组长: 组长通过 teaching_group_members.role='lead' 管理
-//   - CreateTeachingGroup / UpdateTeachingGroup 移除单一 LeadUserID 参数
-//   - 角色校验新增 'lead' 选项
-//   - GetTeachingGroupDetail 返回 lead_user_names(所有组长名称)
+// 普通更新接口不包含education_domain，本上下文不关闭现有独立换域接口。
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 
 	"tedna/internal/logger"
@@ -43,40 +26,72 @@ import (
 	"tedna/internal/repository"
 )
 
-// ==================== 错误常量 ====================
-
 var (
-	ErrOrgNameRequired      = errors.New("组织名称不能为空")
-	ErrOrgTypeRequired      = errors.New("组织类型不能为空")
-	ErrOrgTypeInvalid       = errors.New("无效的组织类型，可选值：region/school")
-	ErrSchoolNeedsParent    = errors.New("学校必须指定所属区域")
-	ErrOrgNameExists        = errors.New("同类型下组织名称已存在")
-	ErrOrgHasChildren       = errors.New("该组织下还有子组织，无法删除")
-	ErrOrgHasGroups         = errors.New("该学校下还有教研组，无法删除")
-	ErrGroupNameRequired    = errors.New("教研组名称不能为空")
-	ErrGroupSchoolRequired  = errors.New("教研组必须指定所属学校")
-	ErrGroupSubjectRequired = errors.New("教研组学科不能为空")
-	ErrGroupNameExists      = errors.New("该学校下教研组名称已存在")
-	ErrMemberUserRequired   = errors.New("成员用户ID不能为空")
-	ErrMemberAlreadyExists  = errors.New("该用户已是教研组成员")
-	ErrOrgNotFound          = errors.New("组织不存在")
-	ErrGroupNotFound        = errors.New("教研组不存在")
-	ErrMemberNotFound       = errors.New("教研组成员不存在")
-	ErrNoReviewPermission   = errors.New("无评审权限，需要是教研组长或骨干教师")
+	ErrOrgNameRequired               = errors.New("组织名称不能为空")
+	ErrOrgTypeRequired               = errors.New("组织类型不能为空")
+	ErrOrgTypeInvalid                = errors.New("无效的组织类型，可选值：region/school")
+	ErrSchoolNeedsParent             = errors.New("学校必须指定所属区域")
+	ErrSchoolEducationDomainRequired = errors.New("新建学校必须选择教育类型")
+	ErrSchoolEducationDomainInvalid  = errors.New("学校教育类型必须为k12、vocational或adult")
+	ErrOrgNameExists                 = errors.New("同类型下组织名称已存在")
+	ErrOrgHasChildren                = errors.New("该组织下还有子组织，无法删除")
+	ErrOrgHasGroups                  = errors.New("该学校下还有教研组，无法删除")
+	ErrGroupNameRequired             = errors.New("教研组名称不能为空")
+	ErrGroupSchoolRequired           = errors.New("教研组必须指定所属学校")
+	ErrGroupSubjectRequired          = errors.New("教研组学科不能为空")
+	ErrGroupNameExists               = errors.New("该学校下教研组名称已存在")
+	ErrMemberUserRequired            = errors.New("成员用户ID不能为空")
+	ErrMemberAlreadyExists           = errors.New("该用户已是教研组成员")
+	ErrOrgNotFound                   = errors.New("组织不存在")
+	ErrGroupNotFound                 = errors.New("教研组不存在")
+	ErrMemberNotFound                = errors.New("教研组成员不存在")
+	ErrNoReviewPermission            = errors.New("无评审权限，需要是教研组长或骨干教师")
 )
 
+// OrganizationService 组织与教研组业务服务。
 type OrganizationService struct{}
 
 var orgLog = logger.WithModule("organization")
 
+// NewOrganizationService 创建组织服务。
 func NewOrganizationService() *OrganizationService {
 	return &OrganizationService{}
 }
 
+// normalizeCreateOrganizationEducationDomain 解析创建组织时的最终教育域。
+//
+// 区域始终返回mixed；学校必须显式提交具体教学域。
+func normalizeCreateOrganizationEducationDomain(
+	orgType string,
+	requestedDomain string,
+) (string, error) {
+	if orgType == models.OrgTypeRegion {
+		return models.EducationDomainMixed, nil
+	}
+
+	domain := strings.ToLower(
+		strings.TrimSpace(requestedDomain),
+	)
+	if domain == "" {
+		return "", ErrSchoolEducationDomainRequired
+	}
+	if !models.IsTeachingEducationDomain(domain) {
+		return "", ErrSchoolEducationDomainInvalid
+	}
+
+	return domain, nil
+}
+
 // ==================== 组织 CRUD ====================
 
-func (s *OrganizationService) CreateOrganization(ctx context.Context, req *models.CreateOrganizationRequest) (*models.Organization, error) {
+// CreateOrganization 创建区域或学校。
+func (s *OrganizationService) CreateOrganization(
+	ctx context.Context,
+	req *models.CreateOrganizationRequest,
+) (*models.Organization, error) {
 	req.Name = strings.TrimSpace(req.Name)
+	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
+
 	if req.Name == "" {
 		return nil, ErrOrgNameRequired
 	}
@@ -86,11 +101,28 @@ func (s *OrganizationService) CreateOrganization(ctx context.Context, req *model
 	if !models.IsValidOrgType(req.Type) {
 		return nil, ErrOrgTypeInvalid
 	}
-	if req.Type == models.OrgTypeSchool && (req.ParentID == nil || *req.ParentID == "") {
+
+	if req.Type == models.OrgTypeSchool &&
+		(req.ParentID == nil ||
+			strings.TrimSpace(*req.ParentID) == "") {
 		return nil, ErrSchoolNeedsParent
 	}
 
-	exists, err := repository.CheckOrgNameExists(ctx, req.Name, req.Type, "")
+	educationDomain, err :=
+		normalizeCreateOrganizationEducationDomain(
+			req.Type,
+			req.EducationDomain,
+		)
+	if err != nil {
+		return nil, err
+	}
+
+	exists, err := repository.CheckOrgNameExists(
+		ctx,
+		req.Name,
+		req.Type,
+		"",
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -98,41 +130,75 @@ func (s *OrganizationService) CreateOrganization(ctx context.Context, req *model
 		return nil, ErrOrgNameExists
 	}
 
-	if req.Type == models.OrgTypeSchool && req.ParentID != nil {
-		parent, err := repository.GetOrganizationByID(ctx, *req.ParentID)
-		if err != nil {
+	if req.Type == models.OrgTypeSchool &&
+		req.ParentID != nil {
+		parent, getErr := repository.GetOrganizationByID(
+			ctx,
+			*req.ParentID,
+		)
+		if getErr != nil {
 			return nil, ErrOrgNotFound
 		}
 		if parent.Type != models.OrgTypeRegion {
-			return nil, errors.New("父级组织必须是区域类型")
+			return nil, errors.New(
+				"父级组织必须是区域类型",
+			)
 		}
 	}
 
 	org := &models.Organization{
-		Name:        req.Name,
-		Type:        req.Type,
-		ParentID:    req.ParentID,
-		AdminUserID: req.AdminUserID,
+		Name:            req.Name,
+		Type:            req.Type,
+		EducationDomain: educationDomain,
+		ParentID:        req.ParentID,
+		AdminUserID:     req.AdminUserID,
 	}
-	if err := repository.CreateOrganization(ctx, org); err != nil {
-		orgLog.Error("创建组织失败", "name", req.Name, "type", req.Type, "error", err)
+
+	if err := repository.CreateOrganization(
+		ctx,
+		org,
+	); err != nil {
+		orgLog.Error(
+			"创建组织失败",
+			"name",
+			req.Name,
+			"type",
+			req.Type,
+			"education_domain",
+			educationDomain,
+			"error",
+			err,
+		)
 		return nil, err
 	}
-	orgLog.Info("创建组织成功", "org_id", org.ID, "name", org.Name, "type", org.Type)
+
+	orgLog.Info(
+		"创建组织成功",
+		"org_id",
+		org.ID,
+		"name",
+		org.Name,
+		"type",
+		org.Type,
+		"education_domain",
+		org.EducationDomain,
+	)
+
 	return org, nil
 }
 
-// ListOrganizations 组织列表（按数据范围 scope 过滤，防跨区域/跨校越权）
-//
-// 过滤规则：
-//   - scope.IsAdmin           → 不过滤，返回全量
-//   - scope.Blocked           → 返回空列表（孤儿/未绑校/查询失败）
-//   - region_admin            → 仅保留 scope.OrgIDs（辖区区域 + 辖区学校）内的组织
-//   - senior_operator         → 可见组织集 = scope.OrgIDs（本校）∪ 本校父区域ID
-//                               （额外并入父区域，使组织三栏的"区域"栏能只读展示上级，三栏可用）
-//   - operator/viewer         → scope.OrgIDs 为空切片 → 空集（本不该进 /admin）
-func (s *OrganizationService) ListOrganizations(ctx context.Context, orgType string, parentID string, scope DataScope) (*models.OrganizationListResponse, error) {
-	items, err := repository.ListOrganizations(ctx, orgType, parentID)
+// ListOrganizations 按数据范围查询组织。
+func (s *OrganizationService) ListOrganizations(
+	ctx context.Context,
+	orgType string,
+	parentID string,
+	scope DataScope,
+) (*models.OrganizationListResponse, error) {
+	items, err := repository.ListOrganizations(
+		ctx,
+		orgType,
+		parentID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -140,12 +206,13 @@ func (s *OrganizationService) ListOrganizations(ctx context.Context, orgType str
 		items = []*models.OrganizationListItem{}
 	}
 
-	// admin：不过滤，全量返回
 	if scope.IsAdmin {
-		return &models.OrganizationListResponse{Organizations: items, Total: len(items)}, nil
+		return &models.OrganizationListResponse{
+			Organizations: items,
+			Total:         len(items),
+		}, nil
 	}
 
-	// 构造"可见组织ID集合"
 	visible := make(map[string]struct{})
 	for _, id := range scope.OrgIDs {
 		if id != "" {
@@ -153,32 +220,49 @@ func (s *OrganizationService) ListOrganizations(ctx context.Context, orgType str
 		}
 	}
 
-	// senior_operator：额外并入本校所属父区域ID（保证组织三栏的区域栏可只读展示上级）
-	// 仅当 scope 非 Blocked 且存在本校时才查父区域。
-	if scope.Role == models.RoleSeniorOperator && !scope.Blocked {
-		// scope.OrgIDs 对 senior 即 [本校ID]，取第一个查其父区域
+	if scope.Role == models.RoleSeniorOperator &&
+		!scope.Blocked {
 		for _, schoolID := range scope.OrgIDs {
 			if schoolID == "" {
 				continue
 			}
-			school, gErr := repository.GetOrganizationByID(ctx, schoolID)
-			if gErr == nil && school != nil && school.ParentID != nil && *school.ParentID != "" {
+
+			school, getErr :=
+				repository.GetOrganizationByID(
+					ctx,
+					schoolID,
+				)
+			if getErr == nil &&
+				school != nil &&
+				school.ParentID != nil &&
+				*school.ParentID != "" {
 				visible[*school.ParentID] = struct{}{}
 			}
 		}
 	}
 
-	// 按可见集合过滤（visible 为空 → 返回空列表，fail-closed）
-	filtered := make([]*models.OrganizationListItem, 0, len(items))
-	for _, it := range items {
-		if _, ok := visible[it.ID]; ok {
-			filtered = append(filtered, it)
+	filtered := make(
+		[]*models.OrganizationListItem,
+		0,
+		len(items),
+	)
+	for _, item := range items {
+		if _, allowed := visible[item.ID]; allowed {
+			filtered = append(filtered, item)
 		}
 	}
-	return &models.OrganizationListResponse{Organizations: filtered, Total: len(filtered)}, nil
+
+	return &models.OrganizationListResponse{
+		Organizations: filtered,
+		Total:         len(filtered),
+	}, nil
 }
 
-func (s *OrganizationService) GetOrganization(ctx context.Context, id string) (*models.Organization, error) {
+// GetOrganization 查询单个组织。
+func (s *OrganizationService) GetOrganization(
+	ctx context.Context,
+	id string,
+) (*models.Organization, error) {
 	org, err := repository.GetOrganizationByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, repository.ErrOrgNotFound) {
@@ -186,22 +270,38 @@ func (s *OrganizationService) GetOrganization(ctx context.Context, id string) (*
 		}
 		return nil, err
 	}
+
 	return org, nil
 }
 
-func (s *OrganizationService) UpdateOrganization(ctx context.Context, id string, req *models.UpdateOrganizationRequest) error {
+// UpdateOrganization 更新组织普通字段。
+func (s *OrganizationService) UpdateOrganization(
+	ctx context.Context,
+	id string,
+	req *models.UpdateOrganizationRequest,
+) error {
 	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" {
 		return ErrOrgNameRequired
 	}
-	existing, err := repository.GetOrganizationByID(ctx, id)
+
+	existing, err := repository.GetOrganizationByID(
+		ctx,
+		id,
+	)
 	if err != nil {
 		if errors.Is(err, repository.ErrOrgNotFound) {
 			return ErrOrgNotFound
 		}
 		return err
 	}
-	nameExists, err := repository.CheckOrgNameExists(ctx, req.Name, existing.Type, id)
+
+	nameExists, err := repository.CheckOrgNameExists(
+		ctx,
+		req.Name,
+		existing.Type,
+		id,
+	)
 	if err != nil {
 		return err
 	}
@@ -209,18 +309,6 @@ func (s *OrganizationService) UpdateOrganization(ctx context.Context, id string,
 		return ErrOrgNameExists
 	}
 
-	// ==================== B10 修复：settings / status 缺省保留现值 ====================
-	// repository.UpdateOrganization 的 SQL 是四列(name/admin_user_id/settings/status)无条件全量覆盖，
-	// 且对空串强制兜底（settings空→"{}"、status空→"active"），造成两个真实数据损坏缺陷：
-	//   ① "禁用/启用"按钮只传 name/admin_user_id/status 不传 settings，一次点击就把学校
-	//      settings 里的 portal_modules（门户板块开关）等配置整体抹成 "{}"；
-	//      编辑"区域"弹窗同理不传 settings（板块配置区仅 school+edit 显示），保存即抹掉区域 settings。
-	//   ② 编辑弹窗不传 status，保存一个"已禁用"的组织会被强制置回 "active"（静默重新启用）。
-	// 修法（service 层缺省回填，不动 repo SQL 与请求模型，语义收敛为部分更新）：
-	//   - req.Settings 为空串 → 视为"本次不修改"，回填 existing.Settings。
-	//     真要清空须显式传 "{}"（前端编辑学校时始终传完整合并后的 settings，不受影响）。
-	//   - req.Status 为空串 → 视为"本次不修改"，回填 existing.Status。
-	//     禁用/启用按钮显式传 active/disabled，行为不变。
 	if strings.TrimSpace(req.Settings) == "" {
 		req.Settings = existing.Settings
 	}
@@ -228,60 +316,120 @@ func (s *OrganizationService) UpdateOrganization(ctx context.Context, id string,
 		req.Status = existing.Status
 	}
 
-	if err := repository.UpdateOrganization(ctx, id, req); err != nil {
-		orgLog.Error("更新组织失败", "org_id", id, "error", err)
+	if err := repository.UpdateOrganization(
+		ctx,
+		id,
+		req,
+	); err != nil {
+		orgLog.Error(
+			"更新组织失败",
+			"org_id",
+			id,
+			"error",
+			err,
+		)
 		return err
 	}
 
-	// ==================== Logo 移除链路②：处理 clear_logo ====================
-	// 背景：编辑弹窗"移除Logo"此前只清前端本地 state，请求体没有 logo 字段，
-	// 后端无从得知"用户想删掉 Logo"，移除从不落库（假移除）。
-	// 语义：req.ClearLogo=true → 常规字段更新成功后，清空 organizations.logo_url。
-	// 放在常规更新之后：若常规更新失败（如重名），Logo 保持不动，语义完整。
-	// Logo 上传走独立上传接口（同样写 logo_url 列），与本分支互不干扰。
 	if req.ClearLogo {
-		if err := repository.UpdateOrganizationLogo(ctx, id, ""); err != nil {
-			orgLog.Error("清除组织Logo失败", "org_id", id, "error", err)
+		if err := repository.UpdateOrganizationLogo(
+			ctx,
+			id,
+			"",
+		); err != nil {
+			orgLog.Error(
+				"清除组织Logo失败",
+				"org_id",
+				id,
+				"error",
+				err,
+			)
 			return err
 		}
-		orgLog.Info("清除组织Logo成功", "org_id", id)
+
+		orgLog.Info(
+			"清除组织Logo成功",
+			"org_id",
+			id,
+		)
 	}
 
-	orgLog.Info("更新组织成功", "org_id", id, "name", req.Name)
+	orgLog.Info(
+		"更新组织成功",
+		"org_id",
+		id,
+		"name",
+		req.Name,
+	)
+
 	return nil
 }
 
-func (s *OrganizationService) DeleteOrganization(ctx context.Context, id string) error {
-	children, err := repository.ListOrganizations(ctx, "", id)
+// DeleteOrganization 删除组织。
+func (s *OrganizationService) DeleteOrganization(
+	ctx context.Context,
+	id string,
+) error {
+	children, err := repository.ListOrganizations(
+		ctx,
+		"",
+		id,
+	)
 	if err != nil {
 		return err
 	}
 	if len(children) > 0 {
 		return ErrOrgHasChildren
 	}
-	groups, err := repository.ListTeachingGroups(ctx, id)
+
+	groups, err := repository.ListTeachingGroups(
+		ctx,
+		id,
+	)
 	if err != nil {
 		return err
 	}
 	if len(groups) > 0 {
 		return ErrOrgHasGroups
 	}
-	if err := repository.DeleteOrganization(ctx, id); err != nil {
+
+	if err := repository.DeleteOrganization(
+		ctx,
+		id,
+	); err != nil {
 		if errors.Is(err, repository.ErrOrgNotFound) {
 			return ErrOrgNotFound
 		}
-		orgLog.Error("删除组织失败", "org_id", id, "error", err)
+
+		orgLog.Error(
+			"删除组织失败",
+			"org_id",
+			id,
+			"error",
+			err,
+		)
 		return err
 	}
-	orgLog.Info("删除组织成功", "org_id", id)
+
+	orgLog.Info(
+		"删除组织成功",
+		"org_id",
+		id,
+	)
+
 	return nil
 }
 
 // ==================== 教研组 CRUD ====================
 
-func (s *OrganizationService) CreateTeachingGroup(ctx context.Context, req *models.CreateTeachingGroupRequest) (*models.TeachingGroup, error) {
+// CreateTeachingGroup 创建教研组。
+func (s *OrganizationService) CreateTeachingGroup(
+	ctx context.Context,
+	req *models.CreateTeachingGroupRequest,
+) (*models.TeachingGroup, error) {
 	req.Name = strings.TrimSpace(req.Name)
 	req.Subject = strings.TrimSpace(req.Subject)
+
 	if req.Name == "" {
 		return nil, ErrGroupNameRequired
 	}
@@ -292,15 +440,25 @@ func (s *OrganizationService) CreateTeachingGroup(ctx context.Context, req *mode
 		return nil, ErrGroupSubjectRequired
 	}
 
-	school, err := repository.GetOrganizationByID(ctx, req.SchoolID)
+	school, err := repository.GetOrganizationByID(
+		ctx,
+		req.SchoolID,
+	)
 	if err != nil {
 		return nil, ErrOrgNotFound
 	}
 	if school.Type != models.OrgTypeSchool {
-		return nil, errors.New("教研组只能属于学校类型的组织")
+		return nil, errors.New(
+			"教研组只能属于学校类型的组织",
+		)
 	}
 
-	exists, err := repository.CheckGroupNameExists(ctx, req.SchoolID, req.Name, "")
+	exists, err := repository.CheckGroupNameExists(
+		ctx,
+		req.SchoolID,
+		req.Name,
+		"",
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -308,72 +466,121 @@ func (s *OrganizationService) CreateTeachingGroup(ctx context.Context, req *mode
 		return nil, ErrGroupNameExists
 	}
 
-	tg := &models.TeachingGroup{
+	group := &models.TeachingGroup{
 		Name:        req.Name,
 		SchoolID:    req.SchoolID,
 		Subject:     req.Subject,
 		GradeRange:  req.GradeRange,
 		Description: req.Description,
 	}
-	if err := repository.CreateTeachingGroup(ctx, tg); err != nil {
-		orgLog.Error("创建教研组失败", "name", req.Name, "school_id", req.SchoolID, "error", err)
+
+	if err := repository.CreateTeachingGroup(
+		ctx,
+		group,
+	); err != nil {
+		orgLog.Error(
+			"创建教研组失败",
+			"name",
+			req.Name,
+			"school_id",
+			req.SchoolID,
+			"error",
+			err,
+		)
 		return nil, err
 	}
 
-	orgLog.Info("创建教研组成功", "group_id", tg.ID, "name", tg.Name, "school_id", req.SchoolID)
-	return tg, nil
+	orgLog.Info(
+		"创建教研组成功",
+		"group_id",
+		group.ID,
+		"name",
+		group.Name,
+		"school_id",
+		req.SchoolID,
+	)
+
+	return group, nil
 }
 
-// ListTeachingGroups 教研组列表（按数据范围 scope 校验 school_id 归属，防跨校越权）
-//
-// 规则：
-//   - scope.IsAdmin → 不过滤，按 schoolID（可空）正常查询
-//   - 否则：要求 schoolID 非空且在 scope 可见学校集（SchoolIDs；senior 额外不放区域，
-//     因为教研组只挂学校，区域不直接拥有教研组）内；不满足 → 返回空列表（越权/未指定学校）
-func (s *OrganizationService) ListTeachingGroups(ctx context.Context, schoolID string, scope DataScope) (*models.TeachingGroupListResponse, error) {
-	// admin：原逻辑，全量或按 schoolID 过滤
+// ListTeachingGroups 按数据范围查询教研组。
+func (s *OrganizationService) ListTeachingGroups(
+	ctx context.Context,
+	schoolID string,
+	scope DataScope,
+) (*models.TeachingGroupListResponse, error) {
 	if scope.IsAdmin {
-		items, err := repository.ListTeachingGroups(ctx, schoolID)
+		items, err := repository.ListTeachingGroups(
+			ctx,
+			schoolID,
+		)
 		if err != nil {
 			return nil, err
 		}
 		if items == nil {
 			items = []*models.TeachingGroupListItem{}
 		}
-		return &models.TeachingGroupListResponse{Groups: items, Total: len(items)}, nil
+
+		return &models.TeachingGroupListResponse{
+			Groups: items,
+			Total:  len(items),
+		}, nil
 	}
 
-	// 非 admin：必须指定 school_id，且该 school_id 在可见学校集内
-	empty := &models.TeachingGroupListResponse{Groups: []*models.TeachingGroupListItem{}, Total: 0}
+	empty := &models.TeachingGroupListResponse{
+		Groups: []*models.TeachingGroupListItem{},
+		Total:  0,
+	}
+
 	if scope.Blocked || schoolID == "" {
 		return empty, nil
 	}
+
 	allowed := false
-	for _, sid := range scope.SchoolIDs {
-		if sid == schoolID {
+	for _, visibleSchoolID := range scope.SchoolIDs {
+		if visibleSchoolID == schoolID {
 			allowed = true
 			break
 		}
 	}
+
 	if !allowed {
-		// 请求的学校不在管辖范围 → 空集（防 senior/region 传别校 school_id 越权查教研组）
-		orgLog.Warn("教研组列表越权拦截：请求学校不在管辖范围",
-			"role", scope.Role, "requested_school", schoolID)
+		orgLog.Warn(
+			"教研组列表越权拦截：请求学校不在管辖范围",
+			"role",
+			scope.Role,
+			"requested_school",
+			schoolID,
+		)
 		return empty, nil
 	}
 
-	items, err := repository.ListTeachingGroups(ctx, schoolID)
+	items, err := repository.ListTeachingGroups(
+		ctx,
+		schoolID,
+	)
 	if err != nil {
 		return nil, err
 	}
 	if items == nil {
 		items = []*models.TeachingGroupListItem{}
 	}
-	return &models.TeachingGroupListResponse{Groups: items, Total: len(items)}, nil
+
+	return &models.TeachingGroupListResponse{
+		Groups: items,
+		Total:  len(items),
+	}, nil
 }
 
-func (s *OrganizationService) GetTeachingGroupDetail(ctx context.Context, id string) (*models.TeachingGroupDetailResponse, error) {
-	tg, err := repository.GetTeachingGroupByID(ctx, id)
+// GetTeachingGroupDetail 查询教研组详情。
+func (s *OrganizationService) GetTeachingGroupDetail(
+	ctx context.Context,
+	id string,
+) (*models.TeachingGroupDetailResponse, error) {
+	group, err := repository.GetTeachingGroupByID(
+		ctx,
+		id,
+	)
 	if err != nil {
 		if errors.Is(err, repository.ErrGroupNotFound) {
 			return nil, ErrGroupNotFound
@@ -387,43 +594,58 @@ func (s *OrganizationService) GetTeachingGroupDetail(ctx context.Context, id str
 	}
 
 	schoolName := ""
-	school, err := repository.GetOrganizationByID(ctx, tg.SchoolID)
-	if err == nil {
+	school, getSchoolErr :=
+		repository.GetOrganizationByID(
+			ctx,
+			group.SchoolID,
+		)
+	if getSchoolErr == nil {
 		schoolName = school.Name
 	}
 
 	leadUserName := ""
-	if tg.LeadUserID != nil {
-		leadUser, err := repository.FindUserByID(ctx, *tg.LeadUserID)
-		if err == nil {
+	if group.LeadUserID != nil {
+		leadUser, getLeadErr :=
+			repository.FindUserByID(
+				ctx,
+				*group.LeadUserID,
+			)
+		if getLeadErr == nil {
 			leadUserName = leadUser.DisplayName
 		}
 	}
 
-	leadUserNames, _ := repository.GetGroupLeadNames(ctx, id)
+	leadUserNames, _ :=
+		repository.GetGroupLeadNames(ctx, id)
 
 	return &models.TeachingGroupDetailResponse{
-		ID:            tg.ID,
-		Name:          tg.Name,
-		SchoolID:      tg.SchoolID,
+		ID:            group.ID,
+		Name:          group.Name,
+		SchoolID:      group.SchoolID,
 		SchoolName:    schoolName,
-		Subject:       tg.Subject,
-		GradeRange:    tg.GradeRange,
-		LeadUserID:    tg.LeadUserID,
+		Subject:       group.Subject,
+		GradeRange:    group.GradeRange,
+		LeadUserID:    group.LeadUserID,
 		LeadUserName:  leadUserName,
 		LeadUserNames: leadUserNames,
-		Description:   tg.Description,
-		Settings:      tg.Settings,
-		Status:        tg.Status,
+		Description:   group.Description,
+		Settings:      group.Settings,
+		Status:        group.Status,
 		Members:       members,
-		CreatedAt:     tg.CreatedAt,
-		UpdatedAt:     tg.UpdatedAt,
+		CreatedAt:     group.CreatedAt,
+		UpdatedAt:     group.UpdatedAt,
 	}, nil
 }
 
-func (s *OrganizationService) UpdateTeachingGroup(ctx context.Context, id string, req *models.UpdateTeachingGroupRequest) error {
+// UpdateTeachingGroup 更新教研组。
+func (s *OrganizationService) UpdateTeachingGroup(
+	ctx context.Context,
+	id string,
+	req *models.UpdateTeachingGroupRequest,
+) error {
 	req.Name = strings.TrimSpace(req.Name)
 	req.Subject = strings.TrimSpace(req.Subject)
+
 	if req.Name == "" {
 		return ErrGroupNameRequired
 	}
@@ -431,7 +653,10 @@ func (s *OrganizationService) UpdateTeachingGroup(ctx context.Context, id string
 		return ErrGroupSubjectRequired
 	}
 
-	existing, err := repository.GetTeachingGroupByID(ctx, id)
+	existing, err := repository.GetTeachingGroupByID(
+		ctx,
+		id,
+	)
 	if err != nil {
 		if errors.Is(err, repository.ErrGroupNotFound) {
 			return ErrGroupNotFound
@@ -439,7 +664,13 @@ func (s *OrganizationService) UpdateTeachingGroup(ctx context.Context, id string
 		return err
 	}
 
-	nameExists, err := repository.CheckGroupNameExists(ctx, existing.SchoolID, req.Name, id)
+	nameExists, err :=
+		repository.CheckGroupNameExists(
+			ctx,
+			existing.SchoolID,
+			req.Name,
+			id,
+		)
 	if err != nil {
 		return err
 	}
@@ -447,10 +678,6 @@ func (s *OrganizationService) UpdateTeachingGroup(ctx context.Context, id string
 		return ErrGroupNameExists
 	}
 
-	// ==================== 教研组 settings / status 缺省保留现值（与组织侧 B10 同口径）====================
-	// 教研组编辑弹窗（GroupFormModal）从不提交 settings/status 两字段；
-	// 若 repo 层为全量覆盖+空值兜底，则编辑一次即抹掉教研组 settings、并把已禁用组静默置回 active。
-	// 修法同组织侧：空串视为"本次不修改"，回填库中现值（existing 本就为名称查重而获取，零额外查询）。
 	if strings.TrimSpace(req.Settings) == "" {
 		req.Settings = existing.Settings
 	}
@@ -458,46 +685,91 @@ func (s *OrganizationService) UpdateTeachingGroup(ctx context.Context, id string
 		req.Status = existing.Status
 	}
 
-	if err := repository.UpdateTeachingGroup(ctx, id, req); err != nil {
-		orgLog.Error("更新教研组失败", "group_id", id, "error", err)
+	if err := repository.UpdateTeachingGroup(
+		ctx,
+		id,
+		req,
+	); err != nil {
+		orgLog.Error(
+			"更新教研组失败",
+			"group_id",
+			id,
+			"error",
+			err,
+		)
 		return err
 	}
-	orgLog.Info("更新教研组成功", "group_id", id, "name", req.Name)
+
+	orgLog.Info(
+		"更新教研组成功",
+		"group_id",
+		id,
+		"name",
+		req.Name,
+	)
+
 	return nil
 }
 
-func (s *OrganizationService) DeleteTeachingGroup(ctx context.Context, id string) error {
-	if err := repository.DeleteTeachingGroup(ctx, id); err != nil {
+// DeleteTeachingGroup 删除教研组。
+func (s *OrganizationService) DeleteTeachingGroup(
+	ctx context.Context,
+	id string,
+) error {
+	if err := repository.DeleteTeachingGroup(
+		ctx,
+		id,
+	); err != nil {
 		if errors.Is(err, repository.ErrGroupNotFound) {
 			return ErrGroupNotFound
 		}
-		orgLog.Error("删除教研组失败", "group_id", id, "error", err)
+
+		orgLog.Error(
+			"删除教研组失败",
+			"group_id",
+			id,
+			"error",
+			err,
+		)
 		return err
 	}
-	orgLog.Info("删除教研组成功", "group_id", id)
+
+	orgLog.Info(
+		"删除教研组成功",
+		"group_id",
+		id,
+	)
+
 	return nil
 }
 
 // ==================== 教研组成员管理 ====================
 
-// AddGroupMember 添加教研组成员
-// v122 方案B 改动: 成功后顺便 upsert school_members(保险机制)
+// AddGroupMember 添加教研组成员。
 //
-//	语义: 加入本校教研组 = 本校成员
-//
-// v109 原改动: 角色校验允许 'lead'
-func (s *OrganizationService) AddGroupMember(ctx context.Context, groupID string, req *models.AddGroupMemberRequest) error {
+// 成功后best-effort写入school_members，保持“加入本校教研组即本校成员”。
+func (s *OrganizationService) AddGroupMember(
+	ctx context.Context,
+	groupID string,
+	req *models.AddGroupMemberRequest,
+) error {
 	if req.UserID == "" {
 		return ErrMemberUserRequired
 	}
 
-	// 先取教研组详情,用于后续写 school_members
-	tg, err := repository.GetTeachingGroupByID(ctx, groupID)
+	group, err := repository.GetTeachingGroupByID(
+		ctx,
+		groupID,
+	)
 	if err != nil {
 		return ErrGroupNotFound
 	}
 
-	exists, err := repository.CheckMemberExists(ctx, groupID, req.UserID)
+	exists, err := repository.CheckMemberExists(
+		ctx,
+		groupID,
+		req.UserID,
+	)
 	if err != nil {
 		return err
 	}
@@ -510,7 +782,9 @@ func (s *OrganizationService) AddGroupMember(ctx context.Context, groupID string
 		role = models.GroupMemberRoleMember
 	}
 	if !models.IsValidGroupMemberRole(role) {
-		return errors.New("无效的成员角色，可选值：member/backbone/lead")
+		return errors.New(
+			"无效的成员角色，可选值：member/backbone/lead",
+		)
 	}
 
 	member := &models.TeachingGroupMember{
@@ -518,64 +792,161 @@ func (s *OrganizationService) AddGroupMember(ctx context.Context, groupID string
 		UserID:  req.UserID,
 		Role:    role,
 	}
-	if err := repository.AddGroupMember(ctx, member); err != nil {
-		orgLog.Error("添加教研组成员失败", "group_id", groupID, "user_id", req.UserID, "error", err)
+
+	if err := repository.AddGroupMember(
+		ctx,
+		member,
+	); err != nil {
+		orgLog.Error(
+			"添加教研组成员失败",
+			"group_id",
+			groupID,
+			"user_id",
+			req.UserID,
+			"error",
+			err,
+		)
 		return err
 	}
 
-	// v122 方案B: 顺便写入 school_members(加入本校教研组 = 本校成员)
-	// 失败时不回滚,只记 warning 日志(教研组成员已添加,可由后续 UNION 兜底查询继续工作)
-	if addErr := repository.AddSchoolMember(ctx, tg.SchoolID, req.UserID, "group_member"); addErr != nil {
-		fmt.Printf("[WARN] organization_service.AddGroupMember: 写入 school_members 失败 user_id=%s school_id=%s err=%v\n",
-			req.UserID, tg.SchoolID, addErr)
+	if addErr := repository.AddSchoolMember(
+		ctx,
+		group.SchoolID,
+		req.UserID,
+		"group_member",
+	); addErr != nil {
+		orgLog.Warn(
+			"添加教研组成员后写入学校成员失败",
+			"user_id",
+			req.UserID,
+			"school_id",
+			group.SchoolID,
+			"error",
+			addErr,
+		)
 	}
 
-	orgLog.Info("添加教研组成员成功", "group_id", groupID, "user_id", req.UserID, "role", role, "school_id", tg.SchoolID)
+	orgLog.Info(
+		"添加教研组成员成功",
+		"group_id",
+		groupID,
+		"user_id",
+		req.UserID,
+		"role",
+		role,
+		"school_id",
+		group.SchoolID,
+	)
+
 	return nil
 }
 
-func (s *OrganizationService) RemoveGroupMember(ctx context.Context, groupID string, userID string) error {
-	if err := repository.RemoveGroupMember(ctx, groupID, userID); err != nil {
+// RemoveGroupMember 移除教研组成员。
+//
+// 本操作不自动删除school_members校籍。
+func (s *OrganizationService) RemoveGroupMember(
+	ctx context.Context,
+	groupID string,
+	userID string,
+) error {
+	if err := repository.RemoveGroupMember(
+		ctx,
+		groupID,
+		userID,
+	); err != nil {
 		if errors.Is(err, repository.ErrMemberNotFound) {
 			return ErrMemberNotFound
 		}
-		orgLog.Error("移除教研组成员失败", "group_id", groupID, "user_id", userID, "error", err)
+
+		orgLog.Error(
+			"移除教研组成员失败",
+			"group_id",
+			groupID,
+			"user_id",
+			userID,
+			"error",
+			err,
+		)
 		return err
 	}
-	// 注意: 不主动从 school_members 移除
-	//   语义: 老师可能属于本校但不在某个具体教研组,school_members 应保留
-	//   如需移除本校身份,通过专门的"移除本校成员"接口(未来可能需要)
-	orgLog.Info("移除教研组成员成功", "group_id", groupID, "user_id", userID)
+
+	orgLog.Info(
+		"移除教研组成员成功",
+		"group_id",
+		groupID,
+		"user_id",
+		userID,
+	)
+
 	return nil
 }
 
-func (s *OrganizationService) UpdateGroupMemberRole(ctx context.Context, groupID string, userID string, role string) error {
+// UpdateGroupMemberRole 更新教研组成员角色。
+func (s *OrganizationService) UpdateGroupMemberRole(
+	ctx context.Context,
+	groupID string,
+	userID string,
+	role string,
+) error {
 	if !models.IsValidGroupMemberRole(role) {
-		return errors.New("无效的成员角色，可选值：member/backbone/lead")
+		return errors.New(
+			"无效的成员角色，可选值：member/backbone/lead",
+		)
 	}
-	if err := repository.UpdateGroupMemberRole(ctx, groupID, userID, role); err != nil {
+
+	if err := repository.UpdateGroupMemberRole(
+		ctx,
+		groupID,
+		userID,
+		role,
+	); err != nil {
 		if errors.Is(err, repository.ErrMemberNotFound) {
 			return ErrMemberNotFound
 		}
 		return err
 	}
-	orgLog.Info("更新成员角色成功", "group_id", groupID, "user_id", userID, "role", role)
+
+	orgLog.Info(
+		"更新成员角色成功",
+		"group_id",
+		groupID,
+		"user_id",
+		userID,
+		"role",
+		role,
+	)
+
 	return nil
 }
 
-// ==================== 权限判断辅助 ====================
+// ==================== 权限辅助 ====================
 
-func (s *OrganizationService) GetUserTeachingGroups(ctx context.Context, userID string) ([]*models.TeachingGroupListItem, error) {
+// GetUserTeachingGroups 查询用户所属教研组。
+func (s *OrganizationService) GetUserTeachingGroups(
+	ctx context.Context,
+	userID string,
+) ([]*models.TeachingGroupListItem, error) {
 	return repository.GetUserTeachingGroups(ctx, userID)
 }
 
-func (s *OrganizationService) CheckReviewPermission(ctx context.Context, groupID string, userID string) error {
-	hasPermission, err := repository.IsGroupLeadOrBackbone(ctx, groupID, userID)
+// CheckReviewPermission 校验用户是否为教研组长或骨干教师。
+func (s *OrganizationService) CheckReviewPermission(
+	ctx context.Context,
+	groupID string,
+	userID string,
+) error {
+	hasPermission, err :=
+		repository.IsGroupLeadOrBackbone(
+			ctx,
+			groupID,
+			userID,
+		)
 	if err != nil {
 		return err
 	}
 	if !hasPermission {
 		return ErrNoReviewPermission
 	}
+
 	return nil
 }

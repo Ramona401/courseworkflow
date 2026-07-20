@@ -1,24 +1,20 @@
 package handlers
 
-// course_outline_handler.go — 课程大纲处理器（大单元备课能力·批次一 + 教材版本增强）
+// course_outline_handler.go — 课程大纲HTTP处理器
 //
-// 提供接口（/api/v1/course-outlines）：
-//   GET    /api/v1/course-outlines             — 列出可见大纲（全员登录可查）
-//   POST   /api/v1/course-outlines             — 创建（组长/校管/admin）
-//   GET    /api/v1/course-outlines/publishers  — 查某学科+年级可选教材版本（备课首屏选择器用）★新增
-//   GET    /api/v1/course-outlines/{id}        — 查单条详情（含正文，全员可查）
-//   PUT    /api/v1/course-outlines/{id}        — 更新（归属者）
-//   DELETE /api/v1/course-outlines/{id}        — 软删除（归属者）
-//
-// 路由说明：标准库 ServeMux 用 "/api/v1/course-outlines/"（带尾斜杠）通配全部子路径到
-//   HandleItem，无法按前缀分优先级。因此 /publishers 这个"非ID"子路径在 HandleItem 内
-//   以 id=="publishers" 特判分流，不新增路由（最贴合 ServeMux 的工作方式）。
-//
-// 写权限的归属校验在 service 层（canManageScope）。本 handler 只做路径解析 +
-// claims 提取 + 错误映射，风格对齐 curriculum_handler.go。
+// 上下文16教育域收口：
+//   1. Handler只从JWT取得userID，Service会实时读取数据库角色；
+//   2. 出版社列表将userID传给Service，非K12及异常域返回成功空数组；
+//   3. 详情不再直接调用Repository，统一经过Service的同域和可见范围校验；
+//   4. K12响应保留publisher；
+//   5. vocational/adult响应完全省略publisher字段，避免泄露K12出版社语义；
+//   6. 创建响应同样按当前教育域裁剪；
+//   7. 教育域不可用、跨域和无管理权限统一返回403；
+//   8. 数据库或基础设施解析失败返回5xx。
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -29,174 +25,522 @@ import (
 	"tedna/internal/utils"
 )
 
-// CourseOutlineHandler 课程大纲处理器
+// CourseOutlineHandler 课程大纲处理器。
 type CourseOutlineHandler struct {
 	svc *services.CourseOutlineService
 }
 
-// NewCourseOutlineHandler 创建处理器
-func NewCourseOutlineHandler(svc *services.CourseOutlineService) *CourseOutlineHandler {
-	return &CourseOutlineHandler{svc: svc}
+// NewCourseOutlineHandler 创建处理器。
+func NewCourseOutlineHandler(
+	svc *services.CourseOutlineService,
+) *CourseOutlineHandler {
+	return &CourseOutlineHandler{
+		svc: svc,
+	}
 }
 
-// extractCourseOutlineID 从 /api/v1/course-outlines/{id} 提取 ID
-func extractCourseOutlineID(path string) string {
-	const prefix = "/api/v1/course-outlines/"
-	if !strings.HasPrefix(path, prefix) {
+// extractCourseOutlineID 从单条路径提取ID。
+func extractCourseOutlineID(
+	path string,
+) string {
+	const prefix =
+		"/api/v1/course-outlines/"
+
+	if !strings.HasPrefix(
+		path,
+		prefix,
+	) {
 		return ""
 	}
-	id := strings.TrimPrefix(path, prefix)
-	id = strings.TrimSuffix(id, "/")
+
+	id := strings.TrimPrefix(
+		path,
+		prefix,
+	)
+	id = strings.TrimSuffix(
+		id,
+		"/",
+	)
+
 	return id
 }
 
-// HandleCollection 处理 /api/v1/course-outlines（无尾 ID）：GET 列表 / POST 创建
-func (h *CourseOutlineHandler) HandleCollection(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
+// HandleCollection 处理列表和创建。
+func (h *CourseOutlineHandler) HandleCollection(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(
+			w,
+			"未登录",
+		)
 		return
 	}
+
 	switch r.Method {
 	case http.MethodGet:
-		h.list(w, r, claims.Role, claims.UserID)
+		h.list(
+			w,
+			r,
+			claims.UserID,
+		)
+
 	case http.MethodPost:
-		h.create(w, r, claims.Role, claims.UserID)
+		h.create(
+			w,
+			r,
+			claims.UserID,
+		)
+
 	default:
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET/POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET/POST请求",
+		)
 	}
 }
 
-// HandleItem 处理 /api/v1/course-outlines/{id}：GET 详情 / PUT 更新 / DELETE 删除
-//
-// 特判：id=="publishers" 时分流到「查可用教材版本」（GET，备课首屏选择器用），
-// 这是个非ID的功能子路径，借 ServeMux 的尾斜杠通配落到这里再分流。
-func (h *CourseOutlineHandler) HandleItem(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
+// HandleItem 处理出版社列表、详情、更新和删除。
+func (h *CourseOutlineHandler) HandleItem(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
-		return
-	}
-	id := extractCourseOutlineID(r.URL.Path)
-	if id == "" {
-		utils.BadRequest(w, "缺少大纲ID")
+		utils.Unauthorized(
+			w,
+			"未登录",
+		)
 		return
 	}
 
-	// 非ID功能子路径特判：/api/v1/course-outlines/publishers
+	id := extractCourseOutlineID(
+		r.URL.Path,
+	)
+	if id == "" {
+		utils.BadRequest(
+			w,
+			"缺少大纲ID",
+		)
+		return
+	}
+
 	if id == "publishers" {
 		if r.Method != http.MethodGet {
-			utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
+			utils.Fail(
+				w,
+				http.StatusMethodNotAllowed,
+				"仅支持GET请求",
+			)
 			return
 		}
-		h.listPublishers(w, r)
+
+		h.listPublishers(
+			w,
+			r,
+			claims.UserID,
+		)
 		return
 	}
 
 	switch r.Method {
 	case http.MethodGet:
-		h.detail(w, r, id)
+		h.detail(
+			w,
+			r,
+			claims.UserID,
+			id,
+		)
+
 	case http.MethodPut:
-		h.update(w, r, claims.Role, claims.UserID, id)
+		h.update(
+			w,
+			r,
+			claims.UserID,
+			id,
+		)
+
 	case http.MethodDelete:
-		h.delete(w, r, claims.Role, claims.UserID, id)
+		h.delete(
+			w,
+			r,
+			claims.UserID,
+			id,
+		)
+
 	default:
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET/PUT/DELETE请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET/PUT/DELETE请求",
+		)
 	}
 }
 
-func (h *CourseOutlineHandler) list(w http.ResponseWriter, r *http.Request, role, userID string) {
-	items, err := h.svc.ListOutlines(r.Context(), role, userID)
+func (h *CourseOutlineHandler) list(
+	w http.ResponseWriter,
+	r *http.Request,
+	userID string,
+) {
+	items, domain, err :=
+		h.svc.ListOutlines(
+			r.Context(),
+			userID,
+		)
 	if err != nil {
-		utils.InternalError(w, "查询课程大纲失败: "+err.Error())
+		h.mapError(w, err)
 		return
 	}
-	utils.Success(w, map[string]interface{}{
-		"outlines": items,
-		"total":    len(items),
-	})
+
+	responseItems :=
+		make(
+			[]map[string]interface{},
+			0,
+			len(items),
+		)
+
+	for _, item := range items {
+		responseItems = append(
+			responseItems,
+			courseOutlineListItemResponse(
+				item,
+				domain,
+			),
+		)
+	}
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"outlines": responseItems,
+			"total":    len(responseItems),
+		},
+	)
 }
 
-// listPublishers 查某学科+年级下可选的教材版本列表（备课首屏教材版本选择器用）
-//
-// 入参：query 的 subject、grade（均必填）。
-// 返回：publishers 字符串数组（空串元素代表"通用/不限版本"，前端负责显示成中文）；
-//       该学科年级没有任何相交大纲时返回空数组（前端据此不显示版本选择、不关联大纲）。
-func (h *CourseOutlineHandler) listPublishers(w http.ResponseWriter, r *http.Request) {
-	subject := strings.TrimSpace(r.URL.Query().Get("subject"))
-	grade := strings.TrimSpace(r.URL.Query().Get("grade"))
+// listPublishers 查询可用出版社。
+func (h *CourseOutlineHandler) listPublishers(
+	w http.ResponseWriter,
+	r *http.Request,
+	userID string,
+) {
+	subject := strings.TrimSpace(
+		r.URL.Query().Get("subject"),
+	)
+	grade := strings.TrimSpace(
+		r.URL.Query().Get("grade"),
+	)
+
 	if subject == "" || grade == "" {
-		utils.BadRequest(w, "缺少学科或年级参数")
+		utils.BadRequest(
+			w,
+			"缺少学科或年级参数",
+		)
 		return
 	}
-	publishers, err := h.svc.ListAvailablePublishers(r.Context(), subject, grade)
+
+	publishers, err :=
+		h.svc.ListAvailablePublishers(
+			r.Context(),
+			userID,
+			subject,
+			grade,
+		)
 	if err != nil {
-		utils.InternalError(w, "查询可用教材版本失败: "+err.Error())
+		h.mapError(w, err)
 		return
 	}
+
 	if publishers == nil {
 		publishers = []string{}
 	}
-	utils.Success(w, map[string]interface{}{
-		"publishers": publishers,
-		"total":      len(publishers),
-	})
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"publishers": publishers,
+			"total":      len(publishers),
+		},
+	)
 }
 
-func (h *CourseOutlineHandler) create(w http.ResponseWriter, r *http.Request, role, userID string) {
+func (h *CourseOutlineHandler) create(
+	w http.ResponseWriter,
+	r *http.Request,
+	userID string,
+) {
 	var req models.CreateCourseOutlineRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求体解析失败")
+
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			"请求体解析失败",
+		)
 		return
 	}
-	o, err := h.svc.CreateOutline(r.Context(), role, userID, &req)
+
+	outline, domain, err :=
+		h.svc.CreateOutline(
+			r.Context(),
+			userID,
+			&req,
+		)
 	if err != nil {
 		h.mapError(w, err)
 		return
 	}
-	utils.Success(w, o)
+
+	utils.Success(
+		w,
+		courseOutlineDetailResponse(
+			outline,
+			domain,
+		),
+	)
 }
 
-func (h *CourseOutlineHandler) detail(w http.ResponseWriter, r *http.Request, id string) {
-	o, err := repository.GetCourseOutlineByID(r.Context(), id)
+func (h *CourseOutlineHandler) detail(
+	w http.ResponseWriter,
+	r *http.Request,
+	userID string,
+	id string,
+) {
+	outline, domain, err :=
+		h.svc.GetOutline(
+			r.Context(),
+			userID,
+			id,
+		)
 	if err != nil {
 		h.mapError(w, err)
 		return
 	}
-	utils.Success(w, o)
+
+	utils.Success(
+		w,
+		courseOutlineDetailResponse(
+			outline,
+			domain,
+		),
+	)
 }
 
-func (h *CourseOutlineHandler) update(w http.ResponseWriter, r *http.Request, role, userID, id string) {
+func (h *CourseOutlineHandler) update(
+	w http.ResponseWriter,
+	r *http.Request,
+	userID string,
+	id string,
+) {
 	var req models.UpdateCourseOutlineRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求体解析失败")
+
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			"请求体解析失败",
+		)
 		return
 	}
-	if err := h.svc.UpdateOutline(r.Context(), role, userID, id, &req); err != nil {
+
+	if err := h.svc.UpdateOutline(
+		r.Context(),
+		userID,
+		id,
+		&req,
+	); err != nil {
 		h.mapError(w, err)
 		return
 	}
-	utils.Success(w, map[string]interface{}{"message": "更新成功"})
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"message": "更新成功",
+		},
+	)
 }
 
-func (h *CourseOutlineHandler) delete(w http.ResponseWriter, r *http.Request, role, userID, id string) {
-	if err := h.svc.DeleteOutline(r.Context(), role, userID, id); err != nil {
+func (h *CourseOutlineHandler) delete(
+	w http.ResponseWriter,
+	r *http.Request,
+	userID string,
+	id string,
+) {
+	if err := h.svc.DeleteOutline(
+		r.Context(),
+		userID,
+		id,
+	); err != nil {
 		h.mapError(w, err)
 		return
 	}
-	utils.Success(w, map[string]interface{}{"message": "删除成功"})
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"message": "删除成功",
+		},
+	)
 }
 
-// mapError 业务错误 → HTTP 状态码
-func (h *CourseOutlineHandler) mapError(w http.ResponseWriter, err error) {
-	switch err {
-	case services.ErrOutlineFieldRequired, services.ErrOutlineScopeInvalid:
-		utils.BadRequest(w, err.Error())
-	case services.ErrOutlineNoPermission:
-		utils.Fail(w, http.StatusForbidden, err.Error())
-	case repository.ErrCourseOutlineNotFound:
-		utils.Fail(w, http.StatusNotFound, err.Error())
+// courseOutlineListItemResponse
+// K12保留publisher，非K12完全省略该字段。
+func courseOutlineListItemResponse(
+	item *models.CourseOutlineListItem,
+	educationDomain string,
+) map[string]interface{} {
+	if item == nil {
+		return map[string]interface{}{}
+	}
+
+	response := map[string]interface{}{
+		"id":              item.ID,
+		"scope":           item.Scope,
+		"scope_target_id": item.ScopeTargetID,
+		"scope_name":      item.ScopeName,
+		"subject":         item.Subject,
+		"grade":           item.Grade,
+		"volume":          item.Volume,
+		"title":           item.Title,
+		"creator_name":    item.CreatorName,
+		"updated_at":      item.UpdatedAt,
+	}
+
+	if educationDomain ==
+		models.EducationDomainK12 {
+		response["publisher"] =
+			item.Publisher
+	}
+
+	return response
+}
+
+// courseOutlineDetailResponse
+// K12保留publisher，非K12完全省略该字段。
+func courseOutlineDetailResponse(
+	outline *models.CourseOutline,
+	educationDomain string,
+) map[string]interface{} {
+	if outline == nil {
+		return map[string]interface{}{}
+	}
+
+	response := map[string]interface{}{
+		"id":               outline.ID,
+		"scope":            outline.Scope,
+		"scope_target_id":  outline.ScopeTargetID,
+		"subject":          outline.Subject,
+		"grade":            outline.Grade,
+		"volume":           outline.Volume,
+		"title":            outline.Title,
+		"content":          outline.Content,
+		"source_file_path": outline.SourceFilePath,
+		"source_type":      outline.SourceType,
+		"created_by":       outline.CreatedBy,
+		"status":           outline.Status,
+		"created_at":       outline.CreatedAt,
+		"updated_at":       outline.UpdatedAt,
+	}
+
+	if educationDomain ==
+		models.EducationDomainK12 {
+		response["publisher"] =
+			outline.Publisher
+	}
+
+	return response
+}
+
+// mapError 统一映射课程大纲业务错误。
+func (h *CourseOutlineHandler) mapError(
+	w http.ResponseWriter,
+	err error,
+) {
+	switch {
+	case errors.Is(
+		err,
+		services.ErrOutlineFieldRequired,
+	),
+		errors.Is(
+			err,
+			services.ErrOutlineScopeInvalid,
+		),
+		errors.Is(
+			err,
+			services.ErrOutlinePublisherNotAllowed,
+		),
+		errors.Is(
+			err,
+			services.ErrOutlinePublisherUnavailable,
+		):
+		utils.BadRequest(
+			w,
+			err.Error(),
+		)
+
+	case errors.Is(
+		err,
+		services.ErrOutlineNoPermission,
+	),
+		errors.Is(
+			err,
+			services.
+				ErrOutlineEducationDomainRequired,
+		),
+		errors.Is(
+			err,
+			services.
+				ErrOutlineEducationDomainConflict,
+		),
+		errors.Is(
+			err,
+			services.
+				ErrOutlineEducationDomainMismatch,
+		):
+		utils.Fail(
+			w,
+			http.StatusForbidden,
+			err.Error(),
+		)
+
+	case errors.Is(
+		err,
+		repository.ErrCourseOutlineNotFound,
+	):
+		utils.Fail(
+			w,
+			http.StatusNotFound,
+			err.Error(),
+		)
+
+	case errors.Is(
+		err,
+		services.
+			ErrOutlineEducationDomainResolveFailed,
+	):
+		utils.InternalError(
+			w,
+			services.
+				ErrOutlineEducationDomainResolveFailed.
+				Error(),
+		)
+
 	default:
-		utils.InternalError(w, err.Error())
+		utils.InternalError(
+			w,
+			"课程大纲操作失败，请稍后重试",
+		)
 	}
 }

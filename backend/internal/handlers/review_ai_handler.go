@@ -116,11 +116,12 @@ func prepareSSEResponse(w http.ResponseWriter) http.Flusher {
 // ReviewAIOverviewRequest 生成教案概览请求体
 // v110 新增字段:AssistantID(可选)
 type ReviewAIOverviewRequest struct {
-	PlanMeta    string `json:"plan_meta"`
-	PlanContent string `json:"plan_content"`
-	Subject     string `json:"subject"`
-	Grade       string `json:"grade"`
-	AssistantID string `json:"assistant_id"`
+	LessonPlanID string `json:"lesson_plan_id"`
+	PlanMeta     string `json:"plan_meta"`
+	PlanContent  string `json:"plan_content"`
+	Subject      string `json:"subject"`
+	Grade        string `json:"grade"`
+	AssistantID  string `json:"assistant_id"`
 }
 
 // Overview POST /lesson-plans/review-ai/overview (SSE)
@@ -155,6 +156,7 @@ func (h *ReviewAIHandler) Overview(w http.ResponseWriter, r *http.Request) {
 		r,
 		claims.UserID,
 		claims.Role,
+		req.LessonPlanID,
 		req.AssistantID,
 		reviewOverviewDefaultPrompt,
 		req.Subject,
@@ -241,13 +243,14 @@ func (h *ReviewAIHandler) Overview(w http.ResponseWriter, r *http.Request) {
 // ReviewAIChatRequest 对话式审核请求体
 // v110 新增字段:AssistantID(可选)
 type ReviewAIChatRequest struct {
-	PlanMeta    string              `json:"plan_meta"`
-	PlanContent string              `json:"plan_content"`
-	Subject     string              `json:"subject"`
-	Grade       string              `json:"grade"`
-	History     []map[string]string `json:"history"`
-	Message     string              `json:"message"`
-	AssistantID string              `json:"assistant_id"`
+	LessonPlanID string              `json:"lesson_plan_id"`
+	PlanMeta     string              `json:"plan_meta"`
+	PlanContent  string              `json:"plan_content"`
+	Subject      string              `json:"subject"`
+	Grade        string              `json:"grade"`
+	History      []map[string]string `json:"history"`
+	Message      string              `json:"message"`
+	AssistantID  string              `json:"assistant_id"`
 }
 
 // Chat POST /lesson-plans/review-ai/chat (SSE)
@@ -282,6 +285,7 @@ func (h *ReviewAIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 		r,
 		claims.UserID,
 		claims.Role,
+		req.LessonPlanID,
 		req.AssistantID,
 		reviewChatDefaultPrompt,
 		req.Subject,
@@ -393,6 +397,7 @@ func (h *ReviewAIHandler) resolveSystemPrompt(
 	r *http.Request,
 	userID string,
 	role string,
+	lessonPlanID string,
 	assistantID string,
 	defaultPrompt string,
 	subject string,
@@ -409,19 +414,124 @@ func (h *ReviewAIHandler) resolveSystemPrompt(
 		return defaultPrompt, nil
 	}
 
-	subject = strings.TrimSpace(subject)
-	grade = strings.TrimSpace(grade)
-	if subject == "" || grade == "" {
-		return "", errors.New(
-			"缺少教案学科或具体年级，无法校验所选AI助手",
-		)
-	}
+	// B2-B：审核助手使用教案教育域快照。
+	//
+	// 前端传入的学科、年级和lesson_plan_id都不能直接作为资源域授权依据。
+	// 有教案ID时必须重新读取数据库中的LessonPlan，并使用创建时快照域；
+	// 没有教案ID时仅兼容普通教学角色，mixed管理账号不得使用自选助手。
+	requestSubject := strings.TrimSpace(subject)
+	requestGrade := strings.TrimSpace(grade)
+	lessonPlanID = strings.TrimSpace(lessonPlanID)
 
 	actor := services.BuildActorFromClaims(
 		r.Context(),
 		userID,
 		role,
 	)
+	if actor == nil {
+		return "", errors.New(
+			"无法确认当前用户的助手使用范围",
+		)
+	}
+
+	if lessonPlanID != "" {
+		lp, planErr := repository.GetLessonPlanByID(
+			r.Context(),
+			lessonPlanID,
+		)
+		if planErr != nil {
+			if errors.Is(
+				planErr,
+				repository.ErrLessonPlanNotFound,
+			) {
+				return "", errors.New(
+					"正在评审的教案不存在或已被删除",
+				)
+			}
+
+			reviewAILog.Error(
+				"读取审核教案教育域失败",
+				"lesson_plan_id", lessonPlanID,
+				"user_id", userID,
+				"error", planErr,
+			)
+			return "", errors.New(
+				"读取正在评审的教案失败，请稍后重试",
+			)
+		}
+
+		lessonDomain := strings.ToLower(
+			strings.TrimSpace(lp.EducationDomain),
+		)
+		if !models.IsTeachingEducationDomain(
+			lessonDomain,
+		) {
+			reviewAILog.Error(
+				"审核教案教育域快照无效",
+				"lesson_plan_id", lessonPlanID,
+				"education_domain", lp.EducationDomain,
+			)
+			return "", errors.New(
+				"教案教育域快照无效，暂不能使用AI助手",
+			)
+		}
+
+		actorDomain := strings.ToLower(
+			strings.TrimSpace(actor.EducationDomain),
+		)
+
+		// 普通角色只能进入自己当前教学域中的教案。
+		// mixed管理角色可以跨域查看，但进入具体教案后也必须收敛到该教案域。
+		if actorDomain != models.EducationDomainMixed &&
+			actorDomain != lessonDomain {
+			return "", errors.New(
+				"当前账号教育域与正在评审的教案不一致",
+			)
+		}
+
+		planSubject := strings.TrimSpace(lp.Subject)
+		planGrade := strings.TrimSpace(lp.Grade)
+		if planSubject == "" || planGrade == "" {
+			return "", errors.New(
+				"教案缺少学科或具体年级，无法校验所选AI助手",
+			)
+		}
+
+		// 防止客户端使用某份教案ID，却提交另一套学科和年级条件。
+		if requestSubject != "" &&
+			requestSubject != planSubject {
+			return "", errors.New(
+				"请求中的教案学科与数据库记录不一致，请刷新页面后重试",
+			)
+		}
+		if requestGrade != "" &&
+			requestGrade != planGrade {
+			return "", errors.New(
+				"请求中的教案年级与数据库记录不一致，请刷新页面后重试",
+			)
+		}
+
+		actor.EducationDomain = lessonDomain
+		subject = planSubject
+		grade = planGrade
+	} else {
+		if strings.EqualFold(
+			strings.TrimSpace(actor.EducationDomain),
+			models.EducationDomainMixed,
+		) {
+			return "", errors.New(
+				"缺少教案标识，跨域管理账号无法确认本次评审所属教育域",
+			)
+		}
+
+		subject = requestSubject
+		grade = requestGrade
+		if subject == "" || grade == "" {
+			return "", errors.New(
+				"缺少教案学科或具体年级，无法校验所选AI助手",
+			)
+		}
+	}
 
 	assistant, err :=
 		h.assistantService.LoadActiveAssistantForLessonUse(
@@ -448,6 +558,14 @@ func (h *ReviewAIHandler) resolveSystemPrompt(
 		):
 			return "", errors.New(
 				"选择的 AI 助手已停用，请切换其他助手",
+			)
+
+		case errors.Is(
+			err,
+			services.ErrAssistantEducationDomainMismatch,
+		):
+			return "", errors.New(
+				"选择的 AI 助手不属于当前教案教育域",
 			)
 
 		case errors.Is(

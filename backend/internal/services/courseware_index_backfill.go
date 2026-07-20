@@ -9,7 +9,7 @@ package services
 //
 // v0.44 新增（直翻路径补脉络与索引，体验Y+方案）：
 //   - GenerateOverviewFromPages：方案出页后用 haiku 快速生成"哪几页干什么"脉络（前台，几秒）
-//   - BackfillPageIndexAsync：后台异步对照"原文+当前方案"为每页生成 AOCI 索引并回填
+//   - runPageIndexBackfill：后台异步对照"原文+当前方案"为每页生成 AOCI 索引并回填
 //
 // v0.44.1 防贴错双保险：
 //   A. 页数守卫——记录喂AI页数，回填前重查当前页，页数不一致则整体放弃本次回填
@@ -82,7 +82,7 @@ func (s *CoursewareIndexService) GenerateOverviewFromPages(
 	return overview
 }
 
-// BackfillPageIndexAsync 后台异步：对照"教案原文 + 当前页面方案"，为每页生成 AOCI 索引并回填
+// runPageIndexBackfill 后台异步：对照"教案原文 + 当前页面方案"，为每页生成 AOCI 索引并回填
 //
 // 用途：doc/ppt 直翻路径下，页面创建时 page_index 及 CG/IL/VF 索引列为空。
 // 本方法在方案保存后由调用方以 go func 异步触发，用 haiku 整批对照原文+方案逐页编码并回填。
@@ -97,12 +97,99 @@ func (s *CoursewareIndexService) GenerateOverviewFromPages(
 // v0.44.1 防贴错双保险（A页数守卫 + B标题锚点匹配），详见文件头。
 //
 // 参数 rawText：教案/文档原文（doc 传 docx 全文，ppt 传各页文本拼接）
-func (s *CoursewareIndexService) BackfillPageIndexAsync(
-	coursewareID string, userID string,
-	title string, subject string, grade string, rawText string,
+// validateCoursewarePageIndexBackfillSource 校验允许回填的课件来源。
+func validateCoursewarePageIndexBackfillSource(
+	courseware *models.Courseware,
+) error {
+	if courseware == nil {
+		return fmt.Errorf("待回填课件为空")
+	}
+
+	switch courseware.SourceType {
+	case models.CWSourcePPTUpload,
+		models.CWSourceDocUpload:
+		return nil
+
+	default:
+		return fmt.Errorf(
+			"课件来源不支持AOCI索引回填: %s",
+			courseware.SourceType,
+		)
+	}
+}
+
+// loadOwnedPageIndexBackfillInputs 重新加载并校验正式回填输入。
+func loadOwnedPageIndexBackfillInputs(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+) (
+	*models.Courseware,
+	*CoursewareActorContext,
+	error,
+) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	courseware, scopedActor, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerControlMutation(
+				ctx,
+				coursewareID,
+				actor,
+			)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err :=
+		validateCoursewarePageIndexBackfillSource(
+			courseware,
+		); err != nil {
+		return nil, nil, err
+	}
+
+	return courseware,
+		scopedActor,
+		nil
+}
+
+func (s *CoursewareIndexService) runPageIndexBackfill(
+	coursewareID string,
+	actor *CoursewareActorContext,
+	rawText string,
 ) {
 	// 独立后台上下文（不随请求取消而中断）
 	ctx := context.Background()
+
+	courseware, scopedActor, err :=
+		loadOwnedPageIndexBackfillInputs(
+			ctx,
+			coursewareID,
+			actor,
+		)
+	if err != nil {
+		log.Printf(
+			"[courseware_index] 后台补索引-授权失败: cw=%s err=%v",
+			coursewareID,
+			err,
+		)
+		return
+	}
+
+	if strings.TrimSpace(rawText) == "" {
+		log.Printf(
+			"[courseware_index] 后台补索引-原文为空: cw=%s",
+			coursewareID,
+		)
+		return
+	}
+
+	userID := scopedActor.UserID
+	title := courseware.Title
+	subject := courseware.Subject
+	grade := courseware.Grade
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -184,6 +271,21 @@ func (s *CoursewareIndexService) BackfillPageIndexAsync(
 	rawPages, err := s.parseAOCIIndexOutput(pageText)
 	if err != nil || len(rawPages) == 0 {
 		log.Printf("[courseware_index] 后台补索引-解析索引失败: cw=%s err=%v", coursewareID, err)
+		return
+	}
+
+	// ---- 6. AI返回后、正式写库前再次授权 ----
+	if _, _, err :=
+		loadOwnedPageIndexBackfillInputs(
+			ctx,
+			coursewareID,
+			scopedActor,
+		); err != nil {
+		log.Printf(
+			"[courseware_index] 后台补索引-写库前授权失败: cw=%s err=%v",
+			coursewareID,
+			err,
+		)
 		return
 	}
 

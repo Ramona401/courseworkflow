@@ -26,6 +26,7 @@ import {
 } from '@/api/course-outlines'
 import { getMyPublishGroups, type PublishGroup } from '@/api/ai-assistants'
 import { useAuth } from '@/store/auth'
+import { useEducationProfile } from '@/hooks/useEducationProfile'
 
 // ---------- 配色（与 LPSidebar 蓝紫系一致） ----------
 const C = {
@@ -71,7 +72,27 @@ const SYSTEM_OPTION: ScopeOption = { scope: 'system', targetId: '', label: '🌐
 
 export default function CourseOutlinesPage({ embedded = false }: { embedded?: boolean } = {}) {
   const { user } = useAuth()
+  const {
+    isK12,
+    profile,
+    ready: educationReady,
+  } = useEducationProfile()
+
   const isAdmin = user?.role === 'admin'
+
+  /**
+   * admin保留K12全局课程大纲管理兼容能力。
+   *
+   * 普通用户只有在教育域完成解析且确认为K12时，
+   * 才展示出版社字段。
+   */
+  const showPublisher =
+    isAdmin ||
+    (
+      educationReady &&
+      isK12 &&
+      profile.publisher_enabled
+    )
 
   const [list, setList] = useState<CourseOutlineListItem[]>([])
   const [loading, setLoading] = useState(true)
@@ -156,7 +177,9 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
         subject: d.subject,
         grade: d.grade,
         volume: d.volume,
-        publisher: d.publisher || '',
+        publisher: showPublisher
+          ? (d.publisher ?? '')
+          : '',
         title: d.title,
         content: d.content,
       })
@@ -186,7 +209,9 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
           subject: form.subject.trim(),
           grade: form.grade.trim(),
           volume: form.volume.trim(),
-          publisher: form.publisher.trim(),
+          publisher: showPublisher
+            ? form.publisher.trim()
+            : '',
           title: form.title.trim(),
           content: form.content,
         })
@@ -195,7 +220,9 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
         // 新建：解析 scopeKey（system 的 targetId 为空，后端填占位ID）
         const [scope, targetId] = form.scopeKey.split(':') as [CourseOutlineScope, string]
         await createCourseOutline({
-          publisher: form.publisher.trim(),
+          publisher: showPublisher
+            ? form.publisher.trim()
+            : '',
           scope,
           scope_target_id: targetId,
           subject: form.subject.trim(),
@@ -287,13 +314,22 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
                   </div>
                   <div style={{ fontSize: 12, color: C.textSecondary, marginTop: 6 }}>
                     {it.subject} · {it.grade} · {it.volume}
-                    <span style={{
-                      marginLeft: 8, padding: '1px 8px', borderRadius: 6, fontSize: 11,
-                      background: it.publisher ? 'rgba(79,123,232,0.10)' : C.borderLight,
-                      color: it.publisher ? C.primary : C.textMuted,
-                    }}>
-                      {publisherLabel(it.publisher || '')}
-                    </span>
+                    {showPublisher && (
+                      <span style={{
+                        marginLeft: 8,
+                        padding: '1px 8px',
+                        borderRadius: 6,
+                        fontSize: 11,
+                        background: it.publisher
+                          ? 'rgba(79,123,232,0.10)'
+                          : C.borderLight,
+                        color: it.publisher
+                          ? C.primary
+                          : C.textMuted,
+                      }}>
+                        {publisherLabel(it.publisher)}
+                      </span>
+                    )}
                     <span style={{ color: C.textMuted, marginLeft: 10 }}>
                       由 {it.creator_name || '—'} 维护 · 更新于 {fmtDate(it.updated_at)}
                     </span>
@@ -368,6 +404,8 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
               </Field>
             </div>
 
+            {showPublisher && (
+              <>
             {/* 教材版本：预置下拉 + 可手动输入新版本（一标多本，空=通用/不限版本） */}
             <Field label="教材版本">
               <select
@@ -397,6 +435,9 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
                 />
               )}
             </Field>
+
+              </>
+            )}
 
             <Field label="标题">
               <input value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })}

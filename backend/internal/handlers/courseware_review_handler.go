@@ -46,7 +46,10 @@ func NewCoursewareReviewHandler(reviewService *services.CoursewareReviewService,
 // ==================== 提交审核（作者发起，挂在课件子路由）====================
 
 // SubmitForReview POST /api/v1/coursewares/{id}/submit-review
-func (h *CoursewareReviewHandler) SubmitForReview(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareReviewHandler) SubmitForReview(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
@@ -61,7 +64,17 @@ func (h *CoursewareReviewHandler) SubmitForReview(w http.ResponseWriter, r *http
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
-	if err := h.reviewService.SubmitForReview(r.Context(), id, claims.UserID); err != nil {
+
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+	if err := h.reviewService.SubmitForReview(
+		r.Context(),
+		id,
+		actor,
+	); err != nil {
 		h.handleReviewError(w, err)
 		return
 	}
@@ -71,7 +84,10 @@ func (h *CoursewareReviewHandler) SubmitForReview(w http.ResponseWriter, r *http
 // ==================== L1 / L2 审核 ====================
 
 // ReviewL1 POST /api/v1/courseware-reviews/{id}/l1
-func (h *CoursewareReviewHandler) ReviewL1(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareReviewHandler) ReviewL1(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
@@ -91,7 +107,18 @@ func (h *CoursewareReviewHandler) ReviewL1(w http.ResponseWriter, r *http.Reques
 		utils.BadRequest(w, "请求参数格式错误")
 		return
 	}
-	if err := h.reviewService.ReviewL1(r.Context(), id, claims.UserID, &req); err != nil {
+
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+	if err := h.reviewService.ReviewL1(
+		r.Context(),
+		id,
+		actor,
+		&req,
+	); err != nil {
 		h.handleReviewError(w, err)
 		return
 	}
@@ -99,7 +126,10 @@ func (h *CoursewareReviewHandler) ReviewL1(w http.ResponseWriter, r *http.Reques
 }
 
 // ReviewL2 POST /api/v1/courseware-reviews/{id}/l2
-func (h *CoursewareReviewHandler) ReviewL2(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareReviewHandler) ReviewL2(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
@@ -119,7 +149,18 @@ func (h *CoursewareReviewHandler) ReviewL2(w http.ResponseWriter, r *http.Reques
 		utils.BadRequest(w, "请求参数格式错误")
 		return
 	}
-	if err := h.reviewService.ReviewL2(r.Context(), id, claims.UserID, claims.Role, &req); err != nil {
+
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+	if err := h.reviewService.ReviewL2(
+		r.Context(),
+		id,
+		actor,
+		&req,
+	); err != nil {
 		h.handleReviewError(w, err)
 		return
 	}
@@ -129,7 +170,10 @@ func (h *CoursewareReviewHandler) ReviewL2(w http.ResponseWriter, r *http.Reques
 // ==================== 审核历史 ====================
 
 // GetReviewHistory GET /api/v1/courseware-reviews/{id}/history
-func (h *CoursewareReviewHandler) GetReviewHistory(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareReviewHandler) GetReviewHistory(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
 		return
@@ -139,7 +183,22 @@ func (h *CoursewareReviewHandler) GetReviewHistory(w http.ResponseWriter, r *htt
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
-	result, err := h.reviewService.GetReviewHistory(r.Context(), id)
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+	result, err := h.reviewService.GetReviewHistory(
+		r.Context(),
+		id,
+		actor,
+	)
 	if err != nil {
 		h.handleReviewError(w, err)
 		return
@@ -150,7 +209,10 @@ func (h *CoursewareReviewHandler) GetReviewHistory(w http.ResponseWriter, r *htt
 // ==================== 审核详情（决策二：联动批注）====================
 
 // GetReviewDetail GET /api/v1/courseware-reviews/{id}/detail
-func (h *CoursewareReviewHandler) GetReviewDetail(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareReviewHandler) GetReviewDetail(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
 		return
@@ -165,7 +227,18 @@ func (h *CoursewareReviewHandler) GetReviewDetail(w http.ResponseWriter, r *http
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	result, err := h.reviewService.GetReviewDetail(r.Context(), id, claims.UserID, claims.Role, h.cwService)
+
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+	result, err := h.reviewService.GetReviewDetail(
+		r.Context(),
+		id,
+		actor,
+		h.cwService,
+	)
 	if err != nil {
 		h.handleReviewError(w, err)
 		return
@@ -176,7 +249,10 @@ func (h *CoursewareReviewHandler) GetReviewDetail(w http.ResponseWriter, r *http
 // ==================== 待审核列表 ====================
 
 // GetPendingReviews GET /api/v1/courseware-reviews/pending
-func (h *CoursewareReviewHandler) GetPendingReviews(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareReviewHandler) GetPendingReviews(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
 		return
@@ -186,12 +262,24 @@ func (h *CoursewareReviewHandler) GetPendingReviews(w http.ResponseWriter, r *ht
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	q := r.URL.Query()
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	offset, _ := strconv.Atoi(q.Get("offset"))
-	result, err := h.reviewService.GetPendingReviews(r.Context(), claims.UserID, claims.Role, limit, offset)
+
+	query := r.URL.Query()
+	limit, _ := strconv.Atoi(query.Get("limit"))
+	offset, _ := strconv.Atoi(query.Get("offset"))
+
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+	result, err := h.reviewService.GetPendingReviews(
+		r.Context(),
+		actor,
+		limit,
+		offset,
+	)
 	if err != nil {
-		utils.InternalError(w, "获取待审核列表失败")
+		h.handleReviewError(w, err)
 		return
 	}
 	utils.Success(w, result)
@@ -201,7 +289,10 @@ func (h *CoursewareReviewHandler) GetPendingReviews(w http.ResponseWriter, r *ht
 
 // GetReviewedRecords GET /api/v1/courseware-reviews/reviewed
 // 参数：level(1/2), decision(approved/revision/空=全部), limit, offset
-func (h *CoursewareReviewHandler) GetReviewedRecords(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareReviewHandler) GetReviewedRecords(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
 		return
@@ -211,17 +302,31 @@ func (h *CoursewareReviewHandler) GetReviewedRecords(w http.ResponseWriter, r *h
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	q := r.URL.Query()
-	level, _ := strconv.Atoi(q.Get("level"))
+
+	query := r.URL.Query()
+	level, _ := strconv.Atoi(query.Get("level"))
 	if level <= 0 {
 		level = models.ReviewLevelL1
 	}
-	decision := q.Get("decision")
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	offset, _ := strconv.Atoi(q.Get("offset"))
-	result, err := h.reviewService.GetReviewedRecords(r.Context(), claims.UserID, claims.Role, level, decision, limit, offset)
+	decision := query.Get("decision")
+	limit, _ := strconv.Atoi(query.Get("limit"))
+	offset, _ := strconv.Atoi(query.Get("offset"))
+
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+	result, err := h.reviewService.GetReviewedRecords(
+		r.Context(),
+		actor,
+		level,
+		decision,
+		limit,
+		offset,
+	)
 	if err != nil {
-		utils.InternalError(w, "获取已审核记录失败")
+		h.handleReviewError(w, err)
 		return
 	}
 	utils.Success(w, result)
@@ -230,7 +335,10 @@ func (h *CoursewareReviewHandler) GetReviewedRecords(w http.ResponseWriter, r *h
 // ==================== 审核统计 ====================
 
 // GetReviewStats GET /api/v1/courseware-reviews/stats
-func (h *CoursewareReviewHandler) GetReviewStats(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareReviewHandler) GetReviewStats(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
 		return
@@ -244,9 +352,19 @@ func (h *CoursewareReviewHandler) GetReviewStats(w http.ResponseWriter, r *http.
 	if level <= 0 {
 		level = models.ReviewLevelL1
 	}
-	result, err := h.reviewService.GetReviewStats(r.Context(), claims.UserID, claims.Role, level)
+
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+	result, err := h.reviewService.GetReviewStats(
+		r.Context(),
+		actor,
+		level,
+	)
 	if err != nil {
-		utils.InternalError(w, "获取审核统计失败")
+		h.handleReviewError(w, err)
 		return
 	}
 	utils.Success(w, result)
@@ -254,23 +372,83 @@ func (h *CoursewareReviewHandler) GetReviewStats(w http.ResponseWriter, r *http.
 
 // ==================== 错误映射 ====================
 
-func (h *CoursewareReviewHandler) handleReviewError(w http.ResponseWriter, err error) {
+func (h *CoursewareReviewHandler) handleReviewError(
+	w http.ResponseWriter,
+	err error,
+) {
 	switch {
-	case errors.Is(err, services.ErrCWReviewCoursewareNotFound):
+	case errors.Is(
+		err,
+		services.ErrCWReviewCoursewareNotFound,
+	):
 		utils.Fail(w, http.StatusNotFound, err.Error())
-	case errors.Is(err, services.ErrCWReviewNoPermission):
-		utils.Fail(w, http.StatusForbidden, err.Error())
-	case errors.Is(err, services.ErrCWSubmitNotOwner):
-		utils.Fail(w, http.StatusForbidden, err.Error())
-	case errors.Is(err, services.ErrCWReviewNotSubmitted),
-		errors.Is(err, services.ErrCWReviewNotL2Status),
-		errors.Is(err, services.ErrCWReviewInvalidDecision),
-		errors.Is(err, services.ErrCWSubmitNotReady),
-		errors.Is(err, services.ErrCWSubmitWrongState),
-		errors.Is(err, services.ErrCWSubmitNoSchool):
+
+	case errors.Is(
+		err,
+		services.ErrCWReviewNoPermission,
+	),
+		errors.Is(
+			err,
+			services.ErrCWSubmitNotOwner,
+		),
+		errors.Is(
+			err,
+			services.ErrCoursewareActorRequired,
+		),
+		errors.Is(
+			err,
+			services.ErrCoursewareEducationDomainMismatch,
+		):
+		utils.Fail(
+			w,
+			http.StatusForbidden,
+			"您没有访问或审核此课件的权限",
+		)
+
+	case errors.Is(
+		err,
+		services.ErrCoursewareEducationDomainInvalid,
+	),
+		errors.Is(
+			err,
+			services.ErrCoursewareRuntimeDomainRequired,
+		):
+		utils.InternalError(
+			w,
+			"课件教育域异常，请联系管理员处理",
+		)
+
+	case errors.Is(
+		err,
+		services.ErrCWReviewNotSubmitted,
+	),
+		errors.Is(
+			err,
+			services.ErrCWReviewNotL2Status,
+		),
+		errors.Is(
+			err,
+			services.ErrCWReviewInvalidDecision,
+		),
+		errors.Is(
+			err,
+			services.ErrCWSubmitNotReady,
+		),
+		errors.Is(
+			err,
+			services.ErrCWSubmitWrongState,
+		),
+		errors.Is(
+			err,
+			services.ErrCWSubmitNoSchool,
+		):
 		utils.BadRequest(w, err.Error())
+
 	default:
-		utils.InternalError(w, "审核操作失败，请稍后重试")
+		utils.InternalError(
+			w,
+			"审核操作失败，请稍后重试",
+		)
 	}
 }
 

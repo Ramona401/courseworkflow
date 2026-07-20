@@ -20,6 +20,8 @@
  * 依赖: api/mathGraph.ts
  */
 import { useState, useRef } from 'react'
+import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import { C } from './workshopConstants'
 import { generateMathGraphCode } from '@/api/mathGraph'
 
@@ -96,13 +98,50 @@ function compressImageToDataURI(file: File): Promise<string> {
   })
 }
 
+
+/**
+ * 为模板底稿生成短标识，避免把大段构造代码写进sessionStorage键。
+ */
+function hashMathDraftIdentity(
+  value: string,
+): string {
+  let hash = 2166136261
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+
+  return (hash >>> 0).toString(36)
+}
+
 // ==================== 组件 ====================
 
 export default function MathGraphAIPanel({
   mode, templateName, baseCode, boundingBox, code, onCode, onExit, busyExternal, previewError,
 }: Props) {
-  // 描述输入(每轮生成后清空,供下一轮追改)
-  const [desc, setDesc] = useState('')
+  const { user } = useAuth()
+
+  /**
+   * 只缓存老师输入的自然语言描述。
+   *
+   * 图片dataURI、AI代码、执行错误和运行状态均不进入草稿缓存。
+   */
+  const descDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'math-graph-ai',
+    resourceId: [
+      mode,
+      templateName || 'no-template',
+      boundingBox || 'default-box',
+      hashMathDraftIdentity(baseCode),
+    ].join('|'),
+    field: 'description',
+    initialValue: '',
+    maxHistory: 40,
+  })
+  const desc = descDraft.value
+  const setDesc = descDraft.setValue
   // 生成运行态
   const [loading, setLoading] = useState(false)
   // 错误信息
@@ -141,7 +180,10 @@ export default function MathGraphAIPanel({
   }
 
   // ---- 核心调用:以给定描述发起生成/追改(生成按钮与一键修复共用) ----
-  const runGenerate = async (description: string) => {
+  const runGenerate = async (
+    description: string,
+    consumeManualDraft = true,
+  ) => {
     setLoading(true)
     setError('')
     try {
@@ -158,7 +200,10 @@ export default function MathGraphAIPanel({
       })
       onCode(result.code)
       setRounds(r => r + 1)
-      setDesc('')
+      // 人工生成或追改成功后才提交输入；自动修复不影响老师尚未发送的草稿。
+      if (consumeManualDraft) {
+        descDraft.commit()
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : '生成失败,请重试')
     } finally {
@@ -180,7 +225,7 @@ export default function MathGraphAIPanel({
     if (disabled || !canAutoFix) return
     const fixDesc = '这段代码在画板上执行时报错了,报错信息:「' + (previewError || '').trim()
       + '」。请对照常见错误自查清单定位并修复病灶,其余部分保持不动,输出修复后的完整代码。'
-    void runGenerate(fixDesc)
+    void runGenerate(fixDesc, false)
   }
 
   // ---- 重置:清空 AI 代码与图片(adapt 回模板底稿预览 / create 回空画板),轮数归零 ----
@@ -275,12 +320,19 @@ export default function MathGraphAIPanel({
       <textarea
         value={desc}
         onChange={e => setDesc(e.target.value)}
+        onKeyDown={e => {
+          descDraft.handleKeyDown(e)
+        }}
         placeholder={hasCode ? '继续追改:如 角弧再大一点 / 把标注移到右上…' : (image ? '补充说明(可选):如 只画第2小问的图 / 把动点 P 做成滑杆…' : placeholder)}
         maxLength={2000}
         rows={4}
         disabled={disabled}
         style={{ width: '100%', boxSizing: 'border-box', padding: '9px 11px', borderRadius: 10, border: '1.5px solid #E9E5F5', fontSize: 12.5, lineHeight: 1.6, outline: 'none', resize: 'vertical', fontFamily: 'inherit', background: disabled ? '#F9FAFB' : '#fff' }}
       />
+
+      <div style={{ marginTop: 6, fontSize: 11, color: C.textMuted, lineHeight: 1.5 }}>
+        描述已自动保存 · 生成失败不会清除 · Ctrl/Command+Z恢复误删
+      </div>
 
       {/* 生成/追改按钮 */}
       <button

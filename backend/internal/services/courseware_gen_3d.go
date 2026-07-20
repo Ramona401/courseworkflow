@@ -27,19 +27,21 @@ import (
 // Generate3DSinglePage 一次性生成完整的3D互动HTML单页
 // 前置条件：课件 source_type='3d_single'，status='generating'
 // 流程：加载提示词 → 构建用户提示词 → 调用AI → 提取HTML → 写入page_1 → 状态改preview
-func (s *CoursewareGenService) Generate3DSinglePage(ctx context.Context, coursewareID string, userID string) error {
+func (s *CoursewareGenService) Generate3DSinglePage(ctx context.Context, coursewareID string, actor *CoursewareActorContext) error {
 	startTime := time.Now()
 
-	// ---- 1. 获取课件信息并校验 ----
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+	// ---- 1. 作者专属运行权限与教育域二次校验 ----
+	cw, scopedActor, err :=
+		s.loadOwnerRuntimeCourseware(
+			ctx,
+			coursewareID,
+			actor,
+		)
 	if err != nil {
-		s.broadcastError(coursewareID, "课件不存在: "+err.Error())
-		return fmt.Errorf("课件不存在: %w", err)
+		return err
 	}
-	if cw.UserID != userID {
-		s.broadcastError(coursewareID, "无权操作此课件")
-		return fmt.Errorf("无权操作此课件")
-	}
+	userID := scopedActor.UserID
+
 	if cw.SourceType != models.CWSource3DSingle {
 		s.broadcastError(coursewareID, "此课件不是3D单页类型")
 		return fmt.Errorf("课件来源类型不是3d_single: %s", cw.SourceType)

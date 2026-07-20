@@ -161,18 +161,26 @@ export async function refineNav(coursewareId: string, instruction: string): Prom
  *       后端走多模态微调(CallAIMultimodal,失败降级CallAI)。
  *       向后兼容：不传 image 时与旧版行为完全一致。
  */
+export type CWRefineMode = 'preserve' | 'rebuild'
+
 export async function refinePage(
   coursewareId: string,
   pageNumber: number,
   instruction: string,
   image?: string,
-): Promise<{ page_number: number; html_content: string; message: string }> {
-  const body: Record<string, string> = { instruction }
+  mode: CWRefineMode = 'preserve',
+): Promise<{
+  page_number: number
+  html_content: string
+  message: string
+  mode?: CWRefineMode
+}> {
+  const body: Record<string, string> = { instruction, mode }
   if (image) body.image = image
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/pages/${pageNumber}/refine`,
     body,
-    { timeout: 300000 }, // opus全量重写整页+多模态推理较慢，5分钟超时（防后端已成功而前端先超时报假失败）
+    { timeout: 300000 }, // 整页HTML修改与多模态推理可能较慢，统一使用5分钟超时
   )
   return extractData(resp)
 }

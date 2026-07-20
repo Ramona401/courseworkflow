@@ -1,164 +1,179 @@
 package services
 
-// ==================== P5-4 SSE事件广播中心 ====================
+// sse_hub.go — Pipeline SSE事件广播中心
+//
 // 功能：
-//   1. 管理所有SSE长连接（按Pipeline ID分组）
-//   2. 订阅/取消订阅：前端连接SSE时Subscribe，断开时Unsubscribe
-//   3. 广播事件：Pipeline执行步骤完成时Broadcast，推送给所有订阅该Pipeline的客户端
+//   - 按Pipeline ID管理SSE长连接；
+//   - Pipeline步骤更新时向订阅者广播；
+//   - 所有订阅、取消和广播操作使用同一把互斥锁，避免关闭竞态。
 //
-// 竞态修复（代码审查）：
-//   原版Broadcast用RLock，Unsubscribe用Lock，存在以下竞态：
-//   Broadcast持有RLock正在向channel写入时，另一goroutine调用Unsubscribe获得Lock并close(ch)，
-//   随后Broadcast继续向已关闭的channel写入会panic（select default不能防止close后的写入panic）。
-//
-//   修复方案：
-//   1. Broadcast改用全局写锁（sync.Mutex），与Unsubscribe互斥，彻底消除竞态
-//   2. Unsubscribe将channel标记为"已关闭"而不立即close，改由Broadcast检测后清理
-//   3. 用独立的closed set跟踪待清理channel，避免double-close
-//
-//   性能影响：Broadcast改用互斥锁后，同一时刻只有一个goroutine可广播。
-//   实际场景中同时广播的goroutine极少（Worker数量=5），影响可忽略。
+// 部署排空：
+//   - 全局进入SSE draining后不再登记新Pipeline连接；
+//   - Subscribe在持锁状态下检查draining；
+//   - draining期间返回已关闭channel；
+//   - CloseAll在同一把锁内关闭并清空全部连接，实现在sse_drain.go。
 
 import (
-	"tedna/internal/logger"
 	"sync"
+
+	"tedna/internal/logger"
 )
 
-// ==================== SSE事件类型 ====================
-
-// SSEEvent SSE推送事件
+// SSEEvent Pipeline推送事件。
 type SSEEvent struct {
-	EventType   string `json:"type"`         // 事件类型：step_update / pipeline_done / pipeline_error
-	PipelineID  string `json:"pipeline_id"`  // Pipeline ID
-	CurrentStep string `json:"current_step"` // 当前步骤
-	StepStatus  string `json:"step_status"`  // 步骤状态：done / failed / running
-	Status      string `json:"status"`       // Pipeline整体状态
-	Message     string `json:"message"`      // 可选描述信息
+	EventType   string `json:"type"`
+	PipelineID  string `json:"pipeline_id"`
+	CurrentStep string `json:"current_step"`
+	StepStatus  string `json:"step_status"`
+	Status      string `json:"status"`
+	Message     string `json:"message"`
 }
 
-// ==================== SSE广播中心 ====================
-
-// SSEHub SSE事件广播中心（全局单例）
-// 管理按Pipeline ID分组的SSE连接
+// SSEHub Pipeline SSE广播中心。
 type SSEHub struct {
-	mu          sync.Mutex                       // 统一互斥锁，保护所有操作（避免RLock+Lock竞态）
-	subscribers map[string]map[chan SSEEvent]bool // pipelineID → set of channels（true=活跃，false=待清理）
+	mu          sync.Mutex
+	subscribers map[string]map[chan SSEEvent]bool
 }
 
 var sseLog = logger.WithModule("sse")
 
-// GlobalSSEHub 全局SSE广播中心实例
+// GlobalSSEHub 全局Pipeline SSE广播中心。
 var GlobalSSEHub = NewSSEHub()
 
-// NewSSEHub 创建新的SSE广播中心
+// NewSSEHub 创建Pipeline SSE广播中心。
 func NewSSEHub() *SSEHub {
 	return &SSEHub{
 		subscribers: make(map[string]map[chan SSEEvent]bool),
 	}
 }
 
-// Subscribe 订阅指定Pipeline的SSE事件
-// 返回一个事件channel，调用方从中读取事件
-// 缓冲大小10，防止慢消费者阻塞广播
+// Subscribe 订阅指定Pipeline的SSE事件。
 func (h *SSEHub) Subscribe(pipelineID string) chan SSEEvent {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	if IsGlobalSSEDraining() {
+		ch := make(chan SSEEvent)
+		close(ch)
+
+		sseLog.Debug("服务正在排空，拒绝新的Pipeline SSE订阅",
+			"pipeline_id", pipelineID,
+		)
+		return ch
+	}
+
 	ch := make(chan SSEEvent, 10)
+
 	if h.subscribers[pipelineID] == nil {
 		h.subscribers[pipelineID] = make(map[chan SSEEvent]bool)
 	}
-	// true 表示channel活跃可用
+
 	h.subscribers[pipelineID][ch] = true
 
-	count := len(h.subscribers[pipelineID])
-	sseLog.Debug("SSE新订阅", "pipeline_id", pipelineID, "subscriber_count", count)
+	sseLog.Debug("Pipeline SSE新订阅",
+		"pipeline_id", pipelineID,
+		"subscriber_count", len(h.subscribers[pipelineID]),
+	)
+
 	return ch
 }
 
-// Unsubscribe 取消订阅指定Pipeline的SSE事件
-// 将channel标记为待清理（false），由下次Broadcast或本函数负责close和删除
-// 修复：不在持有锁期间close channel后立即让Broadcast写入已关闭channel
-func (h *SSEHub) Unsubscribe(pipelineID string, ch chan SSEEvent) {
+// Unsubscribe 取消Pipeline SSE订阅。
+func (h *SSEHub) Unsubscribe(
+	pipelineID string,
+	ch chan SSEEvent,
+) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	subs, ok := h.subscribers[pipelineID]
-	if !ok {
-		return
-	}
-
-	active, exists := subs[ch]
+	subs, exists := h.subscribers[pipelineID]
 	if !exists {
 		return
 	}
 
+	active, channelExists := subs[ch]
+	if !channelExists {
+		return
+	}
+
 	if active {
-		// 标记为非活跃，并关闭channel
-		// 此时持有互斥锁，Broadcast无法同时执行，不会有double-write风险
 		subs[ch] = false
 		close(ch)
 		delete(subs, ch)
 	}
 
-	// 如果该Pipeline没有订阅者了，清理map条目
 	if len(subs) == 0 {
 		delete(h.subscribers, pipelineID)
 	}
 
-	count := 0
-	if s, ok2 := h.subscribers[pipelineID]; ok2 {
-		count = len(s)
+	remaining := 0
+	if current, stillExists := h.subscribers[pipelineID]; stillExists {
+		remaining = len(current)
 	}
-	sseLog.Debug("SSE取消订阅", "pipeline_id", pipelineID, "remaining_subscribers", count)
+
+	sseLog.Debug("Pipeline SSE取消订阅",
+		"pipeline_id", pipelineID,
+		"remaining_subscribers", remaining,
+	)
 }
 
-// Broadcast 向指定Pipeline的所有订阅者广播事件
-// 使用互斥锁与Subscribe/Unsubscribe互斥，彻底避免向已关闭channel写入的竞态
-// 非阻塞写入：如果某个channel已满则跳过（避免慢消费者阻塞整个广播）
-func (h *SSEHub) Broadcast(pipelineID string, event SSEEvent) {
+// Broadcast 向指定Pipeline的全部订阅者广播事件。
+func (h *SSEHub) Broadcast(
+	pipelineID string,
+	event SSEEvent,
+) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	subs, ok := h.subscribers[pipelineID]
-	if !ok || len(subs) == 0 {
-		return // 没有订阅者，直接返回
+	subs, exists := h.subscribers[pipelineID]
+	if !exists || len(subs) == 0 {
+		return
 	}
 
 	sent := 0
-	// total 已移入 Debug 日志的内联表达式
 
 	for ch, active := range subs {
 		if !active {
-			// 跳过已标记为非活跃的channel（理论上Unsubscribe已删除，双重保险）
 			continue
 		}
+
 		select {
 		case ch <- event:
 			sent++
 		default:
-			// channel已满，跳过此订阅者（防止阻塞）
-			// 注意：不在此处关闭channel，由Unsubscribe负责关闭
+			// 慢消费者channel已满时跳过，不阻塞Pipeline执行。
 		}
 	}
 
-	sseLog.Debug("SSE广播事件", "pipeline_id", pipelineID, "event_type", event.EventType, "step", event.CurrentStep, "subscriber_count", sent)
+	sseLog.Debug("Pipeline SSE广播事件",
+		"pipeline_id", pipelineID,
+		"event_type", event.EventType,
+		"step", event.CurrentStep,
+		"subscriber_count", sent,
+	)
 }
 
-// GetSubscriberCount 获取指定Pipeline的订阅者数量（用于监控）
+// GetSubscriberCount 返回指定Pipeline订阅者数量。
 func (h *SSEHub) GetSubscriberCount(pipelineID string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
 	return len(h.subscribers[pipelineID])
 }
 
-// GetTotalSubscribers 获取所有Pipeline的总订阅者数量
+// GetTotalSubscribers 返回全部Pipeline订阅者数量。
 func (h *SSEHub) GetTotalSubscribers() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
 	total := 0
 	for _, subs := range h.subscribers {
-		total += len(subs)
+		for _, active := range subs {
+			if active {
+				total++
+			}
+		}
 	}
+
 	return total
 }

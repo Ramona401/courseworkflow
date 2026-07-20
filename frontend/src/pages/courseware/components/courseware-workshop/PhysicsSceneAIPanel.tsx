@@ -3,6 +3,8 @@
  */
 
 import { useRef, useState } from 'react'
+import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import { C } from './workshopConstants'
 import { generatePhysicsSceneCode } from '@/api/physicsSceneAI'
 
@@ -59,10 +61,42 @@ function compressImageToDataURI(file: File): Promise<string> {
   })
 }
 
+
+/**
+ * 为力学场景模板底稿生成短标识。
+ */
+function hashPhysicsSceneDraftIdentity(
+  value: string,
+): string {
+  let hash = 2166136261
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+
+  return (hash >>> 0).toString(36)
+}
+
 export default function PhysicsSceneAIPanel({
   mode, templateName, baseCode, code, onCode, onExit, busyExternal, previewError,
 }: Props) {
-  const [desc, setDesc] = useState('')
+  const { user } = useAuth()
+
+  const descDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'physics-scene-ai',
+    resourceId: [
+      mode,
+      templateName || 'no-template',
+      hashPhysicsSceneDraftIdentity(baseCode),
+    ].join('|'),
+    field: 'description',
+    initialValue: '',
+    maxHistory: 40,
+  })
+  const desc = descDraft.value
+  const setDesc = descDraft.setValue
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [rounds, setRounds] = useState(0)
@@ -91,7 +125,10 @@ export default function PhysicsSceneAIPanel({
     }
   }
 
-  const runGenerate = async (description: string) => {
+  const runGenerate = async (
+    description: string,
+    consumeManualDraft = true,
+  ) => {
     setLoading(true)
     setError('')
     try {
@@ -107,7 +144,10 @@ export default function PhysicsSceneAIPanel({
       })
       onCode(result.code)
       setRounds(r => r + 1)
-      setDesc('')
+      // 自动修复不清除老师正在编辑的人工追改草稿。
+      if (consumeManualDraft) {
+        descDraft.commit()
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : '生成失败，请重试')
     } finally {
@@ -124,7 +164,7 @@ export default function PhysicsSceneAIPanel({
     if (disabled || !canAutoFix) return
     const fixDesc = '这段 Matter.js setup 代码在预览中执行时报错了，报错信息是：' + (previewError || '').trim()
       + '。请只修复导致报错的问题，保持场景主体和教学设计不变，输出修复后的完整 setup 代码。'
-    void runGenerate(fixDesc)
+    void runGenerate(fixDesc, false)
   }
 
   const handleReset = () => {
@@ -218,12 +258,19 @@ export default function PhysicsSceneAIPanel({
       <textarea
         value={desc}
         onChange={e => setDesc(e.target.value)}
+        onKeyDown={e => {
+          descDraft.handleKeyDown(e)
+        }}
         placeholder={placeholder}
         maxLength={2400}
         rows={5}
         disabled={disabled}
         style={{ width: '100%', boxSizing: 'border-box', padding: '10px 11px', borderRadius: 11, border: '1.5px solid #FBD5D5', fontSize: 12.5, lineHeight: 1.6, outline: 'none', resize: 'vertical', fontFamily: 'inherit', background: disabled ? '#F9FAFB' : '#fff' }}
       />
+
+      <div style={{ marginTop: 6, fontSize: 11, color: C.textMuted, lineHeight: 1.5 }}>
+        描述已自动保存 · AI生成失败不会清除 · Ctrl/Command+Z恢复误删
+      </div>
 
       <button
         onClick={handleGenerate}

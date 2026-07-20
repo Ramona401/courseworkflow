@@ -128,13 +128,13 @@ func resolveAssetPublicURL(asset *models.CoursewareAsset) string {
 
 // GenerateImageServiceRequest AI图片生成请求参数
 type GenerateImageServiceRequest struct {
-	CoursewareID  string // 课件ID
-	PageNumber    int    // 页码
-	PlaceholderID string // 占位符ID（可选）
-	Prompt        string // 生成提示词
-	Size          string // 图片尺寸（如 2560x1440, 1920x1920）
-	RefImageURL   string // 参考图URL（图生图模式，可选）
-	UserID        string // 操作者ID
+	CoursewareID  string                  // 课件ID
+	PageNumber    int                     // 页码
+	PlaceholderID string                  // 占位符ID（可选）
+	Prompt        string                  // 生成提示词
+	Size          string                  // 图片尺寸（如 2560x1440, 1920x1920）
+	RefImageURL   string                  // 参考图URL（图生图模式，可选）
+	Actor         *CoursewareActorContext // 可信作者Actor
 }
 
 // GenerateImageServiceResponse AI图片生成响应
@@ -156,14 +156,23 @@ func (s *CoursewareAssetService) GenerateImage(
 	ctx context.Context,
 	req *GenerateImageServiceRequest,
 ) (*GenerateImageServiceResponse, error) {
-	// 1. 校验课件和权限
-	cw, err := repository.GetCoursewareByID(ctx, req.CoursewareID)
+	// 1. 重新加载正式课件并执行作者专属教育域二次校验。
+	if req == nil {
+		return nil, ErrCoursewareActorRequired
+	}
+
+	cw, scopedActor, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				req.CoursewareID,
+				req.Actor,
+			)
 	if err != nil {
-		return nil, fmt.Errorf("课件不存在: %w", err)
+		return nil, err
 	}
-	if cw.UserID != req.UserID {
-		return nil, fmt.Errorf("无权操作此课件")
-	}
+
+	userID := scopedActor.UserID
 
 	// 2. 校验页面
 	page, err := repository.GetCoursewarePageByNumber(ctx, req.CoursewareID, req.PageNumber)
@@ -180,7 +189,7 @@ func (s *CoursewareAssetService) GenerateImage(
 	// 4. 准备调用参数
 	traceCtx := &ai.TraceContext{
 		SceneCode: "courseware_image_gen",
-		UserID:    &req.UserID,
+		UserID:    &userID,
 	}
 	// 确定图片尺寸：用户指定 > 默认1920x1920
 	imageSize := req.Size
@@ -366,10 +375,10 @@ func (s *CoursewareAssetService) downloadAndSaveImage(ctx context.Context, cours
 
 // UploadAssetRequest 上传图片请求参数
 type UploadAssetRequest struct {
-	CoursewareID  string // 课件ID
-	PageNumber    int    // 页码
-	PlaceholderID string // 占位符ID（可选）
-	UserID        string // 操作者ID
+	CoursewareID  string                  // 课件ID
+	PageNumber    int                     // 页码
+	PlaceholderID string                  // 占位符ID（可选）
+	Actor         *CoursewareActorContext // 可信作者Actor
 }
 
 // UploadAssetResponse 上传图片响应
@@ -388,13 +397,19 @@ func (s *CoursewareAssetService) UploadAsset(
 	file multipart.File,
 	header *multipart.FileHeader,
 ) (*UploadAssetResponse, error) {
-	// 1. 校验课件和权限
-	cw, err := repository.GetCoursewareByID(ctx, req.CoursewareID)
-	if err != nil {
-		return nil, fmt.Errorf("课件不存在: %w", err)
+	// 1. 重新加载正式课件并执行作者专属教育域二次校验。
+	if req == nil {
+		return nil, ErrCoursewareActorRequired
 	}
-	if cw.UserID != req.UserID {
-		return nil, fmt.Errorf("无权操作此课件")
+
+	if _, _, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				req.CoursewareID,
+				req.Actor,
+			); err != nil {
+		return nil, err
 	}
 
 	// 2. 校验文件大小
@@ -512,34 +527,62 @@ func (s *CoursewareAssetService) UploadAsset(
 // ==================== 列表查询 ====================
 
 // ListPageAssets 获取指定页面的所有图片/视频资产
-func (s *CoursewareAssetService) ListPageAssets(ctx context.Context, coursewareID string, pageNumber int, userID string) ([]*models.CoursewareAsset, error) {
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
-	if err != nil {
-		return nil, fmt.Errorf("课件不存在: %w", err)
-	}
-	if cw.UserID != userID {
-		return nil, fmt.Errorf("无权操作此课件")
+func (s *CoursewareAssetService) ListPageAssets(
+	ctx context.Context,
+	coursewareID string,
+	pageNumber int,
+	actor *CoursewareActorContext,
+) ([]*models.CoursewareAsset, error) {
+	if _, _, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				coursewareID,
+				actor,
+			); err != nil {
+		return nil, err
 	}
 
-	page, err := repository.GetCoursewarePageByNumber(ctx, coursewareID, pageNumber)
+	page, err :=
+		repository.GetCoursewarePageByNumber(
+			ctx,
+			coursewareID,
+			pageNumber,
+		)
 	if err != nil {
-		return nil, fmt.Errorf("页面不存在: 课件=%s 页码=%d", coursewareID, pageNumber)
+		return nil, fmt.Errorf(
+			"页面不存在: 课件=%s 页码=%d",
+			coursewareID,
+			pageNumber,
+		)
 	}
 
-	return repository.ListCWAssetsByPage(ctx, page.ID)
+	return repository.ListCWAssetsByPage(
+		ctx,
+		page.ID,
+	)
 }
 
 // ListCoursewareAssets 获取课件的全部图片/视频资产
-func (s *CoursewareAssetService) ListCoursewareAssets(ctx context.Context, coursewareID string, userID string) ([]*models.CoursewareAsset, error) {
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
-	if err != nil {
-		return nil, fmt.Errorf("课件不存在: %w", err)
-	}
-	if cw.UserID != userID {
-		return nil, fmt.Errorf("无权操作此课件")
+func (s *CoursewareAssetService) ListCoursewareAssets(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+) ([]*models.CoursewareAsset, error) {
+	if _, _, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				coursewareID,
+				actor,
+			); err != nil {
+		return nil, err
 	}
 
-	return repository.ListCWAssetsByCourseware(ctx, coursewareID)
+	return repository.ListCWAssetsByCourseware(
+		ctx,
+		coursewareID,
+	)
 }
 
 // ==================== 删除资产 ====================
@@ -550,71 +593,263 @@ func (s *CoursewareAssetService) ListCoursewareAssets(ctx context.Context, cours
 // 因此删除前先判断：该资产若是所属课件的当前风格锚点，则先清空课件锚点引用，
 // 否则后续生成图片取锚点图时会查不到 asset 而报错（resolveStyleAnchorForGen 已做兜底，但
 // 在删除时主动清理更干净，避免无效的锚点状态残留在前端展示）。
-func (s *CoursewareAssetService) DeleteAsset(ctx context.Context, assetID string, userID string) error {
-	asset, err := repository.GetCWAssetByID(ctx, assetID)
+func (s *CoursewareAssetService) DeleteAsset(
+	ctx context.Context,
+	coursewareID string,
+	assetID string,
+	actor *CoursewareActorContext,
+) error {
+	// 路径课件先完成作者专属授权，避免通过随机asset_id探测其它课件资产。
+	cw, _, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				coursewareID,
+				actor,
+			)
 	if err != nil {
-		return fmt.Errorf("资产不存在: %w", err)
+		return err
 	}
 
-	cw, err := repository.GetCoursewareByID(ctx, asset.CoursewareID)
+	asset, err := repository.GetCWAssetByID(
+		ctx,
+		assetID,
+	)
 	if err != nil {
-		return fmt.Errorf("课件不存在: %w", err)
+		return fmt.Errorf(
+			"资产不存在: %w",
+			err,
+		)
 	}
-	if cw.UserID != userID {
-		return fmt.Errorf("无权操作此课件")
+	if asset.CoursewareID != coursewareID {
+		return fmt.Errorf(
+			"资产不属于路径指定课件",
+		)
 	}
 
-	// 契约②：删的资产若是该课件的风格锚点，先清空锚点引用（避免悬空引用）
-	if cw.StyleAnchorAssetID != nil && *cw.StyleAnchorAssetID == assetID {
-		if clrErr := repository.ClearCoursewareStyleAnchor(ctx, cw.ID); clrErr != nil {
-			// 清锚点失败仅记WARN不阻断删除（resolveStyleAnchorForGen 有兜底，不会因悬空引用报错）
-			cwAssetLog.Warn("删除锚点资产时清空课件锚点引用失败(继续删除资产)",
-				"asset_id", assetID,
-				"courseware_id", cw.ID,
-				"error", clrErr,
+	// 契约②：删的资产若是该课件的风格锚点，先清空锚点引用。
+	if cw.StyleAnchorAssetID != nil &&
+		*cw.StyleAnchorAssetID == assetID {
+		if clrErr :=
+			repository.ClearCoursewareStyleAnchor(
+				ctx,
+				cw.ID,
+			); clrErr != nil {
+			cwAssetLog.Warn(
+				"删除锚点资产时清空课件锚点引用失败(继续删除资产)",
+				"asset_id",
+				assetID,
+				"courseware_id",
+				cw.ID,
+				"error",
+				clrErr,
 			)
 		} else {
-			cwAssetLog.Info("删除锚点资产，已连带清空课件锚点引用",
-				"asset_id", assetID,
-				"courseware_id", cw.ID,
+			cwAssetLog.Info(
+				"删除锚点资产，已连带清空课件锚点引用",
+				"asset_id",
+				assetID,
+				"courseware_id",
+				cw.ID,
 			)
 		}
 	}
 
-	// 删除物理文件
-	if asset.OssURL != "" && strings.HasPrefix(asset.OssURL, CWAssetURLPrefix) {
-		relativePath := asset.OssURL[len(CWAssetURLPrefix):]
-		fullPath := filepath.Join(CWAssetUploadDir, relativePath)
-		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
-			cwAssetLog.Warn("删除物理文件失败",
-				"asset_id", assetID,
-				"path", fullPath,
-				"error", err,
+	// 删除物理文件。
+	if asset.OssURL != "" &&
+		strings.HasPrefix(
+			asset.OssURL,
+			CWAssetURLPrefix,
+		) {
+		relativePath :=
+			asset.OssURL[len(CWAssetURLPrefix):]
+		fullPath := filepath.Join(
+			CWAssetUploadDir,
+			relativePath,
+		)
+
+		if removeErr := os.Remove(
+			fullPath,
+		); removeErr != nil &&
+			!os.IsNotExist(removeErr) {
+			cwAssetLog.Warn(
+				"删除物理文件失败",
+				"asset_id",
+				assetID,
+				"path",
+				fullPath,
+				"error",
+				removeErr,
 			)
 		}
 	}
 
-	// v0.42.11: 若该资产已上传到OSS云盘(public_oss_url非空),尽力删除云盘副本
-	// 失败仅记WARN不阻断,避免OSS抖动导致本地删除失败;残留孤儿文件可后续清理
+	// 已上传OSS时尽力删除云盘副本。
 	if asset.PublicOSSURL != "" {
-		ossSvc := NewOSSService(s.cfg)
-		if delErr := ossSvc.DeleteObjectFromOSS(asset.PublicOSSURL); delErr != nil {
-			cwAssetLog.Warn("删除OSS云盘副本失败(本地仍照常删除)",
-				"asset_id", assetID,
-				"public_oss_url", asset.PublicOSSURL,
-				"error", delErr,
+		ossService := NewOSSService(s.cfg)
+
+		if deleteErr :=
+			ossService.DeleteObjectFromOSS(
+				asset.PublicOSSURL,
+			); deleteErr != nil {
+			cwAssetLog.Warn(
+				"删除OSS云盘副本失败(本地仍照常删除)",
+				"asset_id",
+				assetID,
+				"public_oss_url",
+				asset.PublicOSSURL,
+				"error",
+				deleteErr,
 			)
 		} else {
-			cwAssetLog.Info("OSS云盘副本已删除", "asset_id", assetID, "public_oss_url", asset.PublicOSSURL)
+			cwAssetLog.Info(
+				"OSS云盘副本已删除",
+				"asset_id",
+				assetID,
+				"public_oss_url",
+				asset.PublicOSSURL,
+			)
 		}
 	}
 
-	if err := repository.DeleteCWAsset(ctx, assetID); err != nil {
-		return fmt.Errorf("删除资产记录失败: %w", err)
+	if err := repository.DeleteCWAsset(
+		ctx,
+		assetID,
+	); err != nil {
+		return fmt.Errorf(
+			"删除资产记录失败: %w",
+			err,
+		)
 	}
 
-	cwAssetLog.Info("课件资产删除成功", "asset_id", assetID, "asset_type", asset.AssetType, "courseware_id", asset.CoursewareID)
+	cwAssetLog.Info(
+		"课件资产删除成功",
+		"asset_id",
+		assetID,
+		"asset_type",
+		asset.AssetType,
+		"courseware_id",
+		asset.CoursewareID,
+	)
+
 	return nil
+}
+
+// UploadCoursewareAssetOSSResult 课件资产上云结果。
+type UploadCoursewareAssetOSSResult struct {
+	AssetID      string `json:"asset_id"`
+	LocalURL     string `json:"local_url"`
+	OSSPublicURL string `json:"oss_public_url"`
+	Message      string `json:"message"`
+}
+
+// validateCoursewareAssetForCourseware 校验资产真实归属于路径课件。
+func validateCoursewareAssetForCourseware(
+	coursewareID string,
+	asset *models.CoursewareAsset,
+) error {
+	if asset == nil {
+		return fmt.Errorf("资产不存在")
+	}
+	if asset.CoursewareID != coursewareID {
+		return fmt.Errorf("资产不属于路径指定课件")
+	}
+
+	return nil
+}
+
+// UploadCoursewareAssetToOSS 在作者专属运行通道中上传课件资产到OSS。
+//
+// 低层OSSService保持无身份语义，供装配、背景生产等可信内部流程复用；
+// HTTP作者授权、路径课件归属和资产数据库校验统一在本方法完成。
+func (s *CoursewareAssetService) UploadCoursewareAssetToOSS(
+	ctx context.Context,
+	coursewareID string,
+	assetID string,
+	actor *CoursewareActorContext,
+) (*UploadCoursewareAssetOSSResult, error) {
+	if _, _, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				coursewareID,
+				actor,
+			); err != nil {
+		return nil, err
+	}
+
+	asset, err := repository.GetCWAssetByID(
+		ctx,
+		assetID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"资产不存在: %w",
+			err,
+		)
+	}
+	if err := validateCoursewareAssetForCourseware(
+		coursewareID,
+		asset,
+	); err != nil {
+		return nil, err
+	}
+
+	localURL := strings.TrimSpace(
+		asset.OssURL,
+	)
+	if localURL == "" ||
+		!strings.HasPrefix(
+			localURL,
+			"/uploads/",
+		) {
+		return nil, fmt.Errorf(
+			"资产没有本地文件或已经是外部URL",
+		)
+	}
+
+	ossService := NewOSSService(s.cfg)
+	publicURL, err :=
+		ossService.UploadAssetToOSS(
+			localURL,
+		)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"上传云盘失败: %w",
+			err,
+		)
+	}
+
+	message := "上传云盘成功"
+
+	if updateErr :=
+		repository.UpdateCWAssetPublicURL(
+			ctx,
+			assetID,
+			publicURL,
+		); updateErr != nil {
+		message =
+			"上传云盘成功(URL持久化失败,不影响使用)"
+
+		cwAssetLog.Warn(
+			"课件资产OSS地址回写失败",
+			"courseware_id",
+			coursewareID,
+			"asset_id",
+			assetID,
+			"public_url",
+			publicURL,
+			"error",
+			updateErr,
+		)
+	}
+
+	return &UploadCoursewareAssetOSSResult{
+		AssetID:      assetID,
+		LocalURL:     localURL,
+		OSSPublicURL: publicURL,
+		Message:      message,
+	}, nil
 }
 
 // ==================== 风格锚点设/清（轮2新增，一步式同步）====================
@@ -631,67 +866,134 @@ type SetStyleAnchorResult struct {
 // 流程：校验资产归属 → 取资产公网URL → 多模态读图提取VAOCI → 落库（asset_id + vaoci）。
 // 仅图片资产可设为锚点（视频/音频不支持）。
 // 提取VAOCI为多模态调用，耗时数秒到十几秒，由前端 loading 兜底。
-func (s *CoursewareAssetService) SetStyleAnchor(ctx context.Context, coursewareID string, assetID string, userID string) (*SetStyleAnchorResult, error) {
-	// 1. 校验课件归属
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+func (s *CoursewareAssetService) SetStyleAnchor(
+	ctx context.Context,
+	coursewareID string,
+	assetID string,
+	actor *CoursewareActorContext,
+) (*SetStyleAnchorResult, error) {
+	// 自动上云、读图AI和锚点落库前重新执行作者域二次授权。
+	_, scopedActor, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				coursewareID,
+				actor,
+			)
 	if err != nil {
-		return nil, fmt.Errorf("课件不存在: %w", err)
-	}
-	if cw.UserID != userID {
-		return nil, fmt.Errorf("无权操作此课件")
+		return nil, err
 	}
 
-	// 2. 校验资产存在 + 属于本课件 + 是图片
-	asset, err := repository.GetCWAssetByID(ctx, assetID)
+	asset, err := repository.GetCWAssetByID(
+		ctx,
+		assetID,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("资产不存在: %w", err)
+		return nil, fmt.Errorf(
+			"资产不存在: %w",
+			err,
+		)
 	}
-	if asset.CoursewareID != coursewareID {
-		return nil, fmt.Errorf("资产不属于此课件")
+	if err := validateCoursewareAssetForCourseware(
+		coursewareID,
+		asset,
+	); err != nil {
+		return nil, err
 	}
 	if asset.AssetType != models.CWAssetTypeImage {
-		return nil, fmt.Errorf("仅图片可设为风格锚点")
+		return nil, fmt.Errorf(
+			"仅图片可设为风格锚点",
+		)
 	}
 
-	// 3. 自动上云（轮3增强）：锚点图若未上传OSS，先传一次，拿到稳定的OSS公网地址。
-	//    这样：① 多模态读图/后续图生图用阿里云稳定地址，不依赖本服务器 /uploads/ 可达性；
-	//          ② 锚点 asset 的 public_oss_url 被回写，前端任何页都能用它显示锚点缩略图（跨页缓存）。
-	//    已上云（public_oss_url 非空）则跳过，幂等不重复传。
-	if strings.TrimSpace(asset.PublicOSSURL) == "" && strings.HasPrefix(asset.OssURL, "/uploads/") {
-		ossSvc := NewOSSService(s.cfg)
-		publicURL, upErr := ossSvc.UploadAssetToOSS(asset.OssURL)
-		if upErr != nil {
-			return nil, fmt.Errorf("锚点图上传云盘失败（设锚点需稳定公网地址）: %w", upErr)
+	// 锚点图尚未上云时，先取得稳定的OSS公网地址。
+	if strings.TrimSpace(
+		asset.PublicOSSURL,
+	) == "" &&
+		strings.HasPrefix(
+			asset.OssURL,
+			"/uploads/",
+		) {
+		ossService := NewOSSService(s.cfg)
+
+		publicURL, uploadErr :=
+			ossService.UploadAssetToOSS(
+				asset.OssURL,
+			)
+		if uploadErr != nil {
+			return nil, fmt.Errorf(
+				"锚点图上传云盘失败（设锚点需稳定公网地址）: %w",
+				uploadErr,
+			)
 		}
-		// 回写 public_oss_url 持久化（失败仅记WARN，不阻断——本次已拿到URL可用）
-		if updErr := repository.UpdateCWAssetPublicURL(ctx, assetID, publicURL); updErr != nil {
-			cwAssetLog.Warn("锚点图OSS地址回写失败(不阻断设锚点)", "asset_id", assetID, "error", updErr)
+
+		if updateErr :=
+			repository.UpdateCWAssetPublicURL(
+				ctx,
+				assetID,
+				publicURL,
+			); updateErr != nil {
+			cwAssetLog.Warn(
+				"锚点图OSS地址回写失败(不阻断设锚点)",
+				"asset_id",
+				assetID,
+				"error",
+				updateErr,
+			)
 		}
+
 		asset.PublicOSSURL = publicURL
-		cwAssetLog.Info("设锚点：锚点图已自动上云", "asset_id", assetID, "public_oss_url", publicURL)
+
+		cwAssetLog.Info(
+			"设锚点：锚点图已自动上云",
+			"asset_id",
+			assetID,
+			"public_oss_url",
+			publicURL,
+		)
 	}
 
-	// 取资产公网URL（契约③：此时 public_oss_url 必有值，优先用它）
-	anchorURL := resolveAssetPublicURL(asset)
+	anchorURL := resolveAssetPublicURL(
+		asset,
+	)
 	if anchorURL == "" {
-		return nil, fmt.Errorf("无法解析锚点图的公网URL，请确认图片已正确保存")
+		return nil, fmt.Errorf(
+			"无法解析锚点图的公网URL，请确认图片已正确保存",
+		)
 	}
 
-	// 4. 多模态读图提取VAOCI风格索引（一步式同步，失败直接报错）
-	vaoci, err := s.ExtractVAOCIFromImageURL(ctx, anchorURL, userID)
+	vaoci, err := s.ExtractVAOCIFromImageURL(
+		ctx,
+		anchorURL,
+		scopedActor.UserID,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("提取风格索引失败: %w", err)
+		return nil, fmt.Errorf(
+			"提取风格索引失败: %w",
+			err,
+		)
 	}
 
-	// 5. 落库
-	if err := repository.UpdateCoursewareStyleAnchor(ctx, coursewareID, assetID, vaoci); err != nil {
-		return nil, fmt.Errorf("保存风格锚点失败: %w", err)
+	if err := repository.UpdateCoursewareStyleAnchor(
+		ctx,
+		coursewareID,
+		assetID,
+		vaoci,
+	); err != nil {
+		return nil, fmt.Errorf(
+			"保存风格锚点失败: %w",
+			err,
+		)
 	}
 
-	cwAssetLog.Info("设置课件风格锚点成功",
-		"courseware_id", coursewareID,
-		"anchor_asset_id", assetID,
-		"vaoci_len", len([]rune(vaoci)),
+	cwAssetLog.Info(
+		"设置课件风格锚点成功",
+		"courseware_id",
+		coursewareID,
+		"anchor_asset_id",
+		assetID,
+		"vaoci_len",
+		len([]rune(vaoci)),
 	)
 
 	return &SetStyleAnchorResult{
@@ -702,18 +1004,37 @@ func (s *CoursewareAssetService) SetStyleAnchor(ctx context.Context, coursewareI
 }
 
 // ClearStyleAnchor 清除课件风格锚点（两字段置NULL）
-func (s *CoursewareAssetService) ClearStyleAnchor(ctx context.Context, coursewareID string, userID string) error {
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
-	if err != nil {
-		return fmt.Errorf("课件不存在: %w", err)
+func (s *CoursewareAssetService) ClearStyleAnchor(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+) error {
+	if _, _, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				coursewareID,
+				actor,
+			); err != nil {
+		return err
 	}
-	if cw.UserID != userID {
-		return fmt.Errorf("无权操作此课件")
+
+	if err := repository.ClearCoursewareStyleAnchor(
+		ctx,
+		coursewareID,
+	); err != nil {
+		return fmt.Errorf(
+			"清除风格锚点失败: %w",
+			err,
+		)
 	}
-	if err := repository.ClearCoursewareStyleAnchor(ctx, coursewareID); err != nil {
-		return fmt.Errorf("清除风格锚点失败: %w", err)
-	}
-	cwAssetLog.Info("清除课件风格锚点成功", "courseware_id", coursewareID)
+
+	cwAssetLog.Info(
+		"清除课件风格锚点成功",
+		"courseware_id",
+		coursewareID,
+	)
+
 	return nil
 }
 
@@ -723,67 +1044,140 @@ func (s *CoursewareAssetService) ClearStyleAnchor(ctx context.Context, coursewar
 // 两种模式：
 //  1. placeholderID非空 → 替换占位符div为<img>标签
 //  2. placeholderID为空 → 在内容区末尾追加<img>标签
-func (s *CoursewareAssetService) InsertImageToPage(ctx context.Context, coursewareID string, pageNumber int, assetID string, userID string) (string, error) {
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
-	if err != nil {
-		return "", fmt.Errorf("课件不存在: %w", err)
-	}
-	if cw.UserID != userID {
-		return "", fmt.Errorf("无权操作此课件")
+func (s *CoursewareAssetService) InsertImageToPage(
+	ctx context.Context,
+	coursewareID string,
+	pageNumber int,
+	assetID string,
+	actor *CoursewareActorContext,
+) (string, error) {
+	if _, _, err :=
+		(&CoursewareService{}).
+			LoadCoursewareForOwnerRuntime(
+				ctx,
+				coursewareID,
+				actor,
+			); err != nil {
+		return "", err
 	}
 
-	asset, err := repository.GetCWAssetByID(ctx, assetID)
+	asset, err := repository.GetCWAssetByID(
+		ctx,
+		assetID,
+	)
 	if err != nil {
-		return "", fmt.Errorf("资产不存在: %w", err)
+		return "", fmt.Errorf(
+			"资产不存在: %w",
+			err,
+		)
 	}
 	if asset.CoursewareID != coursewareID {
-		return "", fmt.Errorf("资产不属于此课件")
+		return "", fmt.Errorf(
+			"资产不属于此课件",
+		)
 	}
 
-	page, err := repository.GetCoursewarePageByNumber(ctx, coursewareID, pageNumber)
+	page, err :=
+		repository.GetCoursewarePageByNumber(
+			ctx,
+			coursewareID,
+			pageNumber,
+		)
 	if err != nil {
 		return "", fmt.Errorf("页面不存在")
 	}
 	if page.HTMLContent == "" {
-		return "", fmt.Errorf("页面尚未生成HTML，请先生成课件")
+		return "", fmt.Errorf(
+			"页面尚未生成HTML，请先生成课件",
+		)
 	}
 
 	html := page.HTMLContent
-	imgTag := fmt.Sprintf(`<img src="%s" alt="课件图片" style="max-width:100%%;height:auto;border-radius:var(--cw-radius,12px);margin:12px 0" />`, asset.OssURL)
+	imgTag := fmt.Sprintf(
+		`<img src="%s" alt="课件图片" `+
+			`style="max-width:100%%;height:auto;`+
+			`border-radius:var(--cw-radius,12px);`+
+			`margin:12px 0" />`,
+		asset.OssURL,
+	)
 
-	// 模式1: 替换占位符
 	if asset.PlaceholderID != "" {
-		placeholderPattern := fmt.Sprintf(`<div[^>]*data-placeholder-id="%s"[^>]*>[\s\S]*?</div>`, regexp.QuoteMeta(asset.PlaceholderID))
-		re, err := regexp.Compile(placeholderPattern)
-		if err == nil && re.MatchString(html) {
-			html = re.ReplaceAllString(html, imgTag)
-			cwAssetLog.Info("替换占位符为图片",
-				"courseware_id", coursewareID,
-				"page_number", pageNumber,
-				"placeholder_id", asset.PlaceholderID,
+		placeholderPattern := fmt.Sprintf(
+			`<div[^>]*data-placeholder-id="%s"`+
+				`[^>]*>[\s\S]*?</div>`,
+			regexp.QuoteMeta(
+				asset.PlaceholderID,
+			),
+		)
+
+		compiled, compileErr :=
+			regexp.Compile(placeholderPattern)
+
+		if compileErr == nil &&
+			compiled.MatchString(html) {
+			html = compiled.ReplaceAllString(
+				html,
+				imgTag,
+			)
+
+			cwAssetLog.Info(
+				"替换占位符为图片",
+				"courseware_id",
+				coursewareID,
+				"page_number",
+				pageNumber,
+				"placeholder_id",
+				asset.PlaceholderID,
 			)
 		} else {
-			cwAssetLog.Warn("未找到占位符，降级为追加模式",
-				"placeholder_id", asset.PlaceholderID,
-				"page_number", pageNumber,
+			cwAssetLog.Warn(
+				"未找到占位符，降级为追加模式",
+				"placeholder_id",
+				asset.PlaceholderID,
+				"page_number",
+				pageNumber,
 			)
-			html = appendImageToHTML(html, imgTag)
+
+			html = appendImageToHTML(
+				html,
+				imgTag,
+			)
 		}
 	} else {
-		html = appendImageToHTML(html, imgTag)
+		html = appendImageToHTML(
+			html,
+			imgTag,
+		)
 	}
 
-	// 写回数据库
-	if err := repository.UpdateCWPageHTML(ctx, page.ID, html, page.PlaceholderMap, page.MatchedComponentIDs, page.Status); err != nil {
-		return "", fmt.Errorf("更新页面HTML失败: %w", err)
+	if err := repository.UpdateCWPageHTML(
+		ctx,
+		page.ID,
+		html,
+		page.PlaceholderMap,
+		page.MatchedComponentIDs,
+		page.Status,
+	); err != nil {
+		return "", fmt.Errorf(
+			"更新页面HTML失败: %w",
+			err,
+		)
 	}
 
-	_ = repository.UpdateCWAssetStatus(ctx, assetID, models.CWAssetStatusConfirmed)
+	_ = repository.UpdateCWAssetStatus(
+		ctx,
+		assetID,
+		models.CWAssetStatusConfirmed,
+	)
 
-	cwAssetLog.Info("图片已插入页面HTML",
-		"courseware_id", coursewareID,
-		"page_number", pageNumber,
-		"asset_id", assetID,
+	cwAssetLog.Info(
+		"图片已插入页面HTML",
+		"courseware_id",
+		coursewareID,
+		"page_number",
+		pageNumber,
+		"asset_id",
+		assetID,
 	)
 
 	return html, nil

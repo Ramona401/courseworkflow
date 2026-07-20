@@ -29,9 +29,9 @@ import (
 // CreateCourseware 创建课件记录
 // v0.42: lesson_plan_id 改为可空，新增 source_type 参数
 func CreateCourseware(ctx context.Context, cw *models.Courseware) error {
-	sql := `INSERT INTO coursewares (id, lesson_plan_id, user_id, title, subject, grade, status, style_config, page_count, source_type, source_file_path)
-VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-RETURNING id, created_at, updated_at`
+	sql := `INSERT INTO coursewares (id, lesson_plan_id, user_id, title, subject, grade, status, style_config, page_count, source_type, source_file_path, education_domain)
+VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+RETURNING id, education_domain, created_at, updated_at`
 	// v0.42: lesson_plan_id 可空处理——指针为nil或空字符串值都传NULL
 	var lpID interface{}
 	if cw.LessonPlanID != nil && *cw.LessonPlanID != "" {
@@ -45,7 +45,8 @@ RETURNING id, created_at, updated_at`
 		lpID, cw.UserID, cw.Title, cw.Subject, cw.Grade,
 		cw.Status, nullIfEmpty(cw.StyleConfig), cw.PageCount,
 		sourceType, nullIfEmpty(cw.SourceFilePath),
-	).Scan(&cw.ID, &cw.CreatedAt, &cw.UpdatedAt)
+		nullIfEmpty(cw.EducationDomain),
+	).Scan(&cw.ID, &cw.EducationDomain, &cw.CreatedAt, &cw.UpdatedAt)
 }
 
 // GetCoursewareByID 根据ID获取课件详情
@@ -54,7 +55,7 @@ RETURNING id, created_at, updated_at`
 // 阶段1: 再加 publish_state/review_level/review_school_id/code_share_scope 四列（共26列）
 // 回收站迭代: WHERE 加 deleted_at IS NULL 排除已软删课件
 func GetCoursewareByID(ctx context.Context, id string) (*models.Courseware, error) {
-	sql := `SELECT id, lesson_plan_id, user_id, title, subject, grade, status,
+	sql := `SELECT id, lesson_plan_id, user_id, title, subject, grade, education_domain, status,
 COALESCE(style_config::text, ''), page_count, COALESCE(index_overview, ''),
 COALESCE(logo_url, ''), COALESCE(org_name, ''), COALESCE(nav_template_html, ''),
 pipeline_id, COALESCE(source_type, 'lesson_plan'), COALESCE(source_file_path, ''),
@@ -69,6 +70,7 @@ FROM coursewares WHERE id = $1 AND deleted_at IS NULL`
 	cw := &models.Courseware{}
 	err := database.DB.QueryRow(ctx, sql, id).Scan(
 		&cw.ID, &cw.LessonPlanID, &cw.UserID, &cw.Title, &cw.Subject, &cw.Grade,
+		&cw.EducationDomain,
 		&cw.Status, &cw.StyleConfig, &cw.PageCount, &cw.IndexOverview,
 		&cw.LogoURL, &cw.OrgName, &cw.NavTemplateHTML,
 		&cw.PipelineID, &cw.SourceType, &cw.SourceFilePath,
@@ -117,7 +119,7 @@ func ListCoursewares(ctx context.Context, userID string, status string, subject 
 	// v0.42: LEFT JOIN lesson_plans（lesson_plan_id 可空时 lp.title 为 NULL → COALESCE 兜底）
 	// 阶段1: 末尾增 publish_state/review_level/code_share_scope 三列
 	listSQL := fmt.Sprintf(`SELECT c.id, c.lesson_plan_id, COALESCE(lp.title, ''), c.title, c.subject, c.grade,
-c.status, c.page_count, c.pipeline_id, COALESCE(c.source_type, 'lesson_plan'),
+c.education_domain, c.status, c.page_count, c.pipeline_id, COALESCE(c.source_type, 'lesson_plan'),
 COALESCE(c.publish_state, 'private'), COALESCE(c.review_level, 0), COALESCE(c.code_share_scope, 'none'),
 c.created_at, c.updated_at
 FROM coursewares c
@@ -138,7 +140,7 @@ LIMIT $%d OFFSET $%d`, whereClause, argIdx, argIdx+1)
 		item := &models.CoursewareListItem{}
 		if err := rows.Scan(
 			&item.ID, &item.LessonPlanID, &item.LessonPlanTitle, &item.Title,
-			&item.Subject, &item.Grade, &item.Status, &item.PageCount,
+			&item.Subject, &item.Grade, &item.EducationDomain, &item.Status, &item.PageCount,
 			&item.PipelineID, &item.SourceType,
 			&item.PublishState, &item.ReviewLevel, &item.CodeShareScope,
 			&item.CreatedAt, &item.UpdatedAt,
@@ -169,88 +171,212 @@ LIMIT $%d OFFSET $%d`, whereClause, argIdx, argIdx+1)
 // 只列 publish_state='published_shared' 的课件，按 updated_at 倒序。
 // 关联 users 取作者显示名，关联 school_members→organizations 取作者学校名（取一条，无则空）。
 // 回收站迭代: 初始条件加 c.deleted_at IS NULL 排除已软删课件
-func ListSharedCoursewares(ctx context.Context, visibleAuthorIDs []string, subject string, limit int, offset int) ([]*models.SharedCoursewareListItem, int, error) {
+func ListSharedCoursewares(
+	ctx context.Context,
+	visibleAuthorIDs []string,
+	currentEducationDomain string,
+	subject string,
+	limit int,
+	offset int,
+) ([]*models.SharedCoursewareListItem, int, error) {
 	if limit <= 0 {
 		limit = 20
 	}
+	if offset < 0 {
+		offset = 0
+	}
 
-	conditions := []string{"c.publish_state = 'published_shared'", "c.deleted_at IS NULL"}
+	conditions := []string{
+		"c.publish_state = 'published_shared'",
+		"c.deleted_at IS NULL",
+	}
 	args := []interface{}{}
 	argIdx := 1
 
 	// 作者白名单三态：
-	//   nil        → 不加作者条件（全局可见，仅 admin）
-	//   非nil空切片 → 注入恒假条件（看不到任何，fail-closed）
-	//   非空        → c.user_id = ANY($n)
+	//   nil          → 不限作者，仅admin可传；
+	//   非nil空切片 → 匹配空集，fail-closed；
+	//   非空切片    → 仅白名单作者。
 	if visibleAuthorIDs != nil {
 		if len(visibleAuthorIDs) == 0 {
 			conditions = append(conditions, "1 = 0")
 		} else {
-			conditions = append(conditions, fmt.Sprintf("c.user_id = ANY($%d)", argIdx))
+			conditions = append(
+				conditions,
+				fmt.Sprintf(
+					"c.user_id = ANY($%d)",
+					argIdx,
+				),
+			)
 			args = append(args, visibleAuthorIDs)
 			argIdx++
 		}
 	}
 
-	if subject != "" {
-		conditions = append(conditions, fmt.Sprintf("c.subject = $%d", argIdx))
-		args = append(args, subject)
+	// 教育域是独立于组织范围的第二道硬门槛。
+	//
+	// 具体教学域只可读取同域或common；
+	// mixed管理上下文可读取全部合法资源域；
+	// common、空值和非法当前域一律匹配空集。
+	normalizedDomain := strings.ToLower(
+		strings.TrimSpace(currentEducationDomain),
+	)
+	switch {
+	case models.IsTeachingEducationDomain(
+		normalizedDomain,
+	):
+		conditions = append(
+			conditions,
+			fmt.Sprintf(
+				"(c.education_domain = $%d OR c.education_domain = $%d)",
+				argIdx,
+				argIdx+1,
+			),
+		)
+		args = append(
+			args,
+			normalizedDomain,
+			models.EducationDomainCommon,
+		)
+		argIdx += 2
+
+	case normalizedDomain == models.EducationDomainMixed:
+		conditions = append(
+			conditions,
+			"c.education_domain IN ('k12', 'vocational', 'adult', 'common')",
+		)
+
+	default:
+		conditions = append(conditions, "1 = 0")
+	}
+
+	if strings.TrimSpace(subject) != "" {
+		conditions = append(
+			conditions,
+			fmt.Sprintf(
+				"c.subject = $%d",
+				argIdx,
+			),
+		)
+		args = append(args, strings.TrimSpace(subject))
 		argIdx++
 	}
 
-	whereClause := strings.Join(conditions, " AND ")
+	whereClause := strings.Join(
+		conditions,
+		" AND ",
+	)
 
-	countSQL := fmt.Sprintf("SELECT COUNT(*) FROM coursewares c WHERE %s", whereClause)
+	countSQL := fmt.Sprintf(
+		"SELECT COUNT(*) FROM coursewares c WHERE %s",
+		whereClause,
+	)
+
 	var total int
-	if err := database.DB.QueryRow(ctx, countSQL, args...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("查询共享课件总数失败: %w", err)
+	if err := database.DB.QueryRow(
+		ctx,
+		countSQL,
+		args...,
+	).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf(
+			"查询共享课件总数失败: %w",
+			err,
+		)
 	}
 
-	// 作者学校名用 LATERAL 子查询取一条（school_members→organizations，type=school 且 active）
-	listSQL := fmt.Sprintf(`SELECT c.id, c.title, c.subject, c.grade, c.page_count,
+	listSQL := fmt.Sprintf(`SELECT
+c.id,
+c.title,
+c.subject,
+c.grade,
+c.education_domain,
+c.page_count,
 COALESCE(c.source_type, 'lesson_plan'),
-c.user_id, COALESCE(u.display_name, u.username, ''),
+c.user_id,
+COALESCE(u.display_name, u.username, ''),
 COALESCE(sch.name, ''),
-COALESCE(c.publish_state, 'private'), COALESCE(c.code_share_scope, 'none'),
-c.created_at, c.updated_at
+COALESCE(c.publish_state, 'private'),
+COALESCE(c.code_share_scope, 'none'),
+c.created_at,
+c.updated_at
 FROM coursewares c
 LEFT JOIN users u ON u.id = c.user_id
 LEFT JOIN LATERAL (
-    SELECT o.name
-    FROM school_members sm
-    JOIN organizations o ON o.id = sm.school_id AND o.status = 'active'
-    WHERE sm.user_id = c.user_id
-    LIMIT 1
+	SELECT o.name
+	FROM school_members sm
+	JOIN organizations o
+		ON o.id = sm.school_id
+		AND o.status = 'active'
+	WHERE sm.user_id = c.user_id
+	LIMIT 1
 ) sch ON true
 WHERE %s
 ORDER BY c.updated_at DESC
-LIMIT $%d OFFSET $%d`, whereClause, argIdx, argIdx+1)
+LIMIT $%d OFFSET $%d`,
+		whereClause,
+		argIdx,
+		argIdx+1,
+	)
+
 	args = append(args, limit, offset)
 
-	rows, err := database.DB.Query(ctx, listSQL, args...)
+	rows, err := database.DB.Query(
+		ctx,
+		listSQL,
+		args...,
+	)
 	if err != nil {
-		return nil, 0, fmt.Errorf("查询共享课件列表失败: %w", err)
+		return nil, 0, fmt.Errorf(
+			"查询共享课件列表失败: %w",
+			err,
+		)
 	}
 	defer rows.Close()
 
-	var items []*models.SharedCoursewareListItem
+	items := make(
+		[]*models.SharedCoursewareListItem,
+		0,
+	)
+
 	for rows.Next() {
 		item := &models.SharedCoursewareListItem{}
+
 		if err := rows.Scan(
-			&item.ID, &item.Title, &item.Subject, &item.Grade, &item.PageCount,
+			&item.ID,
+			&item.Title,
+			&item.Subject,
+			&item.Grade,
+			&item.EducationDomain,
+			&item.PageCount,
 			&item.SourceType,
-			&item.AuthorID, &item.AuthorName,
+			&item.AuthorID,
+			&item.AuthorName,
 			&item.SchoolName,
-			&item.PublishState, &item.CodeShareScope,
-			&item.CreatedAt, &item.UpdatedAt,
+			&item.PublishState,
+			&item.CodeShareScope,
+			&item.CreatedAt,
+			&item.UpdatedAt,
 		); err != nil {
-			return nil, 0, fmt.Errorf("扫描共享课件行失败: %w", err)
+			return nil, 0, fmt.Errorf(
+				"扫描共享课件行失败: %w",
+				err,
+			)
 		}
-		item.SourceName = models.CWSourceNameMap[item.SourceType]
+
+		item.SourceName =
+			models.CWSourceNameMap[item.SourceType]
 		item.PublishStateName = models.CWPublishStateNameMap[item.PublishState]
-		// CanCopy 由 service 层按 code_share_scope + 归属关系裁决，repo 不算
+
 		items = append(items, item)
 	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf(
+			"遍历共享课件列表失败: %w",
+			err,
+		)
+	}
+
 	return items, total, nil
 }
 

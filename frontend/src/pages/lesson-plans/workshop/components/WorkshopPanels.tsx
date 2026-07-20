@@ -11,403 +11,23 @@
  * v203变更（专家模式首屏简化）：
  *   - StartForm 从双栏布局（左基本信息+右320px黄色配方面板）改为单栏布局
  *   - 配方选择从整版面板改为与对话模式一致的下拉选择器
- *   - 复用 getAvailableRecipes API（按用户可见性+学科过滤，学校>教研组>个人排序）
  *   - 去掉"当前学科/全部配方"切换器、去掉"新建配方"入口（需要的去配方管理页）
  *   - 保留课本图片区域不变
  */
-import { useState, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useState } from 'react'
 import type {
   ConversationMessage,
   AIReviewResult,
   ConvComponent,
-  RecipeSelectionMode,
 } from '@/api/lesson-plans'
-import { getAvailableRecipes, type RecipeListItem } from '@/api/recipes'
-import { getTextbooks, triggerTextbookOCR, type TextbookListItem } from '@/api/textbooks'
-import { getAvailablePublishers, publisherLabel } from '@/api/course-outlines'
-import { C, SUBJECTS, GRADES, renderMarkdown } from './workshopConstants'
+import { C, renderMarkdown } from './workshopConstants'
 import ContextReceiptCard from './context-receipt/ContextReceiptCard'
-import RecipeModeSelector from './RecipeModeSelector'
 
 // ==================== 首屏备课表单 ====================
 
 // ==================== 首屏备课表单 ====================
 
-interface StartFormProps {
-  onStart: (
-    subject: string,
-    grade: string,
-    topic: string,
-    duration: number,
-    recipeMode: RecipeSelectionMode,
-    recipeId?: string,
-    textbookPageIds?: string[],
-    coursePublisher?: string | null,
-  ) => void
-  loading: boolean
-}
-
-export function StartForm({ onStart, loading }: StartFormProps) {
-  const [subject, setSubject]   = useState('AI')
-  const [grade, setGrade]       = useState('一年级')
-  const [topic, setTopic]       = useState('')
-  const [duration, setDuration] = useState(45)
-  // 教材版本（专家模式起步选）：三态 null=不关联/''=通用版/具名=该版本
-  const [coursePublisher, setCoursePublisher] = useState<string | null>(null)
-  const [coursePublishers, setCoursePublishers] = useState<string[]>([])
-  const [coursePubLoading, setCoursePubLoading] = useState(false)
-  const navigate = useNavigate()
-
-  // v203 简化：配方用 getAvailableRecipes（按用户可见性+学科，学校>教研组>个人排序）
-  const [recipes, setRecipes]             = useState<RecipeListItem[]>([])
-  const [recipesLoading, setRecipesLoad]  = useState(false)
-  const [selectedRecipeId, setSelectedId] = useState<string | null>(null)
-  const [recipeMode, setRecipeMode] =
-    useState<RecipeSelectionMode>('auto')
-
-  const [textbooks, setTextbooks]             = useState<TextbookListItem[]>([])
-  const [textbooksLoading, setTextbooksLoad]  = useState(false)
-  const [textbooksLoaded, setTextbooksLoaded] = useState(false)
-  const [selectedTextbookIds, setSelectedTBIds] = useState<Set<string>>(new Set())
-  const [ocrInProgress, setOcrInProgress] = useState<Set<string>>(new Set())
-  const [ocrFailed, setOcrFailed]         = useState<Set<string>>(new Set())
-
-  // v203 简化：按学科和具体年级拉可见配方（复用对话模式同一 API），学科切换时重拉并清空已选
-  useEffect(() => {
-    let cancelled = false
-    setRecipesLoad(true)
-    getAvailableRecipes(subject, grade)
-      .then(resp => {
-        if (cancelled) return
-        const list = resp.recipes || []
-        setRecipes(list)
-        // 学科或年级切换时：已选配方若不在新列表里则清空
-        setSelectedId(prev =>
-          prev && list.some(r => r.id === prev)
-            ? prev
-            : recipeMode === 'selected' && list.length > 0
-              ? list[0].id
-              : null
-        )
-      })
-      .catch(() => { if (!cancelled) setRecipes([]) })
-      .finally(() => { if (!cancelled) setRecipesLoad(false) })
-    return () => { cancelled = true }
-  }, [subject, grade])
-
-  useEffect(() => {
-    const loadTextbooks = async () => {
-      setTextbooksLoad(true); setTextbooksLoaded(false)
-      try {
-        const resp = await getTextbooks({ subject, grade_range: grade, limit: 50 })
-        setTextbooks(resp.pages || [])
-        setSelectedTBIds(new Set())
-      } catch { setTextbooks([]) }
-      finally { setTextbooksLoad(false); setTextbooksLoaded(true) }
-    }
-    loadTextbooks()
-  }, [subject, grade])
-
-  // 教材版本下拉：按学科+年级拉该学科年级真实存在大纲的可选版本（与对话模式同款）。
-  // 有大纲→默认选中第一个版本（可改可清）；无大纲→不显示、coursePublisher 置 null（不关联）。
-  useEffect(() => {
-    let cancelled = false
-    if (!subject || !grade) { setCoursePublishers([]); setCoursePublisher(null); return }
-    setCoursePubLoading(true)
-    getAvailablePublishers(subject, grade)
-      .then(list => {
-        if (cancelled) return
-        const pubs = list || []
-        setCoursePublishers(pubs)
-        if (pubs.length === 0) {
-          setCoursePublisher(null)
-        } else {
-          setCoursePublisher(prev => (prev !== null && pubs.includes(prev)) ? prev : pubs[0])
-        }
-      })
-      .catch(() => { if (!cancelled) { setCoursePublishers([]); setCoursePublisher(null) } })
-      .finally(() => { if (!cancelled) setCoursePubLoading(false) })
-    return () => { cancelled = true }
-  }, [subject, grade])
-
-  const toggleTextbook = (id: string) => {
-    const willSelect = !selectedTextbookIds.has(id)
-    setSelectedTBIds(prev => {
-      const n = new Set(prev)
-      if (n.has(id)) { n.delete(id) } else { n.add(id) }
-      return n
-    })
-    if (willSelect) {
-      const tb = textbooks.find(t => t.id === id)
-      if (tb && !tb.has_ocr && !ocrInProgress.has(id)) {
-        maybeTriggerOCR(id)
-      }
-    }
-  }
-
-  const maybeTriggerOCR = async (id: string) => {
-    setOcrInProgress(prev => { const n = new Set(prev); n.add(id); return n })
-    setOcrFailed(prev => { const n = new Set(prev); n.delete(id); return n })
-    try {
-      await triggerTextbookOCR(id)
-      setTextbooks(prev => prev.map(t => t.id === id ? { ...t, has_ocr: true } : t))
-    } catch {
-      setOcrFailed(prev => { const n = new Set(prev); n.add(id); return n })
-    } finally {
-      setOcrInProgress(prev => { const n = new Set(prev); n.delete(id); return n })
-    }
-  }
-
-  const handleSubmit = () => {
-    if (!topic.trim()) return
-    if (ocrInProgress.size > 0) return
-    if (recipeMode === 'selected' && !selectedRecipeId) return
-
-    onStart(
-      subject,
-      grade,
-      topic.trim(),
-      duration,
-      recipeMode,
-      recipeMode === 'selected'
-        ? selectedRecipeId || undefined
-        : undefined,
-      selectedTextbookIds.size > 0
-        ? Array.from(selectedTextbookIds)
-        : undefined,
-      coursePublisher,
-    )
-  }
-
-  const selBtn = (active: boolean): React.CSSProperties => ({
-    padding: '6px 14px', borderRadius: '20px',
-    border: `1px solid ${active ? C.primary : C.border}`,
-    background: active ? C.primaryLight : 'transparent',
-    color: active ? C.primary : C.textSec,
-    fontSize: '13px', fontWeight: active ? 600 : 400,
-    cursor: 'pointer', transition: 'all 150ms ease',
-  })
-
-  const recipeReady =
-    recipeMode !== 'selected' || Boolean(selectedRecipeId)
-
-  const startButtonText =
-    ocrInProgress.size > 0
-      ? `课本识别中（${ocrInProgress.size}）请稍候...`
-      : loading
-        ? '正在准备备课环境...'
-        : recipeMode === 'auto'
-          ? '✨ 智能匹配并开始备课 →'
-          : recipeMode === 'selected'
-            ? selectedRecipeId
-              ? '📦 带指定配方开始备课 →'
-              : '请先选择配方'
-            : '开始备课（不使用配方）→'
-
-  return (
-    <div style={{ maxWidth: '680px', margin: '0 auto', padding: '36px 0' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
-        <span style={{ fontSize: '28px', lineHeight: 1 }}>✨</span>
-        <div>
-          <h1 style={{ fontSize: '20px', fontWeight: 700, color: C.text, margin: '0 0 2px' }}>开始今天的备课</h1>
-          <p style={{ fontSize: '13px', color: C.textSec, margin: 0 }}>告诉AI你要上什么课，选择配方让AI从第一句话就带着教研共识工作</p>
-        </div>
-      </div>
-
-      {/* 单栏布局（v203 简化：去掉右侧 320px 配方面板） */}
-      <div style={{ background: C.card, borderRadius: '16px', padding: '28px', boxShadow: '0 4px 24px rgba(0,0,0,0.06)', border: `1px solid ${C.border}` }}>
-        <div style={{ marginBottom: '18px' }}>
-          <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>学科</label>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-            {SUBJECTS.map(s => <button key={s} onClick={() => setSubject(s)} style={selBtn(subject === s)}>{s}</button>)}
-          </div>
-        </div>
-        <div style={{ marginBottom: '18px' }}>
-          <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>年级</label>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-            {GRADES.map(g => <button key={g} onClick={() => setGrade(g)} style={selBtn(grade === g)}>{g}</button>)}
-          </div>
-        </div>
-        <div style={{ marginBottom: '18px' }}>
-          <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>
-            课题 <span style={{ color: C.danger }}>*</span>
-          </label>
-          <input type="text" value={topic} onChange={e => setTopic(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleSubmit()}
-            placeholder="例如：认识人工智能、图像识别应用..."
-            style={{ width: '100%', padding: '10px 14px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '15px', color: C.text, outline: 'none', boxSizing: 'border-box', transition: 'border-color 150ms ease' }}
-            onFocus={e => { e.target.style.borderColor = C.primary }}
-            onBlur={e  => { e.target.style.borderColor = C.border }} />
-        </div>
-        <div style={{ marginBottom: '18px' }}>
-          <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>课时时长</label>
-          <div style={{ display: 'flex', gap: '8px' }}>
-            {[40, 45, 50, 60].map(d => <button key={d} onClick={() => setDuration(d)} style={selBtn(duration === d)}>{d}分钟</button>)}
-          </div>
-        </div>
-
-        {/* 配方三态选择（对话模式与专家模式共用同一组件） */}
-        <div style={{ marginBottom: '18px' }}>
-          <RecipeModeSelector
-            mode={recipeMode}
-            setMode={setRecipeMode}
-            recipes={recipes}
-            recipeId={selectedRecipeId || ''}
-            setRecipeId={value => setSelectedId(value || null)}
-            loading={recipesLoading}
-          />
-        </div>
-
-        {/* 教材版本（选填）——仅当本学科本年级真实有大纲时才显示 */}
-        {coursePublishers.length > 0 && (
-          <div style={{ marginBottom: '18px' }}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>📚 教材版本</label>
-            <select
-              value={coursePublisher === null ? '__none__' : coursePublisher}
-              onChange={e => setCoursePublisher(e.target.value === '__none__' ? null : e.target.value)}
-              disabled={coursePubLoading}
-              style={{ width: '100%', padding: '11px 14px', borderRadius: '10px', border: `1.5px solid ${coursePublisher !== null ? '#8B5CF6' : C.border}`, fontSize: '14px', color: coursePublisher !== null ? C.text : C.textMuted, background: C.card, cursor: 'pointer', outline: 'none', boxSizing: 'border-box', transition: 'border-color 150ms ease' }}>
-              {coursePublishers.map(p => (
-                <option key={p || '__generic__'} value={p}>{publisherLabel(p)}</option>
-              ))}
-              <option value="__none__">不关联大纲（本节课不注入大纲）</option>
-            </select>
-            {coursePublisher !== null ? (
-              <div style={{ fontSize: '11px', color: '#7C3AED', marginTop: '6px', lineHeight: 1.5 }}>
-                ✓ 备课时将注入「{publisherLabel(coursePublisher)}」这版的课程大纲
-              </div>
-            ) : (
-              <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px', lineHeight: 1.5 }}>
-                💡 当前不关联大纲；如需对齐教材，请在上方选择你所用的版本
-              </div>
-            )}
-          </div>
-        )}
-
-        <button
-          onClick={handleSubmit}
-          disabled={
-            !topic.trim() ||
-            loading ||
-            ocrInProgress.size > 0 ||
-            !recipeReady
-          }
-          style={{
-            width: '100%',
-            padding: '14px',
-            borderRadius: '10px',
-            border: 'none',
-            background:
-              (
-                !topic.trim() ||
-                loading ||
-                ocrInProgress.size > 0 ||
-                !recipeReady
-              )
-                ? '#E5E7EB'
-                : C.primary,
-            color:
-              (
-                !topic.trim() ||
-                loading ||
-                ocrInProgress.size > 0 ||
-                !recipeReady
-              )
-                ? C.textMuted
-                : '#fff',
-            fontSize: '16px',
-            fontWeight: 600,
-            cursor:
-              (
-                !topic.trim() ||
-                loading ||
-                ocrInProgress.size > 0 ||
-                !recipeReady
-              )
-                ? 'not-allowed'
-                : 'pointer',
-            transition: 'all 200ms ease',
-          }}
-        >
-          {startButtonText}
-        </button>
-        {selectedTextbookIds.size > 0 && (
-          <div style={{ marginTop: '8px', padding: '10px 12px', background: 'rgba(16,185,129,0.06)', borderRadius: '8px', fontSize: '12px', color: '#166534', lineHeight: 1.6 }}>
-            📷 已关联 {selectedTextbookIds.size} 张课本图片，AI会参考课本原文
-          </div>
-        )}
-      </div>
-
-      {/* 课本图片区域（完整保留，逻辑不动） */}
-      {textbooksLoaded && textbooks.length > 0 && (
-        <div style={{ maxWidth: '680px', margin: '16px auto 0', background: '#F0FDF4', borderRadius: '12px', padding: '16px 20px', border: '1px solid #BBF7D0' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
-            <div style={{ fontSize: '14px', fontWeight: 600, color: '#166534' }}>
-              📷 关联课本图片 <span style={{ fontSize: '12px', fontWeight: 400, color: '#6B7280' }}>（已选 {selectedTextbookIds.size} 张）</span>
-            </div>
-            <button onClick={() => navigate('/lesson-plans/textbooks')} style={{ fontSize: '12px', color: C.primary, background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}>管理课本</button>
-          </div>
-          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', maxHeight: '120px', overflowY: 'auto' }}>
-            {textbooks.map(tb => {
-              const checked = selectedTextbookIds.has(tb.id)
-              return (
-                <div key={tb.id} onClick={() => toggleTextbook(tb.id)} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 10px', borderRadius: '8px', cursor: 'pointer', background: checked ? 'rgba(79,123,232,0.08)' : '#fff', border: checked ? '1px solid #4F7BE8' : '1px solid #E5E7EB', fontSize: '12px', color: '#1F2937', transition: 'all 150ms ease', userSelect: 'none' }}>
-                  <input type="checkbox" checked={checked} readOnly style={{ accentColor: '#4F7BE8', pointerEvents: 'none' }} />
-                  <img src={tb.image_url} alt="" style={{ width: '28px', height: '28px', objectFit: 'cover', borderRadius: '4px' }} onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
-                  <div style={{ maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {tb.chapter || tb.textbook_name}
-                    {ocrInProgress.has(tb.id)
-                      ? <span style={{ marginLeft: '4px', color: '#F59E0B', fontSize: '10px' }}>⏳识别中…</span>
-                      : ocrFailed.has(tb.id)
-                        ? <span style={{ marginLeft: '4px', color: '#EF4444', fontSize: '10px' }}>⚠识别失败</span>
-                        : tb.has_ocr
-                          ? <span style={{ marginLeft: '4px', color: '#10B981', fontSize: '10px' }}>✓已识别</span>
-                          : <span style={{ marginLeft: '4px', color: '#9CA3AF', fontSize: '10px' }}>未识别</span>}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      )}
-      {textbooksLoaded && textbooks.length === 0 && !textbooksLoading && (
-        <div style={{ maxWidth: '680px', margin: '16px auto 0', borderRadius: '12px', padding: '16px 20px', background: 'rgba(79,123,232,0.04)', border: '1px dashed rgba(79,123,232,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <span style={{ fontSize: '24px' }}>📷</span>
-            <div>
-              <div style={{ fontSize: '13px', fontWeight: 600, color: C.text }}>上传课本图片，让AI精准参考课本原文</div>
-              <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '2px', lineHeight: 1.5 }}>拍照或扫描课本相关页面，AI识别文字后备课更贴合教材内容</div>
-            </div>
-          </div>
-          <button onClick={() => navigate('/lesson-plans/textbooks')} style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', background: C.primary, color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>
-            去上传课本 →
-          </button>
-        </div>
-      )}
-      {textbooksLoading && (
-        <div style={{ maxWidth: '680px', margin: '16px auto 0', textAlign: 'center', fontSize: '12px', color: C.textMuted }}>加载课本图片...</div>
-      )}
-
-      {/* 快捷入口 */}
-      <div style={{ display: 'flex', justifyContent: 'center', gap: '8px', marginTop: '20px' }}>
-        {[
-          { icon: '📋', text: '我的教案', path: '/lesson-plans/my-plans' },
-          { icon: '📦', text: '配方管理', path: '/lesson-plans/recipes' },
-          { icon: '📚', text: '教案库',   path: '/lesson-plans/library' },
-          { icon: '📷', text: '课本管理', path: '/lesson-plans/textbooks' },
-        ].map(item => (
-          <button key={item.path} onClick={() => navigate(item.path)}
-            style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: C.textSec, background: 'transparent', border: 'none', padding: '6px 12px', borderRadius: '8px', cursor: 'pointer', transition: 'all 150ms ease' }}
-            onMouseEnter={e => { const el = e.currentTarget as HTMLButtonElement; el.style.background = C.primaryLight; el.style.color = C.primary }}
-            onMouseLeave={e => { const el = e.currentTarget as HTMLButtonElement; el.style.background = 'transparent'; el.style.color = C.textSec }}>
-            <span>{item.icon}</span><span>{item.text}</span>
-          </button>
-        ))}
-      </div>
-    </div>
-  )
-}
+export { default as StartForm } from './EducationAwareStartForm'
 
 // ==================== AI消息气泡 ====================
 
@@ -416,9 +36,20 @@ interface AIBubbleProps {
   streaming?: boolean
   onSelectComponent: (comp: ConvComponent) => void
   selectedComponentIds: Set<string>
+  /**
+   * 消息列表层计算后的回执显示结果。
+   * 默认true，兼容其它尚未接入列表去重的调用点。
+   */
+  showContextReceipt?: boolean
 }
 
-export function AIBubble({ msg, streaming = false, onSelectComponent, selectedComponentIds }: AIBubbleProps) {
+export function AIBubble({
+  msg,
+  streaming = false,
+  onSelectComponent,
+  selectedComponentIds,
+  showContextReceipt = true,
+}: AIBubbleProps) {
   const [expandedComponent, setExpandedComponent] = useState<string | null>(null)
 
   return (
@@ -435,7 +66,11 @@ export function AIBubble({ msg, streaming = false, onSelectComponent, selectedCo
           </div>
         )}
 
-        <ContextReceiptCard receipt={msg.metadata?.context_receipt} />
+        {showContextReceipt && (
+          <ContextReceiptCard
+            receipt={msg.metadata?.context_receipt}
+          />
+        )}
 
         {msg.type === 'components' && msg.components && msg.components.length > 0 && (
           <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '8px' }}>

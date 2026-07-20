@@ -32,11 +32,18 @@ import "time"
 // 迭代1新增：LessonStructure 教案结构偏好（JSONB数组）+ PromptMode 备课模式
 // 迭代2升级：StagesConfig 从 StageOverride 格式升级为 StageFlowItem 格式（兼容旧格式）
 type TeachingRecipe struct {
-	ID                 string     `json:"id"`                  // UUID主键
-	Name               string     `json:"name"`                // 配方名称，如"七年级AI课-张老师班"
-	Description        string     `json:"description"`         // 配方说明
-	Subject            string     `json:"subject"`             // 学科
-	GradeRange         string     `json:"grade_range"`         // 适用年级
+	ID          string `json:"id"`          // UUID主键
+	Name        string `json:"name"`        // 配方名称，如"七年级AI课-张老师班"
+	Description string `json:"description"` // 配方说明
+	Subject     string `json:"subject"`     // 学科
+	GradeRange  string `json:"grade_range"` // 适用年级
+
+	// EducationDomain 教学资源教育域快照：k12 / vocational / adult / common。
+	//
+	// 本字段由数据库触发器在创建或Fork时确定，API请求不得自行指定；
+	// mixed绝不能写入教学资源。
+	EducationDomain string `json:"education_domain"`
+
 	ComponentIDs       string     `json:"component_ids"`       // 绑定的组件ID数组（JSONB）
 	StudentProfile     string     `json:"student_profile"`     // 学情记录（自由文本，持续更新）
 	TeachingStyle      string     `json:"teaching_style"`      // 教学风格偏好
@@ -112,7 +119,7 @@ type LessonStructureBlock struct {
 
 // LessonStructureSubSection 教学过程子环节（教学过程板块专属）
 type LessonStructureSubSection struct {
-	Name              string `json:"name"`              // 环节名称，如"导入"
+	Name              string `json:"name"`               // 环节名称，如"导入"
 	Duration          int    `json:"duration"`           // 时长（分钟）
 	Goal              string `json:"goal"`               // 设计目标
 	OutputRequirement string `json:"output_requirement"` // 输出要求
@@ -137,13 +144,13 @@ type StageFlowItem struct {
 
 // FlowPreset 预设流程模板（后端硬编码，前端展示供老师快速选择）
 type FlowPreset struct {
-	Key         string          `json:"key"`          // 模板唯一标识
-	Name        string          `json:"name"`         // 模板名称，如"完整引导"
-	Description string          `json:"description"`  // 说明
-	Duration    string          `json:"duration"`     // 预估时间，如"15-25分钟"
-	Icon        string          `json:"icon"`         // 图标emoji
-	Stages      []StageFlowItem `json:"stages"`       // 预设的阶段配置
-	PromptMode  string          `json:"prompt_mode"`  // 推荐的备课模式
+	Key         string          `json:"key"`         // 模板唯一标识
+	Name        string          `json:"name"`        // 模板名称，如"完整引导"
+	Description string          `json:"description"` // 说明
+	Duration    string          `json:"duration"`    // 预估时间，如"15-25分钟"
+	Icon        string          `json:"icon"`        // 图标emoji
+	Stages      []StageFlowItem `json:"stages"`      // 预设的阶段配置
+	PromptMode  string          `json:"prompt_mode"` // 推荐的备课模式
 }
 
 // ==================== 流程完整性校验（迭代2新增）====================
@@ -200,8 +207,9 @@ type CreateRecipeRequest struct {
 // 迭代1新增：LessonStructure + PromptMode
 // 迭代2新增：StagesConfig
 // C-P1-19修复：补 Subject + GradeRange 字段。此前缺这两字段，导致编辑配方时前端传来的
-//   学科/年级在JSON反序列化时被直接丢弃（前端有传、结构体没收），表现为"改了存不进"。
-//   字段名与 CreateRecipeRequest 对齐。
+//
+//	学科/年级在JSON反序列化时被直接丢弃（前端有传、结构体没收），表现为"改了存不进"。
+//	字段名与 CreateRecipeRequest 对齐。
 type UpdateRecipeRequest struct {
 	Name               string   `json:"name"`                // 配方名称（必填）
 	Description        string   `json:"description"`         // 配方说明
@@ -245,11 +253,14 @@ type RecipeListResponse struct {
 
 // RecipeListItem 配方列表单条（不含大文本字段）
 type RecipeListItem struct {
-	ID             string     `json:"id"`
-	Name           string     `json:"name"`
-	Description    string     `json:"description"`
-	Subject        string     `json:"subject"`
-	GradeRange     string     `json:"grade_range"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Subject     string `json:"subject"`
+	GradeRange  string `json:"grade_range"`
+	// EducationDomain 资源所属教育域，供管理页展示和调用方确认隔离边界。
+	EducationDomain string `json:"education_domain"`
+
 	ComponentCount int        `json:"component_count"` // 绑定组件数量
 	Scope          string     `json:"scope"`
 	ScopeName      string     `json:"scope_name"` // 中文名
@@ -260,8 +271,8 @@ type RecipeListItem struct {
 	Version        int        `json:"version"`
 	ForkedFrom     *string    `json:"forked_from"`
 	Status         string     `json:"status"`
-	PromptMode     string     `json:"prompt_mode"`    // 迭代1：备课模式
-	StagesConfig   string     `json:"stages_config"`  // 迭代2：流程配置（供前端列表展示阶段数量）
+	PromptMode     string     `json:"prompt_mode"`   // 迭代1：备课模式
+	StagesConfig   string     `json:"stages_config"` // 迭代2：流程配置（供前端列表展示阶段数量）
 	CreatedAt      *time.Time `json:"created_at"`
 	UpdatedAt      *time.Time `json:"updated_at"`
 }
@@ -315,6 +326,6 @@ type StageOverride struct {
 const (
 	StageActionOverride      = "override"       // 覆盖同code的默认阶段的部分字段
 	StageActionInsertAfter   = "insert_after"   // 在指定阶段后插入新阶段
-	StageActionSkip          = "skip"            // 跳过该默认阶段
-	StageActionReplacePrompt = "replace_prompt"  // 仅替换提示词
+	StageActionSkip          = "skip"           // 跳过该默认阶段
+	StageActionReplacePrompt = "replace_prompt" // 仅替换提示词
 )

@@ -19,20 +19,51 @@
  *   需上溯两级到 pages/courseware/ 根目录,故为 '../../KnowledgePointSelector'。
  */
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import {
   createCourseware, createCoursewareFromTopic,
   createCoursewareFromPPT, createCoursewareFromDoc, createCoursewareFrom3D,
 } from '@/api/coursewares'
 import apiClient from '@/api/client'
+import { useSubjects } from '@/hooks/useSubjects'
+import { useEducationProfile } from '@/hooks/useEducationProfile'
+import {
+  getEducationLevelOptions,
+  getTopicPlaceholder,
+} from '@/education-domain/options'
 import KnowledgePointSelector from '../../KnowledgePointSelector'
-import { C, SUBJECTS, btnBase, type LPItem } from './listConstants'
+import { C, btnBase, type LPItem } from './listConstants'
 
 export default function CreateCoursewareModal({ open, onClose, onCreated }: {
   open: boolean
   onClose: () => void
   onCreated: (coursewareId: string) => void
 }) {
+  /**
+   * 课程目录来自当前登录用户的教育域和教学组织。
+   * 职业教育、成人教育不会再读取K12静态学科清单。
+   */
+  const {
+    subjects,
+    loading: subjectsLoading,
+    empty: subjectsEmpty,
+  } = useSubjects()
+
+  const {
+    domain,
+    profile,
+  } = useEducationProfile()
+
+  const levelOptions = useMemo(
+    () => getEducationLevelOptions(domain),
+    [domain],
+  )
+
+  const levelValues = useMemo(
+    () => levelOptions.map(item => item.value),
+    [levelOptions],
+  )
+
   // 入口状态机
   const [createMode, setCreateMode] = useState<'select' | 'lesson_plan' | 'topic' | 'ppt' | 'doc' | '3d_single'>('select')
 
@@ -81,6 +112,91 @@ export default function CreateCoursewareModal({ open, onClose, onCreated }: {
     setDocFile(null); setDocSubject(''); setDocGrade(''); setDocTitle('')
     setThreeDSubject(''); setThreeDGrade(''); setThreeDTopic(''); setThreeDDesc('')
   }, [open])
+
+  /**
+   * 弹窗打开或课程目录刷新后，四个直接创建入口
+   * 始终使用当前教育域实际可用的课程。
+   */
+  useEffect(() => {
+    if (!open || subjectsLoading) return
+
+    const firstSubject = subjects[0] || ''
+
+    setTopicSubject(previous =>
+      subjects.includes(previous)
+        ? previous
+        : firstSubject,
+    )
+
+    setPptSubject(previous =>
+      subjects.includes(previous)
+        ? previous
+        : firstSubject,
+    )
+
+    setDocSubject(previous =>
+      subjects.includes(previous)
+        ? previous
+        : firstSubject,
+    )
+
+    setThreeDSubject(previous =>
+      subjects.includes(previous)
+        ? previous
+        : firstSubject,
+    )
+  }, [
+    open,
+    subjectsLoading,
+    subjects,
+  ])
+
+  /**
+   * 学习层级按当前教育域呈现：
+   * K12使用年级，职教使用中职层级，成人教育使用学习基础。
+   */
+  useEffect(() => {
+    if (!open) return
+
+    const firstLevel = levelValues[0] || ''
+
+    setTopicGrade(previous =>
+      levelValues.includes(previous)
+        ? previous
+        : firstLevel,
+    )
+
+    setPptGrade(previous =>
+      levelValues.includes(previous)
+        ? previous
+        : firstLevel,
+    )
+
+    setDocGrade(previous =>
+      levelValues.includes(previous)
+        ? previous
+        : firstLevel,
+    )
+
+    setThreeDGrade(previous =>
+      levelValues.includes(previous)
+        ? previous
+        : firstLevel,
+    )
+  }, [
+    open,
+    levelValues,
+  ])
+
+  /**
+   * 课标知识点属于K12课程标准能力。
+   * 当前教育域未启用课程标准时清除旧选择，避免跨域携带。
+   */
+  useEffect(() => {
+    if (!profile.curriculum_enabled) {
+      setTopicKPCodes([])
+    }
+  }, [profile.curriculum_enabled])
 
   if (!open) return null
 
@@ -195,6 +311,24 @@ export default function CreateCoursewareModal({ open, onClose, onCreated }: {
       onClick={onClose}>
       <div style={{ background: '#fff', borderRadius: '16px', width: '90%', maxWidth: '600px', maxHeight: '80vh', overflow: 'auto', padding: '28px' }}
         onClick={e => e.stopPropagation()}>
+
+        {subjectsEmpty &&
+         !subjectsLoading &&
+         createMode !== 'select' &&
+         createMode !== 'lesson_plan' && (
+          <div style={{
+            marginBottom: '16px',
+            padding: '10px 12px',
+            borderRadius: '9px',
+            background: '#FEF2F2',
+            color: '#DC2626',
+            fontSize: '12px',
+            lineHeight: 1.6,
+          }}>
+            当前组织尚未配置可用
+            {profile.subject_label}，请联系管理员。
+          </div>
+        )}
 
         {/* 入口选择页 */}
         {createMode === 'select' && <>
@@ -332,20 +466,36 @@ export default function CreateCoursewareModal({ open, onClose, onCreated }: {
           <div style={{ fontSize: '14px', color: C.textSecondary, marginBottom: '20px' }}>输入学科、年级和主题名称,AI直接规划课件方案</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
             <div>
-              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>学科 *</label>
+              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>{profile.subject_label} *</label>
               <select value={topicSubject} onChange={e => setTopicSubject(e.target.value)} style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', background: '#fff' }}>
                 <option value="">请选择学科</option>
-                {SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
+                {subjects.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
             </div>
             <div>
-              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>年级 *</label>
-              <input value={topicGrade} onChange={e => setTopicGrade(e.target.value)} placeholder="如:三年级、初二、高一"
-                style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box' }} />
+              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>{profile.grade_label} *</label>
+              <select
+                value={topicGrade}
+                onChange={e => setTopicGrade(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', background: '#fff' }}
+              >
+                <option value="">
+                  请选择{profile.grade_label}
+                </option>
+
+                {levelOptions.map(option => (
+                  <option
+                    key={option.value}
+                    value={option.value}
+                  >
+                    {option.label}
+                  </option>
+                ))}
+              </select>
             </div>
             <div>
               <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>主题名称 *</label>
-              <input value={topicName} onChange={e => setTopicName(e.target.value)} placeholder="如:牛顿第一定律、认识人工智能、二次函数"
+              <input value={topicName} onChange={e => setTopicName(e.target.value)} placeholder={getTopicPlaceholder(domain)}
                 style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box' }} />
             </div>
             <div>
@@ -353,15 +503,18 @@ export default function CreateCoursewareModal({ open, onClose, onCreated }: {
               <textarea value={topicNotes} onChange={e => setTopicNotes(e.target.value)} placeholder="如:重点讲解力的合成与分解、需要包含实验环节..." rows={3}
                 style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', resize: 'vertical', boxSizing: 'border-box' }} />
             </div>
-            <div>
-              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>课标知识点(可选,勾选后AI按课标难度自动适配)</label>
-              <KnowledgePointSelector subject={topicSubject} grade={topicGrade} selectedCodes={topicKPCodes} onChange={setTopicKPCodes} />
-              {topicKPCodes.length > 0 && (
-                <div style={{ marginTop: '8px', padding: '8px 12px', borderRadius: '8px', background: 'rgba(124,58,237,0.06)', border: '1px solid rgba(124,58,237,0.2)', fontSize: '12px', color: '#6D28D9', lineHeight: 1.5 }}>
-                  ✓ 已选 {topicKPCodes.length} 个课标知识点,创建后 AI 将按这些知识点的课标难度要求自动适配课件深度
-                </div>
-              )}
-            </div>
+            {profile.curriculum_enabled && (
+              <div>
+                <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>课标知识点(可选,勾选后AI按课标难度自动适配)</label>
+                <KnowledgePointSelector subject={topicSubject} grade={topicGrade} selectedCodes={topicKPCodes} onChange={setTopicKPCodes} />
+
+                {topicKPCodes.length > 0 && (
+                  <div style={{ marginTop: '8px', padding: '8px 12px', borderRadius: '8px', background: 'rgba(124,58,237,0.06)', border: '1px solid rgba(124,58,237,0.2)', fontSize: '12px', color: '#6D28D9', lineHeight: 1.5 }}>
+                    ✓ 已选 {topicKPCodes.length} 个课标知识点,创建后 AI 将按这些知识点的课标难度要求自动适配课件深度
+                  </div>
+                )}
+              </div>
+            )}
           </div>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
             <button onClick={() => setCreateMode('select')} style={{ ...btnBase, border: `1px solid ${C.border}`, background: 'transparent', color: C.textSecondary }}>返回</button>
@@ -402,16 +555,32 @@ export default function CreateCoursewareModal({ open, onClose, onCreated }: {
               </div>
             </div>
             <div>
-              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>学科 *</label>
+              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>{profile.subject_label} *</label>
               <select value={pptSubject} onChange={e => setPptSubject(e.target.value)} style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', background: '#fff' }}>
                 <option value="">请选择学科</option>
-                {SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
+                {subjects.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
             </div>
             <div>
-              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>年级 *</label>
-              <input value={pptGrade} onChange={e => setPptGrade(e.target.value)} placeholder="如:三年级、初二、高一"
-                style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box' }} />
+              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>{profile.grade_label} *</label>
+              <select
+                value={pptGrade}
+                onChange={e => setPptGrade(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', background: '#fff' }}
+              >
+                <option value="">
+                  请选择{profile.grade_label}
+                </option>
+
+                {levelOptions.map(option => (
+                  <option
+                    key={option.value}
+                    value={option.value}
+                  >
+                    {option.label}
+                  </option>
+                ))}
+              </select>
             </div>
             <div>
               <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>课件标题(可选,默认使用PPT文件名)</label>
@@ -458,16 +627,32 @@ export default function CreateCoursewareModal({ open, onClose, onCreated }: {
               </div>
             </div>
             <div>
-              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>学科 *</label>
+              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>{profile.subject_label} *</label>
               <select value={docSubject} onChange={e => setDocSubject(e.target.value)} style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', background: '#fff' }}>
                 <option value="">请选择学科</option>
-                {SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
+                {subjects.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
             </div>
             <div>
-              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>年级 *</label>
-              <input value={docGrade} onChange={e => setDocGrade(e.target.value)} placeholder="如:三年级、初二、高一"
-                style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box' }} />
+              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>{profile.grade_label} *</label>
+              <select
+                value={docGrade}
+                onChange={e => setDocGrade(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '14px', outline: 'none', background: '#fff' }}
+              >
+                <option value="">
+                  请选择{profile.grade_label}
+                </option>
+
+                {levelOptions.map(option => (
+                  <option
+                    key={option.value}
+                    value={option.value}
+                  >
+                    {option.label}
+                  </option>
+                ))}
+              </select>
             </div>
             <div>
               <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>课件标题(可选,默认使用文档文件名)</label>
@@ -499,16 +684,32 @@ export default function CreateCoursewareModal({ open, onClose, onCreated }: {
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
             <div>
-              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>学科 *</label>
+              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>{profile.subject_label} *</label>
               <select value={threeDSubject} onChange={e => setThreeDSubject(e.target.value)} style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: '1px solid ' + C.border, fontSize: '14px', outline: 'none', background: '#fff' }}>
                 <option value="">请选择学科</option>
-                {SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
+                {subjects.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
             </div>
             <div>
-              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>年级 *</label>
-              <input value={threeDGrade} onChange={e => setThreeDGrade(e.target.value)} placeholder="如:三年级、初二、高一"
-                style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: '1px solid ' + C.border, fontSize: '14px', outline: 'none', boxSizing: 'border-box' }} />
+              <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>{profile.grade_label} *</label>
+              <select
+                value={threeDGrade}
+                onChange={e => setThreeDGrade(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', border: '1px solid ' + C.border, fontSize: '14px', outline: 'none', background: '#fff' }}
+              >
+                <option value="">
+                  请选择{profile.grade_label}
+                </option>
+
+                {levelOptions.map(option => (
+                  <option
+                    key={option.value}
+                    value={option.value}
+                  >
+                    {option.label}
+                  </option>
+                ))}
+              </select>
             </div>
             <div>
               <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, marginBottom: '6px', display: 'block' }}>3D 主题名称 *</label>

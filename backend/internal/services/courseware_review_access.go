@@ -19,12 +19,126 @@ package services
 
 import (
 	"context"
+	"strings"
 
 	"tedna/internal/models"
 	"tedna/internal/repository"
 )
 
 // ==================== 审核详情访问裁决 ====================
+
+// ValidateCoursewareReviewEducationDomain 校验课件能否进入审核链。
+//
+// 规则：
+//   - k12/vocational/adult审核员只能处理同域课件；
+//   - admin、region_admin的mixed管理上下文可处理合法具体教学域；
+//   - district_inspector不会因mixed身份获得审核业务权限；
+//   - common、mixed资源快照、空值和非法资源域均拒绝。
+func ValidateCoursewareReviewEducationDomain(
+	actor *CoursewareActorContext,
+	courseware *models.Courseware,
+) error {
+	if err := ValidateCoursewareEducationDomainForActor(
+		actor,
+		courseware,
+	); err != nil {
+		return err
+	}
+
+	domain := strings.ToLower(
+		strings.TrimSpace(courseware.EducationDomain),
+	)
+	if !models.IsTeachingEducationDomain(domain) {
+		return ErrCoursewareRuntimeDomainRequired
+	}
+
+	return nil
+}
+
+// CanReviewLoadedCourseware 组合教育域与原审核组织权限。
+func (s *CoursewareReviewService) CanReviewLoadedCourseware(
+	ctx context.Context,
+	courseware *models.Courseware,
+	actor *CoursewareActorContext,
+) (bool, error) {
+	if err := ValidateCoursewareReviewEducationDomain(
+		actor,
+		courseware,
+	); err != nil {
+		return false, err
+	}
+
+	return s.canReviewCourseware(
+		ctx,
+		courseware,
+		actor.UserID,
+		actor.Role,
+	), nil
+}
+
+// coursewareReviewHistoryPolicyAllows 是不访问数据库的审核历史查看策略。
+func coursewareReviewHistoryPolicyAllows(
+	courseware *models.Courseware,
+	actor *CoursewareActorContext,
+	canReview bool,
+) bool {
+	if courseware == nil || actor == nil {
+		return false
+	}
+	if courseware.UserID == actor.UserID {
+		return true
+	}
+	return canReview
+}
+
+// CanViewLoadedCoursewareReviewHistory 判断Actor能否查看审核历史。
+//
+// 作者换校后仍可查看自己的合法历史课件审核反馈；
+// 非作者必须同时通过严格教育域校验与审核组织权限。
+func (s *CoursewareReviewService) CanViewLoadedCoursewareReviewHistory(
+	ctx context.Context,
+	courseware *models.Courseware,
+	actor *CoursewareActorContext,
+) (bool, error) {
+	if err := validateCoursewareDomainForAuthorizedActor(
+		actor,
+		courseware,
+		true,
+	); err != nil {
+		return false, err
+	}
+
+	domain := strings.ToLower(
+		strings.TrimSpace(courseware.EducationDomain),
+	)
+	if !models.IsTeachingEducationDomain(domain) {
+		return false, ErrCoursewareRuntimeDomainRequired
+	}
+
+	if courseware.UserID == actor.UserID {
+		return true, nil
+	}
+
+	if err := ValidateCoursewareReviewEducationDomain(
+		actor,
+		courseware,
+	); err != nil {
+		return false, err
+	}
+
+	canReview := s.canReviewCourseware(
+		ctx,
+		courseware,
+		actor.UserID,
+		actor.Role,
+	)
+
+	return coursewareReviewHistoryPolicyAllows(
+		courseware,
+		actor,
+		canReview,
+	), nil
+}
 
 // canReviewCourseware 裁决"当前用户能否查看/审核该课件的审核详情"（审核详情访问控制）。
 //   - admin → true

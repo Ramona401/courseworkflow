@@ -17,7 +17,6 @@ import (
 	"tedna/internal/ai"
 	"tedna/internal/middleware"
 	"tedna/internal/models"
-	"tedna/internal/repository"
 	"tedna/internal/services"
 	"tedna/internal/utils"
 )
@@ -35,276 +34,537 @@ func NewCoursewareSubtitleHandler(svc *services.CoursewareSubtitleService) *Cour
 // ==================== 创建/更新字幕轨 ====================
 
 // UpsertSubtitle POST /api/v1/coursewares/{id}/subtitles
-func (h *CoursewareSubtitleHandler) UpsertSubtitle(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareSubtitleHandler) UpsertSubtitle(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST",
+		)
 		return
 	}
 
-	// 从路径提取课件ID
-	coursewareID := extractSubtitleCoursewareID(r.URL.Path)
+	coursewareID :=
+		extractSubtitleCoursewareID(
+			r.URL.Path,
+		)
 	if coursewareID == "" {
-		utils.BadRequest(w, "无效的课件ID")
+		utils.BadRequest(
+			w,
+			"无效的课件ID",
+		)
 		return
 	}
 
-	// 获取当前用户
-	claims, ok := middleware.GetClaims(r.Context())
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未认证")
 		return
 	}
 
-	// 校验课件存在和权限
-	cw, err := repository.GetCoursewareByID(r.Context(), coursewareID)
+	scopedActor, err :=
+		authorizeCoursewareSubtitleRefine(
+			r.Context(),
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
 	if err != nil {
-		utils.Fail(w, http.StatusNotFound, "课件不存在")
-		return
-	}
-	if cw.UserID != claims.UserID {
-		utils.Forbidden(w, "无权操作此课件")
+		writeCoursewareSubtitleError(
+			w,
+			err,
+		)
 		return
 	}
 
-	// 解析请求体
 	var req models.UpsertSubtitleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求体解析失败")
+
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			"请求体解析失败",
+		)
 		return
 	}
 
-	// 校验必填字段
-	if req.ScopeType == "" || req.Language == "" || req.Segments == "" {
-		utils.BadRequest(w, "scope_type、language、segments 为必填字段")
-		return
-	}
-	// 校验 scope_type 合法性
-	if req.ScopeType != models.SubScopeVideoAsset &&
-		req.ScopeType != models.SubScopeEditorDraft &&
-		req.ScopeType != models.SubScopePage {
-		utils.BadRequest(w, "scope_type 无效，应为 video_asset/editor_draft/page")
-		return
-	}
-	// 校验 segments 是合法 JSON 数组
-	var testParse []models.SubtitleSegment
-	if err := json.Unmarshal([]byte(req.Segments), &testParse); err != nil {
-		utils.BadRequest(w, "segments 不是合法的 JSON 数组")
+	subtitle, err :=
+		h.subtitleService.UpsertSubtitle(
+			r.Context(),
+			coursewareID,
+			scopedActor,
+			&req,
+		)
+	if err != nil {
+		writeCoursewareSubtitleError(
+			w,
+			err,
+		)
 		return
 	}
 
-	// 构建模型
-	userID := claims.UserID
-	sub := &models.CoursewareSubtitle{
-		CoursewareID: coursewareID,
-		ScopeType:    req.ScopeType,
-		ScopeID:      req.ScopeID,
-		Language:     req.Language,
-		Segments:     req.Segments,
-		StyleConfig:  req.StyleConfig,
-		TTSConfig:    req.TTSConfig,
-		CreatedBy:    &userID,
-	}
-
-	// UPSERT
-	if err := repository.UpsertCoursewareSubtitle(r.Context(), sub); err != nil {
-		utils.InternalError(w, "保存字幕失败: "+err.Error())
-		return
-	}
-
-	utils.Success(w, sub)
+	utils.Success(
+		w,
+		subtitle,
+	)
 }
 
 // ==================== 查询字幕轨列表 ====================
 
 // ListSubtitles GET /api/v1/coursewares/{id}/subtitles?scope_type=x&scope_id=y
-func (h *CoursewareSubtitleHandler) ListSubtitles(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareSubtitleHandler) ListSubtitles(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET",
+		)
 		return
 	}
 
-	coursewareID := extractSubtitleCoursewareID(r.URL.Path)
+	coursewareID :=
+		extractSubtitleCoursewareID(
+			r.URL.Path,
+		)
 	if coursewareID == "" {
-		utils.BadRequest(w, "无效的课件ID")
+		utils.BadRequest(
+			w,
+			"无效的课件ID",
+		)
 		return
 	}
 
-	scopeType := r.URL.Query().Get("scope_type")
-	scopeID := r.URL.Query().Get("scope_id")
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未认证")
+		return
+	}
 
-	subs, err := repository.ListCoursewareSubtitles(r.Context(), coursewareID, scopeType, scopeID)
+	actor, err :=
+		authorizeCoursewareSubtitleView(
+			r.Context(),
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
 	if err != nil {
-		utils.InternalError(w, "查询字幕列表失败: "+err.Error())
+		writeCoursewareSubtitleError(
+			w,
+			err,
+		)
 		return
 	}
-	if subs == nil {
-		subs = []*models.CoursewareSubtitle{}
+
+	items, err :=
+		h.subtitleService.ListSubtitles(
+			r.Context(),
+			coursewareID,
+			actor,
+			r.URL.Query().Get("scope_type"),
+			r.URL.Query().Get("scope_id"),
+		)
+	if err != nil {
+		writeCoursewareSubtitleError(
+			w,
+			err,
+		)
+		return
 	}
 
-	utils.Success(w, subs)
+	utils.Success(
+		w,
+		items,
+	)
 }
 
 // ==================== 删除字幕轨 ====================
 
 // DeleteSubtitle DELETE /api/v1/coursewares/{id}/subtitles/{sub_id}
-func (h *CoursewareSubtitleHandler) DeleteSubtitle(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareSubtitleHandler) DeleteSubtitle(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodDelete {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持DELETE",
+		)
 		return
 	}
 
-	coursewareID := extractSubtitleCoursewareID(r.URL.Path)
-	subID := extractSubtitleID(r.URL.Path)
-	if coursewareID == "" || subID == "" {
-		utils.BadRequest(w, "无效的路径参数")
+	coursewareID :=
+		extractSubtitleCoursewareID(
+			r.URL.Path,
+		)
+	subtitleID :=
+		extractSubtitleID(
+			r.URL.Path,
+		)
+
+	if coursewareID == "" ||
+		subtitleID == "" {
+		utils.BadRequest(
+			w,
+			"无效的路径参数",
+		)
 		return
 	}
 
-	claims, ok := middleware.GetClaims(r.Context())
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未认证")
 		return
 	}
 
-	// 校验课件权限
-	cw, err := repository.GetCoursewareByID(r.Context(), coursewareID)
+	scopedActor, err :=
+		authorizeCoursewareSubtitleRefine(
+			r.Context(),
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
 	if err != nil {
-		utils.Fail(w, http.StatusNotFound, "课件不存在")
-		return
-	}
-	if cw.UserID != claims.UserID {
-		utils.Forbidden(w, "无权操作此课件")
-		return
-	}
-
-	// 校验字幕属于此课件
-	sub, err := repository.GetCoursewareSubtitleByID(r.Context(), subID)
-	if err != nil {
-		utils.Fail(w, http.StatusNotFound, "字幕不存在")
-		return
-	}
-	if sub.CoursewareID != coursewareID {
-		utils.Forbidden(w, "字幕不属于此课件")
+		writeCoursewareSubtitleError(
+			w,
+			err,
+		)
 		return
 	}
 
-	if err := repository.DeleteCoursewareSubtitle(r.Context(), subID); err != nil {
-		utils.InternalError(w, "删除字幕失败: "+err.Error())
+	if err :=
+		h.subtitleService.DeleteSubtitle(
+			r.Context(),
+			coursewareID,
+			subtitleID,
+			scopedActor,
+		); err != nil {
+		writeCoursewareSubtitleError(
+			w,
+			err,
+		)
 		return
 	}
 
-	utils.Success(w, map[string]string{"message": "删除成功"})
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "删除成功",
+		},
+	)
 }
 
 // ==================== 导出 SRT ====================
 
 // ExportSRT POST /api/v1/coursewares/{id}/subtitles/{sub_id}/export-srt
-func (h *CoursewareSubtitleHandler) ExportSRT(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareSubtitleHandler) ExportSRT(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST",
+		)
 		return
 	}
 
-	subID := extractSubtitleID(r.URL.Path)
-	if subID == "" {
-		utils.BadRequest(w, "无效的字幕ID")
+	coursewareID :=
+		extractSubtitleCoursewareID(
+			r.URL.Path,
+		)
+	subtitleID :=
+		extractSubtitleID(
+			r.URL.Path,
+		)
+
+	if coursewareID == "" ||
+		subtitleID == "" {
+		utils.BadRequest(
+			w,
+			"无效的路径参数",
+		)
 		return
 	}
 
-	srtContent, err := h.subtitleService.ExportSRT(r.Context(), subID)
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未认证")
+		return
+	}
+
+	actor, err :=
+		authorizeCoursewareSubtitleView(
+			r.Context(),
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
 	if err != nil {
-		utils.InternalError(w, "导出SRT失败: "+err.Error())
+		writeCoursewareSubtitleError(
+			w,
+			err,
+		)
 		return
 	}
 
-	// 返回 SRT 文本文件
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Disposition", "attachment; filename=subtitle.srt")
+	srtContent, err :=
+		h.subtitleService.ExportSRT(
+			r.Context(),
+			coursewareID,
+			subtitleID,
+			actor,
+		)
+	if err != nil {
+		writeCoursewareSubtitleError(
+			w,
+			err,
+		)
+		return
+	}
+
+	w.Header().Set(
+		"Content-Type",
+		"text/plain; charset=utf-8",
+	)
+	w.Header().Set(
+		"Content-Disposition",
+		"attachment; filename=subtitle.srt",
+	)
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(srtContent))
+	_, _ = w.Write(
+		[]byte(srtContent),
+	)
 }
 
 // ==================== 硬字幕烧录 ====================
 
 // BurnInSubtitle POST /api/v1/coursewares/{id}/subtitles/{sub_id}/burn-in
-func (h *CoursewareSubtitleHandler) BurnInSubtitle(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareSubtitleHandler) BurnInSubtitle(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST",
+		)
 		return
 	}
 
-	coursewareID := extractSubtitleCoursewareID(r.URL.Path)
-	subID := extractSubtitleID(r.URL.Path)
-	if coursewareID == "" || subID == "" {
-		utils.BadRequest(w, "无效的路径参数")
+	coursewareID :=
+		extractSubtitleCoursewareID(
+			r.URL.Path,
+		)
+	subtitleID :=
+		extractSubtitleID(
+			r.URL.Path,
+		)
+
+	if coursewareID == "" ||
+		subtitleID == "" {
+		utils.BadRequest(
+			w,
+			"无效的路径参数",
+		)
 		return
 	}
 
-	claims, ok := middleware.GetClaims(r.Context())
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未认证")
+		utils.Unauthorized(
+			w,
+			"未认证",
+		)
+		return
+	}
+
+	scopedActor, err :=
+		authorizeCoursewareSubtitleOwnerControl(
+			r.Context(),
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if err != nil {
+		writeCoursewareSubtitleError(
+			w,
+			err,
+		)
 		return
 	}
 
 	var req models.BurnInSubtitleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求体解析失败")
-		return
-	}
-	if req.VideoAssetID == "" {
-		utils.BadRequest(w, "video_asset_id 为必填")
+
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			"请求体解析失败",
+		)
 		return
 	}
 
-	result, err := h.subtitleService.BurnInSubtitle(r.Context(), subID, req.VideoAssetID, coursewareID, claims.UserID)
+	if strings.TrimSpace(
+		req.VideoAssetID,
+	) == "" {
+		utils.BadRequest(
+			w,
+			"video_asset_id 为必填",
+		)
+		return
+	}
+
+	result, err :=
+		h.subtitleService.BurnInSubtitle(
+			r.Context(),
+			coursewareID,
+			subtitleID,
+			req.VideoAssetID,
+			scopedActor,
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		writeCoursewareSubtitleError(
+			w,
+			err,
+		)
 		return
 	}
 
-	utils.Success(w, result)
+	utils.Success(
+		w,
+		result,
+	)
 }
-
 
 // ==================== v0.42.9 TTS 配音 ====================
 
 // GenerateTTS POST /api/v1/coursewares/{id}/subtitles/{sub_id}/generate-tts
-func (h *CoursewareSubtitleHandler) GenerateTTS(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareSubtitleHandler) GenerateTTS(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST",
+		)
 		return
 	}
 
-	coursewareID := extractSubtitleCoursewareID(r.URL.Path)
-	subID := extractSubtitleID(r.URL.Path)
-	if coursewareID == "" || subID == "" {
-		utils.BadRequest(w, "无效的路径参数")
+	coursewareID :=
+		extractSubtitleCoursewareID(
+			r.URL.Path,
+		)
+	subtitleID :=
+		extractSubtitleID(
+			r.URL.Path,
+		)
+
+	if coursewareID == "" ||
+		subtitleID == "" {
+		utils.BadRequest(
+			w,
+			"无效的路径参数",
+		)
 		return
 	}
 
-	claims, ok := middleware.GetClaims(r.Context())
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未认证")
+		utils.Unauthorized(
+			w,
+			"未认证",
+		)
+		return
+	}
+
+	scopedActor, err :=
+		authorizeCoursewareSubtitleOwnerControl(
+			r.Context(),
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		)
+	if err != nil {
+		writeCoursewareSubtitleError(
+			w,
+			err,
+		)
 		return
 	}
 
 	var req models.GenerateTTSRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, "请求体解析失败")
-		return
-	}
-	if req.Voice == "" {
-		utils.BadRequest(w, "voice（音色代码）为必填")
+
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			"请求体解析失败",
+		)
 		return
 	}
 
-	result, err := h.subtitleService.GenerateTTS(r.Context(), subID, coursewareID, claims.UserID, req.Voice, req.Speed, req.SegmentIDs)
+	if strings.TrimSpace(req.Voice) == "" {
+		utils.BadRequest(
+			w,
+			"voice（音色代码）为必填",
+		)
+		return
+	}
+
+	result, err :=
+		h.subtitleService.GenerateTTS(
+			r.Context(),
+			coursewareID,
+			subtitleID,
+			scopedActor,
+			req.Voice,
+			req.Speed,
+			req.SegmentIDs,
+		)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		writeCoursewareSubtitleError(
+			w,
+			err,
+		)
 		return
 	}
 
-	utils.Success(w, result)
+	utils.Success(
+		w,
+		result,
+	)
 }
 
 // ListTTSVoices GET /api/v1/tts-voices?language=zh-CN

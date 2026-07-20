@@ -23,6 +23,8 @@
  * 本组件只负责确定性解析这两个标记，不让AI自行声明是否已更新。
  */
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import { DEFAULT_SUBJECTS } from '@/constants/subjects'
 import type {
   CSSProperties,
@@ -30,6 +32,7 @@ import type {
   Dispatch,
   SetStateAction,
   MouseEvent as ReactMouseEvent,
+  KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
 import {
   getUnitPlans,
@@ -93,6 +96,136 @@ const VOLUMES = ['上册', '下册', '全册']
 
 // 空串是“通用版”的合法值，因此“不关联”必须使用独立哨兵值。
 const PUBLISHER_NONE = '__NONE__'
+
+interface NewUnitPlanForm {
+  scopeKey: string
+  subject: string
+  grade: string
+  volume: string
+  unit: string
+  title: string
+  publisher: string
+}
+
+interface UnitPlanSaveForm {
+  title: string
+  unit_theme: string
+  content: string
+  atlas: string
+}
+
+const DEFAULT_NEW_UNIT_PLAN_FORM: NewUnitPlanForm = {
+  scopeKey: '',
+  subject: '语文',
+  grade: '三年级',
+  volume: '下册',
+  unit: '',
+  title: '',
+  publisher: PUBLISHER_NONE,
+}
+
+const EMPTY_UNIT_PLAN_SAVE_FORM: UnitPlanSaveForm = {
+  title: '',
+  unit_theme: '',
+  content: '',
+  atlas: '',
+}
+
+/**
+ * 安全解析新建单元方案表单。
+ */
+function parseNewUnitPlanForm(
+  raw: string,
+): NewUnitPlanForm {
+  if (!raw.trim()) {
+    return {
+      ...DEFAULT_NEW_UNIT_PLAN_FORM,
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(
+      raw,
+    ) as Partial<NewUnitPlanForm>
+
+    return {
+      scopeKey:
+        typeof parsed.scopeKey === 'string'
+          ? parsed.scopeKey
+          : '',
+      subject:
+        typeof parsed.subject === 'string'
+          ? parsed.subject
+          : DEFAULT_NEW_UNIT_PLAN_FORM.subject,
+      grade:
+        typeof parsed.grade === 'string'
+          ? parsed.grade
+          : DEFAULT_NEW_UNIT_PLAN_FORM.grade,
+      volume:
+        typeof parsed.volume === 'string'
+          ? parsed.volume
+          : DEFAULT_NEW_UNIT_PLAN_FORM.volume,
+      unit:
+        typeof parsed.unit === 'string'
+          ? parsed.unit
+          : '',
+      title:
+        typeof parsed.title === 'string'
+          ? parsed.title
+          : '',
+      publisher:
+        typeof parsed.publisher === 'string'
+          ? parsed.publisher
+          : PUBLISHER_NONE,
+    }
+  } catch {
+    return {
+      ...DEFAULT_NEW_UNIT_PLAN_FORM,
+    }
+  }
+}
+
+/**
+ * 安全解析正式方案保存表单。
+ */
+function parseUnitPlanSaveForm(
+  raw: string,
+): UnitPlanSaveForm {
+  if (!raw.trim()) {
+    return {
+      ...EMPTY_UNIT_PLAN_SAVE_FORM,
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(
+      raw,
+    ) as Partial<UnitPlanSaveForm>
+
+    return {
+      title:
+        typeof parsed.title === 'string'
+          ? parsed.title
+          : '',
+      unit_theme:
+        typeof parsed.unit_theme === 'string'
+          ? parsed.unit_theme
+          : '',
+      content:
+        typeof parsed.content === 'string'
+          ? parsed.content
+          : '',
+      atlas:
+        typeof parsed.atlas === 'string'
+          ? parsed.atlas
+          : '',
+    }
+  } catch {
+    return {
+      ...EMPTY_UNIT_PLAN_SAVE_FORM,
+    }
+  }
+}
 
 // ==================== 续作标记协议 ====================
 
@@ -230,6 +363,8 @@ const btnTextbook: CSSProperties = {
 // ==================== 主组件 ====================
 
 export default function UnitPlansPanel() {
+  const { user } = useAuth()
+
   const [list, setList] = useState<UnitPlanListItem[]>([])
   const [loading, setLoading] = useState(true)
   const [view, setView] = useState<'list' | 'session'>('list')
@@ -238,15 +373,53 @@ export default function UnitPlansPanel() {
   const [canCreate, setCanCreate] = useState(false)
 
   const [showNew, setShowNew] = useState(false)
-  const [nf, setNf] = useState({
-    scopeKey: '',
-    subject: '语文',
-    grade: '三年级',
-    volume: '下册',
-    unit: '',
-    title: '',
-    publisher: PUBLISHER_NONE,
+
+  /**
+   * 新建单元方案表单统一保存为JSON草稿。
+   *
+   * 关闭弹窗、刷新或切换页面后仍可恢复；
+   * 创建成功后只重置已经消费的单元、标题和教材版本。
+   */
+  const newPlanDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'unit-plan-new',
+    resourceId: 'new-plan',
+    field: 'form',
+    initialValue: JSON.stringify(
+      DEFAULT_NEW_UNIT_PLAN_FORM,
+    ),
+    maxHistory: 30,
   })
+
+  const nf = parseNewUnitPlanForm(
+    newPlanDraft.value,
+  )
+
+  const setNf: Dispatch<
+    SetStateAction<NewUnitPlanForm>
+  > = useCallback(
+    (next) => {
+      newPlanDraft.setValue(
+        (previousText) => {
+          const previous =
+            parseNewUnitPlanForm(
+              previousText,
+            )
+
+          const resolved =
+            typeof next === 'function'
+              ? next(previous)
+              : next
+
+          return JSON.stringify(
+            resolved,
+          )
+        },
+      )
+    },
+    [newPlanDraft.setValue],
+  )
+
   const [starting, setStarting] = useState(false)
 
   const [availablePublishers, setAvailablePublishers] = useState<string[]>([])
@@ -254,7 +427,22 @@ export default function UnitPlansPanel() {
 
   const [plan, setPlan] = useState<UnitPlanDetail | null>(null)
   const [messages, setMessages] = useState<UnitPlanMessage[]>([])
-  const [input, setInput] = useState('')
+  /**
+   * 单元方案AI会话输入按当前用户和方案ID隔离。
+   */
+  const unitChatDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'unit-plan-conversation',
+    resourceId:
+      plan?.id || 'no-active-plan',
+    field: 'message',
+    initialValue: '',
+    maxHistory: 40,
+  })
+
+  const input = unitChatDraft.value
+  const setInput = unitChatDraft.setValue
+
   const [sending, setSending] = useState(false)
   const [canEditCurrent, setCanEditCurrent] = useState(false)
 
@@ -277,12 +465,50 @@ export default function UnitPlansPanel() {
   const [revisionReady, setRevisionReady] = useState(false)
 
   const [showSave, setShowSave] = useState(false)
-  const [sf, setSf] = useState({
-    title: '',
-    unit_theme: '',
-    content: '',
-    atlas: '',
+  /**
+   * 正式方案保存表单统一保存。
+   *
+   * 方案正文可能较长，因此历史数量限制为12份。
+   */
+  const saveFormDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'unit-plan-save',
+    resourceId:
+      plan?.id || 'no-active-plan',
+    field: 'form',
+    initialValue: '',
+    maxHistory: 12,
   })
+
+  const sf = parseUnitPlanSaveForm(
+    saveFormDraft.value,
+  )
+
+  const setSf: Dispatch<
+    SetStateAction<UnitPlanSaveForm>
+  > = useCallback(
+    (next) => {
+      saveFormDraft.setValue(
+        (previousText) => {
+          const previous =
+            parseUnitPlanSaveForm(
+              previousText,
+            )
+
+          const resolved =
+            typeof next === 'function'
+              ? next(previous)
+              : next
+
+          return JSON.stringify(
+            resolved,
+          )
+        },
+      )
+    },
+    [saveFormDraft.setValue],
+  )
+
   const [saving, setSaving] = useState(false)
 
   const [viewPlan, setViewPlan] = useState<UnitPlanDetail | null>(null)
@@ -356,7 +582,14 @@ export default function UnitPlansPanel() {
         setCanCreate(opts.length > 0)
         setNf((s) => ({
           ...s,
-          scopeKey: opts[0]?.key || '',
+          scopeKey:
+            s.scopeKey &&
+            opts.some(
+              (option) =>
+                option.key === s.scopeKey,
+            )
+              ? s.scopeKey
+              : opts[0]?.key || '',
         }))
       } catch {
         // 无可发布归属时仅作为消费端查看方案。
@@ -375,20 +608,28 @@ export default function UnitPlansPanel() {
 
     setPublishersLoading(true)
     setAvailablePublishers([])
-    setNf((s) => ({
-      ...s,
-      publisher: PUBLISHER_NONE,
-    }))
 
     ;(async () => {
       try {
         const pubs = await getAvailablePublishers(nf.subject, nf.grade)
         if (!cancelled) {
           setAvailablePublishers(pubs)
+          setNf((current) => ({
+            ...current,
+            publisher:
+              current.publisher === PUBLISHER_NONE ||
+              pubs.includes(current.publisher)
+                ? current.publisher
+                : PUBLISHER_NONE,
+          }))
         }
       } catch {
         if (!cancelled) {
           setAvailablePublishers([])
+          setNf((current) => ({
+            ...current,
+            publisher: PUBLISHER_NONE,
+          }))
         }
       } finally {
         if (!cancelled) {
@@ -407,7 +648,6 @@ export default function UnitPlansPanel() {
   const clearSession = () => {
     setPlan(null)
     setMessages([])
-    setInput('')
     setCanEditCurrent(false)
     setWorkingDraft({ content: '', atlas: '' })
     setRevisionReady(false)
@@ -456,6 +696,13 @@ export default function UnitPlansPanel() {
       })
 
       setPlan(r.plan)
+      // 创建成功后重置已消费字段，保留常用归属、学科、年级和册次。
+      setNf((current) => ({
+        ...current,
+        unit: '',
+        title: '',
+        publisher: PUBLISHER_NONE,
+      }))
       setMessages([
         {
           role: 'assistant',
@@ -516,21 +763,28 @@ export default function UnitPlansPanel() {
   // ==================== 发送消息 ====================
 
   const doSend = async () => {
-    if (!plan || !input.trim() || sending) return
+    if (
+      !plan ||
+      !input.trim() ||
+      sending
+    ) {
+      return
+    }
 
     const msg = input.trim()
-    setInput('')
+    const localCreatedAt =
+      `local_${Date.now()}`
 
     const displayMsg = textbookContext
       ? msg + '\n（已附课本原文参考）'
       : msg
 
-    setMessages((m) => [
-      ...m,
+    setMessages((current) => [
+      ...current,
       {
         role: 'user',
         content: displayMsg,
-        created_at: '',
+        created_at: localCreatedAt,
       },
     ])
 
@@ -542,10 +796,13 @@ export default function UnitPlansPanel() {
         ? `【老师上传的教材原文参考】\n${textbookContext}\n\n【老师本轮说的话】\n${msg}`
         : msg
 
-      const reply = await chatUnitPlan(plan.id, aiMsg)
+      const reply = await chatUnitPlan(
+        plan.id,
+        aiMsg,
+      )
 
-      setMessages((m) => [
-        ...m,
+      setMessages((current) => [
+        ...current,
         {
           role: 'assistant',
           content: reply,
@@ -553,29 +810,49 @@ export default function UnitPlansPanel() {
         },
       ])
 
-      // 只解析后端约定的确定性标记。没有标记时保留原workingDraft，
-      // 避免普通对话或AI局部建议把已保存正式方案覆盖为空。
-      const parsed = parseLatestRevision(reply)
+      /**
+       * 后端成功返回后，本轮输入才算正式消费。
+       * commit清空显示值，但保留Ctrl+Z恢复快照。
+       */
+      unitChatDraft.commit()
+
+      const parsed =
+        parseLatestRevision(reply)
 
       if (parsed.content || parsed.atlas) {
-        setWorkingDraft((prev) => ({
-          content: parsed.content || prev.content,
-          atlas: parsed.atlas || prev.atlas,
+        setWorkingDraft((previous) => ({
+          content:
+            parsed.content ||
+            previous.content,
+          atlas:
+            parsed.atlas ||
+            previous.atlas,
         }))
 
         if (parsed.content) {
           setRevisionReady(true)
-          showToast('已识别AI返回的完整最新版，可保存本次优化')
+          showToast(
+            '已识别AI返回的完整最新版，可保存本次优化',
+          )
         }
       }
-    } catch (e: any) {
-      setMessages((m) => [
-        ...m,
+    } catch (error: any) {
+      /**
+       * 请求失败时撤回本地用户气泡，
+       * 输入框保留原文，可直接重新发送。
+       */
+      setMessages((current) => [
+        ...current.filter(
+          (message) =>
+            message.created_at !==
+            localCreatedAt,
+        ),
         {
           role: 'assistant',
           content:
             '（出错了：' +
-            (e?.message || '请重试') +
+            (error?.message ||
+              '请重试；输入内容已经保留') +
             '）',
           created_at: '',
         },
@@ -689,12 +966,15 @@ export default function UnitPlansPanel() {
         .join('\n')
     }
 
-    setSf({
-      title: plan.title,
-      unit_theme: plan.unit_theme || '',
-      content,
-      atlas,
-    })
+    // 已存在未保存的人工修改时优先保留，不能被新AI结果覆盖。
+    if (!saveFormDraft.value.trim()) {
+      setSf({
+        title: plan.title,
+        unit_theme: plan.unit_theme || '',
+        content,
+        atlas,
+      })
+    }
 
     setShowSave(true)
   }
@@ -714,6 +994,9 @@ export default function UnitPlansPanel() {
     try {
       await saveUnitPlan(plan.id, sf)
 
+      // 正式保存成功后清除已消费的会话和保存表单草稿。
+      unitChatDraft.clear()
+      saveFormDraft.clear()
       setShowSave(false)
       clearSession()
       setView('list')
@@ -1034,6 +1317,10 @@ export default function UnitPlansPanel() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
+              if (unitChatDraft.handleKeyDown(e)) {
+                return
+              }
+
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault()
                 doSend()
@@ -1075,6 +1362,7 @@ export default function UnitPlansPanel() {
             saving={saving}
             isRevision={isRevisionMode}
             revisionReady={revisionReady}
+            handleDraftKeyDown={saveFormDraft.handleKeyDown}
             onCancel={() => setShowSave(false)}
             onSave={doSave}
           />
@@ -1131,15 +1419,7 @@ export default function UnitPlansPanel() {
 
         {canCreate && (
           <button
-            onClick={() => {
-              setNf((s) => ({
-                ...s,
-                unit: '',
-                title: '',
-                publisher: PUBLISHER_NONE,
-              }))
-              setShowNew(true)
-            }}
+            onClick={() => setShowNew(true)}
             style={btnPrimary}
           >
             ＋ 新建单元方案
@@ -1516,6 +1796,7 @@ export default function UnitPlansPanel() {
 
               <input
                 value={nf.unit}
+                onKeyDown={newPlanDraft.handleKeyDown}
                 onChange={(e) =>
                   setNf((s) => ({
                     ...s,
@@ -1534,6 +1815,7 @@ export default function UnitPlansPanel() {
 
               <input
                 value={nf.title}
+                onKeyDown={newPlanDraft.handleKeyDown}
                 onChange={(e) =>
                   setNf((s) => ({
                     ...s,
@@ -2017,6 +2299,7 @@ function SaveModal({
   saving,
   isRevision,
   revisionReady,
+  handleDraftKeyDown,
   onCancel,
   onSave,
 }: {
@@ -2037,6 +2320,9 @@ function SaveModal({
   saving: boolean
   isRevision: boolean
   revisionReady: boolean
+  handleDraftKeyDown: (
+    event: ReactKeyboardEvent<HTMLElement>,
+  ) => boolean
   onCancel: () => void
   onSave: () => void
 }) {
@@ -2095,6 +2381,7 @@ function SaveModal({
             <label style={labelStyle}>标题</label>
             <input
               value={sf.title}
+              onKeyDown={handleDraftKeyDown}
               onChange={(e) =>
                 setSf((s) => ({
                   ...s,
@@ -2111,6 +2398,7 @@ function SaveModal({
             </label>
             <input
               value={sf.unit_theme}
+              onKeyDown={handleDraftKeyDown}
               onChange={(e) =>
                 setSf((s) => ({
                   ...s,
@@ -2126,6 +2414,7 @@ function SaveModal({
           <label style={labelStyle}>方案文档</label>
           <textarea
             value={sf.content}
+            onKeyDown={handleDraftKeyDown}
             onChange={(e) =>
               setSf((s) => ({
                 ...s,
@@ -2147,6 +2436,7 @@ function SaveModal({
           </label>
           <textarea
             value={sf.atlas}
+            onKeyDown={handleDraftKeyDown}
             onChange={(e) =>
               setSf((s) => ({
                 ...s,
@@ -2161,6 +2451,17 @@ function SaveModal({
             }}
           />
         </div>
+      </div>
+
+      <div
+        style={{
+          marginTop: 10,
+          fontSize: 11,
+          color: C.textMuted,
+          lineHeight: 1.5,
+        }}
+      >
+        已自动保存未提交内容 · Ctrl/Command+Z恢复误删
       </div>
 
       <div

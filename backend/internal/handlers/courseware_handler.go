@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -58,11 +59,19 @@ func (h *CoursewareHandler) ListCoursewares(w http.ResponseWriter, r *http.Reque
 }
 
 // CreateCourseware POST /api/v1/coursewares — 创建课件
-func (h *CoursewareHandler) CreateCourseware(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) CreateCourseware(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
@@ -75,48 +84,153 @@ func (h *CoursewareHandler) CreateCourseware(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	cw, err := h.cwService.CreateCourseware(r.Context(), claims.UserID, &req)
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+
+	cw, err := h.cwService.CreateCourseware(
+		r.Context(),
+		actor,
+		&req,
+	)
 	if err != nil {
-		utils.InternalError(w, "创建课件失败: "+err.Error())
+		switch {
+		case errors.Is(
+			err,
+			services.ErrCoursewareLessonPlanRequired,
+		):
+			utils.BadRequest(w, err.Error())
+
+		case errors.Is(
+			err,
+			services.ErrCoursewareLessonPlanNotFound,
+		):
+			utils.Fail(
+				w,
+				http.StatusNotFound,
+				err.Error(),
+			)
+
+		case errors.Is(
+			err,
+			services.ErrCoursewareActorRequired,
+		),
+			errors.Is(
+				err,
+				services.ErrCoursewareCreationDomainRequired,
+			),
+			errors.Is(
+				err,
+				services.ErrCoursewareLessonPlanNotOwned,
+			):
+			utils.Fail(
+				w,
+				http.StatusForbidden,
+				err.Error(),
+			)
+
+		case errors.Is(
+			err,
+			services.ErrCoursewareLessonPlanDomainInvalid,
+		):
+			utils.InternalError(
+				w,
+				"关联教案教育域异常，请联系管理员处理",
+			)
+
+		default:
+			utils.InternalError(
+				w,
+				"创建课件失败: "+err.Error(),
+			)
+		}
 		return
 	}
+
 	utils.Success(w, cw)
 }
 
 // GetCourseware GET /api/v1/coursewares/{id} — 课件详情
-func (h *CoursewareHandler) GetCourseware(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) GetCourseware(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
-		return
-	}
-	id := extractCoursewareID(r.URL.Path)
-	if id == "" {
-		utils.BadRequest(w, "缺少课件ID")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET请求",
+		)
 		return
 	}
 
-	resp, err := h.cwService.GetCourseware(r.Context(), id)
-	if err != nil {
-		utils.InternalError(w, "获取课件详情失败: "+err.Error())
-		return
-	}
-	utils.Success(w, resp)
-}
-
-// UpdateCourseware PUT /api/v1/coursewares/{id} — 更新课件标题
-func (h *CoursewareHandler) UpdateCourseware(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
-		return
-	}
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
+
 	id := extractCoursewareID(r.URL.Path)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+
+	resp, err := h.cwService.GetCoursewareForView(
+		r.Context(),
+		id,
+		actor,
+	)
+	if err != nil {
+		handleCoursewareAccessError(
+			w,
+			err,
+			"获取课件详情失败",
+		)
+		return
+	}
+
+	utils.Success(w, resp)
+}
+
+// UpdateCourseware PUT /api/v1/coursewares/{id} — 更新课件标题
+func (h *CoursewareHandler) UpdateCourseware(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if r.Method != http.MethodPut {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	id := extractCoursewareID(r.URL.Path)
+	if id == "" {
+		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
 
@@ -126,74 +240,149 @@ func (h *CoursewareHandler) UpdateCourseware(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if err := h.cwService.UpdateCoursewareTitle(r.Context(), id, claims.UserID, req.Title); err != nil {
-		utils.InternalError(w, err.Error())
+	if err := h.cwService.UpdateCoursewareTitleForActor(
+		r.Context(),
+		id,
+		actor,
+		req.Title,
+	); err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]string{"message": "更新成功"})
 }
 
 // DeleteCourseware DELETE /api/v1/coursewares/{id} — 删除课件
-func (h *CoursewareHandler) DeleteCourseware(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) DeleteCourseware(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodDelete {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持DELETE请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
+
 	id := extractCoursewareID(r.URL.Path)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
 
-	if err := h.cwService.DeleteCourseware(r.Context(), id, claims.UserID); err != nil {
-		utils.InternalError(w, err.Error())
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
+
+	if err := h.cwService.DeleteCoursewareForActor(
+		r.Context(),
+		id,
+		actor,
+	); err != nil {
+		writeCoursewareControlError(w, err)
+		return
+	}
+
 	utils.Success(w, map[string]string{"message": "删除成功"})
 }
 
 // ==================== 课件页面操作 ====================
 
 // GetCoursewarePages GET /api/v1/coursewares/{id}/pages — 获取全部页面
-func (h *CoursewareHandler) GetCoursewarePages(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) GetCoursewarePages(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持GET请求")
-		return
-	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/pages")
-	if id == "" {
-		utils.BadRequest(w, "缺少课件ID")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持GET请求",
+		)
 		return
 	}
 
-	pages, err := h.cwService.GetPages(r.Context(), id)
-	if err != nil {
-		utils.InternalError(w, "获取页面列表失败: "+err.Error())
-		return
-	}
-	utils.Success(w, pages)
-}
-
-// UpdatePageIndex PUT /api/v1/coursewares/{id}/pages/{num} — 更新单页索引
-func (h *CoursewareHandler) UpdatePageIndex(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
-		return
-	}
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
 
-	cwID, pageNum := extractCoursewarePagePath(r.URL.Path)
-	if cwID == "" || pageNum <= 0 {
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/pages",
+	)
+	if id == "" {
+		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+
+	pages, err := h.cwService.GetPagesForView(
+		r.Context(),
+		id,
+		actor,
+	)
+	if err != nil {
+		handleCoursewareAccessError(
+			w,
+			err,
+			"获取页面列表失败",
+		)
+		return
+	}
+
+	utils.Success(w, pages)
+}
+
+// UpdatePageIndex PUT /api/v1/coursewares/{id}/pages/{num} — 更新单页索引
+func (h *CoursewareHandler) UpdatePageIndex(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if r.Method != http.MethodPut {
+		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
+		return
+	}
+
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		utils.Unauthorized(w, "未登录")
+		return
+	}
+
+	coursewareID, pageNumber :=
+		extractCoursewarePagePath(r.URL.Path)
+	if coursewareID == "" || pageNumber <= 0 {
 		utils.BadRequest(w, "路径参数错误")
+		return
+	}
+
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		coursewareID,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
 
@@ -203,27 +392,53 @@ func (h *CoursewareHandler) UpdatePageIndex(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if err := h.cwService.UpdatePageIndex(r.Context(), cwID, pageNum, claims.UserID, &req); err != nil {
-		utils.InternalError(w, err.Error())
+	if err := h.cwService.UpdatePageIndexForActor(
+		r.Context(),
+		coursewareID,
+		actor,
+		pageNumber,
+		&req,
+	); err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]string{"message": "更新成功"})
 }
 
 // AddPage POST /api/v1/coursewares/{id}/pages — 手动添加页面
-func (h *CoursewareHandler) AddPage(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) AddPage(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/pages")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/pages",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
 
@@ -233,28 +448,53 @@ func (h *CoursewareHandler) AddPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	page, err := h.cwService.AddPage(r.Context(), id, claims.UserID, &req)
+	page, err := h.cwService.AddPageForActor(
+		r.Context(),
+		id,
+		actor,
+		&req,
+	)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		writeCoursewareControlError(w, err)
 		return
 	}
+
 	utils.Success(w, page)
 }
 
 // ReorderPages PUT /api/v1/coursewares/{id}/pages/reorder — 页面排序
-func (h *CoursewareHandler) ReorderPages(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) ReorderPages(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/pages/reorder")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/pages/reorder",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
 
@@ -264,53 +504,107 @@ func (h *CoursewareHandler) ReorderPages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := h.cwService.ReorderPages(r.Context(), id, claims.UserID, req.PageIDs); err != nil {
-		utils.InternalError(w, err.Error())
+	if err := h.cwService.ReorderPagesForActor(
+		r.Context(),
+		id,
+		actor,
+		req.PageIDs,
+	); err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]string{"message": "排序成功"})
 }
 
 // ==================== 状态流转 ====================
 
 // ConfirmIndex POST /api/v1/coursewares/{id}/confirm-index — 确认索引
-func (h *CoursewareHandler) ConfirmIndex(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) ConfirmIndex(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/confirm-index")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/confirm-index",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
 
-	if err := h.cwService.ConfirmIndex(r.Context(), id, claims.UserID); err != nil {
-		utils.InternalError(w, err.Error())
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
-	utils.Success(w, map[string]string{"message": "索引确认成功，请选择风格"})
+
+	if err := h.cwService.ConfirmIndexForActor(
+		r.Context(),
+		id,
+		actor,
+	); err != nil {
+		writeCoursewareControlError(w, err)
+		return
+	}
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "索引确认成功，请选择风格",
+		},
+	)
 }
 
 // SaveStyle PUT /api/v1/coursewares/{id}/style — 保存风格（兼容旧接口）
-func (h *CoursewareHandler) SaveStyle(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) SaveStyle(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPut {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持PUT请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/style")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/style",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
 
@@ -320,27 +614,52 @@ func (h *CoursewareHandler) SaveStyle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.cwService.SaveStyle(r.Context(), id, claims.UserID, req.StyleConfig); err != nil {
-		utils.InternalError(w, err.Error())
+	if err := h.cwService.SaveStyleForActor(
+		r.Context(),
+		id,
+		actor,
+		req.StyleConfig,
+	); err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]string{"message": "风格保存成功"})
 }
 
 // SaveStyleFull POST /api/v1/coursewares/{id}/save-style — Phase 4A: 保存完整风格配置
-func (h *CoursewareHandler) SaveStyleFull(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) SaveStyleFull(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/save-style")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/save-style",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
+		return
+	}
+
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
 
@@ -350,57 +669,119 @@ func (h *CoursewareHandler) SaveStyleFull(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := h.cwService.SaveStyleFull(r.Context(), id, claims.UserID, &req); err != nil {
-		utils.InternalError(w, err.Error())
+	if err := h.cwService.SaveStyleFullForActor(
+		r.Context(),
+		id,
+		actor,
+		&req,
+	); err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
-	utils.Success(w, map[string]string{"message": "风格配置保存成功"})
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "风格配置保存成功",
+		},
+	)
 }
 
 // ConfirmStyle POST /api/v1/coursewares/{id}/confirm-style — Phase 4A: 确认风格
-func (h *CoursewareHandler) ConfirmStyle(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) ConfirmStyle(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/confirm-style")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/confirm-style",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
 
-	if err := h.cwService.ConfirmStyle(r.Context(), id, claims.UserID); err != nil {
-		utils.InternalError(w, err.Error())
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
-	utils.Success(w, map[string]string{"message": "风格确认成功，准备生成课件"})
+
+	if err := h.cwService.ConfirmStyleForActor(
+		r.Context(),
+		id,
+		actor,
+	); err != nil {
+		writeCoursewareControlError(w, err)
+		return
+	}
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "风格确认成功，准备生成课件",
+		},
+	)
 }
 
 // UploadLogo POST /api/v1/coursewares/{id}/upload-logo — Phase 4A: 上传Logo
-func (h *CoursewareHandler) UploadLogo(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) UploadLogo(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/upload-logo")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/upload-logo",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
 
-	// 解析multipart表单（最大4MB缓冲）
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
+		return
+	}
+
+	// 必须在作者域预检通过后才解析multipart并打开上传文件。
 	if err := r.ParseMultipartForm(4 << 20); err != nil {
-		utils.BadRequest(w, "文件解析失败: "+err.Error())
+		utils.BadRequest(
+			w,
+			"文件解析失败: "+err.Error(),
+		)
 		return
 	}
 
@@ -411,36 +792,72 @@ func (h *CoursewareHandler) UploadLogo(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	resp, err := h.cwService.UploadLogo(r.Context(), id, file, header, claims.UserID)
+	response, err := h.cwService.UploadLogoForActor(
+		r.Context(),
+		id,
+		actor,
+		file,
+		header,
+	)
 	if err != nil {
-		utils.InternalError(w, err.Error())
+		writeCoursewareControlError(w, err)
 		return
 	}
-	utils.Success(w, resp)
+
+	utils.Success(w, response)
 }
 
 // ConfirmCourseware POST /api/v1/coursewares/{id}/confirm — 确认课件
-func (h *CoursewareHandler) ConfirmCourseware(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareHandler) ConfirmCourseware(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
 	}
-	id := extractCoursewareMiddleID(r.URL.Path, "/confirm")
+
+	id := extractCoursewareMiddleID(
+		r.URL.Path,
+		"/confirm",
+	)
 	if id == "" {
 		utils.BadRequest(w, "缺少课件ID")
 		return
 	}
 
-	if err := h.cwService.ConfirmCourseware(r.Context(), id, claims.UserID); err != nil {
-		utils.InternalError(w, err.Error())
+	actor, err := authorizeCoursewareOwnerRuntimeForHandler(
+		r.Context(),
+		id,
+		claims.UserID,
+		claims.Role,
+	)
+	if err != nil {
+		writeCoursewareControlError(w, err)
 		return
 	}
-	utils.Success(w, map[string]string{"message": "课件确认成功"})
+
+	if err := h.cwService.ConfirmCoursewareForActor(
+		r.Context(),
+		id,
+		actor,
+	); err != nil {
+		writeCoursewareControlError(w, err)
+		return
+	}
+
+	utils.Success(
+		w,
+		map[string]string{
+			"message": "课件确认成功",
+		},
+	)
 }
 
 // ==================== 风格模板查询 ====================
@@ -598,7 +1015,6 @@ func extractCWTemplateID(path string) string {
 	return strings.TrimRight(rest, "/")
 }
 
-
 // ==================== v0.42新增：从主题创建课件 ====================
 
 // CreateFromTopic POST /api/v1/coursewares/from-topic — 从主题直接创建课件
@@ -613,13 +1029,23 @@ func (h *CoursewareHandler) CreateFromTopic(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+	if _, err := services.ResolveCoursewareCreationEducationDomain(actor); err != nil {
+		utils.Fail(w, http.StatusForbidden, err.Error())
+		return
+	}
+
 	var req models.CreateCoursewareFromTopicRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, "请求参数格式错误")
 		return
 	}
 
-	cw, err := h.cwService.CreateCoursewareFromTopic(r.Context(), claims.UserID, &req)
+	cw, err := h.cwService.CreateCoursewareFromTopic(r.Context(), actor, &req)
 	if err != nil {
 		utils.InternalError(w, "创建课件失败: "+err.Error())
 		return
@@ -642,6 +1068,16 @@ func (h *CoursewareHandler) CreateFrom3D(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	actor := services.BuildCoursewareActorFromClaims(
+		r.Context(),
+		claims.UserID,
+		claims.Role,
+	)
+	if _, err := services.ResolveCoursewareCreationEducationDomain(actor); err != nil {
+		utils.Fail(w, http.StatusForbidden, err.Error())
+		return
+	}
+
 	var req struct {
 		Subject     string `json:"subject"`
 		Grade       string `json:"grade"`
@@ -653,16 +1089,17 @@ func (h *CoursewareHandler) CreateFrom3D(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	cw, err := h.cwService.CreateCoursewareFrom3D(r.Context(), claims.UserID, req.Subject, req.Grade, req.Topic, req.Description)
+	cw, err := h.cwService.CreateCoursewareFrom3D(r.Context(), actor, req.Subject, req.Grade, req.Topic, req.Description)
 	if err != nil {
 		utils.InternalError(w, "创建3D课件失败: "+err.Error())
 		return
 	}
 	utils.Success(w, map[string]interface{}{
-		"id":          cw.ID,
-		"title":       cw.Title,
-		"source_type": cw.SourceType,
-		"status":      cw.Status,
-		"message":     "3D互动单页课件创建成功，请触发生成",
+		"id":               cw.ID,
+		"title":            cw.Title,
+		"source_type":      cw.SourceType,
+		"education_domain": cw.EducationDomain,
+		"status":           cw.Status,
+		"message":          "3D互动单页课件创建成功，请触发生成",
 	})
 }

@@ -66,10 +66,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"tedna/internal/models"
 	"tedna/internal/repository"
+	"tedna/internal/utils"
 )
 
 // ==================== 错误常量 ====================
@@ -79,7 +81,7 @@ var (
 	ErrAssistantPromptRequired  = errors.New("助手提示词不能为空")
 	ErrAssistantScenesRequired  = errors.New("助手适用场景至少选择一项")
 	ErrAssistantSubjectRequired = errors.New("助手适用学科不能为空")
-	ErrAssistantGradeRequired   = errors.New("助手适用年级必须选择一年级至高三中的一个具体年级")
+	ErrAssistantGradeRequired   = errors.New("助手适用年级必须是具体年级、小学/初中/高中学段，或留空表示不限年级")
 	ErrAssistantInvalidSource   = errors.New("助手来源无效")
 	ErrAssistantInvalidScene    = errors.New("助手场景代码无效")
 	ErrAssistantPermDenied      = errors.New("无权操作此助手")
@@ -122,6 +124,13 @@ type AssistantActorContext struct {
 	Role     string // 角色:admin / senior_operator / operator / viewer
 	SchoolID string // 当前用户所属学校 ID(senior_operator 经管理员身份反查;其他用户经教研组兜底反查)
 
+	// EducationDomain 当前调用上下文的教育域。
+	//
+	// 普通教师取其确定性教学学校教育域；admin、region_admin和district_inspector
+	// 在管理页面保留mixed。进入具体教案运行时，调用方后续必须用
+	// lesson_plan.education_domain快照覆盖本字段。
+	EducationDomain string
+
 	MyGroupIDs               []string // 我所属的全部教研组 ID
 	MyLeadGroupIDs           []string // 我担任组长(lead)的教研组 ID
 	MyLeadOrBackboneGroupIDs []string // 我担任组长或骨干的教研组 ID(可发布目标)
@@ -147,16 +156,29 @@ func (s *AIAssistantService) ListAssistants(
 	scene, subject, gradeRange string,
 	onlyActive bool,
 ) (*models.AIAssistantListResponse, error) {
+
+	// B2-B：列表Actor教育域空值保护。
+	//
+	// Actor为空说明调用方没有建立可信用户上下文。
+	// 此时返回空候选而不是回退到系统助手或K12资源，避免异常路径放大权限。
+	if actor == nil {
+		return &models.AIAssistantListResponse{
+			Assistants: []*models.AIAssistantListItem{},
+			Total:      0,
+		}, nil
+	}
+
 	params := &models.ListAIAssistantsParams{
-		Scene:               scene,
-		Subject:             subject,
-		GradeRange:          gradeRange,
-		CurrentUserID:       actor.UserID,
-		CurrentUserRole:     actor.Role,
-		CurrentSchoolID:     actor.SchoolID,
-		CurrentGroupIDs:     actor.MyGroupIDs,     // 里程碑一:透传我的教研组集合供可见性 SQL
-		CurrentLeadGroupIDs: actor.MyLeadGroupIDs, // 本次新增:透传我担任组长的教研组,供列表层正确判定组长可编辑/可看原文
-		OnlyActive:          onlyActive,
+		Scene:                  scene,
+		Subject:                subject,
+		GradeRange:             gradeRange,
+		CurrentUserID:          actor.UserID,
+		CurrentUserRole:        actor.Role,
+		CurrentSchoolID:        actor.SchoolID,
+		CurrentEducationDomain: actor.EducationDomain,
+		CurrentGroupIDs:        actor.MyGroupIDs,     // 里程碑一:透传我的教研组集合供可见性 SQL
+		CurrentLeadGroupIDs:    actor.MyLeadGroupIDs, // 本次新增:透传我担任组长的教研组,供列表层正确判定组长可编辑/可看原文
+		OnlyActive:             onlyActive,
 	}
 	items, total, err := repository.ListAIAssistants(ctx, params)
 	if err != nil {
@@ -166,6 +188,102 @@ func (s *AIAssistantService) ListAssistants(
 		Assistants: items,
 		Total:      total,
 	}, nil
+}
+
+// ListAssistantsForManualLesson 返回老师手动选择时可用的助手。
+//
+// 复用现有ListAssistants的可见性、active、学科和场景过滤，
+// 但GradeRange传空，因此不会执行具体年级严格过滤。
+//
+// 返回后按与当前课程的相关性稳定排序：
+//  0. 同一个具体年级；
+//  1. 同学段或不限年级；
+//  2. 其它年级或学段。
+//
+// 同一档内保持仓储原有来源、排序和创建时间顺序。
+func (s *AIAssistantService) ListAssistantsForManualLesson(
+	ctx context.Context,
+	actor *AssistantActorContext,
+	scene string,
+	subject string,
+	currentGrade string,
+) (*models.AIAssistantListResponse, error) {
+	response, err := s.ListAssistants(
+		ctx,
+		actor,
+		scene,
+		subject,
+		"",
+		true,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if response == nil {
+		return &models.AIAssistantListResponse{
+			Assistants: []*models.AIAssistantListItem{},
+			Total:      0,
+		}, nil
+	}
+
+	sort.SliceStable(
+		response.Assistants,
+		func(i int, j int) bool {
+			return manualAssistantGradeRank(
+				response.Assistants[i].GradeRange,
+				currentGrade,
+			) < manualAssistantGradeRank(
+				response.Assistants[j].GradeRange,
+				currentGrade,
+			)
+		},
+	)
+
+	response.Total = len(response.Assistants)
+	return response, nil
+}
+
+// manualAssistantGradeRank 计算手动候选的年级相关性。
+//
+// 数值越小越靠前：
+//
+//	0 = 同一个具体年级；
+//	1 = 同学段的其它具体年级、学段助手或不限年级；
+//	2 = 其它学段。
+func manualAssistantGradeRank(
+	candidateGrade string,
+	currentGrade string,
+) int {
+	if utils.IsStrictGradeMatch(
+		candidateGrade,
+		currentGrade,
+	) {
+		return 0
+	}
+
+	candidateGrade = strings.TrimSpace(
+		candidateGrade,
+	)
+	if candidateGrade == "" {
+		return 1
+	}
+
+	currentSegment :=
+		utils.NormalizeGradeToSegment(
+			currentGrade,
+		)
+	candidateSegment :=
+		utils.NormalizeGradeToSegment(
+			candidateGrade,
+		)
+
+	if currentSegment != "" &&
+		candidateSegment == currentSegment {
+		return 1
+	}
+
+	return 2
 }
 
 // ==================== 2. 获取详情 ====================
@@ -227,6 +345,21 @@ func (s *AIAssistantService) canViewPrompt(actor *AssistantActorContext, a *mode
 // 里程碑一:group 来源细分教研组级 / 全校级两档
 // share_policy:locked 助手收紧——非属主非 admin 不可见(无论 source 是什么)
 func (s *AIAssistantService) canView(actor *AssistantActorContext, a *models.AIAssistant) bool {
+
+	// B2-B：可见性教育域统一防线。
+	//
+	// 详情读取、Fork和旧版通用运行入口全部经过canView，
+	// 因此在原有source、组织和share_policy判断之前统一执行资源域校验：
+	//   - 具体教学域只允许同域或common；
+	//   - mixed管理上下文允许查看合法资源域；
+	//   - 空值、非法值和mixed资源一律拒绝。
+	if !assistantResourceEducationDomainMatches(
+		actor,
+		a,
+	) {
+		return false
+	}
+
 	// admin 可见一切(也不受 locked 限制)
 	if actor.Role == models.RoleAdmin {
 		return true
@@ -274,23 +407,49 @@ func (s *AIAssistantService) CreateAssistant(
 	actor *AssistantActorContext,
 	req *models.CreateAIAssistantRequest,
 ) (*models.AIAssistant, error) {
+
+	// B2-B：创建教学资源教育域前置保护。
+	//
+	// 普通角色必须已经解析出k12、vocational或adult具体教学域，
+	// 才允许创建personal或group教学助手。教育上下文解析失败时严格拒绝，
+	// 防止数据库异常兜底把职教、成教资源误写成K12。
+	//
+	// admin保留系统助手和跨域管理能力：
+	// system助手由数据库触发器稳定写为k12；
+	// Fork操作另由来源资源快照继承教育域。
+	if actor == nil {
+		return nil, ErrAssistantPermDenied
+	}
+	if req == nil {
+		return nil, ErrAssistantNameRequired
+	}
+	if actor.Role != models.RoleAdmin &&
+		!models.IsTeachingEducationDomain(
+			actor.EducationDomain,
+		) {
+		return nil, ErrAssistantPermDenied
+	}
+
 	// 校验必填字段
 	if strings.TrimSpace(req.Name) == "" {
 		return nil, ErrAssistantNameRequired
 	}
 
-	// 写入最终防线：助手必须绑定非空学科和单一具体年级。
+	// 写入最终防线：助手必须绑定非空学科。
 	//
-	// 合法同义表达会在入库前统一规范化：
-	// 十二年级、12年级、12、高三 → 高三。
-	// 高中、10-12、1-6、小学低段及空值均拒绝。
+	// 年级允许单一具体年级、小学/初中/高中学段，
+	// 也可以留空表示不限年级。
+	//
+	// 只有单一具体年级助手参与平台自动匹配；
+	// 学段和不限年级助手只能由老师手动选择。
+
 	rawSubject := strings.TrimSpace(req.Subject)
 	if rawSubject == "" {
 		return nil, ErrAssistantSubjectRequired
 	}
 
 	normalizedSubject, normalizedGrade, validScope :=
-		normalizeStrictResourceScope(
+		normalizeAssistantResourceScope(
 			rawSubject,
 			req.GradeRange,
 		)
@@ -408,6 +567,15 @@ func (s *AIAssistantService) CreateAssistant(
 //
 // 里程碑一:group 来源放行条件 = senior_operator / admin / 名下有可发布教研组的人
 func (s *AIAssistantService) resolveSource(actor *AssistantActorContext, reqSource string) (string, error) {
+
+	// B2-B：来源解析Actor空值保护。
+	//
+	// 来源决定system、group或personal归属，缺少可信Actor时必须拒绝，
+	// 不能依赖前端传入source继续创建资源。
+	if actor == nil {
+		return "", ErrAssistantPermDenied
+	}
+
 	if reqSource == "" {
 		// 不指定时按角色默认
 		switch actor.Role {
@@ -463,6 +631,15 @@ func (s *AIAssistantService) UpdateAssistant(
 	id string,
 	req *models.UpdateAIAssistantRequest,
 ) error {
+
+	// B2-B：更新请求空值保护。
+	if actor == nil {
+		return ErrAssistantPermDenied
+	}
+	if req == nil {
+		return ErrAssistantNameRequired
+	}
+
 	a, err := repository.GetAIAssistantByID(ctx, id)
 	if err != nil {
 		return err
@@ -477,14 +654,16 @@ func (s *AIAssistantService) UpdateAssistant(
 	}
 
 	// 更新同样执行最终防线。
-	// 编辑存量“高中/范围/空年级”助手时，必须先改成一个具体年级。
+	// 单一具体年级、学段和不限年级助手均可正常编辑保存；
+	// 自动匹配仍只接受单一具体年级助手。
+
 	rawSubject := strings.TrimSpace(req.Subject)
 	if rawSubject == "" {
 		return ErrAssistantSubjectRequired
 	}
 
 	normalizedSubject, normalizedGrade, validScope :=
-		normalizeStrictResourceScope(
+		normalizeAssistantResourceScope(
 			rawSubject,
 			req.GradeRange,
 		)
@@ -539,6 +718,18 @@ func (s *AIAssistantService) UpdateAssistant(
 //	  全校级非创建者 → 不可(避免跨人篡改)
 //	personal  → 仅创建者本人
 func (s *AIAssistantService) canEdit(actor *AssistantActorContext, a *models.AIAssistant) bool {
+
+	// B2-B：编辑权教育域统一防线。
+	//
+	// 更新和删除均通过canEdit，因此普通用户即使仍是历史资源属主，
+	// 也不能编辑其它教育域资源。mixed管理员仍可跨域管理合法资源。
+	if !assistantResourceEducationDomainMatches(
+		actor,
+		a,
+	) {
+		return false
+	}
+
 	// admin 可编辑任何助手(share_policy 对 admin 不设限)
 	if actor.Role == models.RoleAdmin {
 		return true
@@ -696,46 +887,97 @@ func (s *AIAssistantService) LoadActiveAssistantForUse(
 // BuildActorFromClaims 辅助工具:从 JWT claims 和仓储反查构建 ActorContext
 // 供 handler / 其他 service 复用
 //
+// 教育域规则：
+//   - 普通教师使用ResolveUserEducationContext解析出的确定性教学教育域；
+//   - admin、region_admin、district_inspector在管理页面固定保留mixed；
+//   - 解析失败按角色安全处理：管理角色mixed，普通角色留空并fail-closed；
+//   - 进入具体教案运行时，调用方必须以lesson_plan.education_domain快照覆盖Actor教育域。
+//
 // 里程碑一:对所有用户都查教研组归属(不再只对 senior_operator),
 //   - MyGroupIDs:所属全部教研组(GetUserTeachingGroups)→ 可见范围
 //   - MyLeadOrBackboneGroupIDs / MyLeadGroupIDs:可发布/可编辑的组(ListMyLeadOrBackboneGroups)
-//   - SchoolID:senior_operator 经管理员身份反查;其他用户经教研组所属学校兜底(取第一个组的学校)
+//   - SchoolID:优先使用教育上下文中的具体教学组织；senior_operator再按管理员身份反查；
+//     其他用户最后用教研组所属学校兜底。
 func BuildActorFromClaims(ctx context.Context, userID, role string) *AssistantActorContext {
 	actor := &AssistantActorContext{
-		UserID: userID,
-		Role:   role,
+		UserID:          userID,
+		Role:            role,
+		EducationDomain: defaultAssistantActorEducationDomain(role),
 	}
 
-	// (1) senior_operator 经管理员身份反查所管理的学校 ID(权威来源)
-	if role == models.RoleSeniorOperator {
+	// (1) 统一调用教育上下文解析器。
+	//
+	// 普通教学角色采用解析出的具体教学域和教学组织；
+	// 跨域管理角色虽然也执行统一解析，但最终固定保留mixed，
+	// 不允许某个具体学校归属反向覆盖管理上下文。
+	educationContext, educationErr := repository.ResolveUserEducationContext(ctx, userID, role)
+	if educationErr == nil &&
+		educationContext != nil &&
+		!isAssistantMixedManagementRole(role) {
+		resolvedDomain := strings.ToLower(strings.TrimSpace(educationContext.EducationDomain))
+		if models.IsTeachingEducationDomain(resolvedDomain) {
+			actor.EducationDomain = resolvedDomain
+			actor.SchoolID = strings.TrimSpace(educationContext.OrganizationID)
+		}
+	}
+
+	// (2) senior_operator在教育上下文未给出具体学校时，
+	//     继续复用管理员身份反查作为兼容兜底。
+	if role == models.RoleSeniorOperator && actor.SchoolID == "" {
 		school, err := repository.GetSchoolByAdminUserID(ctx, userID)
 		if err == nil && school != nil {
 			actor.SchoolID = school.ID
 		}
 	}
 
-	// (2) 所有用户都查所属教研组,填充 MyGroupIDs + 兜底 SchoolID
+	// (3) 所有用户都查所属教研组，填充MyGroupIDs并兜底SchoolID。
+	//
+	// mixed管理Actor仍可保留一个SchoolID用于既有全校级助手可见性判断，
+	// 但其EducationDomain继续保持mixed；后续仓储层会分别使用这两个维度。
 	groups, err := repository.GetUserTeachingGroups(ctx, userID)
 	if err == nil {
-		for _, g := range groups {
-			actor.MyGroupIDs = append(actor.MyGroupIDs, g.ID)
-			// 非 senior_operator 没有管理员学校,用教研组所属学校兜底(取首个)
-			if actor.SchoolID == "" && g.SchoolID != "" {
-				actor.SchoolID = g.SchoolID
+		for _, group := range groups {
+			actor.MyGroupIDs = append(actor.MyGroupIDs, group.ID)
+			if actor.SchoolID == "" && group.SchoolID != "" {
+				actor.SchoolID = group.SchoolID
 			}
 		}
 	}
 
-	// (3) 查我担任 lead/backbone 的教研组(可发布目标),并拆出 lead 组(可编辑组助手)
-	leadOrBB, err := repository.ListMyLeadOrBackboneGroups(ctx, userID)
+	// (4) 查我担任lead/backbone的教研组(可发布目标)，并拆出lead组(可编辑组助手)。
+	leadOrBackboneGroups, err := repository.ListMyLeadOrBackboneGroups(ctx, userID)
 	if err == nil {
-		for _, g := range leadOrBB {
-			actor.MyLeadOrBackboneGroupIDs = append(actor.MyLeadOrBackboneGroupIDs, g.ID)
-			if g.Role == models.GroupMemberRoleLead {
-				actor.MyLeadGroupIDs = append(actor.MyLeadGroupIDs, g.ID)
+		for _, group := range leadOrBackboneGroups {
+			actor.MyLeadOrBackboneGroupIDs = append(actor.MyLeadOrBackboneGroupIDs, group.ID)
+			if group.Role == models.GroupMemberRoleLead {
+				actor.MyLeadGroupIDs = append(actor.MyLeadGroupIDs, group.ID)
 			}
 		}
 	}
 
 	return actor
+}
+
+// isAssistantMixedManagementRole 判断Actor是否应保留跨域管理上下文。
+//
+// mixed只用于系统、区域和抽查管理页面，不承载具体教学资源。
+func isAssistantMixedManagementRole(role string) bool {
+	switch role {
+	case models.RoleAdmin, models.RoleRegionAdmin, models.RoleDistrictInspector:
+		return true
+	default:
+		return false
+	}
+}
+
+// defaultAssistantActorEducationDomain 返回Actor教育域解析前的安全初值。
+//
+// 管理类角色固定为mixed；普通角色先留空，必须由统一教育上下文解析器
+// 给出k12/vocational/adult中的具体教学域。若解析失败，后续资源匹配将因
+// 当前域非法而fail-closed，不会把职教或成教用户错误回退到k12资源。
+func defaultAssistantActorEducationDomain(role string) string {
+	if isAssistantMixedManagementRole(role) {
+		return models.EducationDomainMixed
+	}
+	return ""
 }

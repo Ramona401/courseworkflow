@@ -18,7 +18,7 @@ package services
 //   GenerateIndexFromDoc 在层2直翻出页后：
 //     1) 前台立即用 haiku 生成"哪几页干什么"的真脉络（GenerateOverviewFromPages），
 //        替代原先的套话 overview；失败则退回套话，不阻塞。
-//     2) saveAndBroadcast 成功后，go func 异步触发 BackfillPageIndexAsync，
+//     2) saveAndBroadcast 成功后，go func 异步触发 TriggerPageIndexBackfillTracked，
 //        对照 docx 原文 + 当前方案为每页补 AOCI 索引（page_index + CG/IL/VF），
 //        供后续资源评估；失败不影响课件可用。
 
@@ -66,13 +66,19 @@ type DocExtractResult struct {
 // UploadDocAndCreateCourseware 上传Word文档并创建课件记录
 func (s *CoursewarePPTService) UploadDocAndCreateCourseware(
 	ctx context.Context,
-	userID string,
+	actor *CoursewareActorContext,
 	file multipart.File,
 	header *multipart.FileHeader,
 	subject string,
 	grade string,
 	title string,
 ) (*models.Courseware, *DocExtractResult, error) {
+	domain, err := ResolveCoursewareCreationEducationDomain(actor)
+	if err != nil {
+		return nil, nil, err
+	}
+	userID := actor.UserID
+
 	// ---- 1. 校验文件大小 ----
 	if header.Size > DocMaxSize {
 		return nil, nil, fmt.Errorf("Word文件过大，最大支持30MB（当前%.1fMB）", float64(header.Size)/(1024*1024))
@@ -131,18 +137,20 @@ func (s *CoursewarePPTService) UploadDocAndCreateCourseware(
 	// ---- 6. 创建课件记录 ----
 	relPath := filepath.Join(userID, storedName)
 	cw := &models.Courseware{
-		LessonPlanID:   nil,
-		UserID:         userID,
-		Title:          title,
-		Subject:        subject,
-		Grade:          grade,
-		Status:         models.CoursewareStatusDraft,
-		SourceType:     models.CWSourceDocUpload,
-		SourceFilePath: relPath,
-		PageCount:      0,
+		LessonPlanID:    nil,
+		UserID:          userID,
+		Title:           title,
+		Subject:         subject,
+		EducationDomain: domain,
+		Grade:           grade,
+		Status:          models.CoursewareStatusDraft,
+		SourceType:      models.CWSourceDocUpload,
+		SourceFilePath:  relPath,
+		PageCount:       0,
 	}
 
 	if err := repository.CreateCourseware(ctx, cw); err != nil {
+		_ = os.Remove(fullPath)
 		return nil, nil, fmt.Errorf("创建课件记录失败: %w", err)
 	}
 
@@ -258,24 +266,50 @@ func extractDocParagraphs(data []byte) []string {
 }
 
 // GenerateIndexFromDoc 从Word文档内容生成课件索引
-func (s *CoursewarePPTService) GenerateIndexFromDoc(ctx context.Context, coursewareID string, userID string, preset string, customHint string) error {
-	// ---- 1. 获取课件信息 ----
-	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
+func (s *CoursewarePPTService) GenerateIndexFromDoc(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+	preset string,
+	customHint string,
+) error {
+	// ---- 1. 可信Actor二次授权并重新加载正式课件 ----
+	cw, scopedActor, err :=
+		loadOwnedCoursewareForSchemeMutation(
+			ctx,
+			coursewareID,
+			actor,
+		)
 	if err != nil {
-		s.broadcastError(coursewareID, "课件不存在: "+err.Error())
-		return fmt.Errorf("课件不存在: %w", err)
+		s.broadcastError(
+			coursewareID,
+			"课件授权失败: "+err.Error(),
+		)
+		return err
 	}
-	if cw.UserID != userID {
-		s.broadcastError(coursewareID, "无权操作此课件")
-		return fmt.Errorf("无权操作此课件")
-	}
-	if cw.Status != models.CoursewareStatusDraft && cw.Status != models.CoursewareStatusIndexing {
-		s.broadcastError(coursewareID, "当前状态不允许生成方案: "+cw.Status)
-		return fmt.Errorf("当前状态不允许生成方案: %s", cw.Status)
+
+	userID := scopedActor.UserID
+
+	if cw.Status != models.CoursewareStatusDraft &&
+		cw.Status != models.CoursewareStatusIndexing {
+		s.broadcastError(
+			coursewareID,
+			"当前状态不允许生成方案: "+cw.Status,
+		)
+		return fmt.Errorf(
+			"当前状态不允许生成方案: %s",
+			cw.Status,
+		)
 	}
 	if cw.SourceType != models.CWSourceDocUpload {
-		s.broadcastError(coursewareID, "非文档来源的课件不能使用此接口")
-		return fmt.Errorf("非文档来源: %s", cw.SourceType)
+		s.broadcastError(
+			coursewareID,
+			"非文档来源的课件不能使用此接口",
+		)
+		return fmt.Errorf(
+			"非文档来源: %s",
+			cw.SourceType,
+		)
 	}
 
 	// ---- 2. 解析已存储的Word文件 ----
@@ -413,17 +447,51 @@ func (s *CoursewarePPTService) GenerateIndexFromDoc(ctx context.Context, coursew
 	)
 
 	// ---- 10. 保存并广播（方案+脉络，前台立即可见） ----
-	if err := s.indexService.saveAndBroadcast(ctx, coursewareID, overview, pages); err != nil {
+	if err := s.indexService.saveAndBroadcast(ctx, coursewareID, scopedActor, overview, pages); err != nil {
 		return err
 	}
 
 	// ---- 11. 后台异步补 AOCI 索引（对照 docx 原文 + 当前方案，不阻塞前台） ----
 	// 供后续资源评估使用；失败不影响课件可用。
-	docTitle := cw.Title
-	docSubject := cw.Subject
-	docGrade := cw.Grade
 	rawText := extractResult.FullText
-	go s.indexService.BackfillPageIndexAsync(coursewareID, userID, docTitle, docSubject, docGrade, rawText)
+
+	backfillResult, backfillErr :=
+		s.indexService.TriggerPageIndexBackfillTracked(
+			ctx,
+			coursewareID,
+			scopedActor,
+			rawText,
+		)
+
+	switch {
+	case backfillErr != nil:
+		pptServiceLog.Warn(
+			"Word页索引回填任务授权失败，课件方案主体不受影响",
+			"courseware_id", coursewareID,
+			"error", backfillErr,
+		)
+
+	case backfillResult ==
+		BackgroundRejectedDraining:
+		pptServiceLog.Info(
+			"服务正在排空，跳过Word页索引回填",
+			"courseware_id", coursewareID,
+		)
+
+	case backfillResult ==
+		BackgroundAlreadyRunning:
+		pptServiceLog.Info(
+			"Word页索引回填任务已经运行，无需重复启动",
+			"courseware_id", coursewareID,
+		)
+
+	case backfillResult ==
+		BackgroundInvalid:
+		pptServiceLog.Warn(
+			"Word页索引回填任务参数无效，课件方案主体不受影响",
+			"courseware_id", coursewareID,
+		)
+	}
 
 	return nil
 }

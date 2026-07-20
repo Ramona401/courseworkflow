@@ -12,6 +12,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { DEFAULT_SUBJECTS } from '@/constants/subjects'
 import { useAuth } from '@/store/auth'
+import { useEducationProfile } from '@/hooks/useEducationProfile'
+import ProtectedTextbookImage from '@/components/textbooks/ProtectedTextbookImage'
 import {
   uploadTextbook, getTextbooks, deleteTextbook, triggerTextbookOCR,
   type TextbookListItem,
@@ -40,6 +42,7 @@ function formatSize(bytes: number): string {
 /* ==================== 主组件 ==================== */
 export default function TextbooksPage() {
   const { user } = useAuth()
+  const { isK12 } = useEducationProfile()
 
   // 列表数据
   const [pages, setPages] = useState<TextbookListItem[]>([])
@@ -83,6 +86,14 @@ export default function TextbooksPage() {
 
   // ==================== 加载列表 ====================
   const loadPages = useCallback(async () => {
+    // 非K12手工进入本页面时不发送课本列表请求。
+    if (!isK12) {
+      setPages([])
+      setTotal(0)
+      setLoading(false)
+      return
+    }
+
     setLoading(true)
     try {
       const params: Record<string, string | number> = { limit: 200 }
@@ -95,13 +106,22 @@ export default function TextbooksPage() {
       setPages(resp.pages || []); setTotal(resp.total || 0)
     } catch { showToast('加载失败', 'error') }
     finally { setLoading(false) }
-  }, [subjectFilter, gradeFilter, semesterFilter, unitFilter, searchText])
+  }, [isK12, subjectFilter, gradeFilter, semesterFilter, unitFilter, searchText])
 
   useEffect(() => { loadPages() }, [loadPages])
 
   // ==================== 批量上传（v231核心）====================
   // 逐张上传，页码从起始页码自动递增，实时显示 第N/M张 进度
   const handleUpload = async () => {
+    // 非K12不能通过缓存页面触发课本上传。
+    if (!isK12) {
+      showToast(
+        '当前教育域暂无课本能力',
+        'error',
+      )
+      return
+    }
+
     if (uploadFiles.length === 0 || !uploadTextbookName.trim()) {
       showToast('请选择图片并填写教材名称', 'error'); return
     }
@@ -150,6 +170,15 @@ export default function TextbooksPage() {
 
   // ==================== 删除 ====================
   const handleDelete = async (id: string, name: string) => {
+    // 非K12不能通过缓存页面触发课本删除。
+    if (!isK12) {
+      showToast(
+        '当前教育域暂无课本能力',
+        'error',
+      )
+      return
+    }
+
     if (!confirm(`确定删除「${name}」？`)) return
     setLoadingId(id)
     try {
@@ -160,6 +189,15 @@ export default function TextbooksPage() {
 
   // ==================== OCR识别 ====================
   const handleOCR = async (id: string) => {
+    // 非K12不能通过缓存页面触发OCR。
+    if (!isK12) {
+      showToast(
+        '当前教育域暂无课本能力',
+        'error',
+      )
+      return
+    }
+
     setOcrLoading(true); setOcrText('')
     try {
       const resp = await triggerTextbookOCR(id)
@@ -187,6 +225,33 @@ export default function TextbooksPage() {
     color: active ? C.primary : C.textSec,
     borderColor: active ? C.primary : C.border,
   })
+
+  /**
+   * 独立页面手工URL的最终前端空状态。
+   *
+   * 所有Hook已经正常声明；列表Hook会在非K12时直接返回，
+   * 所以本分支不会产生任何课本查询或写请求。
+   */
+  if (!isK12) {
+    return (
+      <div
+        style={{
+          minHeight: '420px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: C.card,
+          borderRadius: '12px',
+          border: `1px solid ${C.border}`,
+          color: C.textSec,
+          fontSize: '16px',
+          fontWeight: 600,
+        }}
+      >
+        当前教育域暂无课本能力
+      </div>
+    )
+  }
 
   // ==================== 分组：按 教材名 · 学期 归档 ====================
   const grouped = pages.reduce<Record<string, TextbookListItem[]>>((acc, p) => {
@@ -361,8 +426,16 @@ export default function TextbooksPage() {
                 }} onClick={() => { setPreviewItem(item); setOcrText('') }}>
                   {/* 缩略图 */}
                   <div style={{ height: '140px', background: C.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
-                    <img src={item.image_url} alt={item.file_name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
-                      onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
+                    <ProtectedTextbookImage
+                      textbookId={item.id}
+                      alt={item.file_name}
+                      style={{
+                        maxWidth: '100%',
+                        maxHeight: '100%',
+                        objectFit: 'contain',
+                      }}
+                      fallback="📷"
+                    />
                   </div>
                   {/* 信息 */}
                   <div style={{ padding: '10px 12px' }}>
@@ -415,7 +488,17 @@ export default function TextbooksPage() {
             <div style={{ display: 'flex', gap: '0' }}>
               {/* 左：大图 */}
               <div style={{ flex: 1, padding: '16px', display: 'flex', alignItems: 'center', justifyContent: 'center', background: C.bg, minHeight: '400px' }}>
-                <img src={previewItem.image_url} alt={previewItem.file_name} style={{ maxWidth: '100%', maxHeight: '70vh', objectFit: 'contain', borderRadius: '4px' }} />
+                <ProtectedTextbookImage
+                  textbookId={previewItem.id}
+                  alt={previewItem.file_name}
+                  style={{
+                    maxWidth: '100%',
+                    maxHeight: '70vh',
+                    objectFit: 'contain',
+                    borderRadius: '4px',
+                  }}
+                  fallback="正在加载课本图片…"
+                />
               </div>
               {/* 右：OCR区 */}
               <div style={{ width: '300px', borderLeft: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column' }}>

@@ -33,6 +33,13 @@ var (
 // ==================== 创建配方 ====================
 
 // CreateRecipe 创建备课配方
+//
+// B2-C：配方仓储教育域快照。
+// education_domain由数据库BEFORE INSERT触发器确定：
+//   - 普通创建按作者当前教学域写入；
+//   - Fork创建按来源配方教育域继承。
+//
+// 创建完成后通过RETURNING回填数据库最终快照。
 func CreateRecipe(ctx context.Context, r *models.TeachingRecipe) error {
 	query := `
 		INSERT INTO teaching_recipes (
@@ -46,7 +53,7 @@ func CreateRecipe(ctx context.Context, r *models.TeachingRecipe) error {
 			$11, $12, $13, $14, $15,
 			$16, $17
 		)
-		RETURNING id, created_at, updated_at
+		RETURNING id, education_domain, created_at, updated_at
 	`
 	// 组件ID列表序列化为JSON
 	componentJSON := "[]"
@@ -82,7 +89,12 @@ func CreateRecipe(ctx context.Context, r *models.TeachingRecipe) error {
 		r.StudentProfile, r.TeachingStyle, r.SchoolRequirements, r.CustomNotes, r.CustomPrompt,
 		scope, r.ScopeRefID, r.AuthorID, r.ForkedFrom, stagesConfig,
 		lessonStructure, promptMode,
-	).Scan(&r.ID, &r.CreatedAt, &r.UpdatedAt)
+	).Scan(
+		&r.ID,
+		&r.EducationDomain,
+		&r.CreatedAt,
+		&r.UpdatedAt,
+	)
 	if err != nil {
 		return fmt.Errorf("创建配方失败: %w", err)
 	}
@@ -99,7 +111,7 @@ func GetRecipeByID(ctx context.Context, id string) (*models.TeachingRecipe, erro
 		       COALESCE(component_ids::text, '[]'), COALESCE(student_profile, ''),
 		       COALESCE(teaching_style, ''), COALESCE(school_requirements, ''),
 		       COALESCE(custom_notes, ''), COALESCE(custom_prompt, ''),
-		       scope, scope_ref_id, author_id, fork_count, forked_from,
+		       scope, scope_ref_id, author_id, education_domain, fork_count, forked_from,
 		       use_count, version, status,
 		       COALESCE(stages_config::text, '[]'),
 		       COALESCE(lesson_structure::text, '[]'),
@@ -112,7 +124,7 @@ func GetRecipeByID(ctx context.Context, id string) (*models.TeachingRecipe, erro
 		&r.ComponentIDs, &r.StudentProfile,
 		&r.TeachingStyle, &r.SchoolRequirements,
 		&r.CustomNotes, &r.CustomPrompt,
-		&r.Scope, &r.ScopeRefID, &r.AuthorID, &r.ForkCount, &r.ForkedFrom,
+		&r.Scope, &r.ScopeRefID, &r.AuthorID, &r.EducationDomain, &r.ForkCount, &r.ForkedFrom,
 		&r.UseCount, &r.Version, &r.Status,
 		&r.StagesConfig,
 		&r.LessonStructure,
@@ -184,7 +196,7 @@ func ListRecipes(ctx context.Context, authorID string, scope string, scopeRefID 
 	listQuery := fmt.Sprintf(`
 		SELECT r.id, r.name, COALESCE(r.description, ''), r.subject, r.grade_range,
 		       COALESCE(jsonb_array_length(r.component_ids), 0),
-		       r.scope, r.author_id, COALESCE(u.display_name, u.username),
+		       r.scope, r.author_id, r.education_domain, COALESCE(u.display_name, u.username),
 		       r.fork_count, r.use_count, r.version, r.forked_from, r.status,
 		       COALESCE(r.prompt_mode, 'guided'),
 		       COALESCE(r.stages_config::text, '[]'),
@@ -209,7 +221,7 @@ func ListRecipes(ctx context.Context, authorID string, scope string, scopeRefID 
 		if err := rows.Scan(
 			&item.ID, &item.Name, &item.Description, &item.Subject, &item.GradeRange,
 			&item.ComponentCount,
-			&item.Scope, &item.AuthorID, &item.AuthorName,
+			&item.Scope, &item.AuthorID, &item.EducationDomain, &item.AuthorName,
 			&item.ForkCount, &item.UseCount, &item.Version, &item.ForkedFrom, &item.Status,
 			&item.PromptMode,
 			&item.StagesConfig,

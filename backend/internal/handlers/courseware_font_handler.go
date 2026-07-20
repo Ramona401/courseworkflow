@@ -51,51 +51,146 @@ func (h *CoursewareFontHandler) ListSchemes(w http.ResponseWriter, r *http.Reque
 }
 
 // HandleCoursewareFont /api/v1/coursewares/{id}/font 按方法分发
-func (h *CoursewareFontHandler) HandleCoursewareFont(w http.ResponseWriter, r *http.Request) {
-	claims, _ := middleware.GetClaims(r.Context())
-	if claims == nil {
-		bgWriteJSON(w, http.StatusUnauthorized, -1, nil, "未登录")
+func (h *CoursewareFontHandler) HandleCoursewareFont(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	claims, ok := middleware.GetClaims(r.Context())
+	if !ok || claims == nil {
+		bgWriteJSON(
+			w,
+			http.StatusUnauthorized,
+			-1,
+			nil,
+			"未登录",
+		)
 		return
 	}
-	cwID := extractBgCoursewareID(r.URL.Path)
-	if cwID == "" {
-		bgWriteJSON(w, http.StatusBadRequest, -1, nil, "无效的课件ID")
+
+	coursewareID :=
+		extractBgCoursewareID(r.URL.Path)
+	if coursewareID == "" {
+		bgWriteJSON(
+			w,
+			http.StatusBadRequest,
+			-1,
+			nil,
+			"无效的课件ID",
+		)
 		return
 	}
 
 	switch r.Method {
 	case http.MethodGet:
-		sel, err := h.svc.GetSelection(r.Context(), cwID)
-		if err != nil {
-			bgWriteJSON(w, http.StatusNotFound, -1, nil, "查询课件字体失败: "+err.Error())
+		if err := authorizeCoursewareViewForHandler(
+			r.Context(),
+			coursewareID,
+			claims.UserID,
+			claims.Role,
+		); err != nil {
+			handleCoursewareAccessError(
+				w,
+				err,
+				"查询课件字体失败",
+			)
 			return
 		}
-		bgWriteJSON(w, http.StatusOK, 0, sel, "")
+
+		selection, err := h.svc.GetSelection(
+			r.Context(),
+			coursewareID,
+		)
+		if err != nil {
+			bgWriteJSON(
+				w,
+				http.StatusNotFound,
+				-1,
+				nil,
+				"查询课件字体失败: "+err.Error(),
+			)
+			return
+		}
+
+		bgWriteJSON(
+			w,
+			http.StatusOK,
+			0,
+			selection,
+			"",
+		)
 
 	case http.MethodPut:
+		actor, err :=
+			authorizeCoursewareOwnerRuntimeForHandler(
+				r.Context(),
+				coursewareID,
+				claims.UserID,
+				claims.Role,
+			)
+		if err != nil {
+			writeCoursewareControlError(w, err)
+			return
+		}
+
 		var req models.SelectCoursewareFontRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			bgWriteJSON(w, http.StatusBadRequest, -1, nil, "请求体解析失败")
+			bgWriteJSON(
+				w,
+				http.StatusBadRequest,
+				-1,
+				nil,
+				"请求体解析失败",
+			)
 			return
 		}
-		if !req.Clear && strings.TrimSpace(req.SchemeCode) == "" {
-			bgWriteJSON(w, http.StatusBadRequest, -1, nil, "请提供 scheme_code 或 clear:true")
+
+		if !req.Clear &&
+			strings.TrimSpace(req.SchemeCode) == "" {
+			bgWriteJSON(
+				w,
+				http.StatusBadRequest,
+				-1,
+				nil,
+				"请提供 scheme_code 或 clear:true",
+			)
 			return
 		}
+
 		var result *models.FontSelectionResult
-		var err error
 		if req.Clear {
-			result, err = h.svc.ClearFont(r.Context(), cwID, claims.UserID)
+			result, err = h.svc.ClearFontForActor(
+				r.Context(),
+				coursewareID,
+				actor,
+			)
 		} else {
-			result, err = h.svc.SelectFont(r.Context(), cwID, claims.UserID, req.SchemeCode)
+			result, err = h.svc.SelectFontForActor(
+				r.Context(),
+				coursewareID,
+				actor,
+				req.SchemeCode,
+			)
 		}
 		if err != nil {
-			bgWriteErr(w, err)
+			writeCoursewareControlError(w, err)
 			return
 		}
-		bgWriteJSON(w, http.StatusOK, 0, result, "字体已更新")
+
+		bgWriteJSON(
+			w,
+			http.StatusOK,
+			0,
+			result,
+			"字体已更新",
+		)
 
 	default:
-		bgWriteJSON(w, http.StatusMethodNotAllowed, -1, nil, "Method not allowed")
+		bgWriteJSON(
+			w,
+			http.StatusMethodNotAllowed,
+			-1,
+			nil,
+			"Method not allowed",
+		)
 	}
 }

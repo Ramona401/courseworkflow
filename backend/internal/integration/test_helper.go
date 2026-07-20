@@ -42,33 +42,33 @@ import (
 const (
 	// 管理员种子用户（与生产种子一致）
 	SeedAdminID       = "00000000-0000-0000-0000-000000000001"
-	SeedAdminUsername  = "admin"
-	SeedAdminPassword  = "admin123"
-	SeedAdminRole      = "admin"
+	SeedAdminUsername = "admin"
+	SeedAdminPassword = "admin123"
+	SeedAdminRole     = "admin"
 
 	// 操作员种子用户
 	SeedOperatorID       = "00000000-0000-0000-0000-000000000002"
-	SeedOperatorUsername  = "operator1"
-	SeedOperatorPassword  = "operator123"
-	SeedOperatorRole      = "operator"
+	SeedOperatorUsername = "operator1"
+	SeedOperatorPassword = "operator123"
+	SeedOperatorRole     = "operator"
 
 	// 高级操作员种子用户
 	SeedSeniorID       = "00000000-0000-0000-0000-000000000003"
-	SeedSeniorUsername  = "senior1"
-	SeedSeniorPassword  = "senior123"
-	SeedSeniorRole      = "senior_operator"
+	SeedSeniorUsername = "senior1"
+	SeedSeniorPassword = "senior123"
+	SeedSeniorRole     = "senior_operator"
 
 	// 只读用户种子
 	SeedViewerID       = "00000000-0000-0000-0000-000000000004"
-	SeedViewerUsername  = "viewer1"
-	SeedViewerPassword  = "viewer123"
-	SeedViewerRole      = "viewer"
+	SeedViewerUsername = "viewer1"
+	SeedViewerPassword = "viewer123"
+	SeedViewerRole     = "viewer"
 
 	// 被禁用的用户种子
 	SeedDisabledID       = "00000000-0000-0000-0000-000000000005"
-	SeedDisabledUsername  = "disabled1"
-	SeedDisabledPassword  = "disabled123"
-	SeedDisabledRole      = "viewer"
+	SeedDisabledUsername = "disabled1"
+	SeedDisabledPassword = "disabled123"
+	SeedDisabledRole     = "viewer"
 )
 
 // ==================== 测试配置 ====================
@@ -77,14 +77,14 @@ const (
 // 关键安全措施：DB_NAME 硬编码为 "tedna_test"，不从环境变量读取，防止误连生产库
 func testConfig() *config.Config {
 	return &config.Config{
-		DBHost:     envOrDefault("TEST_DB_HOST", "127.0.0.1"),
-		DBPort:     envOrDefault("TEST_DB_PORT", "5432"),
-		DBUser:     envOrDefault("TEST_DB_USER", "tedna_user"),
-		DBPassword: envOrDefault("TEST_DB_PASSWORD", "9fIbnkYABWXt3VGPv8Pn"),
-		DBName:     "tedna_test", // 硬编码！绝不允许改为 tedna
-		Port:       "0",          // httptest 自动分配端口
-		JWTSecret:  "test-jwt-secret-for-integration-tests-only",
-		AESKey:     "c94985251907d9a973ee517d048d8430",
+		DBHost:            envOrDefault("TEST_DB_HOST", "127.0.0.1"),
+		DBPort:            envOrDefault("TEST_DB_PORT", "5432"),
+		DBUser:            envOrDefault("TEST_DB_USER", "tedna_user"),
+		DBPassword:        envOrDefault("TEST_DB_PASSWORD", "9fIbnkYABWXt3VGPv8Pn"),
+		DBName:            "tedna_test", // 硬编码！绝不允许改为 tedna
+		Port:              "0",          // httptest 自动分配端口
+		JWTSecret:         "test-jwt-secret-for-integration-tests-only",
+		AESKey:            "c94985251907d9a973ee517d048d8430",
 		GinMode:           "test",
 		DisableSchedulers: true, // v142: 测试环境禁用调度器防goroutine泄漏
 	}
@@ -147,61 +147,110 @@ func initTestDB(t *testing.T, cfg *config.Config) {
 
 // ==================== 数据清理与种子 ====================
 
-// CleanAndSeed 清空所有表数据并插入种子数据
-// 每个 TestXxx 函数开头调用，保证测试数据隔离
+// CleanAndSeed 清空全部public业务表并插入最小测试种子。
+//
+// 旧实现维护一份手写表名列表。生产结构持续增长后，新表不会自动进入列表，
+// 容易让前一个用例的数据泄漏到后一个用例。当前实现直接从pg_tables读取
+// public下全部普通表，并在一条TRUNCATE语句中CASCADE清空，确保测试基线
+// 始终跟随当前生产schema，不再依赖人工同步表清单。
+//
+// 每个 TestXxx 函数开头调用本函数，保证测试数据隔离。
 func CleanAndSeed(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
 
-	// 按外键依赖顺序清空（先子表后父表）
-	tables := []string{
-		"workshop_stage_outputs",
-		"workshop_stages",
-		"recipe_usage_log",
-		"teaching_recipes",
-		"component_extractions",
-		"lesson_plan_reviews",
-		"lesson_plans",
-		"prompt_templates",
-		"teaching_group_members",
-		"teaching_groups",
-		"organizations",
-		"generated_pages",
-		"pipeline_indexes",
-		"eval_rounds",
-		"pipeline_steps",
-		"pipelines",
-		"ai_call_traces",
-		"course_indexes",
-		"courses",
-		"role_permissions",
-		"roles",
-		"textbook_pages",
-		"user_course_assignments",
-		"audit_logs",
-		"ai_scene_configs",
-		"ai_configs",
-		"external_data_configs",
-		"prompts",
-		"users",
+	// 动态清空public下全部普通表。
+	//
+	// format('%I.%I', ...)由PostgreSQL负责标识符转义，不拼接任何外部输入；
+	// CASCADE用于按真实外键关系处理清理顺序，避免手写依赖顺序失效。
+	_, err := database.DB.Exec(ctx, `
+                DO $clean$
+                DECLARE
+                        table_list text;
+                BEGIN
+                        SELECT string_agg(
+                                format('%I.%I', schemaname, tablename),
+                                ', '
+                                ORDER BY tablename
+                        )
+                        INTO table_list
+                        FROM pg_tables
+                        WHERE schemaname = 'public';
+
+                        IF table_list IS NOT NULL
+                           AND table_list <> '' THEN
+                                EXECUTE
+                                        'TRUNCATE TABLE ' ||
+                                        table_list ||
+                                        ' CASCADE';
+                        END IF;
+                END
+                $clean$;
+        `)
+	if err != nil {
+		t.Fatalf("清空测试数据库全部public表失败: %v", err)
 	}
 
-	for _, table := range tables {
-		_, err := database.DB.Exec(ctx, fmt.Sprintf("DELETE FROM %s", table))
-		if err != nil {
-			t.Fatalf("清空表 %s 失败: %v", table, err)
-		}
-	}
-
-	// 插入种子用户
+	// 插入固定种子用户。
+	//
+	// admin同时设置is_super=true：
+	// 当前审计日志、AI全局配置、外部数据配置和提示词管理均要求超级管理员。
+	// role=admin与is_super是正交权限，测试必须显式覆盖两者，不能再依赖旧规则
+	// “普通admin自动拥有全部敏感管理权限”。
 	seedUsers := []struct {
-		id, username, displayName, password, role, status string
+		id          string
+		username    string
+		displayName string
+		password    string
+		role        string
+		status      string
+		isSuper     bool
 	}{
-		{SeedAdminID, SeedAdminUsername, "管理员", SeedAdminPassword, SeedAdminRole, "active"},
-		{SeedOperatorID, SeedOperatorUsername, "操作员1", SeedOperatorPassword, SeedOperatorRole, "active"},
-		{SeedSeniorID, SeedSeniorUsername, "高级操作员1", SeedSeniorPassword, SeedSeniorRole, "active"},
-		{SeedViewerID, SeedViewerUsername, "查看者1", SeedViewerPassword, SeedViewerRole, "active"},
-		{SeedDisabledID, SeedDisabledUsername, "禁用用户1", SeedDisabledPassword, SeedDisabledRole, "disabled"},
+		{
+			SeedAdminID,
+			SeedAdminUsername,
+			"管理员",
+			SeedAdminPassword,
+			SeedAdminRole,
+			"active",
+			true,
+		},
+		{
+			SeedOperatorID,
+			SeedOperatorUsername,
+			"操作员1",
+			SeedOperatorPassword,
+			SeedOperatorRole,
+			"active",
+			false,
+		},
+		{
+			SeedSeniorID,
+			SeedSeniorUsername,
+			"高级操作员1",
+			SeedSeniorPassword,
+			SeedSeniorRole,
+			"active",
+			false,
+		},
+		{
+			SeedViewerID,
+			SeedViewerUsername,
+			"查看者1",
+			SeedViewerPassword,
+			SeedViewerRole,
+			"active",
+			false,
+		},
+		{
+			SeedDisabledID,
+			SeedDisabledUsername,
+			"禁用用户1",
+			SeedDisabledPassword,
+			SeedDisabledRole,
+			"disabled",
+			false,
+		},
 	}
 
 	for _, u := range seedUsers {
@@ -209,23 +258,57 @@ func CleanAndSeed(t *testing.T) {
 		if err != nil {
 			t.Fatalf("哈希密码失败 (user=%s): %v", u.username, err)
 		}
-		_, err = database.DB.Exec(ctx,
-			`INSERT INTO users (id, username, display_name, password_hash, role, status, created_at, updated_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, now(), now())`,
-			u.id, u.username, u.displayName, hash, u.role, u.status,
+
+		_, err = database.DB.Exec(ctx, `
+                        INSERT INTO users (
+                                id,
+                                username,
+                                display_name,
+                                password_hash,
+                                role,
+                                status,
+                                is_super,
+                                created_at,
+                                updated_at
+                        )
+                        VALUES (
+                                $1,
+                                $2,
+                                $3,
+                                $4,
+                                $5,
+                                $6,
+                                $7,
+                                now(),
+                                now()
+                        )
+                `,
+			u.id,
+			u.username,
+			u.displayName,
+			hash,
+			u.role,
+			u.status,
+			u.isSuper,
 		)
 		if err != nil {
-			t.Fatalf("插入种子用户失败 (user=%s): %v", u.username, err)
+			t.Fatalf(
+				"插入种子用户失败 (user=%s): %v",
+				u.username,
+				err,
+			)
 		}
 	}
 
-	// 插入种子备课工坊阶段（5个系统默认阶段，很多服务依赖它们）
-	// v98修复：增加skippable字段，与生产数据一致（write/revise=false，其余=true）
+	// 插入5个系统默认备课工坊阶段。
+	//
+	// write/revise不可跳过，其余阶段可跳过；与当前生产结构一致。
 	seedStages := []struct {
-		code, name string
-		order      int
-		aiRole     string
-		skippable  bool
+		code      string
+		name      string
+		order     int
+		aiRole    string
+		skippable bool
 	}{
 		{"analyze", "教学分析", 1, "教学分析师", true},
 		{"design", "教学设计", 2, "教学设计师", true},
@@ -235,13 +318,46 @@ func CleanAndSeed(t *testing.T) {
 	}
 
 	for _, s := range seedStages {
-		_, err := database.DB.Exec(ctx,
-			`INSERT INTO workshop_stages (id, stage_code, stage_name, stage_order, source, ai_role, system_prompt, skippable, status, created_at, updated_at)
-			 VALUES (gen_random_uuid(), $1, $2, $3, 'system', $4, '', $5, 'active', now(), now())`,
-			s.code, s.name, s.order, s.aiRole, s.skippable,
+		_, err := database.DB.Exec(ctx, `
+                        INSERT INTO workshop_stages (
+                                id,
+                                stage_code,
+                                stage_name,
+                                stage_order,
+                                source,
+                                ai_role,
+                                system_prompt,
+                                skippable,
+                                status,
+                                created_at,
+                                updated_at
+                        )
+                        VALUES (
+                                gen_random_uuid(),
+                                $1,
+                                $2,
+                                $3,
+                                'system',
+                                $4,
+                                '',
+                                $5,
+                                'active',
+                                now(),
+                                now()
+                        )
+                `,
+			s.code,
+			s.name,
+			s.order,
+			s.aiRole,
+			s.skippable,
 		)
 		if err != nil {
-			t.Fatalf("插入种子阶段失败 (stage=%s): %v", s.code, err)
+			t.Fatalf(
+				"插入种子阶段失败 (stage=%s): %v",
+				s.code,
+				err,
+			)
 		}
 	}
 }

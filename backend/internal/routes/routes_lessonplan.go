@@ -232,7 +232,18 @@ func registerLessonPlanRoutes(
 	mux.Handle("/api/v1/lesson-plans/textbooks/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
-		case hasSuffix(path, "/ocr") && r.Method == http.MethodPost:
+		// 课本原图必须通过登录态和实时K12教育域校验读取。
+		// 本路由必须位于通用详情GET之前，防止/image被误识别为课本ID。
+		case hasSuffix(path, "/image") &&
+			r.Method == http.MethodGet:
+			tbHandler.GetTextbookImage(w, r)
+		case hasSuffix(path, "/image"):
+			methodNotAllowedJSON(
+				w,
+				"课本图片仅支持GET请求",
+			)
+		case hasSuffix(path, "/ocr") &&
+			r.Method == http.MethodPost:
 			tbHandler.TriggerOCR(w, r)
 		default:
 			switch r.Method {

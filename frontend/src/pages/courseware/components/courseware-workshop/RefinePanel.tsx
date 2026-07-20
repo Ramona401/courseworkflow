@@ -39,14 +39,28 @@
  *     · Shift+回车=插入换行（与备课对话输入框 ConversationInputBar 同一套交互口径）；
  *     · Ctrl+V 粘贴截图逻辑不变（onPaste 仍拦截剪贴板图片）。
  */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
+import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import { refinePage, regenerateCWPage, listPageVersions, rollbackPage, getPageVersionDetail, getCoursewarePages } from '@/api/coursewares'
-import type { PageVersionEntry } from '@/api/coursewares'
+import type { CWRefineMode, PageVersionEntry } from '@/api/coursewares'
 import { C, CW_WIDTH, CW_HEIGHT } from './workshopConstants'
 import { injectPreviewMode } from './previewInject'
 import InlineTextEditor from './InlineTextEditor'
 import SnippetInjectPicker from './SnippetInjectPicker'
 import type { InjectedSnippet } from './SnippetInjectPicker'
+import TemplatePageReferencePicker, {
+  buildTemplatePageReferenceMarker,
+} from './TemplatePageReferencePicker'
+import type {
+  TemplatePageReferenceSelection,
+} from './TemplatePageReferencePicker'
+import CoursewareContinuityReferencePicker, {
+  buildCoursewareContinuityReferenceMarker,
+} from './CoursewareContinuityReferencePicker'
+import type {
+  CoursewareContinuityReferenceSelection,
+} from './CoursewareContinuityReferencePicker'
 
 interface Props {
   coursewareId: string
@@ -56,26 +70,71 @@ interface Props {
   onPageUpdated: (pageNum: number, html: string) => void
 }
 
-// P1-05: 草稿 sessionStorage 键前缀；按 课件ID + 页号 分键，不同课件/页互不串
-const REFINE_DRAFT_PREFIX = 'tedna_cw_refine_draft_'
-const refineDraftKey = (cwId: string, pageNum: number) => `${REFINE_DRAFT_PREFIX}${cwId}_${pageNum}`
+// 旧版草稿键，仅用于兼容迁移历史未提交内容。
+const LEGACY_REFINE_DRAFT_PREFIX =
+  'tedna_cw_refine_draft_'
 
-// P1-05: 安全读取草稿（sessionStorage 不可用/异常时静默返回空串，绝不抛错阻断面板）
-function readRefineDraft(cwId: string, pageNum: number): string {
-  if (!cwId || pageNum <= 0) return ''
+const legacyRefineDraftKey = (
+  coursewareId: string,
+  pageNum: number,
+) =>
+  `${LEGACY_REFINE_DRAFT_PREFIX}${coursewareId}_${pageNum}`
+
+/**
+ * 安全读取旧版文字草稿。
+ *
+ * 旧版草稿没有用户维度；迁入统一Hook后，
+ * 新草稿会按照用户、课件和页码严格隔离。
+ */
+function readLegacyRefineDraft(
+  coursewareId: string,
+  pageNum: number,
+): string {
+  if (
+    !coursewareId
+    || pageNum <= 0
+  ) {
+    return ''
+  }
+
   try {
-    return sessionStorage.getItem(refineDraftKey(cwId, pageNum)) || ''
-  } catch { return '' }
+    return (
+      sessionStorage.getItem(
+        legacyRefineDraftKey(
+          coursewareId,
+          pageNum,
+        ),
+      ) || ''
+    )
+  } catch {
+    return ''
+  }
 }
 
-// P1-05: 安全写入/清除草稿（空串视为清除该键，避免留下空草稿）
-function saveRefineDraft(cwId: string, pageNum: number, text: string) {
-  if (!cwId || pageNum <= 0) return
+/**
+ * 微调成功后删除已经消费的旧版草稿键。
+ */
+function removeLegacyRefineDraft(
+  coursewareId: string,
+  pageNum: number,
+): void {
+  if (
+    !coursewareId
+    || pageNum <= 0
+  ) {
+    return
+  }
+
   try {
-    const key = refineDraftKey(cwId, pageNum)
-    if (text) sessionStorage.setItem(key, text)
-    else sessionStorage.removeItem(key)
-  } catch { /* 配额满/隐私模式等：静默忽略，不影响微调主流程 */ }
+    sessionStorage.removeItem(
+      legacyRefineDraftKey(
+        coursewareId,
+        pageNum,
+      ),
+    )
+  } catch {
+    // 旧键删除失败不影响微调主流程。
+  }
 }
 
 // 版本对比弹窗内部状态：加载中 / 已就绪。承载"某历史版"与"当前版"两份 HTML。
@@ -96,9 +155,47 @@ const emptyCompare: CompareState = {
 }
 
 export default function RefinePanel({ coursewareId, pageNum, onPageUpdated }: Props) {
-  // P1-05: 初值直接从 sessionStorage 回填当前 课件+页 的草稿（首次挂载即恢复）
-  const [refineInput, setRefineInput] = useState(() => readRefineDraft(coursewareId, pageNum))
+  const { user } = useAuth()
+
+  /**
+   * 对旧版草稿值做稳定快照。
+   *
+   * 同一课件和页码生命周期内保持不变，避免删除旧键后
+   * initialValue发生变化而覆盖尚未写入新键的迁移内容。
+   */
+  const legacyInitialDraft = useMemo(
+    () =>
+      readLegacyRefineDraft(
+        coursewareId,
+        pageNum,
+      ),
+    [
+      coursewareId,
+      pageNum,
+    ],
+  )
+
+  const refineDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'courseware-page-refine',
+    resourceId: [
+      coursewareId,
+      `page-${pageNum}`,
+    ].join('|'),
+    field: 'instruction',
+    initialValue:
+      legacyInitialDraft,
+    maxHistory: 40,
+  })
+
+  const refineInput =
+    refineDraft.value
+  const updateRefineInput =
+    refineDraft.setValue
+
   const [refineRunning, setRefineRunning] = useState(false)
+  // 单页AI修改双档位：默认保留结构，老师主动选择后才允许全页重构
+  const [refineMode, setRefineMode] = useState<CWRefineMode>('preserve')
   const [refineImage, setRefineImage] = useState('')   // 截图dataURI(走多模态，不入sessionStorage)
   const [regenRunning, setRegenRunning] = useState(false)
   const [message, setMessage] = useState('')
@@ -119,11 +216,14 @@ export default function RefinePanel({ coursewareId, pageNum, onPageUpdated }: Pr
   // 老师从代码收藏库选中的参考代码；提交微调时以标记块形式拼进指令（前端拼接注入，透明可控）
   const [injectedSnippet, setInjectedSnippet] = useState<InjectedSnippet | null>(null)
 
-  // P1-05: 受控更新输入框——同时写 state 与 sessionStorage 草稿（即敲即存，刷新不丢）
-  const updateRefineInput = (text: string) => {
-    setRefineInput(text)
-    saveRefineDraft(coursewareId, pageNum, text)
-  }
+  // 全页重构指定模板页参考；只保存模板ID和页序号，不保存HTML。
+  const [templatePageReference, setTemplatePageReference] = useState<TemplatePageReferenceSelection | null>(null)
+
+  // 本课前页连续性参考；只保存页码，不保存页面HTML。
+  const [
+    continuityPageReferences,
+    setContinuityPageReferences,
+  ] = useState<CoursewareContinuityReferenceSelection | null>(null)
 
   // 切换选中页时：收起弹层并清空上一页的版本列表，避免串页显示；
   // P1-05: 同时按新页号回填该页的草稿（不同页各记各的修改意见）
@@ -133,15 +233,23 @@ export default function RefinePanel({ coursewareId, pageNum, onPageUpdated }: Pr
     setRollbackingId('')
     setCompare(emptyCompare)  // 切页关闭对比弹窗，避免残留上一页的对比内容
     setShowInlineEditor(false) // 切页关闭就地编辑浮层，避免编辑器停留在旧页
-    setRefineInput(readRefineDraft(coursewareId, pageNum))
+    setRefineMode('preserve') // 切换页面后恢复安全默认档位，避免误用上一页的全页重构状态
     setRefineImage('')  // 切页清掉上一页的截图（截图与页强相关，不跨页保留）
     setInjectedSnippet(null)  // 批次C: 切页清掉已注入的参考代码（注入与本次微调强相关，不跨页保留）
+    setTemplatePageReference(null)  // 模板页引用与当前页强相关，不跨页保留
+    setContinuityPageReferences(null)  // 本课前页引用与当前页强相关，不跨页保留
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [coursewareId, pageNum])
 
   // 单页AI微调(批次4a: 支持随附截图走多模态; 微调=保留页内已插入图片)
   const handleRefinePage = async () => {
-    if (!coursewareId || pageNum <= 0 || !refineInput.trim()) return
+    if (
+      !coursewareId
+      || pageNum <= 0
+      || !refineInput.trim()
+      || refineRunning
+      || regenRunning
+    ) return
     setRefineRunning(true)
     try {
       // 批次C: 若已注入参考代码，以标记块形式拼在修改意见之后（截断至约24000字符防token超限）。
@@ -158,16 +266,54 @@ export default function RefinePanel({ coursewareId, pageNum, onPageUpdated }: Pr
           + '但教学内容（文字/数据/图片）仍以当前页为准，不要照抄范本里的文字内容。\n'
           + '```html\n' + refHtml + '\n```\n【参考代码范本·结束】'
       }
-      const result = await refinePage(coursewareId, pageNum, finalInstruction, refineImage || undefined)
+      // 本课前页连续性参考只传页码数组。
+      // 后端会从当前课件重新读取最新HTML，并再次校验页码和数量。
+      if (continuityPageReferences) {
+        finalInstruction = finalInstruction
+          + '\n\n'
+          + buildCoursewareContinuityReferenceMarker(
+            continuityPageReferences,
+          )
+      }
+
+      // 全页重构模板页引用只传模板ID和页序号。
+      // 后端会删除内部标记、重新读取模板并校验权限。
+      if (templatePageReference) {
+        finalInstruction = finalInstruction
+          + '\n\n'
+          + buildTemplatePageReferenceMarker(templatePageReference)
+      }
+
+      const result = await refinePage(
+        coursewareId,
+        pageNum,
+        finalInstruction,
+        refineImage || undefined,
+        refineMode,
+      )
       if (result.html_content) onPageUpdated(pageNum, result.html_content)
-      // P1-05: 微调成功 → 清空输入 + 清除该页草稿（已提交的意见无需再留）
-      updateRefineInput('')
+      /**
+       * 后端已经成功返回更新后的正式页面后，才提交清空输入。
+       * commit保留撤销快照；失败分支不会改变当前草稿。
+       */
+      refineDraft.commit()
+      removeLegacyRefineDraft(
+        coursewareId,
+        pageNum,
+      )
       setRefineImage('')
       setInjectedSnippet(null)  // 批次C: 本次注入已随微调消费，成功后清除
+      setTemplatePageReference(null)  // 本次模板页引用已随重构消费
+      setContinuityPageReferences(null)  // 本次本课前页引用已随重构消费
       setMessage('✅ ' + result.message)
       // 微调成功后该页新增了一个版本快照；若历史弹层正展开则刷新列表
       if (showVersions) loadVersions()
-    } catch (e) { setMessage('❌ 微调失败: ' + (e instanceof Error ? e.message : '未知错误')) } finally { setRefineRunning(false) }
+    } catch (e) {
+      const actionName = refineMode === 'rebuild' ? '全页重构' : '微调'
+      setMessage('❌ ' + actionName + '失败: ' + (e instanceof Error ? e.message : '未知错误'))
+    } finally {
+      setRefineRunning(false)
+    }
   }
 
   // 单页从零重生(重生=不保留页内已插入图片; 后端无并发锁故运行态禁用按钮)
@@ -301,6 +447,12 @@ export default function RefinePanel({ coursewareId, pageNum, onPageUpdated }: Pr
 
   // B-P1-11: textarea 键盘处理——回车提交微调，Shift+回车换行（与备课对话输入框同口径）
   const handleRefineKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (
+      refineDraft.handleKeyDown(e)
+    ) {
+      return
+    }
+
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()  // 阻止默认换行，改为提交
       if (!refineRunning && pageNum > 0 && refineInput.trim()) handleRefinePage()
@@ -319,30 +471,132 @@ export default function RefinePanel({ coursewareId, pageNum, onPageUpdated }: Pr
 
   return (
     <div style={{ marginTop: 16, padding: '16px', borderRadius: 10, border: `1px solid ${C.border}`, background: '#FAFAFA' }}>
-      <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 8 }}>🎨 对某页不满意？在上方预览区选中该页，输入修改意见</div>
+      <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 10 }}>
+        {refineMode === 'rebuild'
+          ? '🧱 全页重构：允许重新设计本页内容区，导航栏与模板风格保持不变'
+          : '🎨 保留结构微调：只修改指定部分，保留当前布局、ID、函数和交互'}
+      </div>
+
+      {/* 单页AI修改二段档位：共用输入框与执行按钮，不增加弹窗 */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        marginBottom: 12,
+        padding: 4,
+        borderRadius: 9,
+        background: '#F3F4F6',
+        width: 'fit-content',
+        maxWidth: '100%',
+        flexWrap: 'wrap',
+      }}>
+        <button
+          type="button"
+          onClick={() => {
+            setRefineMode('preserve')
+            setTemplatePageReference(null)
+            setContinuityPageReferences(null)
+          }}
+          disabled={refineRunning || regenRunning}
+          style={{
+            padding: '8px 15px',
+            borderRadius: 7,
+            border: refineMode === 'preserve' ? '1px solid #7C3AED' : '1px solid transparent',
+            background: refineMode === 'preserve' ? '#fff' : 'transparent',
+            color: refineMode === 'preserve' ? '#6D28D9' : '#6B7280',
+            boxShadow: refineMode === 'preserve' ? '0 1px 4px rgba(124,58,237,0.18)' : 'none',
+            fontSize: 12,
+            fontWeight: 700,
+            cursor: refineRunning || regenRunning ? 'default' : 'pointer',
+          }}
+        >
+          🛠 保留结构微调
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setRefineMode('rebuild')}
+          disabled={refineRunning || regenRunning}
+          style={{
+            padding: '8px 15px',
+            borderRadius: 7,
+            border: refineMode === 'rebuild' ? '1px solid #EA580C' : '1px solid transparent',
+            background: refineMode === 'rebuild' ? '#fff' : 'transparent',
+            color: refineMode === 'rebuild' ? '#C2410C' : '#6B7280',
+            boxShadow: refineMode === 'rebuild' ? '0 1px 4px rgba(234,88,12,0.18)' : 'none',
+            fontSize: 12,
+            fontWeight: 700,
+            cursor: refineRunning || regenRunning ? 'default' : 'pointer',
+          }}
+        >
+          🧱 全页重构
+        </button>
+
+        <span style={{ padding: '0 8px', fontSize: 11, color: '#9CA3AF', lineHeight: 1.5 }}>
+          {refineMode === 'rebuild'
+            ? '允许重建内容区布局、ID、函数与交互；当前版本会自动保存'
+            : '适合改文字、颜色、大小、位置或删除明确指定的局部元素'}
+        </span>
+      </div>
+
       <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-start' }}>
         <span style={{ padding: '8px 12px', borderRadius: 8, background: C.primaryBg, color: C.primary, fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap', marginTop: 2 }}>
           当前：第 {pageNum || '—'} 页
         </span>
         {/* B-P1-11: 单行input → 可拖高多行textarea；回车提交、Shift+回车换行 */}
         <textarea value={refineInput} onChange={e => updateRefineInput(e.target.value)}
-          placeholder="例如：标题字号再大一些、增加图片占位...（回车提交，Shift+回车换行；可 Ctrl+V 粘贴截图，先在上方选要改的页）"
+          placeholder={refineMode === 'rebuild'
+            ? '例如：延续所选前页的人物、卡片体系和逐步点击逻辑，把本页开发为下一阶段任务...'
+            : '例如：标题字号再大一些、删除右上角人物、调整卡片位置...（回车提交，Shift+回车换行）'}
           onKeyDown={handleRefineKeyDown}
           onPaste={handleRefinePaste}
           rows={2}
           style={{ flex: 1, padding: '10px 14px', borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 14, outline: 'none', minWidth: 200, resize: 'vertical', fontFamily: 'inherit', lineHeight: 1.6, boxSizing: 'border-box' }}
-          disabled={refineRunning} />
-        <button onClick={handleRefinePage} disabled={refineRunning || pageNum <= 0 || !refineInput.trim()}
-          style={{ padding: '10px 20px', borderRadius: 8, border: 'none', background: pageNum > 0 && refineInput.trim() && !refineRunning ? '#7C3AED' : '#E5E7EB', color: pageNum > 0 && refineInput.trim() && !refineRunning ? '#fff' : '#9CA3AF', fontSize: 14, fontWeight: 600, cursor: pageNum > 0 && refineInput.trim() && !refineRunning ? 'pointer' : 'default', whiteSpace: 'nowrap', marginTop: 2 }}>
-          {refineRunning ? '⏳ 微调中...' : '🎨 AI微调'}
+          disabled={refineRunning || regenRunning} />
+        <button
+          onClick={handleRefinePage}
+          disabled={refineRunning || regenRunning || pageNum <= 0 || !refineInput.trim()}
+          style={{
+            padding: '10px 20px',
+            borderRadius: 8,
+            border: 'none',
+            background: pageNum > 0 && refineInput.trim() && !refineRunning && !regenRunning
+              ? (refineMode === 'rebuild' ? '#EA580C' : '#7C3AED')
+              : '#E5E7EB',
+            color: pageNum > 0 && refineInput.trim() && !refineRunning && !regenRunning ? '#fff' : '#9CA3AF',
+            fontSize: 14,
+            fontWeight: 600,
+            cursor: pageNum > 0 && refineInput.trim() && !refineRunning && !regenRunning ? 'pointer' : 'default',
+            whiteSpace: 'nowrap',
+            marginTop: 2,
+          }}
+        >
+          {refineRunning
+            ? (refineMode === 'rebuild' ? '⏳ 重构中...' : '⏳ 微调中...')
+            : (refineMode === 'rebuild' ? '🧱 重构本页' : '🎨 AI微调')}
         </button>
       </div>
+
+      <div
+        style={{
+          marginTop: 5,
+          fontSize: 10,
+          color: '#9CA3AF',
+          lineHeight: 1.5,
+        }}
+      >
+        当前课件和页码的微调指令已自动保存 ·
+        微调失败不会清除 ·
+        Ctrl/Command+Z恢复误删 ·
+        截图不会进入文字草稿
+      </div>
+
       {/* 截图粘贴 + 就地改文字 + 历史版本 + 重生本页 */}
       <div style={{ display: 'flex', gap: 10, marginTop: 10, flexWrap: 'wrap', alignItems: 'center' }}>
         {refineImage ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <img src={refineImage} alt="参考截图" style={{ width: 40, height: 40, objectFit: 'cover', borderRadius: 6, border: '2px solid #7C3AED' }} />
-            <span style={{ fontSize: 11, color: '#7C3AED' }}>已附截图(微调将参考)</span>
+            <span style={{ fontSize: 11, color: '#7C3AED' }}>已附截图(AI修改将参考)</span>
             <button onClick={() => setRefineImage('')} disabled={refineRunning || regenRunning} style={{ padding: '2px 8px', borderRadius: 4, border: '1px solid #EF4444', background: 'transparent', color: '#EF4444', fontSize: 11, cursor: (refineRunning || regenRunning) ? 'default' : 'pointer' }}>移除</button>
           </div>
         ) : (
@@ -353,13 +607,41 @@ export default function RefinePanel({ coursewareId, pageNum, onPageUpdated }: Pr
               if (!f) return
               loadRefineImageFile(f)
             }; inp.click()
-          }} disabled={refineRunning || regenRunning} style={{ padding: '8px 14px', borderRadius: 8, border: '1px dashed #7C3AED', background: 'rgba(124,58,237,0.04)', color: '#7C3AED', fontSize: 13, cursor: (refineRunning || regenRunning) ? 'default' : 'pointer' }}>📷 附截图微调（或在输入框 Ctrl+V 粘贴）</button>
+          }} disabled={refineRunning || regenRunning} style={{ padding: '8px 14px', borderRadius: 8, border: '1px dashed #7C3AED', background: 'rgba(124,58,237,0.04)', color: '#7C3AED', fontSize: 13, cursor: (refineRunning || regenRunning) ? 'default' : 'pointer' }}>📷 附参考截图（或在输入框 Ctrl+V 粘贴）</button>
         )}
         <div style={{ flex: 1 }} />
-        {/* 批次C: 注入参考代码选择器（从我的代码收藏选一条，微调时AI参照其布局/交互/视觉） */}
+        {/* 全页重构：选择当前课件前面1至5页，保持人物、叙事和交互连续 */}
+        {refineMode === 'rebuild' && (
+          <CoursewareContinuityReferencePicker
+            coursewareId={coursewareId}
+            currentPageNumber={pageNum}
+            selected={continuityPageReferences}
+            onSelect={setContinuityPageReferences}
+            onRemove={() => setContinuityPageReferences(null)}
+            disabled={refineRunning || regenRunning || pageNum <= 1}
+          />
+        )}
+
+        {/* 全页重构：可选择模板中的具体一页作为样式或交互逻辑参考 */}
+        {refineMode === 'rebuild' && (
+          <TemplatePageReferencePicker
+            selected={templatePageReference}
+            onSelect={(selection) => {
+              setTemplatePageReference(selection)
+              setInjectedSnippet(null)
+            }}
+            onRemove={() => setTemplatePageReference(null)}
+            disabled={refineRunning || regenRunning || pageNum <= 0}
+          />
+        )}
+
+        {/* 代码收藏与模板页均是强参考源，二者互斥，避免AI同时服从两套范本 */}
         <SnippetInjectPicker
           injected={injectedSnippet}
-          onInject={setInjectedSnippet}
+          onInject={(snippet) => {
+            setInjectedSnippet(snippet)
+            setTemplatePageReference(null)
+          }}
           onRemove={() => setInjectedSnippet(null)}
           disabled={refineRunning || regenRunning || pageNum <= 0}
         />
@@ -376,9 +658,9 @@ export default function RefinePanel({ coursewareId, pageNum, onPageUpdated }: Pr
           📜 历史版本{showVersions ? ' ▲' : ' ▼'}
         </button>
         <button onClick={handleRegeneratePage} disabled={pageNum <= 0 || regenRunning || refineRunning}
-          title={pageNum <= 0 ? '请先在上方预览区选中页' : '按方案从零重画本页(会清空本页已插入的图片)'}
+          title={pageNum <= 0 ? '请先在上方预览区选中页' : '忽略当前页面内容，按原页面方案从零生成（会清空本页已插入的图片）'}
           style={{ padding: '8px 18px', borderRadius: 8, border: 'none', background: (pageNum > 0 && !regenRunning && !refineRunning) ? 'linear-gradient(135deg, #F59E0B, #EF4444)' : '#E5E7EB', color: (pageNum > 0 && !regenRunning && !refineRunning) ? '#fff' : '#9CA3AF', fontSize: 13, fontWeight: 600, cursor: (pageNum > 0 && !regenRunning && !refineRunning) ? 'pointer' : 'default', whiteSpace: 'nowrap' }}>
-          {regenRunning ? '⏳ 重生中...' : '🔄 重生本页'}
+          {regenRunning ? '⏳ 重生中...' : '🔄 按方案重生'}
         </button>
       </div>
 
@@ -429,7 +711,9 @@ export default function RefinePanel({ coursewareId, pageNum, onPageUpdated }: Pr
         </div>
       )}
 
-      <div style={{ marginTop: 6, fontSize: 11, color: '#9CA3AF' }}>💡 微调=AI在现有页面上增量修改、保留已插图片；重生=AI按方案从零重画、不保留已插图片；就地编辑=你自己点选文字改内容/字号/颜色/加粗/字体，或点图片替换（不调AI、最快）。页面变形/损坏时用重生补救。微调/重生/就地编辑前系统会自动存一版，可在「📜 历史版本」里「👁 对比当前版」看改了什么、或一键回退。输入框可向下拖高、Shift+回车换行写多条意见；截图除「附截图微调」选文件外，也可在输入框直接 Ctrl+V 粘贴。修改意见会自动暂存，刷新或切走再回来不丢。</div>
+      <div style={{ marginTop: 6, fontSize: 11, color: '#9CA3AF' }}>
+        💡 保留结构微调＝只改指定局部并保留当前布局、ID和交互；全页重构＝根据你的要求重新设计本页内容区，但保留导航栏与模板风格；按方案重生＝忽略当前页面，依据原页面方案从零生成。三种AI修改前系统都会自动保存当前版本，可在「📜 历史版本」中对比或回退。就地编辑仍适合改错字、字号、颜色和替换图片，不调用AI。
+      </div>
       {/* W2: 自带消息条(原Step5无展示位, 微调结果此前不可见) */}
       {message && (
         <div style={{ marginTop: 12, padding: '10px 14px', borderRadius: 8, fontSize: 13, background: message.startsWith('❌') ? '#FEE2E2' : message.startsWith('✅') ? '#D1FAE5' : '#EFF6FF', color: message.startsWith('❌') ? '#DC2626' : message.startsWith('✅') ? '#059669' : '#2563EB' }}>{message}</div>

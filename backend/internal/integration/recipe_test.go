@@ -24,6 +24,12 @@ package integration
 //   11. 校验有效流程 → 通过
 //   12. 校验缺少必选阶段 → 返回校验结果
 //
+//
+// 教育域说明：
+//   - 配方属于具体教学资源，创建Actor必须是k12/vocational/adult；
+//   - 平台admin处于mixed管理域，不能通过教师创建接口生成个人配方；
+//   - 因此配方CRUD测试统一使用operator1（测试默认解析为k12）。
+
 // 关键注意：
 //   CreateRecipeRequest/UpdateRecipeRequest 中 stages_config 和 lesson_structure
 //   是 string 类型（JSON字符串），不是Go对象。传参时必须序列化为字符串。
@@ -79,8 +85,8 @@ func TestRecipe_Create(t *testing.T) {
 	server, _ := SetupTestServer(t)
 	CleanAndSeed(t)
 
-	token := LoginAsAdmin(t, server.URL)
-	recipeID := createTestRecipeViaAPI(t, server.URL, token, "数学探究配方", "数学", "7-9")
+	token := LoginAsOperator(t, server.URL)
+	recipeID := createTestRecipeViaAPI(t, server.URL, token, "数学探究配方", "数学", "七年级")
 
 	// 验证DB中存在
 	var count int
@@ -100,7 +106,7 @@ func TestRecipe_CreateMissingFields(t *testing.T) {
 	server, _ := SetupTestServer(t)
 	CleanAndSeed(t)
 
-	token := LoginAsAdmin(t, server.URL)
+	token := LoginAsOperator(t, server.URL)
 
 	// 缺少name → 服务层返回"配方名称不能为空"
 	body := map[string]interface{}{
@@ -112,13 +118,49 @@ func TestRecipe_CreateMissingFields(t *testing.T) {
 	AssertHTTPStatus(t, resp, http.StatusBadRequest)
 }
 
+// TestRecipe_CreateRangeRejected 配方创建必须绑定单一具体年级。
+//
+// 7-9等范围可以继续用于组件检索条件，
+// 但不能作为备课配方自身的适用年级。
+func TestRecipe_CreateRangeRejected(
+	t *testing.T,
+) {
+	server, _ := SetupTestServer(t)
+	CleanAndSeed(t)
+
+	token := LoginAsOperator(t, server.URL)
+
+	body := map[string]interface{}{
+		"name":          "非法范围配方",
+		"subject":       "数学",
+		"grade_range":   "7-9",
+		"description":   "范围年级应被拒绝",
+		"stages_config": defaultStagesConfigJSON,
+		"prompt_mode":   "guided",
+	}
+
+	resp, _ := DoPost(
+		t,
+		server.URL+
+			"/api/v1/lesson-plans/recipes",
+		body,
+		token,
+	)
+
+	AssertHTTPStatus(
+		t,
+		resp,
+		http.StatusBadRequest,
+	)
+}
+
 // TestRecipe_GetDetail 获取配方详情
 func TestRecipe_GetDetail(t *testing.T) {
 	server, _ := SetupTestServer(t)
 	CleanAndSeed(t)
 
-	token := LoginAsAdmin(t, server.URL)
-	recipeID := createTestRecipeViaAPI(t, server.URL, token, "语文阅读配方", "语文", "7-8")
+	token := LoginAsOperator(t, server.URL)
+	recipeID := createTestRecipeViaAPI(t, server.URL, token, "语文阅读配方", "语文", "八年级")
 
 	resp, apiResp := DoGet(t, server.URL+"/api/v1/lesson-plans/recipes/"+recipeID, token)
 	AssertHTTPStatus(t, resp, http.StatusOK)
@@ -144,8 +186,8 @@ func TestRecipe_Update(t *testing.T) {
 	server, _ := SetupTestServer(t)
 	CleanAndSeed(t)
 
-	token := LoginAsAdmin(t, server.URL)
-	recipeID := createTestRecipeViaAPI(t, server.URL, token, "待更新配方", "英语", "7-9")
+	token := LoginAsOperator(t, server.URL)
+	recipeID := createTestRecipeViaAPI(t, server.URL, token, "待更新配方", "英语", "九年级")
 
 	// UpdateRecipeRequest 的 stages_config 也是 string 类型
 	shortStagesJSON := `[{"stage_code":"analyze","enabled":true,"order":1},{"stage_code":"write","enabled":true,"order":2},{"stage_code":"review","enabled":true,"order":3}]`
@@ -153,7 +195,7 @@ func TestRecipe_Update(t *testing.T) {
 	updateBody := map[string]interface{}{
 		"name":          "已更新配方",
 		"subject":       "英语",
-		"grade_range":   "7-9",
+		"grade_range":   "九年级",
 		"description":   "更新后的描述",
 		"stages_config": shortStagesJSON,
 	}
@@ -180,8 +222,8 @@ func TestRecipe_Delete(t *testing.T) {
 	server, _ := SetupTestServer(t)
 	CleanAndSeed(t)
 
-	token := LoginAsAdmin(t, server.URL)
-	recipeID := createTestRecipeViaAPI(t, server.URL, token, "待删除配方", "科学", "5-6")
+	token := LoginAsOperator(t, server.URL)
+	recipeID := createTestRecipeViaAPI(t, server.URL, token, "待删除配方", "科学", "五年级")
 
 	resp, apiResp := DoDelete(t, server.URL+"/api/v1/lesson-plans/recipes/"+recipeID, token)
 	AssertHTTPStatus(t, resp, http.StatusOK)
@@ -207,11 +249,22 @@ func TestRecipe_Fork(t *testing.T) {
 	server, _ := SetupTestServer(t)
 	CleanAndSeed(t)
 
-	adminToken := LoginAsAdmin(t, server.URL)
-	recipeID := createTestRecipeViaAPI(t, server.URL, adminToken, "可Fork配方", "数学", "7-9")
-
 	operatorToken := LoginAsOperator(t, server.URL)
-	resp, apiResp := DoPost(t, server.URL+"/api/v1/lesson-plans/recipes/"+recipeID+"/fork", nil, operatorToken)
+	recipeID := createTestRecipeViaAPI(
+		t,
+		server.URL,
+		operatorToken,
+		"可Fork配方",
+		"数学",
+		"七年级",
+	)
+
+	resp, apiResp := DoPost(
+		t,
+		server.URL+"/api/v1/lesson-plans/recipes/"+recipeID+"/fork",
+		nil,
+		operatorToken,
+	)
 	AssertHTTPStatus(t, resp, http.StatusOK)
 	AssertAPICode(t, apiResp, 0)
 
@@ -233,9 +286,9 @@ func TestRecipe_List(t *testing.T) {
 	server, _ := SetupTestServer(t)
 	CleanAndSeed(t)
 
-	token := LoginAsAdmin(t, server.URL)
-	createTestRecipeViaAPI(t, server.URL, token, "列表测试1", "数学", "7-9")
-	createTestRecipeViaAPI(t, server.URL, token, "列表测试2", "语文", "7-8")
+	token := LoginAsOperator(t, server.URL)
+	createTestRecipeViaAPI(t, server.URL, token, "列表测试1", "数学", "七年级")
+	createTestRecipeViaAPI(t, server.URL, token, "列表测试2", "语文", "八年级")
 
 	resp, apiResp := DoGet(t, server.URL+"/api/v1/lesson-plans/recipes", token)
 	AssertHTTPStatus(t, resp, http.StatusOK)

@@ -235,7 +235,10 @@ func (s *LessonPlanGenService) handleReviewStageOutput(
 		"improvements", len(reviewResult.Improvements))
 
 	// v89新增：review阶段完成后自动触发教案索引生成
-	go s.triggerAutoLessonIndex(ctx, planID, &reviewResult.TotalScore)
+	s.triggerAutoLessonIndexTracked(
+		planID,
+		&reviewResult.TotalScore,
+	)
 }
 
 // safeReviewRawFallback 为 fallback review 的 suggestion 字段准备原文（v169新增）
@@ -263,11 +266,26 @@ func (s *LessonPlanGenService) TriggerAIReview(
 	if strings.TrimSpace(lp.ContentMarkdown) == "" {
 		return errors.New("教案内容为空，无法评审")
 	}
+	task, taskErr := startLessonPlanAITask(planID)
+	if taskErr != nil {
+		return taskErr
+	}
+
 	lpGenLog.Info("触发AI评审", "plan_id", planID)
-	go func() {
-		bgCtx := context.Background()
-		s.executeAIReviewAsync(bgCtx, lp)
-	}()
+
+	s.runLessonPlanAITask(
+		task,
+		planID,
+		"",
+		"review",
+		func() {
+			s.executeAIReviewAsync(
+				context.Background(),
+				lp,
+			)
+		},
+	)
+
 	return nil
 }
 
@@ -354,11 +372,36 @@ func (s *LessonPlanGenService) ApplyAISuggestions(
 	if strings.TrimSpace(lp.AIReviewResult) == "" {
 		return errors.New("尚未生成AI评审，请先触发评审")
 	}
-	lpGenLog.Info("应用AI建议", "plan_id", req.PlanID, "suggestions_count", len(req.Suggestions))
-	go func() {
-		bgCtx := context.Background()
-		s.applyAndReviewAsync(bgCtx, lp, req.Suggestions)
-	}()
+	task, taskErr := startLessonPlanAITask(req.PlanID)
+	if taskErr != nil {
+		return taskErr
+	}
+
+	lpGenLog.Info(
+		"应用AI建议",
+		"plan_id", req.PlanID,
+		"suggestions_count", len(req.Suggestions),
+	)
+
+	suggestionIDs := append(
+		[]string(nil),
+		req.Suggestions...,
+	)
+
+	s.runLessonPlanAITask(
+		task,
+		req.PlanID,
+		"",
+		"apply_suggestions",
+		func() {
+			s.applyAndReviewAsync(
+				context.Background(),
+				lp,
+				suggestionIDs,
+			)
+		},
+	)
+
 	return nil
 }
 

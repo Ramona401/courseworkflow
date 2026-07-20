@@ -352,9 +352,9 @@ func extractNavBarFromTopToEnd(html string, endIdx int) string {
 // extractNavFallback 兜底导航栏提取（NAV_START/NAV_END均不存在时的最后手段）。
 //
 // 策略优先级：
-//   1. 优先找包含 "height:80" 或 "height: 80" 的 <div>（80px高度是导航栏的标志特征），
-//      提取该完整div块；
-//   2. 找不到80px div时，回退为找最外层div的第一个子div（兼容非标准导航栏高度的罕见情况）。
+//  1. 优先找包含 "height:80" 或 "height: 80" 的 <div>（80px高度是导航栏的标志特征），
+//     提取该完整div块；
+//  2. 找不到80px div时，回退为找最外层div的第一个子div（兼容非标准导航栏高度的罕见情况）。
 func extractNavFallback(html string) string {
 	lowerHTML := strings.ToLower(html)
 
@@ -497,11 +497,12 @@ var cwNavURLGuardRe = regexp.MustCompile(`(?is)(?:src|href)\s*=\s*"[^"]*"|(?:src
 // 例如："1 / 15" → "{{PAGE_NUM}} / {{TOTAL_PAGES}}"
 //
 // 修复（防误伤Logo URL）：旧实现直接对整段HTML做"数字/数字"全局替换，
-//   会把 <img src="/uploads/.../763 / 242453....png"> 这类图片路径里的数字串
-//   误当页码替换成占位符，导致Logo URL被写坏、图片彻底裂掉（手动批量与全自动装配同源中招）。
-//   现改为：先用 cwNavURLGuardRe 把所有 src/href/url() 的URL上下文整体挖出、以不可见占位符替换保护，
-//   仅对剩余文本（真正的页码显示区）做替换，最后把被保护的URL原样还原。
-//   对"页码在正文文本、Logo URL在属性里"这一稳定结构，替换精准且零副作用。
+//
+//	会把 <img src="/uploads/.../763 / 242453....png"> 这类图片路径里的数字串
+//	误当页码替换成占位符，导致Logo URL被写坏、图片彻底裂掉（手动批量与全自动装配同源中招）。
+//	现改为：先用 cwNavURLGuardRe 把所有 src/href/url() 的URL上下文整体挖出、以不可见占位符替换保护，
+//	仅对剩余文本（真正的页码显示区）做替换，最后把被保护的URL原样还原。
+//	对"页码在正文文本、Logo URL在属性里"这一稳定结构，替换精准且零副作用。
 func ReplaceNavPageNumbers(navHTML string) string {
 	// 兼容旧调用名：内部转调 StripNavPageNumbers（从导航栏中剥除页码元素）
 	// 页码改由 injectPageNumIntoNav 在拼接时后端确定性追加，不再做占位符替换
@@ -628,6 +629,9 @@ func (s *CoursewareGenService) buildPreviewUserPrompt(
 	sb.WriteString(fmt.Sprintf("- 预估复杂度：%d/5\n", page.EstimatedComplexity))
 	sb.WriteString("\n")
 
+	// 老师确认的互动方式是本页必须执行的功能契约，不是普通风格建议。
+	s.appendInteractionContract(&sb, page)
+
 	// 教案原文校准（本次新增）：按页定向匹配教案相关片段，作为事实来源注入
 	s.appendLessonPlanCalibration(&sb, extractPageRelevantLessonSection(lessonContext, page))
 
@@ -718,6 +722,9 @@ func (s *CoursewareGenService) buildBatchUserPrompt(
 	sb.WriteString(fmt.Sprintf("- 预估复杂度：%d/5\n", page.EstimatedComplexity))
 	sb.WriteString("\n")
 
+	// 老师确认的互动方式是本页必须执行的功能契约，不是普通风格建议。
+	s.appendInteractionContract(&sb, page)
+
 	// 教案原文校准（本次新增）：按页定向匹配教案相关片段，作为事实来源注入
 	s.appendLessonPlanCalibration(&sb, extractPageRelevantLessonSection(lessonContext, page))
 
@@ -779,6 +786,7 @@ func (s *CoursewareGenService) appendMatchedComponents(sb *strings.Builder, matc
 		return
 	}
 	sb.WriteString("## 参考组件（可参考其布局和交互模式，但必须用风格模板的配色）\n")
+	sb.WriteString("以下组件只允许作为与本页互动契约一致的参考；若组件代码与老师选择的互动方式冲突，必须以互动契约为准，不得擅自把 input 改成 click、把 drag 改成普通按钮。\n")
 	for i, comp := range matchedComps {
 		sb.WriteString(fmt.Sprintf("\n### 参考组件 %d：%s（%s）\n", i+1, comp.Name, comp.ComponentType))
 		// 只注入代码片段的前2000字符，避免提示词过长
@@ -799,40 +807,10 @@ func (s *CoursewareGenService) appendMatchedComponents(sb *strings.Builder, matc
 // 12000上限覆盖4套新模板最长封面样例（小画本10625字符），保证样例嵌入的背景图URL不被截掉。
 const cwSampleRefMaxRunes = 12000
 
-// pickSamplePageIndex 按"当前页页型"挑选最匹配的模板样例页下标。
-//
-// 5页标准模板（sample_pages 固定顺序：封面/学习目标/内容讲解/互动练习/课后作业）：
-//   - 第1页 → 封面样例(0)
-//   - 第2页 → 学习目标样例(1)
-//   - 最后1页 → 课后作业样例(4)
-//   - 互动型页（click/drag/game/quiz 或交互复杂度≥4）→ 互动练习样例(3)
-//   - 其余 → 内容讲解样例(2)
-//
-// 非5页模板（旧单页模板/AI提取草稿等）：封面参考第1个样例，其余参考最后1个样例（单样例即同一个）。
-// 返回：样例下标 + 页型中文标签（注入提示词时告知AI）。
-func pickSamplePageIndex(samplesLen int, page *models.CoursewarePage, pageNum int, totalPages int) (int, string) {
-	if samplesLen == 5 {
-		switch {
-		case pageNum == 1:
-			return 0, "封面"
-		case pageNum == 2:
-			return 1, "学习目标"
-		case pageNum == totalPages:
-			return 4, "课后作业"
-		default:
-			it := page.InteractionType
-			if it == "click" || it == "drag" || it == "game" || it == "quiz" || page.IdxInteractionLevel >= 4 {
-				return 3, "互动练习"
-			}
-			return 2, "内容讲解"
-		}
-	}
-	// 非5页模板的回退策略
-	if pageNum == 1 || samplesLen == 1 {
-		return 0, "通用样例"
-	}
-	return samplesLen - 1, "通用样例"
-}
+// 任意页数模板的样例页选择逻辑已统一迁移到
+// template_source_preserve.go 的pickTemplateSamplePageIndex。
+// 该实现支持封面、目录、目标、互动、数据、总结、作业等页型匹配，
+// 找不到明确页型时按课件页位置映射模板位置，不再只支持固定5页模板。
 
 // appendSamplePageReference 把"与本页页型最接近的模板官方样例页HTML"追加进AI生成提示词。
 //
@@ -863,7 +841,7 @@ func (s *CoursewareGenService) appendSamplePageReference(
 		}
 		return
 	}
-	idx, label := pickSamplePageIndex(len(tplInfo.SamplePages), page, pageNum, totalPages)
+	idx, label := pickTemplateSamplePageIndex(tplInfo.SamplePages, page, pageNum, totalPages)
 	if idx < 0 || idx >= len(tplInfo.SamplePages) {
 		return
 	}
@@ -1055,25 +1033,65 @@ func (s *CoursewareGenService) applyTemplateBackgroundOnly(html string, tplInfo 
 // ==================== 组件匹配 ====================
 
 // matchComponentsForPage 为单页匹配最合适的课件组件（top 2）
-func (s *CoursewareGenService) matchComponentsForPage(ctx context.Context, page *models.CoursewarePage, subject string, grade string) []*models.MatchedCWComponent {
-	req := &models.MatchCWComponentsRequest{
-		SubjectScope:     subject,
-		GradeScope:       grade,
-		InteractionLevel: page.IdxInteractionLevel,
-		VisualFormat:     page.IdxVisualFormat,
-		Limit:            2,
+func (s *CoursewareGenService) matchComponentsForPage(
+	ctx context.Context,
+	page *models.CoursewarePage,
+	subject string,
+	grade string,
+) []*models.MatchedCWComponent {
+	if page == nil {
+		return nil
 	}
-	// 如果页面没有索引维度，用方案字段推断
-	if req.InteractionLevel <= 0 {
-		req.InteractionLevel = page.EstimatedComplexity
+
+	// 老师在确认方案中选择的 interaction_type / visual_format 是最后事实源。
+	// 层1索引仅在方案字段为空时兜底，不再用 estimated_complexity 冒充互动等级。
+	req := &models.MatchCWComponentsRequest{
+		SubjectScope: subject,
+		GradeScope:   grade,
+		InteractionLevel: cwInteractionLevelForPlan(
+			page.InteractionType,
+			page.IdxInteractionLevel,
+			page.EstimatedComplexity,
+		),
+		VisualFormat: cwVisualFormatForMatch(page),
+		// 先放大候选池，再按互动代码结构过滤，最后只注入Top 2。
+		Limit: 8,
 	}
 
 	matched, err := repository.MatchCWComponents(ctx, req)
 	if err != nil {
-		cwGenLog.Warn("组件匹配失败", "page_num", page.PageNumber, "error", err)
+		cwGenLog.Warn(
+			"组件匹配失败",
+			"page_num", page.PageNumber,
+			"interaction_type", page.InteractionType,
+			"visual_format", page.VisualFormat,
+			"error", err,
+		)
 		return nil
 	}
-	return matched
+
+	filtered := filterCWComponentsForInteraction(
+		matched,
+		page.InteractionType,
+	)
+	if len(filtered) == 0 {
+		if len(matched) > 0 &&
+			normalizeCWInteractionType(page.InteractionType) != "" &&
+			normalizeCWInteractionType(page.InteractionType) != "static" {
+			cwGenLog.Info(
+				"候选组件均与方案互动类型冲突，本页不注入参考组件",
+				"page_num", page.PageNumber,
+				"interaction_type", page.InteractionType,
+				"candidate_count", len(matched),
+			)
+		}
+		return nil
+	}
+
+	if len(filtered) > 2 {
+		filtered = filtered[:2]
+	}
+	return filtered
 }
 
 // ==================== HTML提取 ====================
@@ -1086,38 +1104,64 @@ func (s *CoursewareGenService) extractHTMLFromAIOutput(aiOutput string) string {
 		return ""
 	}
 
-	// 去除markdown代码块标记
 	text = cwGenStripCodeFences(text)
+	lower := strings.ToLower(text)
 
-	// 查找第一个<div开始的位置
-	divStart := strings.Index(text, "<div")
-	if divStart < 0 {
-		// 可能包含完整HTML文档结构
-		htmlStart := strings.Index(text, "<html")
-		if htmlStart >= 0 {
-			return text[htmlStart:]
+	// 完整HTML文档优先。
+	// 旧逻辑先寻找<div>，会从<header>内部的第一个div开始截取，
+	// 把DOCTYPE、head、style、header开头以及尾部script/body/html全部丢掉。
+	docStart := -1
+	if idx := strings.Index(lower, "<!doctype html"); idx >= 0 {
+		docStart = idx
+	}
+	if idx := strings.Index(lower, "<html"); idx >= 0 && (docStart < 0 || idx < docStart) {
+		docStart = idx
+	}
+	if docStart >= 0 {
+		if relEnd := strings.LastIndex(lower[docStart:], "</html>"); relEnd >= 0 {
+			end := docStart + relEnd + len("</html>")
+			return strings.TrimSpace(text[docStart:end])
 		}
-		// 最后尝试返回全部文本（可能就是纯HTML）
-		if strings.Contains(text, "<") && strings.Contains(text, ">") {
-			return text
+		// 未找到</html>时仍保留完整文档起点，由后续结构校验负责拦截残缺内容。
+		return strings.TrimSpace(text[docStart:])
+	}
+
+	// 普通课件片段：支持<div>和<section>根节点，选择最早出现的一个。
+	type rootCandidate struct {
+		start    int
+		closeTag string
+	}
+	candidates := make([]rootCandidate, 0, 2)
+
+	if idx := strings.Index(lower, "<div"); idx >= 0 {
+		candidates = append(candidates, rootCandidate{start: idx, closeTag: "</div>"})
+	}
+	if idx := strings.Index(lower, "<section"); idx >= 0 {
+		candidates = append(candidates, rootCandidate{start: idx, closeTag: "</section>"})
+	}
+
+	if len(candidates) > 0 {
+		chosen := candidates[0]
+		for _, candidate := range candidates[1:] {
+			if candidate.start < chosen.start {
+				chosen = candidate
+			}
 		}
-		return ""
+
+		part := text[chosen.start:]
+		partLower := strings.ToLower(part)
+		if last := strings.LastIndex(partLower, chosen.closeTag); last >= 0 {
+			part = part[:last+len(chosen.closeTag)]
+		}
+		return strings.TrimSpace(part)
 	}
 
-	// 从<div开始提取
-	htmlPart := text[divStart:]
-
-	// 简单验证：至少有一个闭合的div
-	if !strings.Contains(htmlPart, "</div>") {
-		return ""
+	// 其它合法HTML片段，例如<body>或<header>片段。
+	if strings.Contains(text, "<") && strings.Contains(text, ">") {
+		return strings.TrimSpace(text)
 	}
 
-	// 截断到最后一个 </div>，剥掉 AI 在 HTML 之后追加的解释文字 / 代码围栏残留
-	if last := strings.LastIndex(htmlPart, "</div>"); last >= 0 {
-		htmlPart = htmlPart[:last+len("</div>")]
-	}
-
-	return strings.TrimSpace(htmlPart)
+	return ""
 }
 
 // cwGenStripCodeFences 去除AI输出中的markdown代码块标记

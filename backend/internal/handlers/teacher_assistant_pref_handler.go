@@ -56,6 +56,15 @@ type getPrefResponse struct {
 //
 // 存量偏好若不适用于本次具体年级或阶段，返回has_record=false，
 // 但不删除数据库中的原偏好。
+
+// GetPref GET /assistant-prefs?subject=&grade=&stage=
+//
+// 偏好表仍按老师×学科保存。
+// 读取时重新校验active、可见性、学科和当前阶段，
+// 具体年级不再阻断老师保存的手动偏好。
+//
+// 偏好在当前学科或阶段不适用时返回has_record=false，
+// 但不删除数据库中的原偏好。
 func (h *TeacherAssistantPrefHandler) GetPref(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -71,15 +80,24 @@ func (h *TeacherAssistantPrefHandler) GetPref(
 
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims.UserID == "" {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		utils.Unauthorized(
+			w,
+			utils.MsgNotLoggedIn,
+		)
 		return
 	}
 
 	query := r.URL.Query()
-	subject := strings.TrimSpace(query.Get("subject"))
-	grade := strings.TrimSpace(query.Get("grade"))
+	subject := strings.TrimSpace(
+		query.Get("subject"),
+	)
+	grade := strings.TrimSpace(
+		query.Get("grade"),
+	)
 	scene := stageToAssistantScene(
-		strings.TrimSpace(query.Get("stage")),
+		strings.TrimSpace(
+			query.Get("stage"),
+		),
 	)
 
 	if subject == "" {
@@ -126,16 +144,16 @@ func (h *TeacherAssistantPrefHandler) GetPref(
 	)
 
 	assistant, validateErr :=
-		h.assistantService.ValidateAssistantForLesson(
-			r.Context(),
-			actor,
-			assistantID,
-			subject,
-			grade,
-			scene,
-		)
+		h.assistantService.
+			ValidateAssistantForManualLesson(
+				r.Context(),
+				actor,
+				assistantID,
+				subject,
+				scene,
+			)
+
 	if validateErr != nil || assistant == nil {
-		// 原偏好仍保留在数据库，但本年级/本阶段不生效。
 		response.HasRecord = false
 		response.AssistantID = ""
 		response.AssistantName = ""
@@ -152,6 +170,18 @@ func (h *TeacherAssistantPrefHandler) GetPref(
 //
 // 具体助手必须与请求中的学科、具体年级及阶段匹配。
 // assistant_id为空仍表示老师明确选择系统默认。
+
+// PutPref PUT /assistant-prefs
+//
+// assistant_id为空表示老师明确选择系统默认。
+//
+// 非空助手必须满足：
+//   - active；
+//   - 当前老师可见；
+//   - 与请求学科一致；
+//   - 支持当前阶段。
+//
+// 具体年级不作为手动偏好的阻断条件。
 func (h *TeacherAssistantPrefHandler) PutPref(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -167,7 +197,10 @@ func (h *TeacherAssistantPrefHandler) PutPref(
 
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims.UserID == "" {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		utils.Unauthorized(
+			w,
+			utils.MsgNotLoggedIn,
+		)
 		return
 	}
 
@@ -175,7 +208,10 @@ func (h *TeacherAssistantPrefHandler) PutPref(
 	if err := json.NewDecoder(r.Body).Decode(
 		&request,
 	); err != nil {
-		utils.BadRequest(w, utils.MsgBadRequestBody)
+		utils.BadRequest(
+			w,
+			utils.MsgBadRequestBody,
+		)
 		return
 	}
 
@@ -198,6 +234,7 @@ func (h *TeacherAssistantPrefHandler) PutPref(
 	}
 
 	assistantName := ""
+
 	if assistantID != "" {
 		actor := services.BuildActorFromClaims(
 			r.Context(),
@@ -206,21 +243,23 @@ func (h *TeacherAssistantPrefHandler) PutPref(
 		)
 
 		assistant, err :=
-			h.assistantService.ValidateAssistantForLesson(
-				r.Context(),
-				actor,
-				assistantID,
-				subject,
-				grade,
-				scene,
-			)
+			h.assistantService.
+				ValidateAssistantForManualLesson(
+					r.Context(),
+					actor,
+					assistantID,
+					subject,
+					scene,
+				)
+
 		if err != nil || assistant == nil {
 			utils.BadRequest(
 				w,
-				"选择的助手不适用于当前学科、具体年级或阶段",
+				"选择的助手当前不可用，或不适用于当前学科和阶段",
 			)
 			return
 		}
+
 		assistantName = assistant.Name
 	}
 
@@ -247,6 +286,11 @@ func (h *TeacherAssistantPrefHandler) PutPref(
 // GetOptions GET /assistant-options?subject=&grade=&stage=
 //
 // 只返回同学科、同具体年级、当前场景可用的助手。
+
+// GetOptions GET /assistant-options?subject=&grade=&stage=
+//
+// 返回同学科、当前场景下老师可见的全部active助手。
+// 具体年级仅用于相关性排序，不再过滤手动候选。
 func (h *TeacherAssistantPrefHandler) GetOptions(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -262,15 +306,24 @@ func (h *TeacherAssistantPrefHandler) GetOptions(
 
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims.UserID == "" {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		utils.Unauthorized(
+			w,
+			utils.MsgNotLoggedIn,
+		)
 		return
 	}
 
 	query := r.URL.Query()
-	subject := strings.TrimSpace(query.Get("subject"))
-	grade := strings.TrimSpace(query.Get("grade"))
+	subject := strings.TrimSpace(
+		query.Get("subject"),
+	)
+	grade := strings.TrimSpace(
+		query.Get("grade"),
+	)
 	scene := stageToAssistantScene(
-		strings.TrimSpace(query.Get("stage")),
+		strings.TrimSpace(
+			query.Get("stage"),
+		),
 	)
 
 	if subject == "" {
@@ -288,14 +341,15 @@ func (h *TeacherAssistantPrefHandler) GetOptions(
 		claims.Role,
 	)
 
-	response, err := h.assistantService.ListAssistants(
-		r.Context(),
-		actor,
-		scene,
-		subject,
-		grade,
-		true,
-	)
+	response, err :=
+		h.assistantService.
+			ListAssistantsForManualLesson(
+				r.Context(),
+				actor,
+				scene,
+				subject,
+				grade,
+			)
 	if err != nil {
 		utils.InternalError(w, "查询可选助手失败")
 		return

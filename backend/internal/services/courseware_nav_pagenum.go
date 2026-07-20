@@ -35,30 +35,60 @@ var cwNavPageNumDivRe = regexp.MustCompile(
 //  2. div剥除未命中时，回退剥裸文本页码（先保护URL再正则替换）——兼容非div包裹的页码。
 //
 // 剥除后模板只含logo+机构名等结构元素，页码由 injectPageNumIntoNav 拼接时追加。
-func StripNavPageNumbers(navHTML string) string {
-	result := navHTML
 
-	// 策略1：剥整个页码div容器
-	stripped := cwNavPageNumDivRe.ReplaceAllString(result, "")
-	if strings.TrimSpace(stripped) != strings.TrimSpace(result) {
-		return strings.TrimSpace(stripped)
+var (
+	// 页码三段：分子、原始分隔符、分母。用于保留01/18、1 / 18等模板原格式。
+	cwNavPagePartsRe = regexp.MustCompile(`(\d+)(\s*/\s*)(\d+)`)
+
+	// 新模板占位符支持记录前导零宽度，如{{PAGE_NUM_2}}。
+	cwNavPagePlaceholderRe  = regexp.MustCompile(`\{\{PAGE_NUM(?:_(\d+))?\}\}`)
+	cwNavTotalPlaceholderRe = regexp.MustCompile(`\{\{TOTAL_PAGES(?:_(\d+))?\}\}`)
+)
+
+func StripNavPageNumbers(navHTML string) string {
+	nav := strings.TrimSpace(navHTML)
+	if nav == "" {
+		return nav
 	}
 
-	// 策略2：回退剥裸文本页码（先保护URL上下文，再剥页码文本，再还原URL）
+	// 保护src/href/url()，避免资源URL里的数字被误当成页码。
 	guards := make([]string, 0, 8)
-	guardIdx := 0
-	protected := cwNavURLGuardRe.ReplaceAllStringFunc(result, func(m string) string {
-		// 用 ASCII BEL 字符做占位（Go源码合法，不会出现在HTML中）
-		token := fmt.Sprintf("\x07GUARD%d\x07", guardIdx)
+	protected := cwNavURLGuardRe.ReplaceAllStringFunc(nav, func(m string) string {
+		token := fmt.Sprintf("\x07GUARD%d\x07", len(guards))
 		guards = append(guards, m)
-		guardIdx++
 		return token
 	})
-	protected = cwNavPageNumRe.ReplaceAllString(protected, "")
-	for i, g := range guards {
+
+	// 保留原页码DOM、class、位置、分隔符和前导零，仅替换第一处数字。
+	replaced := false
+	protected = cwNavPagePartsRe.ReplaceAllStringFunc(protected, func(m string) string {
+		if replaced {
+			return m
+		}
+		parts := cwNavPagePartsRe.FindStringSubmatch(m)
+		if len(parts) != 4 {
+			return m
+		}
+
+		pageToken := "{{PAGE_NUM}}"
+		if len(parts[1]) > 1 && strings.HasPrefix(parts[1], "0") {
+			pageToken = fmt.Sprintf("{{PAGE_NUM_%d}}", len(parts[1]))
+		}
+
+		totalToken := "{{TOTAL_PAGES}}"
+		if len(parts[3]) > 1 && strings.HasPrefix(parts[3], "0") {
+			totalToken = fmt.Sprintf("{{TOTAL_PAGES_%d}}", len(parts[3]))
+		}
+
+		replaced = true
+		return pageToken + parts[2] + totalToken
+	})
+
+	for i, original := range guards {
 		token := fmt.Sprintf("\x07GUARD%d\x07", i)
-		protected = strings.Replace(protected, token, g, 1)
+		protected = strings.Replace(protected, token, original, 1)
 	}
+
 	return strings.TrimSpace(protected)
 }
 
@@ -76,21 +106,116 @@ func buildNavPageNumDiv(pageNum int, totalPages int) string {
 // 导航栏典型结构：<div style="...flex;justify-content:space-between;...">左侧logo...</div>
 // 页码div插入到外层闭合 </div> 之前，flex + space-between 自动推到右端。
 // 同时清理可能残留的旧占位符（兼容存量数据）。
+func cwNavPlaceholderWidth(token string) int {
+	underscore := strings.LastIndex(token, "_")
+	end := strings.LastIndex(token, "}}")
+	if underscore < 0 || end <= underscore+1 {
+		return 0
+	}
+
+	width := 0
+	for _, ch := range token[underscore+1 : end] {
+		if ch < '0' || ch > '9' {
+			return 0
+		}
+		width = width*10 + int(ch-'0')
+	}
+	return width
+}
+
+func cwFormatNavNumber(value int, width int) string {
+	if width > 0 {
+		return fmt.Sprintf("%0*d", width, value)
+	}
+	return fmt.Sprintf("%d", value)
+}
+
+func cwInsertFallbackPageDiv(nav string, pageDiv string) string {
+	trimmed := strings.TrimSpace(nav)
+	lower := strings.ToLower(trimmed)
+
+	// 按导航根标签插入，避免header/nav结构中的页码被塞进最后一个内部div。
+	for _, tagName := range []string{"header", "nav", "div"} {
+		openPrefix := "<" + tagName
+		if !strings.HasPrefix(lower, openPrefix) {
+			continue
+		}
+
+		closeTag := "</" + tagName + ">"
+		closeIndex := strings.LastIndex(lower, closeTag)
+		if closeIndex >= 0 {
+			return trimmed[:closeIndex] +
+				"\n  " + pageDiv + "\n" +
+				trimmed[closeIndex:]
+		}
+	}
+
+	return trimmed + "\n" + pageDiv
+}
+
 func injectPageNumIntoNav(navTemplate string, pageNum int, totalPages int) string {
 	nav := strings.TrimSpace(navTemplate)
 	if nav == "" {
 		return nav
 	}
-	// 清理可能残留的旧占位符文本（兼容存量已保存含占位符的模板）
-	nav = strings.ReplaceAll(nav, "{{PAGE_NUM}}", "")
-	nav = strings.ReplaceAll(nav, "{{TOTAL_PAGES}}", "")
 
-	pageDiv := buildNavPageNumDiv(pageNum, totalPages)
+	hadPlaceholder :=
+		cwNavPagePlaceholderRe.MatchString(nav) ||
+			cwNavTotalPlaceholderRe.MatchString(nav)
 
-	// 找最后一个 </div>，在其前面插入页码div
-	lastClose := strings.LastIndex(nav, "</div>")
-	if lastClose < 0 {
-		return nav + "\n" + pageDiv
+	if hadPlaceholder {
+		nav = cwNavPagePlaceholderRe.ReplaceAllStringFunc(nav, func(token string) string {
+			return cwFormatNavNumber(pageNum, cwNavPlaceholderWidth(token))
+		})
+		nav = cwNavTotalPlaceholderRe.ReplaceAllStringFunc(nav, func(token string) string {
+			return cwFormatNavNumber(totalPages, cwNavPlaceholderWidth(token))
+		})
+		return nav
 	}
-	return nav[:lastClose] + "\n  " + pageDiv + "\n" + nav[lastClose:]
+
+	// 兼容没有占位符的存量模板：替换第一处真实页码，同时保留分隔与补零风格。
+	guards := make([]string, 0, 8)
+	protected := cwNavURLGuardRe.ReplaceAllStringFunc(nav, func(m string) string {
+		token := fmt.Sprintf("\x07GUARD%d\x07", len(guards))
+		guards = append(guards, m)
+		return token
+	})
+
+	replaced := false
+	protected = cwNavPagePartsRe.ReplaceAllStringFunc(protected, func(m string) string {
+		if replaced {
+			return m
+		}
+		parts := cwNavPagePartsRe.FindStringSubmatch(m)
+		if len(parts) != 4 {
+			return m
+		}
+
+		pageWidth := 0
+		if len(parts[1]) > 1 && strings.HasPrefix(parts[1], "0") {
+			pageWidth = len(parts[1])
+		}
+
+		totalWidth := 0
+		if len(parts[3]) > 1 && strings.HasPrefix(parts[3], "0") {
+			totalWidth = len(parts[3])
+		}
+
+		replaced = true
+		return cwFormatNavNumber(pageNum, pageWidth) +
+			parts[2] +
+			cwFormatNavNumber(totalPages, totalWidth)
+	})
+
+	for i, original := range guards {
+		token := fmt.Sprintf("\x07GUARD%d\x07", i)
+		protected = strings.Replace(protected, token, original, 1)
+	}
+
+	if replaced {
+		return strings.TrimSpace(protected)
+	}
+
+	// 模板根本没有页码区域时，才追加平台兜底页码。
+	return cwInsertFallbackPageDiv(nav, buildNavPageNumDiv(pageNum, totalPages))
 }

@@ -341,6 +341,11 @@ export interface ListAssistantsParams {
   subject?: string
   /** 年级筛选(空=全部) */
   grade?: string
+  /**
+   * 具体教案页面使用，后端据此采用教案教育域快照。
+   * 未传时继续使用登录用户当前Actor教育域。
+   */
+  lesson_plan_id?: string
   /** 是否只显示激活的 */
   only_active?: boolean
 }
@@ -367,6 +372,12 @@ export async function listAssistants(params?: ListAssistantsParams): Promise<AIA
   if (params?.scene) query.set('scene', params.scene)
   if (params?.subject) query.set('subject', params.subject)
   if (params?.grade) query.set('grade', params.grade)
+  if (params?.lesson_plan_id) {
+    query.set(
+      'lesson_plan_id',
+      params.lesson_plan_id,
+    )
+  }
   if (params?.only_active !== undefined) query.set('only_active', String(params.only_active))
   const qs = query.toString()
   const url = `/ai-assistants${qs ? '?' + qs : ''}`

@@ -145,7 +145,17 @@ type AIAssistant struct {
 	Description string `json:"description"`
 
 	// 来源与归属
-	Source         string  `json:"source"`          // system | group | personal
+	Source string `json:"source"` // system | group | personal
+
+	// EducationDomain 教学资源教育域快照：k12 / vocational / adult / common。
+	//
+	// 本字段由数据库触发器在创建或Fork时确定，API请求不得自行指定：
+	//   - 普通创建按创建者当前教学教育域；
+	//   - Fork继承来源助手教育域；
+	//   - system助手由数据库规则确定。
+	// mixed绝不能写入教学资源。
+	EducationDomain string `json:"education_domain"`
+
 	CreatedBy      *string `json:"created_by"`      // 创建者用户 ID
 	OrganizationID *string `json:"organization_id"` // source=group 时填写(学校 ID)
 	// GroupID:教研组 ID。里程碑一启用——
@@ -195,21 +205,25 @@ type AIAssistant struct {
 
 // AIAssistantListItem 列表返回项,附带创建者显示名和学校名(便于前端展示)
 type AIAssistantListItem struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	AvatarEmoji string   `json:"avatar_emoji"`
-	Description string   `json:"description"`
-	Source      string   `json:"source"`
-	SourceLabel string   `json:"source_label"` // 中文展示:系统/本校/我的
-	Subject     string   `json:"subject"`
-	GradeRange  string   `json:"grade_range"`
-	Scenes      []string `json:"scenes"` // 已解析为字符串数组
-	UseCount    int      `json:"use_count"`
-	AvgScore    *float64 `json:"avg_score"`
-	IsActive    bool     `json:"is_active"`
-	IsDefaultHere bool   `json:"is_default_here"` // 是否在当前场景被标为默认
-	CanEdit       bool   `json:"can_edit"`        // 当前用户能否编辑
-	CanDelete     bool   `json:"can_delete"`      // 当前用户能否删除
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	AvatarEmoji string `json:"avatar_emoji"`
+	Description string `json:"description"`
+	Source      string `json:"source"`
+	SourceLabel string `json:"source_label"` // 中文展示:系统/本校/我的
+
+	// EducationDomain 资源所属教育域，供管理页展示和调用方确认隔离边界。
+	EducationDomain string `json:"education_domain"`
+
+	Subject       string   `json:"subject"`
+	GradeRange    string   `json:"grade_range"`
+	Scenes        []string `json:"scenes"` // 已解析为字符串数组
+	UseCount      int      `json:"use_count"`
+	AvgScore      *float64 `json:"avg_score"`
+	IsActive      bool     `json:"is_active"`
+	IsDefaultHere bool     `json:"is_default_here"` // 是否在当前场景被标为默认
+	CanEdit       bool     `json:"can_edit"`        // 当前用户能否编辑
+	CanDelete     bool     `json:"can_delete"`      // 当前用户能否删除
 
 	// CanFork:当前用户能否把该助手 fork 成自己的(本次新增)
 	//   = 可见 && (share_policy=open || 自己是属主 || admin)
@@ -239,7 +253,8 @@ type AIAssistantListItem struct {
 
 // SourceLabelMap source → 中文展示名
 // 注:group 来源细分两档的展示文案(教研组级/全校级)由前端按 group_id 有无区分,
-//    此处保留 source 维度的兜底标签。
+//
+//	此处保留 source 维度的兜底标签。
 var SourceLabelMap = map[string]string{
 	AssistantSourceSystem:   "系统",
 	AssistantSourceGroup:    "本校",
@@ -312,6 +327,13 @@ type ListAIAssistantsParams struct {
 	CurrentUserID   string // 当前用户 ID(用于过滤 personal)
 	CurrentUserRole string // 当前用户角色
 	CurrentSchoolID string // 当前用户所属学校 ID(用于过滤 group 全校级,可为空)
+
+	// CurrentEducationDomain 当前调用上下文的教育域。
+	//
+	// 普通教学入口为k12/vocational/adult；管理页面可为mixed。
+	// 进入具体教案运行时，调用方必须用教案education_domain快照覆盖本值，
+	// 不能继续使用mixed管理员上下文。
+	CurrentEducationDomain string
 
 	// 里程碑一新增:当前用户所属的全部教研组 ID 集合
 	//   用于可见性过滤教研组级 group 助手(group 来源 + group_id IN 本集合)

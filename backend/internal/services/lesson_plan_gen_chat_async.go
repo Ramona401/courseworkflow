@@ -416,63 +416,19 @@ func (s *LessonPlanGenService) processChatStageAsync(
 		"assistant_injected", assistantPrompt != "",
 		"full_generate", fullGenerate)
 
-	// ==================== v204：Harness 输出采集（best-effort，绝不阻塞主流程）====================
-	// 主流程已全部完成（message_done / 芯片均已送达老师），此处把本轮的「输入画像 + 输出全文」
-	// 落库到 harness_eval_samples，供后台 judge 分析与 admin 标注。
-	// 独立 goroutine + recover 兜底 + 写失败仅 Warn——采集的任何问题都不波及老师备课。
-	// 取值全部来自本函数已算好的变量；唯一新增计算是 is_downgraded（查学校境外授权，fail-safe）。
-	// 存输出用 rawContent（AI 原始全文，含各围栏块），judge 需要法医级原始证据。
-	go func(
-		planID, stageCode, authorID, schoolID, assistantID, assistantLabel,
-		modelUsed, sysPrompt, aiRaw string,
-	) {
-		defer func() {
-			if r := recover(); r != nil {
-				lpGenLog.Warn("harness采集 goroutine panic，已兜底忽略",
-					"plan_id", planID, "stage", stageCode, "panic", r)
-			}
-		}()
-
-		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		// 计算 is_downgraded：学校未授权境外模型 → 本轮 generator 走境内降级。
-		// fail-safe：schoolID 空或查询出错 → 按"未授权=降级"无法确定时，沿用 IsSchoolOverseasEnabled
-		// 的 fail-closed 语义（出错返 false=未授权），即 is_downgraded=true 偏保守；
-		// 但查询出错本身只记 Warn，绝不让采集失败。
-		isDowngraded := false
-		if enabled, qerr := repository.IsSchoolOverseasEnabled(bgCtx, schoolID); qerr != nil {
-			lpGenLog.Warn("harness采集-查学校境外授权失败，is_downgraded 按未授权(降级)保守处理",
-				"plan_id", planID, "school_id", schoolID, "error", qerr)
-			isDowngraded = true // 查不到授权状态时保守标记为降级（与系统 fail-closed 一致）
-		} else {
-			isDowngraded = !enabled // 已授权=不降级；未授权=降级
-		}
-
-		in := repository.HarnessEvalSampleInput{
-			LessonPlanID:  planID,
-			StageCode:     stageCode,
-			UserID:        authorID,
-			SchoolID:      schoolID,
-			ModelUsed:     modelUsed,
-			IsDowngraded:  isDowngraded,
-			AssistantID:   assistantID,
-			AssistantName: assistantLabel,
-			SystemPrompt:  sysPrompt,
-			AIOutput:      aiRaw,
-		}
-		if err := repository.InsertHarnessEvalSample(bgCtx, in); err != nil {
-			lpGenLog.Warn("harness采集-写入样本失败（不影响主流程）",
-				"plan_id", planID, "stage", stageCode, "error", err)
-			return
-		}
-		lpGenLog.Info("harness采集-样本已落库",
-			"plan_id", planID, "stage", stageCode, "model", modelUsed,
-			"is_downgraded", isDowngraded, "assistant", assistantLabel,
-			"sys_prompt_len", len(sysPrompt), "ai_output_len", len(aiRaw))
-	}(
-		planID, currentStage, lp.AuthorID, lpSchoolID, req.AssistantID, assistantLabel,
-		result.ModelUsed, stageSystemPrompt, rawContent,
+	// ==================== v204：Harness输出采集 ====================
+	// 老师已收到message_done和建议芯片；此处在Tracked主任务尾部best-effort执行。
+	// 最长等待5秒，不再产生主任务之外的未登记goroutine。
+	s.captureHarnessSampleBestEffort(
+		planID,
+		currentStage,
+		lp.AuthorID,
+		lpSchoolID,
+		req.AssistantID,
+		assistantLabel,
+		result.ModelUsed,
+		stageSystemPrompt,
+		rawContent,
 	)
 
 	// v87：对话完成后异步检测停滞，插入教练建议

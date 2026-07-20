@@ -19,6 +19,8 @@
  *   - HistoryTab 回退失败由 alert 改为 Toast 轻提示,与 PublishTab 风格统一
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { useAuth } from '@/store/auth'
+import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import {
   refineTemplate, subscribeTemplateRefineSSE, getTemplateHistory,
   rollbackTemplate, publishDraft, deleteDraft, getPublishTargets,
@@ -233,7 +235,25 @@ function RefineTab({ template, onRefineDone }: {
   template: CoursewareTemplate
   onRefineDone: (updated: CoursewareTemplate) => void
 }) {
-  const [instruction, setInstruction] = useState('')
+  const { user } = useAuth()
+
+  /**
+   * AI微调指令按当前用户和模板ID隔离。
+   *
+   * SSE真正完成后才提交清空；
+   * 请求失败、SSE失败、切换Tab或关闭弹窗时均保留。
+   */
+  const instructionDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'template-refine',
+    resourceId: template.id,
+    field: 'instruction',
+    initialValue: '',
+    maxHistory: 40,
+  })
+
+  const instruction = instructionDraft.value
+  const setInstruction = instructionDraft.setValue
   const [refining, setRefining] = useState(false)
   const [progressMsg, setProgressMsg] = useState('')
   const [chunkCount, setChunkCount] = useState(0)
@@ -277,7 +297,8 @@ function RefineTab({ template, onRefineDone }: {
         }
         setRefining(false)
         setProgressMsg('')
-        setInstruction('')
+        // SSE已经完整完成后才提交指令草稿。
+        instructionDraft.commit()
         onRefineDone(updated)
       },
       onError: d => {
@@ -306,6 +327,9 @@ function RefineTab({ template, onRefineDone }: {
         <textarea
           value={instruction}
           onChange={e => setInstruction(e.target.value)}
+          onKeyDown={e => {
+            instructionDraft.handleKeyDown(e)
+          }}
           disabled={refining}
           placeholder="用自然语言描述你想要的修改,例如:把主色改成更柔和的天蓝色,圆角加大..."
           style={{
@@ -363,6 +387,8 @@ function RefineTab({ template, onRefineDone }: {
       </div>
 
       <div style={{ fontSize: '12px', color: C.textMuted, lineHeight: 1.6, padding: '10px 14px', background: '#F9FAFB', borderRadius: '8px' }}>
+        💾 修改指令已自动保存，微调失败或切换Tab不会丢失；Ctrl/Command+Z可恢复误删。
+        <br />
         💡 微调会自动保存修改前的版本到历史快照(最多保留 20 条),你可以随时回退到任意历史版本。
       </div>
       <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
@@ -471,12 +497,88 @@ function PublishTab({ template, onPublished, onDeleted, showToast }: {
   onDeleted: () => void
   showToast: (t: { message: string; type: 'success' | 'error' }) => void
 }) {
-  // 表单字段
-  const [name, setName] = useState(template.name)
-  const [desc, setDesc] = useState(template.description || '')
-  const [category, setCategory] = useState(template.style_category)
-  const [scope, setScope] = useState<'personal' | 'school' | 'group' | 'system'>('personal')
-  const [selectedGroupID, setSelectedGroupID] = useState('') // group scope 时选中的教研组 ID
+  const { user } = useAuth()
+
+  /**
+   * 模板发布表单按当前用户和模板ID隔离。
+   *
+   * 发布失败、切换Tab或关闭弹窗后仍可恢复。
+   */
+  const nameDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'template-publish',
+    resourceId: template.id,
+    field: 'name',
+    initialValue: template.name,
+    maxHistory: 30,
+  })
+  const name = nameDraft.value
+  const setName = nameDraft.setValue
+
+  const descriptionDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'template-publish',
+    resourceId: template.id,
+    field: 'description',
+    initialValue: template.description || '',
+    maxHistory: 30,
+  })
+  const desc = descriptionDraft.value
+  const setDesc = descriptionDraft.setValue
+
+  const categoryDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'template-publish',
+    resourceId: template.id,
+    field: 'category',
+    initialValue: template.style_category,
+    maxHistory: 20,
+  })
+  const category =
+    categoryDraft.value ||
+    template.style_category
+  const setCategory = categoryDraft.setValue
+
+  const scopeDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'template-publish',
+    resourceId: template.id,
+    field: 'scope',
+    initialValue: 'personal',
+    maxHistory: 20,
+  })
+  const scopeValue = scopeDraft.value
+  const scope:
+    | 'personal'
+    | 'school'
+    | 'group'
+    | 'system' =
+    scopeValue === 'school' ||
+    scopeValue === 'group' ||
+    scopeValue === 'system'
+      ? scopeValue
+      : 'personal'
+
+  const setScope = (
+    value:
+      | 'personal'
+      | 'school'
+      | 'group'
+      | 'system',
+  ) => {
+    scopeDraft.setValue(value)
+  }
+
+  const groupDraft = useProtectedDraft({
+    userId: user?.id,
+    scope: 'template-publish',
+    resourceId: template.id,
+    field: 'group-id',
+    initialValue: '',
+    maxHistory: 20,
+  })
+  const selectedGroupID = groupDraft.value
+  const setSelectedGroupID = groupDraft.setValue
 
   // 发布目标(后端返回)
   const [targets, setTargets] = useState<PublishTargetsResponse | null>(null)
@@ -496,12 +598,36 @@ function PublishTab({ template, onPublished, onDeleted, showToast }: {
       .finally(() => setLoadingTargets(false))
   }, [])
 
-  // 切换到 group scope 时,自动选中第一个组
+  // 已缓存的发布范围失去权限时，自动回退到个人模板。
   useEffect(() => {
-    if (scope === 'group' && targets && targets.groups.length > 0) {
-      setSelectedGroupID(targets.groups[0].id)
+    if (!targets) return
+
+    const scopeStillAvailable =
+      scope === 'personal' ||
+      (scope === 'school' && targets.school.available) ||
+      (scope === 'group' && targets.groups.length > 0) ||
+      (scope === 'system' && targets.system.available)
+
+    if (!scopeStillAvailable) {
+      setScope('personal')
     }
-  }, [scope, targets, selectedGroupID])
+  }, [scope, targets])
+
+  // 切换到 group scope 时,自动选中第一个有效组
+  useEffect(() => {
+    if (scope !== 'group' || !targets || targets.groups.length === 0) {
+      return
+    }
+
+    if (
+      selectedGroupID &&
+      targets.groups.some(group => group.id === selectedGroupID)
+    ) {
+      return
+    }
+
+    setSelectedGroupID(targets.groups[0].id)
+  }, [scope, targets, selectedGroupID, setSelectedGroupID])
 
   const handlePublish = async () => {
     setError('')
@@ -536,6 +662,12 @@ function PublishTab({ template, onPublished, onDeleted, showToast }: {
         scope_target_id: scopeTargetID,
       })
       showToast({ message: `模板「${name}」已成功发布`, type: 'success' })
+      // 发布成功后清除全部已消费表单草稿。
+      nameDraft.clear()
+      descriptionDraft.clear()
+      categoryDraft.clear()
+      scopeDraft.clear()
+      groupDraft.clear()
       onPublished()
     } catch (e) {
       const msg = (e as { response?: { data?: { message?: string } } })?.response?.data?.message
@@ -550,6 +682,12 @@ function PublishTab({ template, onPublished, onDeleted, showToast }: {
     setDeleting(true)
     try {
       await deleteDraft(template.id)
+      // 草稿模板已删除，对应发布表单一并清除。
+      nameDraft.clear()
+      descriptionDraft.clear()
+      categoryDraft.clear()
+      scopeDraft.clear()
+      groupDraft.clear()
       onDeleted()
     } catch (e) {
       const msg = (e as { response?: { data?: { message?: string } } })?.response?.data?.message
@@ -614,7 +752,7 @@ function PublishTab({ template, onPublished, onDeleted, showToast }: {
       {/* 模板名称 */}
       <div>
         <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, display: 'block', marginBottom: '6px' }}>模板名称 *</label>
-        <input value={name} onChange={e => setName(e.target.value)} disabled={publishing} style={{
+        <input value={name} onChange={e => setName(e.target.value)} onKeyDown={e => { nameDraft.handleKeyDown(e) }} disabled={publishing} style={{
           width: '100%', padding: '10px 14px', borderRadius: '8px', border: `1px solid ${C.border}`,
           fontSize: '14px', outline: 'none', background: publishing ? '#F9FAFB' : '#fff',
         }} />
@@ -623,7 +761,7 @@ function PublishTab({ template, onPublished, onDeleted, showToast }: {
       {/* 描述 */}
       <div>
         <label style={{ fontSize: '13px', fontWeight: 600, color: C.textPrimary, display: 'block', marginBottom: '6px' }}>描述</label>
-        <input value={desc} onChange={e => setDesc(e.target.value)} disabled={publishing} placeholder="简短描述模板特点(可选)" style={{
+        <input value={desc} onChange={e => setDesc(e.target.value)} onKeyDown={e => { descriptionDraft.handleKeyDown(e) }} disabled={publishing} placeholder="简短描述模板特点(可选)" style={{
           width: '100%', padding: '10px 14px', borderRadius: '8px', border: `1px solid ${C.border}`,
           fontSize: '14px', outline: 'none', background: publishing ? '#F9FAFB' : '#fff',
         }} />
@@ -718,6 +856,10 @@ function PublishTab({ template, onPublished, onDeleted, showToast }: {
           ⚠️ {error}
         </div>
       )}
+
+      <div style={{ fontSize: '11px', color: C.textMuted, lineHeight: 1.6, padding: '8px 11px', background: '#F9FAFB', borderRadius: '8px' }}>
+        发布表单已自动保存 · 发布失败不会清除 · Ctrl/Command+Z恢复文字误删
+      </div>
 
       {/* 底部按钮:删除草稿 + 立即发布 */}
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', marginTop: '10px' }}>
