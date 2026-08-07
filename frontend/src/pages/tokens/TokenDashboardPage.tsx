@@ -81,10 +81,18 @@ import { useState, useEffect, useCallback } from 'react'
 import { useAuth } from '@/store/auth'
 import { useNavigate } from 'react-router-dom'
 import {
-  getTokenOverview, getTokenAccounts, getTokenAllocations,
-  getTokenPurchases, getTokenConsumption,
-  type TokenOverviewStats, type TokenAccountListItem,
-  type AllocationListItem, type PurchaseListItem, type ConsumptionListItem,
+  getMyTokenAccount,
+  getTokenOverview,
+  getTokenAccounts,
+  getTokenAllocations,
+  getTokenPurchases,
+  getTokenConsumption,
+  type MyTokenAccountResponse,
+  type TokenOverviewStats,
+  type TokenAccountListItem,
+  type AllocationListItem,
+  type PurchaseListItem,
+  type ConsumptionListItem,
 } from '@/api/tokens'
 import {
   C, tabBtnStyle, inputStyle,
@@ -134,6 +142,7 @@ export default function TokenDashboardPage() {
   const navigate = useNavigate()
   const role = user?.role || ''
   const isAdmin = role === 'admin'
+  const isSuperAdmin = isAdmin && user?.is_super === true
   const isSchoolAdmin = role === 'senior_operator'
   const isRegionAdmin = role === 'region_admin' // region_admin batch：区域管理员
 
@@ -148,24 +157,35 @@ export default function TokenDashboardPage() {
   const isPersonal = !isManager
 
   // 可见Tab：
-  //   admin          → 全部五个（含采购/策略）
-  //   region_admin   → accounts/allocations/consumption/purchases 四个（看采购记录，
-  //                    但充值按钮、创建账户、积分策略Tab 仍仅 admin；消费流水暂为空集）
+  //   超级管理员      → 全部Tab（含内部成本与积分策略）
+  //   二线管理员      → 汇总/账户/分配/采购/消费，不显示积分策略
+  //   region_admin   → accounts/allocations/consumption/purchases 四个
   //   senior_operator→ accounts/allocations/consumption 三个
-  //   operator/viewer→ accounts/consumption 两个
-  const visibleTabs: TabKey[] = isAdmin
+  //   operator/viewer→ consumption 一个（个人消费明细）
+  const visibleTabs: TabKey[] = isSuperAdmin
     ? ['report', 'accounts', 'allocations', 'purchases', 'consumption', 'pricing']
-    : isRegionAdmin
+    : isAdmin
+      ? ['report', 'accounts', 'allocations', 'purchases', 'consumption']
+      : isRegionAdmin
       ? ['report', 'accounts', 'allocations', 'consumption', 'purchases']
       : isSchoolAdmin
         ? ['report', 'accounts', 'allocations', 'consumption']
-        : ['accounts', 'consumption']
+        : ['consumption']
 
   // 统计卡片范围前缀：admin=系统 / region_admin=本区域 / senior=本校 / 其它=我的
   const scopeLabel = isAdmin ? '系统' : isRegionAdmin ? '本区域' : isSchoolAdmin ? '本校' : '我的'
 
-  const [stats, setStats] = useState<TokenOverviewStats | null>(null)
-  const [tab, setTab] = useState<TabKey>(visibleTabs[0])
+  const [stats, setStats] =
+    useState<TokenOverviewStats | null>(null)
+
+  const [myAccount, setMyAccount] =
+    useState<MyTokenAccountResponse | null>(null)
+
+  const [myAccountLoaded, setMyAccountLoaded] =
+    useState(!isPersonal)
+
+  const [tab, setTab] =
+    useState<TabKey>(visibleTabs[0])
   const [accounts, setAccounts] = useState<TokenAccountListItem[]>([])
   const [allocations, setAllocations] = useState<AllocationListItem[]>([])
   const [purchases, setPurchases] = useState<PurchaseListItem[]>([])
@@ -196,10 +216,35 @@ export default function TokenDashboardPage() {
 
   const loadStats = useCallback(async () => {
     try {
-      const data = await getTokenOverview()
+      const data =
+        await getTokenOverview()
+
       setStats(data)
-    } catch { /* ignore */ }
+    } catch {
+      // 统计异常不阻断账户和消费明细主体。
+    }
   }, [])
+
+  const loadMyAccount = useCallback(async () => {
+    if (!isPersonal) {
+      setMyAccount(null)
+      setMyAccountLoaded(true)
+      return
+    }
+
+    setMyAccountLoaded(false)
+
+    try {
+      const data =
+        await getMyTokenAccount()
+
+      setMyAccount(data)
+    } catch {
+      setMyAccount(null)
+    } finally {
+      setMyAccountLoaded(true)
+    }
+  }, [isPersonal])
 
   // 加载列表数据
   // P1：按 page 计算 offset；账户Tab 额外带 type/keyword（批次2 后端筛选）；
@@ -236,8 +281,17 @@ export default function TokenDashboardPage() {
     setLoading(false)
   }, [tab, page, accountTypeFilter, accountKeyword])
 
-  useEffect(() => { loadStats() }, [loadStats])
-  useEffect(() => { loadList() }, [loadList])
+  useEffect(() => {
+    loadStats()
+  }, [loadStats])
+
+  useEffect(() => {
+    loadMyAccount()
+  }, [loadMyAccount])
+
+  useEffect(() => {
+    loadList()
+  }, [loadList])
 
   // 切 Tab 时回到第1页，并清空账户筛选条件（避免筛选残留到其它Tab）
   const handleSwitchTab = (t: TabKey) => {
@@ -282,7 +336,16 @@ export default function TokenDashboardPage() {
 
   const formatNum = (n: number) => n < 10 && n > 0 ? n.toFixed(4) : n.toLocaleString(undefined, { maximumFractionDigits: 2 })
 
-  const showPagination = tab !== 'pricing'
+  const showPagination =
+    tab !== 'pricing'
+
+  const personalAccount =
+    myAccount?.has_account
+      ? myAccount.account
+      : undefined
+
+  const personalAvailable =
+    myAccount?.available_balance ?? 0
 
   return (
     <div style={PAGE_CONTAINER_STYLE}>
@@ -295,8 +358,25 @@ export default function TokenDashboardPage() {
           <span style={{ fontSize: '15px' }}>←</span> 返回首页
         </button>
         <div>
-          <div style={{ fontSize: '20px', fontWeight: 700, color: C.text }}>💎 积分管理</div>
-          <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '2px' }}>账户 · 分配 · 消费 · 策略</div>
+          <div style={{
+            fontSize: '20px',
+            fontWeight: 700,
+            color: C.text,
+          }}>
+            {isPersonal
+              ? '💎 我的积分'
+              : '💎 积分管理'}
+          </div>
+
+          <div style={{
+            fontSize: '12px',
+            color: C.textMuted,
+            marginTop: '2px',
+          }}>
+            {isPersonal
+              ? '余额 · 冻结 · 消费明细'
+              : '账户 · 分配 · 消费 · 策略'}
+          </div>
         </div>
       </div>
 
@@ -317,33 +397,141 @@ export default function TokenDashboardPage() {
       )}
 
       {/* ========== 概览统计 ========== */}
-      {stats && (
-        <div style={{ display: 'flex', gap: '16px', marginBottom: '24px', flexWrap: 'wrap' }}>
-          {!isPersonal && <StatCard label={`${scopeLabel}账户数`} value={formatNum(stats.total_accounts)} color={C.primary} />}
-          <StatCard label={`${scopeLabel}总余额`} value={`${formatNum(stats.total_balance)} 积分`} color={C.green} />
-          <StatCard label={`${scopeLabel}本月消费`} value={`${formatNum(stats.month_consumed)} 积分`} color={C.orange} />
-          <StatCard label={`${scopeLabel}今日消费`} value={`${formatNum(stats.today_consumed)} 积分`} color={C.purple} />
-          {!isPersonal && stats.low_balance_count > 0 && (
-            <StatCard label="余额预警" value={`${stats.low_balance_count} 个`} color={C.red} />
+      {isPersonal ? (
+        <>
+          {!myAccountLoaded ? (
+            <div style={{
+              padding: '28px',
+              marginBottom: '24px',
+              textAlign: 'center',
+              color: C.textMuted,
+              background: C.white,
+              border: `1px solid ${C.border}`,
+              borderRadius: '16px',
+            }}>
+              正在加载个人积分账户…
+            </div>
+          ) : personalAccount ? (
+            <div style={{
+              display: 'flex',
+              gap: '16px',
+              marginBottom: '24px',
+              flexWrap: 'wrap',
+            }}>
+              <StatCard
+                label="可用积分"
+                value={`${formatNum(personalAvailable)} 积分`}
+                color={C.green}
+              />
+
+              <StatCard
+                label="冻结积分"
+                value={`${formatNum(personalAccount.frozen_amount)} 积分`}
+                color={C.orange}
+              />
+
+              <StatCard
+                label="累计消费"
+                value={`${formatNum(personalAccount.total_consumed)} 积分`}
+                color={C.primary}
+              />
+
+              <StatCard
+                label="本月消费"
+                value={`${formatNum(stats?.month_consumed ?? 0)} 积分`}
+                color={C.purple}
+              />
+
+              <StatCard
+                label="今日消费"
+                value={`${formatNum(stats?.today_consumed ?? 0)} 积分`}
+                color={C.red}
+              />
+            </div>
+          ) : (
+            <div style={{
+              padding: '24px',
+              marginBottom: '24px',
+              background: 'rgba(245,158,11,0.08)',
+              border: `1px solid ${C.orange}`,
+              borderRadius: '16px',
+              color: C.orange,
+            }}>
+              <div style={{
+                fontSize: '15px',
+                fontWeight: 700,
+                marginBottom: '6px',
+              }}>
+                暂未开通个人积分账户
+              </div>
+
+              <div style={{
+                fontSize: '13px',
+                lineHeight: 1.7,
+              }}>
+                请联系学校管理员创建个人积分账户并分配积分。
+              </div>
+            </div>
+          )}
+        </>
+      ) : stats ? (
+        <div style={{
+          display: 'flex',
+          gap: '16px',
+          marginBottom: '24px',
+          flexWrap: 'wrap',
+        }}>
+          <StatCard
+            label={`${scopeLabel}账户数`}
+            value={formatNum(stats.total_accounts)}
+            color={C.primary}
+          />
+
+          <StatCard
+            label={`${scopeLabel}总余额`}
+            value={`${formatNum(stats.total_balance)} 积分`}
+            color={C.green}
+          />
+
+          <StatCard
+            label={`${scopeLabel}本月消费`}
+            value={`${formatNum(stats.month_consumed)} 积分`}
+            color={C.orange}
+          />
+
+          <StatCard
+            label={`${scopeLabel}今日消费`}
+            value={`${formatNum(stats.today_consumed)} 积分`}
+            color={C.purple}
+          />
+
+          {stats.low_balance_count > 0 && (
+            <StatCard
+              label="余额预警"
+              value={`${stats.low_balance_count} 个`}
+              color={C.red}
+            />
           )}
         </div>
-      )}
+      ) : null}
 
       {/* ========== Tab切换 + 操作按钮 ========== */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '20px', flexWrap: 'wrap' }}>
         {visibleTabs.map(t => (
           <button key={t} onClick={() => handleSwitchTab(t)} style={tabBtnStyle(tab === t)}>
-            {TAB_LABELS[t]}
+            {isPersonal && t === 'consumption'
+              ? '📊 消费明细'
+              : TAB_LABELS[t]}
           </button>
         ))}
         <div style={{ flex: 1 }} />
-        {isAdmin && tab === 'accounts' && (
+        {isSuperAdmin && tab === 'accounts' && (
           <button onClick={() => setShowCreateModal(true)}
             style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', cursor: 'pointer', fontSize: '13px', fontWeight: 600, color: C.white, background: C.primary }}>
             + 创建账户
           </button>
         )}
-        {isAdmin && tab === 'purchases' && (
+        {isSuperAdmin && tab === 'purchases' && (
           <button onClick={() => setShowPurchaseModal(true)}
             style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', cursor: 'pointer', fontSize: '13px', fontWeight: 600, color: C.white, background: C.green }}>
             + 充值积分
@@ -395,8 +583,8 @@ export default function TokenDashboardPage() {
           }} />}
           {tab === 'allocations' && <AllocationsTable items={allocations} />}
           {tab === 'purchases' && <PurchasesTable items={purchases} />}
-          {tab === 'consumption' && <ConsumptionTable items={consumption} isAdmin={isAdmin} />}
-          {tab === 'pricing' && <PricingTab />}
+          {tab === 'consumption' && <ConsumptionTable items={consumption} isSuperAdmin={isSuperAdmin} />}
+          {tab === 'pricing' && isSuperAdmin && <PricingTab />}
 
           {/* P1 分页器 */}
           {showPagination && (

@@ -11,7 +11,7 @@
  *
  * 设计要点：大纲正文 content 存原文整块，录入就是一个大文本框，粘贴即可，不拆字段。
  */
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useMemo, useState, useCallback } from 'react'
 import {
   getCourseOutlines,
   getCourseOutline,
@@ -20,13 +20,19 @@ import {
   deleteCourseOutline,
   type CourseOutlineListItem,
   type CourseOutlineScope,
+  type CourseOutlineSchoolSystem,
   COURSE_OUTLINE_PUBLISHERS,
   COURSE_OUTLINE_PUBLISHER_GENERIC_LABEL,
+  COURSE_OUTLINE_SCHOOL_SYSTEM_STANDARD,
   publisherLabel,
+  schoolSystemLabel,
 } from '@/api/course-outlines'
 import { getMyPublishGroups, type PublishGroup } from '@/api/ai-assistants'
 import { useAuth } from '@/store/auth'
 import { useEducationProfile } from '@/hooks/useEducationProfile'
+import { useSubjects } from '@/hooks/useSubjects'
+import { getEducationLevelOptions } from '@/education-domain/options'
+import { CourseOutlineSchoolSystemField } from './CourseOutlineSchoolSystemField'
 
 // ---------- 配色（与 LPSidebar 蓝紫系一致） ----------
 const C = {
@@ -59,20 +65,27 @@ interface FormState {
   grade: string
   volume: string
   publisher: string           // 教材版本（空串=通用/不限版本）
+  schoolSystem: CourseOutlineSchoolSystem
   title: string
   content: string
 }
 
 const emptyForm: FormState = {
-  scopeKey: '', subject: '', grade: '', volume: '', publisher: '', title: '', content: '',
+  scopeKey: '', subject: '', grade: '', volume: '', publisher: '',
+  schoolSystem: COURSE_OUTLINE_SCHOOL_SYSTEM_STANDARD,
+  title: '', content: '',
 }
 
 /** 全局大纲选项（admin 专属，target 留空由后端填占位ID） */
 const SYSTEM_OPTION: ScopeOption = { scope: 'system', targetId: '', label: '🌐 全局（所有学校通用）' }
 
+/** 课程大纲册次使用受控值，避免自由文本导致精确候选身份漂移。 */
+const COURSE_OUTLINE_VOLUME_OPTIONS = ['上册', '下册', '全册']
+
 export default function CourseOutlinesPage({ embedded = false }: { embedded?: boolean } = {}) {
   const { user } = useAuth()
   const {
+    domain,
     isK12,
     profile,
     ready: educationReady,
@@ -86,25 +99,59 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
    * 普通用户只有在教育域完成解析且确认为K12时，
    * 才展示出版社字段。
    */
-  const showPublisher =
+  const showK12Fields =
     isAdmin ||
     (
       educationReady &&
-      isK12 &&
+      isK12
+    )
+
+  const showPublisher =
+    showK12Fields &&
+    (
+      isAdmin ||
       profile.publisher_enabled
     )
+
+  const {
+    subjects,
+    loading: subjectsLoading,
+    empty: subjectsEmpty,
+  } = useSubjects()
+
+  const gradeOptions = useMemo(
+    () => getEducationLevelOptions(domain),
+    [domain],
+  )
 
   const [list, setList] = useState<CourseOutlineListItem[]>([])
   const [loading, setLoading] = useState(true)
   const [scopeOptions, setScopeOptions] = useState<ScopeOption[]>([])
-  const [canPublishSchool, setCanPublishSchool] = useState(false)
-  const [mySchoolName, setMySchoolName] = useState('')
 
   // 弹窗
   const [showModal, setShowModal] = useState(false)
   const [form, setForm] = useState<FormState>(emptyForm)
   const [saving, setSaving] = useState(false)
   const [modalError, setModalError] = useState('')
+
+  /**
+   * 编辑历史记录时保留数据库中的旧值作为兼容选项，
+   * 新建和后续变更只能从当前受控目录中选择。
+   */
+  const controlledSubjectOptions = useMemo(() => {
+    if (!form.subject || subjects.includes(form.subject)) return subjects
+    return [form.subject, ...subjects]
+  }, [form.subject, subjects])
+
+  const controlledGradeOptions = useMemo(() => {
+    if (!form.grade || gradeOptions.some(item => item.value === form.grade)) return gradeOptions
+    return [{ value: form.grade, label: `${form.grade}（历史值）` }, ...gradeOptions]
+  }, [form.grade, gradeOptions])
+
+  const controlledVolumeOptions = useMemo(() => {
+    if (!form.volume || COURSE_OUTLINE_VOLUME_OPTIONS.includes(form.volume)) return COURSE_OUTLINE_VOLUME_OPTIONS
+    return [form.volume, ...COURSE_OUTLINE_VOLUME_OPTIONS]
+  }, [form.volume])
 
   // 全局提示
   const [toast, setToast] = useState<{ type: 'success' | 'error'; msg: string } | null>(null)
@@ -145,7 +192,6 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
       if (isAdmin) {
         opts.unshift(SYSTEM_OPTION)
       }
-      setCanPublishSchool(res.can_publish_school)
       setScopeOptions(opts)
     } catch (e) {
       // my-groups 失败不阻断查看；admin 即便失败也应能录全局大纲
@@ -161,7 +207,13 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
 
   // ---------- 打开新建 ----------
   const openCreate = () => {
-    setForm({ ...emptyForm, scopeKey: scopeOptions[0] ? `${scopeOptions[0].scope}:${scopeOptions[0].targetId}` : '' })
+    setForm({
+      ...emptyForm,
+      scopeKey: scopeOptions[0] ? `${scopeOptions[0].scope}:${scopeOptions[0].targetId}` : '',
+      subject: subjects[0] || '',
+      grade: gradeOptions[0]?.value || '',
+      volume: COURSE_OUTLINE_VOLUME_OPTIONS[0],
+    })
     setModalError('')
     setShowModal(true)
   }
@@ -180,6 +232,9 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
         publisher: showPublisher
           ? (d.publisher ?? '')
           : '',
+        schoolSystem:
+          d.school_system ??
+          COURSE_OUTLINE_SCHOOL_SYSTEM_STANDARD,
         title: d.title,
         content: d.content,
       })
@@ -204,7 +259,7 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
     setSaving(true)
     try {
       if (form.id) {
-        // 编辑：归属不变，只更新内容
+        // 编辑：归属不变，受控身份字段、学制和正文可以更新
         await updateCourseOutline(form.id, {
           subject: form.subject.trim(),
           grade: form.grade.trim(),
@@ -212,6 +267,10 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
           publisher: showPublisher
             ? form.publisher.trim()
             : '',
+          school_system:
+            showK12Fields
+              ? form.schoolSystem
+              : COURSE_OUTLINE_SCHOOL_SYSTEM_STANDARD,
           title: form.title.trim(),
           content: form.content,
         })
@@ -223,6 +282,10 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
           publisher: showPublisher
             ? form.publisher.trim()
             : '',
+          school_system:
+            showK12Fields
+              ? form.schoolSystem
+              : COURSE_OUTLINE_SCHOOL_SYSTEM_STANDARD,
           scope,
           scope_target_id: targetId,
           subject: form.subject.trim(),
@@ -255,6 +318,7 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
   }
 
   const canManageAny = scopeOptions.length > 0
+  const canCreateOutline = canManageAny && !subjectsLoading && !subjectsEmpty && gradeOptions.length > 0
   const isSystemSelected = form.scopeKey.startsWith('system:')
 
   // ==================== 渲染 ====================
@@ -266,19 +330,28 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
           <div>
             <h1 style={{ fontSize: 22, fontWeight: 700, color: C.textPrimary, margin: 0 }}>📖 课程大纲</h1>
             <div style={{ fontSize: 13, color: C.textSecondary, marginTop: 6 }}>
-              一册书的完整课时地图。备课时系统会按「学科+年级+册次」自动把对应大纲喂给 AI，让它备某一课时也知道整册全貌。
+              一册书的完整课时地图。备课时老师从当前学科和年级的可见候选中精确选择，系统按唯一大纲ID为AI提供整册教学依据。
             </div>
           </div>
-          {canManageAny && (
+          {canCreateOutline && (
             <button onClick={openCreate} style={btnPrimary}>＋ 新建大纲</button>
           )}
         </div>
       ) : (
-        canManageAny && (
+        canCreateOutline && (
           <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
             <button onClick={openCreate} style={btnPrimary}>＋ 新建大纲</button>
           </div>
         )
+      )}
+
+      {canManageAny && !subjectsLoading && subjectsEmpty && (
+        <div style={{
+          marginTop: 16, padding: '12px 16px', borderRadius: 10,
+          background: '#FFF7ED', border: '1px solid #FED7AA', color: '#9A3412', fontSize: 13,
+        }}>
+          当前教育域尚未配置可用课程目录，暂时不能新建课程大纲，请先由管理员完成课程配置。
+        </div>
       )}
 
       {/* 无可管理归属的提示 */}
@@ -301,7 +374,7 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
             padding: 48, textAlign: 'center', color: C.textMuted,
             background: C.white, borderRadius: 12, border: `1px dashed ${C.border}`,
           }}>
-            还没有课程大纲。{canManageAny ? '点击右上角「新建大纲」录入第一份。' : ''}
+            还没有课程大纲。{canCreateOutline ? '点击右上角「新建大纲」录入第一份。' : ''}
           </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -328,6 +401,14 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
                           : C.textMuted,
                       }}>
                         {publisherLabel(it.publisher)}
+                      </span>
+                    )}
+                    {showK12Fields && it.school_system && (
+                      <span style={{
+                        marginLeft: 8, padding: '1px 8px', borderRadius: 6, fontSize: 11,
+                        background: 'rgba(124,58,237,0.08)', color: '#6D28D9',
+                      }}>
+                        {schoolSystemLabel(it.school_system)}
                       </span>
                     )}
                     <span style={{ color: C.textMuted, marginLeft: 10 }}>
@@ -384,23 +465,45 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
                 padding: '8px 12px', borderRadius: 8,
                 background: 'rgba(139,92,246,0.08)', border: '1px solid rgba(139,92,246,0.2)',
               }}>
-                🌐 全局大纲对<b>所有学校</b>的老师生效，备课时按「学科 + 年级」自动调用。请确认内容具有普适性。
+                🌐 全局大纲对<b>所有学校</b>的老师可见，备课时仍由老师在精确候选中主动选择。请确认内容具有普适性。
               </div>
             )}
 
-            {/* 学科 / 年级 / 册次 三个检索标签 */}
+            {/* 学科 / 年级 / 册次使用统一受控选项，保证精确候选身份稳定。 */}
             <div style={{ display: 'flex', gap: 10 }}>
               <Field label="学科" flex>
-                <input value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })}
-                  placeholder="如：语文" style={inputStyle} />
+                <select
+                  value={form.subject}
+                  disabled={subjectsLoading || subjectsEmpty}
+                  onChange={(e) => setForm({ ...form, subject: e.target.value })}
+                  style={inputStyle}
+                >
+                  {controlledSubjectOptions.map(subject => (
+                    <option key={subject} value={subject}>{subject}</option>
+                  ))}
+                </select>
               </Field>
               <Field label="年级" flex>
-                <input value={form.grade} onChange={(e) => setForm({ ...form, grade: e.target.value })}
-                  placeholder="如：三年级" style={inputStyle} />
+                <select
+                  value={form.grade}
+                  onChange={(e) => setForm({ ...form, grade: e.target.value })}
+                  style={inputStyle}
+                >
+                  {controlledGradeOptions.map(option => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
               </Field>
               <Field label="册次" flex>
-                <input value={form.volume} onChange={(e) => setForm({ ...form, volume: e.target.value })}
-                  placeholder="如：下册" style={inputStyle} />
+                <select
+                  value={form.volume}
+                  onChange={(e) => setForm({ ...form, volume: e.target.value })}
+                  style={inputStyle}
+                >
+                  {controlledVolumeOptions.map(volume => (
+                    <option key={volume} value={volume}>{volume}</option>
+                  ))}
+                </select>
               </Field>
             </div>
 
@@ -437,6 +540,16 @@ export default function CourseOutlinesPage({ embedded = false }: { embedded?: bo
             </Field>
 
               </>
+            )}
+
+            {showK12Fields && (
+              <CourseOutlineSchoolSystemField
+                value={form.schoolSystem}
+                onChange={(schoolSystem) =>
+                  setForm({ ...form, schoolSystem })
+                }
+                inputStyle={inputStyle}
+              />
             )}
 
             <Field label="标题">

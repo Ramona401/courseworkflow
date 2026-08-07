@@ -10,10 +10,10 @@
  *   - 严格按课程与具体层级匹配配方。
  *
  * K12额外保留：
- *   - 课程大纲教材版本；
+ *   - 精确课程大纲（唯一ID）；
  *   - 课本页面图片与OCR。
  *
- * 职业教育与成人教育不加载K12教材版本或课本图片，
+ * 职业教育与成人教育不加载K12精确课程大纲或课本图片，
  * 但可以正常创建、选择和自动匹配本教育域配方。
  */
 
@@ -39,10 +39,7 @@ import {
 import type {
   TextbookListItem,
 } from '@/api/textbooks'
-import {
-  getAvailablePublishers,
-  publisherLabel,
-} from '@/api/course-outlines'
+import ExactCourseOutlineSelector from './ExactCourseOutlineSelector'
 import {
   useEducationProfile,
 } from '@/hooks/useEducationProfile'
@@ -65,7 +62,7 @@ interface StartFormProps {
     recipeMode: RecipeSelectionMode,
     recipeId?: string,
     textbookPageIds?: string[],
-    coursePublisher?: string | null,
+    courseOutlineId?: string | null,
   ) => void
   loading: boolean
 }
@@ -140,18 +137,19 @@ export default function EducationAwareStartForm({
     grade,
   ])
 
-  const [coursePublisher, setCoursePublisher] =
-    useState<string | null>(null)
+  /**
+   * 专家模式开始备课的课程大纲正式值。
+   * null表示明确不关联；任何非空值都必须是候选接口返回的唯一ID。
+   */
+  const [courseOutlineId, setCourseOutlineId] = useState<string | null>(null)
+  const [courseOutlineLoading, setCourseOutlineLoading] = useState(false)
 
-  const [
-    coursePublishers,
-    setCoursePublishers,
-  ] = useState<string[]>([])
-
-  const [
-    coursePubLoading,
-    setCoursePubLoading,
-  ] = useState(false)
+  /** 非K12或关闭教材版本能力时，清除可能残留的精确课程大纲ID。 */
+  useEffect(() => {
+    if (isK12 && profile.publisher_enabled) return
+    setCourseOutlineId(null)
+    setCourseOutlineLoading(false)
+  }, [isK12, profile.publisher_enabled])
 
   const [recipes, setRecipes] =
     useState<RecipeListItem[]>([])
@@ -293,69 +291,6 @@ export default function EducationAwareStartForm({
     grade,
   ])
 
-  useEffect(() => {
-    let cancelled = false
-
-    if (
-      !isK12 ||
-      !profile.publisher_enabled ||
-      !subject ||
-      !grade
-    ) {
-      setCoursePublishers([])
-      setCoursePublisher(null)
-      return
-    }
-
-    setCoursePubLoading(true)
-
-    getAvailablePublishers(
-      subject,
-      grade,
-    )
-      .then(list => {
-        if (cancelled) return
-
-        const publishers =
-          list || []
-
-        setCoursePublishers(
-          publishers,
-        )
-
-        if (publishers.length === 0) {
-          setCoursePublisher(null)
-        } else {
-          setCoursePublisher(previous =>
-            previous !== null &&
-            publishers.includes(previous)
-              ? previous
-              : publishers[0],
-          )
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setCoursePublishers([])
-          setCoursePublisher(null)
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setCoursePubLoading(false)
-        }
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [
-    isK12,
-    profile.publisher_enabled,
-    subject,
-    grade,
-  ])
-
   const toggleTextbook = (id: string) => {
     const willSelect =
       !selectedTextbookIds.has(id)
@@ -445,6 +380,7 @@ export default function EducationAwareStartForm({
     !loading &&
     !subjectsLoading &&
     !subjectsEmpty &&
+    !courseOutlineLoading &&
     ocrInProgress.size === 0 &&
     recipeReady
 
@@ -467,7 +403,7 @@ export default function EducationAwareStartForm({
           )
         : undefined,
       isK12
-        ? coursePublisher
+        ? courseOutlineId
         : null,
     )
   }
@@ -730,62 +666,24 @@ export default function EducationAwareStartForm({
         </div>
 
         {isK12 &&
-         coursePublishers.length > 0 && (
+         profile.publisher_enabled && (
           <div style={{
             marginBottom: '18px',
           }}>
-            <label style={{
-              display: 'block',
-              fontSize: '14px',
-              fontWeight: 600,
-              color: C.text,
-              marginBottom: '8px',
-            }}>
-              📚 教材版本
-            </label>
-
-            <select
-              value={
-                coursePublisher === null
-                  ? '__none__'
-                  : coursePublisher
+            <ExactCourseOutlineSelector
+              subject={subject}
+              grade={grade}
+              value={courseOutlineId}
+              onChange={setCourseOutlineId}
+              disabled={
+                loading ||
+                !subjectValid ||
+                !gradeValid
               }
-              disabled={coursePubLoading}
-              onChange={event =>
-                setCoursePublisher(
-                  event.target.value ===
-                    '__none__'
-                    ? null
-                    : event.target.value,
-                )
+              onLoadingChange={
+                setCourseOutlineLoading
               }
-              style={{
-                width: '100%',
-                padding: '11px 14px',
-                borderRadius: '10px',
-                border:
-                  `1px solid ${C.border}`,
-                background: C.card,
-              }}
-            >
-              {coursePublishers.map(
-                item => (
-                  <option
-                    key={
-                      item ||
-                      '__generic__'
-                    }
-                    value={item}
-                  >
-                    {publisherLabel(item)}
-                  </option>
-                ),
-              )}
-
-              <option value="__none__">
-                不关联课程大纲
-              </option>
-            </select>
+            />
           </div>
         )}
 
@@ -811,9 +709,11 @@ export default function EducationAwareStartForm({
               : 'not-allowed',
           }}
         >
-          {loading
-            ? `正在准备${profile.lesson_plan_label}环境...`
-            : `开始${profile.lesson_plan_label} →`}
+          {courseOutlineLoading
+            ? '正在加载精确课程大纲...'
+            : loading
+              ? `正在准备${profile.lesson_plan_label}环境...`
+              : `开始${profile.lesson_plan_label} →`}
         </button>
       </div>
 

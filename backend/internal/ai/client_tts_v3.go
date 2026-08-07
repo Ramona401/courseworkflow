@@ -7,7 +7,7 @@ package ai
 //   请求头: Content-Type: application/json
 //          X-Api-App-Id:      豆包语音应用APP ID
 //          X-Api-Access-Key:  应用Access Token
-//          X-Api-Resource-Id: 按音色推导（见resolveTTSResourceID）
+//          X-Api-Resource-Id: 按音色推导（见ResolveTTSResourceID）
 //   请求体: {"user":{"uid":"tedna"},
 //           "req_params":{"text":"...","speaker":"音色码",
 //                         "audio_params":{"format":"mp3","sample_rate":24000,"speech_rate":可选}}}
@@ -74,11 +74,11 @@ const ttsV3DoneCode = 20000000
 
 // ==================== 辅助函数 ====================
 
-// resolveTTSResourceID 按音色码推导 X-Api-Resource-Id
+// ResolveTTSResourceID 按音色码推导 X-Api-Resource-Id
 // 路由表：S_开头=声音复刻(seed-icl-2.0)；含_uranus_或saturn_开头=官方2.0(seed-tts-2.0)；
 //
 //	其余按官方1.0(seed-tts-1.0)。传错会报55000000: resource ID is mismatched。
-func resolveTTSResourceID(voice string) string {
+func ResolveTTSResourceID(voice string) string {
 	if strings.HasPrefix(voice, "S_") {
 		return "seed-icl-2.0"
 	}
@@ -114,7 +114,7 @@ func synthesizeSpeechV3(ctx context.Context, cfg *TTSConfig, text string, voice 
 		baseURL = ttsV3DefaultBaseURL
 	}
 	apiURL := strings.TrimRight(baseURL, "/") + "/api/v3/tts/unidirectional"
-	resourceID := resolveTTSResourceID(voice)
+	resourceID := ResolveTTSResourceID(voice)
 
 	// 2. 构建请求体
 	reqBody := ttsV3Request{}
@@ -154,14 +154,36 @@ func synthesizeSpeechV3(ctx context.Context, cfg *TTSConfig, text string, voice 
 	// 4. 发送请求（流式返回，超时给足90秒）
 	client := &http.Client{Timeout: 90 * time.Second}
 	startTime := time.Now()
-	httpResp, err := client.Do(httpReq)
-	if err != nil {
-		latencyMs := time.Since(startTime).Milliseconds()
-		ttsLog.Error("TTS v3 HTTP请求失败", "error", err, "latency_ms", latencyMs)
-		return nil, fmt.Errorf("TTS请求失败: %w", err)
-	}
-	defer httpResp.Body.Close()
+	httpResp, err :=
+		client.Do(
+			httpReq,
+		)
 
+	if err != nil {
+		latencyMs :=
+			time.Since(
+				startTime,
+			).Milliseconds()
+
+		ttsLog.Error(
+			"TTS v3 HTTP请求结果不确定",
+			"error",
+			err,
+			"latency_ms",
+			latencyMs,
+		)
+
+		return nil,
+			&TTSSynthesisError{
+				Cause: fmt.Errorf(
+					"TTS请求网络结果不确定: %w",
+					err,
+				),
+				Uncertain: true,
+			}
+	}
+
+	defer httpResp.Body.Close()
 	// 5. HTTP层错误（鉴权失败等会直接非200）
 	if httpResp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(httpResp.Body)
@@ -184,69 +206,183 @@ func synthesizeSpeechV3(ctx context.Context, cfg *TTSConfig, text string, voice 
 	chunkCount := 0
 	doneSeen := false
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		line :=
+			strings.TrimSpace(
+				scanner.Text(),
+			)
+
 		if line == "" {
 			continue
 		}
-		// 兼容可能的SSE风格 "data:" 前缀
-		line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+
+		line =
+			strings.TrimSpace(
+				strings.TrimPrefix(
+					line,
+					"data:",
+				),
+			)
+
 		if line == "" {
 			continue
 		}
 
 		var item ttsV3Line
-		if err := json.Unmarshal([]byte(line), &item); err != nil {
-			// 单行解析失败记警告跳过，不让个别脏行毁掉整次合成
-			ttsLog.Warn("TTS v3响应行解析失败，跳过", "line_preview", truncateStr(line, 120), "error", err)
-			continue
+
+		if err :=
+			json.Unmarshal(
+				[]byte(line),
+				&item,
+			); err != nil {
+			return nil,
+				&TTSSynthesisError{
+					Cause: fmt.Errorf(
+						"解析TTS流式响应失败: %w",
+						err,
+					),
+					Uncertain: true,
+				}
 		}
 
 		switch {
-		case item.Code == ttsV3DoneCode:
-			// 流结束哨兵
+		case item.Code ==
+			ttsV3DoneCode:
 			doneSeen = true
-		case item.Code == 0 && item.Data != "":
-			// 音频块：base64解码追加
-			chunk, decErr := base64.StdEncoding.DecodeString(item.Data)
-			if decErr != nil {
-				ttsLog.Warn("TTS v3音频块base64解码失败，跳过", "error", decErr)
-				continue
+
+		case item.Code == 0 &&
+			item.Data != "":
+			chunk, decodeErr :=
+				base64.StdEncoding.
+					DecodeString(
+						item.Data,
+					)
+
+			if decodeErr != nil {
+				return nil,
+					&TTSSynthesisError{
+						Cause: fmt.Errorf(
+							"解码TTS音频块失败: %w",
+							decodeErr,
+						),
+						Uncertain: true,
+					}
 			}
+
 			audioBuf.Write(chunk)
 			chunkCount++
+
 		case item.Code == 0:
-			// code=0但无data：心跳/空包，忽略
+			// 心跳或空包。
+
 		default:
-			// 业务错误码（如55000000 resource ID不匹配）
-			latencyMs := time.Since(startTime).Milliseconds()
-			ttsLog.Error("TTS v3返回业务错误",
-				"code", item.Code, "message", item.Message, "latency_ms", latencyMs)
-			return nil, fmt.Errorf("TTS合成失败(code %d): %s", item.Code, item.Message)
+			latencyMs :=
+				time.Since(
+					startTime,
+				).Milliseconds()
+
+			ttsLog.Error(
+				"TTS v3返回明确业务错误",
+				"code",
+				item.Code,
+				"message",
+				item.Message,
+				"latency_ms",
+				latencyMs,
+			)
+
+			return nil,
+				fmt.Errorf(
+					"TTS合成失败(code %d): %s",
+					item.Code,
+					item.Message,
+				)
 		}
+
 		if doneSeen {
 			break
 		}
 	}
-	if scanErr := scanner.Err(); scanErr != nil && audioBuf.Len() == 0 {
-		return nil, fmt.Errorf("读取TTS流式响应失败: %w", scanErr)
+	if scanErr :=
+		scanner.Err(); scanErr != nil {
+		return nil,
+			&TTSSynthesisError{
+				Cause: fmt.Errorf(
+					"读取TTS流式响应失败: %w",
+					scanErr,
+				),
+				Uncertain: true,
+			}
 	}
 
-	latencyMs := time.Since(startTime).Milliseconds()
+	if !doneSeen {
+		return nil,
+			&TTSSynthesisError{
+				Cause: fmt.Errorf(
+					"TTS流式响应未收到结束标识",
+				),
+				Uncertain: true,
+			}
+	}
+
+	latencyMs :=
+		time.Since(
+			startTime,
+		).Milliseconds()
 
 	if audioBuf.Len() < 100 {
-		return nil, fmt.Errorf("TTS未返回有效音频（收到%d块共%d字节），请检查音色码与服务开通状态", chunkCount, audioBuf.Len())
+		return nil,
+			&TTSSynthesisError{
+				Cause: fmt.Errorf(
+					"TTS供应商已完成但未返回有效音频（%d块，%d字节）",
+					chunkCount,
+					audioBuf.Len(),
+				),
+				ProviderSucceeded: true,
+			}
+	}
+	// 7. 写盘。此时已经收到供应商成功结束标识，
+	// 后续本地失败不能释放积分预留。
+	if err :=
+		os.MkdirAll(
+			outputDir,
+			0755,
+		); err != nil {
+		return nil,
+			&TTSSynthesisError{
+				Cause: fmt.Errorf(
+					"创建输出目录失败: %w",
+					err,
+				),
+				ProviderSucceeded: true,
+			}
 	}
 
-	// 7. 写盘
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return nil, fmt.Errorf("创建输出目录失败: %w", err)
-	}
-	outputPath := filepath.Join(outputDir, outputName+".mp3")
-	if err := os.WriteFile(outputPath, audioBuf.Bytes(), 0644); err != nil {
-		return nil, fmt.Errorf("写入音频文件失败: %w", err)
-	}
-	written := int64(audioBuf.Len())
+	outputPath :=
+		filepath.Join(
+			outputDir,
+			outputName+".mp3",
+		)
 
+	if err :=
+		os.WriteFile(
+			outputPath,
+			audioBuf.Bytes(),
+			0644,
+		); err != nil {
+		return nil,
+			&TTSSynthesisError{
+				Cause: fmt.Errorf(
+					"写入音频文件失败: %w",
+					err,
+				),
+				ProviderSucceeded: true,
+			}
+	}
+
+	written :=
+		int64(
+			audioBuf.Len(),
+		)
 	// 8. ffprobe取时长
 	duration := getAudioDuration(outputPath)
 

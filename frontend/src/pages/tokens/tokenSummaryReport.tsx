@@ -5,10 +5,11 @@
  *   挂在 TokenDashboardPage 的"📈 汇总报告"Tab。后端 6 维度聚合，前端按角色给维度入口。
  *
  * 维度入口（角色差异化）：
- *   - admin          → 区域/学校/老师/模型/场景/趋势（region 仅 admin 可见）
- *   - region_admin   → 学校/老师/模型/场景/趋势（看辖区，无 region 维度——只管一个区域无意义）
- *   - senior_operator→ 老师/模型/场景/趋势（看本校，无学校维度——只有一个校）
- *   $成本列仅 admin 展示（其它角色不应看到美元 API 成本）。
+ *   - 超级管理员      → 区域/学校/老师/模型/场景/趋势
+ *   - 二线管理员      → 区域/学校/老师/场景/趋势，不含模型和成本
+ *   - region_admin   → 学校/老师/场景/趋势
+ *   - senior_operator→ 老师/场景/趋势
+ *   美元成本列仅超级管理员展示。
  *
  * 三层下钻（你要的"汇总→点进去看明细"）：
  *   第1层 维度排行（默认）
@@ -75,20 +76,22 @@ export default function TokenSummaryReport() {
   const { user } = useAuth()
   const role = user?.role || ''
   const isAdmin = role === 'admin'
+  const isSuperAdmin = isAdmin && user?.is_super === true
   const isRegionAdmin = role === 'region_admin'
   const isSchoolAdmin = role === 'senior_operator'
 
-  // 角色可见维度入口
-  // 批三-3b：模型维度仅 admin 可见，非 admin（区域/学校管理员/老师）去掉 'model'，只看业务维度
-  const visibleDims: Dim[] = isAdmin
+  // 角色可见维度入口：模型维度只向超级管理员开放。
+  const visibleDims: Dim[] = isSuperAdmin
     ? ['region', 'school', 'user', 'model', 'scene', 'time']
-    : isRegionAdmin
+    : isAdmin
+      ? ['region', 'school', 'user', 'scene', 'time']
+      : isRegionAdmin
       ? ['school', 'user', 'scene', 'time']
       : isSchoolAdmin
         ? ['user', 'scene', 'time']
         : ['scene', 'time'] // 兜底（普通角色一般不进此报告）
-  // 批三-3b：非 admin 下钻子维度默认走 scene（不暴露模型）
-  const defaultSubDim: 'model' | 'scene' = isAdmin ? 'model' : 'scene'
+  // 非超级管理员下钻默认走scene，不暴露真实模型维度。
+  const defaultSubDim: 'model' | 'scene' = isSuperAdmin ? 'model' : 'scene'
 
   const [dim, setDim] = useState<Dim>(visibleDims[0])
   const [range, setRange] = useState<RangeKey>('all')
@@ -105,14 +108,14 @@ export default function TokenSummaryReport() {
   const [detailTotal, setDetailTotal] = useState(0)
   const [detailPage, setDetailPage] = useState(1)
 
-  // 批三-3b：admin 时加载模型别名解析器，把模型维度排行的真名转业务别名（非 admin 见不到模型维度）
+  // 仅超级管理员加载模型别名解析器。
   const [resolveAlias, setResolveAlias] = useState<((m: string) => string) | null>(null)
   useEffect(() => {
-    if (!isAdmin) { setResolveAlias(null); return }
+    if (!isSuperAdmin) { setResolveAlias(null); return }
     let alive = true
     loadAliasResolver().then(fn => { if (alive) setResolveAlias(() => fn) })
     return () => { alive = false }
-  }, [isAdmin])
+  }, [isSuperAdmin])
 
   // 加载汇总（第1层/第2层/第2.5层都走 getConsumptionSummary，差别在 dimension 和 filter）
   const loadSummary = useCallback(async () => {
@@ -130,7 +133,7 @@ export default function TokenSummaryReport() {
       const data = await getConsumptionSummary(params)
       setRows(data?.rows || [])
       setTotalCredits(data?.total_credits || 0)
-      setTotalCostUSD(data?.total_cost_usd || 0)
+      setTotalCostUSD(data?.total_cost_usd ?? 0)
       setTotalCalls(data?.total_calls || 0)
       if (data?.scope_message) setScopeMsg(data.scope_message)
     } catch { setRows([]) }
@@ -161,7 +164,7 @@ export default function TokenSummaryReport() {
 
   // 重名检测：同 label 出现多次时，附 user_id 后4位
   const labelCounts = rows.reduce<Record<string, number>>((acc, r) => { acc[r.label] = (acc[r.label] || 0) + 1; return acc }, {})
-  // 批三-3b：当前是否模型维度（第1层 dim 或下钻 subDim）。仅 admin 能到达模型维度。
+  // 当前是否模型维度；只有超级管理员可以到达该维度。
   const isModelView = dim === 'model' || (drill.kind === 'userBreakdown' && drill.subDim === 'model')
   const displayLabel = (r: ConsumptionSummaryRow) => {
     // 模型维度且已加载解析器：把真实模型名转业务别名（不暴露真名）
@@ -196,7 +199,7 @@ export default function TokenSummaryReport() {
       {/* 总览卡片 */}
       <div style={{ display: 'flex', gap: '16px', marginBottom: '20px', flexWrap: 'wrap' }}>
         <StatCard label="总消费积分" value={`${totalCredits.toLocaleString(undefined, { maximumFractionDigits: 2 })}`} color={C.primary} />
-        {isAdmin && <StatCard label="总成本(USD)" value={`$${totalCostUSD.toFixed(2)}`} color={C.orange} />}
+        {isSuperAdmin && <StatCard label="总成本(USD)" value={`$${totalCostUSD.toFixed(2)}`} color={C.orange} />}
         <StatCard label="总调用次数" value={totalCalls.toLocaleString()} color={C.purple} />
       </div>
 
@@ -242,7 +245,7 @@ export default function TokenSummaryReport() {
               </button>
               {/* 模型/场景子维度切换 */}
               <div style={{ display: 'flex', gap: '4px', marginLeft: '8px' }}>
-                {(isAdmin ? (['model', 'scene'] as ('model' | 'scene')[]) : (['scene'] as ('model' | 'scene')[])).map(sd => (
+                {(isSuperAdmin ? (['model', 'scene'] as ('model' | 'scene')[]) : (['scene'] as ('model' | 'scene')[])).map(sd => (
                   <button key={sd} onClick={() => setDrill({ ...drill, subDim: sd })}
                     style={{ padding: '3px 10px', borderRadius: '12px', cursor: 'pointer', fontSize: '11px',
                       border: `1px solid ${drill.subDim === sd ? C.purple : C.border}`,
@@ -271,13 +274,13 @@ export default function TokenSummaryReport() {
         <div style={{ textAlign: 'center', color: C.textMuted, padding: '40px' }}>加载中...</div>
       ) : drill.kind === 'detail' ? (
         <>
-          <ConsumptionTable items={detailItems} isAdmin={isAdmin} />
+          <ConsumptionTable items={detailItems} isSuperAdmin={isSuperAdmin} />
           <Pagination page={detailPage} pageSize={PAGE_SIZE} total={detailTotal} onChange={setDetailPage} />
         </>
       ) : dim === 'time' && drill.kind === 'summary' ? (
         <BarChart rows={rows} />
       ) : (
-        <RankList rows={rows} totalCredits={totalCredits} isAdmin={isAdmin}
+        <RankList rows={rows} totalCredits={totalCredits} isSuperAdmin={isSuperAdmin}
           displayLabel={displayLabel} clickable={rowClickable} onRowClick={onRowClick}
           scopeHint={drill.kind === 'schoolUsers' ? `${drill.schoolName} 全校` : drill.kind === 'userBreakdown' ? `${drill.userName} 个人` : undefined} />
       )}
@@ -286,8 +289,8 @@ export default function TokenSummaryReport() {
 }
 
 // ============ 排行榜（占比条）============
-function RankList({ rows, totalCredits, isAdmin, displayLabel, clickable, onRowClick, scopeHint }: {
-  rows: ConsumptionSummaryRow[]; totalCredits: number; isAdmin: boolean
+function RankList({ rows, totalCredits, isSuperAdmin, displayLabel, clickable, onRowClick, scopeHint }: {
+  rows: ConsumptionSummaryRow[]; totalCredits: number; isSuperAdmin: boolean
   displayLabel: (r: ConsumptionSummaryRow) => string
   clickable: boolean; onRowClick: (r: ConsumptionSummaryRow) => void
   scopeHint?: string
@@ -316,7 +319,7 @@ function RankList({ rows, totalCredits, isAdmin, displayLabel, clickable, onRowC
             </span>
             <span style={{ display: 'flex', gap: '16px', alignItems: 'baseline' }}>
               <span style={{ fontSize: '15px', fontWeight: 700, color: C.primary }}>{r.credits.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
-              {isAdmin && <span style={{ fontSize: '12px', color: C.orange }}>${r.cost_usd.toFixed(2)}</span>}
+              {isSuperAdmin && <span style={{ fontSize: '12px', color: C.orange }}>${(r.cost_usd ?? 0).toFixed(2)}</span>}
               <span style={{ fontSize: '12px', color: C.textSec }}>{r.calls.toLocaleString()}次</span>
               <span style={{ fontSize: '12px', color: C.textMuted, width: '44px', textAlign: 'right' }}>{r.percent.toFixed(1)}%</span>
             </span>

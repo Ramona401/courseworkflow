@@ -33,10 +33,9 @@ package services
 //   lessonContext 为空(非教案来源/取数失败)时不注入，行为与改造前完全一致，零回归。
 //   取数与定向匹配逻辑见独立文件 courseware_gen_lesson_context.go。
 //
-// ★双cw-page封面守卫（本次修复，根治"导航栏被撑成1080满屏遮罩"反复横跳）：
-//   normalizeRootCanvas 遇到含 <!-- NAV_END --> 的双层封面结构直接原样返回，
-//   不再强改第一个div(导航栏)的尺寸。使自动生成/微调/重生/背景秒换四条路径行为统一，
-//   彻底消除"改一边坏一边"。详见 normalizeRootCanvas 函数注释。
+// ★双cw-page封面守卫：
+//   normalizeRootCanvas 通过真实顶层兄弟DOM识别“导航画布+内容画布”，不再仅凭NAV_END猜结构。
+//   真实双画布原样保留；普通单根页面即使含NAV标记仍正常归一化，详见对应函数注释。
 
 import (
 	"context"
@@ -55,8 +54,9 @@ import (
 // 导航栏模板中的 {{PAGE_NUM}} / {{TOTAL_PAGES}} 替换为实际页码
 // AI生成的内容区可能是完整的<div>（含最外层），也可能只是内容区片段
 func (s *CoursewareGenService) assembleFullPage(contentHTML string, navTemplate string, pageNum int, totalPages int, tplInfo *cwTemplateInfo) string {
-	// 导航栏模板不含页码（保存时已剥除），此处由后端确定性追加页码div到导航栏末尾
-	nav := injectPageNumIntoNav(navTemplate, pageNum, totalPages)
+	// 导航模板在保存时已经剥除真实页码。组装时由后端统一回填页码，
+	// 同时补NAV标记、80px安全壳、Logo尺寸守卫和模板导航作用域CSS。
+	nav := buildSafeNavBlock(navTemplate, pageNum, totalPages)
 
 	// 构建CSS变量字符串
 	cssVars := s.buildCSSVarsString(tplInfo)
@@ -109,22 +109,19 @@ var (
 // 只动第一个 <div 开标签，正文一律不碰；非<div开头或无法解析时原样返回。
 // 用于：assembleFullPage（批量生成+单页重生）与 RefinePage（单页微调）。
 //
-// ★双cw-page封面页守卫（本次修复，根治「导航栏被撑成1080满屏遮罩」反复横跳）：
+// ★双cw-page封面页守卫：
 //
-//	含 <!-- NAV_END --> 的HTML是「导航栏div(第一个) + 内容div(第二个)」两层平级结构，
-//	是页面作者刻意设计的双层封面。本函数只认"第一个<div>"当根容器，会把导航栏div的
-//	height 用 enforceCanvasDecls 强改成 1080px；导航栏div自带 position:absolute +
-//	z-index:100 + 不透明背景，被撑成 1080px 后变成一整块满屏遮罩，盖住内容div全部正文
-//	（表现为"封面导航栏被改到全屏高、正文都在却完全看不见"）。这类双层结构的两个div尺寸
-//	AI已各自写对（导航栏≈80px + 内容1080px），画布闸门根本不该碰第一个div，故直接原样返回。
+//	历史模板可能采用「导航栏div(第一个) + 内容div(第二个)」两个顶层兄弟画布。
+//	若把第一个导航div当根容器执行enforceCanvasDecls，它会从约80px被强改成1080px，
+//	再叠加absolute、z-index和不透明背景后形成满屏遮罩。
 //
-//	此守卫让自动生成(assembleFullPage) / 微调(RefinePage) / 重生(RegenerateSinglePage) /
-//	背景秒换(swapInjectedBackground) 四条路径对双cw-page结构的处理完全统一——此前各调用方
-//	各自用 Contains(NAV_END) 打补丁绕过本函数，微调路径漏打就"改一边坏一边"；现一处根治，
-//	各处原有的 NAV_END 判断降为幂等无害的冗余保险，不再此消彼长。
+//	NAV标记只表示页面存在导航栏，不能证明两个div是顶层兄弟；普通单根页面也会有NAV标记。
+//	因此本函数统一调用isDetachedCWNavCanvas检查真实顶层结构：仅真实双画布原样返回，
+//	普通单根页面继续执行1920×1080归一化。生成、微调、重生和背景秒换共享同一判定。
 func normalizeRootCanvas(html string) string {
-	// 双cw-page封面页（含 NAV_END）：两层平级结构，不动第一个div尺寸，原样返回。
-	if strings.Contains(html, "<!-- NAV_END -->") {
+	// 只有真实的“导航div + 内容div”顶层兄弟结构才跳过画布归一化。
+	// NAV标记只表示存在导航栏，不能代表DOM层级；普通单根页面也会包含NAV标记。
+	if isDetachedCWNavCanvas(html) {
 		return html
 	}
 
@@ -229,34 +226,29 @@ func (s *CoursewareGenService) buildCSSVarsString(tplInfo *cwTemplateInfo) strin
 // ExtractNavByMarkers 按 <!-- NAV_START --> / <!-- NAV_END --> 标记提取导航栏HTML
 // 返回标记之间的内容（不含标记本身），如果没找到标记则尝试兜底提取
 func ExtractNavByMarkers(html string) string {
-	const startMarker = "<!-- NAV_START -->"
-	const endMarker = "<!-- NAV_END -->"
-
-	startIdx := strings.Index(html, startMarker)
-	endIdx := strings.Index(html, endMarker)
-
-	// 情况1（标准）：两个标记都存在，精确提取标记之间的内容
-	if startIdx >= 0 && endIdx > startIdx {
-		navContent := html[startIdx+len(startMarker) : endIdx]
-		navContent = strings.TrimSpace(navContent)
+	// 情况1：兼容标准标记、无空格标记及大小写变体。
+	if markerRange, ok := findCWNavMarkerRange(html); ok {
+		navContent := strings.TrimSpace(
+			html[markerRange.StartMarkerEnd:markerRange.EndMarkerStart],
+		)
 		if navContent != "" {
 			return navContent
 		}
 	}
 
-	// 情况2（常见AI遗漏）：只有 NAV_END 没有 NAV_START
-	// AI经常忘记写 NAV_START 但写了 NAV_END，此时导航栏80px bar是从HTML开头到 NAV_END 之间的内容。
-	// 从HTML开头向后找第一个含 height:80 或 height: 80 的<div>，提取该完整div作为导航栏。
-	if startIdx < 0 && endIdx > 0 {
+	// 情况2（常见AI遗漏）：只有NAV_END没有NAV_START。
+	// 从HTML开头到结束标记之间寻找首个高度约80px的完整导航div。
+	startMarker, endMarker := findCWNavMarkerPositions(html)
+	if len(startMarker) == 0 && len(endMarker) == 2 && endMarker[0] > 0 {
 		cwGenLog.Warn("只找到NAV_END未找到NAV_START，尝试从HTML开头提取80px导航栏div")
-		navFromTop := extractNavBarFromTopToEnd(html, endIdx)
+		navFromTop := extractNavBarFromTopToEnd(html, endMarker[0])
 		if navFromTop != "" {
 			return navFromTop
 		}
 	}
 
-	// 情况3：两个标记都没找到，走兜底提取
-	cwGenLog.Warn("未找到NAV_START/NAV_END标记，尝试兜底提取导航栏")
+	// 情况3：没有形成完整标记对，走导航结构兜底提取。
+	cwGenLog.Warn("未找到完整NAV_START/NAV_END标记，尝试兜底提取导航栏")
 	return extractNavFallback(html)
 }
 
@@ -994,16 +986,11 @@ func (s *CoursewareGenService) applyTemplateBackgroundOnly(html string, tplInfo 
 	// 选择器 .cw-page:last-of-type 与秒换 buildBgStyleTag 完全一致:双cw-page封面只命中内容div,单页命中唯一div,零回归
 	styleTag := "<style>/* TEDNA-TPL-BG 模板官方背景兜底注入 */.cw-page:last-of-type{" + strings.Join(parts, ";") + "}</style>"
 
-	// ★双cw-page封面(含 NAV_END:导航栏div + 内容div)——跳过 normalizeRootCanvas。
-	// 根因修复：normalizeRootCanvas 只认"第一个div"当根容器，会把导航栏div的 height
-	// 用 enforceCanvasDecls 强改成 1080px。导航栏div自带 position:absolute + z-index:100
-	// + 不透明背景，被撑成 1080px 后就变成一整块满屏遮罩，盖住下面内容div的全部正文
-	// （表现为"首页导航栏被改到全屏高"）。与背景秒换 swapInjectedBackground 路径B 口径一致：
-	// 含 NAV_END 时不动任何div尺寸，直接把 <style> 注入到第一个div开标签之后即可
-	// （<style>为全局CSS，注入位置无所谓；选择器 :last-of-type 精准命中内容div）。
-	// 注：normalizeRootCanvas 现已自带 NAV_END 守卫（原样返回），此处判断成为幂等冗余保险，
-	//     两处一致、互不冲突，保留以维持注入位置逻辑清晰。
-	if strings.Contains(html, "<!-- NAV_END -->") {
+	// 真实双顶层画布（导航div + 内容div）跳过 normalizeRootCanvas。
+	// 结构判断来自isDetachedCWNavCanvas，不再把NAV_END当作DOM层级证据。
+	// 直接把全局<style>注入第一个div内部，:last-of-type仍只命中后面的内容画布，
+	// 从而既保留导航原高度，又保证背景不落到导航或Logo上。
+	if isDetachedCWNavCanvas(html) {
 		t := strings.TrimSpace(html)
 		if !strings.HasPrefix(strings.ToLower(t), "<div") {
 			return html
@@ -1039,129 +1026,50 @@ func (s *CoursewareGenService) matchComponentsForPage(
 	subject string,
 	grade string,
 ) []*models.MatchedCWComponent {
-	if page == nil {
-		return nil
-	}
-
-	// 老师在确认方案中选择的 interaction_type / visual_format 是最后事实源。
-	// 层1索引仅在方案字段为空时兜底，不再用 estimated_complexity 冒充互动等级。
-	req := &models.MatchCWComponentsRequest{
-		SubjectScope: subject,
-		GradeScope:   grade,
-		InteractionLevel: cwInteractionLevelForPlan(
-			page.InteractionType,
-			page.IdxInteractionLevel,
-			page.EstimatedComplexity,
-		),
-		VisualFormat: cwVisualFormatForMatch(page),
-		// 先放大候选池，再按互动代码结构过滤，最后只注入Top 2。
-		Limit: 8,
-	}
-
-	matched, err := repository.MatchCWComponents(ctx, req)
-	if err != nil {
-		cwGenLog.Warn(
-			"组件匹配失败",
-			"page_num", page.PageNumber,
-			"interaction_type", page.InteractionType,
-			"visual_format", page.VisualFormat,
-			"error", err,
-		)
-		return nil
-	}
-
-	filtered := filterCWComponentsForInteraction(
-		matched,
-		page.InteractionType,
+	// subject和grade参数为保持既有调用签名暂时保留。
+	//
+	// 实际匹配不会信任这两个长期持有的值，而是在独立运行时服务中
+	// 根据page.courseware_id重新读取正式课件及其教育域快照。
+	return s.matchCoursewareComponentsForPageSnapshot(
+		ctx,
+		page,
 	)
-	if len(filtered) == 0 {
-		if len(matched) > 0 &&
-			normalizeCWInteractionType(page.InteractionType) != "" &&
-			normalizeCWInteractionType(page.InteractionType) != "static" {
-			cwGenLog.Info(
-				"候选组件均与方案互动类型冲突，本页不注入参考组件",
-				"page_num", page.PageNumber,
-				"interaction_type", page.InteractionType,
-				"candidate_count", len(matched),
-			)
-		}
-		return nil
-	}
-
-	if len(filtered) > 2 {
-		filtered = filtered[:2]
-	}
-	return filtered
 }
 
 // ==================== HTML提取 ====================
 
-// extractHTMLFromAIOutput 从AI输出中提取HTML代码
-// AI可能输出markdown代码块包裹或直接HTML
-func (s *CoursewareGenService) extractHTMLFromAIOutput(aiOutput string) string {
-	text := strings.TrimSpace(aiOutput)
-	if text == "" {
-		return ""
-	}
+// extractHTMLFromAIOutput 从AI输出中安全提取完整HTML文档或课件片段。
+//
+// 课件片段允许根.cw-page后继续存在同级script/style。提取边界由
+// courseware_gen_html_scan.go的词法扫描器决定，JavaScript字符串中的
+// “</div>”不再被误当成页面终点。
+func (s *CoursewareGenService) extractHTMLFromAIOutput(
+	aiOutput string,
+) string {
+	extraction :=
+		cwExtractCoursewareHTMLFromAIOutput(
+			aiOutput,
+		)
 
-	text = cwGenStripCodeFences(text)
-	lower := strings.ToLower(text)
+	cwGenLog.Info(
+		"AI HTML提取结构摘要",
+		"raw_structure",
+		cwDescribeHTMLStructure(aiOutput),
+		"cleaned_structure",
+		cwDescribeHTMLStructure(extraction.Cleaned),
+		"extracted_structure",
+		cwDescribeHTMLStructure(extraction.HTML),
+		"root_name",
+		extraction.RootName,
+		"complete_boundary",
+		extraction.Complete,
+		"extract_start",
+		extraction.Start,
+		"extract_end",
+		extraction.End,
+	)
 
-	// 完整HTML文档优先。
-	// 旧逻辑先寻找<div>，会从<header>内部的第一个div开始截取，
-	// 把DOCTYPE、head、style、header开头以及尾部script/body/html全部丢掉。
-	docStart := -1
-	if idx := strings.Index(lower, "<!doctype html"); idx >= 0 {
-		docStart = idx
-	}
-	if idx := strings.Index(lower, "<html"); idx >= 0 && (docStart < 0 || idx < docStart) {
-		docStart = idx
-	}
-	if docStart >= 0 {
-		if relEnd := strings.LastIndex(lower[docStart:], "</html>"); relEnd >= 0 {
-			end := docStart + relEnd + len("</html>")
-			return strings.TrimSpace(text[docStart:end])
-		}
-		// 未找到</html>时仍保留完整文档起点，由后续结构校验负责拦截残缺内容。
-		return strings.TrimSpace(text[docStart:])
-	}
-
-	// 普通课件片段：支持<div>和<section>根节点，选择最早出现的一个。
-	type rootCandidate struct {
-		start    int
-		closeTag string
-	}
-	candidates := make([]rootCandidate, 0, 2)
-
-	if idx := strings.Index(lower, "<div"); idx >= 0 {
-		candidates = append(candidates, rootCandidate{start: idx, closeTag: "</div>"})
-	}
-	if idx := strings.Index(lower, "<section"); idx >= 0 {
-		candidates = append(candidates, rootCandidate{start: idx, closeTag: "</section>"})
-	}
-
-	if len(candidates) > 0 {
-		chosen := candidates[0]
-		for _, candidate := range candidates[1:] {
-			if candidate.start < chosen.start {
-				chosen = candidate
-			}
-		}
-
-		part := text[chosen.start:]
-		partLower := strings.ToLower(part)
-		if last := strings.LastIndex(partLower, chosen.closeTag); last >= 0 {
-			part = part[:last+len(chosen.closeTag)]
-		}
-		return strings.TrimSpace(part)
-	}
-
-	// 其它合法HTML片段，例如<body>或<header>片段。
-	if strings.Contains(text, "<") && strings.Contains(text, ">") {
-		return strings.TrimSpace(text)
-	}
-
-	return ""
+	return extraction.HTML
 }
 
 // cwGenStripCodeFences 去除AI输出中的markdown代码块标记

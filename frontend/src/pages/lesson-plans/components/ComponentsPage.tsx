@@ -14,6 +14,11 @@
  *   - 集成ComponentEditModal创建/编辑弹窗
  */
 import { useState, useEffect, useCallback } from 'react'
+import { useEducationProfile } from '@/hooks/useEducationProfile'
+import {
+  RESOURCE_EDUCATION_DOMAIN_LABELS,
+  type ResourceEducationDomain,
+} from '@/education-domain/types'
 import {
   getComponents, deleteComponent, getExtractions, confirmExtraction,
   type ComponentListItem, type ExtractionListItem, type LibraryType,
@@ -91,6 +96,8 @@ function Toast({ msg, type }: { msg: string; type: 'success' | 'error' }) {
 // ==================== 主页面 ====================
 
 export default function ComponentsPage() {
+  const { isMixed } = useEducationProfile()
+
   // Tab状态：overview / list / extractions
   const [activeTab, setActiveTab] = useState<'overview' | 'list' | 'extractions'>('overview')
 
@@ -101,7 +108,9 @@ export default function ComponentsPage() {
   // 组件列表（迭代4B-1新增Tab）
   const [components, setComponents] = useState<ComponentListItem[]>([])
   const [listLoading, setListLoading] = useState(false)
-  const [listFilter, setListFilter] = useState<{ libraryType: string; subject: string }>({ libraryType: '', subject: '' })
+  const [listFilter, setListFilter] = useState<{
+    libraryType: string; subject: string; educationDomain: ResourceEducationDomain | ''
+  }>({ libraryType: '', subject: '', educationDomain: '' })
   const [listTotal, setListTotal] = useState(0)
 
   // 萃取待审
@@ -144,6 +153,7 @@ export default function ComponentsPage() {
       const resp = await getComponents({
         library_type: (listFilter.libraryType || undefined) as LibraryType | undefined,
         subject: listFilter.subject || undefined,
+        education_domain: isMixed ? listFilter.educationDomain || undefined : undefined,
         limit: 200,
       })
       const data = resp as unknown as { components: ComponentListItem[]; total: number }
@@ -151,7 +161,7 @@ export default function ComponentsPage() {
       setListTotal(data.total || 0)
     } catch (e) { console.error('加载组件列表失败', e) }
     finally { setListLoading(false) }
-  }, [listFilter])
+  }, [isMixed, listFilter])
 
   // ---- 加载萃取列表 ----
   const loadExtractions = useCallback(async () => {
@@ -214,7 +224,7 @@ export default function ComponentsPage() {
 
   // ---- 概览卡片点击：切换到列表Tab并设置类型筛选 ----
   const viewTypeComponents = (typeKey: string) => {
-    setListFilter({ libraryType: typeKey, subject: '' })
+    setListFilter(current => ({ ...current, libraryType: typeKey, subject: '' }))
     setActiveTab('list')
   }
 
@@ -330,6 +340,9 @@ export default function ComponentsPage() {
                 <option key={s} value={s}>{s}</option>
               )}
             </select>
+            {isMixed && <select value={listFilter.educationDomain} onChange={e => setListFilter(f => ({ ...f, educationDomain: e.target.value as ResourceEducationDomain | '' }))} style={{
+              padding: '7px 12px', borderRadius: '8px', border: `1px solid ${C.border}`, fontSize: '13px', color: C.text, background: '#fff', cursor: 'pointer',
+            }}><option value="">全部资源域</option>{Object.entries(RESOURCE_EDUCATION_DOMAIN_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>}
             <div style={{ flex: 1 }} />
             <span style={{ fontSize: '12px', color: C.textMuted }}>{listTotal} 个组件</span>
           </div>
@@ -353,6 +366,7 @@ export default function ComponentsPage() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
               {components.map(comp => {
                 const typeInfo = COMPONENT_TYPES.find(t => t.key === comp.library_type)
+                const readOnlyCommon = !isMixed && comp.education_domain === 'common'
                 return (
                   <div key={comp.id} style={{
                     display: 'flex', alignItems: 'center', gap: '14px', padding: '14px 18px',
@@ -374,6 +388,7 @@ export default function ComponentsPage() {
                         <span style={{ fontSize: '11px', color: C.textMuted }}>{comp.library_name || typeInfo?.name}</span>
                         <span style={{ fontSize: '11px', color: C.textMuted }}>·</span>
                         <span style={{ fontSize: '11px', color: C.textMuted }}>{comp.subject === 'general' ? '通用' : comp.subject}</span>
+                        <span style={{ fontSize: '10px', color: C.primary, background: C.primaryLight, padding: '1px 6px', borderRadius: '5px' }}>{RESOURCE_EDUCATION_DOMAIN_LABELS[comp.education_domain]}</span>
                         {comp.grade_range && <>
                           <span style={{ fontSize: '11px', color: C.textMuted }}>·</span>
                           <span style={{ fontSize: '11px', color: C.textMuted }}>{comp.grade_range}</span>
@@ -404,15 +419,13 @@ export default function ComponentsPage() {
                       {comp.source === 'ai_extracted' ? 'AI萃取' : comp.source === 'manual' ? '手动' : comp.source}
                     </span>
 
-                    {/* 删除按钮 */}
-                    <button onClick={e => { e.stopPropagation(); setDeleteConfirmId(comp.id) }} style={{
+                    {/* common对普通教学Actor只读，mixed管理Actor仍可治理。 */}
+                    {readOnlyCommon ? <span style={{ fontSize: '10px', color: C.textMuted, flexShrink: 0 }}>只读</span> : <button onClick={e => { e.stopPropagation(); setDeleteConfirmId(comp.id) }} style={{
                       background: 'none', border: 'none', cursor: 'pointer', fontSize: '14px', color: C.textMuted,
                       padding: '4px 6px', borderRadius: '6px', flexShrink: 0,
                     }}
                     onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = C.danger }}
-                    onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = C.textMuted }}>
-                      🗑️
-                    </button>
+                    onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = C.textMuted }}>🗑️</button>}
                   </div>
                 )
               })}

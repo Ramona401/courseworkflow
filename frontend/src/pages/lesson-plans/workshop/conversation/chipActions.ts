@@ -29,6 +29,10 @@
 
 import type { SuggestedAction } from '@/api/lesson-plans'
 import type { ChipDef, ChipActionType } from './conversationScript'
+import {
+  buildConversationChipActionKey,
+  isConversationPublishIntent,
+} from './conversationActionIntent'
 
 /**
  * 芯片执行上下文 —— 页面组件实现并注入的能力集合
@@ -68,68 +72,134 @@ function isStageAdvanceConfirmText(text: string): boolean {
   return /进入.{0,12}(阶段|教学设计|教案撰写|撰写|修订|定稿|评审|下一)/.test(t)
 }
 
-export async function dispatchChip(ctx: ChipContext, chip: ChipDef): Promise<void> {
-  switch (chip.action_type) {
-    case 'send_text':
-      // v192：若芯片文本是"进入下一阶段"的确认语，则直接走推进（写分隔符+触发下一阶段开场白，
-      //       开场白已会承接前文），不再作为聊天消息发给上一阶段——避免上一阶段多回一句过渡告别。
-      if (chip.payload?.text && isStageAdvanceConfirmText(chip.payload.text)) {
+const activeChipActions =
+  new WeakMap<
+    ChipContext,
+    Set<string>
+  >()
+
+export async function dispatchChip(
+  ctx: ChipContext,
+  chip: ChipDef,
+): Promise<void> {
+  const actionKey =
+    buildConversationChipActionKey(chip)
+
+  let active =
+    activeChipActions.get(ctx)
+
+  if (!active) {
+    active = new Set<string>()
+    activeChipActions.set(ctx, active)
+  }
+
+  if (active.has(actionKey)) {
+    return
+  }
+
+  active.add(actionKey)
+
+  try {
+    switch (chip.action_type) {
+      case 'send_text': {
+        const text =
+          chip.payload?.text?.trim() || ''
+
+        if (!text) {
+          break
+        }
+
+        if (
+          isConversationPublishIntent(text) ||
+          isConversationPublishIntent(chip.label)
+        ) {
+          await ctx.publish()
+          break
+        }
+
+        if (
+          isStageAdvanceConfirmText(text)
+        ) {
+          await ctx.advanceNext()
+        } else {
+          await ctx.sendText(text)
+        }
+        break
+      }
+
+      case 'full_generate':
+        await ctx.fullGenerate(
+          (
+            chip.payload?.stage &&
+            chip.payload.stage.trim()
+          )
+            ? chip.payload.stage
+            : 'write',
+        )
+        break
+
+      case 'switch_stage':
+        if (
+          chip.payload?.stage &&
+          chip.payload.stage.trim()
+        ) {
+          await ctx.switchStage(
+            chip.payload.stage,
+          )
+        }
+        break
+
+      case 'open_tool':
+        if (
+          chip.payload?.tool &&
+          chip.payload.tool.trim()
+        ) {
+          ctx.openTool(
+            chip.payload.tool,
+          )
+        }
+        break
+
+      case 'confirm_structure': {
+        const text =
+          chip.payload?.text?.trim() || ''
+
+        if (!text) {
+          break
+        }
+
+        if (
+          isConversationPublishIntent(text) ||
+          isConversationPublishIntent(chip.label)
+        ) {
+          await ctx.publish()
+        } else {
+          await ctx.sendText(text)
+        }
+        break
+      }
+
+      case 'advance_stage':
         await ctx.advanceNext()
-      } else if (chip.payload?.text) {
-        await ctx.sendText(chip.payload.text)
-      }
-      break
+        break
 
-    case 'full_generate':
-      // 协议五枚举之一（v192-fix 补全）：一键直接出完整教案。
-      // payload.stage 指定目标阶段（如 write）；缺省时默认 write（与转换层注释一致）。
-      // handleFullGenerate 内部已处理"非目标阶段则先 switchToStage + 二次态校验 + 常驻幻觉提示"。
-      await ctx.fullGenerate((chip.payload?.stage && chip.payload.stage.trim()) ? chip.payload.stage : 'write')
-      break
+      case 'publish':
+        await ctx.publish()
+        break
 
-    case 'switch_stage':
-      // 协议五枚举之一（v192-fix 补全）：跳到 payload.stage 指定的阶段（如 review/revise）。
-      // 转换层 suggestedActionsToChips 已保证 switch_stage 芯片必带非空 payload.stage，
-      // 此处再防一次：缺 stage 时静默忽略，不报错。
-      if (chip.payload?.stage && chip.payload.stage.trim()) {
-        await ctx.switchStage(chip.payload.stage)
-      }
-      break
+      case 'focus_input':
+        ctx.focusInput()
+        break
 
-    case 'open_tool':
-      // 协议五枚举之一（v192-fix 补全）：唤起 payload.tool 指定的能力（components/textbook/import 等）。
-      // 转换层已保证 open_tool 芯片必带非空 payload.tool；此处再防一次。
-      if (chip.payload?.tool && chip.payload.tool.trim()) {
-        ctx.openTool(chip.payload.tool)
-      }
-      break
+      default:
+        break
+    }
+  } finally {
+    active.delete(actionKey)
 
-    case 'confirm_structure':
-      // 协议五枚举之一（v192-fix 补全）：确认结构卡。按协议约定"暂按 send_text 处理"，
-      // 即把 payload.text 当作老师的确认话发送。转换层已保证 confirm_structure 必带非空 text。
-      if (chip.payload?.text) {
-        await ctx.sendText(chip.payload.text)
-      }
-      break
-
-    case 'advance_stage':
-      // Phase A 内部类型：进入下一阶段
-      await ctx.advanceNext()
-      break
-
-    case 'publish':
-      // Phase A 内部类型：发布教案
-      await ctx.publish()
-      break
-
-    case 'focus_input':
-      // Phase A 内部类型：聚焦输入框让老师自己说
-      ctx.focusInput()
-      break
-
-    default:
-      // 协议安全底线：未知类型静默忽略，不报错不阻塞
-      break
+    if (active.size === 0) {
+      activeChipActions.delete(ctx)
+    }
   }
 }
 

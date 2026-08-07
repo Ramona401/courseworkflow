@@ -17,6 +17,7 @@ import (
 	"errors"
 	"testing"
 
+	"strings"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 )
@@ -435,6 +436,80 @@ func TestBuildImportedLessonPlanStageOutputsRequiresReview(
 			"缺少review阶段未被拒绝: %v",
 			err,
 		)
+	}
+}
+
+func TestBuildImportOpeningMessageEncouragesImmediateConversation(
+	t *testing.T,
+) {
+	request :=
+		&models.ImportExistingPlanRequest{
+			Subject: "化学",
+			Grade:   "九年级",
+			Topic:   "金属钠",
+			ContentMarkdown: strings.Repeat(
+				"教学内容",
+				20,
+			),
+			SourceType: "docx_fidelity",
+		}
+
+	message :=
+		buildImportOpeningMessage(
+			request,
+			[]string{
+				"analyze",
+				"design",
+				"write",
+			},
+		)
+
+	if message == nil {
+		t.Fatal(
+			"开场消息不应为空",
+		)
+	}
+
+	requiredTexts := []string{
+		"保留原格式Word文档",
+		"教学分析 → 教学设计 → 教案撰写",
+		"现在可以直接开始",
+		"直接开始聊天评审",
+		"后台质量检查会独立进行",
+		"不影响您继续聊天",
+		"原始Word文档和版式内容仍会保留",
+	}
+
+	for _, requiredText := range requiredTexts {
+		if !strings.Contains(
+			message.Content,
+			requiredText,
+		) {
+			t.Fatalf(
+				"开场消息缺少必要文案%q：%s",
+				requiredText,
+				message.Content,
+			)
+		}
+	}
+
+	forbiddenTexts := []string{
+		"请稍候",
+		"等待右侧出现",
+		"右侧面板显示详细评分",
+	}
+
+	for _, forbiddenText := range forbiddenTexts {
+		if strings.Contains(
+			message.Content,
+			forbiddenText,
+		) {
+			t.Fatalf(
+				"开场消息仍包含阻塞性文案%q：%s",
+				forbiddenText,
+				message.Content,
+			)
+		}
 	}
 }
 

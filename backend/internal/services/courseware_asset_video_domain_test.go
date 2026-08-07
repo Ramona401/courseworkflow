@@ -95,3 +95,142 @@ func TestValidateVideoSourceFrameAsset(
 		)
 	}
 }
+
+func TestValidateCoursewareVideoBillingIdentity(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	if coursewareVideoBillingVariant != "silent" {
+		t.Fatalf(
+			"expected silent billing variant, got %s",
+			coursewareVideoBillingVariant,
+		)
+	}
+
+	identity, err :=
+		newCoursewareVideoBillingIdentity(
+			"user-1",
+			"school-1",
+			"courseware-1",
+			"page-1",
+			1,
+			"doubao-seedance-1-5-pro-251215",
+			"11111111-1111-4111-8111-111111111111",
+			"生成一个无声教学视频",
+			"",
+			"",
+		)
+
+	if err != nil {
+		t.Fatalf(
+			"create billing identity failed: %v",
+			err,
+		)
+	}
+
+	metadata :=
+		coursewareVideoMetadataString(
+			coursewareVideoBillingMetadata(
+				identity,
+				"task-1",
+			),
+		)
+
+	valid :=
+		&models.TokenMediaBilling{
+			UserID:          identity.UserID,
+			BillingNodeCode: coursewareVideoBillingNodeCode,
+			MediaType:       models.MediaTypeVideo,
+			Provider:        coursewareVideoBillingProvider,
+			ModelName:       identity.ModelName,
+			Variant:         coursewareVideoBillingVariant,
+			MediaUnit:       models.MediaUnitProviderToken,
+			CoursewareID: coursewareVideoStringPointer(
+				identity.CoursewareID,
+			),
+			PageID: coursewareVideoStringPointer(
+				identity.PageID,
+			),
+			Metadata: []byte(
+				metadata,
+			),
+		}
+
+	if err :=
+		validateCoursewareVideoBillingIdentity(
+			valid,
+			identity,
+		); err != nil {
+		t.Fatalf(
+			"valid billing identity rejected: %v",
+			err,
+		)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*models.TokenMediaBilling)
+	}{
+		{
+			name: "provider mismatch rejected",
+			mutate: func(
+				billing *models.TokenMediaBilling,
+			) {
+				billing.Provider = "other"
+			},
+		},
+		{
+			name: "model mismatch rejected",
+			mutate: func(
+				billing *models.TokenMediaBilling,
+			) {
+				billing.ModelName =
+					"other-model"
+			},
+		},
+		{
+			name: "variant mismatch rejected",
+			mutate: func(
+				billing *models.TokenMediaBilling,
+			) {
+				billing.Variant = "audio"
+			},
+		},
+		{
+			name: "unit mismatch rejected",
+			mutate: func(
+				billing *models.TokenMediaBilling,
+			) {
+				billing.MediaUnit =
+					models.MediaUnitSecond
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		testCase := testCase
+
+		t.Run(
+			testCase.name,
+			func(t *testing.T) {
+				t.Parallel()
+
+				candidate := *valid
+				testCase.mutate(
+					&candidate,
+				)
+
+				if err :=
+					validateCoursewareVideoBillingIdentity(
+						&candidate,
+						identity,
+					); err == nil {
+					t.Fatal(
+						"expected identity mismatch",
+					)
+				}
+			},
+		)
+	}
+}

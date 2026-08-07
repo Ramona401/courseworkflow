@@ -50,121 +50,240 @@ func (s *LessonPlanGenService) handleStageOutputSideEffects(
 	stageCode string,
 	structuredJSON string,
 	rawContent string,
-) {
+	turnID string,
+) error {
 	switch stageCode {
 	case "write", "revise":
-		s.handleWriteStageOutput(ctx, planID, lp, structuredJSON, rawContent)
+		return s.handleWriteStageOutput(
+			ctx,
+			planID,
+			lp,
+			stageCode,
+			structuredJSON,
+			rawContent,
+			turnID,
+		)
+
 	case "review":
-		s.handleReviewStageOutput(ctx, planID, structuredJSON, rawContent)
+		s.handleReviewStageOutput(
+			ctx,
+			planID,
+			structuredJSON,
+			rawContent,
+		)
 	}
+
+	return nil
 }
 
-// handleWriteStageOutput 处理write/revise阶段产出物
+// handleWriteStageOutput 处理write/revise阶段产出物。
+//
+// 正文保存统一经过UpdateLessonPlanContentPreservingWord：
+//   - 普通教案走事务级CAS；
+//   - Word保真教案同时生成DOCX不可变版本；
+//   - 并发冲突或结构不匹配时，原正文和原Word都不改变。
 func (s *LessonPlanGenService) handleWriteStageOutput(
 	ctx context.Context,
 	planID string,
 	lp *models.LessonPlan,
+	stageCode string,
 	structuredJSON string,
 	rawContent string,
-) {
+	turnID string,
+) error {
+	if lp == nil {
+		return errors.New("教案上下文为空")
+	}
+
 	content := ""
 
-	// 正常路径：structuredJSON有效
-	if structuredJSON != "" && structuredJSON != "{}" {
+	if structuredJSON != "" &&
+		structuredJSON != "{}" {
 		var structured map[string]interface{}
-		if err := json.Unmarshal([]byte(structuredJSON), &structured); err == nil {
-			if contentRaw, ok := structured["content_markdown"]; ok {
-				if cs, ok := contentRaw.(string); ok {
-					content = strings.TrimSpace(cs)
+
+		if err :=
+			json.Unmarshal(
+				[]byte(structuredJSON),
+				&structured,
+			); err == nil {
+			if contentRaw, ok :=
+				structured["content_markdown"]; ok {
+				if contentString, ok :=
+					contentRaw.(string); ok {
+					content =
+						strings.TrimSpace(
+							contentString,
+						)
 				}
 			}
 		}
 	}
 
-	// 降级路径：从rawContent中重新检测教案内容
-	if content == "" && rawContent != "" {
-		content = DetectLessonPlanContent(rawContent)
-		if content != "" {
-			lpGenLog.Info("write阶段从rawContent fallback提取教案内容",
-				"plan_id", planID, "content_len", len(content))
+	if content == "" &&
+		rawContent != "" {
+		content =
+			DetectLessonPlanContent(
+				rawContent,
+			)
 
-			updatedStructured := map[string]interface{}{
-				"content_markdown": content,
-			}
-			if b, err := json.Marshal(updatedStructured); err == nil {
-				_ = s.stageService.SaveStageOutput(ctx, planID, lp.CurrentStage, string(b), "", "", 0)
-			}
+		if content != "" {
+			lpGenLog.Info(
+				"write/revise阶段从rawContent提取教案正文",
+				"plan_id", planID,
+				"stage", stageCode,
+				"client_turn_id", turnID,
+				"content_len", len(content),
+			)
 		}
 	}
 
 	if content == "" {
-		lpGenLog.Warn("write阶段未能提取到教案内容", "plan_id", planID)
-		// v203修复（画布不更新）：本轮AI回复未识别到完整教案（可能是对话性内容如
-		// "正文已更新不再重复输出"），但DB已有正文时，仍广播已有正文刷新画布，
-		// 保证画布与DB始终同步——否则老师看到AI说"已更新"但画布纹丝不动。
-		existingForBroadcast := strings.TrimSpace(lp.ContentMarkdown)
+		lpGenLog.Warn(
+			"write/revise阶段未提取到可保存正文",
+			"plan_id", planID,
+			"stage", stageCode,
+			"client_turn_id", turnID,
+		)
+
+		existingForBroadcast :=
+			strings.TrimSpace(
+				lp.ContentMarkdown,
+			)
 		if existingForBroadcast != "" {
-			GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
-				EventType: models.LPSSEContentUpdate,
-				PlanID:    planID,
-				Content:   existingForBroadcast,
-			})
-			lpGenLog.Info("write阶段未提取到新内容，广播已有教案正文刷新画布",
-				"plan_id", planID, "existing_len", len(existingForBroadcast))
+			GlobalLPSSEHub.Broadcast(
+				planID,
+				models.LPSSEEvent{
+					EventType: models.LPSSEContentUpdate,
+					PlanID:    planID,
+					Content:   existingForBroadcast,
+				},
+			)
 		}
-		return
+
+		return errors.New(
+			"AI没有输出可保存的完整教案正文",
+		)
 	}
 
-	// 缩写保护增强：
-	//
-	// 旧规则只检查新正文前300字是否包含“教学目标”或“教学设计”。
-	// 当个人助手把【基本信息】、教材分析、设计理念放在教学目标之前时，
-	// 一份完整新版也可能被误判为“只输出了后半段”，导致画布继续显示旧正文。
-	//
-	// 现在仍保留“新正文不足旧正文70%”这一风险条件，但使用
-	// hasLessonPlanOpeningStructure识别多种可信教案开头。
-	existingMd := strings.TrimSpace(lp.ContentMarkdown)
-	existingRunes := []rune(existingMd)
-	newRunes := []rune(content)
+	existingMarkdown :=
+		strings.TrimSpace(
+			lp.ContentMarkdown,
+		)
+	existingRunes :=
+		[]rune(existingMarkdown)
+	newRunes :=
+		[]rune(content)
 
 	if len(existingRunes) > 800 &&
-		len(newRunes) < len(existingRunes)*7/10 &&
-		!hasLessonPlanOpeningStructure(content) {
+		len(newRunes) <
+			len(existingRunes)*7/10 &&
+		!hasLessonPlanOpeningStructure(
+			content,
+		) {
 		lpGenLog.Warn(
-			"write阶段缩写保护：新内容明显短于已有正文且缺少可信教案开头，拒绝覆盖",
+			"write/revise阶段缩写保护拒绝覆盖",
 			"plan_id", planID,
+			"stage", stageCode,
+			"client_turn_id", turnID,
 			"existing_runes", len(existingRunes),
 			"new_runes", len(newRunes),
 		)
 
-		GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
+		GlobalLPSSEHub.Broadcast(
+			planID,
+			models.LPSSEEvent{
+				EventType: models.LPSSEContentUpdate,
+				PlanID:    planID,
+				Content:   existingMarkdown,
+			},
+		)
+
+		return errors.New(
+			"AI生成的新正文明显不完整，系统已保留原教案",
+		)
+	}
+
+	changeSummary :=
+		"AI在教案撰写阶段更新完整正文"
+	if stageCode == "revise" {
+		changeSummary =
+			"AI在修订定稿阶段更新完整正文"
+	}
+
+	mutation, err :=
+		UpdateLessonPlanContentPreservingWord(
+			ctx,
+			LessonPlanContentMutationInput{
+				PlanID:            planID,
+				CallerID:          lp.AuthorID,
+				Title:             lp.Title,
+				ContentMarkdown:   content,
+				ContentStructured: lp.ContentStructured,
+				DurationMinutes:   lp.DurationMinutes,
+				ExpectedVersion:   lp.Version,
+				ExpectedContent:   lp.ContentMarkdown,
+				ChangeSource: models.
+					LessonPlanWordChangeSourceAI,
+				ChangeSummary: changeSummary,
+			},
+		)
+	if err != nil {
+		lpGenLog.Warn(
+			"write/revise阶段正文与Word同步失败",
+			"plan_id", planID,
+			"stage", stageCode,
+			"client_turn_id", turnID,
+			"error", err,
+		)
+		return err
+	}
+
+	GlobalLPSSEHub.Broadcast(
+		planID,
+		models.LPSSEEvent{
 			EventType: models.LPSSEContentUpdate,
 			PlanID:    planID,
-			Content:   existingMd,
-		})
-		return
-	}
-	// 更新教案正文到lesson_plans表
-	if err := repository.UpdateLessonPlanContent(ctx, planID, lp.Title, content, "{}", lp.DurationMinutes); err != nil {
-		lpGenLog.Warn("write阶段更新教案正文失败", "plan_id", planID, "error", err)
-		return
-	}
+			Content:   mutation.ContentMarkdown,
+		},
+	)
 
-	// 推送内容更新事件给前端
-	GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
-		EventType: models.LPSSEContentUpdate,
-		PlanID:    planID,
-		Content:   content,
-	})
+	lp.ContentMarkdown =
+		mutation.ContentMarkdown
+	lp.Version =
+		mutation.CurrentVersion
 
-	// v74保留：自动将write/revise阶段标记为completed
-	if err := repository.CompleteStageOutput(ctx, planID, lp.CurrentStage, "[]"); err != nil {
-		lpGenLog.Warn("自动完成write阶段产出失败", "plan_id", planID, "error", err)
+	if err :=
+		repository.CompleteStageOutput(
+			ctx,
+			planID,
+			lp.CurrentStage,
+			"[]",
+		); err != nil {
+		lpGenLog.Warn(
+			"自动完成write/revise阶段产出失败",
+			"plan_id", planID,
+			"stage", lp.CurrentStage,
+			"error", err,
+		)
 	} else {
-		lpGenLog.Info("write/revise阶段产出自动标记completed", "plan_id", planID, "stage", lp.CurrentStage)
+		lpGenLog.Info(
+			"write/revise阶段产出自动标记completed",
+			"plan_id", planID,
+			"stage", lp.CurrentStage,
+		)
 	}
 
-	lpGenLog.Info("write/revise阶段教案正文已更新", "plan_id", planID, "content_len", len(content))
+	lpGenLog.Info(
+		"write/revise阶段教案正文已安全更新",
+		"plan_id", planID,
+		"stage", stageCode,
+		"content_len",
+		len(mutation.ContentMarkdown),
+		"current_version",
+		mutation.CurrentVersion,
+	)
+
+	return nil
 }
 
 // handleReviewStageOutput 处理review阶段产出物
@@ -411,59 +530,159 @@ func (s *LessonPlanGenService) applyAndReviewAsync(
 	lp *models.LessonPlan,
 	suggestionIDs []string,
 ) {
+	if lp == nil {
+		return
+	}
+
 	planID := lp.ID
 
-	GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
-		EventType: models.LPSSEThinking,
-		PlanID:    planID,
-	})
-
-	aiCfg, err := aiClient.GetEffectiveConfig(s.cfg.GetAESKey(), lessonPlanSceneCode, "", "", "")
-	if err != nil {
-		s.broadcastError(planID, "", "AI配置失败: "+err.Error())
-		return
-	}
-
-	suggestions := extractSuggestionsByIDs(lp.AIReviewResult, suggestionIDs)
-	if len(suggestions) == 0 {
-		s.broadcastError(planID, "", "未找到有效的改进建议")
-		return
-	}
-
-	optimizePrompt := buildOptimizePrompt(lp.ContentMarkdown, suggestions)
-	systemPrompt := fmt.Sprintf(
-		"你是一位专业的%s课教案优化专家。请根据评审建议改进教案内容，保持原有结构，重点改进被指出的问题。输出完整的改进后教案Markdown。",
-		lp.Subject,
+	GlobalLPSSEHub.Broadcast(
+		planID,
+		models.LPSSEEvent{
+			EventType: models.LPSSEThinking,
+			PlanID:    planID,
+		},
 	)
 
-	// v89-2：构建TraceContext，关联教案ID和作者
-	optimizeTraceCtx := &aiClient.TraceContext{
-		SceneCode:    lessonPlanSceneCode,
-		LessonPlanID: &planID,
-		UserID:       &lp.AuthorID,
-	}
-	result, err := aiClient.CallAI(aiCfg, systemPrompt, optimizePrompt, optimizeTraceCtx)
+	aiConfig, err :=
+		aiClient.GetEffectiveConfig(
+			s.cfg.GetAESKey(),
+			lessonPlanSceneCode,
+			"",
+			"",
+			"",
+		)
 	if err != nil {
-		s.broadcastError(planID, "", "AI优化失败: "+err.Error())
+		s.broadcastError(
+			planID,
+			"",
+			"AI配置失败: "+err.Error(),
+		)
 		return
 	}
 
-	newContent := strings.TrimSpace(result.Content)
+	suggestions :=
+		extractSuggestionsByIDs(
+			lp.AIReviewResult,
+			suggestionIDs,
+		)
+	if len(suggestions) == 0 {
+		s.broadcastError(
+			planID,
+			"",
+			"未找到有效的改进建议",
+		)
+		return
+	}
+
+	optimizePrompt :=
+		buildOptimizePrompt(
+			lp.ContentMarkdown,
+			suggestions,
+		)
+	systemPrompt :=
+		fmt.Sprintf(
+			"你是一位专业的%s课教案优化专家。请根据评审建议改进教案内容，保持原有结构，重点改进被指出的问题。输出完整的改进后教案Markdown。",
+			lp.Subject,
+		)
+
+	if wordPrompt, _ :=
+		buildLessonPlanWordFidelityMutationPrompt(
+			ctx,
+			lp,
+			"应用AI评审建议",
+		); wordPrompt != "" {
+		systemPrompt += wordPrompt
+	}
+
+	optimizeTraceContext :=
+		&aiClient.TraceContext{
+			SceneCode:    lessonPlanSceneCode,
+			LessonPlanID: &planID,
+			UserID:       &lp.AuthorID,
+		}
+
+	result, err :=
+		aiClient.CallAI(
+			aiConfig,
+			systemPrompt,
+			optimizePrompt,
+			optimizeTraceContext,
+		)
+	if err != nil {
+		s.broadcastError(
+			planID,
+			"",
+			"AI优化失败: "+err.Error(),
+		)
+		return
+	}
+
+	newContent :=
+		strings.TrimSpace(
+			result.Content,
+		)
 	if newContent == "" {
-		s.broadcastError(planID, "", "AI优化返回内容为空")
+		s.broadcastError(
+			planID,
+			"",
+			"AI优化返回内容为空",
+		)
 		return
 	}
 
-	_ = repository.UpdateLessonPlanContent(ctx, planID, lp.Title, newContent, "{}", lp.DurationMinutes)
+	mutation, err :=
+		UpdateLessonPlanContentPreservingWord(
+			ctx,
+			LessonPlanContentMutationInput{
+				PlanID:            planID,
+				CallerID:          lp.AuthorID,
+				Title:             lp.Title,
+				ContentMarkdown:   newContent,
+				ContentStructured: lp.ContentStructured,
+				DurationMinutes:   lp.DurationMinutes,
+				ExpectedVersion:   lp.Version,
+				ExpectedContent:   lp.ContentMarkdown,
+				ChangeSource: models.
+					LessonPlanWordChangeSourceAI,
+				ChangeSummary: "应用AI评审建议并更新教案正文",
+			},
+		)
+	if err != nil {
+		lpGenLog.Warn(
+			"应用AI评审建议保存失败",
+			"plan_id", planID,
+			"error", err,
+		)
 
-	GlobalLPSSEHub.Broadcast(planID, models.LPSSEEvent{
-		EventType: models.LPSSEContentUpdate,
-		PlanID:    planID,
-		Content:   newContent,
-	})
+		s.broadcastError(
+			planID,
+			"",
+			lessonPlanContentMutationPublicMessage(
+				err,
+			),
+		)
+		return
+	}
 
-	lp.ContentMarkdown = newContent
-	s.executeAIReviewAsync(ctx, lp)
+	GlobalLPSSEHub.Broadcast(
+		planID,
+		models.LPSSEEvent{
+			EventType: models.LPSSEContentUpdate,
+			PlanID:    planID,
+			Content:   mutation.ContentMarkdown,
+		},
+	)
+
+	lp.ContentMarkdown =
+		mutation.ContentMarkdown
+	lp.Version =
+		mutation.CurrentVersion
+
+	s.executeAIReviewAsync(
+		ctx,
+		lp,
+	)
 }
 
 // ==================== 自动教案索引触发 ====================

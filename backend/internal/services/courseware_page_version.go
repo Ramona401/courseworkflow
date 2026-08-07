@@ -487,7 +487,7 @@ func (s *CoursewareGenService) RollbackCWPage(
 	pageNum int,
 	versionID string,
 ) (string, error) {
-	_, page, err :=
+	courseware, page, err :=
 		s.loadOwnedCoursewarePageForMutation(
 			ctx,
 			coursewareID,
@@ -567,12 +567,27 @@ func (s *CoursewareGenService) RollbackCWPage(
 		return "", metadataErr
 	}
 
+	// 无论目标版本是完整快照还是迁移前旧版本，
+	// 即将继续写回的组件ID都必须按正式课件快照域重新过滤。
+	safeMatchedComponentIDs, componentReferenceErr :=
+		sanitizeCoursewarePageMatchedComponentIDsForWrite(
+			ctx,
+			courseware,
+			matchedComponentIDs,
+		)
+	if componentReferenceErr != nil {
+		return "", fmt.Errorf(
+			"复核回退页面课件组件引用失败: %w",
+			componentReferenceErr,
+		)
+	}
+
 	if err := repository.UpdateCWPageHTML(
 		ctx,
 		page.ID,
 		target.HTMLContent,
 		placeholderMap,
-		matchedComponentIDs,
+		safeMatchedComponentIDs,
 		pageStatus,
 	); err != nil {
 		return "", fmt.Errorf(
@@ -606,7 +621,7 @@ func (s *CoursewareGenService) SaveManualEditedPage(
 	pageNum int,
 	newHTML string,
 ) (string, error) {
-	_, page, err :=
+	courseware, page, err :=
 		s.loadOwnedCoursewarePageForMutation(
 			ctx,
 			coursewareID,
@@ -670,12 +685,27 @@ func (s *CoursewareGenService) SaveManualEditedPage(
 		return "", err
 	}
 
+	// 就地编辑只修改HTML，不重新选择组件。
+	// 旧matched_component_ids继续写回前必须按课件快照域重新过滤。
+	safeMatchedComponentIDs, componentReferenceErr :=
+		sanitizeCoursewarePageMatchedComponentIDsForWrite(
+			ctx,
+			courseware,
+			page.MatchedComponentIDs,
+		)
+	if componentReferenceErr != nil {
+		return "", fmt.Errorf(
+			"复核页面课件组件引用失败: %w",
+			componentReferenceErr,
+		)
+	}
+
 	if err := repository.UpdateCWPageHTML(
 		ctx,
 		page.ID,
 		newHTML,
 		page.PlaceholderMap,
-		page.MatchedComponentIDs,
+		safeMatchedComponentIDs,
 		models.CWPageStatusGenerated,
 	); err != nil {
 		return "", fmt.Errorf(

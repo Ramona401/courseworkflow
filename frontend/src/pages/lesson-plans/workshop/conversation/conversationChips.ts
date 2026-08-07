@@ -13,6 +13,9 @@ import {
   STAGE_SEP_PREFIX, N0_CHIPS, STAGE_FOLLOWUP_CHIPS, type ChipDef,
 } from './conversationScript'
 import type { ConversationMessage } from '@/api/lesson-plans'
+import {
+  isConversationPublishIntent,
+} from './conversationActionIntent'
 
 /** computeVisibleChips 入参（页面把当前会话派生量打包传入） */
 export interface VisibleChipsInput {
@@ -24,6 +27,33 @@ export interface VisibleChipsInput {
   currentStage: string
   planContent: string
 }
+
+/**
+ * 原Word格式投影仍失败时，只允许老师沿原段落继续修订。
+ *
+ * 该状态禁止发布和普通阶段推进；候选稿已由后端完整保留，
+ * 第一枚芯片把同一候选重新投影到既有段落/表格槽位，
+ * 第二枚芯片让老师直接指出要修改的原段落。
+ */
+const WORD_FORMAT_REJECTED_CHIPS: ChipDef[] = [
+  {
+    id: 'word_format_retry',
+    emoji: '🛠',
+    label: '按原段落重改',
+    action_type: 'send_text',
+    payload: {
+      text:
+        '请把上方候选修改内容严格映射回当前正式教案的原有段落和表格单元格：只能修改原段落文字，不得新增、删除、移动、拆分或合并任何段落及表格行列；保留全部图片和公式，格式校验通过后自动同步到正式教案。',
+    },
+    highlight: true,
+  },
+  {
+    id: 'word_format_manual',
+    emoji: '✏️',
+    label: '我指定原段落',
+    action_type: 'focus_input',
+  },
+]
 
 /**
  * 计算当前应显示的芯片（行为与原 ConversationModePage 内联 IIFE 逐字一致）。
@@ -46,18 +76,96 @@ export function computeVisibleChips(input: VisibleChipsInput): ChipDef[] {
 
   const hasContent = !!(planContent && planContent.trim().length > 0)
 
-  // B-2：AI 动态芯片优先（已经过 suggestedActionsToChips 白名单清洗）
+  /*
+   * Word格式投影失败是可恢复的特殊终态：
+   * 候选稿已保留，但只能沿原段落重改，不能显示发布或阶段推进。
+   */
+  if (
+    last.metadata?.word_format_rejected ===
+    true
+  ) {
+    return WORD_FORMAT_REJECTED_CHIPS
+  }
+
+  /*
+   * 错误、超时和未提交正式稿都不能继续显示发布或阶段推进芯片。
+   *
+   * 历史版本中的write/revise完整教案消息可能是在Word校验前展示的，
+   * 因而没有content_committed=true。此类消息必须按未保存稿处理。
+   */
+  if (
+    isConversationFailureMessage(last) ||
+    isUncommittedLessonPlanArtifact(
+      last,
+      currentStage,
+    )
+  ) {
+    return []
+  }
+
+  // AI动态芯片只补充内容动作，终态推进和发布始终使用确定性剧本芯片。
   if (dynamicChips.length > 0) {
     const aiContentChips = dynamicChips.filter(
-      c => c.action_type !== 'switch_stage' && c.action_type !== 'advance_stage'
+      chip => {
+        if (
+          chip.action_type ===
+            'switch_stage' ||
+          chip.action_type ===
+            'advance_stage'
+        ) {
+          return false
+        }
+
+        if (
+          (
+            chip.action_type ===
+              'send_text' ||
+            chip.action_type ===
+              'confirm_structure'
+          ) &&
+          (
+            isConversationPublishIntent(
+              chip.payload?.text || '',
+            ) ||
+            isConversationPublishIntent(
+              chip.label,
+            )
+          )
+        ) {
+          return false
+        }
+
+        return true
+      },
     )
-    const scriptAdvanceChip = (STAGE_FOLLOWUP_CHIPS[currentStage] || []).filter(
-      c =>
-        c.action_type === 'advance_stage' &&
-        !(c.requireContent && !hasContent) &&
-        !(c.requireNoContent && hasContent)
-    )
-    return [...aiContentChips, ...scriptAdvanceChip]
+
+    const scriptTerminalChips =
+      (
+        STAGE_FOLLOWUP_CHIPS[
+          currentStage
+        ] || []
+      ).filter(
+        chip =>
+          (
+            chip.action_type ===
+              'advance_stage' ||
+            chip.action_type ===
+              'publish'
+          ) &&
+          !(
+            chip.requireContent &&
+            !hasContent
+          ) &&
+          !(
+            chip.requireNoContent &&
+            hasContent
+          ),
+      )
+
+    return deduplicateVisibleChips([
+      ...aiContentChips,
+      ...scriptTerminalChips,
+    ])
   }
 
   // 兜底：剧本常量芯片（确定性节点用确定性芯片）
@@ -101,4 +209,83 @@ export function shouldHideHistoryMessage(m: ConversationMessage): boolean {
   if ((m.role as string) === 'assistant' && m.content.startsWith('📋 阶段评估')) return true
   if (m.role === 'user' && m.content === '请对上一阶段完成的教案进行全面专业评审,直接输出评审报告,包含各维度评分和改进建议。') return true
   return false
+}
+
+/** 判断前端或SSE生成的失败消息。 */
+function isConversationFailureMessage(
+  message: ConversationMessage,
+): boolean {
+  const id = message.id || ''
+  const content = (message.content || '').trim()
+
+  const failurePrefixes = [
+    'err_',
+    'send_err_',
+    'retry_err_',
+    'fullgen_err_',
+    'watchdog_',
+    'adv_err_',
+  ]
+
+  return (
+    failurePrefixes.some(prefix =>
+      id.startsWith(prefix),
+    ) ||
+    content.startsWith('⚠️') ||
+    content.includes('本轮没有保存') ||
+    content.includes('本轮内容未展示也未发布')
+  )
+}
+
+/**
+ * 判断write/revise完整成稿是否缺少后端提交凭据。
+ *
+ * 普通讨论消息不受影响；只有严格命中完整教案判据的消息才需要
+ * content_committed=true。
+ */
+function isUncommittedLessonPlanArtifact(
+  message: ConversationMessage,
+  currentStage: string,
+): boolean {
+  if (
+    currentStage !== 'write' &&
+    currentStage !== 'revise'
+  ) {
+    return false
+  }
+
+  if (!isFullLessonPlanMessage(message)) {
+    return false
+  }
+
+  return (
+    message.metadata?.content_committed !==
+    true
+  )
+}
+
+function deduplicateVisibleChips(
+  chips: ChipDef[],
+): ChipDef[] {
+  const seen = new Set<string>()
+  const result: ChipDef[] = []
+
+  for (const chip of chips) {
+    const key = [
+      chip.action_type,
+      chip.payload?.text || '',
+      chip.payload?.stage || '',
+      chip.payload?.tool || '',
+      chip.label,
+    ].join('\u001f')
+
+    if (seen.has(key)) {
+      continue
+    }
+
+    seen.add(key)
+    result.push(chip)
+  }
+
+  return result
 }

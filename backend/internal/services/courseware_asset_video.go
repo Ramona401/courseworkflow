@@ -17,7 +17,6 @@ package services
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,12 +34,13 @@ import (
 
 // GenerateVideoServiceRequest AI视频生成请求参数
 type GenerateVideoServiceRequest struct {
-	CoursewareID       string                  // 课件ID
-	PageNumber         int                     // 页码
-	Prompt             string                  // 视频描述提示词
-	RefImageURL        string                  // 参考图URL（图生视频模式，可选，须公网可访问）
-	Actor              *CoursewareActorContext // 可信作者Actor
-	SourceFrameAssetID string                  // 首帧图资产ID（两步流可选，非空时写 metadata 溯源；空=直接文字生视频，无溯源）
+        CoursewareID       string
+        PageNumber         int
+        Prompt             string
+        RefImageURL        string
+        Actor              *CoursewareActorContext
+        SourceFrameAssetID string
+        OperationID        string
 }
 
 // GenerateVideoServiceResponse AI视频生成任务提交响应
@@ -131,173 +131,358 @@ func (s *CoursewareAssetService) resolveVideoReferenceURL(
 
 // GenerateVideo 提交视频生成任务（异步，返回task_id供前端轮询）
 func (s *CoursewareAssetService) GenerateVideo(
-	ctx context.Context,
-	req *GenerateVideoServiceRequest,
+        ctx context.Context,
+        req *GenerateVideoServiceRequest,
 ) (*GenerateVideoServiceResponse, error) {
-	if req == nil {
-		return nil, ErrCoursewareActorRequired
-	}
+        if req == nil {
+                return nil,
+                        ErrCoursewareActorRequired
+        }
 
-	// 外部视频任务提交前重新加载正式课件并执行作者域二次授权。
-	_, scopedActor, err :=
-		(&CoursewareService{}).
-			LoadCoursewareForOwnerRuntime(
-				ctx,
-				req.CoursewareID,
-				req.Actor,
-			)
-	if err != nil {
-		return nil, err
-	}
+        req.CoursewareID =
+                strings.TrimSpace(
+                        req.CoursewareID,
+                )
 
-	userID := scopedActor.UserID
+        req.Prompt =
+                strings.TrimSpace(
+                        req.Prompt,
+                )
 
-	page, err :=
-		repository.GetCoursewarePageByNumber(
-			ctx,
-			req.CoursewareID,
-			req.PageNumber,
-		)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"页面不存在: 课件=%s 页码=%d",
-			req.CoursewareID,
-			req.PageNumber,
-		)
-	}
+        req.RefImageURL =
+                strings.TrimSpace(
+                        req.RefImageURL,
+                )
 
-	// 首帧资产校验必须发生在外部任务提交之前。
-	refURL, err := s.resolveVideoReferenceURL(
-		ctx,
-		req,
-	)
-	if err != nil {
-		return nil, err
-	}
+        req.SourceFrameAssetID =
+                strings.TrimSpace(
+                        req.SourceFrameAssetID,
+                )
 
-	videoConfig, err :=
-		ai.GetVideoConfig(s.cfg.GetAESKey())
-	if err != nil {
-		return nil, fmt.Errorf(
-			"视频生成API未配置: %w",
-			err,
-		)
-	}
+        req.OperationID =
+                strings.TrimSpace(
+                        req.OperationID,
+                )
 
-	traceContext := &ai.TraceContext{
-		SceneCode: "courseware_video_gen",
-		UserID:    &userID,
-	}
+        if req.CoursewareID == "" ||
+                req.PageNumber <= 0 ||
+                req.Prompt == "" {
+                return nil,
+                        ErrMediaBillingInvalidRequest
+        }
 
-	result, err := ai.SubmitVideoTask(
-		ctx,
-		videoConfig,
-		req.Prompt,
-		refURL,
-		traceContext,
-	)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"视频任务提交失败: %w",
-			err,
-		)
-	}
+        courseware, scopedActor, err :=
+                (&CoursewareService{}).
+                        LoadCoursewareForOwnerRuntime(
+                                ctx,
+                                req.CoursewareID,
+                                req.Actor,
+                        )
 
-	asset := &models.CoursewareAsset{
-		CoursewareID:     req.CoursewareID,
-		PageID:           &page.ID,
-		PlaceholderID:    result.TaskID,
-		AssetType:        models.CWAssetTypeVideo,
-		GenerationPrompt: req.Prompt,
-		OssURL:           "",
-		FileSize:         0,
-		MimeType:         "video/mp4",
-		Status:           models.CWAssetStatusGenerating,
-	}
+        if err != nil {
+                return nil, err
+        }
 
-	if err := repository.CreateCWAsset(
-		ctx,
-		asset,
-	); err != nil {
-		return nil, fmt.Errorf(
-			"记录视频资产失败: %w",
-			err,
-		)
-	}
+        page, err :=
+                repository.GetCoursewarePageByNumber(
+                        ctx,
+                        courseware.ID,
+                        req.PageNumber,
+                )
 
-	sourceFrameAssetID := strings.TrimSpace(
-		req.SourceFrameAssetID,
-	)
-	if sourceFrameAssetID != "" {
-		metadataBytes, marshalErr :=
-			json.Marshal(
-				map[string]string{
-					"source_frame_asset_id": sourceFrameAssetID,
-				},
-			)
+        if err != nil {
+                return nil,
+                        fmt.Errorf(
+                                "页面不存在: 课件=%s 页码=%d",
+                                courseware.ID,
+                                req.PageNumber,
+                        )
+        }
 
-		if marshalErr != nil {
-			cwAssetLog.Warn(
-				"视频首帧溯源JSON序列化失败(跳过溯源,不影响视频生成)",
-				"asset_id",
-				asset.ID,
-				"source_frame_asset_id",
-				sourceFrameAssetID,
-				"error",
-				marshalErr,
-			)
-		} else if updateErr :=
-			repository.UpdateCWAssetMetadata(
-				ctx,
-				asset.ID,
-				string(metadataBytes),
-			); updateErr != nil {
-			cwAssetLog.Warn(
-				"写入视频首帧溯源metadata失败(不影响视频生成)",
-				"asset_id",
-				asset.ID,
-				"source_frame_asset_id",
-				sourceFrameAssetID,
-				"error",
-				updateErr,
-			)
-		} else {
-			cwAssetLog.Info(
-				"视频已记录首帧溯源",
-				"asset_id",
-				asset.ID,
-				"source_frame_asset_id",
-				sourceFrameAssetID,
-			)
-		}
-	}
+        refURL, err :=
+                s.resolveVideoReferenceURL(
+                        ctx,
+                        req,
+                )
 
-	cwAssetLog.Info(
-		"视频生成任务已提交",
-		"courseware_id",
-		req.CoursewareID,
-		"page_number",
-		req.PageNumber,
-		"asset_id",
-		asset.ID,
-		"task_id",
-		result.TaskID,
-		"model",
-		result.ModelUsed,
-		"prompt_len",
-		len(req.Prompt),
-		"has_ref_image",
-		refURL != "",
-		"has_source_frame",
-		sourceFrameAssetID != "",
-	)
+        if err != nil {
+                return nil, err
+        }
 
-	return &GenerateVideoServiceResponse{
-		AssetID:   asset.ID,
-		TaskID:    result.TaskID,
-		ModelUsed: result.ModelUsed,
-		Message:   "视频生成任务已提交，通常需要30-120秒完成",
-	}, nil
+        videoConfig, err :=
+                ai.GetVideoConfig(
+                        s.cfg.GetAESKey(),
+                )
+
+        if err != nil {
+                return nil,
+                        fmt.Errorf(
+                                "视频生成API未配置: %w",
+                                err,
+                        )
+        }
+
+        schoolID, _ :=
+                repository.GetSchoolIDByUserID(
+                        ctx,
+                        scopedActor.UserID,
+                )
+
+        identity, err :=
+                newCoursewareVideoBillingIdentity(
+                        scopedActor.UserID,
+                        schoolID,
+                        courseware.ID,
+                        page.ID,
+                        page.PageNumber,
+                        videoConfig.Model,
+                        req.OperationID,
+                        req.Prompt,
+                        refURL,
+                        req.SourceFrameAssetID,
+                )
+
+        if err != nil {
+                return nil, err
+        }
+
+        billing, err :=
+                reserveCoursewareVideoBilling(
+                        ctx,
+                        identity,
+                )
+
+        if err != nil {
+                return nil, err
+        }
+
+        if billing == nil {
+                return nil,
+                        ErrMediaBillingInvalidRequest
+        }
+
+        if !billing.ReservationCreated {
+                return s.recoverCoursewareVideoSubmission(
+                        billing,
+                        identity,
+                        req,
+                        page,
+                )
+        }
+
+        userID :=
+                scopedActor.UserID
+
+        traceContext :=
+                &ai.TraceContext{
+                        SceneCode:
+                                "courseware_video_gen",
+                        UserID:
+                                &userID,
+                        SchoolID:
+                                identity.SchoolID,
+                }
+
+        result, err :=
+                ai.SubmitVideoTask(
+                        ctx,
+                        videoConfig,
+                        req.Prompt,
+                        refURL,
+                        traceContext,
+                )
+
+        if err != nil {
+                if ai.IsVideoSubmitUncertain(
+                        err,
+                ) {
+                        cwAssetLog.Error(
+                                "视频提交结果不确定，保持积分预留并禁止自动重复提交",
+                                "idempotency_key",
+                                identity.IdempotencyKey,
+                                "courseware_id",
+                                identity.CoursewareID,
+                                "page_number",
+                                identity.PageNumber,
+                                "error",
+                                err,
+                        )
+
+                        return nil,
+                                fmt.Errorf(
+                                        "%w: 供应商提交结果尚未确认，请稍后刷新本页查看",
+                                        ErrCoursewareVideoBillingInProgress,
+                                )
+                }
+
+                releaseErr :=
+                        releaseCoursewareVideoBilling(
+                                billing,
+                                "",
+                                "video_provider_submit_failed",
+                                map[string]interface{}{
+                                        "submit_error":
+                                                truncateMediaBillingReason(
+                                                        err.Error(),
+                                                ),
+                                },
+                        )
+
+                if releaseErr != nil {
+                        cwAssetLog.Error(
+                                "视频提交失败后的积分释放失败",
+                                "idempotency_key",
+                                identity.IdempotencyKey,
+                                "error",
+                                releaseErr,
+                        )
+                }
+
+                return nil,
+                        fmt.Errorf(
+                                "视频任务提交失败: %w",
+                                err,
+                        )
+        }
+
+        taskID :=
+                strings.TrimSpace(
+                        result.TaskID,
+                )
+
+        if taskID == "" {
+                return nil,
+                        fmt.Errorf(
+                                "视频供应商未返回任务ID",
+                        )
+        }
+
+        billingService :=
+                NewMediaBillingService()
+
+        taskBindErr :=
+                bindCoursewareVideoExternalTask(
+                        billingService,
+                        identity.IdempotencyKey,
+                        taskID,
+                )
+
+        if taskBindErr != nil {
+                cwAssetLog.Error(
+                        "视频供应商任务已创建但计费任务绑定失败",
+                        "idempotency_key",
+                        identity.IdempotencyKey,
+                        "task_id",
+                        taskID,
+                        "error",
+                        taskBindErr,
+                )
+        }
+
+        asset, err :=
+                s.createGeneratingVideoAsset(
+                        req,
+                        page,
+                        identity,
+                        taskID,
+                )
+
+        if err != nil {
+                cwAssetLog.Error(
+                        "视频供应商任务已创建但资产记录失败",
+                        "idempotency_key",
+                        identity.IdempotencyKey,
+                        "task_id",
+                        taskID,
+                        "task_bound",
+                        taskBindErr == nil,
+                        "error",
+                        err,
+                )
+
+                return nil,
+                        fmt.Errorf(
+                                "视频任务已提交，但资产记录失败: %w",
+                                err,
+                        )
+        }
+
+        assetBindErr :=
+                bindCoursewareVideoAsset(
+                        billingService,
+                        identity.IdempotencyKey,
+                        asset.ID,
+                )
+
+        if assetBindErr != nil {
+                cwAssetLog.Error(
+                        "视频资产已创建但计费资产绑定失败",
+                        "idempotency_key",
+                        identity.IdempotencyKey,
+                        "asset_id",
+                        asset.ID,
+                        "error",
+                        assetBindErr,
+                )
+        }
+
+        if taskBindErr != nil {
+                retryErr :=
+                        bindCoursewareVideoExternalTask(
+                                billingService,
+                                identity.IdempotencyKey,
+                                taskID,
+                        )
+
+                if retryErr == nil {
+                        taskBindErr = nil
+                } else {
+                        cwAssetLog.Error(
+                                "视频计费任务绑定重试仍失败",
+                                "idempotency_key",
+                                identity.IdempotencyKey,
+                                "task_id",
+                                taskID,
+                                "error",
+                                retryErr,
+                        )
+                }
+        }
+
+        cwAssetLog.Info(
+                "视频任务已提交并进入积分预留状态",
+                "courseware_id",
+                identity.CoursewareID,
+                "page_number",
+                identity.PageNumber,
+                "asset_id",
+                asset.ID,
+                "task_id",
+                taskID,
+                "prompt_len",
+                len(req.Prompt),
+                "has_ref_image",
+                identity.HasReferenceImage,
+                "has_source_frame",
+                identity.SourceFrameAssetID != "",
+                "estimated_provider_tokens",
+                coursewareVideoEstimatedProviderTokens,
+                "asset_bound",
+                assetBindErr == nil,
+                "task_bound",
+                taskBindErr == nil,
+        )
+
+        return &GenerateVideoServiceResponse{
+                AssetID:
+                        asset.ID,
+                TaskID:
+                        taskID,
+                ModelUsed:
+                        result.ModelUsed,
+                Message:
+                        "视频生成任务已提交，通常需要30-120秒完成",
+        }, nil
 }
 
 // ==================== v0.42.1 视频任务状态查询 ====================
@@ -318,232 +503,481 @@ type QueryVideoStatusResponse struct {
 // QueryVideoStatus 查询视频生成任务状态
 // 如果任务已完成，自动下载视频保存到本地并更新数据库
 func (s *CoursewareAssetService) QueryVideoStatus(
-	ctx context.Context,
-	coursewareID string,
-	assetID string,
-	actor *CoursewareActorContext,
+        ctx context.Context,
+        coursewareID string,
+        assetID string,
+        actor *CoursewareActorContext,
 ) (*QueryVideoStatusResponse, error) {
-	// 先授权路径中的课件，避免通过随机asset_id探测其它课件资产。
-	if _, _, err :=
-		(&CoursewareService{}).
-			LoadCoursewareForOwnerRuntime(
-				ctx,
-				coursewareID,
-				actor,
-			); err != nil {
-		return nil, err
-	}
+        if _, _, err :=
+                (&CoursewareService{}).
+                        LoadCoursewareForOwnerRuntime(
+                                ctx,
+                                coursewareID,
+                                actor,
+                        ); err != nil {
+                return nil, err
+        }
 
-	asset, err := repository.GetCWAssetByID(
-		ctx,
-		assetID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"视频资产不存在: %w",
-			err,
-		)
-	}
+        asset, err :=
+                repository.GetCWAssetByID(
+                        ctx,
+                        assetID,
+                )
 
-	if asset.CoursewareID != coursewareID {
-		return nil, fmt.Errorf(
-			"视频资产不属于路径指定课件",
-		)
-	}
-	if asset.AssetType != models.CWAssetTypeVideo {
-		return nil, fmt.Errorf(
-			"资产不是视频资产",
-		)
-	}
+        if err != nil {
+                return nil,
+                        fmt.Errorf(
+                                "视频资产不存在: %w",
+                                err,
+                        )
+        }
 
-	if asset.Status == models.CWAssetStatusUploaded ||
-		asset.Status == models.CWAssetStatusConfirmed {
-		return &QueryVideoStatusResponse{
-			AssetID:  asset.ID,
-			TaskID:   asset.PlaceholderID,
-			Status:   "uploaded",
-			VideoURL: asset.OssURL,
-			Message:  "视频已生成完成",
-		}, nil
-	}
+        if asset.CoursewareID !=
+                coursewareID {
+                return nil,
+                        fmt.Errorf(
+                                "视频资产不属于路径指定课件",
+                        )
+        }
 
-	if asset.Status != models.CWAssetStatusGenerating {
-		return &QueryVideoStatusResponse{
-			AssetID: asset.ID,
-			TaskID:  asset.PlaceholderID,
-			Status:  "failed",
-			ErrorMsg: "视频资产状态异常: " +
-				asset.Status,
-			Message: "视频生成出现问题",
-		}, nil
-	}
+        if asset.AssetType !=
+                models.CWAssetTypeVideo {
+                return nil,
+                        fmt.Errorf(
+                                "资产不是视频资产",
+                        )
+        }
 
-	taskID := strings.TrimSpace(
-		asset.PlaceholderID,
-	)
-	if taskID == "" {
-		return nil, fmt.Errorf(
-			"视频任务ID为空",
-		)
-	}
+        billing, err :=
+                loadCoursewareVideoBilling(
+                        ctx,
+                        asset,
+                )
 
-	videoConfig, err :=
-		ai.GetVideoConfig(s.cfg.GetAESKey())
-	if err != nil {
-		return nil, fmt.Errorf(
-			"视频生成API配置加载失败: %w",
-			err,
-		)
-	}
+        if err != nil {
+                return nil, err
+        }
 
-	queryResult, err := ai.QueryVideoTask(
-		ctx,
-		videoConfig,
-		taskID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"查询视频任务状态失败: %w",
-			err,
-		)
-	}
+        taskID :=
+                resolveCoursewareVideoTaskID(
+                        billing,
+                        asset,
+                )
 
-	switch queryResult.Status {
-	case "running":
-		return &QueryVideoStatusResponse{
-			AssetID: asset.ID,
-			TaskID:  taskID,
-			Status:  "generating",
-			Message: "视频正在生成中，请稍后重试查询",
-		}, nil
+        if asset.Status ==
+                models.CWAssetStatusUploaded ||
+                asset.Status ==
+                        models.CWAssetStatusConfirmed {
+                if billing != nil &&
+                        billing.Status ==
+                                models.MediaBillingStatusReserved {
+                        settleErr :=
+                                settleCoursewareVideoBillingFromAsset(
+                                        billing,
+                                        asset,
+                                )
 
-	case "succeeded":
-		if strings.TrimSpace(
-			queryResult.VideoURL,
-		) == "" {
-			return nil, fmt.Errorf(
-				"视频生成成功但未返回视频URL",
-			)
-		}
+                        if settleErr != nil &&
+                                taskID != "" {
+                                videoConfig, configErr :=
+                                        ai.GetVideoConfig(
+                                                s.cfg.GetAESKey(),
+                                        )
 
-		// 外部任务完成后、下载写盘前再次校验课件作者与教育域。
-		if _, _, authErr :=
-			(&CoursewareService{}).
-				LoadCoursewareForOwnerRuntime(
-					ctx,
-					coursewareID,
-					actor,
-				); authErr != nil {
-			return nil, authErr
-		}
+                                if configErr == nil {
+                                        queryResult, queryErr :=
+                                                ai.QueryVideoTask(
+                                                        ctx,
+                                                        videoConfig,
+                                                        taskID,
+                                                )
 
-		localURL, fileSize, downloadErr :=
-			s.downloadAndSaveVideo(
-				ctx,
-				coursewareID,
-				taskID,
-				queryResult.VideoURL,
-			)
-		if downloadErr != nil {
-			cwAssetLog.Error(
-				"下载视频失败",
-				"asset_id",
-				asset.ID,
-				"task_id",
-				taskID,
-				"error",
-				downloadErr,
-			)
+                                        if queryErr == nil &&
+                                                queryResult.Status ==
+                                                        "succeeded" {
+                                                _ =
+                                                        updateCoursewareVideoAssetResultMetadata(
+                                                                asset,
+                                                                queryResult,
+                                                        )
 
-			return nil, fmt.Errorf(
-				"下载视频文件失败: %w",
-				downloadErr,
-			)
-		}
+                                                retryErr :=
+                                                        settleCoursewareVideoBilling(
+                                                                billing,
+                                                                asset,
+                                                                queryResult,
+                                                        )
 
-		if updateErr :=
-			repository.UpdateCWAssetOSSURL(
-				ctx,
-				asset.ID,
-				localURL,
-				fileSize,
-				"video/mp4",
-			); updateErr != nil {
-			cwAssetLog.Warn(
-				"更新视频URL失败",
-				"asset_id",
-				asset.ID,
-				"error",
-				updateErr,
-			)
-		}
+                                                if retryErr != nil {
+                                                        cwAssetLog.Error(
+                                                                "已完成视频补结算失败",
+                                                                "asset_id",
+                                                                asset.ID,
+                                                                "task_id",
+                                                                taskID,
+                                                                "error",
+                                                                retryErr,
+                                                        )
+                                                }
+                                        }
+                                }
+                        }
+                }
 
-		cwAssetLog.Info(
-			"视频生成完成并保存到本地",
-			"asset_id",
-			asset.ID,
-			"task_id",
-			taskID,
-			"duration",
-			queryResult.Duration,
-			"resolution",
-			queryResult.Resolution,
-			"file_size",
-			fileSize,
-			"local_url",
-			localURL,
-		)
+                metadata :=
+                        coursewareVideoMetadataMap(
+                                asset.Metadata,
+                        )
 
-		return &QueryVideoStatusResponse{
-			AssetID:    asset.ID,
-			TaskID:     taskID,
-			Status:     "uploaded",
-			VideoURL:   localURL,
-			Duration:   queryResult.Duration,
-			Resolution: queryResult.Resolution,
-			Ratio:      queryResult.Ratio,
-			Message: fmt.Sprintf(
-				"视频生成完成！时长%d秒，分辨率%s",
-				queryResult.Duration,
-				queryResult.Resolution,
-			),
-		}, nil
+                return &QueryVideoStatusResponse{
+                        AssetID:
+                                asset.ID,
+                        TaskID:
+                                taskID,
+                        Status:
+                                "uploaded",
+                        VideoURL:
+                                asset.OssURL,
+                        Duration:
+                                coursewareVideoMetadataInt(
+                                        metadata,
+                                        "video_duration",
+                                ),
+                        Resolution:
+                                coursewareVideoMetadataText(
+                                        metadata,
+                                        "video_resolution",
+                                ),
+                        Ratio:
+                                coursewareVideoMetadataText(
+                                        metadata,
+                                        "video_ratio",
+                                ),
+                        Message:
+                                "视频已生成完成",
+                }, nil
+        }
 
-	case "failed":
-		_ = repository.UpdateCWAssetStatus(
-			ctx,
-			asset.ID,
-			models.CWAssetStatusPending,
-		)
+        if asset.Status !=
+                models.CWAssetStatusGenerating {
+                return &QueryVideoStatusResponse{
+                        AssetID:
+                                asset.ID,
+                        TaskID:
+                                taskID,
+                        Status:
+                                "failed",
+                        ErrorMsg:
+                                "视频资产状态异常: " +
+                                        asset.Status,
+                        Message:
+                                "视频生成出现问题",
+                }, nil
+        }
 
-		cwAssetLog.Warn(
-			"视频生成失败",
-			"asset_id",
-			asset.ID,
-			"task_id",
-			taskID,
-			"error",
-			queryResult.ErrorMsg,
-		)
+        if billing != nil &&
+                (billing.Status ==
+                        models.MediaBillingStatusFailed ||
+                        billing.Status ==
+                                models.MediaBillingStatusCancelled) {
+                return &QueryVideoStatusResponse{
+                        AssetID:
+                                asset.ID,
+                        TaskID:
+                                taskID,
+                        Status:
+                                "failed",
+                        ErrorMsg:
+                                billing.FailureReason,
+                        Message:
+                                "视频生成任务已经失败或取消",
+                }, nil
+        }
 
-		return &QueryVideoStatusResponse{
-			AssetID:  asset.ID,
-			TaskID:   taskID,
-			Status:   "failed",
-			ErrorMsg: queryResult.ErrorMsg,
-			Message: "视频生成失败: " +
-				queryResult.ErrorMsg,
-		}, nil
+        if taskID == "" {
+                return nil,
+                        fmt.Errorf(
+                                "视频任务ID为空",
+                        )
+        }
 
-	default:
-		return &QueryVideoStatusResponse{
-			AssetID: asset.ID,
-			TaskID:  taskID,
-			Status:  "generating",
-			Message: "视频状态: " +
-				queryResult.Status,
-		}, nil
-	}
+        videoConfig, err :=
+                ai.GetVideoConfig(
+                        s.cfg.GetAESKey(),
+                )
+
+        if err != nil {
+                return nil,
+                        fmt.Errorf(
+                                "视频生成API配置加载失败: %w",
+                                err,
+                        )
+        }
+
+        queryResult, err :=
+                ai.QueryVideoTask(
+                        ctx,
+                        videoConfig,
+                        taskID,
+                )
+
+        if err != nil {
+                return nil,
+                        fmt.Errorf(
+                                "查询视频任务状态失败: %w",
+                                err,
+                        )
+        }
+
+        switch queryResult.Status {
+        case "running":
+                return &QueryVideoStatusResponse{
+                        AssetID:
+                                asset.ID,
+                        TaskID:
+                                taskID,
+                        Status:
+                                "generating",
+                        Message:
+                                "视频正在生成中，请稍后重试查询",
+                }, nil
+
+        case "succeeded":
+                if strings.TrimSpace(
+                        queryResult.VideoURL,
+                ) == "" {
+                        return nil,
+                                fmt.Errorf(
+                                        "视频生成成功但未返回视频URL",
+                                )
+                }
+
+                if queryResult.TotalTokens <= 0 {
+                        return nil,
+                                fmt.Errorf(
+                                        "视频生成成功但未返回有效token用量",
+                                )
+                }
+
+                if _, _, authErr :=
+                        (&CoursewareService{}).
+                                LoadCoursewareForOwnerRuntime(
+                                        ctx,
+                                        coursewareID,
+                                        actor,
+                                ); authErr != nil {
+                        return nil, authErr
+                }
+
+                metadataErr :=
+                        updateCoursewareVideoAssetResultMetadata(
+                                asset,
+                                queryResult,
+                        )
+
+                if metadataErr != nil {
+                        cwAssetLog.Warn(
+                                "保存视频供应商结果元数据失败",
+                                "asset_id",
+                                asset.ID,
+                                "task_id",
+                                taskID,
+                                "error",
+                                metadataErr,
+                        )
+                }
+
+                if billing != nil {
+                        settleErr :=
+                                settleCoursewareVideoBilling(
+                                        billing,
+                                        asset,
+                                        queryResult,
+                                )
+
+                        if settleErr != nil {
+                                cwAssetLog.Error(
+                                        "视频供应商成功后的积分结算失败，预留保持待补偿",
+                                        "asset_id",
+                                        asset.ID,
+                                        "task_id",
+                                        taskID,
+                                        "total_tokens",
+                                        queryResult.TotalTokens,
+                                        "error",
+                                        settleErr,
+                                )
+                        }
+                }
+
+                localURL, fileSize, downloadErr :=
+                        s.downloadAndSaveVideo(
+                                ctx,
+                                coursewareID,
+                                taskID,
+                                queryResult.VideoURL,
+                        )
+
+                if downloadErr != nil {
+                        cwAssetLog.Error(
+                                "视频已经成功并结算，但下载保存失败",
+                                "asset_id",
+                                asset.ID,
+                                "task_id",
+                                taskID,
+                                "error",
+                                downloadErr,
+                        )
+
+                        return nil,
+                                fmt.Errorf(
+                                        "下载视频文件失败: %w",
+                                        downloadErr,
+                                )
+                }
+
+                updateCtx, cancel :=
+                        context.WithTimeout(
+                                context.Background(),
+                                coursewareVideoBillingDBTimeout,
+                        )
+
+                updateErr :=
+                        repository.UpdateCWAssetOSSURL(
+                                updateCtx,
+                                asset.ID,
+                                localURL,
+                                fileSize,
+                                "video/mp4",
+                        )
+
+                cancel()
+
+                if updateErr != nil {
+                        return nil,
+                                fmt.Errorf(
+                                        "视频已经生成，但资产状态保存失败: %w",
+                                        updateErr,
+                                )
+                }
+
+                cwAssetLog.Info(
+                        "视频生成完成、积分结算并保存到本地",
+                        "asset_id",
+                        asset.ID,
+                        "task_id",
+                        taskID,
+                        "duration",
+                        queryResult.Duration,
+                        "resolution",
+                        queryResult.Resolution,
+                        "total_tokens",
+                        queryResult.TotalTokens,
+                        "file_size",
+                        fileSize,
+                        "local_url",
+                        localURL,
+                )
+
+                return &QueryVideoStatusResponse{
+                        AssetID:
+                                asset.ID,
+                        TaskID:
+                                taskID,
+                        Status:
+                                "uploaded",
+                        VideoURL:
+                                localURL,
+                        Duration:
+                                queryResult.Duration,
+                        Resolution:
+                                queryResult.Resolution,
+                        Ratio:
+                                queryResult.Ratio,
+                        Message:
+                                fmt.Sprintf(
+                                        "视频生成完成！时长%d秒，分辨率%s",
+                                        queryResult.Duration,
+                                        queryResult.Resolution,
+                                ),
+                }, nil
+
+        case "failed":
+                if billing != nil {
+                        releaseErr :=
+                                releaseCoursewareVideoBilling(
+                                        billing,
+                                        taskID,
+                                        "video_provider_task_failed",
+                                        map[string]interface{}{
+                                                "provider_error":
+                                                        truncateMediaBillingReason(
+                                                                queryResult.ErrorMsg,
+                                                        ),
+                                        },
+                                )
+
+                        if releaseErr != nil {
+                                return nil,
+                                        fmt.Errorf(
+                                                "视频任务失败，但积分预留释放尚未完成: %w",
+                                                releaseErr,
+                                        )
+                        }
+                }
+
+                statusCtx, cancel :=
+                        context.WithTimeout(
+                                context.Background(),
+                                coursewareVideoBillingDBTimeout,
+                        )
+
+                statusErr :=
+                        repository.UpdateCWAssetStatus(
+                                statusCtx,
+                                asset.ID,
+                                models.CWAssetStatusPending,
+                        )
+
+                cancel()
+
+                if statusErr != nil {
+                        cwAssetLog.Warn(
+                                "视频失败状态写入资产失败",
+                                "asset_id",
+                                asset.ID,
+                                "error",
+                                statusErr,
+                        )
+                }
+
+                return &QueryVideoStatusResponse{
+                        AssetID:
+                                asset.ID,
+                        TaskID:
+                                taskID,
+                        Status:
+                                "failed",
+                        ErrorMsg:
+                                queryResult.ErrorMsg,
+                        Message:
+                                "视频生成失败: " +
+                                        queryResult.ErrorMsg,
+                }, nil
+
+        default:
+                return &QueryVideoStatusResponse{
+                        AssetID:
+                                asset.ID,
+                        TaskID:
+                                taskID,
+                        Status:
+                                "generating",
+                        Message:
+                                "视频状态: " +
+                                        queryResult.Status,
+                }, nil
+        }
 }
 
 // downloadAndSaveVideo 下载远程视频并保存到本地磁盘

@@ -36,23 +36,24 @@ package repository
 //   在可见性 OR 子句里额外追加 D 分支"lp.author_id = callerID"。
 
 import (
-	"context"
-	"database/sql"
-	"errors"
-	"fmt"
-	"time"
+        "context"
+        "database/sql"
+        "errors"
+        "fmt"
+        "strings"
+        "time"
 
-	"github.com/jackc/pgx/v5"
-	"tedna/internal/database"
-	"tedna/internal/models"
+        "github.com/jackc/pgx/v5"
+        "tedna/internal/database"
+        "tedna/internal/models"
 )
 
 // ==================== 错误常量 ====================
 
 var (
-	ErrLessonPlanNotFound = errors.New("教案不存在")
-	ErrTemplateNotFound   = errors.New("提示词模板不存在")
-	ErrExtractionNotFound = errors.New("萃取记录不存在")
+        ErrLessonPlanNotFound = errors.New("教案不存在")
+        ErrTemplateNotFound   = errors.New("提示词模板不存在")
+        ErrExtractionNotFound = errors.New("萃取记录不存在")
 )
 
 // ==================== 教案CRUD ====================
@@ -66,64 +67,64 @@ var (
 // INSERT完成后必须通过RETURNING回填最终值，确保内存中的LessonPlan
 // 与数据库资源快照保持一致，供同一请求后续助手和配方隔离直接使用。
 func CreateLessonPlan(ctx context.Context, lp *models.LessonPlan) error {
-	query := `
-		INSERT INTO lesson_plans (
-			title, subject, grade, topic, duration_minutes,
-			content_markdown, content_structured, generation_config,
-			matched_components, conversation_log,
-			status, visibility, author_id, group_id, school_id, template_id, recipe_id,
-			textbook_page_ids
-		) VALUES (
-			$1, $2, $3, $4, $5,
-			$6, $7, $8, $9, $10,
-			$11, $12, $13, $14, $15, $16, $17,
-			$18
-		)
-		RETURNING id, education_domain, created_at, updated_at
-	`
-	dur := lp.DurationMinutes
-	if dur <= 0 {
-		dur = 45
-	}
-	contentStruct := lp.ContentStructured
-	if contentStruct == "" {
-		contentStruct = "{}"
-	}
-	genConfig := lp.GenerationConfig
-	if genConfig == "" {
-		genConfig = "{}"
-	}
-	matchedComp := lp.MatchedComponents
-	if matchedComp == "" {
-		matchedComp = "[]"
-	}
-	convLog := lp.ConversationLog
-	if convLog == "" {
-		convLog = "[]"
-	}
-	status := lp.Status
-	if status == "" {
-		status = "draft"
-	}
-	visibility := lp.Visibility
-	if visibility == "" {
-		visibility = "personal"
-	}
-	textbookIDs := lp.TextbookPageIDs
-	if textbookIDs == "" {
-		textbookIDs = "[]"
-	}
+        query := `
+                INSERT INTO lesson_plans (
+                        title, subject, grade, topic, duration_minutes,
+                        content_markdown, content_structured, generation_config,
+                        matched_components, conversation_log,
+                        status, visibility, author_id, group_id, school_id, template_id, recipe_id,
+                        textbook_page_ids
+                ) VALUES (
+                        $1, $2, $3, $4, $5,
+                        $6, $7, $8, $9, $10,
+                        $11, $12, $13, $14, $15, $16, $17,
+                        $18
+                )
+                RETURNING id, education_domain, created_at, updated_at
+        `
+        dur := lp.DurationMinutes
+        if dur <= 0 {
+                dur = 45
+        }
+        contentStruct := lp.ContentStructured
+        if contentStruct == "" {
+                contentStruct = "{}"
+        }
+        genConfig := lp.GenerationConfig
+        if genConfig == "" {
+                genConfig = "{}"
+        }
+        matchedComp := lp.MatchedComponents
+        if matchedComp == "" {
+                matchedComp = "[]"
+        }
+        convLog := lp.ConversationLog
+        if convLog == "" {
+                convLog = "[]"
+        }
+        status := lp.Status
+        if status == "" {
+                status = "draft"
+        }
+        visibility := lp.Visibility
+        if visibility == "" {
+                visibility = "personal"
+        }
+        textbookIDs := lp.TextbookPageIDs
+        if textbookIDs == "" {
+                textbookIDs = "[]"
+        }
 
-	err := database.DB.QueryRow(ctx, query,
-		lp.Title, lp.Subject, lp.Grade, lp.Topic, dur,
-		lp.ContentMarkdown, contentStruct, genConfig, matchedComp, convLog,
-		status, visibility, lp.AuthorID, lp.GroupID, lp.SchoolID, lp.TemplateID, lp.RecipeID,
-		textbookIDs,
-	).Scan(&lp.ID, &lp.EducationDomain, &lp.CreatedAt, &lp.UpdatedAt)
-	if err != nil {
-		return fmt.Errorf("创建教案失败: %w", err)
-	}
-	return nil
+        err := database.DB.QueryRow(ctx, query,
+                lp.Title, lp.Subject, lp.Grade, lp.Topic, dur,
+                lp.ContentMarkdown, contentStruct, genConfig, matchedComp, convLog,
+                status, visibility, lp.AuthorID, lp.GroupID, lp.SchoolID, lp.TemplateID, lp.RecipeID,
+                textbookIDs,
+        ).Scan(&lp.ID, &lp.EducationDomain, &lp.CreatedAt, &lp.UpdatedAt)
+        if err != nil {
+                return fmt.Errorf("创建教案失败: %w", err)
+        }
+        return nil
 }
 
 // GetLessonPlanByID 根据ID查询教案
@@ -132,200 +133,223 @@ func CreateLessonPlan(ctx context.Context, lp *models.LessonPlan) error {
 // 以此字段覆盖登录用户的mixed或当前组织域，保证同一教案始终使用创建时域。
 // 回收站迭代: WHERE 加 AND deleted_at IS NULL 排除已软删教案
 func GetLessonPlanByID(ctx context.Context, id string) (*models.LessonPlan, error) {
-	lp := &models.LessonPlan{}
-	var reviewSchoolIDStr string
-	var unitPlanIDStr string
-	var classProfileIDStr string
-	var courseOutlinePublisher sql.NullString
-	query := `
-		SELECT id, title, subject, grade, topic, duration_minutes,
-		       content_markdown, content_structured, generation_config,
-		       matched_components, conversation_log,
-		       ai_review_score, ai_review_result, ai_review_history,
-		       status, visibility, author_id, group_id, school_id, education_domain,
-		       forked_from, fork_count, template_id, recipe_id,
-		       COALESCE(unit_plan_id::text, '') AS unit_plan_id,
-		       COALESCE(class_profile_id::text, '') AS class_profile_id,
-		       course_outline_publisher,
-		       view_count, use_count, version,
-		       current_stage, COALESCE(stage_config::text, '[]'),
-		       COALESCE(textbook_page_ids::text, '[]'),
-		       COALESCE(lesson_index, ''), idx_cognitive_level, idx_pedagogy_intensity,
-		       idx_structure_type, idx_quality_level,
-		       review_level, COALESCE(review_school_id::text, ''),
-		       created_at, updated_at
-		FROM lesson_plans WHERE id = $1 AND deleted_at IS NULL
-	`
-	err := database.DB.QueryRow(ctx, query, id).Scan(
-		&lp.ID, &lp.Title, &lp.Subject, &lp.Grade, &lp.Topic, &lp.DurationMinutes,
-		&lp.ContentMarkdown, &lp.ContentStructured, &lp.GenerationConfig,
-		&lp.MatchedComponents, &lp.ConversationLog,
-		&lp.AIReviewScore, &lp.AIReviewResult, &lp.AIReviewHistory,
-		&lp.Status, &lp.Visibility, &lp.AuthorID, &lp.GroupID, &lp.SchoolID, &lp.EducationDomain,
-		&lp.ForkedFrom, &lp.ForkCount, &lp.TemplateID, &lp.RecipeID,
-		&unitPlanIDStr,
-		&classProfileIDStr,
-		&courseOutlinePublisher,
-		&lp.ViewCount, &lp.UseCount, &lp.Version,
-		&lp.CurrentStage, &lp.StageConfig,
-		&lp.TextbookPageIDs,
-		&lp.LessonIndex, &lp.IdxCognitiveLevel, &lp.IdxPedagogyIntensity,
-		&lp.IdxStructureType, &lp.IdxQualityLevel,
-		&lp.ReviewLevel, &reviewSchoolIDStr,
-		&lp.CreatedAt, &lp.UpdatedAt,
-	)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrLessonPlanNotFound
-		}
-		return nil, fmt.Errorf("查询教案失败: %w", err)
-	}
-	if reviewSchoolIDStr != "" {
-		lp.ReviewSchoolID = &reviewSchoolIDStr
-	}
-	if unitPlanIDStr != "" {
-		lp.UnitPlanID = &unitPlanIDStr
-	}
-	if classProfileIDStr != "" {
-		lp.ClassProfileID = &classProfileIDStr
-	}
-	if courseOutlinePublisher.Valid {
-		v := courseOutlinePublisher.String
-		lp.CourseOutlinePublisher = &v
-	}
-	return lp, nil
+        lp := &models.LessonPlan{}
+        var reviewSchoolIDStr string
+        var unitPlanIDStr string
+        var classProfileIDStr string
+        var courseOutlineIDStr string
+        var courseOutlinePublisher sql.NullString
+        var courseOutlineVolume sql.NullString
+        var schoolSystem sql.NullString
+        query := `
+                SELECT id, title, subject, grade, topic, duration_minutes,
+                       content_markdown, content_structured, generation_config,
+                       matched_components, conversation_log,
+                       ai_review_score, ai_review_result, ai_review_history,
+                       status, visibility, author_id, group_id, school_id, education_domain,
+                       forked_from, fork_count, template_id, recipe_id,
+                       COALESCE(unit_plan_id::text, '') AS unit_plan_id,
+                       COALESCE(class_profile_id::text, '') AS class_profile_id,
+                       COALESCE(course_outline_id::text, '') AS course_outline_id,
+                       course_outline_publisher,
+                       course_outline_volume,
+                       school_system,
+                       view_count, use_count, version,
+                       current_stage, COALESCE(stage_config::text, '[]'),
+                       COALESCE(textbook_page_ids::text, '[]'),
+                       COALESCE(lesson_index, ''), idx_cognitive_level, idx_pedagogy_intensity,
+                       idx_structure_type, idx_quality_level,
+                       review_level, COALESCE(review_school_id::text, ''),
+                       created_at, updated_at
+                FROM lesson_plans WHERE id = $1 AND deleted_at IS NULL
+        `
+        err := database.DB.QueryRow(ctx, query, id).Scan(
+                &lp.ID, &lp.Title, &lp.Subject, &lp.Grade, &lp.Topic, &lp.DurationMinutes,
+                &lp.ContentMarkdown, &lp.ContentStructured, &lp.GenerationConfig,
+                &lp.MatchedComponents, &lp.ConversationLog,
+                &lp.AIReviewScore, &lp.AIReviewResult, &lp.AIReviewHistory,
+                &lp.Status, &lp.Visibility, &lp.AuthorID, &lp.GroupID, &lp.SchoolID, &lp.EducationDomain,
+                &lp.ForkedFrom, &lp.ForkCount, &lp.TemplateID, &lp.RecipeID,
+                &unitPlanIDStr,
+                &classProfileIDStr,
+                &courseOutlineIDStr,
+                &courseOutlinePublisher,
+                &courseOutlineVolume,
+                &schoolSystem,
+                &lp.ViewCount, &lp.UseCount, &lp.Version,
+                &lp.CurrentStage, &lp.StageConfig,
+                &lp.TextbookPageIDs,
+                &lp.LessonIndex, &lp.IdxCognitiveLevel, &lp.IdxPedagogyIntensity,
+                &lp.IdxStructureType, &lp.IdxQualityLevel,
+                &lp.ReviewLevel, &reviewSchoolIDStr,
+                &lp.CreatedAt, &lp.UpdatedAt,
+        )
+        if err != nil {
+                if errors.Is(err, pgx.ErrNoRows) {
+                        return nil, ErrLessonPlanNotFound
+                }
+                return nil, fmt.Errorf("查询教案失败: %w", err)
+        }
+        if reviewSchoolIDStr != "" {
+                lp.ReviewSchoolID = &reviewSchoolIDStr
+        }
+        if unitPlanIDStr != "" {
+                lp.UnitPlanID = &unitPlanIDStr
+        }
+        if classProfileIDStr != "" {
+                lp.ClassProfileID = &classProfileIDStr
+        }
+        if courseOutlineIDStr != "" {
+                value := strings.TrimSpace(courseOutlineIDStr)
+                lp.CourseOutlineID = &value
+        }
+        if courseOutlinePublisher.Valid {
+                value := strings.TrimSpace(courseOutlinePublisher.String)
+                lp.CourseOutlinePublisher = &value
+        }
+        if courseOutlineVolume.Valid &&
+                strings.TrimSpace(courseOutlineVolume.String) != "" {
+                value := strings.TrimSpace(courseOutlineVolume.String)
+                lp.CourseOutlineVolume = &value
+        }
+        if schoolSystem.Valid &&
+                strings.TrimSpace(schoolSystem.String) != "" {
+                value := strings.TrimSpace(schoolSystem.String)
+                lp.SchoolSystem = &value
+        }
+        return lp, nil
 }
 
 // ListLessonPlans 获取教案列表（支持多条件筛选+分页+数据范围白名单）
 // 回收站迭代: 初始 WHERE 加 lp.deleted_at IS NULL 排除已软删教案
 func ListLessonPlans(ctx context.Context, callerID string, authorID string, groupID string, status string, subject string, grade string, limit int, offset int, qualityLevel int, structureType int, cognitiveLevel int, pedagogyIntensity int, scopeUserIDs []string, scopeIsAdmin bool) ([]*models.LessonPlanListItem, int, error) {
-	where := " WHERE lp.deleted_at IS NULL"
-	args := []interface{}{}
-	argIdx := 1
+        where := " WHERE lp.deleted_at IS NULL"
+        args := []interface{}{}
+        argIdx := 1
 
-	if authorID != "" {
-		where += fmt.Sprintf(" AND lp.author_id = $%d", argIdx)
-		args = append(args, authorID)
-		argIdx++
-	}
-	if groupID != "" {
-		where += fmt.Sprintf(" AND lp.group_id = $%d", argIdx)
-		args = append(args, groupID)
-		argIdx++
-	}
-	if status != "" {
-		where += fmt.Sprintf(" AND lp.status = $%d", argIdx)
-		args = append(args, status)
-		argIdx++
-	}
-	if subject != "" {
-		where += fmt.Sprintf(" AND lp.subject = $%d", argIdx)
-		args = append(args, subject)
-		argIdx++
-	}
-	if grade != "" {
-		where += fmt.Sprintf(" AND lp.grade = $%d", argIdx)
-		args = append(args, grade)
-		argIdx++
-	}
+        if authorID != "" {
+                where += fmt.Sprintf(" AND lp.author_id = $%d", argIdx)
+                args = append(args, authorID)
+                argIdx++
+        }
+        if groupID != "" {
+                where += fmt.Sprintf(" AND lp.group_id = $%d", argIdx)
+                args = append(args, groupID)
+                argIdx++
+        }
+        if status != "" {
+                where += fmt.Sprintf(" AND lp.status = $%d", argIdx)
+                args = append(args, status)
+                argIdx++
+        }
+        if subject != "" {
+                where += fmt.Sprintf(" AND lp.subject = $%d", argIdx)
+                args = append(args, subject)
+                argIdx++
+        }
+        if grade != "" {
+                where += fmt.Sprintf(" AND lp.grade = $%d", argIdx)
+                args = append(args, grade)
+                argIdx++
+        }
 
-	// AOCI索引维度筛选
-	if qualityLevel > 0 {
-		where += fmt.Sprintf(" AND lp.idx_quality_level >= $%d", argIdx)
-		args = append(args, qualityLevel)
-		argIdx++
-	}
-	if structureType > 0 {
-		where += fmt.Sprintf(" AND lp.idx_structure_type = $%d", argIdx)
-		args = append(args, structureType)
-		argIdx++
-	}
-	if cognitiveLevel > 0 {
-		where += fmt.Sprintf(" AND lp.idx_cognitive_level >= $%d", argIdx)
-		args = append(args, cognitiveLevel)
-		argIdx++
-	}
-	if pedagogyIntensity > 0 {
-		where += fmt.Sprintf(" AND lp.idx_pedagogy_intensity = $%d", argIdx)
-		args = append(args, pedagogyIntensity)
-		argIdx++
-	}
+        // AOCI索引维度筛选
+        if qualityLevel > 0 {
+                where += fmt.Sprintf(" AND lp.idx_quality_level >= $%d", argIdx)
+                args = append(args, qualityLevel)
+                argIdx++
+        }
+        if structureType > 0 {
+                where += fmt.Sprintf(" AND lp.idx_structure_type = $%d", argIdx)
+                args = append(args, structureType)
+                argIdx++
+        }
+        if cognitiveLevel > 0 {
+                where += fmt.Sprintf(" AND lp.idx_cognitive_level >= $%d", argIdx)
+                args = append(args, cognitiveLevel)
+                argIdx++
+        }
+        if pedagogyIntensity > 0 {
+                where += fmt.Sprintf(" AND lp.idx_pedagogy_intensity = $%d", argIdx)
+                args = append(args, pedagogyIntensity)
+                argIdx++
+        }
 
-	// 数据范围可见性 OR 子句（非 admin 才追加）
-	if !scopeIsAdmin {
-		isMyPlansView := authorID != "" && callerID != "" && authorID == callerID
+        // 数据范围可见性 OR 子句（非 admin 才追加）
+        if !scopeIsAdmin {
+                isMyPlansView := authorID != "" && callerID != "" && authorID == callerID
 
-		if isMyPlansView {
-			scopePlaceholder := argIdx
-			callerPlaceholder := argIdx + 1
-			where += fmt.Sprintf(
-				" AND (lp.author_id = ANY($%d) OR lp.status IN ('published_shared','approved') OR lp.author_id = $%d)",
-				scopePlaceholder, callerPlaceholder,
-			)
-			args = append(args, scopeUserIDs, callerID)
-			argIdx += 2
-		} else {
-			where += fmt.Sprintf(
-				" AND (lp.author_id = ANY($%d) OR lp.status IN ('published_shared','approved'))",
-				argIdx,
-			)
-			args = append(args, scopeUserIDs)
-			argIdx++
-		}
-	}
+                if isMyPlansView {
+                        scopePlaceholder := argIdx
+                        callerPlaceholder := argIdx + 1
+                        where += fmt.Sprintf(
+                                " AND (lp.author_id = ANY($%d) OR lp.status IN ('published_shared','approved') OR lp.author_id = $%d)",
+                                scopePlaceholder, callerPlaceholder,
+                        )
+                        args = append(args, scopeUserIDs, callerID)
+                        argIdx += 2
+                } else {
+                        where += fmt.Sprintf(
+                                " AND (lp.author_id = ANY($%d) OR lp.status IN ('published_shared','approved'))",
+                                argIdx,
+                        )
+                        args = append(args, scopeUserIDs)
+                        argIdx++
+                }
+        }
 
-	var total int
-	if err := database.DB.QueryRow(ctx, "SELECT COUNT(*) FROM lesson_plans lp"+where, args...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("查询教案总数失败: %w", err)
-	}
+        var total int
+        if err := database.DB.QueryRow(ctx, "SELECT COUNT(*) FROM lesson_plans lp"+where, args...).Scan(&total); err != nil {
+                return nil, 0, fmt.Errorf("查询教案总数失败: %w", err)
+        }
 
-	if limit <= 0 {
-		limit = 20
-	}
-	listQuery := fmt.Sprintf(`
-		SELECT lp.id, lp.title, lp.subject, lp.grade, lp.topic, lp.duration_minutes,
-		       lp.status, lp.visibility, lp.author_id,
-		       COALESCE(u.display_name, '') AS author_name,
-		       lp.ai_review_score, lp.fork_count, lp.view_count,
-		       lp.forked_from, lp.recipe_id,
-		       COALESCE(tr.name, '') AS recipe_name,
-		       COALESCE(lp.lesson_index, '') AS lesson_index,
-		       lp.idx_quality_level,
-		       lp.review_level,
-		       lp.created_at, lp.updated_at
-		FROM lesson_plans lp
-		LEFT JOIN users u ON u.id = lp.author_id
-		LEFT JOIN teaching_recipes tr ON tr.id = lp.recipe_id
-		%s
-		ORDER BY lp.updated_at DESC
-		LIMIT $%d OFFSET $%d
-	`, where, argIdx, argIdx+1)
-	args = append(args, limit, offset)
+        if limit <= 0 {
+                limit = 20
+        }
+        listQuery := fmt.Sprintf(`
+                SELECT lp.id, lp.title, lp.subject, lp.grade, lp.topic, lp.duration_minutes,
+                       lp.status, lp.visibility, lp.author_id,
+                       COALESCE(u.display_name, '') AS author_name,
+                       lp.ai_review_score, lp.fork_count, lp.view_count,
+                       lp.forked_from, lp.recipe_id,
+                       COALESCE(tr.name, '') AS recipe_name,
+                       COALESCE(lp.lesson_index, '') AS lesson_index,
+                       lp.idx_quality_level,
+                       lp.review_level,
+                       lp.created_at, lp.updated_at
+                FROM lesson_plans lp
+                LEFT JOIN users u ON u.id = lp.author_id
+                LEFT JOIN teaching_recipes tr ON tr.id = lp.recipe_id
+                %s
+                ORDER BY lp.updated_at DESC
+                LIMIT $%d OFFSET $%d
+        `, where, argIdx, argIdx+1)
+        args = append(args, limit, offset)
 
-	rows, err := database.DB.Query(ctx, listQuery, args...)
-	if err != nil {
-		return nil, 0, fmt.Errorf("查询教案列表失败: %w", err)
-	}
-	defer rows.Close()
+        rows, err := database.DB.Query(ctx, listQuery, args...)
+        if err != nil {
+                return nil, 0, fmt.Errorf("查询教案列表失败: %w", err)
+        }
+        defer rows.Close()
 
-	var items []*models.LessonPlanListItem
-	for rows.Next() {
-		item := &models.LessonPlanListItem{}
-		err := rows.Scan(
-			&item.ID, &item.Title, &item.Subject, &item.Grade, &item.Topic, &item.DurationMinutes,
-			&item.Status, &item.Visibility, &item.AuthorID, &item.AuthorName,
-			&item.AIReviewScore, &item.ForkCount, &item.ViewCount,
-			&item.ForkedFrom, &item.RecipeID, &item.RecipeName, &item.LessonIndex, &item.IdxQualityLevel,
-			&item.ReviewLevel,
-			&item.CreatedAt, &item.UpdatedAt,
-		)
-		if err != nil {
-			return nil, 0, fmt.Errorf("扫描教案行失败: %w", err)
-		}
-		item.StatusName = models.LPStatusNameMap[item.Status]
-		items = append(items, item)
-	}
-	return items, total, nil
+        var items []*models.LessonPlanListItem
+        for rows.Next() {
+                item := &models.LessonPlanListItem{}
+                err := rows.Scan(
+                        &item.ID, &item.Title, &item.Subject, &item.Grade, &item.Topic, &item.DurationMinutes,
+                        &item.Status, &item.Visibility, &item.AuthorID, &item.AuthorName,
+                        &item.AIReviewScore, &item.ForkCount, &item.ViewCount,
+                        &item.ForkedFrom, &item.RecipeID, &item.RecipeName, &item.LessonIndex, &item.IdxQualityLevel,
+                        &item.ReviewLevel,
+                        &item.CreatedAt, &item.UpdatedAt,
+                )
+                if err != nil {
+                        return nil, 0, fmt.Errorf("扫描教案行失败: %w", err)
+                }
+                item.StatusName = models.LPStatusNameMap[item.Status]
+                items = append(items, item)
+        }
+        return items, total, nil
 }
 
 // UpdateLessonPlanContent 更新教案内容。
@@ -339,398 +363,398 @@ func ListLessonPlans(ctx context.Context, callerID string, authorID string, grou
 //   - 完全相同的内容重复保存直接返回，不增加version也不产生噪音快照。
 //   - 每份教案只保留最近50份历史快照，防止长期编辑无限增长。
 func UpdateLessonPlanContent(
-	ctx context.Context,
-	id string,
-	title string,
-	contentMd string,
-	contentStruct string,
-	durMinutes int,
-	versionMeta ...models.LessonPlanVersionMeta,
+        ctx context.Context,
+        id string,
+        title string,
+        contentMd string,
+        contentStruct string,
+        durMinutes int,
+        versionMeta ...models.LessonPlanVersionMeta,
 ) error {
-	if contentStruct == "" {
-		contentStruct = "{}"
-	}
+        if contentStruct == "" {
+                contentStruct = "{}"
+        }
 
-	meta := models.LessonPlanVersionMeta{
-		ChangeSource: models.LPVersionSourceSystem,
-	}
-	if len(versionMeta) > 0 {
-		meta = versionMeta[0]
-	}
-	switch meta.ChangeSource {
-	case models.LPVersionSourceManual,
-		models.LPVersionSourceAI,
-		models.LPVersionSourceImport,
-		models.LPVersionSourceRestore,
-		models.LPVersionSourceSystem:
-		// 合法来源保持原值。
-	default:
-		meta.ChangeSource = models.LPVersionSourceSystem
-	}
+        meta := models.LessonPlanVersionMeta{
+                ChangeSource: models.LPVersionSourceSystem,
+        }
+        if len(versionMeta) > 0 {
+                meta = versionMeta[0]
+        }
+        switch meta.ChangeSource {
+        case models.LPVersionSourceManual,
+                models.LPVersionSourceAI,
+                models.LPVersionSourceImport,
+                models.LPVersionSourceRestore,
+                models.LPVersionSourceSystem:
+                // 合法来源保持原值。
+        default:
+                meta.ChangeSource = models.LPVersionSourceSystem
+        }
 
-	tx, err := database.DB.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("开始教案正文更新事务失败: %w", err)
-	}
-	defer func() {
-		_ = tx.Rollback(ctx)
-	}()
+        tx, err := database.DB.Begin(ctx)
+        if err != nil {
+                return fmt.Errorf("开始教案正文更新事务失败: %w", err)
+        }
+        defer func() {
+                _ = tx.Rollback(ctx)
+        }()
 
-	var (
-		currentTitle         string
-		currentContentMd     string
-		currentContentStruct string
-		currentDuration      int
-		currentVersion       int
-	)
+        var (
+                currentTitle         string
+                currentContentMd     string
+                currentContentStruct string
+                currentDuration      int
+                currentVersion       int
+        )
 
-	err = tx.QueryRow(ctx, `
-		SELECT
-			title,
-			content_markdown,
-			content_structured::text,
-			duration_minutes,
-			version
-		FROM lesson_plans
-		WHERE id = $1
-		  AND deleted_at IS NULL
-		FOR UPDATE
-	`, id).Scan(
-		&currentTitle,
-		&currentContentMd,
-		&currentContentStruct,
-		&currentDuration,
-		&currentVersion,
-	)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrLessonPlanNotFound
-		}
-		return fmt.Errorf("读取教案修改前正文失败: %w", err)
-	}
+        err = tx.QueryRow(ctx, `
+                SELECT
+                        title,
+                        content_markdown,
+                        content_structured::text,
+                        duration_minutes,
+                        version
+                FROM lesson_plans
+                WHERE id = $1
+                  AND deleted_at IS NULL
+                FOR UPDATE
+        `, id).Scan(
+                &currentTitle,
+                &currentContentMd,
+                &currentContentStruct,
+                &currentDuration,
+                &currentVersion,
+        )
+        if err != nil {
+                if errors.Is(err, pgx.ErrNoRows) {
+                        return ErrLessonPlanNotFound
+                }
+                return fmt.Errorf("读取教案修改前正文失败: %w", err)
+        }
 
-	// 完全相同的保存属于无操作，不增加版本号和历史噪音。
-	if currentTitle == title &&
-		currentContentMd == contentMd &&
-		currentContentStruct == contentStruct &&
-		currentDuration == durMinutes {
-		return tx.Commit(ctx)
-	}
+        // 完全相同的保存属于无操作，不增加版本号和历史噪音。
+        if currentTitle == title &&
+                currentContentMd == contentMd &&
+                currentContentStruct == contentStruct &&
+                currentDuration == durMinutes {
+                return tx.Commit(ctx)
+        }
 
-	// 在覆盖之前保存当前完整状态。
-	_, err = tx.Exec(ctx, `
-		INSERT INTO lesson_plan_content_versions (
-			lesson_plan_id,
-			version_number,
-			title,
-			content_markdown,
-			content_structured,
-			duration_minutes,
-			change_source,
-			changed_by,
-			change_summary
-		) VALUES (
-			$1,
-			$2,
-			$3,
-			$4,
-			$5::jsonb,
-			$6,
-			$7,
-			$8,
-			$9
-		)
-		ON CONFLICT (
-			lesson_plan_id,
-			version_number
-		) DO NOTHING
-	`,
-		id,
-		currentVersion,
-		currentTitle,
-		currentContentMd,
-		currentContentStruct,
-		currentDuration,
-		meta.ChangeSource,
-		meta.ChangedBy,
-		meta.ChangeSummary,
-	)
-	if err != nil {
-		return fmt.Errorf("保存教案修改前版本失败: %w", err)
-	}
+        // 在覆盖之前保存当前完整状态。
+        _, err = tx.Exec(ctx, `
+                INSERT INTO lesson_plan_content_versions (
+                        lesson_plan_id,
+                        version_number,
+                        title,
+                        content_markdown,
+                        content_structured,
+                        duration_minutes,
+                        change_source,
+                        changed_by,
+                        change_summary
+                ) VALUES (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5::jsonb,
+                        $6,
+                        $7,
+                        $8,
+                        $9
+                )
+                ON CONFLICT (
+                        lesson_plan_id,
+                        version_number
+                ) DO NOTHING
+        `,
+                id,
+                currentVersion,
+                currentTitle,
+                currentContentMd,
+                currentContentStruct,
+                currentDuration,
+                meta.ChangeSource,
+                meta.ChangedBy,
+                meta.ChangeSummary,
+        )
+        if err != nil {
+                return fmt.Errorf("保存教案修改前版本失败: %w", err)
+        }
 
-	now := time.Now()
-	result, err := tx.Exec(ctx, `
-		UPDATE lesson_plans
-		SET
-			title = $1,
-			content_markdown = $2,
-			content_structured = $3::jsonb,
-			duration_minutes = $4,
-			version = $5,
-			updated_at = $6
-		WHERE id = $7
-		  AND deleted_at IS NULL
-	`,
-		title,
-		contentMd,
-		contentStruct,
-		durMinutes,
-		currentVersion+1,
-		now,
-		id,
-	)
-	if err != nil {
-		return fmt.Errorf("更新教案内容失败: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return ErrLessonPlanNotFound
-	}
+        now := time.Now()
+        result, err := tx.Exec(ctx, `
+                UPDATE lesson_plans
+                SET
+                        title = $1,
+                        content_markdown = $2,
+                        content_structured = $3::jsonb,
+                        duration_minutes = $4,
+                        version = $5,
+                        updated_at = $6
+                WHERE id = $7
+                  AND deleted_at IS NULL
+        `,
+                title,
+                contentMd,
+                contentStruct,
+                durMinutes,
+                currentVersion+1,
+                now,
+                id,
+        )
+        if err != nil {
+                return fmt.Errorf("更新教案内容失败: %w", err)
+        }
+        if result.RowsAffected() == 0 {
+                return ErrLessonPlanNotFound
+        }
 
-	// 每份教案只保留最新50份快照。
-	_, err = tx.Exec(ctx, `
-		DELETE FROM lesson_plan_content_versions
-		WHERE id IN (
-			SELECT id
-			FROM lesson_plan_content_versions
-			WHERE lesson_plan_id = $1
-			ORDER BY version_number DESC, created_at DESC
-			OFFSET 50
-		)
-	`, id)
-	if err != nil {
-		return fmt.Errorf("清理教案过期历史版本失败: %w", err)
-	}
+        // 每份教案只保留最新50份快照。
+        _, err = tx.Exec(ctx, `
+                DELETE FROM lesson_plan_content_versions
+                WHERE id IN (
+                        SELECT id
+                        FROM lesson_plan_content_versions
+                        WHERE lesson_plan_id = $1
+                        ORDER BY version_number DESC, created_at DESC
+                        OFFSET 50
+                )
+        `, id)
+        if err != nil {
+                return fmt.Errorf("清理教案过期历史版本失败: %w", err)
+        }
 
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("提交教案正文更新事务失败: %w", err)
-	}
+        if err := tx.Commit(ctx); err != nil {
+                return fmt.Errorf("提交教案正文更新事务失败: %w", err)
+        }
 
-	return nil
+        return nil
 }
 
 // UpdateLessonPlanStatus 更新教案状态
 func UpdateLessonPlanStatus(ctx context.Context, id string, status string) error {
-	now := time.Now()
-	result, err := database.DB.Exec(ctx,
-		`UPDATE lesson_plans SET status = $1, updated_at = $2 WHERE id = $3`,
-		status, now, id,
-	)
-	if err != nil {
-		return fmt.Errorf("更新教案状态失败: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return ErrLessonPlanNotFound
-	}
-	return nil
+        now := time.Now()
+        result, err := database.DB.Exec(ctx,
+                `UPDATE lesson_plans SET status = $1, updated_at = $2 WHERE id = $3`,
+                status, now, id,
+        )
+        if err != nil {
+                return fmt.Errorf("更新教案状态失败: %w", err)
+        }
+        if result.RowsAffected() == 0 {
+                return ErrLessonPlanNotFound
+        }
+        return nil
 }
 
 // UpdateLessonPlanVisibility 更新教案可见范围
 func UpdateLessonPlanVisibility(ctx context.Context, id string, visibility string, groupID *string) error {
-	now := time.Now()
-	result, err := database.DB.Exec(ctx,
-		`UPDATE lesson_plans SET visibility = $1, group_id = $2, updated_at = $3 WHERE id = $4`,
-		visibility, groupID, now, id,
-	)
-	if err != nil {
-		return fmt.Errorf("更新教案可见范围失败: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return ErrLessonPlanNotFound
-	}
-	return nil
+        now := time.Now()
+        result, err := database.DB.Exec(ctx,
+                `UPDATE lesson_plans SET visibility = $1, group_id = $2, updated_at = $3 WHERE id = $4`,
+                visibility, groupID, now, id,
+        )
+        if err != nil {
+                return fmt.Errorf("更新教案可见范围失败: %w", err)
+        }
+        if result.RowsAffected() == 0 {
+                return ErrLessonPlanNotFound
+        }
+        return nil
 }
 
 // UpdateLessonPlanAIReview 更新教案AI评审结果
 func UpdateLessonPlanAIReview(ctx context.Context, id string, score float64, result string, history string) error {
-	now := time.Now()
-	res, err := database.DB.Exec(ctx, `
-		UPDATE lesson_plans
-		SET ai_review_score = $1, ai_review_result = $2, ai_review_history = $3, updated_at = $4
-		WHERE id = $5
-	`, score, result, history, now, id)
-	if err != nil {
-		return fmt.Errorf("更新AI评审结果失败: %w", err)
-	}
-	if res.RowsAffected() == 0 {
-		return ErrLessonPlanNotFound
-	}
-	return nil
+        now := time.Now()
+        res, err := database.DB.Exec(ctx, `
+                UPDATE lesson_plans
+                SET ai_review_score = $1, ai_review_result = $2, ai_review_history = $3, updated_at = $4
+                WHERE id = $5
+        `, score, result, history, now, id)
+        if err != nil {
+                return fmt.Errorf("更新AI评审结果失败: %w", err)
+        }
+        if res.RowsAffected() == 0 {
+                return ErrLessonPlanNotFound
+        }
+        return nil
 }
 
 // ForkLessonPlan 复制教案（fork）
 func ForkLessonPlan(ctx context.Context, sourceID string, newAuthorID string) (*models.LessonPlan, error) {
-	source, err := GetLessonPlanByID(ctx, sourceID)
-	if err != nil {
-		return nil, err
-	}
-	newLP := &models.LessonPlan{
-		Title:             source.Title + "（副本）",
-		Subject:           source.Subject,
-		Grade:             source.Grade,
-		Topic:             source.Topic,
-		DurationMinutes:   source.DurationMinutes,
-		ContentMarkdown:   source.ContentMarkdown,
-		ContentStructured: source.ContentStructured,
-		GenerationConfig:  source.GenerationConfig,
-		MatchedComponents: source.MatchedComponents,
-		Status:            "draft",
-		Visibility:        "personal",
-		AuthorID:          newAuthorID,
-		ForkedFrom:        &sourceID,
-		TemplateID:        source.TemplateID,
-		RecipeID:          source.RecipeID,
-		TextbookPageIDs:   source.TextbookPageIDs,
-	}
-	if err := CreateLessonPlan(ctx, newLP); err != nil {
-		return nil, err
-	}
-	_, err = database.DB.Exec(ctx,
-		`UPDATE lesson_plans SET fork_count = fork_count + 1 WHERE id = $1`, sourceID)
-	if err != nil {
-		return nil, fmt.Errorf("更新fork计数失败: %w", err)
-	}
-	return newLP, nil
+        source, err := GetLessonPlanByID(ctx, sourceID)
+        if err != nil {
+                return nil, err
+        }
+        newLP := &models.LessonPlan{
+                Title:             source.Title + "（副本）",
+                Subject:           source.Subject,
+                Grade:             source.Grade,
+                Topic:             source.Topic,
+                DurationMinutes:   source.DurationMinutes,
+                ContentMarkdown:   source.ContentMarkdown,
+                ContentStructured: source.ContentStructured,
+                GenerationConfig:  source.GenerationConfig,
+                MatchedComponents: source.MatchedComponents,
+                Status:            "draft",
+                Visibility:        "personal",
+                AuthorID:          newAuthorID,
+                ForkedFrom:        &sourceID,
+                TemplateID:        source.TemplateID,
+                RecipeID:          source.RecipeID,
+                TextbookPageIDs:   source.TextbookPageIDs,
+        }
+        if err := CreateLessonPlan(ctx, newLP); err != nil {
+                return nil, err
+        }
+        _, err = database.DB.Exec(ctx,
+                `UPDATE lesson_plans SET fork_count = fork_count + 1 WHERE id = $1`, sourceID)
+        if err != nil {
+                return nil, fmt.Errorf("更新fork计数失败: %w", err)
+        }
+        return newLP, nil
 }
 
 // IncrementLessonPlanView 增加教案浏览次数
 func IncrementLessonPlanView(ctx context.Context, id string) error {
-	_, err := database.DB.Exec(ctx,
-		`UPDATE lesson_plans SET view_count = view_count + 1 WHERE id = $1`, id)
-	return err
+        _, err := database.DB.Exec(ctx,
+                `UPDATE lesson_plans SET view_count = view_count + 1 WHERE id = $1`, id)
+        return err
 }
 
 // DeleteLessonPlan 删除教案（软删除：设置 deleted_at 时间戳，不物理删除）
 // 软删除后教案在列表/详情中均不可见，但数据保留在数据库中可通过回收站恢复。
 // 30天后由定时任务 PurgeExpiredTrash 自动物理清理。
 func DeleteLessonPlan(ctx context.Context, id string) error {
-	result, err := database.DB.Exec(ctx,
-		`UPDATE lesson_plans SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1 AND deleted_at IS NULL`, id)
-	if err != nil {
-		return fmt.Errorf("删除教案失败: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return ErrLessonPlanNotFound
-	}
-	return nil
+        result, err := database.DB.Exec(ctx,
+                `UPDATE lesson_plans SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1 AND deleted_at IS NULL`, id)
+        if err != nil {
+                return fmt.Errorf("删除教案失败: %w", err)
+        }
+        if result.RowsAffected() == 0 {
+                return ErrLessonPlanNotFound
+        }
+        return nil
 }
 
 // ==================== 教案评审CRUD ====================
 
 // CreateLessonPlanReview 创建教案评审记录
 func CreateLessonPlanReview(ctx context.Context, review *models.LessonPlanReview) error {
-	query := `
-		INSERT INTO lesson_plan_reviews (lesson_plan_id, reviewer_id, decision, score, dimensions, comments, suggestions, round)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		RETURNING id, created_at
-	`
-	dimensions := review.Dimensions
-	if dimensions == "" {
-		dimensions = "{}"
-	}
-	suggestions := review.Suggestions
-	if suggestions == "" {
-		suggestions = "[]"
-	}
-	err := database.DB.QueryRow(ctx, query,
-		review.LessonPlanID, review.ReviewerID, review.Decision,
-		review.Score, dimensions, review.Comments, suggestions, review.Round,
-	).Scan(&review.ID, &review.CreatedAt)
-	if err != nil {
-		return fmt.Errorf("创建评审记录失败: %w", err)
-	}
-	return nil
+        query := `
+                INSERT INTO lesson_plan_reviews (lesson_plan_id, reviewer_id, decision, score, dimensions, comments, suggestions, round)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING id, created_at
+        `
+        dimensions := review.Dimensions
+        if dimensions == "" {
+                dimensions = "{}"
+        }
+        suggestions := review.Suggestions
+        if suggestions == "" {
+                suggestions = "[]"
+        }
+        err := database.DB.QueryRow(ctx, query,
+                review.LessonPlanID, review.ReviewerID, review.Decision,
+                review.Score, dimensions, review.Comments, suggestions, review.Round,
+        ).Scan(&review.ID, &review.CreatedAt)
+        if err != nil {
+                return fmt.Errorf("创建评审记录失败: %w", err)
+        }
+        return nil
 }
 
 // ListLessonPlanReviews 获取教案的评审记录列表
 func ListLessonPlanReviews(ctx context.Context, lessonPlanID string) ([]*models.LessonPlanReviewItem, error) {
-	query := `
-		SELECT r.id, r.reviewer_id, COALESCE(u.display_name, '') AS reviewer_name,
-		       r.decision, r.score, r.comments, r.round, r.created_at
-		FROM lesson_plan_reviews r
-		LEFT JOIN users u ON u.id = r.reviewer_id
-		WHERE r.lesson_plan_id = $1
-		ORDER BY r.round ASC, r.created_at ASC
-	`
-	rows, err := database.DB.Query(ctx, query, lessonPlanID)
-	if err != nil {
-		return nil, fmt.Errorf("查询评审记录失败: %w", err)
-	}
-	defer rows.Close()
+        query := `
+                SELECT r.id, r.reviewer_id, COALESCE(u.display_name, '') AS reviewer_name,
+                       r.decision, r.score, r.comments, r.round, r.created_at
+                FROM lesson_plan_reviews r
+                LEFT JOIN users u ON u.id = r.reviewer_id
+                WHERE r.lesson_plan_id = $1
+                ORDER BY r.round ASC, r.created_at ASC
+        `
+        rows, err := database.DB.Query(ctx, query, lessonPlanID)
+        if err != nil {
+                return nil, fmt.Errorf("查询评审记录失败: %w", err)
+        }
+        defer rows.Close()
 
-	var items []*models.LessonPlanReviewItem
-	for rows.Next() {
-		item := &models.LessonPlanReviewItem{}
-		err := rows.Scan(
-			&item.ID, &item.ReviewerID, &item.ReviewerName,
-			&item.Decision, &item.Score, &item.Comments, &item.Round, &item.CreatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("扫描评审记录行失败: %w", err)
-		}
-		items = append(items, item)
-	}
-	return items, nil
+        var items []*models.LessonPlanReviewItem
+        for rows.Next() {
+                item := &models.LessonPlanReviewItem{}
+                err := rows.Scan(
+                        &item.ID, &item.ReviewerID, &item.ReviewerName,
+                        &item.Decision, &item.Score, &item.Comments, &item.Round, &item.CreatedAt,
+                )
+                if err != nil {
+                        return nil, fmt.Errorf("扫描评审记录行失败: %w", err)
+                }
+                items = append(items, item)
+        }
+        return items, nil
 }
 
 // ==================== 教案索引写入 ====================
 
 // UpdateLessonPlanIndex 更新教案的AOCI索引
 func UpdateLessonPlanIndex(ctx context.Context, planID string, indexText string, cogLevel int, pedIntensity int, structType int, qualLevel int) error {
-	now := time.Now()
-	result, err := database.DB.Exec(ctx, `
-		UPDATE lesson_plans
-		SET lesson_index = $1,
-		    idx_cognitive_level = $2,
-		    idx_pedagogy_intensity = $3,
-		    idx_structure_type = $4,
-		    idx_quality_level = $5,
-		    updated_at = $6
-		WHERE id = $7
-	`, indexText, cogLevel, pedIntensity, structType, qualLevel, now, planID)
-	if err != nil {
-		return fmt.Errorf("更新教案索引失败: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return ErrLessonPlanNotFound
-	}
-	return nil
+        now := time.Now()
+        result, err := database.DB.Exec(ctx, `
+                UPDATE lesson_plans
+                SET lesson_index = $1,
+                    idx_cognitive_level = $2,
+                    idx_pedagogy_intensity = $3,
+                    idx_structure_type = $4,
+                    idx_quality_level = $5,
+                    updated_at = $6
+                WHERE id = $7
+        `, indexText, cogLevel, pedIntensity, structType, qualLevel, now, planID)
+        if err != nil {
+                return fmt.Errorf("更新教案索引失败: %w", err)
+        }
+        if result.RowsAffected() == 0 {
+                return ErrLessonPlanNotFound
+        }
+        return nil
 }
 
 // ==================== 挂载/解除单元方案 ====================
 
 // UpdateLessonPlanUnitPlanID 挂载或解除教案关联的单元方案
 func UpdateLessonPlanUnitPlanID(ctx context.Context, id string, unitPlanID *string) error {
-	now := time.Now()
-	result, err := database.DB.Exec(ctx,
-		`UPDATE lesson_plans SET unit_plan_id = $1, updated_at = $2 WHERE id = $3`,
-		unitPlanID, now, id,
-	)
-	if err != nil {
-		return fmt.Errorf("更新教案单元方案关联失败: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return ErrLessonPlanNotFound
-	}
-	return nil
+        now := time.Now()
+        result, err := database.DB.Exec(ctx,
+                `UPDATE lesson_plans SET unit_plan_id = $1, updated_at = $2 WHERE id = $3`,
+                unitPlanID, now, id,
+        )
+        if err != nil {
+                return fmt.Errorf("更新教案单元方案关联失败: %w", err)
+        }
+        if result.RowsAffected() == 0 {
+                return ErrLessonPlanNotFound
+        }
+        return nil
 }
 
 // ==================== 挂载/解除班级学情卡 ====================
 
 // UpdateLessonPlanClassProfileID 挂载或解除教案关联的班级学情卡
 func UpdateLessonPlanClassProfileID(ctx context.Context, id string, classProfileID *string) error {
-	now := time.Now()
-	result, err := database.DB.Exec(ctx,
-		`UPDATE lesson_plans SET class_profile_id = $1, updated_at = $2 WHERE id = $3`,
-		classProfileID, now, id,
-	)
-	if err != nil {
-		return fmt.Errorf("更新教案班级学情关联失败: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return ErrLessonPlanNotFound
-	}
-	return nil
+        now := time.Now()
+        result, err := database.DB.Exec(ctx,
+                `UPDATE lesson_plans SET class_profile_id = $1, updated_at = $2 WHERE id = $3`,
+                classProfileID, now, id,
+        )
+        if err != nil {
+                return fmt.Errorf("更新教案班级学情关联失败: %w", err)
+        }
+        if result.RowsAffected() == 0 {
+                return ErrLessonPlanNotFound
+        }
+        return nil
 }
 
 // ==================== 挂载/解除课程大纲教材版本 ====================
@@ -739,16 +763,16 @@ func UpdateLessonPlanClassProfileID(ctx context.Context, id string, classProfile
 // publisher 为 nil → 清除（置 NULL）= 未关联大纲
 // publisher 非 nil → 写入该版本（含空串=通用版）
 func UpdateLessonPlanCourseOutlinePublisher(ctx context.Context, id string, publisher *string) error {
-	now := time.Now()
-	result, err := database.DB.Exec(ctx,
-		`UPDATE lesson_plans SET course_outline_publisher = $1, updated_at = $2 WHERE id = $3`,
-		publisher, now, id,
-	)
-	if err != nil {
-		return fmt.Errorf("更新教案课程大纲版本失败: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return ErrLessonPlanNotFound
-	}
-	return nil
+        now := time.Now()
+        result, err := database.DB.Exec(ctx,
+                `UPDATE lesson_plans SET course_outline_publisher = $1, updated_at = $2 WHERE id = $3`,
+                publisher, now, id,
+        )
+        if err != nil {
+                return fmt.Errorf("更新教案课程大纲版本失败: %w", err)
+        }
+        if result.RowsAffected() == 0 {
+                return ErrLessonPlanNotFound
+        }
+        return nil
 }

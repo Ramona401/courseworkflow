@@ -54,15 +54,34 @@ func (s *RecipeService) CreateRecipeForActor(
 	actor *AssistantActorContext,
 	req *models.CreateRecipeRequest,
 ) (*models.TeachingRecipe, error) {
+	if req == nil {
+		return nil,
+			ErrRecipeComponentConfigInvalid
+	}
+
 	if err := validateTeachingRecipeCreationActor(
 		actor,
 	); err != nil {
 		return nil, err
 	}
 
+	validatedComponentIDs, err :=
+		ValidateRecipeComponentIDsForWrite(
+			ctx,
+			req.ComponentIDs,
+			actor.EducationDomain,
+		)
+	if err != nil {
+		return nil, err
+	}
+
+	validatedRequest := *req
+	validatedRequest.ComponentIDs =
+		validatedComponentIDs
+
 	return s.CreateRecipe(
 		ctx,
-		req,
+		&validatedRequest,
 		actor.UserID,
 	)
 }

@@ -1,23 +1,19 @@
 package services
 
-// lesson_plan_course_outline_guard.go — 教案课程大纲挂载与运行时统一硬闸
+// lesson_plan_course_outline_guard.go — 教案唯一课程大纲ID统一硬闸
 //
-// 本文件是教案课程大纲正式运行链的唯一教育域入口。
-//
-// 统一规则：
-//   1. 运行时只信任lesson_plans.education_domain正式快照；
-//   2. 快照只允许k12、vocational、adult三个具体教学域；
-//   3. 查询课程大纲时必须显式携带教案快照域；
-//   4. K12允许空出版社或具名出版社；
-//   5. vocational/adult只允许空字符串，表示“普通课程大纲挂载”；
-//   6. 非K12空字符串不再解释或展示为“通用教材版本”；
-//   7. 非K12具名出版社直接拒绝；
-//   8. 挂载端点还必须验证操作者实时域与教案快照域完全一致；
-//   9. K12挂载的版本必须在当前学科和年级下真实存在；
-//  10. 数据库查询失败必须向上传递，不能静默伪装成没有大纲。
+// 正式规则：
+//   1. 开始备课时，唯一ID必须在任何教案INSERT前完成作者可见性与同域校验；
+//   2. 自动匹配候选仍由候选API要求具体年级完全相等；
+//   3. 教师手动选择时允许大纲年级与教案年级或学段存在交集；
+//   4. 手动选择不能放宽教育域、用户可见范围、active状态或学科一致性；
+//   5. 运行时只信任lesson_plans.education_domain与唯一大纲快照；
+//   6. publisher-only存量教案不再模糊匹配，也不注入任何大纲；
+//   7. 运行时最多返回一份大纲，绝不跨出版社、册次或学制兜底。
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -25,19 +21,51 @@ import (
 	"tedna/internal/repository"
 )
 
-// courseOutlineListActiveByDomain 默认指向正式分域Repository。
-//
-// 测试可临时替换，覆盖挂载和运行时纯编排规则。
-var courseOutlineListActiveByDomain =
-	repository.ListActiveOutlinesBySubjectAndEducationDomain
+var (
+	ErrOutlineExactSelectionInvalid = errors.New(
+		"教案课程大纲唯一挂载无效，请重新选择",
+	)
 
-// resolveLessonPlanCourseOutlineSnapshotDomain
-// 严格读取教案正式教育域快照。
+	ErrOutlineExactSelectionUnavailable = errors.New(
+		"已关联的课程大纲当前不可用，请重新选择",
+	)
+
+	ErrOutlineExactSelectionForbidden = errors.New(
+		"当前已无权读取关联的课程大纲",
+	)
+)
+
+var (
+	lessonPlanCourseOutlineSnapshotReader = repository.GetLessonPlanCourseOutlineSnapshot
+
+	activeCourseOutlineExactReader = repository.GetActiveCourseOutlineByIDAndEducationDomain
+
+	visibleCourseOutlineReader = func(
+		ctx context.Context,
+		userID string,
+		outlineID string,
+	) (
+		*models.CourseOutline,
+		string,
+		error,
+	) {
+		return NewCourseOutlineService().GetOutline(
+			ctx,
+			userID,
+			outlineID,
+		)
+	}
+)
+
+// 旧出版社挂载兼容链暂时保留，直到前后端完成唯一ID切换。
+var courseOutlineListActiveByDomain = repository.ListActiveOutlinesBySubjectAndEducationDomain
+
 func resolveLessonPlanCourseOutlineSnapshotDomain(
 	lessonPlan *models.LessonPlan,
 ) (string, error) {
 	if lessonPlan == nil {
-		return "", ErrOutlineEducationDomainRequired
+		return "",
+			ErrOutlineEducationDomainRequired
 	}
 
 	domain := strings.ToLower(
@@ -45,20 +73,152 @@ func resolveLessonPlanCourseOutlineSnapshotDomain(
 			lessonPlan.EducationDomain,
 		),
 	)
-	if !models.IsTeachingEducationDomain(domain) {
-		return "", ErrOutlineEducationDomainRequired
+
+	if !models.IsTeachingEducationDomain(
+		domain,
+	) {
+		return "",
+			ErrOutlineEducationDomainRequired
 	}
 
 	return domain, nil
 }
 
-// normalizeLessonPlanCourseOutlineMount
-// 校验挂载请求并返回可安全落库的三态出版社指针。
+// ValidateStartConversationCourseOutline
+// 在教案INSERT前校验唯一课程大纲ID。
 //
-// 返回值：
-//   nil      = 解除课程大纲挂载；
-//   &""      = K12通用版本，或非K12普通课程大纲挂载；
-//   &"具名"  = K12具名教材版本。
+// 空ID表示明确不挂载；非空ID必须同时满足：
+//   - 当前作者仍可见；
+//   - 与创建教育域一致；
+//   - active；
+//   - 学科完全相等；
+//   - 年级或学段存在交集；
+//   - 学制字段合法。
+//
+// 自动匹配是否成功不在本函数判断；自动候选API只返回具体年级完全相等候选。
+// 本函数同时承担手动选择的最终业务校验，因此允许具体年级选择覆盖自己的学段大纲。
+func ValidateStartConversationCourseOutline(
+	ctx context.Context,
+	educationDomain string,
+	authorID string,
+	req *models.StartConversationRequest,
+) error {
+	if req == nil {
+		return errors.New(
+			"开始备课请求不能为空",
+		)
+	}
+
+	outlineID := strings.TrimSpace(
+		req.CourseOutlineID,
+	)
+
+	if outlineID == "" {
+		req.CourseOutlineID = ""
+		return nil
+	}
+
+	domain := strings.ToLower(
+		strings.TrimSpace(
+			educationDomain,
+		),
+	)
+
+	if !models.IsTeachingEducationDomain(
+		domain,
+	) {
+		return ErrOutlineEducationDomainRequired
+	}
+
+	if strings.TrimSpace(authorID) == "" {
+		return ErrOutlineExactSelectionForbidden
+	}
+
+	visibleOutline, visibleDomain, err :=
+		visibleCourseOutlineReader(
+			ctx,
+			authorID,
+			outlineID,
+		)
+	if err != nil {
+		if errors.Is(
+			err,
+			repository.ErrCourseOutlineNotFound,
+		) {
+			return ErrOutlineExactSelectionForbidden
+		}
+
+		return fmt.Errorf(
+			"%w: 校验课程大纲可见性失败: %v",
+			ErrOutlineEducationDomainResolveFailed,
+			err,
+		)
+	}
+
+	if visibleOutline == nil ||
+		strings.TrimSpace(
+			visibleOutline.ID,
+		) != outlineID ||
+		strings.ToLower(
+			strings.TrimSpace(
+				visibleDomain,
+			),
+		) != domain {
+		return ErrOutlineExactSelectionForbidden
+	}
+
+	outline, err :=
+		activeCourseOutlineExactReader(
+			ctx,
+			outlineID,
+			domain,
+		)
+	if err != nil {
+		if errors.Is(
+			err,
+			repository.ErrCourseOutlineNotFound,
+		) {
+			return ErrOutlineExactSelectionUnavailable
+		}
+
+		return fmt.Errorf(
+			"%w: 读取唯一课程大纲失败: %v",
+			ErrOutlineEducationDomainResolveFailed,
+			err,
+		)
+	}
+
+	if outline == nil ||
+		strings.TrimSpace(
+			outline.ID,
+		) != outlineID ||
+		strings.TrimSpace(
+			outline.Subject,
+		) != strings.TrimSpace(
+			req.Subject,
+		) ||
+		!courseOutlineGradesMatch(
+			outline.Grade,
+			req.Grade,
+		) ||
+		!models.IsValidCourseOutlineSchoolSystem(
+			strings.TrimSpace(
+				outline.SchoolSystem,
+			),
+		) {
+		return ErrOutlineExactSelectionInvalid
+	}
+
+	req.CourseOutlineID = strings.TrimSpace(
+		outline.ID,
+	)
+
+	return nil
+}
+
+// normalizeLessonPlanCourseOutlineMount
+// 旧publisher-only端点的过渡校验。
+// 新前端不得再调用该路径。
 func normalizeLessonPlanCourseOutlineMount(
 	ctx context.Context,
 	lessonPlan *models.LessonPlan,
@@ -78,14 +238,17 @@ func normalizeLessonPlanCourseOutlineMount(
 			liveEducationDomain,
 		),
 	)
+
 	if !models.IsTeachingEducationDomain(
 		liveDomain,
 	) {
-		return nil, ErrOutlineEducationDomainRequired
+		return nil,
+			ErrOutlineEducationDomainRequired
 	}
 
 	if liveDomain != snapshotDomain {
-		return nil, ErrOutlineEducationDomainMismatch
+		return nil,
+			ErrOutlineEducationDomainMismatch
 	}
 
 	if publisher == nil {
@@ -101,17 +264,11 @@ func normalizeLessonPlanCourseOutlineMount(
 		return nil, err
 	}
 
-	// 非K12空串是普通课程大纲挂载标记。
-	//
-	// 即使当前尚无匹配大纲，也允许先保存该标记；
-	// 后续管理员录入同域普通大纲后，下一轮运行时即可自然命中。
-	if snapshotDomain != models.EducationDomainK12 {
+	if snapshotDomain !=
+		models.EducationDomainK12 {
 		return &normalized, nil
 	}
 
-	// K12具名或通用版本必须真实存在。
-	//
-	// 这道校验阻止直接调用API伪造一个不存在的版本字符串。
 	candidates, err :=
 		courseOutlineListActiveByDomain(
 			ctx,
@@ -131,22 +288,85 @@ func normalizeLessonPlanCourseOutlineMount(
 		normalized,
 		candidates,
 	)
+
 	if len(hits) == 0 {
-		return nil, ErrOutlinePublisherUnavailable
+		return nil,
+			ErrOutlinePublisherUnavailable
 	}
 
 	return &normalized, nil
 }
 
-// ResolveLessonPlanCourseOutlines
-// 按教案正式快照域、学科、学习层级和出版社选择解析运行时大纲。
+// validateExactLessonPlanCourseOutlineSnapshot
+// 复核数据库固化快照与当前正式大纲。
 //
-// 没有挂载或没有匹配项返回空切片，不属于错误。
-// 教育域非法、非K12具名出版社、数据库失败属于错误。
-func ResolveLessonPlanCourseOutlines(
+// grade不是独立快照字段，但当前教案grade仍必须与正式大纲grade或学段相交；
+// 这使教师能够绑定学段大纲，同时防止教案后续被改成完全无关的年级。
+func validateExactLessonPlanCourseOutlineSnapshot(
+	lessonPlan *models.LessonPlan,
+	snapshot *models.LessonPlanCourseOutlineSnapshot,
+	outline *models.CourseOutline,
+) error {
+	if lessonPlan == nil ||
+		snapshot == nil ||
+		outline == nil ||
+		snapshot.CourseOutlineID == nil ||
+		strings.TrimSpace(
+			*snapshot.CourseOutlineID,
+		) == "" ||
+		snapshot.CourseOutlinePublisher == nil ||
+		snapshot.CourseOutlineVolume == nil ||
+		strings.TrimSpace(
+			*snapshot.CourseOutlineVolume,
+		) == "" ||
+		snapshot.SchoolSystem == nil ||
+		!models.IsValidCourseOutlineSchoolSystem(
+			strings.TrimSpace(
+				*snapshot.SchoolSystem,
+			),
+		) {
+		return ErrOutlineExactSelectionInvalid
+	}
+
+	if strings.TrimSpace(
+		outline.ID,
+	) != strings.TrimSpace(
+		*snapshot.CourseOutlineID,
+	) ||
+		strings.TrimSpace(
+			outline.Subject,
+		) != strings.TrimSpace(
+			lessonPlan.Subject,
+		) ||
+		!courseOutlineGradesMatch(
+			outline.Grade,
+			lessonPlan.Grade,
+		) ||
+		strings.TrimSpace(
+			outline.Publisher,
+		) != strings.TrimSpace(
+			*snapshot.CourseOutlinePublisher,
+		) ||
+		strings.TrimSpace(
+			outline.Volume,
+		) != strings.TrimSpace(
+			*snapshot.CourseOutlineVolume,
+		) ||
+		strings.TrimSpace(
+			outline.SchoolSystem,
+		) != strings.TrimSpace(
+			*snapshot.SchoolSystem,
+		) {
+		return ErrOutlineExactSelectionInvalid
+	}
+
+	return nil
+}
+
+func resolveLessonPlanExactCourseOutline(
 	ctx context.Context,
 	lessonPlan *models.LessonPlan,
-) ([]*models.CourseOutline, error) {
+) (*models.CourseOutline, error) {
 	snapshotDomain, err :=
 		resolveLessonPlanCourseOutlineSnapshotDomain(
 			lessonPlan,
@@ -155,49 +375,151 @@ func ResolveLessonPlanCourseOutlines(
 		return nil, err
 	}
 
-	if lessonPlan.CourseOutlinePublisher == nil {
-		return []*models.CourseOutline{}, nil
+	if lessonPlan == nil ||
+		strings.TrimSpace(
+			lessonPlan.ID,
+		) == "" {
+		return nil,
+			ErrOutlineExactSelectionInvalid
 	}
 
-	publisher, err :=
-		normalizeCourseOutlinePublisherForDomain(
-			snapshotDomain,
-			*lessonPlan.CourseOutlinePublisher,
-		)
-	if err != nil {
-		return nil, err
-	}
-
-	candidates, err :=
-		courseOutlineListActiveByDomain(
+	snapshot, err :=
+		lessonPlanCourseOutlineSnapshotReader(
 			ctx,
-			strings.TrimSpace(
-				lessonPlan.Subject,
-			),
-			snapshotDomain,
+			lessonPlan.ID,
 		)
 	if err != nil {
+		if errors.Is(
+			err,
+			repository.ErrLessonPlanNotFound,
+		) {
+			return nil,
+				ErrOutlineExactSelectionUnavailable
+		}
+
 		return nil, fmt.Errorf(
-			"%w: 查询课程大纲候选失败: %v",
+			"%w: 读取教案课程大纲快照失败: %v",
 			ErrOutlineEducationDomainResolveFailed,
 			err,
 		)
 	}
 
-	hits := MatchOutlinesByPublisher(
-		lessonPlan.Grade,
-		publisher,
-		candidates,
-	)
-	if hits == nil {
-		hits = []*models.CourseOutline{}
+	if snapshot == nil ||
+		snapshot.CourseOutlineID == nil ||
+		strings.TrimSpace(
+			*snapshot.CourseOutlineID,
+		) == "" {
+		return nil, nil
 	}
 
-	return hits, nil
+	visibleOutline, visibleDomain, err :=
+		visibleCourseOutlineReader(
+			ctx,
+			lessonPlan.AuthorID,
+			*snapshot.CourseOutlineID,
+		)
+	if err != nil {
+		if errors.Is(
+			err,
+			repository.ErrCourseOutlineNotFound,
+		) {
+			return nil,
+				ErrOutlineExactSelectionForbidden
+		}
+
+		return nil, fmt.Errorf(
+			"%w: 复核课程大纲读取权限失败: %v",
+			ErrOutlineEducationDomainResolveFailed,
+			err,
+		)
+	}
+
+	if visibleOutline == nil ||
+		strings.TrimSpace(
+			visibleOutline.ID,
+		) != strings.TrimSpace(
+			*snapshot.CourseOutlineID,
+		) ||
+		strings.ToLower(
+			strings.TrimSpace(
+				visibleDomain,
+			),
+		) != snapshotDomain {
+		return nil,
+			ErrOutlineExactSelectionForbidden
+	}
+
+	outline, err :=
+		activeCourseOutlineExactReader(
+			ctx,
+			*snapshot.CourseOutlineID,
+			snapshotDomain,
+		)
+	if err != nil {
+		if errors.Is(
+			err,
+			repository.ErrCourseOutlineNotFound,
+		) {
+			return nil,
+				ErrOutlineExactSelectionUnavailable
+		}
+
+		return nil, fmt.Errorf(
+			"%w: 读取唯一课程大纲失败: %v",
+			ErrOutlineEducationDomainResolveFailed,
+			err,
+		)
+	}
+
+	if err :=
+		validateExactLessonPlanCourseOutlineSnapshot(
+			lessonPlan,
+			snapshot,
+			outline,
+		); err != nil {
+		return nil, err
+	}
+
+	return outline, nil
+}
+
+// ResolveLessonPlanCourseOutlines
+// 返回零份或唯一一份已绑定课程大纲。
+func ResolveLessonPlanCourseOutlines(
+	ctx context.Context,
+	lessonPlan *models.LessonPlan,
+) ([]*models.CourseOutline, error) {
+	outline, err :=
+		resolveLessonPlanExactCourseOutline(
+			ctx,
+			lessonPlan,
+		)
+	if err != nil {
+		return nil, err
+	}
+
+	if outline == nil {
+		return []*models.CourseOutline{},
+			nil
+	}
+
+	return []*models.CourseOutline{
+		outline,
+	}, nil
 }
 
 // BuildLessonPlanCourseOutlineContext
-// 构建教案运行时课程大纲上下文，并同时返回命中大纲供日志和回执使用。
+// 构建教案本轮所需的课程层级上下文。
+//
+// 教案对话链存在lessonPlanTurnContextPlan时：
+//   - 普通备课、正式教案、评审和修订只读取active短版知识脉络；
+//   - 该路径不会读取课程大纲正文，避免每轮重复加载全文；
+//   - analyze尚未完成确认时不注入，也不凭课题提前提取；
+//   - analyze之后缺少active快照时fail-closed，要求回到教学分析；
+//   - 只有老师明确询问课程大纲原文或版本要求时，才读取原始大纲全文。
+//
+// 不存在单轮计划的其它调用方（如课程大纲管理或课件独立审核）
+// 保持原有唯一大纲全文读取行为，避免影响非教案对话场景。
 func BuildLessonPlanCourseOutlineContext(
 	ctx context.Context,
 	lessonPlan *models.LessonPlan,
@@ -206,10 +528,83 @@ func BuildLessonPlanCourseOutlineContext(
 	[]*models.CourseOutline,
 	error,
 ) {
-	hits, err := ResolveLessonPlanCourseOutlines(
-		ctx,
-		lessonPlan,
-	)
+	turnPlan :=
+		lessonPlanTurnContextPlanFromContext(
+			ctx,
+		)
+
+	if turnPlan != nil &&
+		turnPlan.UseKnowledgeLineage &&
+		!turnPlan.UseRawCourseOutline {
+		if lessonPlan == nil ||
+			strings.TrimSpace(
+				lessonPlan.ID,
+			) == "" {
+			return "", nil,
+				ErrOutlineExactSelectionInvalid
+		}
+
+		lineage, lineageErr :=
+			repository.GetActiveLessonPlanKnowledgeLineage(
+				ctx,
+				lessonPlan.ID,
+			)
+		if lineageErr != nil {
+			return "", nil,
+				fmt.Errorf(
+					"读取教案active知识脉络失败: %w",
+					lineageErr,
+				)
+		}
+
+		if lineage != nil &&
+			lineage.IsActiveUsable() &&
+			strings.TrimSpace(
+				lineage.ContextText,
+			) != "" {
+			return "\n\n" +
+					strings.TrimSpace(
+						lineage.ContextText,
+					) +
+					"\n",
+				[]*models.CourseOutline{},
+				nil
+		}
+
+		// 教学分析阶段尚未完成确认时，不提前读取或注入大纲全文。
+		if strings.TrimSpace(
+			lessonPlan.CurrentStage,
+		) == "analyze" {
+			turnPlan.UseKnowledgeLineage = false
+
+			if !turnPlan.UseRawCourseOutline {
+				turnPlan.UseCourseOutline = false
+			}
+
+			// 本轮若没有其它正式证据，也不必启动多证据Harness。
+			if !turnPlan.UseTextbook &&
+				!turnPlan.UseRefMaterial &&
+				!turnPlan.UseUnitPlan &&
+				!turnPlan.UseRawCourseOutline &&
+				!turnPlan.UseClassProfile {
+				turnPlan.BlockingEvidenceHarness = false
+			}
+
+			return "",
+				[]*models.CourseOutline{},
+				nil
+		}
+
+		return "", nil,
+			ErrLessonPlanKnowledgeLineageAnalyzeRequired
+	}
+
+	// 原始大纲查询或非教案对话调用方继续走唯一精确大纲硬闸。
+	hits, err :=
+		ResolveLessonPlanCourseOutlines(
+			ctx,
+			lessonPlan,
+		)
 	if err != nil {
 		return "", nil, err
 	}
@@ -218,7 +613,15 @@ func BuildLessonPlanCourseOutlineContext(
 		return "", hits, nil
 	}
 
-	return BuildCourseOutlinesContext(hits),
+	if len(hits) != 1 ||
+		hits[0] == nil {
+		return "", nil,
+			ErrOutlineExactSelectionInvalid
+	}
+
+	return BuildCourseOutlineContext(
+			hits[0],
+		),
 		hits,
 		nil
 }

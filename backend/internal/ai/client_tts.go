@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -65,11 +66,64 @@ type TTSRequest struct {
 
 // TTSResult TTS语音合成结果（业务层使用）
 type TTSResult struct {
-	AudioFilePath string  // 生成的音频文件本地路径
-	AudioURL      string  // 音频文件的公网URL
-	Duration      float64 // 音频时长（秒，由ffprobe获取）
-	ModelUsed     string  // 使用的模型/资源标识
-	FileSize      int64   // 文件大小（字节）
+	AudioFilePath string
+	AudioURL      string
+	Duration      float64
+	ModelUsed     string
+	FileSize      int64
+}
+
+// TTSSynthesisError 描述供应商调用失败后的成本事实。
+//
+// Uncertain表示请求可能已经到达供应商，但无法确认是否成功；
+// ProviderSucceeded表示供应商已经明确成功，只是本地文件处理失败。
+type TTSSynthesisError struct {
+	Cause             error
+	Uncertain         bool
+	ProviderSucceeded bool
+}
+
+func (err *TTSSynthesisError) Error() string {
+	if err == nil ||
+		err.Cause == nil {
+		return "TTS合成失败"
+	}
+
+	return err.Cause.Error()
+}
+
+func (err *TTSSynthesisError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+
+	return err.Cause
+}
+
+// IsTTSSynthesisUncertain 判断是否禁止自动释放和重复调用供应商。
+func IsTTSSynthesisUncertain(
+	err error,
+) bool {
+	var synthesisErr *TTSSynthesisError
+
+	return errors.As(
+		err,
+		&synthesisErr,
+	) &&
+		synthesisErr.Uncertain
+}
+
+// DidTTSSynthesisProviderSucceed 判断供应商是否已经明确成功。
+func DidTTSSynthesisProviderSucceed(
+	err error,
+) bool {
+	var synthesisErr *TTSSynthesisError
+
+	return errors.As(
+		err,
+		&synthesisErr,
+	) &&
+		synthesisErr.ProviderSucceeded
 }
 
 // TTSConfig TTS语音合成API配置（从AI配置中心加载）
@@ -222,15 +276,36 @@ func synthesizeSpeechOpenAI(ctx context.Context, cfg *TTSConfig, text string, vo
 	// 发送请求（30秒超时，TTS通常很快）
 	client := &http.Client{Timeout: 30 * time.Second}
 	startTime := time.Now()
-	httpResp, err := client.Do(httpReq)
-	latencyMs := time.Since(startTime).Milliseconds()
+	httpResp, err :=
+		client.Do(
+			httpReq,
+		)
+
+	latencyMs :=
+		time.Since(
+			startTime,
+		).Milliseconds()
 
 	if err != nil {
-		ttsLog.Error("TTS HTTP请求失败", "error", err, "latency_ms", latencyMs)
-		return nil, fmt.Errorf("TTS请求失败: %w", err)
-	}
-	defer httpResp.Body.Close()
+		ttsLog.Error(
+			"TTS HTTP请求结果不确定",
+			"error",
+			err,
+			"latency_ms",
+			latencyMs,
+		)
 
+		return nil,
+			&TTSSynthesisError{
+				Cause: fmt.Errorf(
+					"TTS请求网络结果不确定: %w",
+					err,
+				),
+				Uncertain: true,
+			}
+	}
+
+	defer httpResp.Body.Close()
 	// 检查HTTP状态码
 	if httpResp.StatusCode != http.StatusOK {
 		// 错误响应是JSON格式
@@ -243,31 +318,101 @@ func synthesizeSpeechOpenAI(ctx context.Context, cfg *TTSConfig, text string, vo
 		return nil, fmt.Errorf("TTS API返回错误(HTTP %d): %s", httpResp.StatusCode, truncateStr(string(respBody), 200))
 	}
 
-	// 成功时返回的是音频二进制流，直接写入文件
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return nil, fmt.Errorf("创建输出目录失败: %w", err)
+	// 成功HTTP响应表示供应商已经完成本次合成。
+	// 后续本地目录、文件或响应流处理失败不能释放预留。
+	if err :=
+		os.MkdirAll(
+			outputDir,
+			0755,
+		); err != nil {
+		return nil,
+			&TTSSynthesisError{
+				Cause: fmt.Errorf(
+					"创建输出目录失败: %w",
+					err,
+				),
+				ProviderSucceeded: true,
+			}
 	}
 
-	outputPath := filepath.Join(outputDir, outputName+".mp3")
-	outFile, err := os.Create(outputPath)
+	outputPath :=
+		filepath.Join(
+			outputDir,
+			outputName+".mp3",
+		)
+
+	outFile, err :=
+		os.Create(
+			outputPath,
+		)
+
 	if err != nil {
-		return nil, fmt.Errorf("创建音频文件失败: %w", err)
+		return nil,
+			&TTSSynthesisError{
+				Cause: fmt.Errorf(
+					"创建音频文件失败: %w",
+					err,
+				),
+				ProviderSucceeded: true,
+			}
 	}
 
-	written, err := io.Copy(outFile, httpResp.Body)
-	outFile.Close()
-	if err != nil {
-		os.Remove(outputPath)
-		return nil, fmt.Errorf("写入音频文件失败: %w", err)
+	written, copyErr :=
+		io.Copy(
+			outFile,
+			httpResp.Body,
+		)
+
+	closeErr :=
+		outFile.Close()
+
+	if copyErr != nil {
+		_ = os.Remove(outputPath)
+
+		return nil,
+			&TTSSynthesisError{
+				Cause: fmt.Errorf(
+					"写入音频文件失败: %w",
+					copyErr,
+				),
+				ProviderSucceeded: true,
+			}
+	}
+
+	if closeErr != nil {
+		_ = os.Remove(outputPath)
+
+		return nil,
+			&TTSSynthesisError{
+				Cause: fmt.Errorf(
+					"关闭音频文件失败: %w",
+					closeErr,
+				),
+				ProviderSucceeded: true,
+			}
 	}
 
 	if written < 100 {
-		// 文件太小，可能是空响应或错误
-		content, _ := os.ReadFile(outputPath)
-		os.Remove(outputPath)
-		return nil, fmt.Errorf("TTS生成的音频文件异常小(%d字节): %s", written, truncateStr(string(content), 200))
-	}
+		content, _ :=
+			os.ReadFile(
+				outputPath,
+			)
 
+		_ = os.Remove(outputPath)
+
+		return nil,
+			&TTSSynthesisError{
+				Cause: fmt.Errorf(
+					"TTS生成的音频文件异常小(%d字节): %s",
+					written,
+					truncateStr(
+						string(content),
+						200,
+					),
+				),
+				ProviderSucceeded: true,
+			}
+	}
 	// 获取音频时长（通过ffprobe）
 	duration := getAudioDuration(outputPath)
 
@@ -386,7 +531,8 @@ func GetTTSConfig(aesKey string) (*TTSConfig, error) {
 		}
 		cfg.APIBaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 
-		// Model字段在v3路径仅作展示标签（实际resource id按音色推导）
+		// 当前开放的官方2.0音色使用真实Resource ID，
+		// 该值同时作为统一积分价格表的严格模型身份。
 		cfg.Model = "seed-tts-2.0"
 		return cfg, nil
 	}

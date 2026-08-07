@@ -917,7 +917,14 @@ func BuildActorFromClaims(ctx context.Context, userID, role string) *AssistantAc
 		resolvedDomain := strings.ToLower(strings.TrimSpace(educationContext.EducationDomain))
 		if models.IsTeachingEducationDomain(resolvedDomain) {
 			actor.EducationDomain = resolvedDomain
-			actor.SchoolID = strings.TrimSpace(educationContext.OrganizationID)
+			// region_admin教育上下文中的OrganizationID
+			// 是区域组织ID，不能错误写入SchoolID。
+			// 后续由实际教研组归属解析具体学校。
+			if role != models.RoleRegionAdmin {
+				actor.SchoolID = strings.TrimSpace(
+					educationContext.OrganizationID,
+				)
+			}
 		}
 	}
 
@@ -963,7 +970,7 @@ func BuildActorFromClaims(ctx context.Context, userID, role string) *AssistantAc
 // mixed只用于系统、区域和抽查管理页面，不承载具体教学资源。
 func isAssistantMixedManagementRole(role string) bool {
 	switch role {
-	case models.RoleAdmin, models.RoleRegionAdmin, models.RoleDistrictInspector:
+	case models.RoleAdmin, models.RoleDistrictInspector:
 		return true
 	default:
 		return false

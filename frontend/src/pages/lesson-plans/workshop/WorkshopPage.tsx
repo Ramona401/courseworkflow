@@ -33,7 +33,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
-import { useEducationProfile } from '@/hooks/useEducationProfile'
 import { useProtectedDraft } from '@/hooks/useProtectedDraft'
 import {
   startConversation, sendChatMessage, triggerAIReview, applyAISuggestions,
@@ -43,26 +42,28 @@ import {
   type StageProgressItem, type StageEventData, type StageCompletenessResponse,
   type SSEConnectionState, type SSEConnection,
   type RecipeSelectionMode,
+  type StartConversationRequest,
+  type ImportExistingPlanResponse,
 } from '@/api/lesson-plans'
 import {
   C, type StreamingState,
   STAGE_STATUS_ICON, STAGE_STATUS_COLOR, STAGE_CODE_EMOJI,
 } from './components/workshopConstants'
 import {
-  StartForm, AIBubble, UserBubble, ThinkingIndicator, ReviewPanel,
+  AIBubble, UserBubble, ThinkingIndicator, ReviewPanel,
 } from './components/WorkshopPanels'
 import LessonDocumentEditor from './components/LessonDocumentEditor'
-import { setLessonPlanCourseOutlinePublisher } from '@/api/course-outlines'
+import ResizableRightPanel from './components/ResizableRightPanel'
 import type { LessonPlanContentRestoreResponse } from '@/api/lesson-plan-versions'
+import type {
+  LessonPlanSectionRewriteApplyResponse,
+} from '@/api/lesson-plan-section-rewrite'
 import { StageSummaryModal } from './components/StageSummaryModal'
 import { StageTransitionView } from './components/StageTransitionView'
 import { StageSeparatorBubble } from './components/StageSeparatorBubble'
 import StageComponentsModal from './components/StageComponentsModal'
 import { ResumingView, StartScreen } from './components/WorkshopStartScreen'
 import { getAssessmentResult } from '@/api/assessment'
-// 迭代7B：备课中展示本次关联的课本图
-import { getTextbook, type TextbookDetail } from '@/api/textbooks'
-import ProtectedTextbookImage from '@/components/textbooks/ProtectedTextbookImage'
 import ImportPlanModal from './components/ImportPlanModal'
 // v112 (P0 STEP 8):引入 AI 助手选择器和场景类型
 import AssistantSelector from '@/components/ai-assistants/AssistantSelector'
@@ -103,11 +104,6 @@ const STAGE_CODE_TO_SCENE: Record<string, AssistantScene> = {
 
 export default function WorkshopPage() {
   const { token, user } = useAuth()
-  const {
-    isK12,
-    profile,
-    ready: educationReady,
-  } = useEducationProfile()
   const navigate  = useNavigate()
   const location  = useLocation()
 
@@ -123,8 +119,6 @@ export default function WorkshopPage() {
   const [startMode, setStartMode] = useState<'choose' | 'new'>('choose')
 
   const [plan, setPlan] = useState<LessonPlan | null>(null)
-  // 迭代7B：本次备课关联的课本图详情（进入备课后按 plan.textbook_page_ids 查出，仅用于展示）
-  const [linkedTextbooks, setLinkedTextbooks] = useState<TextbookDetail[]>([])
   const [messages, setMessages]     = useState<ConversationMessage[]>([])
   const [isThinking, setIsThinking] = useState(false)
   const [streaming, setStreaming]   = useState<StreamingState | null>(null)
@@ -244,36 +238,7 @@ export default function WorkshopPage() {
   // v88:保存planId的ref,供重连回调使用(避免闭包捕获旧值)
   const planIdRef = useRef<string | null>(null)
 
-  // 迭代7B：进入备课（或恢复教案）后，按 plan.textbook_page_ids 查出关联课本图详情用于展示。
-  // 解析 plan.textbook_page_ids（JSON数组字符串），批量 getTextbook 拿缩略图+章节名。
-  // plan 为空或无关联时清空。查询失败静默忽略，不影响备课主流程。
-  useEffect(() => {
-    // 当前教育域不是K12时，不读取任何课本详情。
-    //
-    // 即使sessionStorage恢复了历史教案，或教案中残留旧的
-    // textbook_page_ids，也不能向课本详情接口发送请求。
-    if (!isK12) {
-      setLinkedTextbooks([])
-      return
-    }
 
-    const ids = (() => {
-      try {
-        const raw = plan?.textbook_page_ids
-        if (!raw || raw === '[]') return [] as string[]
-        const arr = JSON.parse(raw)
-        return Array.isArray(arr) ? (arr as string[]) : []
-      } catch { return [] as string[] }
-    })()
-    if (ids.length === 0) { setLinkedTextbooks([]); return }
-    let cancelled = false
-    Promise.all(ids.map(id => getTextbook(id).catch(() => null)))
-      .then(list => {
-        if (cancelled) return
-        setLinkedTextbooks(list.filter((t): t is TextbookDetail => t !== null))
-      })
-    return () => { cancelled = true }
-  }, [isK12, plan])
 
   useEffect(() => {
     // B-P1-22: 自由滚动——仅当用户当前贴近底部(容差120px)时才自动跟随到最新；
@@ -508,31 +473,114 @@ export default function WorkshopPage() {
     resumePlan()
   }, [effectivePlanId, phase, connectSSE, refreshStages])
 
-  // v108:导入教案成功后回调
-  const handleImportSuccess = async (planId: string, openingMessage: ConversationMessage) => {
+  // 导入接口成功返回后立即进入聊天，不等待AI评审完成。
+  const handleImportSuccess = (
+    response: ImportExistingPlanResponse,
+  ) => {
+    const importedPlan = response.plan
+    const openingMessage =
+      response.opening_message
+    const planId = importedPlan.id
+
     setShowImportModal(false)
-    try {
-      const [planData, convData] = await Promise.all([
-        getLessonPlan(planId),
-        getConversation(planId),
-      ])
-      setPlan(planData)
-      const serverMsgs = (convData.messages || []).filter(
-        (m: ConversationMessage) => m.role === 'user' || m.role === 'assistant' || m.role === 'system'
-      )
-      setMessages(serverMsgs.length > 0 ? serverMsgs : [openingMessage])
-      if (planData.content_markdown) setPlanContent(planData.content_markdown)
-      setPhase('chatting')
-      sessionStorage.setItem('workshop_active_plan_id', planId)
-      connectSSE(planId)
-      if (planData.current_stage && planData.stage_config) {
-        await refreshStages(planId)
-      }
-      setRightPanel('review')  // 自动切到评审面板等待AI评审
-    } catch (err) {
-      console.error('导入后加载教案失败:', err)
-      alert('导入成功但加载失败,请刷新页面重试')
-    }
+
+    setPlan(importedPlan)
+    setMessages([openingMessage])
+    setPlanContent(
+      importedPlan.content_markdown || '',
+    )
+    setReview(null)
+    setReviewLoading(false)
+    setApplyingReview(false)
+    setStageItems([])
+    setCurrentStage('')
+    setIsStageMode(false)
+    isStageModeRef.current = false
+    setViewingStage(null)
+    setIsThinking(false)
+    setStreaming(null)
+    setIsStageProcessing(false)
+    setSelectedComponentIds(new Set())
+    setRightPanel('review')
+    setPhase('chatting')
+
+    sessionStorage.setItem(
+      'workshop_active_plan_id',
+      planId,
+    )
+
+    // 先连接SSE，避免错过快速完成的后台评审事件。
+    connectSSE(planId)
+
+    // 阶段和详情后台校准，不阻塞进入聊天。
+    void refreshStages(planId)
+
+    void Promise.all([
+      getLessonPlan(planId),
+      getConversation(planId),
+    ])
+      .then(([planData, convData]) => {
+        if (planIdRef.current !== planId) {
+          return
+        }
+
+        setPlan(planData)
+
+        const serverMessages =
+          (convData.messages || []).filter(
+            message =>
+              message.role === 'user' ||
+              message.role === 'assistant' ||
+              message.role === 'system',
+          )
+
+        setMessages(
+          serverMessages.length > 0
+            ? serverMessages
+            : [openingMessage],
+        )
+
+        setPlanContent(
+          planData.content_markdown ||
+          importedPlan.content_markdown ||
+          '',
+        )
+
+        if (planData.ai_review_result) {
+          try {
+            const parsedReview =
+              typeof planData.ai_review_result ===
+                'string'
+                ? JSON.parse(
+                    planData.ai_review_result,
+                  )
+                : planData.ai_review_result
+
+            if (
+              parsedReview &&
+              typeof parsedReview === 'object' &&
+              'total_score' in parsedReview
+            ) {
+              setReview(
+                parsedReview as AIReviewResult,
+              )
+              setReviewLoading(false)
+            }
+          } catch {
+            // SSE仍会继续接收正式评审结果。
+          }
+        }
+      })
+      .catch(error => {
+        console.error(
+          '导入后后台校准教案失败:',
+          error,
+        )
+
+        showContentToast(
+          '✅ 教案已导入，可直接开始对话；最新状态将自动同步',
+        )
+      })
   }
 
   const handleStart = async (
@@ -543,72 +591,42 @@ export default function WorkshopPage() {
     recipeMode: RecipeSelectionMode,
     recipeId?: string,
     textbookPageIds?: string[],
-    coursePublisher?: string | null,
+    courseOutlineId?: string | null,
   ) => {
     setStartLoading(true)
     try {
-      const req: Record<string, unknown> = {
+      /**
+       * 开始请求使用正式类型直接构造。
+       *
+       * 课程大纲在教案创建事务中按唯一ID校验并固化，
+       * 不再在创建成功后追加publisher-only二次挂载。
+       */
+      const request: StartConversationRequest = {
         subject,
         grade,
         topic,
         duration_minutes: duration,
         recipe_mode: recipeMode,
+        recipe_id:
+          recipeMode === 'selected'
+            ? recipeId
+            : undefined,
+        textbook_page_ids:
+          textbookPageIds &&
+          textbookPageIds.length > 0
+            ? textbookPageIds
+            : undefined,
+        course_outline_id:
+          courseOutlineId ||
+          undefined,
       }
-      if (recipeMode === 'selected' && recipeId) {
-        req.recipe_id = recipeId
-      }
-      if (textbookPageIds && textbookPageIds.length > 0) {
-        req.textbook_page_ids = textbookPageIds
-      }
-      const resp = await startConversation(req as unknown as Parameters<typeof startConversation>[0])
+
+      const resp =
+        await startConversation(request)
       setPlan(resp.plan)
       setMessages([resp.opening_message])
       setPhase('chatting')
       sessionStorage.setItem('workshop_active_plan_id', resp.plan.id)
-      /**
-       * 创建完成后写入课程大纲挂载三态。
-       *
-       * K12：
-       *   - 保持首屏出版社选择结果；
-       *   - null/undefined表示老师未选择，不挂载课程大纲。
-       *
-       * vocational/adult：
-       *   - 首屏不显示出版社；
-       *   - 自动写入空字符串，表示挂载同域普通课程大纲；
-       *   - 后端运行时按照教案教育域快照、学科和学习层级匹配；
-       *   - 不会读取或泄漏K12出版社大纲。
-       *
-       * mixed、教育域未就绪或非法：
-       *   - 不自动挂载，保持fail-closed。
-       */
-      const isOrdinaryNonK12 =
-        educationReady &&
-        (
-          profile.code === 'vocational' ||
-          profile.code === 'adult'
-        )
-
-      const outlineMountPublisher =
-        isOrdinaryNonK12
-          ? ''
-          : coursePublisher
-
-      if (
-        outlineMountPublisher !== null &&
-        outlineMountPublisher !== undefined
-      ) {
-        try {
-          await setLessonPlanCourseOutlinePublisher(
-            resp.plan.id,
-            outlineMountPublisher,
-          )
-        } catch (outlineError) {
-          console.error(
-            '课程大纲关联失败:',
-            outlineError,
-          )
-        }
-      }
       connectSSE(resp.plan.id)
       if (resp.plan.current_stage && resp.plan.stage_config) {
         await refreshStages(resp.plan.id)
@@ -641,8 +659,8 @@ export default function WorkshopPage() {
       role: 'user' as const,
       type: 'text' as const,
       content:
-        msgText
-        || `已选择${selectedComponentIds.size}个组件`,
+        msgText ||
+        '已加入教学策略',
       created_at:
         new Date().toISOString(),
     }
@@ -881,6 +899,32 @@ export default function WorkshopPage() {
     )
     showContentToast(
       `✅ 已恢复历史v${result.restored_from_version}，当前为v${result.current_version}`,
+    )
+  }
+
+  /**
+   * 章节AI修改成功后同步专家模式右栏正文和正式版本号。
+   *
+   * 后端已经在事务内完成作者、状态、版本和段落哈希复核，
+   * 因此本页只消费原子应用结果，不再执行全文二次保存。
+   */
+  const handleSectionRewriteApplied = (
+    result: LessonPlanSectionRewriteApplyResponse,
+  ) => {
+    setPlanContent(result.content_markdown)
+    setPlan(previous => previous
+      ? {
+          ...previous,
+          content_markdown: result.content_markdown,
+          version: result.current_version,
+        }
+      : previous
+    )
+
+    showContentToast(
+      result.changed
+        ? `✅ 已用AI修改当前章节，教案更新为v${result.current_version}`
+        : `ℹ️ 当前章节没有变化，仍为v${result.current_version}`,
     )
   }
 
@@ -1151,6 +1195,22 @@ export default function WorkshopPage() {
     ? stageItems[currentStageIdx + 1] : null
 
   const planAny    = plan as Record<string, unknown> | null
+
+  /**
+   * 这里只判断是否存在课文依据，不读取课本详情、文件名、张数或OCR状态。
+   */
+  const hasTextbookContext = (() => {
+    try {
+      const raw = plan?.textbook_page_ids
+      if (!raw) return false
+
+      const ids = JSON.parse(raw)
+      return Array.isArray(ids) && ids.length > 0
+    } catch {
+      return false
+    }
+  })()
+
   const recipeName = planAny?.recipe_name ? String(planAny.recipe_name) : ''
   const recipeId   = planAny?.recipe_id   ? String(planAny.recipe_id)   : ''
 
@@ -1242,33 +1302,42 @@ export default function WorkshopPage() {
             ) : (
               <button onClick={() => navigate('/lesson-plans/recipes')} style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px', color: C.textMuted, background: 'none', border: `1px dashed ${C.border}`, borderRadius: '6px', padding: '6px 8px', cursor: 'pointer', width: '100%', justifyContent: 'center' }}>📦 添加配方</button>
             )}
-            {/* 迭代7B：本次参考的课本图缩略展示——让老师明确知道这次备课 AI 参考了哪些课本页 */}
-            {isK12 && linkedTextbooks.length > 0 && (
-              <div style={{ marginTop: '8px', padding: '8px 10px', background: 'rgba(16,185,129,0.06)', borderRadius: '8px', border: '1px solid rgba(16,185,129,0.15)' }}>
-                <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '6px' }}>📷 参考课本（{linkedTextbooks.length}张）</div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-                  {linkedTextbooks.map(tb => (
-                    <div key={tb.id} title={`${tb.chapter || tb.textbook_name}${tb.has_ocr ? '（已识别）' : '（未识别，AI无法参考）'}`}
-                      onClick={() => navigate('/lesson-plans/textbooks')}
-                      style={{ position: 'relative', cursor: 'pointer', borderRadius: '4px', overflow: 'hidden', border: tb.has_ocr ? '1px solid #10B981' : '1px solid #E5E7EB' }}>
-                      <ProtectedTextbookImage
-                        textbookId={tb.id}
-                        alt={tb.file_name || tb.textbook_name}
-                        style={{
-                          width: '36px',
-                          height: '36px',
-                          objectFit: 'cover',
-                          display: 'block',
-                        }}
-                        fallback="📷"
-                      />
-                      {!tb.has_ocr && (
-                        <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'rgba(239,68,68,0.85)', color: '#fff', fontSize: '8px', textAlign: 'center', lineHeight: 1.4 }}>未识别</div>
-                      )}
-                    </div>
-                  ))}
+            {hasTextbookContext && (
+              <button
+                type="button"
+                onClick={() => navigate('/lesson-plans/textbooks')}
+                title="查看或调整本课使用的课文依据"
+                style={{
+                  width: '100%',
+                  marginTop: '8px',
+                  padding: '8px 10px',
+                  borderRadius: '8px',
+                  border: '1px solid rgba(16,185,129,0.15)',
+                  background: 'rgba(16,185,129,0.06)',
+                  color: '#047857',
+                  cursor: 'pointer',
+                  textAlign: 'left',
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: '11px',
+                    fontWeight: 600,
+                  }}
+                >
+                  📖 贴着课文备课
                 </div>
-              </div>
+                <div
+                  style={{
+                    marginTop: '3px',
+                    color: C.textMuted,
+                    fontSize: '10px',
+                    lineHeight: 1.5,
+                  }}
+                >
+                  本课已具备课文依据
+                </div>
+              </button>
             )}
           </div>
         )}
@@ -1361,7 +1430,7 @@ export default function WorkshopPage() {
                   <button
                     onClick={() => setShowPickComponentsModal(true)}
                     disabled={isBusy}
-                    title="从组件库挑选参考组件补充到对话上下文"
+                    title="挑选可用于本阶段的教学策略"
                     style={{
                       padding: '6px 10px',
                       borderRadius: '8px',
@@ -1376,7 +1445,7 @@ export default function WorkshopPage() {
                       transition: 'all 150ms ease',
                     }}
                   >
-                    📚 选组件{selectedComponentIds.size > 0 ? `·${selectedComponentIds.size}` : ''}
+                    📚 教学策略
                   </button>
                 )}
                 <span style={{ fontSize: '12px', color: C.textMuted }}>{currentStageIdx + 1} / {stageItems.length}</span>
@@ -1394,7 +1463,7 @@ export default function WorkshopPage() {
                 想直接调整教案？可在右侧「<span style={{ fontWeight: 600, color: '#4F7BE8' }}>教案预览</span>」点击「编辑正文」，并支持拖拽、粘贴或点击上传图片
               </span>
               <button
-                onClick={() => { setImageTipDismissed(true); try { localStorage.setItem('workshop_image_tip_dismissed', '1') } catch {} }}
+                onClick={() => { setImageTipDismissed(true); try { localStorage.setItem('workshop_image_tip_dismissed', '1') } catch { /* localStorage不可用时只保留本次会话状态 */ } }}
                 style={{ padding: '2px 8px', borderRadius: '6px', border: '1px solid rgba(79,123,232,0.2)', background: 'transparent', fontSize: '12px', color: '#9CA3AF', cursor: 'pointer', flexShrink: 0, lineHeight: 1.4 }}
                 title="不再显示此提示"
               >✕</button>
@@ -1652,7 +1721,7 @@ export default function WorkshopPage() {
 
         {selectedComponentIds.size > 0 && (
           <div style={{ padding: '8px 20px', background: C.primaryLight, borderTop: `1px solid ${C.border}`, fontSize: '13px', color: C.primary, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span>已选择 {selectedComponentIds.size} 个教学组件</span>
+            <span>已加入教学策略，下一条会结合使用</span>
             <button onClick={() => setSelectedComponentIds(new Set())} style={{ background: 'none', border: 'none', cursor: 'pointer', color: C.textMuted, fontSize: '13px' }}>清空</button>
           </div>
         )}
@@ -1748,7 +1817,18 @@ export default function WorkshopPage() {
       </div>
 
       {/* 右栏 */}
-      <div style={{ width: '420px', flexShrink: 0, display: 'flex', flexDirection: 'column', background: C.card }}>
+      <ResizableRightPanel
+        storageKey="lesson_plan_expert_preview_width"
+        defaultWidth={520}
+        minWidth={380}
+        maxWidth={760}
+        minPrimaryWidth={sidebarCollapsed ? 580 : 710}
+        panelStyle={{
+          display: 'flex',
+          flexDirection: 'column',
+          background: C.card,
+        }}
+      >
         <div style={{ display: 'flex', borderBottom: `1px solid ${C.border}`, padding: '0 16px' }}>
           {([
             { key: 'preview' as const, label: '📄 教案预览' },
@@ -1792,6 +1872,7 @@ export default function WorkshopPage() {
               }
               onSave={handleManualContentSave}
               onRestored={handleContentRestored}
+              onSectionRewriteApplied={handleSectionRewriteApplied}
               compact
               emptyState={(
                 <div style={{
@@ -1871,7 +1952,7 @@ export default function WorkshopPage() {
             <button onClick={handlePublish} style={{ flex: 1, padding: '9px', borderRadius: '8px', border: 'none', background: C.primary, color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>发布教案 →</button>
           </div>
         )}
-      </div>
+      </ResizableRightPanel>
 
       {/* 阶段组件推荐弹窗(阶段过渡时) */}
       {showComponentsModal && plan && pendingTransitionStage && (

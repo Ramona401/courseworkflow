@@ -302,13 +302,13 @@ c.updated_at
 FROM coursewares c
 LEFT JOIN users u ON u.id = c.user_id
 LEFT JOIN LATERAL (
-	SELECT o.name
-	FROM school_members sm
-	JOIN organizations o
-		ON o.id = sm.school_id
-		AND o.status = 'active'
-	WHERE sm.user_id = c.user_id
-	LIMIT 1
+        SELECT o.name
+        FROM school_members sm
+        JOIN organizations o
+                ON o.id = sm.school_id
+                AND o.status = 'active'
+        WHERE sm.user_id = c.user_id
+        LIMIT 1
 ) sch ON true
 WHERE %s
 ORDER BY c.updated_at DESC
@@ -380,16 +380,79 @@ LIMIT $%d OFFSET $%d`,
 	return items, total, nil
 }
 
-// UpdateCoursewareStatus 更新课件状态
-func UpdateCoursewareStatus(ctx context.Context, id string, status string) error {
-	sql := `UPDATE coursewares SET status = $1, updated_at = $2 WHERE id = $3`
-	tag, err := database.DB.Exec(ctx, sql, status, time.Now(), id)
+// UpdateCoursewareStatus 更新课件状态。
+//
+// 携带装配写回身份时，只有当前running版本可以更新课件生产状态；
+// 取消、重启或新版本领取后，旧context会得到版本冲突。
+func UpdateCoursewareStatus(
+	ctx context.Context,
+	id string,
+	status string,
+) error {
+	if assembly, ok :=
+		coursewareAssemblyWriteContextFrom(
+			ctx,
+		); ok {
+		if strings.TrimSpace(id) !=
+			assembly.CoursewareID {
+			return ErrCoursewareAssemblyVersionConflict
+		}
+
+		tag, err := database.DB.Exec(
+			ctx,
+			`UPDATE coursewares
+                        SET
+                                status = $1,
+                                updated_at = $2
+                        WHERE id = $3
+                          AND deleted_at IS NULL
+                          AND assembly_version = $4
+                          AND assembly_status = 'running'
+                          AND active_assembly_run_id = $5`,
+			status,
+			time.Now(),
+			id,
+			assembly.Version,
+			assembly.RunID,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"按装配版本更新课件状态失败: %w",
+				err,
+			)
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrCoursewareAssemblyVersionConflict
+		}
+
+		return nil
+	}
+
+	sql :=
+		`UPDATE coursewares
+                SET status = $1, updated_at = $2
+                WHERE id = $3`
+
+	tag, err := database.DB.Exec(
+		ctx,
+		sql,
+		status,
+		time.Now(),
+		id,
+	)
 	if err != nil {
-		return fmt.Errorf("更新课件状态失败: %w", err)
+		return fmt.Errorf(
+			"更新课件状态失败: %w",
+			err,
+		)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("课件不存在: %s", id)
+		return fmt.Errorf(
+			"课件不存在: %s",
+			id,
+		)
 	}
+
 	return nil
 }
 
@@ -689,13 +752,71 @@ WHERE courseware_id = $6 AND page_number = $7`
 	return nil
 }
 
-// UpdateCWPageHTML 更新页面生成的HTML代码
-func UpdateCWPageHTML(ctx context.Context, pageID string, htmlContent string, placeholderMap string, matchedIDs string, status string) error {
-	sql := `UPDATE courseware_pages SET html_content = $1, placeholder_map = $2::jsonb,
-matched_component_ids = $3::jsonb, status = $4, updated_at = $5
-WHERE id = $6`
-	_, err := database.DB.Exec(ctx, sql, htmlContent, nullIfEmpty(placeholderMap), nullIfEmpty(matchedIDs), status, time.Now(), pageID)
-	return err
+// UpdateCWPageHTML 更新页面生成的HTML代码。
+//
+// 自动装配context存在时转入版本化SQL；普通写入则明确把assembly_version
+// 重置为0，并使旧浏览器布局报告失效。这样手工编辑、AI微调、回退、
+// 背景或字体修改后，不会继续展示旧HTML对应的passed报告。
+func UpdateCWPageHTML(
+	ctx context.Context,
+	pageID string,
+	htmlContent string,
+	placeholderMap string,
+	matchedIDs string,
+	status string,
+) error {
+	if assembly, ok :=
+		coursewareAssemblyWriteContextFrom(
+			ctx,
+		); ok {
+		return UpdateCWPageHTMLForAssembly(
+			ctx,
+			CoursewareAssemblyPageWrite{
+				PageID:              pageID,
+				CoursewareID:        assembly.CoursewareID,
+				Version:             assembly.Version,
+				RunID:               assembly.RunID,
+				HTMLContent:         htmlContent,
+				PlaceholderMap:      placeholderMap,
+				MatchedComponentIDs: matchedIDs,
+				PageStatus:          status,
+			},
+		)
+	}
+
+	sql :=
+		`UPDATE courseware_pages
+                SET
+                        html_content = $1,
+                        placeholder_map = $2::jsonb,
+                        matched_component_ids = $3::jsonb,
+                        status = $4,
+                        assembly_version = 0,
+                        layout_status = 'unchecked',
+                        layout_audit_json = '{}'::jsonb,
+                        layout_html_hash = NULL,
+                        layout_checked_at = NULL,
+                        updated_at = $5
+                WHERE id = $6`
+
+	_, err := database.DB.Exec(
+		ctx,
+		sql,
+		htmlContent,
+		nullIfEmpty(placeholderMap),
+		nullIfEmpty(matchedIDs),
+		status,
+		time.Now(),
+		pageID,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"更新课件页面HTML失败: %w",
+			err,
+		)
+	}
+
+	return nil
 }
 
 // UpdateCWPageStatus 更新页面状态

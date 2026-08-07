@@ -65,7 +65,24 @@ func coursewareAnnotationManagePolicyAllows(
 			actor.UserID
 }
 
+// coursewareAnnotationPageIDEqual 比较可空稳定页面ID。
+func coursewareAnnotationPageIDEqual(
+	before *string,
+	after *string,
+) bool {
+	if before == nil ||
+		after == nil {
+		return before == nil &&
+			after == nil
+	}
+
+	return *before == *after
+}
+
 // coursewareAnnotationRevisionUnchanged 判断批注是否仍为同一数据库版本。
+//
+// PageNumber是通过稳定PageID动态解析的当前页码，页面重排时可能变化，
+// 因此版本一致性比较稳定PageID和创建时页码快照，不比较动态当前页码。
 func coursewareAnnotationRevisionUnchanged(
 	before *models.CoursewareAnnotation,
 	after *models.CoursewareAnnotation,
@@ -78,8 +95,12 @@ func coursewareAnnotationRevisionUnchanged(
 	return before.ID == after.ID &&
 		before.CoursewareID ==
 			after.CoursewareID &&
-		before.PageNumber ==
-			after.PageNumber &&
+		coursewareAnnotationPageIDEqual(
+			before.PageID,
+			after.PageID,
+		) &&
+		before.PageNumberSnapshot ==
+			after.PageNumberSnapshot &&
 		before.ReviewerID ==
 			after.ReviewerID &&
 		before.UpdatedAt.Equal(
@@ -271,7 +292,10 @@ func (s *CoursewareService) CreateCWAnnotation(
 	cwAnnotationLog.Info(
 		"课件批注创建",
 		"courseware_id", coursewareID,
-		"page", req.PageNumber,
+		"page_id", latestPage.ID,
+		"page_number", annotation.PageNumber,
+		"page_number_snapshot",
+		annotation.PageNumberSnapshot,
 		"reviewer", latestActor.UserID,
 	)
 

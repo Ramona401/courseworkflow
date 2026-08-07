@@ -155,12 +155,13 @@ func (h *AssistantDesignerHandler) Chat(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var req struct {
-		Message      string                     `json:"message"`
-		History      []services.DesignerMessage `json:"history"`
-		Subject      string                     `json:"subject"`
-		Grade        string                     `json:"grade"`
-		Scenes       []string                   `json:"scenes"`
-		CurrentDraft string                     `json:"current_draft"`
+		Message         string                     `json:"message"`
+		History         []services.DesignerMessage `json:"history"`
+		Subject         string                     `json:"subject"`
+		Grade           string                     `json:"grade"`
+		EducationDomain string                     `json:"education_domain"`
+		Scenes          []string                   `json:"scenes"`
+		CurrentDraft    string                     `json:"current_draft"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestBody)
@@ -186,8 +187,13 @@ func (h *AssistantDesignerHandler) Chat(w http.ResponseWriter, r *http.Request) 
 	})
 
 	dCtx := &services.DesignerContext{
-		Subject:      strings.TrimSpace(req.Subject),
-		Grade:        strings.TrimSpace(req.Grade),
+		Subject: strings.TrimSpace(req.Subject),
+		Grade:   strings.TrimSpace(req.Grade),
+		EducationDomain: strings.ToLower(
+			strings.TrimSpace(
+				req.EducationDomain,
+			),
+		),
 		Scenes:       req.Scenes,
 		CurrentDraft: req.CurrentDraft,
 	}
@@ -240,6 +246,7 @@ func (h *AssistantDesignerHandler) Chat(w http.ResponseWriter, r *http.Request) 
 	if err := h.designerService.DesignChat(
 		r.Context(),
 		claims.UserID,
+		claims.Role,
 		req.Message,
 		req.History,
 		dCtx,

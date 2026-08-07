@@ -1,203 +1,311 @@
 package integration
 
-// test_helper.go — 集成测试基础设施
+// test_helper.go — 集成测试核心基础设施
 //
-// 职责：
-//   1. 连接 tedna_test 测试数据库（与生产 tedna 完全隔离）
-//   2. 清空所有表数据 + 插入种子数据（每个测试用例前调用）
-//   3. 启动真实 HTTP 服务（httptest.NewServer）
-//   4. 提供便捷的 HTTP 请求辅助函数（带/不带 Token）
-//   5. 提供 JSON 解析辅助函数
+// 本文件负责：
+//   1. 构造严格指向tedna_test的测试配置；
+//   2. 初始化和关闭测试数据库连接池；
+//   3. 通过测试库专用SECURITY DEFINER函数清空测试数据；
+//   4. 写入全局公共测试种子；
+//   5. 使用生产完整路由包装启动httptest服务。
 //
-// 设计原则：
-//   - 测试数据库名固定为 tedna_test，绝不连接生产库
-//   - 每个 TestXxx 函数开头调用 CleanAndSeed() 保证数据干净
-//   - 种子数据使用固定 UUID，方便断言
-//   - HTTP 辅助函数自动处理 JSON 编解码
+// HTTP请求与登录辅助位于test_http_helpers.go。
+// 教学智能体数据库夹具位于assistant_runtime_fixture*.go。
+// 完整路由所需环境绑定位于test_config_environment.go。
 //
-// v98变更：种子阶段增加skippable字段，与生产数据一致（write/revise=false，其余=true）
+// 安全边界：
+//   - DBName硬编码为tedna_test，不能被环境变量覆盖；
+//   - 每次清理前再次读取current_database；
+//   - 普通业务仓储继续使用tedna_user执行；
+//   - 只有数据清理通过测试库专用重置函数提升权限；
+//   - 重置函数自身也会再次校验数据库名；
+//   - 测试环境禁用全部定时调度器；
+//   - 路由入口与生产一致，使用SetupWithAssistantRuntime；
+//   - 构造完整路由前，把测试配置绑定到当前测试进程环境，
+//     兼容历史Handler构造器内部的config.Load调用；
+//   - 测试环境变量由testing.T自动恢复，不污染其它测试进程。
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
 	"tedna/internal/config"
 	"tedna/internal/database"
-	"tedna/internal/repository"
 	"tedna/internal/routes"
 	"tedna/internal/utils"
 )
 
-// ==================== 固定种子数据常量 ====================
-
+// 公共测试用户固定标识。
 const (
-	// 管理员种子用户（与生产种子一致）
 	SeedAdminID       = "00000000-0000-0000-0000-000000000001"
 	SeedAdminUsername = "admin"
 	SeedAdminPassword = "admin123"
 	SeedAdminRole     = "admin"
 
-	// 操作员种子用户
 	SeedOperatorID       = "00000000-0000-0000-0000-000000000002"
 	SeedOperatorUsername = "operator1"
 	SeedOperatorPassword = "operator123"
 	SeedOperatorRole     = "operator"
 
-	// 高级操作员种子用户
 	SeedSeniorID       = "00000000-0000-0000-0000-000000000003"
 	SeedSeniorUsername = "senior1"
 	SeedSeniorPassword = "senior123"
 	SeedSeniorRole     = "senior_operator"
 
-	// 只读用户种子
 	SeedViewerID       = "00000000-0000-0000-0000-000000000004"
 	SeedViewerUsername = "viewer1"
 	SeedViewerPassword = "viewer123"
 	SeedViewerRole     = "viewer"
 
-	// 被禁用的用户种子
 	SeedDisabledID       = "00000000-0000-0000-0000-000000000005"
 	SeedDisabledUsername = "disabled1"
 	SeedDisabledPassword = "disabled123"
 	SeedDisabledRole     = "viewer"
 )
 
-// ==================== 测试配置 ====================
-
-// testConfig 返回指向 tedna_test 数据库的测试配置
-// 关键安全措施：DB_NAME 硬编码为 "tedna_test"，不从环境变量读取，防止误连生产库
+// testConfig 构造严格隔离的测试配置。
 func testConfig() *config.Config {
 	return &config.Config{
-		DBHost:            envOrDefault("TEST_DB_HOST", "127.0.0.1"),
-		DBPort:            envOrDefault("TEST_DB_PORT", "5432"),
-		DBUser:            envOrDefault("TEST_DB_USER", "tedna_user"),
-		DBPassword:        envOrDefault("TEST_DB_PASSWORD", "9fIbnkYABWXt3VGPv8Pn"),
-		DBName:            "tedna_test", // 硬编码！绝不允许改为 tedna
-		Port:              "0",          // httptest 自动分配端口
-		JWTSecret:         "test-jwt-secret-for-integration-tests-only",
-		AESKey:            "c94985251907d9a973ee517d048d8430",
+		DBHost: envOrDefault(
+			"TEST_DB_HOST",
+			"127.0.0.1",
+		),
+		DBPort: envOrDefault(
+			"TEST_DB_PORT",
+			"5432",
+		),
+		DBUser: envOrDefault(
+			"TEST_DB_USER",
+			"tedna_user",
+		),
+		DBPassword: envOrDefault(
+			"TEST_DB_PASSWORD",
+			"9fIbnkYABWXt3VGPv8Pn",
+		),
+
+		// 不允许任何环境变量把集成测试切换到生产库。
+		DBName: "tedna_test",
+
+		Port:              "0",
 		GinMode:           "test",
-		DisableSchedulers: true, // v142: 测试环境禁用调度器防goroutine泄漏
+		DisableSchedulers: true,
+
+		JWTSecret:
+			"test-jwt-secret-for-integration-tests-only",
+		AESKey:
+			"c94985251907d9a973ee517d048d8430",
+
+		// 提供不可访问的本地占位AI配置。
+		// 当前定向测试不调用AI，配置只用于完整生产路由构造。
+		AIAPIBaseURL:
+			"http://127.0.0.1:1/v1",
+		AIAPIKey:
+			"integration-test-no-network-key",
+		AIDefaultModel:
+			"integration-test-model",
+
+		AssistantRuntimePrivacySalt:
+			"test-assistant-runtime-privacy-salt-not-for-production",
+		AssistantRuntimeTokenTTLMinutes: 15,
+
+		CoursewareGenConcurrency:         1,
+		CoursewareAssemblyImgConcurrency: 1,
 	}
 }
 
-// envOrDefault 读取环境变量，不存在则返回默认值
-func envOrDefault(key, defaultVal string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
+// envOrDefault 读取允许覆盖的测试连接参数。
+func envOrDefault(
+	key string,
+	defaultValue string,
+) string {
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
-	return defaultVal
+
+	return defaultValue
 }
 
-// ==================== 数据库初始化 ====================
-
-// initTestDB 初始化测试数据库连接
-// 直接设置 database.DB 全局变量，使所有 repository 层代码指向测试库
-func initTestDB(t *testing.T, cfg *config.Config) {
+// initTestDB 初始化全局测试数据库连接池。
+func initTestDB(
+	t *testing.T,
+	cfg *config.Config,
+) {
 	t.Helper()
 
-	// 构建 DSN（与 database.Init 逻辑一致，但指向 tedna_test）
-	dsn := fmt.Sprintf(
-		"postgres://%s:%s@%s:%s/%s?sslmode=disable",
-		cfg.DBUser, cfg.DBPassword,
-		cfg.DBHost, cfg.DBPort, cfg.DBName,
+	if cfg == nil ||
+		cfg.DBName != "tedna_test" {
+		t.Fatal(
+			"安全检查失败：测试数据库必须为tedna_test",
+		)
+	}
+
+	dsnURL := &url.URL{
+		Scheme: "postgres",
+		User: url.UserPassword(
+			cfg.DBUser,
+			cfg.DBPassword,
+		),
+		Host: cfg.DBHost + ":" + cfg.DBPort,
+		Path: "/" + cfg.DBName,
+	}
+
+	query := dsnURL.Query()
+	query.Set(
+		"sslmode",
+		"disable",
 	)
+	dsnURL.RawQuery = query.Encode()
 
-	// 二次确认数据库名（防御性编程）
-	if cfg.DBName != "tedna_test" {
-		t.Fatalf("安全检查失败：测试数据库名必须为 tedna_test，实际为 %s", cfg.DBName)
-	}
-
-	poolConfig, err := pgxpool.ParseConfig(dsn)
+	poolConfig, err := pgxpool.ParseConfig(
+		dsnURL.String(),
+	)
 	if err != nil {
-		t.Fatalf("解析测试数据库DSN失败: %v", err)
+		t.Fatalf(
+			"解析测试数据库DSN失败: %v",
+			err,
+		)
 	}
 
-	// 测试环境使用较小的连接池
 	poolConfig.MaxConns = 10
 	poolConfig.MinConns = 2
 	poolConfig.MaxConnLifetime = 30 * time.Minute
+	poolConfig.MaxConnIdleTime = 10 * time.Minute
 
-	pool, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
+	pool, err := pgxpool.NewWithConfig(
+		context.Background(),
+		poolConfig,
+	)
 	if err != nil {
-		t.Fatalf("连接测试数据库失败: %v", err)
+		t.Fatalf(
+			"连接测试数据库失败: %v",
+			err,
+		)
 	}
 
-	if err := pool.Ping(context.Background()); err != nil {
-		t.Fatalf("Ping测试数据库失败: %v", err)
+	if err := pool.Ping(
+		context.Background(),
+	); err != nil {
+		pool.Close()
+
+		t.Fatalf(
+			"Ping测试数据库失败: %v",
+			err,
+		)
 	}
 
-	// 设置全局 DB，所有 repository 层自动使用测试库
+	var currentDatabase string
+
+	if err := pool.QueryRow(
+		context.Background(),
+		"SELECT current_database()",
+	).Scan(
+		&currentDatabase,
+	); err != nil {
+		pool.Close()
+
+		t.Fatalf(
+			"读取当前测试数据库失败: %v",
+			err,
+		)
+	}
+
+	if currentDatabase != "tedna_test" {
+		pool.Close()
+
+		t.Fatalf(
+			"安全检查失败：实际连接数据库为%s",
+			currentDatabase,
+		)
+	}
+
 	database.DB = pool
 
-	// 注册清理：测试结束后关闭连接池
 	t.Cleanup(func() {
 		pool.Close()
+
+		if database.DB == pool {
+			database.DB = nil
+		}
 	})
 }
 
-// ==================== 数据清理与种子 ====================
-
-// CleanAndSeed 清空全部public业务表并插入最小测试种子。
-//
-// 旧实现维护一份手写表名列表。生产结构持续增长后，新表不会自动进入列表，
-// 容易让前一个用例的数据泄漏到后一个用例。当前实现直接从pg_tables读取
-// public下全部普通表，并在一条TRUNCATE语句中CASCADE清空，确保测试基线
-// 始终跟随当前生产schema，不再依赖人工同步表清单。
-//
-// 每个 TestXxx 函数开头调用本函数，保证测试数据隔离。
-func CleanAndSeed(t *testing.T) {
+// CleanAndSeed 清空测试数据并写入公共种子。
+func CleanAndSeed(
+	t *testing.T,
+) {
 	t.Helper()
-	ctx := context.Background()
 
-	// 动态清空public下全部普通表。
-	//
-	// format('%I.%I', ...)由PostgreSQL负责标识符转义，不拼接任何外部输入；
-	// CASCADE用于按真实外键关系处理清理顺序，避免手写依赖顺序失效。
-	_, err := database.DB.Exec(ctx, `
-                DO $clean$
-                DECLARE
-                        table_list text;
-                BEGIN
-                        SELECT string_agg(
-                                format('%I.%I', schemaname, tablename),
-                                ', '
-                                ORDER BY tablename
-                        )
-                        INTO table_list
-                        FROM pg_tables
-                        WHERE schemaname = 'public';
-
-                        IF table_list IS NOT NULL
-                           AND table_list <> '' THEN
-                                EXECUTE
-                                        'TRUNCATE TABLE ' ||
-                                        table_list ||
-                                        ' CASCADE';
-                        END IF;
-                END
-                $clean$;
-        `)
-	if err != nil {
-		t.Fatalf("清空测试数据库全部public表失败: %v", err)
+	if database.DB == nil {
+		t.Fatal(
+			"测试数据库连接池未初始化",
+		)
 	}
 
-	// 插入固定种子用户。
+	ctx := context.Background()
+
+	var currentDatabase string
+
+	if err := database.DB.QueryRow(
+		ctx,
+		"SELECT current_database()",
+	).Scan(
+		&currentDatabase,
+	); err != nil {
+		t.Fatalf(
+			"确认测试数据库身份失败: %v",
+			err,
+		)
+	}
+
+	if currentDatabase != "tedna_test" {
+		t.Fatalf(
+			"拒绝清理非测试数据库：%s",
+			currentDatabase,
+		)
+	}
+
+	// 不直接向tedna_user开放不可变表的TRUNCATE权限。
 	//
-	// admin同时设置is_super=true：
-	// 当前审计日志、AI全局配置、外部数据配置和提示词管理均要求超级管理员。
-	// role=admin与is_super是正交权限，测试必须显式覆盖两者，不能再依赖旧规则
-	// “普通admin自动拥有全部敏感管理权限”。
-	seedUsers := []struct {
+	// 测试库专用函数由postgres拥有并使用SECURITY DEFINER执行，
+	// 函数内部再次确认数据库名必须为tedna_test。
+	_, err := database.DB.Exec(
+		ctx,
+		`
+		SELECT public.tedna_test_reset_public_tables()
+		`,
+	)
+	if err != nil {
+		t.Fatalf(
+			"调用测试数据库受控重置函数失败: %v",
+			err,
+		)
+	}
+
+	seedUsers(
+		t,
+		ctx,
+	)
+
+	seedWorkshopStages(
+		t,
+		ctx,
+	)
+}
+
+// seedUsers 写入公共测试用户。
+func seedUsers(
+	t *testing.T,
+	ctx context.Context,
+) {
+	t.Helper()
+
+	users := []struct {
 		id          string
 		username    string
 		displayName string
@@ -207,363 +315,236 @@ func CleanAndSeed(t *testing.T) {
 		isSuper     bool
 	}{
 		{
-			SeedAdminID,
-			SeedAdminUsername,
-			"管理员",
-			SeedAdminPassword,
-			SeedAdminRole,
-			"active",
-			true,
+			id:          SeedAdminID,
+			username:    SeedAdminUsername,
+			displayName: "管理员",
+			password:    SeedAdminPassword,
+			role:        SeedAdminRole,
+			status:      "active",
+			isSuper:     true,
 		},
 		{
-			SeedOperatorID,
-			SeedOperatorUsername,
-			"操作员1",
-			SeedOperatorPassword,
-			SeedOperatorRole,
-			"active",
-			false,
+			id:          SeedOperatorID,
+			username:    SeedOperatorUsername,
+			displayName: "操作员1",
+			password:    SeedOperatorPassword,
+			role:        SeedOperatorRole,
+			status:      "active",
 		},
 		{
-			SeedSeniorID,
-			SeedSeniorUsername,
-			"高级操作员1",
-			SeedSeniorPassword,
-			SeedSeniorRole,
-			"active",
-			false,
+			id:          SeedSeniorID,
+			username:    SeedSeniorUsername,
+			displayName: "高级操作员1",
+			password:    SeedSeniorPassword,
+			role:        SeedSeniorRole,
+			status:      "active",
 		},
 		{
-			SeedViewerID,
-			SeedViewerUsername,
-			"查看者1",
-			SeedViewerPassword,
-			SeedViewerRole,
-			"active",
-			false,
+			id:          SeedViewerID,
+			username:    SeedViewerUsername,
+			displayName: "查看者1",
+			password:    SeedViewerPassword,
+			role:        SeedViewerRole,
+			status:      "active",
 		},
 		{
-			SeedDisabledID,
-			SeedDisabledUsername,
-			"禁用用户1",
-			SeedDisabledPassword,
-			SeedDisabledRole,
-			"disabled",
-			false,
+			id:          SeedDisabledID,
+			username:    SeedDisabledUsername,
+			displayName: "禁用用户1",
+			password:    SeedDisabledPassword,
+			role:        SeedDisabledRole,
+			status:      "disabled",
 		},
 	}
 
-	for _, u := range seedUsers {
-		hash, err := utils.HashPassword(u.password)
-		if err != nil {
-			t.Fatalf("哈希密码失败 (user=%s): %v", u.username, err)
-		}
-
-		_, err = database.DB.Exec(ctx, `
-                        INSERT INTO users (
-                                id,
-                                username,
-                                display_name,
-                                password_hash,
-                                role,
-                                status,
-                                is_super,
-                                created_at,
-                                updated_at
-                        )
-                        VALUES (
-                                $1,
-                                $2,
-                                $3,
-                                $4,
-                                $5,
-                                $6,
-                                $7,
-                                now(),
-                                now()
-                        )
-                `,
-			u.id,
-			u.username,
-			u.displayName,
-			hash,
-			u.role,
-			u.status,
-			u.isSuper,
+	for _, user := range users {
+		passwordHash, err := utils.HashPassword(
+			user.password,
 		)
 		if err != nil {
 			t.Fatalf(
-				"插入种子用户失败 (user=%s): %v",
-				u.username,
+				"哈希测试用户密码失败(user=%s): %v",
+				user.username,
+				err,
+			)
+		}
+
+		_, err = database.DB.Exec(
+			ctx,
+			`
+			INSERT INTO users (
+				id,
+				username,
+				display_name,
+				password_hash,
+				role,
+				status,
+				is_super,
+				created_at,
+				updated_at
+			)
+			VALUES (
+				$1,
+				$2,
+				$3,
+				$4,
+				$5,
+				$6,
+				$7,
+				NOW(),
+				NOW()
+			)
+			`,
+			user.id,
+			user.username,
+			user.displayName,
+			passwordHash,
+			user.role,
+			user.status,
+			user.isSuper,
+		)
+		if err != nil {
+			t.Fatalf(
+				"插入测试用户失败(user=%s): %v",
+				user.username,
 				err,
 			)
 		}
 	}
+}
 
-	// 插入5个系统默认备课工坊阶段。
-	//
-	// write/revise不可跳过，其余阶段可跳过；与当前生产结构一致。
-	seedStages := []struct {
+// seedWorkshopStages 写入系统备课阶段种子。
+func seedWorkshopStages(
+	t *testing.T,
+	ctx context.Context,
+) {
+	t.Helper()
+
+	stages := []struct {
 		code      string
 		name      string
 		order     int
 		aiRole    string
 		skippable bool
 	}{
-		{"analyze", "教学分析", 1, "教学分析师", true},
-		{"design", "教学设计", 2, "教学设计师", true},
-		{"write", "教案撰写", 3, "教案撰写专家", false},
-		{"review", "AI评审", 4, "教案评审专家", true},
-		{"revise", "修订定稿", 5, "教案修订专家", false},
+		{
+			code:      "analyze",
+			name:      "教学分析",
+			order:     1,
+			aiRole:    "教学分析师",
+			skippable: true,
+		},
+		{
+			code:      "design",
+			name:      "教学设计",
+			order:     2,
+			aiRole:    "教学设计师",
+			skippable: true,
+		},
+		{
+			code:   "write",
+			name:   "教案撰写",
+			order:  3,
+			aiRole: "教案撰写专家",
+		},
+		{
+			code:      "review",
+			name:      "AI评审",
+			order:     4,
+			aiRole:    "教案评审专家",
+			skippable: true,
+		},
+		{
+			code:   "revise",
+			name:   "修订定稿",
+			order:  5,
+			aiRole: "教案修订专家",
+		},
 	}
 
-	for _, s := range seedStages {
-		_, err := database.DB.Exec(ctx, `
-                        INSERT INTO workshop_stages (
-                                id,
-                                stage_code,
-                                stage_name,
-                                stage_order,
-                                source,
-                                ai_role,
-                                system_prompt,
-                                skippable,
-                                status,
-                                created_at,
-                                updated_at
-                        )
-                        VALUES (
-                                gen_random_uuid(),
-                                $1,
-                                $2,
-                                $3,
-                                'system',
-                                $4,
-                                '',
-                                $5,
-                                'active',
-                                now(),
-                                now()
-                        )
-                `,
-			s.code,
-			s.name,
-			s.order,
-			s.aiRole,
-			s.skippable,
+	for _, stage := range stages {
+		_, err := database.DB.Exec(
+			ctx,
+			`
+			INSERT INTO workshop_stages (
+				id,
+				stage_code,
+				stage_name,
+				stage_order,
+				source,
+				ai_role,
+				system_prompt,
+				skippable,
+				status,
+				created_at,
+				updated_at
+			)
+			VALUES (
+				gen_random_uuid(),
+				$1,
+				$2,
+				$3,
+				'system',
+				$4,
+				'',
+				$5,
+				'active',
+				NOW(),
+				NOW()
+			)
+			`,
+			stage.code,
+			stage.name,
+			stage.order,
+			stage.aiRole,
+			stage.skippable,
 		)
 		if err != nil {
 			t.Fatalf(
-				"插入种子阶段失败 (stage=%s): %v",
-				s.code,
+				"插入测试阶段失败(stage=%s): %v",
+				stage.code,
 				err,
 			)
 		}
 	}
 }
 
-// ==================== HTTP 服务启动 ====================
-
-// SetupTestServer 初始化测试数据库 + 启动 HTTP 测试服务器
-// 返回 httptest.Server 和测试配置
-// 调用方在测试结束后 server.Close()
-func SetupTestServer(t *testing.T) (*httptest.Server, *config.Config) {
+// SetupTestServer 使用生产最终路由包装启动HTTP测试服务。
+func SetupTestServer(
+	t *testing.T,
+) (
+	*httptest.Server,
+	*config.Config,
+) {
 	t.Helper()
 
 	cfg := testConfig()
-	initTestDB(t, cfg)
 
-	// 启动 AI 调用追踪异步写入器（routes.Setup 中会调用）
-	repository.InitTraceWriter()
+	// 完整生产路由中仍有少量历史Handler构造器会再次调用config.Load。
+	// 必须先把严格隔离的测试配置绑定到当前测试进程环境，
+	// 再初始化数据库和构造路由，防止它们读取生产.env或缺失必填配置。
+	bindTestConfigEnvironment(
+		t,
+		cfg,
+	)
 
-	// 使用与生产相同的路由注册逻辑
-	handler := routes.Setup(cfg)
+	initTestDB(
+		t,
+		cfg,
+	)
 
-	// 创建测试 HTTP 服务器
-	server := httptest.NewServer(handler)
+	handler := routes.SetupWithAssistantRuntime(
+		cfg,
+	)
+
+	server := httptest.NewServer(
+		handler,
+	)
 
 	t.Cleanup(func() {
 		server.Close()
 	})
 
-	return server, cfg
-}
-
-// ==================== HTTP 请求辅助函数 ====================
-
-// APIResponse 统一 API 响应结构（与 utils.Response 对应）
-type APIResponse struct {
-	Code    int             `json:"code"`
-	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data,omitempty"`
-}
-
-// DoRequest 发送 HTTP 请求并返回响应
-// method: GET/POST/PUT/DELETE
-// url: 完整URL（含 server.URL 前缀）
-// body: 请求体（nil 表示无 body）
-// token: JWT token（空字符串表示不带认证头）
-func DoRequest(t *testing.T, method, url string, body interface{}, token string) (*http.Response, *APIResponse) {
-	t.Helper()
-
-	var bodyReader io.Reader
-	if body != nil {
-		jsonBytes, err := json.Marshal(body)
-		if err != nil {
-			t.Fatalf("序列化请求体失败: %v", err)
-		}
-		bodyReader = bytes.NewReader(jsonBytes)
-	}
-
-	req, err := http.NewRequest(method, url, bodyReader)
-	if err != nil {
-		t.Fatalf("创建HTTP请求失败: %v", err)
-	}
-
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("发送HTTP请求失败: %v", err)
-	}
-
-	// 读取并解析响应体
-	respBody, err := io.ReadAll(resp.Body)
-	defer resp.Body.Close()
-	if err != nil {
-		t.Fatalf("读取响应体失败: %v", err)
-	}
-
-	var apiResp APIResponse
-	if len(respBody) > 0 {
-		if err := json.Unmarshal(respBody, &apiResp); err != nil {
-			// 非JSON响应（如SSE流），不解析
-			apiResp = APIResponse{Code: -999, Message: string(respBody)}
-		}
-	}
-
-	return resp, &apiResp
-}
-
-// DoGet 发送 GET 请求
-func DoGet(t *testing.T, url string, token string) (*http.Response, *APIResponse) {
-	t.Helper()
-	return DoRequest(t, http.MethodGet, url, nil, token)
-}
-
-// DoPost 发送 POST 请求
-func DoPost(t *testing.T, url string, body interface{}, token string) (*http.Response, *APIResponse) {
-	t.Helper()
-	return DoRequest(t, http.MethodPost, url, body, token)
-}
-
-// DoPut 发送 PUT 请求
-func DoPut(t *testing.T, url string, body interface{}, token string) (*http.Response, *APIResponse) {
-	t.Helper()
-	return DoRequest(t, http.MethodPut, url, body, token)
-}
-
-// DoDelete 发送 DELETE 请求
-func DoDelete(t *testing.T, url string, token string) (*http.Response, *APIResponse) {
-	t.Helper()
-	return DoRequest(t, http.MethodDelete, url, nil, token)
-}
-
-// ==================== 登录辅助函数 ====================
-
-// LoginAs 使用指定用户名密码登录，返回 JWT token
-// 登录失败时直接 t.Fatal
-func LoginAs(t *testing.T, serverURL, username, password string) string {
-	t.Helper()
-
-	loginBody := map[string]string{
-		"username": username,
-		"password": password,
-	}
-
-	resp, apiResp := DoPost(t, serverURL+"/api/v1/auth/login", loginBody, "")
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("登录失败 (user=%s): HTTP %d, message=%s", username, resp.StatusCode, apiResp.Message)
-	}
-
-	if apiResp.Code != 0 {
-		t.Fatalf("登录失败 (user=%s): code=%d, message=%s", username, apiResp.Code, apiResp.Message)
-	}
-
-	// 从响应中提取 token
-	var loginData struct {
-		Token string `json:"token"`
-	}
-	if err := json.Unmarshal(apiResp.Data, &loginData); err != nil {
-		t.Fatalf("解析登录响应失败 (user=%s): %v", username, err)
-	}
-
-	if loginData.Token == "" {
-		t.Fatalf("登录成功但 token 为空 (user=%s)", username)
-	}
-
-	return loginData.Token
-}
-
-// LoginAsAdmin 以管理员身份登录
-func LoginAsAdmin(t *testing.T, serverURL string) string {
-	t.Helper()
-	return LoginAs(t, serverURL, SeedAdminUsername, SeedAdminPassword)
-}
-
-// LoginAsOperator 以操作员身份登录
-func LoginAsOperator(t *testing.T, serverURL string) string {
-	t.Helper()
-	return LoginAs(t, serverURL, SeedOperatorUsername, SeedOperatorPassword)
-}
-
-// LoginAsSenior 以高级操作员身份登录
-func LoginAsSenior(t *testing.T, serverURL string) string {
-	t.Helper()
-	return LoginAs(t, serverURL, SeedSeniorUsername, SeedSeniorPassword)
-}
-
-// LoginAsViewer 以只读用户身份登录
-func LoginAsViewer(t *testing.T, serverURL string) string {
-	t.Helper()
-	return LoginAs(t, serverURL, SeedViewerUsername, SeedViewerPassword)
-}
-
-// ==================== JSON 解析辅助函数 ====================
-
-// ParseData 将 APIResponse.Data 解析到目标结构体
-func ParseData(t *testing.T, apiResp *APIResponse, target interface{}) {
-	t.Helper()
-	if apiResp.Data == nil {
-		t.Fatal("API响应Data为nil")
-	}
-	if err := json.Unmarshal(apiResp.Data, target); err != nil {
-		t.Fatalf("解析API响应Data失败: %v, raw=%s", err, string(apiResp.Data))
-	}
-}
-
-// ==================== 断言辅助函数 ====================
-
-// AssertHTTPStatus 断言 HTTP 状态码
-func AssertHTTPStatus(t *testing.T, resp *http.Response, expected int) {
-	t.Helper()
-	if resp.StatusCode != expected {
-		t.Errorf("期望HTTP状态码 %d，实际 %d", expected, resp.StatusCode)
-	}
-}
-
-// AssertAPICode 断言 API 业务码
-func AssertAPICode(t *testing.T, apiResp *APIResponse, expected int) {
-	t.Helper()
-	if apiResp.Code != expected {
-		t.Errorf("期望API Code %d，实际 %d (message=%s)", expected, apiResp.Code, apiResp.Message)
-	}
+	return server,
+		cfg
 }

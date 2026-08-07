@@ -145,7 +145,9 @@ func (h *CoursewareIndexHandler) IndexStream(w http.ResponseWriter, r *http.Requ
 				return
 			}
 			writeCWSSEEvent(w, flusher, event.EventType, event.Data)
-			if event.EventType == services.CWSSEIndexDone || event.EventType == services.CWSSEGenDone || event.EventType == services.CWSSEError {
+			if event.EventType == services.CWSSEIndexDone ||
+				event.EventType == services.CWSSEGenDone ||
+				event.EventType == services.CWSSEError {
 				return
 			}
 		case <-r.Context().Done():
@@ -177,8 +179,7 @@ func (h *CoursewareIndexHandler) DeletePage(
 		return
 	}
 
-	coursewareID, pageNumber :=
-		extractCoursewarePagePath(r.URL.Path)
+	coursewareID, pageNumber := extractCoursewarePagePath(r.URL.Path)
 	if coursewareID == "" || pageNumber <= 0 {
 		utils.BadRequest(w, "路径参数错误")
 		return
@@ -265,11 +266,10 @@ func (h *CoursewareIndexHandler) GetAlignmentReport(
 		return
 	}
 
-	report, err :=
-		repository.GetAlignmentReportByCoursewareID(
-			r.Context(),
-			id,
-		)
+	report, err := repository.GetAlignmentReportByCoursewareID(
+		r.Context(),
+		id,
+	)
 	if err != nil {
 		utils.InternalError(
 			w,
@@ -311,7 +311,12 @@ func (h *CoursewareIndexHandler) RecheckAlignment(
 
 // ==================== SSE辅助函数 ====================
 
-func writeCWSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string, data interface{}) {
+func writeCWSSEEvent(
+	w http.ResponseWriter,
+	flusher http.Flusher,
+	eventType string,
+	data interface{},
+) {
 	dataBytes, err := json.Marshal(data)
 	if err != nil {
 		return
@@ -390,11 +395,15 @@ func (h *CoursewareIndexHandler) GenerateIndexFromPPT(
 // CreateFromPPT POST /api/v1/coursewares/from-ppt — 上传PPT创建课件
 // Content-Type: multipart/form-data
 // 字段: file(.pptx) + subject + grade + title(可选)
-func (h *CoursewareIndexHandler) CreateFromPPT(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareIndexHandler) CreateFromPPT(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
@@ -443,24 +452,35 @@ func (h *CoursewareIndexHandler) CreateFromPPT(w http.ResponseWriter, r *http.Re
 	}
 
 	cw, extractResult, err := h.pptService.UploadAndCreateCourseware(
-		r.Context(), actor, file, header, subject, grade, title,
+		r.Context(),
+		actor,
+		file,
+		header,
+		subject,
+		grade,
+		title,
 	)
 	if err != nil {
 		utils.InternalError(w, "创建课件失败: "+err.Error())
 		return
 	}
 
-	// 返回课件信息和PPT解析概要
-	utils.Success(w, map[string]interface{}{
-		"id":               cw.ID,
-		"title":            cw.Title,
-		"subject":          cw.Subject,
-		"grade":            cw.Grade,
-		"education_domain": cw.EducationDomain,
-		"source_type":      cw.SourceType,
-		"slide_count":      extractResult.SlideCount,
-		"message":          fmt.Sprintf("PPT上传成功（%d页），课件已创建", extractResult.SlideCount),
-	})
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"id":               cw.ID,
+			"title":            cw.Title,
+			"subject":          cw.Subject,
+			"grade":            cw.Grade,
+			"education_domain": cw.EducationDomain,
+			"source_type":      cw.SourceType,
+			"slide_count":      extractResult.SlideCount,
+			"message": fmt.Sprintf(
+				"PPT上传成功（%d页），课件已创建",
+				extractResult.SlideCount,
+			),
+		},
+	)
 }
 
 // ==================== v0.42 入口C: Word文档上传创建课件 ====================
@@ -468,11 +488,15 @@ func (h *CoursewareIndexHandler) CreateFromPPT(w http.ResponseWriter, r *http.Re
 // CreateFromDoc POST /api/v1/coursewares/from-doc — 上传Word文档创建课件
 // Content-Type: multipart/form-data
 // 字段: file(.docx) + subject + grade + title(可选)
-func (h *CoursewareIndexHandler) CreateFromDoc(w http.ResponseWriter, r *http.Request) {
+func (h *CoursewareIndexHandler) CreateFromDoc(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
 		return
 	}
+
 	claims, ok := middleware.GetClaims(r.Context())
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
@@ -520,23 +544,35 @@ func (h *CoursewareIndexHandler) CreateFromDoc(w http.ResponseWriter, r *http.Re
 	}
 
 	cw, extractResult, err := h.pptService.UploadDocAndCreateCourseware(
-		r.Context(), actor, file, header, subject, grade, title,
+		r.Context(),
+		actor,
+		file,
+		header,
+		subject,
+		grade,
+		title,
 	)
 	if err != nil {
 		utils.InternalError(w, "创建课件失败: "+err.Error())
 		return
 	}
 
-	utils.Success(w, map[string]interface{}{
-		"id":               cw.ID,
-		"title":            cw.Title,
-		"subject":          cw.Subject,
-		"grade":            cw.Grade,
-		"education_domain": cw.EducationDomain,
-		"source_type":      cw.SourceType,
-		"word_count":       extractResult.WordCount,
-		"message":          fmt.Sprintf("文档上传成功（%d字），课件已创建", extractResult.WordCount),
-	})
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"id":               cw.ID,
+			"title":            cw.Title,
+			"subject":          cw.Subject,
+			"grade":            cw.Grade,
+			"education_domain": cw.EducationDomain,
+			"source_type":      cw.SourceType,
+			"word_count":       extractResult.WordCount,
+			"message": fmt.Sprintf(
+				"文档上传成功（%d字），课件已创建",
+				extractResult.WordCount,
+			),
+		},
+	)
 }
 
 // GenerateIndexFromDoc POST /api/v1/coursewares/{id}/generate-index-doc — 从Word文档生成课件索引
@@ -550,11 +586,17 @@ func (h *CoursewareIndexHandler) GenerateIndexFromDoc(
 // ==================== 断裂B: 取课件关联教案正文（对照抽屉用） ====================
 
 // GetLessonPlanContent GET /api/v1/coursewares/{id}/lesson-plan-content
-// 返回课件关联教案的纯文本正文，供 Step4/Step5 工作台的"原教案对照抽屉"展示。
-// 复用 services.ExtractLessonPlanContentForCW 的优先级链（content_markdown→
-// conversation_log 最长assistant消息→ai_review_result→ai_review_history），
-// 故对话生成型教案也能拿到正文（前端直接读 content_markdown 会落空）。
-// 非教案来源 / 无关联教案：返回 has_lesson_plan=false，前端不显示抽屉入口。
+// 返回课件关联教案的只读正文，供课件工坊与正式审核工作台的"原教案对照抽屉"展示。
+//
+// 授权采用窄范围双通道：
+//   - 原有课件普通查看权保持不变；
+//   - 或当前用户已通过既有课件审核详情访问权限。
+//
+// 审核通道只对本只读端点生效，不扩展普通课件详情、编辑、作者控制、素材或其它接口权限。
+// 后续仍复核课件与来源教案必须属于完全相同的具体教学教育域。
+//
+// 正文提取复用 services.ExtractLessonPlanContentForCW 的既有优先级链，故对话生成型教案
+// 也能拿到正式正文；非教案来源 / 无关联教案返回 has_lesson_plan=false。
 func (h *CoursewareIndexHandler) GetLessonPlanContent(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -589,7 +631,7 @@ func (h *CoursewareIndexHandler) GetLessonPlanContent(
 		claims.Role,
 	)
 
-	cw, err := h.cwService.LoadCoursewareForView(
+	cw, err := h.cwService.LoadCoursewareForLessonPlanContext(
 		r.Context(),
 		id,
 		actor,
@@ -603,18 +645,16 @@ func (h *CoursewareIndexHandler) GetLessonPlanContent(
 		return
 	}
 
-	// Word上传课件的完整原文属于课件内容的一部分。
-	// 只有通过该课件统一查看权后才能返回。
+	// Word上传课件的完整原文属于课件来源材料的一部分。
+	// 只有通过本端点的普通查看或审核详情授权后才能返回。
 	if cw.SourceType == models.CWSourceDocUpload {
-		if docText :=
-			services.ExtractDocUploadFullText(cw); docText != "" {
+		if docText := services.ExtractDocUploadFullText(cw); docText != "" {
 			utils.Success(
 				w,
 				map[string]interface{}{
 					"has_lesson_plan": true,
-					"title": cw.Title +
-						"（上传文档原文）",
-					"content": docText,
+					"title":           cw.Title + "（上传文档原文）",
+					"content":         docText,
 				},
 			)
 			return
@@ -659,12 +699,8 @@ func (h *CoursewareIndexHandler) GetLessonPlanContent(
 		strings.TrimSpace(lp.EducationDomain),
 	)
 
-	if !models.IsTeachingEducationDomain(
-		coursewareDomain,
-	) ||
-		!models.IsTeachingEducationDomain(
-			lessonPlanDomain,
-		) ||
+	if !models.IsTeachingEducationDomain(coursewareDomain) ||
+		!models.IsTeachingEducationDomain(lessonPlanDomain) ||
 		coursewareDomain != lessonPlanDomain {
 		utils.InternalError(
 			w,
@@ -673,8 +709,7 @@ func (h *CoursewareIndexHandler) GetLessonPlanContent(
 		return
 	}
 
-	content :=
-		services.ExtractLessonPlanContentForCW(lp)
+	content := services.ExtractLessonPlanContentForCW(lp)
 
 	utils.Success(
 		w,

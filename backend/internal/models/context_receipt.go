@@ -6,7 +6,8 @@ package models
 //   1. 区分“已关联”与“本轮实际读取”；
 //   2. 回执由确定性代码生成，不让AI自行声明读了什么；
 //   3. 回执写入ConversationMessage.Metadata，实时SSE、断线补齐和历史恢复共用；
-//   4. 只返回名称、数量和状态，不返回提示词正文、教材原文或组件完整指引。
+//   4. 只返回名称、数量和状态，不返回提示词正文、教材原文或组件完整指引；
+//   5. 区分“课程大纲来源是否已关联”和“知识脉络快照是否实际注入”。
 
 const ContextReceiptVersion = "v1"
 
@@ -25,17 +26,28 @@ const (
 
 // ContextReceipt 一轮AI回复实际使用的上下文摘要。
 type ContextReceipt struct {
-	Version           string                    `json:"version"`
-	StageCode         string                    `json:"stage_code"`
-	Assistant         *AssistantContextReceipt  `json:"assistant,omitempty"`
-	Recipe            *MaterialContextReceipt   `json:"recipe,omitempty"`
-	Components        *ComponentsContextReceipt `json:"components,omitempty"`
-	Textbook          *MaterialContextReceipt   `json:"textbook,omitempty"`
-	UnitPlan          *MaterialContextReceipt   `json:"unit_plan,omitempty"`
-	CourseOutline     *MaterialContextReceipt   `json:"course_outline,omitempty"`
-	ClassProfile      *MaterialContextReceipt   `json:"class_profile,omitempty"`
-	RefMaterial       *MaterialContextReceipt   `json:"ref_material,omitempty"`
-	SystemPromptRunes int                       `json:"system_prompt_runes,omitempty"`
+	Version       string `json:"version"`
+	StageCode     string `json:"stage_code"`
+
+	Assistant  *AssistantContextReceipt  `json:"assistant,omitempty"`
+	Recipe     *MaterialContextReceipt   `json:"recipe,omitempty"`
+	Components *ComponentsContextReceipt `json:"components,omitempty"`
+
+	Textbook     *MaterialContextReceipt `json:"textbook,omitempty"`
+	UnitPlan     *MaterialContextReceipt `json:"unit_plan,omitempty"`
+	CourseOutline *MaterialContextReceipt `json:"course_outline,omitempty"`
+
+	// KnowledgeLineage记录本轮是否实际注入教师确认后生成的
+	// active知识脉络短版上下文。
+	//
+	// CourseOutline只表示权威来源是否精确关联和当前是否可读取；
+	// 后续阶段不再把课程大纲全文作为普通提示词内容重复注入。
+	KnowledgeLineage *MaterialContextReceipt `json:"knowledge_lineage,omitempty"`
+
+	ClassProfile *MaterialContextReceipt `json:"class_profile,omitempty"`
+	RefMaterial  *MaterialContextReceipt `json:"ref_material,omitempty"`
+
+	SystemPromptRunes int `json:"system_prompt_runes,omitempty"`
 }
 
 // AssistantContextReceipt 记录本轮助手如何被解析，以及是否真正加载。

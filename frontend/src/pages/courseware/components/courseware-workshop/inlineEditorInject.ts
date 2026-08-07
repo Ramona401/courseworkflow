@@ -8,7 +8,7 @@
  *
  * 支持的能力：
  *   - 文字元素选中（放宽版 isEditableTextEl，支持含行内格式子元素）
- *   - 图片选中（含视频占位智能检测 isVideoPlaceholder）
+ *   - 图片选中（保留视频占位提示，同时所有图片均可原位转视频）
  *   - 视频 <video> 选中
  *   - 可拖拽块选中（绝对定位元素，含8点手柄拖拽缩放）
  *   - mouseup 文字选区检测 + savedRange 保存
@@ -34,7 +34,14 @@
  *      post('deselect')，外层面板回到未选中提示态。
  *   5. hover 提示同步改为就近优先，且每次 mouseover 先全局清一遍 hover
  *      标记，杜绝残留虚线框。
+ *
+ * 【v5.8 文字格式保留修复】整段文字修改改用文本节点重分配算法：
+ *   - 不再执行 element.textContent = newText，避免整段删除 strong/span/em 等行内格式
+ *   - 只更新既有 Text 节点的 nodeValue，保留原DOM标签、class、style和事件属性
+ *   - 算法由 inlineEditorTextPreserve.ts 独立生成并注入，避免继续膨胀本文件
  */
+
+import { buildInlineTextPreserveRuntime } from './inlineEditorTextPreserve'
 
 /**
  * 生成注入 iframe 的完整编辑脚本（CSS + JS）
@@ -110,6 +117,8 @@ export function buildEditorInject(token: string, isFullDoc: boolean): string {
     'AUDIO':1,'IFRAME':1,'OBJECT':1,'EMBED':1
   };
 
+${buildInlineTextPreserveRuntime()}
+
   /* ===== 元素判定函数 ===== */
 
   /** 可编辑文字元素（放宽版：允许行内格式子元素） */
@@ -142,7 +151,7 @@ export function buildEditorInject(token: string, isFullDoc: boolean): string {
     return true;
   }
 
-  /** 可选中的视频 */
+  /** 可选中的真实视频节点 */
   function isEditableVideo(el) {
     if (!el || el.nodeType !== 1) return false;
     if (el.tagName === 'VIDEO') return true;
@@ -150,6 +159,7 @@ export function buildEditorInject(token: string, isFullDoc: boolean): string {
     return false;
   }
   function resolveVideoEl(el) {
+    if (!el || el.nodeType !== 1) return null;
     if (el.tagName === 'VIDEO') return el;
     if (el.tagName === 'SOURCE' && el.parentElement && el.parentElement.tagName === 'VIDEO') return el.parentElement;
     return null;
@@ -159,6 +169,53 @@ export function buildEditorInject(token: string, isFullDoc: boolean): string {
     var sources = videoEl.querySelectorAll('source');
     for (var i = 0; i < sources.length; i++) { if (sources[i].src) return sources[i].src; }
     return '';
+  }
+
+  /**
+   * 视频页面常见结构是“真实video + 绝对定位封面DIV”。
+   * 点击封面、播放按钮或封面文字时，必须映射到同一容器内的真实video，
+   * 不能继续把封面识别成普通可拖拽模块。
+   */
+  function hasVideoContainerSignal(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.hasAttribute && el.hasAttribute('data-video-placeholder')) return true;
+    var id = (el.id || '').toLowerCase();
+    var cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+    return id.indexOf('video') >= 0 || id.indexOf('poster') >= 0 ||
+      cls.indexOf('video') >= 0 || cls.indexOf('poster') >= 0;
+  }
+
+  function resolveVideoHit(el, maxUp) {
+    var direct = resolveVideoEl(el);
+    if (direct) return { video: direct, surface: direct };
+
+    var node = el;
+    var depth = maxUp || 6;
+    var surface = null;
+
+    while (node && depth > 0) {
+      if (hasVideoContainerSignal(node)) {
+        if (!surface) surface = node;
+        var nested = node.querySelector ? node.querySelector('video') : null;
+        if (nested) return { video: nested, surface: surface || node };
+      }
+      node = node.parentElement;
+      depth--;
+    }
+
+    return null;
+  }
+
+  function getBackgroundImageURL(el) {
+    if (!el || el.nodeType !== 1) return '';
+    var bg = window.getComputedStyle(el).backgroundImage || '';
+    var match = bg.match(/url\\(["']?([^"')]+)["']?\\)/i);
+    return match && match[1] ? match[1] : '';
+  }
+
+  function getVideoPoster(videoEl, surfaceEl) {
+    if (videoEl.poster) return videoEl.poster;
+    return getBackgroundImageURL(surfaceEl);
   }
 
   /** 可拖拽缩放的块元素（绝对定位 + 有明确宽高） */
@@ -311,9 +368,9 @@ export function buildEditorInject(token: string, isFullDoc: boolean): string {
       if (el !== selectedImg) el.setAttribute('data-tedna-img-hover', '1');
       return;
     }
-    if (isEditableVideo(el)) {
-      var vid = resolveVideoEl(el);
-      if (vid) vid.setAttribute('data-tedna-video-hover', '1');
+    var videoHoverHit = resolveVideoHit(el, 6);
+    if (videoHoverHit) {
+      videoHoverHit.surface.setAttribute('data-tedna-video-hover', '1');
       return;
     }
     /* 文字 / 模块：就近优先解析（与点选逻辑完全一致） */
@@ -374,17 +431,25 @@ export function buildEditorInject(token: string, isFullDoc: boolean): string {
       return;
     }
 
-    /* 视频 */
-    if (isEditableVideo(el)) {
+    /* 视频：直接点击video，或点击其自定义封面/播放按钮/封面文字 */
+    var videoClickHit = resolveVideoHit(el, 6);
+    if (videoClickHit) {
       e.preventDefault(); e.stopPropagation();
       clearAllSelection();
-      var vid = resolveVideoEl(el);
-      if (!vid) return;
-      vid.removeAttribute('data-tedna-video-hover');
-      vid.setAttribute('data-tedna-video-selected', '1');
+      var vid = videoClickHit.video;
+      var surface = videoClickHit.surface;
+      surface.removeAttribute('data-tedna-video-hover');
+      surface.setAttribute('data-tedna-video-selected', '1');
       currentMode = 'video';
-      var vRect = vid.getBoundingClientRect();
-      post('select', { mode: 'video', path: getPath(vid), src: getVideoSrc(vid), width: Math.round(vRect.width), height: Math.round(vRect.height) });
+      var vRect = surface.getBoundingClientRect();
+      post('select', {
+        mode: 'video',
+        path: getPath(vid),
+        src: getVideoSrc(vid),
+        poster: getVideoPoster(vid, surface),
+        width: Math.round(vRect.width),
+        height: Math.round(vRect.height)
+      });
       return;
     }
 
@@ -542,7 +607,12 @@ export function buildEditorInject(token: string, isFullDoc: boolean): string {
     if (d.type === 'apply') {
       var el = elByPath(d.payload.path);
       if (!el) return;
-      if (typeof d.payload.text === 'string') el.textContent = d.payload.text;
+      if (typeof d.payload.text === 'string') {
+        replaceTednaTextPreservingInlineFormat(el, d.payload.text);
+        /* 文字节点内容变化后，旧Range可能已失效，必须清空选区防止后续格式操作命中旧位置。 */
+        savedRange = null;
+        post('selection_change', { hasSelection: false });
+      }
       if (d.payload.fontSizePx) el.style.fontSize = d.payload.fontSizePx + 'px';
       if (d.payload.color) el.style.color = d.payload.color;
 
@@ -584,22 +654,71 @@ export function buildEditorInject(token: string, isFullDoc: boolean): string {
 
     } else if (d.type === 'replace_img_with_video') {
       var imgEl = elByPath(d.payload.path);
-      if (!imgEl || imgEl.tagName !== 'IMG') return;
+      if (!imgEl || imgEl.tagName !== 'IMG' || !d.payload.src) return;
+
+      /*
+       * 任意图片原位转视频：
+       *   - 始终只替换当前IMG节点；
+       *   - 禁止清空父容器，避免误删同容器标题、按钮、说明和装饰；
+       *   - 保留当前图片的class/id/行内样式、IAOCI等data属性及可访问性属性；
+       *   - 原图片作为poster，视频加载前仍保持原视觉。
+       */
+      var imgRect = imgEl.getBoundingClientRect();
+      var computedImgStyle = window.getComputedStyle(imgEl);
       var videoTag = document.createElement('video');
+
       videoTag.src = d.payload.src;
       videoTag.setAttribute('controls', '');
       videoTag.setAttribute('preload', 'metadata');
-      videoTag.style.width = imgEl.style.width || (imgEl.getBoundingClientRect().width + 'px');
-      videoTag.style.height = imgEl.style.height || (imgEl.getBoundingClientRect().height + 'px');
-      videoTag.style.borderRadius = window.getComputedStyle(imgEl).borderRadius || '12px';
-      videoTag.style.objectFit = 'cover'; videoTag.style.display = 'block';
-      var imgParent = imgEl.parentElement;
-      if (imgParent) {
-        var sibCount = 0;
-        for (var sc = 0; sc < imgParent.childNodes.length; sc++) { if (imgParent.childNodes[sc].nodeType === 1) sibCount++; }
-        if (sibCount <= 4) { imgParent.innerHTML = ''; imgParent.appendChild(videoTag); }
-        else { imgEl.parentNode.replaceChild(videoTag, imgEl); }
-      } else { imgEl.parentNode.replaceChild(videoTag, imgEl); }
+      videoTag.setAttribute('playsinline', '');
+      videoTag.setAttribute('data-converted-from-image', '1');
+
+      var poster = imgEl.currentSrc || imgEl.src || '';
+      if (poster) videoTag.setAttribute('poster', poster);
+      if (imgEl.id) videoTag.id = imgEl.id;
+      if (imgEl.className) videoTag.className = imgEl.className;
+      if (imgEl.title) videoTag.title = imgEl.title;
+      if (imgEl.alt) videoTag.setAttribute('aria-label', imgEl.alt);
+
+      for (var ai = 0; ai < imgEl.attributes.length; ai++) {
+        var attr = imgEl.attributes[ai];
+        var attrName = attr.name.toLowerCase();
+        var keepData = attrName.indexOf('data-') === 0 &&
+          attrName.indexOf('data-tedna-') !== 0;
+        var keepAria = attrName.indexOf('aria-') === 0;
+
+        if (keepData || keepAria) {
+          videoTag.setAttribute(attr.name, attr.value);
+        }
+      }
+
+      videoTag.style.cssText = imgEl.style.cssText;
+      if (!videoTag.style.width) {
+        videoTag.style.width = Math.round(imgRect.width) + 'px';
+      }
+      if (!videoTag.style.height) {
+        videoTag.style.height = Math.round(imgRect.height) + 'px';
+      }
+      if (!videoTag.style.borderRadius) {
+        videoTag.style.borderRadius =
+          computedImgStyle.borderRadius || '12px';
+      }
+      if (!videoTag.style.objectFit) {
+        videoTag.style.objectFit =
+          computedImgStyle.objectFit || 'cover';
+      }
+      if (!videoTag.style.display) {
+        videoTag.style.display =
+          computedImgStyle.display === 'inline'
+            ? 'inline-block'
+            : (computedImgStyle.display || 'block');
+      }
+
+      var imgParent = imgEl.parentNode;
+      if (!imgParent) return;
+
+      clearAllSelection();
+      imgParent.replaceChild(videoTag, imgEl);
 
     } else if (d.type === 'resize_image') {
       var img2 = elByPath(d.payload.path);

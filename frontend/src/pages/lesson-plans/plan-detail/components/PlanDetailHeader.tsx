@@ -16,6 +16,13 @@
  *   点击后才收到错误。delete/workshop/fork 不受影响（删除、返回工坊补正文、
  *   Fork 他人教案都不应被"自己这份正文为空"拦截）。
  *   注意：前端禁用仅为体验优化，后端校验才是真正防线。
+ *
+ * Word保真下载修复：
+ *   - 作者导出时先请求后端保存的当前原格式DOCX；
+ *   - 原格式文档存在且仍为active时直接下载，保留表格、图片和Word版式；
+ *   - 没有原格式Word时回退现有Markdown通用导出；
+ *   - Word已与当前正文不同步时明确提示，不把旧文件冒充当前正文；
+ *   - 非作者查看共享教案时继续使用浏览器端通用导出，不探测作者私有文件。
  */
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -111,14 +118,35 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction, interactions
   const contentGatedActions = new Set(['submit', 'publish', 'courseware'])
 
   /**
-   * v142优化：点击"导出Word"时动态加载 docx 库
-   * 首次点击会多等约 0.5-1 秒加载 chunk，后续浏览器缓存秒开
+   * 导出Word：
+   * 1. 作者先尝试下载后端保存的当前原格式DOCX；
+   * 2. 后端明确返回“原格式Word教案不存在”时，才回退通用Markdown导出；
+   * 3. 文档已stale、文件校验失败或其它异常时不静默回退，避免把旧版或异常文件
+   *    冒充当前正文，也避免教师误以为表格版式已经保留。
    */
   const handleExportWord = async () => {
     if (exporting) return
     setExporting(true)
+
     try {
-      // 动态导入：docx + file-saver 只在用户点击时才加载（~300KB独立chunk）
+      if (isOwner) {
+        try {
+          const { downloadLessonPlanWordFidelity } = await import('@/api/lesson-plan-word-import')
+          await downloadLessonPlanWordFidelity(plan.id)
+          return
+        } catch (error) {
+          const isFidelityDocumentMissing =
+            error instanceof Error &&
+            error.message === '原格式Word教案不存在'
+
+          if (!isFidelityDocumentMissing) {
+            throw error
+          }
+        }
+      }
+
+      // 普通教案、非作者共享教案，或作者教案没有保真Word记录时，
+      // 使用原有Markdown重建导出链。
       const { exportLessonPlanToWord } = await import('@/utils/exportWord')
       await exportLessonPlanToWord({
         title:            plan.title,
@@ -133,7 +161,14 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction, interactions
       })
     } catch (err) {
       console.error('导出Word失败:', err)
-      alert('导出失败，请稍后重试')
+
+      const message =
+        err instanceof Error &&
+        err.message.trim()
+          ? err.message
+          : '导出失败，请稍后重试'
+
+      alert(message)
     } finally {
       setExporting(false)
     }
@@ -268,7 +303,9 @@ export function ActionBar({ plan, isOwner, actionLoading, onAction, interactions
         style={exportBtn}
         disabled={exporting}
         onClick={handleExportWord}
-        title="将教案导出为Word文档（.docx）">
+        title={isOwner
+          ? '原格式Word导入的教案优先下载保真文档；其他教案导出为Word'
+          : '将当前可见教案导出为Word文档（.docx）'}>
         {exporting ? '⏳ 导出中...' : '📄 导出 Word'}
       </button>
 

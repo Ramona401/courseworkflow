@@ -7,8 +7,7 @@ package repository
 //   - CRUD（CreateRecipe / GetRecipeByID / ListRecipes / UpdateRecipe / DeleteRecipe）
 //   - Fork + Share
 //   - 使用记录（RecordRecipeUsage）
-//   - 组件查询（GetRecipeComponentBriefs / GetRecipeComponentContents）
-//
+// //
 // 效果统计（GetRecipeStats）和市场排行榜（ListMarketRecipes）
 // 已拆分至 recipe_repo_market.go（v92重构）
 
@@ -400,95 +399,4 @@ func RecordRecipeUsage(ctx context.Context, recipeID string, planID string, user
 	_, _ = database.DB.Exec(ctx,
 		`UPDATE teaching_recipes SET use_count = use_count + 1 WHERE id = $1`, recipeID)
 	return nil
-}
-
-// ==================== 组件摘要查询 ====================
-
-// GetRecipeComponentBriefs 批量查询配方绑定的组件摘要信息
-func GetRecipeComponentBriefs(ctx context.Context, componentIDs []string) ([]*models.RecipeComponentBrief, error) {
-	if len(componentIDs) == 0 {
-		return []*models.RecipeComponentBrief{}, nil
-	}
-
-	query := `
-		SELECT id, library_type, display_label, quality_score, status
-		FROM lesson_plan_components
-		WHERE id = ANY($1)
-		ORDER BY library_type, quality_score DESC
-	`
-	rows, err := database.DB.Query(ctx, query, componentIDs)
-	if err != nil {
-		return nil, fmt.Errorf("查询组件摘要失败: %w", err)
-	}
-	defer rows.Close()
-
-	var items []*models.RecipeComponentBrief
-	for rows.Next() {
-		item := &models.RecipeComponentBrief{}
-		if err := rows.Scan(&item.ID, &item.LibraryType, &item.DisplayLabel, &item.QualityScore, &item.Status); err != nil {
-			return nil, fmt.Errorf("扫描组件摘要行失败: %w", err)
-		}
-		item.LibraryName = models.LibraryTypeNameMap[item.LibraryType]
-		items = append(items, item)
-	}
-	if items == nil {
-		items = []*models.RecipeComponentBrief{}
-	}
-	return items, nil
-}
-
-// ==================== 获取组件完整内容（用于构建AI上下文）====================
-
-// GetRecipeComponentContents 查询配方绑定组件的完整内容（用于注入AI提示词）
-// 返回按library_type分组的组件，包含display_label+design_logic+full_guide
-func GetRecipeComponentContents(ctx context.Context, componentIDs []string) ([]*models.MatchedComponentGroup, error) {
-	if len(componentIDs) == 0 {
-		return []*models.MatchedComponentGroup{}, nil
-	}
-
-	query := `
-		SELECT library_type, id, display_label, COALESCE(design_logic, ''),
-		       COALESCE(example_snippet, ''), COALESCE(full_guide, ''),
-		       quality_score, usage_count, select_count
-		FROM lesson_plan_components
-		WHERE id = ANY($1) AND status = 'active' AND review_status = 'approved'
-		ORDER BY library_type, quality_score DESC
-	`
-	rows, err := database.DB.Query(ctx, query, componentIDs)
-	if err != nil {
-		return nil, fmt.Errorf("查询配方组件内容失败: %w", err)
-	}
-	defer rows.Close()
-
-	groupMap := make(map[string]*models.MatchedComponentGroup)
-	var groupOrder []string
-
-	for rows.Next() {
-		var libraryType string
-		mc := &models.MatchedComponent{}
-		if err := rows.Scan(
-			&libraryType, &mc.ID, &mc.DisplayLabel, &mc.DesignLogic,
-			&mc.ExampleSnippet, &mc.FullGuide,
-			&mc.QualityScore, &mc.UsageCount, &mc.SelectCount,
-		); err != nil {
-			return nil, fmt.Errorf("扫描组件内容行失败: %w", err)
-		}
-		group, exists := groupMap[libraryType]
-		if !exists {
-			group = &models.MatchedComponentGroup{
-				LibraryType: libraryType,
-				LibraryName: models.LibraryTypeNameMap[libraryType],
-				Components:  []*models.MatchedComponent{},
-			}
-			groupMap[libraryType] = group
-			groupOrder = append(groupOrder, libraryType)
-		}
-		group.Components = append(group.Components, mc)
-	}
-
-	var result []*models.MatchedComponentGroup
-	for _, lt := range groupOrder {
-		result = append(result, groupMap[lt])
-	}
-	return result, nil
 }

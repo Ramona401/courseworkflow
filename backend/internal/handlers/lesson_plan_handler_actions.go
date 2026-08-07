@@ -12,6 +12,8 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"log"
 	"net/http"
 
@@ -21,38 +23,49 @@ import (
 
 // ==================== 教案状态操作 ====================
 
+type publishLessonPlanPersonalRequest struct {
+	ExpectedVersion int `json:"expected_version"`
+}
+
 func (h *LessonPlanHandler) PublishPersonal(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
-	id := extractLPMiddleID(
-		r.URL.Path,
-		"/publish-personal",
-	)
+	if r.Method != http.MethodPost {
+		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
+		return
+	}
+
+	id := extractLPMiddleID(r.URL.Path, "/publish-personal")
 	if id == "" {
-		utils.BadRequest(
-			w,
-			utils.MsgMissingLessonPlanID,
-		)
+		utils.BadRequest(w, utils.MsgMissingLessonPlanID)
 		return
 	}
 
 	userID := getCurrentUserID(r)
+	if userID == "" {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		return
+	}
+
+	var req publishLessonPlanPersonalRequest
+	decodeErr := json.NewDecoder(r.Body).Decode(&req)
+	if decodeErr != nil && !errors.Is(decodeErr, io.EOF) {
+		utils.BadRequest(w, utils.MsgBadRequestBody)
+		return
+	}
+
 	if err := h.lpService.PublishPersonal(
 		r.Context(),
 		id,
 		userID,
+		req.ExpectedVersion,
 	); err != nil {
 		h.handleLPError(w, err)
 		return
 	}
 
-	utils.Success(
-		w,
-		map[string]string{
-			"message": "个人发布成功",
-		},
-	)
+	utils.Success(w, map[string]string{"message": "个人发布成功"})
 }
 
 func (h *LessonPlanHandler) SubmitForReview(
@@ -203,10 +216,23 @@ func (h *LessonPlanHandler) StartDevelopment(
 	utils.Success(w, result)
 }
 
+// ForkLessonPlan 复制当前用户可见的共享教案。
+//
+// 路由层使用后缀分发，因此Handler必须自行限制POST，
+// 防止GET或其它方法误触发写操作。
 func (h *LessonPlanHandler) ForkLessonPlan(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
+	if r.Method != http.MethodPost {
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			utils.MsgMethodPostOnly,
+		)
+		return
+	}
+
 	id := extractLPMiddleID(
 		r.URL.Path,
 		"/fork",
@@ -220,6 +246,11 @@ func (h *LessonPlanHandler) ForkLessonPlan(
 	}
 
 	userID := getCurrentUserID(r)
+	if userID == "" {
+		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		return
+	}
+
 	newLessonPlan, err := h.lpService.ForkLessonPlan(
 		r.Context(),
 		id,

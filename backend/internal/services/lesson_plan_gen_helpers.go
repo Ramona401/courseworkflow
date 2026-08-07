@@ -35,6 +35,7 @@ import (
 
 	"tedna/internal/models"
 	"tedna/internal/repository"
+	"tedna/internal/utils"
 )
 
 // appendUnrecognizedTextbookNotice 检查勾选的课本图中有几张未识别文字（OCR 为空），
@@ -165,8 +166,10 @@ func (s *LessonPlanGenService) broadcastSoftRetryNotice(ctx context.Context, pla
 // isCreditGateError 判断错误是否为积分守卫拦截类错误（积分硬闸 batch 新增）
 //
 // 守卫（token_guard.CheckBalance）的三种拒绝文案是判断依据：
-//   "积分余额不足，请联系学校管理员分配积分" / "积分账户未开通，请联系系统管理员" /
-//   "积分账户已冻结，请联系系统管理员"。
+//
+//	"积分余额不足，请联系学校管理员分配积分" / "积分账户未开通，请联系系统管理员" /
+//	"积分账户已冻结，请联系系统管理员"。
+//
 // CallAI/CallAIStream 被拦时把守卫 Message 原样包成 error 返回，
 // 故用「积分余额不足 / 积分账户」两个关键词做包含匹配即可覆盖全部三种，
 // 且不会误伤网络类错误（那些文案里不含"积分"）。
@@ -223,13 +226,35 @@ func (s *LessonPlanGenService) parseAIReply(ctx context.Context, content string,
 	if strings.Contains(content, "【推荐组件】") || strings.Contains(content, "推荐以下教学方案") {
 		msg.Type = models.ConvMsgTypeComponents
 		msg.Content = cleanComponentMarkers(content)
-		groups, _ := repository.MatchComponents(ctx, &models.MatchComponentsRequest{
-			Subject:       lp.Subject,
-			GradeRange:    lp.Grade,
-			InjectionMode: "recommend",
-			Limit:         3,
-		})
-		msg.Components = convertGroupsToConvComponents(groups)
+		educationDomain := strings.ToLower(
+			strings.TrimSpace(
+				lp.EducationDomain,
+			),
+		)
+
+		if models.IsTeachingEducationDomain(
+			educationDomain,
+		) {
+			groups, _ :=
+				repository.MatchComponentsForEducationDomain(
+					ctx,
+					&models.MatchComponentsRequest{
+						EducationDomain: educationDomain,
+						Subject:         lp.Subject,
+						GradeRange: utils.NormalizeGradeToNumber(
+							lp.Grade,
+						),
+						InjectionMode: "recommend",
+						Limit:         3,
+					},
+					educationDomain,
+				)
+
+			msg.Components =
+				convertGroupsToConvComponents(
+					groups,
+				)
+		}
 		return msg
 	}
 

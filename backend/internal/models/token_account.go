@@ -278,27 +278,38 @@ type AllocationListResponse struct {
 // ConsumptionListItem 消费流水列表项
 // v129变更：金额字段从 int64 → float64，新增精确计算字段
 type ConsumptionListItem struct {
-	ID            string     `json:"id"`
-	AccountName   string     `json:"account_name"` // 账户名称
-	UserName      string     `json:"user_name"`    // 用户名
-	Amount        float64    `json:"amount"`
-	BalanceBefore float64    `json:"balance_before"`
-	BalanceAfter  float64    `json:"balance_after"`
-	SceneCode     string     `json:"scene_code"`
-	ModelUsed     string     `json:"model_used"`
-	TokensUsed    int        `json:"tokens_used"`
-	Memo          string     `json:"memo"`
-	CreatedAt     *time.Time `json:"created_at"`
-	// v129新增
-	InputTokens     int     `json:"input_tokens"`
-	OutputTokens    int     `json:"output_tokens"`
-	ModelName       string  `json:"model_name"`
-	Provider        string  `json:"provider"`
-	CostUSD         float64 `json:"cost_usd"`
-	ExchangeRate    float64 `json:"exchange_rate"`
-	Multiplier      float64 `json:"multiplier"`
-	CreditsConsumed float64 `json:"credits_consumed"`
-	LatencyMs       int     `json:"latency_ms"`
+        ID            string     `json:"id"`
+        AccountName   string     `json:"account_name"`
+        UserName      string     `json:"user_name"`
+        Amount        float64    `json:"amount"`
+        BalanceBefore float64    `json:"balance_before"`
+        BalanceAfter  float64    `json:"balance_after"`
+        SceneCode     string     `json:"scene_code"`
+        ModelUsed     string     `json:"model_used"`
+        TokensUsed    int        `json:"tokens_used"`
+        Memo          string     `json:"memo"`
+        CreatedAt     *time.Time `json:"created_at"`
+
+        // 统一业务计费身份。
+        BillingCategory string `json:"billing_category"`
+        BillingNodeCode string `json:"billing_node_code"`
+        BillingNodeName string `json:"billing_node_name"`
+
+        // 媒体实际计量。文本AI流水为空或0。
+        MediaType     string  `json:"media_type"`
+        MediaUnit     string  `json:"media_unit"`
+        MediaQuantity float64 `json:"media_quantity"`
+
+        // 内部精确成本字段，仅超级管理员完整响应公开。
+        InputTokens     int     `json:"input_tokens"`
+        OutputTokens    int     `json:"output_tokens"`
+        ModelName       string  `json:"model_name"`
+        Provider        string  `json:"provider"`
+        CostUSD         float64 `json:"cost_usd"`
+        ExchangeRate    float64 `json:"exchange_rate"`
+        Multiplier      float64 `json:"multiplier"`
+        CreditsConsumed float64 `json:"credits_consumed"`
+        LatencyMs       int     `json:"latency_ms"`
 }
 
 // ConsumptionListResponse 消费流水列表响应

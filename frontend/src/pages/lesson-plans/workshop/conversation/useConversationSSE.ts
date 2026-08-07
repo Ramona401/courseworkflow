@@ -37,6 +37,12 @@ import {
 import type { StreamingState } from '../components/workshopConstants'
 import type { ChipDef } from './conversationScript'
 import { suggestedActionsToChips } from './chipActions'
+import {
+  normalizeLessonPlanBusinessErrorMessage,
+} from '@/api/lesson-plan-sse-errors'
+import {
+  classifyConversationSSEEvent,
+} from './conversationSSEEventScope'
 
 /** 第一层·软提示触发阈值（毫秒）：发起一轮后多久没等到首 chunk 就安抚一句 */
 const SLOW_HINT_MS = 8000
@@ -135,15 +141,19 @@ export function useConversationSSE(params: UseConversationSSEParams): UseConvers
   }, [])
 
   /**
-   * 轮次过滤：判断一个事件是否"过期轮次的迟到回复"，是则应丢弃。
-   *   - clientTurnId 为空 → 不过滤（系统旁路）；
-   *   - 非空且 !== 当前轮 → 过期，丢弃；
-   *   - 非空且 === 当前轮 → 本轮，处理。
+   * 判断当前事件属于老师主动对话、后台旁路还是过期轮次。
+   *
+   * 无clientTurnId的后台评审事件可以继续写入最终报告，
+   * 但不能修改聊天输入框使用的isThinking、streaming和fullGenerating。
    */
-  const isStaleTurn = (clientTurnId?: string): boolean => {
-    if (!clientTurnId) return false
-    return clientTurnId !== paramsRef.current.currentTurnRef.current
-  }
+  const getEventScope = (
+    clientTurnId?: string,
+  ) =>
+    classifyConversationSSEEvent(
+      clientTurnId,
+      paramsRef.current
+        .currentTurnRef.current,
+    )
 
   // 组件卸载：关连接 + 清计时器
   useEffect(() => {
@@ -162,94 +172,286 @@ export function useConversationSSE(params: UseConversationSSEParams): UseConvers
     planIdRef.current = planId
     sseRef.current = createLessonPlanSSE(planId, p.token, {
       onThinking: (clientTurnId?: string) => {
-        if (isStaleTurn(clientTurnId)) return
+        const scope =
+          getEventScope(clientTurnId)
+
+        if (
+          scope !== 'current_turn'
+        ) {
+          return
+        }
+
         resetWatchdog()
         paramsRef.current.setIsThinking(true)
         paramsRef.current.setStreaming(null)
       },
       onChunk: (chunk: string, clientTurnId?: string) => {
-        if (isStaleTurn(clientTurnId)) return
-        // 首个 chunk 到达：撤软提示、续看门狗（开始出字了）
+        const scope =
+          getEventScope(clientTurnId)
+
+        if (
+          scope !== 'current_turn'
+        ) {
+          return
+        }
+
+        // 首个聊天chunk到达：撤软提示并续看门狗。
         clearSlowHint()
         resetWatchdog()
         paramsRef.current.setIsThinking(false)
         paramsRef.current.setStreaming(prev =>
           prev
-            ? { ...prev, content: prev.content + chunk }
-            : { id: `stream_${Date.now()}`, content: chunk }
+            ? {
+                ...prev,
+                content:
+                  prev.content + chunk,
+              }
+            : {
+                id:
+                  `stream_${Date.now()}`,
+                content: chunk,
+              }
         )
       },
-      onMessageDone: (msg: ConversationMessage, clientTurnId?: string, assistantLabel?: string) => {
-        if (isStaleTurn(clientTurnId)) return
-        // 本轮收尾：清掉所有计时器
-        clearTurnTimers()
-        const cur = paramsRef.current
-        cur.setIsThinking(false)
-        cur.setStreaming(null)
-        cur.setFullGenerating(false)
-        cur.setDynamicChips([])
-        cur.setMessages(prev => [...prev, msg])
-        // 可见性补丁：把本轮实际匹配的助手名转发给页面更新顶栏(assistantLabel 可能为 undefined/空=纯骨架)
-        cur.onAssistantLabel?.(assistantLabel || '')
-        const isSoftRetry = !!(msg.metadata && (msg.metadata as Record<string, unknown>).soft_retry === true)
-        if (isSoftRetry) {
-          cur.onSoftFailure()
-        } else {
-          cur.onNormalReply()
+      onMessageDone: (
+        msg: ConversationMessage,
+        clientTurnId?: string,
+        assistantLabel?: string,
+      ) => {
+        const scope =
+          getEventScope(clientTurnId)
+
+        if (
+          scope === 'stale_turn'
+        ) {
+          return
         }
+
+        const cur =
+          paramsRef.current
+
+        /*
+         * 后台评审的最终报告仍应进入消息列表，
+         * 但只有老师主动发起的当前聊天轮次可以结束聊天忙碌状态。
+         */
+        if (
+          scope === 'current_turn'
+        ) {
+          clearTurnTimers()
+          cur.setIsThinking(false)
+          cur.setStreaming(null)
+          cur.setFullGenerating(false)
+          cur.setDynamicChips([])
+
+          cur.onAssistantLabel?.(
+            assistantLabel || '',
+          )
+
+          const isSoftRetry =
+            Boolean(
+              msg.metadata &&
+              (
+                msg.metadata as
+                  Record<string, unknown>
+              ).soft_retry === true,
+            )
+
+          if (isSoftRetry) {
+            cur.onSoftFailure()
+          } else {
+            cur.onNormalReply()
+          }
+        }
+
+        cur.setMessages(
+          previous => [
+            ...previous,
+            msg,
+          ],
+        )
       },
       onContentUpdate: (content: string) => {
-        // content_update 不带 turnID（write/revise 落库旁路），不参与过滤
+        // content_update只会在正式正文成功落库后广播。
+        // 该事件不带turnID，因此作为右侧画布的提交事实旁路处理。
         const cur = paramsRef.current
-        cur.setPlanContent(prev => {
-          const wasEmpty = !prev || prev.trim().length === 0
-          if (wasEmpty && content && content.trim().length > 0) {
-            cur.showToast('✅ 教案正文已生成！右侧画布可查看全文')
-            cur.setFullGenerating(false)
+
+        cur.setPlanContent(previous => {
+          const previousContent =
+            (previous || '').trim()
+          const nextContent =
+            (content || '').trim()
+
+          if (
+            nextContent &&
+            previousContent !== nextContent
+          ) {
+            cur.showToast(
+              previousContent
+                ? '✅ 修改已保存，并同步到右侧教案画布'
+                : '✅ 教案正文已生成！右侧画布可查看全文',
+            )
           }
+
           return content
         })
+
+        cur.setFullGenerating(false)
       },
       onReviewDone: () => { /* 评审报告以对话消息形式呈现，Phase A 不单独渲染面板 */ },
       onStageStarted: () => { paramsRef.current.refreshStages(planId) },
       onStageComplete: () => { paramsRef.current.refreshStages(planId) },
       onStageOutput: () => { paramsRef.current.refreshStages(planId) },
-      onSuggestedActions: (actions: SuggestedAction[], clientTurnId?: string) => {
-        if (isStaleTurn(clientTurnId)) return
-        const chips = suggestedActionsToChips(actions)
-        if (chips.length > 0) paramsRef.current.setDynamicChips(chips)
+      onSuggestedActions: (
+        actions: SuggestedAction[],
+        clientTurnId?: string,
+      ) => {
+        const scope =
+          getEventScope(clientTurnId)
+
+        if (
+          scope === 'stale_turn'
+        ) {
+          return
+        }
+
+        const chips =
+          suggestedActionsToChips(
+            actions,
+          )
+
+        if (chips.length > 0) {
+          paramsRef.current
+            .setDynamicChips(chips)
+        }
       },
-      onRetryNotice: (content: string, clientTurnId?: string) => {
-        // 第二层·重试可见性：本轮首轮空流、后端自动重试时到达。续看门狗、显示提示。
-        if (isStaleTurn(clientTurnId)) return
+      onRetryNotice: (
+        content: string,
+        clientTurnId?: string,
+      ) => {
+        const scope =
+          getEventScope(clientTurnId)
+
+        /*
+         * 重试提示只属于老师主动发起的聊天轮次。
+         * 后台评审重试不能占用聊天输入框。
+         */
+        if (
+          scope !== 'current_turn'
+        ) {
+          return
+        }
+
         resetWatchdog()
-        paramsRef.current.onRetryNotice(content)
+        paramsRef.current
+          .onRetryNotice(content)
       },
-      onError: (err: string, clientTurnId?: string) => {
-        if (isStaleTurn(clientTurnId)) return
-        // 本轮出错收尾：清计时器
-        clearTurnTimers()
-        const cur = paramsRef.current
-        console.error('[对话模式] 生成出错:', err)
-        cur.setIsThinking(false)
-        cur.setStreaming(null)
-        cur.setFullGenerating(false)
-        cur.setDynamicChips([])
-        cur.setMessages(prev => [...prev, {
-          id: `err_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
-          content: `我这边刚才没接上话，可能是网络打了个盹。你之前的内容都还在、不会丢——把刚才那句再发一次、或点下面的「重新回答」就好。`,
-          created_at: new Date().toISOString(),
-        }])
-        cur.onSoftFailure()
+      onError: (
+        err: string,
+        clientTurnId?: string,
+      ) => {
+        const scope =
+          getEventScope(clientTurnId)
+
+        if (
+          scope === 'stale_turn'
+        ) {
+          return
+        }
+
+        const cur =
+          paramsRef.current
+
+        const message =
+          normalizeLessonPlanBusinessErrorMessage(
+            err,
+          )
+
+        console.error(
+          scope === 'current_turn'
+            ? '[对话模式] 本轮业务错误:'
+            : '[对话模式] 后台旁路业务错误:',
+          err,
+        )
+
+        /*
+         * 后台任务错误可以显示安全提示，
+         * 但不能结束或启动老师当前聊天轮次的忙碌状态。
+         */
+        if (
+          scope === 'current_turn'
+        ) {
+          clearTurnTimers()
+          cur.setIsThinking(false)
+          cur.setStreaming(null)
+          cur.setFullGenerating(false)
+          cur.setDynamicChips([])
+        }
+
+        cur.setMessages(previous => {
+          const lastMessage =
+            previous[
+              previous.length - 1
+            ]
+
+          if (
+            lastMessage?.id
+              .startsWith('err_') &&
+            lastMessage.content ===
+              message
+          ) {
+            return previous
+          }
+
+          return [
+            ...previous,
+            {
+              id:
+                `err_${Date.now()}`,
+              role:
+                'assistant' as const,
+              type:
+                'text' as const,
+              content: message,
+              created_at:
+                new Date()
+                  .toISOString(),
+            },
+          ]
+        })
+
+        if (
+          scope === 'current_turn'
+        ) {
+          cur.onSoftFailure()
+        }
       },
       onDone: () => {
-        clearTurnTimers()
-        const cur = paramsRef.current
-        cur.setIsThinking(false)
-        cur.setStreaming(null)
-        cur.setFullGenerating(false)
+        /*
+         * done事件没有clientTurnId，无法证明它属于当前聊天轮次。
+         * 它可能来自导入后的后台评审，因此不得修改聊天忙碌状态。
+         *
+         * 正常聊天由message_done/error收尾；
+         * 异常无收尾时由90秒看门狗兜底。
+         */
       },
-      onConnectionStateChange: (state: SSEConnectionState) => { setSseState(state) },
+      onConnectionStateChange: (state: SSEConnectionState) => {
+        setSseState(state)
+
+        // 短暂重连期间保留当前流式状态，等待连接自动恢复。
+        // 只有达到最大重试次数、确认断开后才结束本地等待；
+        // 真正断线只由顶栏状态条提示，不插入AI消息。
+        if (state === 'disconnected') {
+          clearTurnTimers()
+
+          const cur =
+            paramsRef.current
+
+          cur.setIsThinking(false)
+          cur.setStreaming(null)
+          cur.setFullGenerating(false)
+          cur.setDynamicChips([])
+        }
+      },
       onReconnected: async () => {
         const pid = planIdRef.current
         if (!pid) return
@@ -264,8 +466,13 @@ export function useConversationSSE(params: UseConversationSSEParams): UseConvers
           const planData = await getLessonPlan(pid)
           if (planData.content_markdown) cur.setPlanContent(planData.content_markdown)
           if (planData.current_stage && planData.stage_config) await cur.refreshStages(pid)
+
+          // 重连补齐完成后，旧连接对应的看门狗不应继续计时，
+          // 否则可能在连接已经恢复后误报90秒超时。
+          clearTurnTimers()
           cur.setIsThinking(false)
           cur.setStreaming(null)
+          cur.setFullGenerating(false)
         } catch (err) {
           console.error('[对话模式] 重连补齐失败:', err)
         }

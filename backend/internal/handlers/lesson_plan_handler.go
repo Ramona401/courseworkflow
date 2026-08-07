@@ -10,9 +10,15 @@ package handlers
 //
 // 状态流转与提示词模板端点拆至lesson_plan_handler_actions.go。
 // 错误映射和路径解析拆至lesson_plan_handler_support.go。
+// 教案目录段落AI修改端点拆至lesson_plan_section_rewrite_handler.go。
 //
 // 上下文10：普通教案创建成功后写入lesson_plan.create审计，
 // 审计记录数据库最终返回的education_domain快照，不记录教案正文。
+//
+// 上下文17：
+//   - 详情读取必须传入当前登录用户ID，由Service统一执行可见性校验；
+//   - /interact与/interactions是保留互动子路径，错误HTTP方法不能回落到
+//     普通详情、更新或删除处理器。
 
 import (
 	"encoding/json"
@@ -30,6 +36,10 @@ import (
 // LessonPlanHandler 教案管理接口处理器。
 type LessonPlanHandler struct {
 	lpService *services.LessonPlanService
+
+	// sectionRewriteService仅服务于教案目录段落AI修改两阶段接口。
+	// 采用Setter注入，保持NewLessonPlanHandler旧签名兼容既有测试和调用方。
+	sectionRewriteService *services.LessonPlanSectionRewriteService
 }
 
 // NewLessonPlanHandler 创建教案管理处理器实例。
@@ -39,6 +49,19 @@ func NewLessonPlanHandler(
 	return &LessonPlanHandler{
 		lpService: lpService,
 	}
+}
+
+// SetSectionRewriteService 注入教案段落AI修改服务。
+//
+// 路由初始化完成后该依赖只读，不存在运行期并发修改。
+// 未注入时相关端点固定返回503，不降级到普通全文更新接口。
+func (h *LessonPlanHandler) SetSectionRewriteService(
+	service *services.LessonPlanSectionRewriteService,
+) {
+	if h == nil {
+		return
+	}
+	h.sectionRewriteService = service
 }
 
 // ==================== 教案列表 ====================
@@ -57,9 +80,14 @@ func (h *LessonPlanHandler) ListLessonPlans(
 		return
 	}
 
-	claims, ok := middleware.GetClaims(r.Context())
+	claims, ok := middleware.GetClaims(
+		r.Context(),
+	)
 	if !ok || claims.UserID == "" {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		utils.Unauthorized(
+			w,
+			utils.MsgNotLoggedIn,
+		)
 		return
 	}
 
@@ -75,8 +103,12 @@ func (h *LessonPlanHandler) ListLessonPlans(
 	status := query.Get("status")
 	subject := query.Get("subject")
 	grade := query.Get("grade")
-	limit, _ := strconv.Atoi(query.Get("limit"))
-	offset, _ := strconv.Atoi(query.Get("offset"))
+	limit, _ := strconv.Atoi(
+		query.Get("limit"),
+	)
+	offset, _ := strconv.Atoi(
+		query.Get("offset"),
+	)
 	qualityLevel, _ := strconv.Atoi(
 		query.Get("quality_level"),
 	)
@@ -107,8 +139,14 @@ func (h *LessonPlanHandler) ListLessonPlans(
 		&scope,
 	)
 	if err != nil {
-		log.Printf("获取教案列表失败: %v", err)
-		utils.InternalError(w, "获取教案列表失败")
+		log.Printf(
+			"获取教案列表失败: %v",
+			err,
+		)
+		utils.InternalError(
+			w,
+			"获取教案列表失败",
+		)
 		return
 	}
 
@@ -136,21 +174,30 @@ func (h *LessonPlanHandler) CreateLessonPlan(
 
 	userID := getCurrentUserID(r)
 	if userID == "" {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+		utils.Unauthorized(
+			w,
+			utils.MsgNotLoggedIn,
+		)
 		return
 	}
 
 	var req models.CreateLessonPlanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, utils.MsgBadRequestBody)
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			utils.MsgBadRequestBody,
+		)
 		return
 	}
 
-	lessonPlan, err := h.lpService.CreateLessonPlan(
-		r.Context(),
-		&req,
-		userID,
-	)
+	lessonPlan, err :=
+		h.lpService.CreateLessonPlan(
+			r.Context(),
+			&req,
+			userID,
+		)
 	if err != nil {
 		h.handleLPError(w, err)
 		return
@@ -172,7 +219,9 @@ func (h *LessonPlanHandler) CreateLessonPlan(
 			"creation_entry":    "ordinary",
 			"explicit_snapshot": true,
 		},
-		repository.GetClientIP(r.RemoteAddr),
+		repository.GetClientIP(
+			r.RemoteAddr,
+		),
 	)
 
 	utils.Success(w, lessonPlan)
@@ -194,6 +243,13 @@ func (h *LessonPlanHandler) GetLessonPlan(
 		return
 	}
 
+	if rejectLPInteractionSubpathFallback(
+		w,
+		r.URL.Path,
+	) {
+		return
+	}
+
 	id := extractLPID(r.URL.Path)
 	if id == "" {
 		utils.BadRequest(
@@ -203,10 +259,21 @@ func (h *LessonPlanHandler) GetLessonPlan(
 		return
 	}
 
-	detail, err := h.lpService.GetLessonPlan(
-		r.Context(),
-		id,
-	)
+	userID := getCurrentUserID(r)
+	if userID == "" {
+		utils.Unauthorized(
+			w,
+			utils.MsgNotLoggedIn,
+		)
+		return
+	}
+
+	detail, err :=
+		h.lpService.GetLessonPlan(
+			r.Context(),
+			id,
+			userID,
+		)
 	if err != nil {
 		h.handleLPError(w, err)
 		return
@@ -231,6 +298,13 @@ func (h *LessonPlanHandler) UpdateLessonPlan(
 		return
 	}
 
+	if rejectLPInteractionSubpathFallback(
+		w,
+		r.URL.Path,
+	) {
+		return
+	}
+
 	id := extractLPID(r.URL.Path)
 	if id == "" {
 		utils.BadRequest(
@@ -241,10 +315,22 @@ func (h *LessonPlanHandler) UpdateLessonPlan(
 	}
 
 	userID := getCurrentUserID(r)
+	if userID == "" {
+		utils.Unauthorized(
+			w,
+			utils.MsgNotLoggedIn,
+		)
+		return
+	}
 
 	var req models.UpdateLessonPlanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, utils.MsgBadRequestBody)
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			utils.MsgBadRequestBody,
+		)
 		return
 	}
 
@@ -282,6 +368,13 @@ func (h *LessonPlanHandler) DeleteLessonPlan(
 		return
 	}
 
+	if rejectLPInteractionSubpathFallback(
+		w,
+		r.URL.Path,
+	) {
+		return
+	}
+
 	id := extractLPID(r.URL.Path)
 	if id == "" {
 		utils.BadRequest(
@@ -292,6 +385,14 @@ func (h *LessonPlanHandler) DeleteLessonPlan(
 	}
 
 	userID := getCurrentUserID(r)
+	if userID == "" {
+		utils.Unauthorized(
+			w,
+			utils.MsgNotLoggedIn,
+		)
+		return
+	}
+
 	if err := h.lpService.DeleteLessonPlan(
 		r.Context(),
 		id,

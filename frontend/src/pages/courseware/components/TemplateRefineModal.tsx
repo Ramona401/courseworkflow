@@ -21,6 +21,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useAuth } from '@/store/auth'
 import { useProtectedDraft } from '@/hooks/useProtectedDraft'
+import { useVoiceDraftInput } from '@/hooks/useVoiceDraftInput'
+import VoiceInputButton from '@/components/voice/VoiceInputButton'
 import {
   refineTemplate, subscribeTemplateRefineSSE, getTemplateHistory,
   rollbackTemplate, publishDraft, deleteDraft, getPublishTargets,
@@ -259,6 +261,31 @@ function RefineTab({ template, onRefineDone }: {
   const [chunkCount, setChunkCount] = useState(0)
   const [error, setError] = useState('')
   const sseRef = useRef<{ close: () => void } | null>(null)
+  const instructionInputRef = useRef<HTMLTextAreaElement | null>(null)
+
+  /**
+   * 模板微调语音直接写入现有受保护指令草稿。
+   *
+   * partial只覆盖本轮听写片段，失败恢复录音前内容；
+   * final只回填输入框，不会自动触发模板微调。
+   */
+  const voiceInput = useVoiceDraftInput({
+    value: instruction,
+    setValue: setInstruction,
+    disabled: refining,
+    maxDurationSeconds: 120,
+    onFinalFocus: (finalValue) => {
+      const element = instructionInputRef.current
+      if (!element) return
+
+      element.focus()
+      element.setSelectionRange(
+        finalValue.length,
+        finalValue.length,
+      )
+    },
+    onError: setError,
+  })
 
   useEffect(() => {
     return () => { sseRef.current?.close() }
@@ -273,6 +300,8 @@ function RefineTab({ template, onRefineDone }: {
   ]
 
   const handleRefine = async () => {
+    if (voiceInput.isActive) return
+
     setError('')
     const inst = instruction.trim()
     if (!inst) {
@@ -325,12 +354,13 @@ function RefineTab({ template, onRefineDone }: {
           修改指令
         </label>
         <textarea
+          ref={instructionInputRef}
           value={instruction}
           onChange={e => setInstruction(e.target.value)}
           onKeyDown={e => {
             instructionDraft.handleKeyDown(e)
           }}
-          disabled={refining}
+          disabled={refining || voiceInput.isActive}
           placeholder="用自然语言描述你想要的修改,例如:把主色改成更柔和的天蓝色,圆角加大..."
           style={{
             width: '100%', minHeight: '90px', padding: '12px 14px',
@@ -339,17 +369,74 @@ function RefineTab({ template, onRefineDone }: {
             background: refining ? '#F9FAFB' : '#fff',
           }}
         />
+
+        <div
+          style={{
+            marginTop: 7,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+          }}
+        >
+          <VoiceInputButton
+            status={voiceInput.status}
+            isSupported={voiceInput.isSupported}
+            elapsedSeconds={voiceInput.elapsedSeconds}
+            disabled={refining}
+            error={voiceInput.error}
+            onStart={voiceInput.begin}
+            onStop={voiceInput.stop}
+            onCancel={voiceInput.cancel}
+          />
+
+          <span
+            style={{
+              color:
+                voiceInput.status === 'error'
+                  ? C.danger
+                  : voiceInput.isActive
+                    ? C.refine
+                    : C.textMuted,
+              fontSize: 11,
+              lineHeight: 1.5,
+            }}
+          >
+            {voiceInput.statusText ||
+              '点击麦克风可语音描述；识别文字不会自动开始微调'}
+          </span>
+        </div>
       </div>
 
       <div>
         <div style={{ fontSize: '12px', color: C.textMuted, marginBottom: '8px' }}>💡 试试这些常见指令:</div>
         <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
           {examples.map(ex => (
-            <button key={ex} onClick={() => !refining && setInstruction(ex)} disabled={refining} style={{
-              padding: '5px 12px', borderRadius: '14px', border: `1px solid ${C.border}`,
-              background: refining ? '#F9FAFB' : '#FFF8F0', color: C.textSecondary,
-              fontSize: '12px', cursor: refining ? 'not-allowed' : 'pointer',
-            }}>{ex}</button>
+            <button
+              key={ex}
+              onClick={() => {
+                if (!refining && !voiceInput.isActive) {
+                  setInstruction(ex)
+                }
+              }}
+              disabled={refining || voiceInput.isActive}
+              style={{
+                padding: '5px 12px',
+                borderRadius: '14px',
+                border: `1px solid ${C.border}`,
+                background:
+                  refining || voiceInput.isActive
+                    ? '#F9FAFB'
+                    : '#FFF8F0',
+                color: C.textSecondary,
+                fontSize: '12px',
+                cursor:
+                  refining || voiceInput.isActive
+                    ? 'not-allowed'
+                    : 'pointer',
+              }}
+            >
+              {ex}
+            </button>
           ))}
         </div>
       </div>
@@ -376,12 +463,34 @@ function RefineTab({ template, onRefineDone }: {
       )}
 
       <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-        <button onClick={handleRefine} disabled={refining || !instruction.trim()} style={{
-          padding: '10px 28px', borderRadius: '10px', border: 'none',
-          background: refining || !instruction.trim() ? '#D1D5DB' : 'linear-gradient(135deg, #7C3AED, #F59E0B)',
-          color: '#fff', fontSize: '14px', fontWeight: 700,
-          cursor: refining || !instruction.trim() ? 'not-allowed' : 'pointer',
-        }}>
+        <button
+          onClick={handleRefine}
+          disabled={
+            refining ||
+            voiceInput.isActive ||
+            !instruction.trim()
+          }
+          style={{
+            padding: '10px 28px',
+            borderRadius: '10px',
+            border: 'none',
+            background:
+              refining ||
+              voiceInput.isActive ||
+              !instruction.trim()
+                ? '#D1D5DB'
+                : 'linear-gradient(135deg, #7C3AED, #F59E0B)',
+            color: '#fff',
+            fontSize: '14px',
+            fontWeight: 700,
+            cursor:
+              refining ||
+              voiceInput.isActive ||
+              !instruction.trim()
+                ? 'not-allowed'
+                : 'pointer',
+          }}
+        >
           {refining ? 'AI 微调中...' : '✨ 开始微调'}
         </button>
       </div>

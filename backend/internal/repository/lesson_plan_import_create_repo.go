@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"tedna/internal/database"
@@ -43,6 +44,55 @@ var (
 		"失败导入教案补偿清理被安全条件拒绝",
 	)
 )
+
+// importedStageCompletedAt 为导入时跳过的前置阶段生成完成时间。
+//
+// completed_at直接作为独立参数传给SQL，避免同一个PostgreSQL参数
+// 同时被推断为状态列类型和CASE比较类型。
+func importedStageCompletedAt(
+	status string,
+	now time.Time,
+) *time.Time {
+	if status !=
+		string(models.StageOutputSkipped) {
+		return nil
+	}
+
+	value := now
+	return &value
+}
+
+// isEmptyImportedAIReviewJSON 判断新建教案是否尚无AI评审结果。
+//
+// ai_review_result是JSON/JSONB列，不能与空字符串直接COALESCE；
+// 这里兼容SQL NULL、JSON null和空对象三种未评审状态。
+func isEmptyImportedAIReviewJSON(
+	raw string,
+) bool {
+	normalized := strings.TrimSpace(
+		raw,
+	)
+	if normalized == "" {
+		return true
+	}
+
+	var value any
+	if err := json.Unmarshal(
+		[]byte(normalized),
+		&value,
+	); err != nil {
+		return false
+	}
+
+	switch typed := value.(type) {
+	case nil:
+		return true
+	case map[string]any:
+		return len(typed) == 0
+	default:
+		return false
+	}
+}
 
 // FinalizeImportedLessonPlanCreation
 // 原子固化导入教案的阶段状态和开场消息。
@@ -287,6 +337,11 @@ func FinalizeImportedLessonPlanCreation(
 			conversationSnapshot = "[]"
 		}
 
+		completedAt := importedStageCompletedAt(
+			string(output.Status),
+			time.Now(),
+		)
+
 		_, err = tx.Exec(ctx, `
 			INSERT INTO workshop_stage_outputs (
 				lesson_plan_id,
@@ -310,11 +365,7 @@ func FinalizeImportedLessonPlanCreation(
 				$7,
 				$8,
 				$9,
-				CASE
-					WHEN $9 = $10
-					THEN NOW()
-					ELSE NULL
-				END
+				$10
 			)
 		`,
 			lessonPlanID,
@@ -326,7 +377,7 @@ func FinalizeImportedLessonPlanCreation(
 			output.ModelUsed,
 			output.TokensUsed,
 			output.Status,
-			models.StageOutputSkipped,
+			completedAt,
 		)
 		if err != nil {
 			return fmt.Errorf(
@@ -412,7 +463,7 @@ func DeleteIncompleteImportedLessonPlanCreation(
 			COALESCE(content_markdown, ''),
 			COALESCE(education_domain, ''),
 			COALESCE(conversation_log::text, '[]'),
-			COALESCE(ai_review_result, '')
+			COALESCE(ai_review_result::text, '')
 		FROM lesson_plans
 		WHERE id = $1
 		FOR UPDATE
@@ -445,7 +496,7 @@ func DeleteIncompleteImportedLessonPlanCreation(
 		strings.TrimSpace(contentMarkdown) == "" ||
 		storedDomain != domain ||
 		!isEmptyConversationLogJSON(conversationLog) ||
-		strings.TrimSpace(aiReviewResult) != "" {
+		!isEmptyImportedAIReviewJSON(aiReviewResult) {
 		return fmt.Errorf(
 			"%w: plan_id=%s status=%s visibility=%s domain=%s",
 			ErrIncompleteImportedLessonPlanCleanupRejected,
@@ -475,7 +526,11 @@ func DeleteIncompleteImportedLessonPlanCreation(
 		  AND education_domain = $5
 		  AND COALESCE(content_markdown, '') <> ''
 		  AND COALESCE(conversation_log::text, '[]') = '[]'
-		  AND COALESCE(ai_review_result, '') = ''
+		  AND (
+                      ai_review_result IS NULL
+                      OR ai_review_result::jsonb = '{}'::jsonb
+                      OR ai_review_result::jsonb = 'null'::jsonb
+                  )
 	`,
 		lessonPlanID,
 		authorID,

@@ -1,4 +1,8 @@
 import { DEFAULT_SUBJECTS } from '@/constants/subjects'
+import {
+  renderMarkdown as renderLessonPlanMarkdown,
+} from '@/pages/lesson-plans/plan-detail/components/planDetailConstants'
+
 /**
  * workshopConstants.tsx — 备课工坊共用常量和工具函数
  *
@@ -18,6 +22,12 @@ import { DEFAULT_SUBJECTS } from '@/constants/subjects'
  *   3) 「政治」保留——义务教育段用「道德与法治」、高中段用「政治」，老师按学段选。
  *   注意：新学科在课标库暂无数据时为预期行为——能选、能备课，但不注入课标约束，
  *   与现有「暂无该学科年级数据」兜底一致，不报错不崩溃。
+ *
+ * 教案图片预览统一修复：
+ *   - 继续保留本文件对AI输出中孤立格式符号的预处理；
+ *   - 正式Markdown结构渲染统一复用教案详情页已经生产验证的渲染器；
+ *   - 图片、链接、表格、标题、列表和粗体在备课工坊与各类教案预览中保持一致；
+ *   - 不使用dangerouslySetInnerHTML，不执行正文中的HTML或脚本。
  */
 
 // ==================== 颜色常量 ====================
@@ -155,7 +165,15 @@ const PUA_BOLD_END   = '\uE002'
  */
 function preprocessText(text: string): string {
   // FE-WC-01修复：构建基于PUA字符的正则，替代原来的 §BOLD§/§END§
-  const puaBoldRe   = new RegExp(PUA_BOLD_START + '([^' + PUA_BOLD_START + PUA_BOLD_END + ']+)' + PUA_BOLD_END, 'g')
+  const puaBoldRe = new RegExp(
+    PUA_BOLD_START +
+      '([^' +
+      PUA_BOLD_START +
+      PUA_BOLD_END +
+      ']+)' +
+      PUA_BOLD_END,
+    'g',
+  )
 
   return text
     .split('\n')
@@ -163,127 +181,53 @@ function preprocessText(text: string): string {
       const t = line.trim()
 
       // 保留标准markdown格式行，不处理
-      if (/^#{1,3}\s+/.test(t)) return line      // ## 标题（有空格）
-      if (/^[-*]\s+/.test(t)) return line         // - 列表或 * 列表
-      if (/^\d+\.\s+/.test(t)) return line        // 1. 有序列表
-      if (/^---+$/.test(t)) return line           // --- 分隔线
-      if (/^\*\*[^*]/.test(t)) return line        // **开头的粗体行
+      if (/^#{1,3}\s+/.test(t)) return line
+      if (/^[-*]\s+/.test(t)) return line
+      if (/^\d+\.\s+/.test(t)) return line
+      if (/^---+$/.test(t)) return line
+      if (/^\*\*[^*]/.test(t)) return line
 
       // 行首连续的#号（没有空格，不是标题）→ 去掉
       let result = line.replace(/^(\s*)#+([^#\s])/, '$1$2')
 
       // 行内孤立的单个*（不是**粗体**的部分）→ 去掉
-      // 先用PUA字符保护**粗体**，再清理孤立*，再还原
+      // 先用PUA字符保护**粗体**，再清理孤立*，最后还原。
       result = result
-        .replace(/\*\*([^*]+)\*\*/g, PUA_BOLD_START + '$1' + PUA_BOLD_END)  // 保护**粗体**为PUA占位符
-        .replace(/\*/g, '')                                                    // 去掉所有孤立*
-        .replace(puaBoldRe, '**$1**')                                          // 还原**粗体**
+        .replace(
+          /\*\*([^*]+)\*\*/g,
+          PUA_BOLD_START + '$1' + PUA_BOLD_END,
+        )
+        .replace(/\*/g, '')
+        .replace(puaBoldRe, '**$1**')
 
       return result
     })
     .join('\n')
 }
 
-// ==================== 增强版Markdown渲染器 ====================
+// ==================== 统一Markdown渲染器 ====================
 
 /**
- * renderMarkdown 将AI输出文本渲染为React节点
+ * renderMarkdown 将备课工坊文本渲染为React节点。
  *
- * 支持格式：
- *   # ## ### 标题（渲染为不同字号的粗体）
- *   **粗体**
- *   - 无序列表  * 无序列表
- *   1. 有序列表
- *   --- 分隔线
- *   普通段落
+ * 本函数只负责保留备课工坊已有的格式符号清理策略，正式Markdown解析统一复用
+ * 教案详情页渲染器，确保以下内容在所有教案预览入口表现一致：
  *
- * v73增强：渲染前调用preprocessText清理孤立的*和#符号
+ *   - #、##、### 标题；
+ *   - **粗体**；
+ *   - 无序列表和有序列表；
+ *   - 分割线；
+ *   - 块级图片与行内图片；
+ *   - Markdown链接；
+ *   - GFM表格；
+ *   - 普通段落。
+ *
+ * 渲染过程只创建受控React节点，不执行正文内嵌HTML或脚本。
  */
 export function renderMarkdown(text: string): React.ReactNode {
   if (!text) return null
 
-  // 预处理：清理不规范格式符号
-  const cleaned = preprocessText(text)
-
-  const lines = cleaned.split('\n')
-  const nodes: React.ReactNode[] = []
-  let listItems: React.ReactNode[] = []
-  let listType: 'ul' | 'ol' | null = null
-  let key = 0
-
-  // 解析行内格式（**粗体**）
-  const parseInline = (line: string): React.ReactNode => {
-    // 同时处理 *斜体*（转为普通加粗显示，不用斜体）
-    const parts = line.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/)
-    if (parts.length === 1) return line
-    return (
-      <>
-        {parts.map((part, i) => {
-          if (part.startsWith('**') && part.endsWith('**')) {
-            return <strong key={i} style={{ fontWeight: 700, color: C.text }}>{part.slice(2, -2)}</strong>
-          }
-          if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
-            // *斜体* → 渲染为普通加粗（不用斜体，更易读）
-            return <strong key={i} style={{ fontWeight: 600, color: C.text }}>{part.slice(1, -1)}</strong>
-          }
-          return part
-        })}
-      </>
-    )
-  }
-
-  const flushList = () => {
-    if (!listItems.length) return
-    nodes.push(
-      listType === 'ul'
-        ? <ul key={key++} style={{ margin: '6px 0 6px 16px', padding: 0, listStyle: 'disc' }}>{listItems}</ul>
-        : <ol key={key++} style={{ margin: '6px 0 6px 16px', padding: 0, listStyle: 'decimal' }}>{listItems}</ol>
-    )
-    listItems = []; listType = null
-  }
-
-  for (const line of lines) {
-    const t = line.trim()
-    if (!t) { flushList(); continue }
-
-    // 分隔线
-    if (/^---+$/.test(t)) {
-      flushList()
-      nodes.push(<hr key={key++} style={{ border: 'none', borderTop: `1px solid ${C.border}`, margin: '10px 0' }} />)
-      continue
-    }
-
-    // 标题（### ## #）
-    const h3 = t.match(/^###\s+(.+)/)
-    if (h3) { flushList(); nodes.push(<div key={key++} style={{ fontSize: '14px', fontWeight: 700, color: C.text, margin: '10px 0 4px' }}>{parseInline(h3[1])}</div>); continue }
-
-    const h2 = t.match(/^##\s+(.+)/)
-    if (h2) { flushList(); nodes.push(<div key={key++} style={{ fontSize: '15px', fontWeight: 700, color: C.text, margin: '12px 0 4px', paddingTop: '4px' }}>{parseInline(h2[1])}</div>); continue }
-
-    const h1 = t.match(/^#\s+(.+)/)
-    if (h1) { flushList(); nodes.push(<div key={key++} style={{ fontSize: '16px', fontWeight: 700, color: C.text, margin: '14px 0 6px' }}>{parseInline(h1[1])}</div>); continue }
-
-    // 无序列表（- 或 *）
-    const ul = t.match(/^[-*]\s+(.+)/)
-    if (ul) {
-      if (listType !== 'ul') { flushList(); listType = 'ul' }
-      listItems.push(<li key={key++} style={{ fontSize: '14px', color: C.text, lineHeight: 1.7, marginBottom: '2px' }}>{parseInline(ul[1])}</li>)
-      continue
-    }
-
-    // 有序列表
-    const ol = t.match(/^\d+\.\s+(.+)/)
-    if (ol) {
-      if (listType !== 'ol') { flushList(); listType = 'ol' }
-      listItems.push(<li key={key++} style={{ fontSize: '14px', color: C.text, lineHeight: 1.7, marginBottom: '2px' }}>{parseInline(ol[1])}</li>)
-      continue
-    }
-
-    // 普通段落
-    flushList()
-    nodes.push(<div key={key++} style={{ fontSize: '15px', color: C.text, lineHeight: 1.7, marginBottom: '2px' }}>{parseInline(t)}</div>)
-  }
-
-  flushList()
-  return <>{nodes}</>
+  return renderLessonPlanMarkdown(
+    preprocessText(text),
+  )
 }

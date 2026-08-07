@@ -13,6 +13,8 @@ package routes
 //          （对话模式备课中随时关联课本；引擎每轮重读该列，更新即下轮生效）
 // 大单元挂载 新增:PUT /api/v1/lesson-plans/plans/{id}/unit-plan — 教案挂载/解除单元方案
 //          （注入层每轮重读 lesson_plans.unit_plan_id，更新即下轮生效，引擎零改动）
+// 精确课程大纲中途挂载:
+//   PUT /api/v1/lesson-plans/plans/{id}/course-outline — 按唯一ID设置、更换或解除课程大纲
 // 助手轻量选择入口 Phase 1 新增:
 //   GET/PUT /api/v1/lesson-plans/assistant-prefs       — 老师×学科 助手选择偏好读写
 //   GET     /api/v1/lesson-plans/assistant-options     — 当前学科(阶段)可选助手列表
@@ -88,6 +90,12 @@ func registerLessonPlanRoutes(
 	// ---- v108新增:导入已有教案(需在/plans/通配路由前注册)----
 	mux.Handle("/api/v1/lesson-plans/plans/import-existing",
 		middleware.Chain(http.HandlerFunc(lpGenHandler.ImportExistingPlan), authMW))
+
+	// ---- 原格式Word教案：上传并生成浏览器安全预览 ----
+	// 只创建24小时短时导入会话，不创建正式教案、不启动AI评审。
+	// 精确路径必须位于 /plans/ 通配路由之前。
+	mux.Handle("/api/v1/lesson-plans/plans/import-word/preview",
+		middleware.Chain(http.HandlerFunc(lpGenHandler.PreviewWordImport), authMW))
 
 	// ==================== 阶段化备课工坊(Phase 7B 新增)====================
 
@@ -432,6 +440,16 @@ func registerLessonPlanRoutes(
 	mux.Handle("/api/v1/lesson-plans/plans/", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
+		// ---- 原格式Word保真下载 ----
+		// 必须先于普通教案GET和其它较短子路径匹配。
+		case hasSuffix(path, "/word-document/download") && r.Method == http.MethodGet:
+			lpGenHandler.DownloadWordDocument(w, r)
+		case indexOf(path, "/word-document/download") >= 0:
+			methodNotAllowedJSON(
+				w,
+				"原格式Word下载仅支持GET请求",
+			)
+
 		// ---- v123 新增:教案资产管理(/plans/{id}/assets) ----
 		// 必须放在通配处理最前面,因为它的优先级最高(具体路径优先于通用 GET/PUT/DELETE)
 		case hasSuffix(path, "/assets") && r.Method == http.MethodPost:
@@ -454,6 +472,17 @@ func registerLessonPlanRoutes(
 			methodNotAllowedJSON(
 				w,
 				"教案版本列表与详情仅支持GET，恢复仅支持POST",
+			)
+		// ---- 教案目录段落AI修改：生成预览与原子应用 ----
+		// apply长后缀必须先于section-rewrite基础路径匹配。
+		case hasSuffix(path, "/section-rewrite/apply") && r.Method == http.MethodPost:
+			lpHandler.ApplySectionRewrite(w, r)
+		case hasSuffix(path, "/section-rewrite") && r.Method == http.MethodPost:
+			lpHandler.GenerateSectionRewritePreview(w, r)
+		case indexOf(path, "/section-rewrite") >= 0:
+			methodNotAllowedJSON(
+				w,
+				"教案段落AI修改仅支持POST请求",
 			)
 		// ---- v125新增：教案互动（点赞/收藏） ----
 		case hasSuffix(path, "/interact") && r.Method == http.MethodPost:
@@ -479,10 +508,18 @@ func registerLessonPlanRoutes(
 		// 后缀 /class-profile 与上方所有后缀(/assets、/textbooks、/unit-plan、/interact 等)均不冲突。
 		case hasSuffix(path, "/class-profile") && r.Method == http.MethodPut:
 			lpHandler.UpdateLessonPlanClassProfile(w, r)
-		// ---- 教材版本增强：课程大纲教材版本设置/解除(PUT /plans/{id}/course-outline-publisher) ----
-		// 备课首屏选定教材版本后写入 lesson_plans.course_outline_publisher，注入层下一轮 analyze/design
-		// 阶段据此版本精确匹配注入对应版本大纲（零跨版本兜底）。三态：传 null=解除不注入、传 ""=通用版、
-		// 传 "人教版"=具名版本。后缀 /course-outline-publisher 与上方所有后缀均不冲突。
+		// ---- 精确课程大纲中途挂载(PUT /plans/{id}/course-outline) ----
+		// 正式值是唯一course_outline_id；传UUID设置或更换，传null或空字符串解除。
+		// Service执行作者、可编辑状态、实时教育域、可见范围、学科和具体年级硬闸，
+		// 数据库触发器固化publisher、volume、school_system快照，下一轮对话自动生效。
+		case hasSuffix(path, "/course-outline"):
+			if r.Method == http.MethodPut {
+				lpHandler.UpdateLessonPlanCourseOutline(w, r)
+			} else {
+				methodNotAllowedJSON(w, "精确课程大纲关联仅支持PUT请求")
+			}
+		// ---- publisher-only旧兼容端点(PUT /plans/{id}/course-outline-publisher) ----
+		// 仅供尚未迁移的旧调用点临时使用，新前端不得继续新增调用。
 		case hasSuffix(path, "/course-outline-publisher") && r.Method == http.MethodPut:
 			lpHandler.UpdateLessonPlanCourseOutlinePublisher(w, r)
 		// ---- 阶段操作 ----

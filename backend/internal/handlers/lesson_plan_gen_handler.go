@@ -1,6 +1,6 @@
 package handlers
 
-// ==================== 教案生成HTTP处理器 ====================
+// lesson_plan_gen_handler.go — 教案生成HTTP处理器
 
 import (
 	"encoding/json"
@@ -15,16 +15,13 @@ import (
 	"tedna/internal/utils"
 )
 
-// LessonPlanGenHandler 教案生成处理器
 type LessonPlanGenHandler struct {
 	genService  *services.LessonPlanGenService
 	authService *services.AuthService
 }
 
-// 模块日志
 var lpGenHandlerLog = logger.WithModule("lp_gen_handler")
 
-// NewLessonPlanGenHandler 创建教案生成处理器
 func NewLessonPlanGenHandler(
 	genService *services.LessonPlanGenService,
 	authService *services.AuthService,
@@ -35,177 +32,242 @@ func NewLessonPlanGenHandler(
 	}
 }
 
-// ==================== POST /plans/start-conversation ====================
-
-func (h *LessonPlanGenHandler) StartConversation(w http.ResponseWriter, r *http.Request) {
+func (h *LessonPlanGenHandler) StartConversation(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
+
 	userID := getCurrentUserID(r)
 	if userID == "" {
 		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
+
 	var req models.StartConversationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
-	lp, openingMsg, err := h.genService.StartConversation(r.Context(), &req, userID)
+
+	lp, openingMsg, err := h.genService.StartConversation(
+		r.Context(),
+		&req,
+		userID,
+	)
 	if err != nil {
 		h.handleGenError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]interface{}{
 		"plan":            lp,
 		"opening_message": openingMsg,
 	})
 }
 
-// ==================== POST /plans/:id/chat ====================
-
-func (h *LessonPlanGenHandler) Chat(w http.ResponseWriter, r *http.Request) {
+func (h *LessonPlanGenHandler) Chat(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
+
 	planID := extractLPGenID(r.URL.Path, "/chat")
 	if planID == "" {
 		utils.BadRequest(w, utils.MsgMissingLessonPlanID)
 		return
 	}
+
 	userID := getCurrentUserID(r)
 	if userID == "" {
 		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
+
 	var req models.LessonPlanChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	req.PlanID = planID
-	if err := h.genService.Chat(r.Context(), &req, userID); err != nil {
+
+	if err := h.genService.ChatWithValidatedComponents(
+		r.Context(),
+		&req,
+		userID,
+	); err != nil {
 		h.handleGenError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]string{
 		"status":  "processing",
 		"message": "AI正在思考，请通过SSE获取回复",
 	})
 }
 
-// ==================== POST /plans/:id/trigger-review ====================
-
-func (h *LessonPlanGenHandler) TriggerAIReview(w http.ResponseWriter, r *http.Request) {
+func (h *LessonPlanGenHandler) TriggerAIReview(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
+
 	planID := extractLPGenID(r.URL.Path, "/trigger-review")
 	if planID == "" {
 		utils.BadRequest(w, utils.MsgMissingLessonPlanID)
 		return
 	}
+
 	userID := getCurrentUserID(r)
 	if userID == "" {
 		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-	if err := h.genService.TriggerAIReview(r.Context(), planID, userID); err != nil {
+
+	if err := h.genService.TriggerAIReview(
+		r.Context(),
+		planID,
+		userID,
+	); err != nil {
 		h.handleGenError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]string{
 		"status":  "reviewing",
 		"message": "AI评审已启动，请通过SSE获取结果",
 	})
 }
 
-// ==================== POST /plans/:id/apply-suggestions ====================
-
-func (h *LessonPlanGenHandler) ApplyAISuggestions(w http.ResponseWriter, r *http.Request) {
+func (h *LessonPlanGenHandler) ApplyAISuggestions(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
+
 	planID := extractLPGenID(r.URL.Path, "/apply-suggestions")
 	if planID == "" {
 		utils.BadRequest(w, utils.MsgMissingLessonPlanID)
 		return
 	}
+
 	userID := getCurrentUserID(r)
 	if userID == "" {
 		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
+
 	var req models.ApplyAISuggestionsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
 	req.PlanID = planID
-	if err := h.genService.ApplyAISuggestions(r.Context(), &req, userID); err != nil {
+
+	if err := h.genService.ApplyAISuggestions(
+		r.Context(),
+		&req,
+		userID,
+	); err != nil {
 		h.handleGenError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]string{
 		"status":  "optimizing",
 		"message": "AI优化已启动，请通过SSE获取更新",
 	})
 }
 
-// ==================== GET /plans/:id/conversation ====================
-
-func (h *LessonPlanGenHandler) GetConversation(w http.ResponseWriter, r *http.Request) {
+func (h *LessonPlanGenHandler) GetConversation(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodGetOnly)
 		return
 	}
+
 	planID := extractLPGenID(r.URL.Path, "/conversation")
 	if planID == "" {
 		utils.BadRequest(w, utils.MsgMissingLessonPlanID)
 		return
 	}
+
 	userID := getCurrentUserID(r)
 	if userID == "" {
 		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
-	msgs, err := h.genService.GetConversation(r.Context(), planID, userID)
+
+	messages, contextCapsule, err :=
+		h.genService.GetConversationWithContextCapsule(
+			r.Context(),
+			planID,
+			userID,
+		)
 	if err != nil {
 		h.handleGenError(w, err)
 		return
 	}
+
 	utils.Success(w, map[string]interface{}{
-		"messages": msgs,
-		"total":    len(msgs),
+		"messages":        messages,
+		"total":           len(messages),
+		"context_capsule": contextCapsule,
 	})
 }
 
-// ==================== GET /sse/plans/:id/stream ====================
-
-func (h *LessonPlanGenHandler) StreamPlan(w http.ResponseWriter, r *http.Request) {
+// StreamPlan 建立教案实时事件连接。
+//
+// 同一教案允许多个标签页、窗口或设备并行订阅。
+// 每个请求只注销自己的channel，不关闭同一教案的其它连接。
+func (h *LessonPlanGenHandler) StreamPlan(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodGet {
 		http.Error(w, utils.MsgMethodGetOnly, http.StatusMethodNotAllowed)
 		return
 	}
+
 	token := r.URL.Query().Get("token")
 	if token == "" {
-		http.Error(w, `{"code":-1,"message":"缺少token参数"}`, http.StatusUnauthorized)
+		http.Error(
+			w,
+			`{"code":-1,"message":"缺少token参数"}`,
+			http.StatusUnauthorized,
+		)
 		return
 	}
-	_, err := h.authService.ValidateToken(token)
-	if err != nil {
-		http.Error(w, `{"code":-1,"message":"token无效或已过期"}`, http.StatusUnauthorized)
+
+	if _, err := h.authService.ValidateToken(token); err != nil {
+		http.Error(
+			w,
+			`{"code":-1,"message":"token无效或已过期"}`,
+			http.StatusUnauthorized,
+		)
 		return
 	}
+
 	planID := extractPlanIDForSSE(r.URL.Path)
 	if planID == "" {
 		http.Error(w, utils.MsgMissingLessonPlanID, http.StatusBadRequest)
 		return
 	}
+
 	finishSSEHandshake, handshakeOK := beginSSEHandshake(w)
 	if !handshakeOK {
 		return
@@ -217,6 +279,7 @@ func (h *LessonPlanGenHandler) StreamPlan(w http.ResponseWriter, r *http.Request
 		http.Error(w, "不支持SSE流", http.StatusInternalServerError)
 		return
 	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -232,56 +295,92 @@ func (h *LessonPlanGenHandler) StreamPlan(w http.ResponseWriter, r *http.Request
 		EventType: models.LPSSEConnected,
 		PlanID:    planID,
 	})
-	lpGenHandlerLog.Debug("教案SSE连接建立", "plan_id", planID, "remote_addr", r.RemoteAddr)
+
+	lpGenHandlerLog.Debug(
+		"教案SSE连接建立",
+		"plan_id",
+		planID,
+		"remote_addr",
+		r.RemoteAddr,
+		"subscriber_count",
+		services.GlobalLPSSEHub.SubscriberCount(planID),
+	)
 
 	ctx := r.Context()
+
 	for {
 		select {
 		case <-ctx.Done():
-			lpGenHandlerLog.Debug("教案SSE客户端断开", "plan_id", planID)
+			lpGenHandlerLog.Debug(
+				"教案SSE客户端断开",
+				"plan_id",
+				planID,
+			)
 			return
-		case event, ok := <-ch:
-			if !ok {
+
+		case event, open := <-ch:
+			if !open {
 				return
 			}
+
 			writeLPSSEEvent(w, flusher, event)
-			if event.EventType == models.LPSSEDone || event.EventType == models.LPSSEError {
+
+			if event.EventType == models.LPSSEDone ||
+				event.EventType == models.LPSSEError {
 				return
 			}
 		}
 	}
 }
 
-// ==================== 辅助函数 ====================
-
-func writeLPSSEEvent(w http.ResponseWriter, flusher http.Flusher, event models.LPSSEEvent) {
+func writeLPSSEEvent(
+	w http.ResponseWriter,
+	flusher http.Flusher,
+	event models.LPSSEEvent,
+) {
 	data, err := json.Marshal(event)
 	if err != nil {
 		return
 	}
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", string(event.EventType), string(data))
+
+	_, _ = fmt.Fprintf(
+		w,
+		"event: %s\ndata: %s\n\n",
+		string(event.EventType),
+		string(data),
+	)
+
 	flusher.Flush()
 }
 
-func extractLPGenID(path string, suffix string) string {
-	prefix := "/api/v1/lesson-plans/plans/"
+func extractLPGenID(
+	path string,
+	suffix string,
+) string {
+	const prefix = "/api/v1/lesson-plans/plans/"
 	return extractMiddleSegment(path, prefix, suffix)
 }
 
-func extractPlanIDForSSE(path string) string {
-	streamIdx := strings.LastIndex(path, "/stream")
-	if streamIdx <= 0 {
+func extractPlanIDForSSE(
+	path string,
+) string {
+	streamIndex := strings.LastIndex(path, "/stream")
+	if streamIndex <= 0 {
 		return ""
 	}
-	path = path[:streamIdx]
+
+	path = path[:streamIndex]
+
 	lastSlash := strings.LastIndex(path, "/")
 	if lastSlash < 0 {
 		return ""
 	}
+
 	id := path[lastSlash+1:]
 	if id == "" || id == "plans" {
 		return ""
 	}
+
 	return id
 }
 
@@ -293,7 +392,8 @@ func (h *LessonPlanGenHandler) handleGenError(
 	case errors.Is(err, services.ErrLPGenServiceDraining):
 		utils.Fail(w, http.StatusServiceUnavailable, err.Error())
 
-	case errors.Is(err, services.ErrLPGenTaskRunning):
+	case errors.Is(err, services.ErrLPGenTaskRunning),
+		errors.Is(err, services.ErrLPGenPublishIntent):
 		utils.Fail(w, http.StatusConflict, err.Error())
 
 	case errors.Is(err, services.ErrLPGenSubjectRequired),
@@ -301,33 +401,48 @@ func (h *LessonPlanGenHandler) handleGenError(
 		errors.Is(err, services.ErrLPGenTopicRequired),
 		errors.Is(err, services.ErrLPGenImportContentRequired),
 		errors.Is(err, services.ErrLPGenImportSourceInvalid),
-		errors.Is(err, services.ErrLPTextbookSelectionInvalid):
+		errors.Is(err, services.ErrLessonPlanWordFileRequired),
+		errors.Is(err, services.ErrLessonPlanWordFileTooLarge),
+		errors.Is(err, services.ErrLessonPlanWordFileInvalid),
+		errors.Is(err, services.ErrLessonPlanWordParseFailed),
+		errors.Is(err, services.ErrLPTextbookSelectionInvalid),
+		errors.Is(err, services.ErrComponentSelectionInvalid),
+		errors.Is(err, services.ErrComponentEducationDomainInvalid),
+		errors.Is(err, services.ErrOutlineExactSelectionInvalid):
 		utils.BadRequest(w, err.Error())
 
 	case errors.Is(err, services.ErrLPGenUnauthorized),
 		errors.Is(err, services.ErrLPGenNotEditable),
 		errors.Is(err, services.ErrLPCreationEducationDomainRequired),
 		errors.Is(err, services.ErrLPCreationEducationDomainConflict),
-		errors.Is(err, services.ErrLPTextbookEducationDomainDenied):
+		errors.Is(err, services.ErrLPTextbookEducationDomainDenied),
+		errors.Is(err, services.ErrOutlineExactSelectionForbidden),
+		errors.Is(err, services.ErrOutlineEducationDomainRequired),
+		errors.Is(err, services.ErrOutlineEducationDomainConflict),
+		errors.Is(err, services.ErrOutlineEducationDomainMismatch):
 		utils.Fail(w, http.StatusForbidden, err.Error())
 
-	case errors.Is(err, services.ErrLPCreationEducationDomainResolveFailed):
+	case errors.Is(err, services.ErrOutlineExactSelectionUnavailable),
+		errors.Is(err, services.ErrLPGenPlanNotFound):
+		utils.Fail(w, http.StatusNotFound, err.Error())
+
+	case errors.Is(err, services.ErrLPCreationEducationDomainResolveFailed),
+		errors.Is(err, services.ErrOutlineEducationDomainResolveFailed):
 		lpGenHandlerLog.Error(
-			"教案创建教育域解析失败",
-			"error", err,
+			"教案创建教育域或课程大纲解析失败",
+			"error",
+			err,
 		)
 		utils.InternalError(
 			w,
-			"教育域解析失败，请稍后重试",
+			"教育域或课程大纲解析失败，请稍后重试",
 		)
-
-	case errors.Is(err, services.ErrLPGenPlanNotFound):
-		utils.Fail(w, http.StatusNotFound, err.Error())
 
 	case errors.Is(err, services.ErrLPGenImportReviewStageRequired):
 		lpGenHandlerLog.Error(
 			"导入流程缺少AI评审阶段",
-			"error", err,
+			"error",
+			err,
 		)
 		utils.InternalError(
 			w,
@@ -337,7 +452,8 @@ func (h *LessonPlanGenHandler) handleGenError(
 	default:
 		lpGenHandlerLog.Error(
 			"教案生成操作失败",
-			"error", err,
+			"error",
+			err,
 		)
 		utils.InternalError(
 			w,
@@ -346,29 +462,36 @@ func (h *LessonPlanGenHandler) handleGenError(
 	}
 }
 
-// ==================== POST /plans/import-existing ====================
-
-// ImportExistingPlan 导入已有教案。
-// 前端负责解析Word/PDF，后端只接收纯文本和元信息。
-func (h *LessonPlanGenHandler) ImportExistingPlan(w http.ResponseWriter, r *http.Request) {
+func (h *LessonPlanGenHandler) ImportExistingPlan(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
 		return
 	}
+
 	userID := getCurrentUserID(r)
 	if userID == "" {
 		utils.Unauthorized(w, utils.MsgNotLoggedIn)
 		return
 	}
+
 	var req models.ImportExistingPlanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, utils.MsgBadRequestBody)
 		return
 	}
-	resp, err := h.genService.ImportExistingPlan(r.Context(), &req, userID)
+
+	response, err := h.genService.ImportExistingPlan(
+		r.Context(),
+		&req,
+		userID,
+	)
 	if err != nil {
 		h.handleGenError(w, err)
 		return
 	}
-	utils.Success(w, resp)
+
+	utils.Success(w, response)
 }

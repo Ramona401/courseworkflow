@@ -65,22 +65,59 @@ export interface EducationProfileContext {
 export function useEducationProfile(): EducationProfileContext {
   const { user } = useAuth()
 
-  const isRegionAdmin = user?.role === 'region_admin'
+  const role =
+    user?.role || ''
 
-  // 区域管理员采用严格模式：
-  //   1. 后端必须显式返回ready=true；
-  //   2. 教育域必须是三个具体教学域之一。
-  //
-  // 其它角色保持兼容窗口：
-  //   - 后端显式返回false时阻断；
-  //   - 字段尚未下发时暂按可用处理，避免原子部署期间误伤存量角色。
+  const isRegionAdmin =
+    role === 'region_admin'
+
+  const isMixedManagementRole =
+    role === 'admin' ||
+    role === 'district_inspector'
+
+  /**
+   * 后端显式返回false时，任何角色都必须阻断教学业务。
+   *
+   * 字段暂未返回时仍允许继续检查具体教育域，但不允许通过
+   * normalizeEducationDomain根据角色把空值静默推断成K12。
+   */
+  const backendReady =
+    user?.education_domain_ready !== false
+
+  const concreteDomainReady =
+    isTeachingDomain(
+      user?.education_domain,
+    )
+
+  const mixedManagementReady =
+    user?.education_domain === 'mixed'
+
+  /**
+   * 教育域就绪规则：
+   *
+   * 1. region_admin：
+   *    必须由后端显式返回ready=true，并具有唯一具体教学域。
+   *
+   * 2. admin、district_inspector：
+   *    只允许明确的mixed管理教育域。
+   *
+   * 3. senior_operator、operator、viewer等教学身份：
+   *    必须具有k12、vocational或adult具体教学域。
+   *
+   * 普通账号教育域为空时不再被前端静默识别成K12，
+   * 从而避免页面允许提交、后端可信Actor却返回403的状态错位。
+   */
   const ready = Boolean(
     user &&
     (
       isRegionAdmin
         ? user.education_domain_ready === true &&
-          isTeachingDomain(user.education_domain)
-        : user.education_domain_ready !== false
+          concreteDomainReady
+        : isMixedManagementRole
+          ? backendReady &&
+            mixedManagementReady
+          : backendReady &&
+            concreteDomainReady
     ),
   )
 

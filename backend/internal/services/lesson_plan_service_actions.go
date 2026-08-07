@@ -29,48 +29,60 @@ type StartDevelopmentResult struct {
 	Message    string `json:"message"`
 }
 
+var (
+	ErrLPPublishStatusInvalid = errors.New(
+		"只有草稿、退回或已发布状态的教案可以个人发布",
+	)
+	ErrLPPublishVersionConflict = errors.New(
+		"教案正文已更新，请刷新并确认右侧最新版本后再发布",
+	)
+	ErrLPWordOutOfSyncForPublish = errors.New(
+		"原格式Word与当前教案正文不同步，不能发布，请先恢复或重新同步",
+	)
+)
+
 // ==================== 教案状态流转 ====================
 
 // PublishPersonal 个人发布。
+//
+// expectedVersions为可选参数，兼容旧内部调用；新前端提交右侧正式版本。
 func (s *LessonPlanService) PublishPersonal(
 	ctx context.Context,
 	id string,
 	callerID string,
+	expectedVersions ...int,
 ) error {
-	lessonPlan, err := repository.GetLessonPlanByID(
+	expectedVersion := 0
+	if len(expectedVersions) > 0 {
+		expectedVersion = expectedVersions[0]
+	}
+
+	err := repository.CommitLessonPlanPersonalPublishAtVersion(
 		ctx,
 		id,
+		callerID,
+		expectedVersion,
 	)
-	if err != nil {
-		return s.mapNotFoundErr(err)
+	if err == nil {
+		return nil
 	}
-	if lessonPlan.AuthorID != callerID {
+
+	switch {
+	case errors.Is(err, repository.ErrLessonPlanPublishNotFound):
+		return ErrLPNotFound
+	case errors.Is(err, repository.ErrLessonPlanPublishNotAuthor):
 		return ErrLPNotAuthor
-	}
-
-	if lessonPlan.Status != models.LPStatusDraft &&
-		lessonPlan.Status != models.LPStatusRevision &&
-		lessonPlan.Status != models.LPStatusPublishedPersonal {
-		return errors.New(
-			"只有草稿、退回或已发布状态的教案可以个人发布",
-		)
-	}
-
-	if strings.TrimSpace(
-		lessonPlan.ContentMarkdown,
-	) == "" {
-		lpLog.Info(
-			"个人发布被拦截：教案正文为空",
-			"plan_id", id,
-		)
+	case errors.Is(err, repository.ErrLessonPlanPublishStatusInvalid):
+		return ErrLPPublishStatusInvalid
+	case errors.Is(err, repository.ErrLessonPlanPublishContentEmpty):
 		return ErrLPContentEmpty
+	case errors.Is(err, repository.ErrLessonPlanPublishVersionConflict):
+		return ErrLPPublishVersionConflict
+	case errors.Is(err, repository.ErrLessonPlanPublishWordOutOfSync):
+		return ErrLPWordOutOfSyncForPublish
+	default:
+		return err
 	}
-
-	return repository.UpdateLessonPlanStatus(
-		ctx,
-		id,
-		models.LPStatusPublishedPersonal,
-	)
 }
 
 // SubmitForReview 提交评审。

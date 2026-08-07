@@ -50,65 +50,92 @@ func (s *WorkshopStageService) GetRecommendedComponents(
 	stageCode string,
 	callerID string,
 ) (*models.StageRecommendedComponentsResponse, error) {
-	lp, err := repository.GetLessonPlanByID(
-		ctx,
-		lessonPlanID,
-	)
+	lessonPlan, err :=
+		repository.GetLessonPlanByID(
+			ctx,
+			lessonPlanID,
+		)
+
 	if err != nil {
-		return nil, ErrLPGenPlanNotFound
-	}
-	if lp.AuthorID != callerID {
-		return nil, ErrLPGenUnauthorized
+		return nil,
+			ErrLPGenPlanNotFound
 	}
 
-	compTypes, hasMapping := stageComponentTypeMap[stageCode]
-	if !hasMapping || len(compTypes) == 0 {
+	if lessonPlan.AuthorID != callerID {
+		return nil,
+			ErrLPGenUnauthorized
+	}
+
+	// 后续所有组件读取只认教案创建时教育域快照。
+	ctx = withLessonComponentDomain(
+		ctx,
+		lessonPlan.EducationDomain,
+	)
+
+	componentTypes, hasMapping :=
+		stageComponentTypeMap[stageCode]
+
+	if !hasMapping ||
+		len(componentTypes) == 0 {
 		return &models.StageRecommendedComponentsResponse{
-			StageCode:  stageCode,
-			StageName:  stageCodeToName(stageCode),
+			StageCode: stageCode,
+			StageName: stageCodeToName(
+				stageCode,
+			),
 			Components: []*models.RecommendedComponentItem{},
 		}, nil
 	}
 
-	seenIDs := make(map[string]bool)
-	var allItems []*models.RecommendedComponentItem
+	seenIDs := make(
+		map[string]bool,
+	)
 
-	// 配方组件按本会话的选择方式加载：
-	//   - 自动配方继续严格匹配学科和具体年级；
-	//   - 老师指定配方只校验active与使用权限；
-	//   - 明确不使用配方时不提供配方组件。
-	if lp.RecipeID != nil &&
-		strings.TrimSpace(*lp.RecipeID) != "" {
+	allItems := make(
+		[]*models.RecommendedComponentItem,
+		0,
+	)
+
+	if lessonPlan.RecipeID != nil &&
+		strings.TrimSpace(
+			*lessonPlan.RecipeID,
+		) != "" {
 		recipe, selectionMode, recipeErr :=
 			loadRecipeForPlanUse(
 				ctx,
-				lp,
+				lessonPlan,
 			)
 
 		if recipeErr != nil {
 			wsLog.Info(
 				"阶段组件推荐忽略当前不可用的配方",
-				"plan_id", lessonPlanID,
-				"stage", stageCode,
-				"recipe_id", *lp.RecipeID,
-				"recipe_mode", selectionMode,
-				"subject", lp.Subject,
-				"grade", lp.Grade,
-				"error", recipeErr,
+				"plan_id",
+				lessonPlanID,
+				"stage",
+				stageCode,
+				"recipe_id",
+				*lessonPlan.RecipeID,
+				"recipe_mode",
+				selectionMode,
+				"error",
+				recipeErr,
 			)
 		} else if recipe != nil {
-			recipeItems := s.getRecipeComponentsForStage(
-				ctx,
-				recipe,
-				compTypes,
-			)
+			recipeItems :=
+				s.getRecipeComponentsForStage(
+					ctx,
+					recipe,
+					componentTypes,
+				)
+
 			for _, item := range recipeItems {
-				if seenIDs[item.ID] {
+				if item == nil ||
+					seenIDs[item.ID] {
 					continue
 				}
 
 				seenIDs[item.ID] = true
 				item.Source = "recipe"
+
 				allItems = append(
 					allItems,
 					item,
@@ -117,101 +144,179 @@ func (s *WorkshopStageService) GetRecommendedComponents(
 		}
 	}
 
-	// 自动组件仍按当前教案的学科和具体年级匹配。
-	autoItems := s.getAutoMatchedComponentsForStage(
-		ctx,
-		compTypes,
-		lp.Subject,
-		lp.Grade,
-	)
+	autoItems :=
+		s.getAutoMatchedComponentsForStage(
+			ctx,
+			componentTypes,
+			lessonPlan.Subject,
+			lessonPlan.Grade,
+		)
+
 	for _, item := range autoItems {
-		if seenIDs[item.ID] {
+		if item == nil ||
+			seenIDs[item.ID] {
 			continue
 		}
 
 		seenIDs[item.ID] = true
 		item.Source = "auto"
+
 		allItems = append(
 			allItems,
 			item,
 		)
 	}
 
-	if allItems == nil {
-		allItems = []*models.RecommendedComponentItem{}
-	}
-
 	wsLog.Info(
-		"获取阶段推荐组件",
-		"plan_id", lessonPlanID,
-		"stage", stageCode,
-		"total_components", len(allItems),
+		"获取教育域过滤后的阶段推荐组件",
+		"plan_id",
+		lessonPlanID,
+		"stage",
+		stageCode,
+		"education_domain",
+		lessonPlan.EducationDomain,
+		"total_components",
+		len(allItems),
 	)
 
 	return &models.StageRecommendedComponentsResponse{
-		StageCode:  stageCode,
-		StageName:  stageCodeToName(stageCode),
+		StageCode: stageCode,
+		StageName: stageCodeToName(
+			stageCode,
+		),
 		Components: allItems,
 	}, nil
 }
 
 // getRecipeComponentsForStage 从配方已选组件中筛选匹配当前阶段类型的组件
-func (s *WorkshopStageService) getRecipeComponentsForStage(ctx context.Context, recipe *models.TeachingRecipe, stageTypes []string) []*models.RecommendedComponentItem {
-	var allComponentIDs []string
-	if err := json.Unmarshal([]byte(recipe.ComponentIDs), &allComponentIDs); err != nil || len(allComponentIDs) == 0 {
+func (s *WorkshopStageService) getRecipeComponentsForStage(
+	ctx context.Context,
+	recipe *models.TeachingRecipe,
+	stageTypes []string,
+) []*models.RecommendedComponentItem {
+	var componentIDs []string
+
+	if err := json.Unmarshal(
+		[]byte(recipe.ComponentIDs),
+		&componentIDs,
+	); err != nil ||
+		len(componentIDs) == 0 {
 		return nil
 	}
-	typeSet := make(map[string]bool)
-	for _, t := range stageTypes {
-		typeSet[t] = true
-	}
-	groups, err := repository.GetRecipeComponentContents(ctx, allComponentIDs)
-	if err != nil || len(groups) == 0 {
+
+	groups, err :=
+		loadHistoricalComponentGroupsForRuntime(
+			ctx,
+			componentIDs,
+		)
+
+	if err != nil ||
+		len(groups) == 0 {
 		return nil
 	}
-	var items []*models.RecommendedComponentItem
-	for _, g := range groups {
-		if !typeSet[g.LibraryType] {
+
+	groups =
+		filterComponentGroupsByLibraryTypes(
+			groups,
+			stageTypes,
+		)
+
+	items := make(
+		[]*models.RecommendedComponentItem,
+		0,
+	)
+
+	for _, group := range groups {
+		if group == nil {
 			continue
 		}
-		for _, c := range g.Components {
-			items = append(items, &models.RecommendedComponentItem{
-				ID: c.ID, LibraryType: g.LibraryType, LibraryName: g.LibraryName,
-				DisplayLabel: c.DisplayLabel, DesignLogic: c.DesignLogic,
-				FullGuide: c.FullGuide, ExampleSnippet: c.ExampleSnippet,
-				QualityScore: c.QualityScore, Source: "recipe",
-			})
+
+		for _, component := range group.Components {
+			if component == nil {
+				continue
+			}
+
+			items = append(
+				items,
+				&models.RecommendedComponentItem{
+					ID:             component.ID,
+					LibraryType:    group.LibraryType,
+					LibraryName:    group.LibraryName,
+					DisplayLabel:   component.DisplayLabel,
+					DesignLogic:    component.DesignLogic,
+					FullGuide:      component.FullGuide,
+					ExampleSnippet: component.ExampleSnippet,
+					QualityScore:   component.QualityScore,
+					Source:         "recipe",
+				},
+			)
 		}
 	}
+
 	return items
 }
 
 // getAutoMatchedComponentsForStage 从组件库自动匹配阶段组件
-func (s *WorkshopStageService) getAutoMatchedComponentsForStage(ctx context.Context, stageTypes []string, subject string, grade string) []*models.RecommendedComponentItem {
-	normalizedGrade := utils.NormalizeGradeToNumber(grade)
-	wsLog.Info("自动匹配组件参数", "subject", subject, "grade", grade, "normalizedGrade", normalizedGrade, "stageTypes", stageTypes)
-	groups, err := repository.MatchComponents(ctx, &models.MatchComponentsRequest{
-		Subject: subject, GradeRange: normalizedGrade, LibraryTypes: stageTypes, Limit: 3,
-	})
-	if err != nil {
-		wsLog.Warn("自动匹配组件查询失败", "error", err)
+func (s *WorkshopStageService) getAutoMatchedComponentsForStage(
+	ctx context.Context,
+	stageTypes []string,
+	subject string,
+	grade string,
+) []*models.RecommendedComponentItem {
+	request := &models.MatchComponentsRequest{
+		Subject: strings.TrimSpace(
+			subject,
+		),
+		GradeRange: utils.NormalizeGradeToNumber(
+			grade,
+		),
+		LibraryTypes: stageTypes,
+		Limit:        3,
+	}
+
+	groups, err :=
+		matchStageComponentsForRuntime(
+			ctx,
+			request,
+		)
+
+	if err != nil ||
+		len(groups) == 0 {
 		return nil
 	}
-	wsLog.Info("自动匹配组件结果", "groups_count", len(groups))
-	if len(groups) == 0 {
-		return nil
-	}
-	var items []*models.RecommendedComponentItem
-	for _, g := range groups {
-		for _, c := range g.Components {
-			items = append(items, &models.RecommendedComponentItem{
-				ID: c.ID, LibraryType: g.LibraryType, LibraryName: g.LibraryName,
-				DisplayLabel: c.DisplayLabel, DesignLogic: c.DesignLogic,
-				FullGuide: c.FullGuide, ExampleSnippet: c.ExampleSnippet,
-				QualityScore: c.QualityScore, Source: "auto",
-			})
+
+	items := make(
+		[]*models.RecommendedComponentItem,
+		0,
+	)
+
+	for _, group := range groups {
+		if group == nil {
+			continue
+		}
+
+		for _, component := range group.Components {
+			if component == nil {
+				continue
+			}
+
+			items = append(
+				items,
+				&models.RecommendedComponentItem{
+					ID:             component.ID,
+					LibraryType:    group.LibraryType,
+					LibraryName:    group.LibraryName,
+					DisplayLabel:   component.DisplayLabel,
+					DesignLogic:    component.DesignLogic,
+					FullGuide:      component.FullGuide,
+					ExampleSnippet: component.ExampleSnippet,
+					QualityScore:   component.QualityScore,
+					Source:         "auto",
+				},
+			)
 		}
 	}
+
 	return items
 }
 

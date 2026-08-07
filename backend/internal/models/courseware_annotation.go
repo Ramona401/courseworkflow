@@ -1,46 +1,61 @@
 package models
 
-// courseware_annotation.go — 课件页级批注数据模型(阶段2)
+// courseware_annotation.go — 课件页级批注数据模型
 //
-// 镜像 annotation.go(教案段落批注),核心差异:
-//   - 挂载点从"段落序号 paragraph_index"换成"页码 page_number"(对齐 courseware_pages.page_number)
-//   - 不含 review_round(评审轮次):课件多级审核在阶段3才接入,本期是纯人工批注闭环
-//   - 状态保留三态(pending/resolved/archived),archived 留给阶段3,本期只用 pending/resolved
+// 页面定位语义：
+//   - PageID：稳定页面ID，页面重排后保持不变；
+//   - PageNumber：目标页面当前页码，页面已删除时回退到创建时页码；
+//   - PageNumberSnapshot：创建批注时的历史页码；
+//   - 页面被删除后PageID为空，但批注记录和历史页码继续保留。
 //
-// 复用既有的 AnnotationStatusPending/Resolved/Archived 常量(定义在 annotation.go,同 models 包)。
+// 批注状态复用annotation.go中已有常量：
+// pending / resolved / archived。
 
 import "time"
 
 // ==================== 数据库实体 ====================
 
-// CoursewareAnnotation 课件页级批注记录(对应 courseware_annotations 表)
+// CoursewareAnnotation 课件页级批注记录。
 type CoursewareAnnotation struct {
-	ID           string    `json:"id"`
-	CoursewareID string    `json:"courseware_id"`
-	PageNumber   int       `json:"page_number"`   // 批注挂在第几页(对齐 courseware_pages.page_number)
-	ReviewerID   string    `json:"reviewer_id"`   // 批注人ID
-	ReviewerName string    `json:"reviewer_name"` // 批注人显示名(冗余,免每次 JOIN)
-	Content      string    `json:"content"`       // 批注内容
-	Status       string    `json:"status"`        // pending / resolved / archived
+	ID           string  `json:"id"`
+	CoursewareID string  `json:"courseware_id"`
+	PageID       *string `json:"page_id"`
+
+	// PageNumber由查询层根据PageID解析当前页码。
+	// 页面已删除时回退到PageNumberSnapshot。
+	PageNumber int `json:"page_number"`
+
+	// PageNumberSnapshot记录创建批注时的页码，不随页面重排变化。
+	PageNumberSnapshot int `json:"page_number_snapshot"`
+
+	ReviewerID   string    `json:"reviewer_id"`
+	ReviewerName string    `json:"reviewer_name"`
+	Content      string    `json:"content"`
+	Status       string    `json:"status"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // ==================== 请求 / 响应模型 ====================
 
-// CreateCWAnnotationRequest 创建课件批注请求
+// CreateCWAnnotationRequest 创建课件批注请求。
+//
+// 前端仍提交当前页码；服务层会在写入前解析稳定PageID，
+// 数据库兼容触发器负责保护旧版本后端。
 type CreateCWAnnotationRequest struct {
-	PageNumber int    `json:"page_number"` // 必填,挂在第几页
-	Content    string `json:"content"`     // 必填,批注内容
+	PageNumber int    `json:"page_number"`
+	Content    string `json:"content"`
 }
 
-// ResolveCWAnnotationRequest 标记课件批注处理状态请求
+// ResolveCWAnnotationRequest 标记课件批注处理状态请求。
 type ResolveCWAnnotationRequest struct {
-	Status string `json:"status"` // resolved / pending
+	Status string `json:"status"`
 }
 
-// CWAnnotationListResponse 课件批注列表响应
-// 前端可按 page_number 分组,在胶片条对应页挂气泡;status 区分待处理/已处理
+// CWAnnotationListResponse 课件批注列表响应。
+//
+// 前端可按PageID稳定关联页面；PageNumber用于当前展示和跳转，
+// PageNumberSnapshot用于页面删除后的历史说明。
 type CWAnnotationListResponse struct {
 	Annotations []*CoursewareAnnotation `json:"annotations"`
 	Total       int                     `json:"total"`

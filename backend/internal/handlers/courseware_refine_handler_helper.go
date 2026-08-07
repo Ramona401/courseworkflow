@@ -1,12 +1,15 @@
 package handlers
 
-// courseware_refine_handler_helper.go — 课件教研微调Handler可信Actor辅助
+// courseware_refine_handler_helper.go
+//
+// 课件教研微调Handler可信Actor辅助和错误映射。
 
 import (
 	"context"
 	"errors"
 	"net/http"
 
+	"tedna/internal/repository"
 	"tedna/internal/services"
 	"tedna/internal/utils"
 )
@@ -42,7 +45,7 @@ func (h *CoursewareGenHandler) authorizeCoursewareRefineForHandler(
 	return scopedActor, nil
 }
 
-// writeCoursewareRefineError 统一映射教研微调Actor和页面冲突错误。
+// writeCoursewareRefineError 统一映射教研微调、页面冲突和整改项应用错误。
 func writeCoursewareRefineError(
 	w http.ResponseWriter,
 	err error,
@@ -55,6 +58,10 @@ func writeCoursewareRefineError(
 		errors.Is(
 			err,
 			services.ErrCoursewarePageNotFound,
+		),
+		errors.Is(
+			err,
+			repository.ErrCoursewareReviewItemNotFound,
 		):
 		utils.Fail(
 			w,
@@ -68,11 +75,23 @@ func writeCoursewareRefineError(
 	),
 		errors.Is(
 			err,
+			services.ErrCWAIReviewActorRequired,
+		),
+		errors.Is(
+			err,
 			services.ErrCoursewareEditDenied,
 		),
 		errors.Is(
 			err,
 			services.ErrCoursewareEducationDomainMismatch,
+		),
+		errors.Is(
+			err,
+			services.ErrCWAIReviewNoPermission,
+		),
+		errors.Is(
+			err,
+			services.ErrCWReviewItemNotDelivered,
 		):
 		utils.Fail(
 			w,
@@ -83,7 +102,39 @@ func writeCoursewareRefineError(
 	case errors.Is(
 		err,
 		services.ErrCoursewarePageMutationConflict,
-	):
+	),
+		errors.Is(
+			err,
+			repository.ErrCoursewareReviewItemConflict,
+		),
+		errors.Is(
+			err,
+			services.ErrCWReviewItemStale,
+		),
+		errors.Is(
+			err,
+			services.ErrCWReviewItemOrphaned,
+		),
+		errors.Is(
+			err,
+			services.ErrCWReviewItemNotActionable,
+		),
+		errors.Is(
+			err,
+			services.ErrCWReviewItemApplicationPageMismatch,
+		),
+		errors.Is(
+			err,
+			services.ErrCWReviewItemApplicationInstructionMissing,
+		),
+		errors.Is(
+			err,
+			services.ErrCWReviewItemApplicationInstructionMismatch,
+		),
+		errors.Is(
+			err,
+			services.ErrCWReviewItemApplicationVersionMismatch,
+		):
 		utils.Fail(
 			w,
 			http.StatusConflict,

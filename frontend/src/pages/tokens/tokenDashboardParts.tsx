@@ -228,43 +228,298 @@ export function PurchasesTable({ items }: { items: PurchaseListItem[] }) {
 }
 
 // ==================== 消费流水表格 ====================
-export function ConsumptionTable({ items, isAdmin = false }: { items: ConsumptionListItem[]; isAdmin?: boolean }) {
-  // 批三-3a：模型列与美元成本列仅 admin 可见；非 admin（区域/学校管理员/老师）只看场景+积分。
-  // admin 看到的模型列也显示业务别名（批三-2 映射），不暴露真实模型名。
-  const [resolveAlias, setResolveAlias] = useState<((m: string) => string) | null>(null)
+
+const CONSUMPTION_UNIT_LABELS: Record<string, string> = {
+  request: '次',
+  image: '张',
+  video: '个视频',
+  character: '字符',
+  audio_second: '秒',
+  second: '秒',
+  provider_token: '供应商计量',
+}
+
+function formatConsumptionNumber(
+  value: number,
+): string {
+  if (
+    value > 0 &&
+    value < 10
+  ) {
+    return value.toLocaleString(
+      'zh-CN',
+      {
+        maximumFractionDigits: 3,
+      },
+    )
+  }
+
+  return value.toLocaleString(
+    'zh-CN',
+    {
+      maximumFractionDigits: 2,
+    },
+  )
+}
+
+function resolveConsumptionBusinessName(
+  item: ConsumptionListItem,
+): string {
+  return (
+    item.business_name?.trim() ||
+    item.billing_node_name?.trim() ||
+    SCENE_CODE_LABELS[item.scene_code] ||
+    item.scene_code ||
+    'AI服务'
+  )
+}
+
+function resolveConsumptionUsage(
+  item: ConsumptionListItem,
+): string {
+  const safeUnit =
+    item.usage_unit?.trim()
+
+  if (safeUnit) {
+    const quantity =
+      item.usage_quantity ?? 0
+
+    return `${formatConsumptionNumber(quantity)} ${
+      CONSUMPTION_UNIT_LABELS[safeUnit] ||
+      safeUnit
+    }`
+  }
+
+  const internalUnit =
+    item.media_unit?.trim()
+
+  if (
+    internalUnit &&
+    (item.media_quantity ?? 0) > 0
+  ) {
+    return `${formatConsumptionNumber(
+      item.media_quantity ?? 0,
+    )} ${
+      CONSUMPTION_UNIT_LABELS[internalUnit] ||
+      internalUnit
+    }`
+  }
+
+  return '1 次'
+}
+
+export function ConsumptionTable({
+  items,
+  isSuperAdmin = false,
+}: {
+  items: ConsumptionListItem[]
+  isSuperAdmin?: boolean
+}) {
+  // 财务成本、真实模型和Token明细只对超级管理员显示。
+  // 其它角色只看到积分、业务名称、安全用量、余额与时间。
+  const [resolveAlias, setResolveAlias] =
+    useState<((model: string) => string) | null>(null)
 
   useEffect(() => {
-    // 仅 admin 拉别名规则（接口 adminOnly，非 admin 不调，避免 403）
-    if (!isAdmin) { setResolveAlias(null); return }
-    let alive = true
-    loadAliasResolver().then(fn => { if (alive) setResolveAlias(() => fn) })
-    return () => { alive = false }
-  }, [isAdmin])
+    if (!isSuperAdmin) {
+      setResolveAlias(null)
+      return
+    }
 
-  if (!items?.length) return <div style={{ textAlign: 'center', color: C.textMuted, padding: '40px' }}>暂无消费记录</div>
+    let alive = true
+
+    loadAliasResolver().then(resolver => {
+      if (alive) {
+        setResolveAlias(
+          () => resolver,
+        )
+      }
+    })
+
+    return () => {
+      alive = false
+    }
+  }, [isSuperAdmin])
+
+  if (!items?.length) {
+    return (
+      <div style={{
+        textAlign: 'center',
+        color: C.textMuted,
+        padding: '40px',
+      }}>
+        暂无消费记录
+      </div>
+    )
+  }
+
   return (
-    <div style={{ background: C.white, borderRadius: '12px', border: `1px solid ${C.border}`, overflow: 'auto' }}>
-      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-        <thead><tr>
-          <th style={thStyle}>用户</th><th style={thStyle}>消费积分</th><th style={thStyle}>场景</th>
-          {isAdmin && <th style={thStyle}>模型</th>}
-          <th style={thStyle}>Token(入/出)</th>
-          {isAdmin && <th style={thStyle}>美元成本</th>}
-          <th style={thStyle}>余额变化</th><th style={thStyle}>时间</th>
-        </tr></thead>
+    <div style={{
+      background: C.white,
+      borderRadius: '12px',
+      border: `1px solid ${C.border}`,
+      overflow: 'auto',
+    }}>
+      <table style={{
+        width: '100%',
+        borderCollapse: 'collapse',
+      }}>
+        <thead>
+          <tr>
+            <th style={thStyle}>用户</th>
+            <th style={thStyle}>消费积分</th>
+            <th style={thStyle}>业务</th>
+            <th style={thStyle}>用量</th>
+            {isSuperAdmin && (
+              <th style={thStyle}>模型</th>
+            )}
+            {isSuperAdmin && (
+              <th style={thStyle}>Token(入/出)</th>
+            )}
+            {isSuperAdmin && (
+              <th style={thStyle}>美元成本</th>
+            )}
+            <th style={thStyle}>余额变化</th>
+            <th style={thStyle}>时间</th>
+          </tr>
+        </thead>
+
         <tbody>
-          {items.map(c => (
-            <tr key={c.id}>
-              <td style={tdStyle}>{c.user_name}</td>
-              <td style={tdStyle}><span style={{ fontWeight: 600, color: C.red }}>-{c.amount.toLocaleString()}</span></td>
-              <td style={tdStyle}><span style={{ fontSize: '12px', padding: '2px 6px', borderRadius: '4px', background: 'rgba(139,92,246,0.08)', color: C.purple }}>{SCENE_CODE_LABELS[c.scene_code] || c.scene_code}</span></td>
-              {isAdmin && <td style={{ ...tdStyle, fontSize: '12px' }}>{resolveAlias ? resolveAlias(c.model_used) : '…'}</td>}
-              <td style={tdStyle}><span style={{ fontSize: '12px' }}>{c.input_tokens > 0 ? `${c.input_tokens.toLocaleString()} / ${c.output_tokens.toLocaleString()}` : c.tokens_used.toLocaleString()}</span></td>
-              {isAdmin && <td style={tdStyle}><span style={{ fontSize: '12px', color: C.textSec }}>{c.cost_usd > 0 ? `$${c.cost_usd.toFixed(6)}` : '-'}</span></td>}
-              <td style={{ ...tdStyle, fontSize: '12px', color: C.textSec }}>{c.balance_before.toLocaleString()} → {c.balance_after.toLocaleString()}</td>
-              <td style={{ ...tdStyle, fontSize: '12px', color: C.textSec }}>{new Date(c.created_at).toLocaleString('zh-CN')}</td>
-            </tr>
-          ))}
+          {items.map(item => {
+            const modelUsed =
+              item.model_used ||
+              item.model_name ||
+              ''
+
+            const inputTokens =
+              item.input_tokens ?? 0
+
+            const outputTokens =
+              item.output_tokens ?? 0
+
+            const totalTokens =
+              item.tokens_used ?? 0
+
+            const costUSD =
+              item.cost_usd ?? 0
+
+            return (
+              <tr key={item.id}>
+                <td style={tdStyle}>
+                  {item.user_name}
+                </td>
+
+                <td style={tdStyle}>
+                  <span style={{
+                    fontWeight: 600,
+                    color: C.red,
+                  }}>
+                    -{item.amount.toLocaleString(
+                      'zh-CN',
+                      {
+                        maximumFractionDigits: 4,
+                      },
+                    )}
+                  </span>
+                </td>
+
+                <td style={tdStyle}>
+                  <span style={{
+                    display: 'inline-flex',
+                    fontSize: '12px',
+                    padding: '3px 8px',
+                    borderRadius: '999px',
+                    background: 'rgba(139,92,246,0.08)',
+                    color: C.purple,
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {resolveConsumptionBusinessName(
+                      item,
+                    )}
+                  </span>
+                </td>
+
+                <td style={{
+                  ...tdStyle,
+                  whiteSpace: 'nowrap',
+                }}>
+                  {resolveConsumptionUsage(
+                    item,
+                  )}
+                </td>
+
+                {isSuperAdmin && (
+                  <td style={{
+                    ...tdStyle,
+                    fontSize: '12px',
+                  }}>
+                    {resolveAlias && modelUsed
+                      ? resolveAlias(modelUsed)
+                      : '…'}
+                  </td>
+                )}
+
+                {isSuperAdmin && (
+                  <td style={tdStyle}>
+                    <span style={{
+                      fontSize: '12px',
+                    }}>
+                      {inputTokens > 0
+                        ? `${inputTokens.toLocaleString()} / ${outputTokens.toLocaleString()}`
+                        : totalTokens.toLocaleString()}
+                    </span>
+                  </td>
+                )}
+
+                {isSuperAdmin && (
+                  <td style={tdStyle}>
+                    <span style={{
+                      fontSize: '12px',
+                      color: C.textSec,
+                    }}>
+                      {costUSD > 0
+                        ? `$${costUSD.toFixed(6)}`
+                        : '-'}
+                    </span>
+                  </td>
+                )}
+
+                <td style={{
+                  ...tdStyle,
+                  fontSize: '12px',
+                  color: C.textSec,
+                  whiteSpace: 'nowrap',
+                }}>
+                  {item.balance_before.toLocaleString(
+                    'zh-CN',
+                    {
+                      maximumFractionDigits: 4,
+                    },
+                  )}
+                  {' → '}
+                  {item.balance_after.toLocaleString(
+                    'zh-CN',
+                    {
+                      maximumFractionDigits: 4,
+                    },
+                  )}
+                </td>
+
+                <td style={{
+                  ...tdStyle,
+                  fontSize: '12px',
+                  color: C.textSec,
+                  whiteSpace: 'nowrap',
+                }}>
+                  {new Date(
+                    item.created_at,
+                  ).toLocaleString(
+                    'zh-CN',
+                  )}
+                </td>
+              </tr>
+            )
+          })}
         </tbody>
       </table>
     </div>

@@ -16,7 +16,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useAuth } from '@/store/auth'
 import { useProtectedDraft } from '@/hooks/useProtectedDraft'
-import { generateCWImage, generateCWVideo, getStoredVideoStoryboards, listPageAssets, queryVideoStatus, saveVideoStoryboards, suggestVideoPrompt } from '@/api/coursewares'
+import { createCWVideoOperationID, createCWVideoFirstFrameOperationID, generateCWVideo, generateCWVideoFirstFrame, getStoredVideoStoryboards, listPageAssets, queryVideoStatus, saveVideoStoryboards, suggestVideoPrompt } from '@/api/coursewares'
 import type { VideoStoryboardItem, CoursewareAsset } from '@/api/coursewares'
 import { C } from './courseware-workshop/workshopConstants'
 
@@ -28,6 +28,7 @@ interface ShotState {
   narration: string
   frameAssetId: string  // 本镜已生成首帧图资产ID（''=未生成）
   frameUrl: string      // 本镜已生成首帧图URL
+  frameOperationId: string // 本次首帧业务操作UUID；失败重试复用，成功后清空
   useShot1Ref: boolean  // 第2镜起：是否用第1镜首帧做参考图（默认true）
 }
 
@@ -55,6 +56,63 @@ export default function VideoStoryboardPanel({ coursewareId, pageNum, styleAncho
   const [videoResult, setVideoResult] = useState<{ url: string; duration: number; resolution: string } | null>(null)
   const submittedPromptRef = useRef('')
   const saveTimerRef = useRef<number | null>(null)
+
+  /**
+   * 同一提示词、页面和首帧的提交失败重试复用原operation_id。
+   * 任一业务输入变化都会自动创建新的operation_id。
+   */
+  const videoOperationRef = useRef<{
+    fingerprint: string
+    operationId: string
+  }>({
+    fingerprint: '',
+    operationId: '',
+  })
+
+  const resolveVideoOperationID = (
+    fingerprint: string,
+  ): string => {
+    const current =
+      videoOperationRef.current
+
+    if (
+      current.fingerprint === fingerprint &&
+      current.operationId
+    ) {
+      return current.operationId
+    }
+
+    const operationId =
+      createCWVideoOperationID()
+
+    videoOperationRef.current = {
+      fingerprint,
+      operationId,
+    }
+
+    return operationId
+  }
+
+  const clearVideoOperationID = () => {
+    videoOperationRef.current = {
+      fingerprint: '',
+      operationId: '',
+    }
+  }
+
+  const shouldPreserveVideoOperationID = (
+    error: unknown,
+  ): boolean => {
+    const message =
+      error instanceof Error
+        ? error.message
+        : String(error || '')
+
+    return /正在提交|尚未确认|稍后查看|Network Error|timeout|超时|网络/i.test(
+      message,
+    )
+  }
+
 
   const { user } = useAuth()
 
@@ -88,6 +146,7 @@ export default function VideoStoryboardPanel({ coursewareId, pageNum, styleAncho
     setShots([]); setActiveIdx(0); setMsg('')
     setVideoResult(null); setVideoAssetId(''); setVideoPolling(false); setVideoSubmitting(false)
     setFrameGenIdx(-1)
+    clearVideoOperationID()
     if (!coursewareId || pageNum <= 0) return
     let cancelled = false
     listPageAssets(coursewareId, pageNum)
@@ -151,6 +210,7 @@ export default function VideoStoryboardPanel({ coursewareId, pageNum, styleAncho
             narration: it.narration || '',
             // 回填已存首帧关联: 恢复缩略图显示与视频按钮就绪态(库里无则为空串, 行为同未生成)
             frameAssetId: it.frame_asset_id || '', frameUrl: it.frame_url || '',
+            frameOperationId: '',
             useShot1Ref: i >= 1,
           })))
           setActiveIdx(0)
@@ -175,6 +235,7 @@ export default function VideoStoryboardPanel({ coursewareId, pageNum, styleAncho
         videoPrompt: it.video_prompt || '',
         narration: it.narration || '',
         frameAssetId: '', frameUrl: '',
+        frameOperationId: '',
         useShot1Ref: i >= 1,
       }))
       setShots(next); setActiveIdx(0)
@@ -207,74 +268,326 @@ export default function VideoStoryboardPanel({ coursewareId, pageNum, styleAncho
     })
   }
 
-  // ② 生成本镜首帧图(16:9)。第2镜起若勾选且第1镜已有首帧 → 用第1镜首帧做参考图
+  // ② 生成本镜首帧图(16:9)。
+  //
+  // 后端使用独立/generate-video-first-frame入口，
+  // 固定计入video_first_frame节点。前端只提交业务operation_id，
+  // 不能指定或覆盖计费节点。
+  //
+  // 请求失败时保留本次operation_id，老师点击重试会继续复用同一业务键；
+  // 成功后清空operation_id，下一次“重新生成”会创建新的业务操作。
   const handleGenFrame = async (idx: number) => {
     const shot = shots[idx]
     if (!shot || genBusy) return
+
     const prompt = shot.imagePrompt.trim()
-    if (!prompt) { setMsg('⚠️ 请先填写第' + (idx + 1) + '镜的首帧图提示词'); return }
-    let refUrl: string | undefined = undefined
-    if (idx >= 1 && shot.useShot1Ref && shots[0] && shots[0].frameUrl) refUrl = shots[0].frameUrl
+    if (!prompt) {
+      setMsg('⚠️ 请先填写第' + (idx + 1) + '镜的首帧图提示词')
+      return
+    }
+
+    let refUrl: string | undefined
+    if (
+      idx >= 1 &&
+      shot.useShot1Ref &&
+      shots[0] &&
+      shots[0].frameUrl
+    ) {
+      refUrl = shots[0].frameUrl
+    }
+
+    let operationId = shot.frameOperationId
+    if (!operationId) {
+      try {
+        operationId = createCWVideoFirstFrameOperationID()
+      } catch (error) {
+        setMsg(
+          '❌ 无法创建首帧任务标识: ' +
+          (error instanceof Error ? error.message : '未知错误'),
+        )
+        return
+      }
+
+      patchShot(
+        idx,
+        {
+          frameOperationId: operationId,
+        },
+      )
+    }
+
     setFrameGenIdx(idx)
-    setMsg('🖼️ 正在生成第' + (idx + 1) + '镜首帧图(16:9)，约10-30秒' + (refUrl ? '，参考第1镜保持一致' : '') + '...')
+    setMsg(
+      '🖼️ 正在生成第' +
+      (idx + 1) +
+      '镜首帧图(16:9)，约10-30秒' +
+      (refUrl ? '，参考第1镜保持一致' : '') +
+      '...',
+    )
+
     try {
-      const res = await generateCWImage(coursewareId, pageNum, prompt, undefined, '2560x1440', refUrl)
-      patchShot(idx, { frameAssetId: res.asset_id, frameUrl: res.url })
+      const res = await generateCWVideoFirstFrame(
+        coursewareId,
+        pageNum,
+        prompt,
+        refUrl,
+        operationId,
+      )
+
+      patchShot(
+        idx,
+        {
+          frameAssetId: res.asset_id,
+          frameUrl: res.url,
+          frameOperationId: '',
+        },
+      )
+
       onAssetCreated({
-        id: res.asset_id, courseware_id: coursewareId, page_id: null, placeholder_id: '',
-        asset_type: 'image', generation_prompt: prompt, oss_url: res.url,
-        file_size: 0, mime_type: 'image/png', status: 'uploaded', created_at: new Date().toISOString(),
+        id: res.asset_id,
+        courseware_id: coursewareId,
+        page_id: null,
+        placeholder_id: 'video-first-frame',
+        asset_type: 'image',
+        generation_prompt: prompt,
+        oss_url: res.url,
+        file_size: 0,
+        mime_type: 'image/png',
+        status: 'uploaded',
+        created_at: new Date().toISOString(),
       })
-      setMsg('✅ 第' + (idx + 1) + '镜首帧图已生成' + (refUrl ? '（已参考第1镜，画风/人物一致）' : '') + '，可点「生成本镜视频」。')
-    } catch (e) {
-      setMsg('❌ 首帧图生成失败: ' + (e instanceof Error ? e.message : '未知错误'))
-    } finally { setFrameGenIdx(-1) }
+
+      setMsg(
+        '✅ 第' +
+        (idx + 1) +
+        '镜首帧图已生成' +
+        (refUrl ? '（已参考第1镜，画风/人物一致）' : '') +
+        '，可点「生成本镜视频」。',
+      )
+    } catch (error) {
+      // 保留frameOperationId，显式重试继续恢复同一业务操作，
+      // 避免供应商已经成功但前端只收到网络错误时重复扣费。
+      setMsg(
+        '❌ 首帧图生成失败: ' +
+        (error instanceof Error ? error.message : '未知错误'),
+      )
+    } finally {
+      setFrameGenIdx(-1)
+    }
   }
 
   // ③ 生成本镜视频：自动用本镜首帧作参考图(图生视频)+ 首帧资产ID溯源
-  const handleGenVideo = async (idx: number) => {
+  const handleGenVideo = async (
+    idx: number,
+  ) => {
     const shot = shots[idx]
-    if (!shot || genBusy) return
-    const vp = shot.videoPrompt.trim()
-    if (!vp) { setMsg('⚠️ 请先填写第' + (idx + 1) + '镜的视频提示词'); return }
-    if (!shot.frameUrl) { setMsg('⚠️ 请先生成第' + (idx + 1) + '镜首帧图，再生成视频'); return }
-    submittedPromptRef.current = vp
-    setVideoSubmitting(true); setMsg(''); setVideoResult(null)
+
+    if (!shot || genBusy) {
+      return
+    }
+
+    const videoPrompt =
+      shot.videoPrompt.trim()
+
+    if (!videoPrompt) {
+      setMsg(
+        '⚠️ 请先填写第' +
+        (idx + 1) +
+        '镜的视频提示词',
+      )
+      return
+    }
+
+    if (!shot.frameUrl) {
+      setMsg(
+        '⚠️ 请先生成第' +
+        (idx + 1) +
+        '镜首帧图，再生成视频',
+      )
+      return
+    }
+
+    const fingerprint =
+      JSON.stringify([
+        coursewareId,
+        pageNum,
+        idx,
+        videoPrompt,
+        shot.frameAssetId,
+        shot.frameUrl,
+      ])
+
+    let operationId = ''
+
     try {
-      const res = await generateCWVideo(coursewareId, pageNum, vp, shot.frameUrl, shot.frameAssetId || undefined)
-      setVideoAssetId(res.asset_id); setVideoSubmitting(false); setVideoPolling(true)
-      setMsg('✅ ' + res.message + '（第' + (idx + 1) + '镜生成中，约30-120秒）')
-    } catch (e) {
-      setMsg('❌ 提交失败: ' + (e instanceof Error ? e.message : '未知错误')); setVideoSubmitting(false)
+      operationId =
+        resolveVideoOperationID(
+          fingerprint,
+        )
+    } catch (error) {
+      setMsg(
+        '❌ 无法创建视频任务标识: ' +
+        (
+          error instanceof Error
+            ? error.message
+            : '未知错误'
+        ),
+      )
+      return
+    }
+
+    submittedPromptRef.current =
+      videoPrompt
+
+    setVideoSubmitting(true)
+    setMsg('')
+    setVideoResult(null)
+
+    try {
+      const result =
+        await generateCWVideo(
+          coursewareId,
+          pageNum,
+          videoPrompt,
+          shot.frameUrl,
+          shot.frameAssetId || undefined,
+          operationId,
+        )
+
+      clearVideoOperationID()
+
+      setVideoAssetId(
+        result.asset_id,
+      )
+      setVideoSubmitting(false)
+      setVideoPolling(true)
+      setMsg(
+        '✅ ' +
+        result.message +
+        '（第' +
+        (idx + 1) +
+        '镜生成中，约30-120秒）',
+      )
+    } catch (error) {
+      if (
+        !shouldPreserveVideoOperationID(
+          error,
+        )
+      ) {
+        clearVideoOperationID()
+      }
+
+      setMsg(
+        '❌ 提交失败: ' +
+        (
+          error instanceof Error
+            ? error.message
+            : '未知错误'
+        ),
+      )
+      setVideoSubmitting(false)
     }
   }
 
   const handleManualGen = async () => {
-    if (!coursewareId || pageNum <= 0 || genBusy) return
-    const p = manualPrompt.trim()
-    if (!p) { setMsg('⚠️ 请先填写视频描述'); return }
-    submittedPromptRef.current = p
-    setVideoSubmitting(true); setMsg(''); setVideoResult(null)
-    try {
-      const res = await generateCWVideo(
+    if (
+      !coursewareId ||
+      pageNum <= 0 ||
+      genBusy
+    ) {
+      return
+    }
+
+    const prompt =
+      manualPrompt.trim()
+
+    if (!prompt) {
+      setMsg(
+        '⚠️ 请先填写视频描述',
+      )
+      return
+    }
+
+    const fingerprint =
+      JSON.stringify([
         coursewareId,
         pageNum,
-        p,
-        undefined,
-        undefined,
+        'manual',
+        prompt,
+      ])
+
+    let operationId = ''
+
+    try {
+      operationId =
+        resolveVideoOperationID(
+          fingerprint,
+        )
+    } catch (error) {
+      setMsg(
+        '❌ 无法创建视频任务标识: ' +
+        (
+          error instanceof Error
+            ? error.message
+            : '未知错误'
+        ),
       )
+      return
+    }
+
+    submittedPromptRef.current =
+      prompt
+
+    setVideoSubmitting(true)
+    setMsg('')
+    setVideoResult(null)
+
+    try {
+      const result =
+        await generateCWVideo(
+          coursewareId,
+          pageNum,
+          prompt,
+          undefined,
+          undefined,
+          operationId,
+        )
+
+      clearVideoOperationID()
 
       /**
-       * 接口返回资产ID代表异步视频任务已正式创建。
-       * 此时才提交清空输入；失败分支不会触碰草稿。
+       * 接口返回资产ID代表异步视频任务已经持久化。
+       * 此时才清空输入；失败分支不会触碰草稿。
        */
       manualPromptDraft.commit()
-      setVideoAssetId(res.asset_id)
+
+      setVideoAssetId(
+        result.asset_id,
+      )
       setVideoSubmitting(false)
       setVideoPolling(true)
-      setMsg('✅ ' + res.message)
-    } catch (e) {
-      setMsg('❌ 提交失败: ' + (e instanceof Error ? e.message : '未知错误')); setVideoSubmitting(false)
+      setMsg(
+        '✅ ' +
+        result.message,
+      )
+    } catch (error) {
+      if (
+        !shouldPreserveVideoOperationID(
+          error,
+        )
+      ) {
+        clearVideoOperationID()
+      }
+
+      setMsg(
+        '❌ 提交失败: ' +
+        (
+          error instanceof Error
+            ? error.message
+            : '未知错误'
+        ),
+      )
+      setVideoSubmitting(false)
     }
   }
 
@@ -320,11 +633,25 @@ export default function VideoStoryboardPanel({ coursewareId, pageNum, styleAncho
               <div style={{ fontSize: 12, fontWeight: 600, color: C.textPrimary, marginBottom: 10 }}>镜 {activeIdx + 1}{active.scene ? '：' + active.scene : ''}</div>
 
               <div style={{ fontSize: 11, color: PURPLE, fontWeight: 600, marginBottom: 4 }}>第一步 · 首帧图提示词（可改）</div>
-              <textarea value={active.imagePrompt} onChange={e => patchShot(activeIdx, { imagePrompt: e.target.value })} rows={3} disabled={genBusy} style={taField} />
+              <textarea
+                value={active.imagePrompt}
+                onChange={e => patchShot(activeIdx, {
+                  imagePrompt: e.target.value,
+                  frameOperationId: '',
+                })}
+                rows={3}
+                disabled={genBusy}
+                style={taField}
+              />
               {activeIdx >= 1 && (
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 6, fontSize: 11, color: shot1HasFrame ? C.textSecondary : '#9CA3AF', cursor: shot1HasFrame ? 'pointer' : 'default' }}>
                   <input type="checkbox" checked={active.useShot1Ref} disabled={!shot1HasFrame || genBusy}
-                    onChange={e => patchShot(activeIdx, { useShot1Ref: e.target.checked })} style={{ width: 14, height: 14, accentColor: PURPLE }} />
+                    onChange={e => patchShot(activeIdx, {
+                      useShot1Ref: e.target.checked,
+                      frameOperationId: '',
+                    })}
+                    style={{ width: 14, height: 14, accentColor: PURPLE }}
+                  />
                   参考第1镜首帧保持一致{shot1HasFrame ? '' : '（请先生成第1镜首帧）'}
                 </label>
               )}

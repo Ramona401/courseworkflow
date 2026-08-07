@@ -2,7 +2,9 @@ package services
 
 // courseware_access_service.go — 课件教育域可信Actor与访问控制底座
 //
-// 本文件只负责课件教育域这一条正交安全边界，不替代课件原有的：
+// 本文件负责课件查看、编辑与作者运行通道的教育域安全边界。
+// 创建、Fork和Actor快照公共函数已拆分到courseware_creation_access.go。
+// 本文件不替代课件原有的：
 //   - 作者归属权限；
 //   - 共享课件可见范围；
 //   - 审核员审核权限；
@@ -41,18 +43,6 @@ var (
 	ErrCoursewareActorRequired = errors.New(
 		"缺少可信课件操作上下文",
 	)
-	ErrCoursewareCreationDomainRequired = errors.New(
-		"无确定教学教育域不能创建课件",
-	)
-	ErrCoursewareLessonPlanNotOwned = errors.New(
-		"只能从自己的教案创建课件，请先Fork到我的教案",
-	)
-	ErrCoursewareLessonPlanDomainInvalid = errors.New(
-		"关联教案缺少有效的具体教学教育域",
-	)
-	ErrCoursewareForkSourceDomainUnsupported = errors.New(
-		"来源课件没有可继承的具体教学教育域，暂不能复制",
-	)
 	ErrCoursewareAccessNotFound = errors.New(
 		"课件不存在",
 	)
@@ -90,87 +80,24 @@ var (
 // 永远共享同一套组织身份与教育域解析规则。
 type CoursewareActorContext = AssistantActorContext
 
-// BuildCoursewareActorFromClaims 根据JWT中的用户ID和角色构造课件可信Actor。
+// isCoursewareMixedReadManagementRole
+// 判断显式mixed Actor能否进入跨教育域管理读取通道。
 //
-// 实际解析工作复用BuildActorFromClaims：
-//   - 普通教学角色解析为k12、vocational或adult；
-//   - admin、region_admin、district_inspector保持mixed管理上下文；
-//   - 普通用户解析失败时EducationDomain为空并在后续校验中fail-closed。
-func BuildCoursewareActorFromClaims(
-	ctx context.Context,
-	userID string,
+// 该判断只用于课件和课件组件的管理读取：
+//   - admin、region_admin、district_inspector允许；
+//   - 不授予个人教学资源创建权限；
+//   - 普通角色伪造mixed仍然拒绝。
+func isCoursewareMixedReadManagementRole(
 	role string,
-) *CoursewareActorContext {
-	return BuildActorFromClaims(ctx, userID, role)
-}
-
-// ResolveCoursewareCreationEducationDomain 解析无教案来源课件的创建教育域。
-//
-// 适用入口：
-//   - 从主题创建；
-//   - PPT上传创建；
-//   - Word上传创建；
-//   - 3D互动单页创建；
-//   - 未来其它不依赖教案的课件创建入口。
-//
-// 返回值只可能是k12、vocational或adult。
-// 不使用NormalizeEducationDomain，避免把空值、mixed或非法值静默回退为k12。
-func ResolveCoursewareCreationEducationDomain(
-	actor *CoursewareActorContext,
-) (string, error) {
-	if actor == nil || strings.TrimSpace(actor.UserID) == "" {
-		return "", ErrCoursewareActorRequired
+) bool {
+	switch strings.TrimSpace(role) {
+	case models.RoleAdmin,
+		models.RoleRegionAdmin,
+		models.RoleDistrictInspector:
+		return true
+	default:
+		return false
 	}
-
-	domain := strings.ToLower(
-		strings.TrimSpace(actor.EducationDomain),
-	)
-	if !models.IsTeachingEducationDomain(domain) {
-		return "", ErrCoursewareCreationDomainRequired
-	}
-
-	return domain, nil
-}
-
-// ResolveCoursewareEducationDomainFromLessonPlan 解析从教案创建课件时应继承的教育域。
-//
-// 安全规则：
-//   - 只能从当前Actor本人创建的教案直接创建个人课件；
-//   - 他人共享或审核通过的教案必须先走教案Fork，不能直接猜ID复制；
-//   - admin、region_admin、district_inspector属于mixed管理身份，
-//     只能管理和查看资源，不能借教案入口创建个人教学课件；
-//   - 教案快照必须是k12、vocational或adult，common/mixed/空值/非法值均拒绝；
-//   - 普通作者当前所在教育域可以与教案快照不同：老师换校或跨域调动后，
-//     仍以历史教案创建时的education_domain为准，不重新按当前学校重分类。
-func ResolveCoursewareEducationDomainFromLessonPlan(
-	actor *CoursewareActorContext,
-	lessonPlan *models.LessonPlan,
-) (string, error) {
-	if actor == nil || strings.TrimSpace(actor.UserID) == "" {
-		return "", ErrCoursewareActorRequired
-	}
-	if lessonPlan == nil {
-		return "", ErrCoursewareLessonPlanDomainInvalid
-	}
-
-	// 管理角色保持mixed管理语义，不能直接创建归属于自己的教学课件。
-	if isCoursewareMixedManagementRole(actor.Role) {
-		return "", ErrCoursewareCreationDomainRequired
-	}
-
-	if strings.TrimSpace(lessonPlan.AuthorID) == "" ||
-		lessonPlan.AuthorID != actor.UserID {
-		return "", ErrCoursewareLessonPlanNotOwned
-	}
-
-	domain := strings.ToLower(
-		strings.TrimSpace(lessonPlan.EducationDomain),
-	)
-	if !models.IsTeachingEducationDomain(domain) {
-		return "", ErrCoursewareLessonPlanDomainInvalid
-	}
-
-	return domain, nil
 }
 
 // ValidateCoursewareEducationDomainForActor 校验Actor是否可以进入某份课件的教育域。
@@ -208,7 +135,7 @@ func ValidateCoursewareEducationDomainForActor(
 	// ResourceEducationDomainMatches本身允许mixed跨域管理。
 	// 此处额外校验角色，防止异常调用方手工构造普通角色+mixed的伪Actor。
 	if currentDomain == models.EducationDomainMixed &&
-		!isCoursewareMixedManagementRole(actor.Role) {
+		!isCoursewareMixedReadManagementRole(actor.Role) {
 		return ErrCoursewareEducationDomainMismatch
 	}
 
@@ -678,104 +605,4 @@ func (s *CoursewareService) LoadCoursewareForOwnerRuntime(
 			courseware,
 		),
 		nil
-}
-
-// ResolveCoursewareForkEducationDomain 解析共享课件Fork副本应写入的教育域。
-//
-// 安全规则：
-//   - Fork会创建归当前用户所有的个人教学课件，因此操作者必须具有
-//     k12、vocational或adult具体教学域；mixed管理账号不能Fork。
-//   - 操作者只能Fork当前教学域可访问的来源课件。
-//   - 副本继承来源课件的具体教学域，不根据复制者学校重新推导。
-//   - common共享课件可以跨域查看，但common不能作为一份具体课件的
-//     运行域，因此本阶段不允许直接Fork common课件。
-func ResolveCoursewareForkEducationDomain(
-	actor *CoursewareActorContext,
-	source *models.Courseware,
-) (string, error) {
-	if _, err := ResolveCoursewareCreationEducationDomain(
-		actor,
-	); err != nil {
-		return "", err
-	}
-
-	if err := ValidateCoursewareEducationDomainForActor(
-		actor,
-		source,
-	); err != nil {
-		return "", err
-	}
-
-	domain := strings.ToLower(
-		strings.TrimSpace(source.EducationDomain),
-	)
-	if !models.IsTeachingEducationDomain(domain) {
-		return "", ErrCoursewareForkSourceDomainUnsupported
-	}
-
-	return domain, nil
-}
-
-// ScopeCoursewareActorToSnapshot 将Actor收敛到具体课件的教育域快照。
-//
-// 使用场景：
-//   - 课件方案生成；
-//   - HTML批量生成；
-//   - 单页微调和整页重构；
-//   - 图片、视频、TTS和字幕派生任务；
-//   - 模板保存与其它会加载教学资源的具体课件运行链。
-//
-// 该函数先执行教育域访问校验，再复制Actor并覆盖EducationDomain。
-// 原Actor不会被修改，避免同一请求后续误把管理上下文永久改变。
-//
-// 具体课件运行必须拥有k12、vocational或adult快照。
-// common可以作为跨域通用候选资源，但不能作为一份具体课件的运行域。
-func ScopeCoursewareActorToSnapshot(
-	actor *CoursewareActorContext,
-	courseware *models.Courseware,
-) (*CoursewareActorContext, error) {
-	if err := ValidateCoursewareEducationDomainForActor(
-		actor,
-		courseware,
-	); err != nil {
-		return nil, err
-	}
-
-	snapshotDomain := strings.ToLower(
-		strings.TrimSpace(courseware.EducationDomain),
-	)
-	if !models.IsTeachingEducationDomain(snapshotDomain) {
-		return nil, ErrCoursewareRuntimeDomainRequired
-	}
-
-	scoped := *actor
-	scoped.EducationDomain = snapshotDomain
-
-	// 深拷贝切片，避免调用方修改scoped中的组织集合时污染原Actor。
-	scoped.MyGroupIDs = append(
-		[]string(nil),
-		actor.MyGroupIDs...,
-	)
-	scoped.MyLeadGroupIDs = append(
-		[]string(nil),
-		actor.MyLeadGroupIDs...,
-	)
-	scoped.MyLeadOrBackboneGroupIDs = append(
-		[]string(nil),
-		actor.MyLeadOrBackboneGroupIDs...,
-	)
-
-	return &scoped, nil
-}
-
-// isCoursewareMixedManagementRole 判断角色是否允许持有mixed课件管理上下文。
-func isCoursewareMixedManagementRole(role string) bool {
-	switch strings.TrimSpace(role) {
-	case models.RoleAdmin,
-		models.RoleRegionAdmin,
-		models.RoleDistrictInspector:
-		return true
-	default:
-		return false
-	}
 }

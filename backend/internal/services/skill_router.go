@@ -35,13 +35,11 @@ package services
 
 import (
 	"context"
-	"encoding/json"
 	"sort"
 	"strings"
 
 	"tedna/internal/logger"
 	"tedna/internal/models"
-	"tedna/internal/repository"
 	"tedna/internal/utils"
 )
 
@@ -258,118 +256,7 @@ type rerankCandidate struct {
 	originalRank int // 在硬筛结果里的原始顺序，用作打分相同时的稳定次级键
 }
 
-// RerankedStageComponents 知识型技能精排版组件注入产物（替换 AutoMatchStageComponents）。
-//
-// 与 AutoMatchStageComponents 完全相同的入参契约 + 完全相同的输出格式（一段可直接拼进
-// 系统提示词第3层的中文文本），唯一区别是中间多了一步"按老师当轮发言做词法精排"。
-//
-// 入参：
-//   - componentTypesJSON：阶段的组件类型 JSON 数组（与 AutoMatchStageComponents 同源）。
-//   - subject / grade：学科 / 年级（grade 内部用 NormalizeGradeToNumber 归一化）。
-//   - stageCode：阶段代码（用于套用 stageTimingMap 的课堂时机硬筛，与老路径一致）。
-//   - recentUserText：老师当轮发言（取最近 1-2 条 user 文本，由调用方拼好传入）。空串则走保底。
-//
-// 返回：
-//   - 注入文本；无候选 / 解析失败 → 返回空串（与 AutoMatchStageComponents 一致，调用方不拼第3层）。
-//
-// 两段式（PRD §6.2 v1 确定性版，零 AI 零额外延迟）：
-//
-//	① 硬筛：复用 MatchComponents（内部走 buildIndexColumnConditions），按
-//	   stage→类型 / 学科 / 年级范围 / StageTiming 砍出候选集（每类放大到 6 条留池）。
-//	② 精排：对候选集，用 recentUserText 的关键词与每条的 [F][T][P][D][C] 标签行 + 标题
-//	   做加权词法重合打分（命中标签 > 命中标题），全局取 Top-N（默认 4）。
-//	保底地板：flag 关闭 / 无发言 / 全部 0 分时，不做精排，按硬筛原序（quality 降序）取前 N，
-//	   等价于"按相关性挑不出来就退回学科+年级+阶段全量匹配"。
-func RerankedStageComponents(
-	ctx context.Context,
-	componentTypesJSON string,
-	subject string,
-	grade string,
-	stageCode string,
-	recentUserText string,
-) string {
-	// ---------- 解析阶段组件类型 ----------
-	var stageTypes []string
-	trimmed := strings.TrimSpace(componentTypesJSON)
-	if trimmed == "" {
-		return ""
-	}
-	if err := json.Unmarshal([]byte(trimmed), &stageTypes); err != nil || len(stageTypes) == 0 {
-		return ""
-	}
-
-	// ---------- ① 硬筛：复用 MatchComponents 拿候选池 ----------
-	normalizedGrade := utils.NormalizeGradeToNumber(grade)
-	matchReq := &models.MatchComponentsRequest{
-		Subject:      subject,
-		GradeRange:   normalizedGrade,
-		LibraryTypes: stageTypes,
-		Limit:        skillRouterCandidateLimitPerType, // 放大候选池供精排
-	}
-	if timings, ok := stageTimingMap[stageCode]; ok {
-		matchReq.StageTiming = timings
-	}
-
-	groups, err := repository.MatchComponents(ctx, matchReq)
-	if err != nil || len(groups) == 0 {
-		// 硬筛即空 → 与 AutoMatchStageComponents 同样返回空串，不拼第3层。
-		return ""
-	}
-
-	// 拍平为候选切片，记录原始顺序作稳定次级键。
-	var candidates []*rerankCandidate
-	rank := 0
-	for _, g := range groups {
-		for _, c := range g.Components {
-			candidates = append(candidates, &rerankCandidate{
-				libraryType:  g.LibraryType,
-				libraryName:  g.LibraryName,
-				component:    c,
-				score:        0,
-				originalRank: rank,
-			})
-			rank++
-		}
-	}
-	if len(candidates) == 0 {
-		return ""
-	}
-
-	// ---------- ② 精排：词法打分（仅在开关开启且有发言时）----------
-	keywords := extractRerankKeywords(recentUserText)
-	reranked := false
-	if skillRouterRerankEnabled && len(keywords) > 0 {
-		for _, cand := range candidates {
-			cand.score = scoreCandidateLexical(cand.component, keywords)
-		}
-		// 按 (得分降序, 原始顺序升序) 稳定排序。
-		sort.SliceStable(candidates, func(i, j int) bool {
-			if candidates[i].score != candidates[j].score {
-				return candidates[i].score > candidates[j].score
-			}
-			return candidates[i].originalRank < candidates[j].originalRank
-		})
-		reranked = true
-	}
-	// 否则：保持硬筛原序（MatchComponents 已按 quality 降序），即保底地板。
-
-	// ---------- 取全局 Top-N ----------
-	topN := skillRouterTopN
-	if topN > len(candidates) {
-		topN = len(candidates)
-	}
-	chosen := candidates[:topN]
-
-	// ---------- 按 library_type 归组并格式化（输出格式对齐 AutoMatchStageComponents）----------
-	out := formatRerankedComponents(chosen)
-
-	skillRouterLog.Info("知识型技能精排完成",
-		"subject", subject, "grade", grade, "stage_code", stageCode,
-		"stage_types", stageTypes, "candidate_count", len(candidates),
-		"injected_count", len(chosen), "reranked", reranked,
-		"keyword_count", len(keywords))
-	return out
-}
+// 域感知运行时精排入口位于RerankedStageComponentsForRuntime。
 
 // formatRerankedComponents 把精排后选中的候选格式化为可注入第3层的中文文本。
 //

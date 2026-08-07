@@ -37,6 +37,25 @@ const (
 	CourseOutlineSourceUpload = "upload" // 上传原件（预留，本步不用）
 )
 
+// 课程大纲学制常量。
+//
+// standard表示普通六三学制；five_four表示五四制。
+// 册次只保存“上册/下册/第一册”等纯册次，不再把学制混入volume。
+const (
+	CourseOutlineSchoolSystemStandard = "standard"
+	CourseOutlineSchoolSystemFiveFour = "five_four"
+)
+
+// IsValidCourseOutlineSchoolSystem 校验课程大纲学制值。
+func IsValidCourseOutlineSchoolSystem(
+	schoolSystem string,
+) bool {
+	return schoolSystem ==
+		CourseOutlineSchoolSystemStandard ||
+		schoolSystem ==
+			CourseOutlineSchoolSystemFiveFour
+}
+
 // 课程大纲状态常量
 const (
 	CourseOutlineStatusActive   = "active"   // 生效
@@ -74,6 +93,7 @@ type CourseOutline struct {
 	Grade          string    `json:"grade"`            // 年级
 	Volume         string    `json:"volume"`           // 册次
 	Publisher      string    `json:"publisher"`        // 教材版本（空串=通用/不限版本）
+	SchoolSystem   string    `json:"school_system"`    // 学制：standard/five_four
 	Title          string    `json:"title"`            // 标题
 	Content        string    `json:"content"`          // 原文整块
 	SourceFilePath string    `json:"source_file_path"` // 原件路径（预留）
@@ -93,7 +113,8 @@ type CourseOutlineListItem struct {
 	Subject       string    `json:"subject"`
 	Grade         string    `json:"grade"`
 	Volume        string    `json:"volume"`
-	Publisher     string    `json:"publisher"` // 教材版本（空串=通用，前端显示"通用/不限版本"）
+	Publisher     string    `json:"publisher"`     // 教材版本（空串=通用，前端显示"通用/不限版本"）
+	SchoolSystem  string    `json:"school_system"` // 学制：standard/five_four
 	Title         string    `json:"title"`
 	CreatorName   string    `json:"creator_name"` // 建立者显示名
 	UpdatedAt     time.Time `json:"updated_at"`
@@ -107,18 +128,20 @@ type CreateCourseOutlineRequest struct {
 	Grade         string `json:"grade"`           // 必填
 	Volume        string `json:"volume"`          // 必填
 	Publisher     string `json:"publisher"`       // 教材版本（选填，空=通用/不限版本）
+	SchoolSystem  string `json:"school_system"`   // K12必填：standard/five_four
 	Title         string `json:"title"`           // 必填
 	Content       string `json:"content"`         // 必填（原文整块）
 }
 
 // UpdateCourseOutlineRequest 更新请求（学科/年级/册次/版本/标题/正文均可改）
 type UpdateCourseOutlineRequest struct {
-	Subject   string `json:"subject"`
-	Grade     string `json:"grade"`
-	Volume    string `json:"volume"`
-	Publisher string `json:"publisher"` // 教材版本（空=通用/不限版本）
-	Title     string `json:"title"`
-	Content   string `json:"content"`
+	Subject      string `json:"subject"`
+	Grade        string `json:"grade"`
+	Volume       string `json:"volume"`
+	Publisher    string `json:"publisher"`     // 教材版本（空=通用/不限版本）
+	SchoolSystem string `json:"school_system"` // K12：standard/five_four
+	Title        string `json:"title"`
+	Content      string `json:"content"`
 }
 
 // IsValidCourseOutlineScope 校验 scope 合法性

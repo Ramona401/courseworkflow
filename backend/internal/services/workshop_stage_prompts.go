@@ -87,7 +87,6 @@ import (
 
 	"tedna/internal/logger"
 	"tedna/internal/models"
-	"tedna/internal/repository"
 	"tedna/internal/utils"
 )
 
@@ -222,7 +221,7 @@ func BuildStageSystemPromptV2(
 	if stage.ComponentTypes != "" && stage.ComponentTypes != "[]" {
 		componentCtx := ""
 		if len(selectedCompIDs) > 0 {
-			componentCtx = BuildSelectedComponentContext(ctx, selectedCompIDs)
+			componentCtx = BuildSelectedComponentContext(ctx, selectedCompIDs, stage.ComponentTypes)
 		}
 		if componentCtx == "" && recipe != nil {
 			componentCtx = BuildStageComponentContext(ctx, recipe, stage.ComponentTypes)
@@ -711,83 +710,208 @@ func BuildPriorOutputsContext(outputs []*models.WorkshopStageOutput) string {
 
 // ==================== 阶段专属组件上下文 ====================
 
-func BuildStageComponentContext(ctx context.Context, recipe *models.TeachingRecipe, componentTypesJSON string) string {
-	var stageTypes []string
-	if err := json.Unmarshal([]byte(componentTypesJSON), &stageTypes); err != nil || len(stageTypes) == 0 {
+func BuildStageComponentContext(
+	ctx context.Context,
+	recipe *models.TeachingRecipe,
+	componentTypesJSON string,
+) string {
+	stageTypes, ok :=
+		parseRuntimeStageTypes(
+			componentTypesJSON,
+		)
+
+	if !ok || len(stageTypes) == 0 {
 		return ""
 	}
-	var allComponentIDs []string
-	if err := json.Unmarshal([]byte(recipe.ComponentIDs), &allComponentIDs); err != nil || len(allComponentIDs) == 0 {
+
+	var componentIDs []string
+
+	if err := json.Unmarshal(
+		[]byte(recipe.ComponentIDs),
+		&componentIDs,
+	); err != nil ||
+		len(componentIDs) == 0 {
 		return ""
 	}
-	groups, err := repository.GetRecipeComponentContents(ctx, allComponentIDs)
-	if err != nil || len(groups) == 0 {
+
+	groups, err :=
+		loadHistoricalComponentGroupsForRuntime(
+			ctx,
+			componentIDs,
+		)
+
+	if err != nil ||
+		len(groups) == 0 {
 		return ""
 	}
-	typeSet := make(map[string]bool)
-	for _, t := range stageTypes {
-		typeSet[t] = true
+
+	groups =
+		filterComponentGroupsByLibraryTypes(
+			groups,
+			stageTypes,
+		)
+
+	if len(groups) == 0 {
+		return ""
 	}
-	var sb strings.Builder
-	hasContent := false
-	for _, g := range groups {
-		if !typeSet[g.LibraryType] {
+
+	var builder strings.Builder
+
+	builder.WriteString(
+		"=== 本阶段参考资料 ===\n",
+	)
+
+	for _, group := range groups {
+		if group == nil {
 			continue
 		}
-		if !hasContent {
-			sb.WriteString("=== 本阶段参考资料 ===\n")
-			hasContent = true
-		}
-		sb.WriteString(fmt.Sprintf("\n【%s】\n", g.LibraryName))
-		for _, c := range g.Components {
-			sb.WriteString(fmt.Sprintf("▸ %s\n", c.DisplayLabel))
-			if c.DesignLogic != "" {
-				sb.WriteString(fmt.Sprintf("  设计逻辑:%s\n", c.DesignLogic))
+
+		builder.WriteString(
+			"\n【" +
+				group.LibraryName +
+				"】\n",
+		)
+
+		for _, component := range group.Components {
+			if component == nil {
+				continue
 			}
-			if c.FullGuide != "" {
-				guide := c.FullGuide
-				if len(guide) > 1000 {
-					guide = guide[:1000] + "...(已截断)"
-				}
-				sb.WriteString(fmt.Sprintf("  完整指引:%s\n", guide))
+
+			builder.WriteString(
+				"▸ " +
+					component.DisplayLabel +
+					"\n",
+			)
+
+			if component.DesignLogic != "" {
+				builder.WriteString(
+					"  设计逻辑:" +
+						component.DesignLogic +
+						"\n",
+				)
+			}
+
+			if component.FullGuide != "" {
+				builder.WriteString(
+					"  完整指引:" +
+						safeUTF8Truncate(
+							component.FullGuide,
+							1000,
+						) +
+						"\n",
+				)
 			}
 		}
 	}
-	return sb.String()
+
+	return builder.String()
 }
 
 // ==================== 用户手动选择组件上下文(迭代12)====================
 
-func BuildSelectedComponentContext(ctx context.Context, componentIDs []string) string {
+func BuildSelectedComponentContext(
+	ctx context.Context,
+	componentIDs []string,
+	componentTypesJSON string,
+) string {
 	if len(componentIDs) == 0 {
 		return ""
 	}
-	groups, err := repository.GetRecipeComponentContents(ctx, componentIDs)
-	if err != nil || len(groups) == 0 {
+
+	stageTypes, ok :=
+		parseRuntimeStageTypes(
+			componentTypesJSON,
+		)
+
+	if !ok || len(stageTypes) == 0 {
 		return ""
 	}
-	var sb strings.Builder
-	sb.WriteString("=== 本阶段参考资料(老师手动选择)===\n")
-	sb.WriteString("以下是老师为本阶段特别选择的教学参考组件,请重点参考:\n")
-	for _, g := range groups {
-		sb.WriteString(fmt.Sprintf("\n【%s】\n", g.LibraryName))
-		for _, c := range g.Components {
-			sb.WriteString(fmt.Sprintf("▸ %s\n", c.DisplayLabel))
-			if c.DesignLogic != "" {
-				sb.WriteString(fmt.Sprintf("  设计逻辑:%s\n", c.DesignLogic))
+
+	groups, err :=
+		loadHistoricalComponentGroupsForRuntime(
+			ctx,
+			componentIDs,
+		)
+
+	if err != nil ||
+		len(groups) == 0 {
+		return ""
+	}
+
+	groups =
+		filterComponentGroupsByLibraryTypes(
+			groups,
+			stageTypes,
+		)
+
+	if len(groups) == 0 {
+		return ""
+	}
+
+	var builder strings.Builder
+
+	builder.WriteString(
+		"=== 本阶段参考资料(老师手动选择)===\n",
+	)
+
+	builder.WriteString(
+		"以下是老师为本阶段特别选择且当前仍然可用的教学参考组件，请重点参考:\n",
+	)
+
+	for _, group := range groups {
+		if group == nil {
+			continue
+		}
+
+		builder.WriteString(
+			"\n【" +
+				group.LibraryName +
+				"】\n",
+		)
+
+		for _, component := range group.Components {
+			if component == nil {
+				continue
 			}
-			if c.FullGuide != "" {
-				guide := c.FullGuide
-				if len(guide) > 1000 {
-					guide = guide[:1000] + "...(已截断)"
-				}
-				sb.WriteString(fmt.Sprintf("  完整指引:%s\n", guide))
+
+			builder.WriteString(
+				"▸ " +
+					component.DisplayLabel +
+					"\n",
+			)
+
+			if component.DesignLogic != "" {
+				builder.WriteString(
+					"  设计逻辑:" +
+						component.DesignLogic +
+						"\n",
+				)
+			}
+
+			if component.FullGuide != "" {
+				builder.WriteString(
+					"  完整指引:" +
+						safeUTF8Truncate(
+							component.FullGuide,
+							1000,
+						) +
+						"\n",
+				)
 			}
 		}
 	}
-	wsPromptLog := logger.WithModule("workshop_stage_prompts")
-	wsPromptLog.Info("用户手动选择的组件已注入提示词", "component_count", len(componentIDs), "matched_groups", len(groups))
-	return sb.String()
+
+	logger.WithModule(
+		"workshop_stage_prompts",
+	).Info(
+		"历史手动组件经过教育域和阶段类型过滤后注入提示词",
+		"submitted_count",
+		len(componentIDs),
+		"loaded_count",
+		countRuntimeComponents(groups),
+	)
+
+	return builder.String()
 }
 
 // ==================== 自动匹配阶段组件 ====================
@@ -810,61 +934,55 @@ var stageTimingMap = map[string][]int{
 //
 // 两者入参契约、输出格式完全一致,故此处可无缝二选一,对第3层之外零影响。
 // recentUserText 为空时行为与改造前逐字等价(开场白路径恒走保底,符合"还没有老师发言"的语义)。
-func resolveStageComponentAutoMatch(ctx context.Context, componentTypesJSON string, subject string, grade string, stageCode string, recentUserText string) string {
-	if skillRouterRerankEnabled && strings.TrimSpace(recentUserText) != "" {
-		if out := RerankedStageComponents(ctx, componentTypesJSON, subject, grade, stageCode, recentUserText); out != "" {
-			return out
+func resolveStageComponentAutoMatch(
+	ctx context.Context,
+	componentTypesJSON string,
+	subject string,
+	grade string,
+	stageCode string,
+	recentUserText string,
+) string {
+	if skillRouterRerankEnabled &&
+		strings.TrimSpace(recentUserText) != "" {
+		output :=
+			RerankedStageComponentsForRuntime(
+				ctx,
+				componentTypesJSON,
+				subject,
+				grade,
+				stageCode,
+				recentUserText,
+			)
+
+		if output != "" {
+			return output
 		}
-		// 精排返回空(候选为空等)→ 落回全量匹配,保证第3层不因精排空手而丢内容。
 	}
-	return AutoMatchStageComponents(ctx, componentTypesJSON, subject, grade, stageCode)
+
+	return AutoMatchStageComponentsForRuntime(
+		ctx,
+		componentTypesJSON,
+		subject,
+		grade,
+		stageCode,
+	)
 }
 
 // AutoMatchStageComponents 根据阶段组件类型+学科+年级自动匹配组件
-func AutoMatchStageComponents(ctx context.Context, componentTypesJSON string, subject string, grade string, stageCode string) string {
-	var stageTypes []string
-	if err := json.Unmarshal([]byte(componentTypesJSON), &stageTypes); err != nil || len(stageTypes) == 0 {
-		return ""
-	}
-
-	normalizedGrade := utils.NormalizeGradeToNumber(grade)
-
-	matchReq := &models.MatchComponentsRequest{
-		Subject:      subject,
-		GradeRange:   normalizedGrade,
-		LibraryTypes: stageTypes,
-		Limit:        2,
-	}
-
-	if timings, ok := stageTimingMap[stageCode]; ok {
-		matchReq.StageTiming = timings
-	}
-
-	groups, err := repository.MatchComponents(ctx, matchReq)
-	if err != nil || len(groups) == 0 {
-		return ""
-	}
-
-	var sb strings.Builder
-	sb.WriteString("=== 本阶段参考资料(系统自动匹配)===\n")
-	sb.WriteString("以下是根据学科和年级自动匹配的教学参考组件,请在本阶段工作中适当参考:\n")
-	for _, g := range groups {
-		sb.WriteString(fmt.Sprintf("\n【%s】\n", g.LibraryName))
-		for _, c := range g.Components {
-			if c.ComponentIndex != "" {
-				sb.WriteString(utils.FormatIndexForPrompt(c.ComponentIndex, c.DisplayLabel))
-				sb.WriteString("\n")
-			} else {
-				sb.WriteString(fmt.Sprintf("▸ %s\n", c.DisplayLabel))
-				if c.DesignLogic != "" {
-					sb.WriteString(fmt.Sprintf("  设计逻辑:%s\n", c.DesignLogic))
-				}
-			}
-		}
-	}
-	wsPromptLog := logger.WithModule("workshop_stage_prompts")
-	wsPromptLog.Info("自动匹配阶段组件", "subject", subject, "grade", grade, "stage_code", stageCode, "stage_types", stageTypes, "matched_groups", len(groups))
-	return sb.String()
+func AutoMatchStageComponents(
+	ctx context.Context,
+	componentTypesJSON string,
+	subject string,
+	grade string,
+	stageCode string,
+) string {
+	return AutoMatchStageComponentsForRuntime(
+		ctx,
+		componentTypesJSON,
+		subject,
+		grade,
+		stageCode,
+	)
 }
 
 // ==================== 阶段内对话提示词(v84分层记忆改造)====================

@@ -2,23 +2,24 @@ package services
 
 // courseware_review_query_service.go
 //
-// 课件多级审核的只读查询：
+// 课件多级审核只读查询：
+//
 //   - 审核历史；
 //   - 待审核列表；
 //   - 审核统计；
 //   - 已审核记录；
-//   - 审核详情。
+//   - 审核详情；
+//   - 当前级别、当前轮次需要复查的历史正式问题。
 //
-// 上下文 6：
-//   region_admin 的待审列表和统计统一使用
-//   ResolveRegionAdminEducationScope 解析出的同域学校白名单。
+// 审核详情中的CarryoverItems只在以下条件全部满足时返回：
 //
-// 统一范围：
-//   管辖区域树下 active 学校
-//   AND 学校教育域等于管理员固定教育域
-//   AND 课件教育域快照等于管理员固定教育域。
+//   1. 课件当前处于submitted；
+//   2. 当前用户具备该课件审核详情访问权限；
+//   3. 问题已经随历史正式审核反馈交付；
+//   4. 作者重新提交时将问题登记到本级、本轮；
+//   5. 问题尚未被人工确认解决。
 //
-// Repository 查询错误直接向上返回，不返回部分列表，不退化成全局数据。
+// Repository查询错误直接向上返回，不返回部分列表。
 
 import (
 	"context"
@@ -31,16 +32,18 @@ import (
 // ==================== 审核历史 ====================
 
 // GetReviewHistory 获取课件审核历史。
-//
-// 权限通过 CanViewLoadedCoursewareReviewHistory 统一裁决。
 func (s *CoursewareReviewService) GetReviewHistory(
 	ctx context.Context,
 	coursewareID string,
 	actor *CoursewareActorContext,
-) (*models.CWReviewHistoryResponse, error) {
+) (
+	*models.CWReviewHistoryResponse,
+	error,
+) {
 	if actor == nil ||
 		actor.UserID == "" {
-		return nil, ErrCoursewareActorRequired
+		return nil,
+			ErrCoursewareActorRequired
 	}
 
 	courseware, err :=
@@ -49,7 +52,8 @@ func (s *CoursewareReviewService) GetReviewHistory(
 			coursewareID,
 		)
 	if err != nil {
-		return nil, ErrCWReviewCoursewareNotFound
+		return nil,
+			ErrCWReviewCoursewareNotFound
 	}
 
 	allowed, err :=
@@ -62,7 +66,8 @@ func (s *CoursewareReviewService) GetReviewHistory(
 		return nil, err
 	}
 	if !allowed {
-		return nil, ErrCWReviewNoPermission
+		return nil,
+			ErrCWReviewNoPermission
 	}
 
 	reviews, err :=
@@ -93,10 +98,14 @@ func (s *CoursewareReviewService) GetPendingReviews(
 	actor *CoursewareActorContext,
 	limit int,
 	offset int,
-) (*models.CWPendingReviewListResponse, error) {
+) (
+	*models.CWPendingReviewListResponse,
+	error,
+) {
 	if actor == nil ||
 		actor.UserID == "" {
-		return nil, ErrCoursewareActorRequired
+		return nil,
+			ErrCoursewareActorRequired
 	}
 
 	if limit <= 0 {
@@ -145,7 +154,9 @@ func (s *CoursewareReviewService) GetPendingReviews(
 			l1Items, _, l1Err :=
 				repository.ListCWPendingReviewsBySchools(
 					ctx,
-					[]string{schoolID},
+					[]string{
+						schoolID,
+					},
 					models.ReviewLevelL1,
 					domain,
 					100,
@@ -158,7 +169,9 @@ func (s *CoursewareReviewService) GetPendingReviews(
 			l2Items, _, l2Err :=
 				repository.ListCWPendingReviewsBySchools(
 					ctx,
-					[]string{schoolID},
+					[]string{
+						schoolID,
+					},
 					models.ReviewLevelL2,
 					domain,
 					100,
@@ -168,10 +181,11 @@ func (s *CoursewareReviewService) GetPendingReviews(
 				return nil, l2Err
 			}
 
-			allItems := append(
-				l1Items,
-				l2Items...,
-			)
+			allItems :=
+				append(
+					l1Items,
+					l2Items...,
+				)
 
 			return &models.CWPendingReviewListResponse{
 				Items: allItems,
@@ -236,10 +250,11 @@ func (s *CoursewareReviewService) GetPendingReviews(
 			return nil, l2Err
 		}
 
-		allItems := append(
-			l1Items,
-			l2Items...,
-		)
+		allItems :=
+			append(
+				l1Items,
+				l2Items...,
+			)
 
 		return &models.CWPendingReviewListResponse{
 			Items: allItems,
@@ -270,10 +285,11 @@ func (s *CoursewareReviewService) GetPendingReviews(
 			return nil, l2Err
 		}
 
-		allItems := append(
-			l1Items,
-			l2Items...,
-		)
+		allItems :=
+			append(
+				l1Items,
+				l2Items...,
+			)
 
 		return &models.CWPendingReviewListResponse{
 			Items: allItems,
@@ -291,16 +307,18 @@ func (s *CoursewareReviewService) GetPendingReviews(
 // ==================== 审核统计 ====================
 
 // GetReviewStats 获取课件审核统计。
-//
-// region_admin 返回辖区同域聚合统计，不使用其个人 reviewer_id 口径。
 func (s *CoursewareReviewService) GetReviewStats(
 	ctx context.Context,
 	actor *CoursewareActorContext,
 	level int,
-) (*models.CWReviewStatsResponse, error) {
+) (
+	*models.CWReviewStatsResponse,
+	error,
+) {
 	if actor == nil ||
 		actor.UserID == "" {
-		return nil, ErrCoursewareActorRequired
+		return nil,
+			ErrCoursewareActorRequired
 	}
 
 	switch actor.Role {
@@ -310,10 +328,12 @@ func (s *CoursewareReviewService) GetReviewStats(
 		models.RoleOperator,
 		models.RoleViewer:
 	default:
-		return &models.CWReviewStatsResponse{}, nil
+		return &models.CWReviewStatsResponse{},
+			nil
 	}
 
-	if actor.Role == models.RoleRegionAdmin {
+	if actor.Role ==
+		models.RoleRegionAdmin {
 		scope, err :=
 			ResolveRegionAdminEducationScope(
 				ctx,
@@ -323,15 +343,18 @@ func (s *CoursewareReviewService) GetReviewStats(
 			return nil, err
 		}
 
-		return repository.GetCoursewareReviewStatsBySchoolsAndDomain(
-			ctx,
-			level,
-			scope.SchoolIDs,
-			scope.EducationDomain,
-		)
+		return repository.
+			GetCoursewareReviewStatsBySchoolsAndDomain(
+				ctx,
+				level,
+				scope.SchoolIDs,
+				scope.EducationDomain,
+			)
 	}
 
-	isAdmin := actor.Role == models.RoleAdmin
+	isAdmin :=
+		actor.Role ==
+			models.RoleAdmin
 
 	var memberIDs []string
 	var schoolIDs []string
@@ -346,7 +369,9 @@ func (s *CoursewareReviewService) GetReviewStats(
 				); err == nil &&
 				school != nil {
 				schoolIDs =
-					[]string{school.ID}
+					[]string{
+						school.ID,
+					}
 			} else if level ==
 				models.ReviewLevelL1 {
 				memberIDs, _ =
@@ -383,9 +408,6 @@ func (s *CoursewareReviewService) GetReviewStats(
 // ==================== 已审核记录 ====================
 
 // GetReviewedRecords 获取课件已审核记录。
-//
-// region_admin 的辖区聚合只作用于统计，不扩大已审核明细范围；
-// 非 admin 的已审核记录仍只显示本人产生的审核记录。
 func (s *CoursewareReviewService) GetReviewedRecords(
 	ctx context.Context,
 	actor *CoursewareActorContext,
@@ -393,10 +415,14 @@ func (s *CoursewareReviewService) GetReviewedRecords(
 	decision string,
 	limit int,
 	offset int,
-) (*models.CWReviewedListResponse, error) {
+) (
+	*models.CWReviewedListResponse,
+	error,
+) {
 	if actor == nil ||
 		actor.UserID == "" {
-		return nil, ErrCoursewareActorRequired
+		return nil,
+			ErrCoursewareActorRequired
 	}
 
 	switch actor.Role {
@@ -418,7 +444,8 @@ func (s *CoursewareReviewService) GetReviewedRecords(
 			actor.UserID,
 			level,
 			decision,
-			actor.Role == models.RoleAdmin,
+			actor.Role ==
+				models.RoleAdmin,
 			actor.EducationDomain,
 			limit,
 			offset,
@@ -439,19 +466,30 @@ func (s *CoursewareReviewService) GetReviewedRecords(
 
 // ==================== 审核详情 ====================
 
-// GetReviewDetail 获取课件审核详情。
-//
-// 权限通过 CanReviewLoadedCourseware 统一裁决。
-// region_admin 只能读取辖区同域课件，不能执行审核决策。
+// isCWPendingReviewLevel 判断是否属于正式审核级别。
+func isCWPendingReviewLevel(
+	reviewLevel int,
+) bool {
+	return reviewLevel ==
+		models.ReviewLevelL1 ||
+		reviewLevel ==
+			models.ReviewLevelL2
+}
+
+// GetReviewDetail 获取课件审核详情及当前轮次需要复查的问题。
 func (s *CoursewareReviewService) GetReviewDetail(
 	ctx context.Context,
 	coursewareID string,
 	actor *CoursewareActorContext,
 	coursewareService *CoursewareService,
-) (*models.CWReviewDetailResponse, error) {
+) (
+	*models.CWReviewDetailResponse,
+	error,
+) {
 	if actor == nil ||
 		actor.UserID == "" {
-		return nil, ErrCoursewareActorRequired
+		return nil,
+			ErrCoursewareActorRequired
 	}
 
 	courseware, err :=
@@ -460,7 +498,8 @@ func (s *CoursewareReviewService) GetReviewDetail(
 			coursewareID,
 		)
 	if err != nil {
-		return nil, ErrCWReviewCoursewareNotFound
+		return nil,
+			ErrCWReviewCoursewareNotFound
 	}
 
 	allowed, err :=
@@ -473,7 +512,8 @@ func (s *CoursewareReviewService) GetReviewDetail(
 		return nil, err
 	}
 	if !allowed {
-		return nil, ErrCWReviewNoPermission
+		return nil,
+			ErrCWReviewNoPermission
 	}
 
 	detail, err :=
@@ -510,9 +550,105 @@ func (s *CoursewareReviewService) GetReviewDetail(
 			[]*models.CWReviewListItem{}
 	}
 
+	pendingReviewLevel :=
+		courseware.ReviewLevel + 1
+
+	pendingReviewRound := 0
+	carryoverItems :=
+		[]*models.CWReviewCarryoverItem{}
+
+	if courseware.PublishState ==
+		models.CWPublishSubmitted &&
+		isCWPendingReviewLevel(
+			pendingReviewLevel,
+		) {
+		reviewCount, countErr :=
+			repository.CountCoursewareReviewsByLevel(
+				ctx,
+				coursewareID,
+				pendingReviewLevel,
+			)
+		if countErr != nil {
+			return nil, countErr
+		}
+
+		pendingReviewRound =
+			reviewCount + 1
+
+		items, itemErr :=
+			repository.ListCoursewareReviewItemsForPendingRound(
+				ctx,
+				coursewareID,
+				pendingReviewLevel,
+				pendingReviewRound,
+			)
+		if itemErr != nil {
+			return nil, itemErr
+		}
+
+		carryoverItems =
+			buildCWReviewCarryoverItems(
+				items,
+			)
+	}
+
 	return &models.CWReviewDetailResponse{
-		Courseware:  detail,
-		Annotations: annotations,
-		Reviews:     reviews,
+		Courseware:         detail,
+		Annotations:        annotations,
+		Reviews:            reviews,
+		PendingReviewRound: pendingReviewRound,
+		CarryoverItems:     carryoverItems,
 	}, nil
+}
+
+func buildCWReviewCarryoverItems(
+	items []*models.CoursewareReviewItem,
+) []*models.CWReviewCarryoverItem {
+	result :=
+		make(
+			[]*models.CWReviewCarryoverItem,
+			0,
+			len(items),
+		)
+
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+
+		result = append(
+			result,
+			&models.CWReviewCarryoverItem{
+				ID: item.ID,
+
+				OriginalReviewLevel: item.ReviewLevel,
+				OriginalReviewRound: item.ReviewRound,
+
+				PendingReviewLevel: item.ResubmittedReviewLevel,
+				PendingReviewRound: item.ResubmittedReviewRound,
+
+				PageID:                item.PageID,
+				PageNumberSnapshot:    item.PageNumberSnapshot,
+				PageTitleSnapshot:     item.PageTitleSnapshot,
+				PageHTMLHash:          item.PageHTMLHash,
+				PageUpdatedAtSnapshot: item.PageUpdatedAtSnapshot,
+
+				Severity:  item.Severity,
+				Dimension: item.Dimension,
+
+				Title:                item.Title,
+				Description:          item.Description,
+				ConfirmedInstruction: item.ConfirmedInstruction,
+
+				Status:          item.Status,
+				AppliedPageHash: item.AppliedPageHash,
+
+				ConfirmedAt:   item.ConfirmedAt,
+				AppliedAt:     item.AppliedAt,
+				ResubmittedAt: item.ResubmittedAt,
+			},
+		)
+	}
+
+	return result
 }

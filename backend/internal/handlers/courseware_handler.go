@@ -406,7 +406,19 @@ func (h *CoursewareHandler) UpdatePageIndex(
 	utils.Success(w, map[string]string{"message": "更新成功"})
 }
 
-// AddPage POST /api/v1/coursewares/{id}/pages — 手动添加页面
+// addCWPageRequest 扩展原有新增页面请求，增加指定插入位置。
+//
+// 为保持旧客户端兼容：
+//   - insert_at缺失或小于等于0时，服务端自动追加到最后；
+//   - insert_at有效时，新页面直接成为该页，原页面整体后移。
+//
+// 使用匿名嵌入后，原有页面方案字段仍保持平铺JSON格式。
+type addCWPageRequest struct {
+	models.AddCWPageRequest
+	InsertAt int `json:"insert_at"`
+}
+
+// AddPage POST /api/v1/coursewares/{id}/pages — 在指定位置添加页面
 func (h *CoursewareHandler) AddPage(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -442,17 +454,18 @@ func (h *CoursewareHandler) AddPage(
 		return
 	}
 
-	var req models.AddCWPageRequest
+	var req addCWPageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		utils.BadRequest(w, "请求参数格式错误")
 		return
 	}
 
-	page, err := h.cwService.AddPageForActor(
+	page, err := h.cwService.AddPageAtForActor(
 		r.Context(),
 		id,
 		actor,
-		&req,
+		&req.AddCWPageRequest,
+		req.InsertAt,
 	)
 	if err != nil {
 		writeCoursewareControlError(w, err)

@@ -47,6 +47,8 @@ import type { SetStateAction } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import { useProtectedDraft } from '@/hooks/useProtectedDraft'
+import { useVoiceDraftInput } from '@/hooks/useVoiceDraftInput'
+import VoiceInputButton from '@/components/voice/VoiceInputButton'
 import {
   getLessonPlan,
   reviewLessonPlan,
@@ -273,6 +275,28 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
   const [chatLoading, setChatLoading]   = useState(false)
   const [activePanel, setActivePanel]   = useState<'overview' | 'chat'>('overview')
   const chatEndRef = useRef<HTMLDivElement>(null)
+  const chatInputRef = useRef<HTMLTextAreaElement>(null)
+
+  /**
+   * 评审对话语音写入现有受保护草稿。
+   * 识别完成后仅聚焦输入框，不自动调用sendChat。
+   */
+  const chatVoice = useVoiceDraftInput({
+    value: chatInput,
+    setValue: setChatInput,
+    disabled: chatLoading,
+    maxDurationSeconds: 120,
+    onFinalFocus: (finalValue) => {
+      const element = chatInputRef.current
+      if (!element) return
+
+      element.focus()
+      element.setSelectionRange(
+        finalValue.length,
+        finalValue.length,
+      )
+    },
+  })
 
   // v112新增：AI助手选择状态
   // null 表示未选，后端走兜底默认 prompt（完全向后兼容）
@@ -355,7 +379,7 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
    * v113 改造:sendChat 改为 SSE 流式消费
    */
   const sendChat = () => {
-    if (!chatInput.trim() || chatLoading) return
+    if (!chatInput.trim() || chatLoading || chatVoice.isActive) return
     const userMsg = chatInput.trim()
 
     const history = chatMsgs.map(m => ({ role: m.role, content: m.content }))
@@ -469,7 +493,11 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
             subject={plan.subject}
             grade={plan.grade}
             lessonPlanId={plan.id}
-            disabled={chatLoading || overviewLoading}
+            disabled={
+              chatLoading ||
+              overviewLoading ||
+              chatVoice.isActive
+            }
             compact={true}
             onEdit={handleEditAssistant}
             onDelete={handleDeleteAssistant}
@@ -479,7 +507,22 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
 
         <div style={{ display: 'flex', gap: '4px' }}>
           {(['overview', 'chat'] as const).map(p => (
-            <button key={p} onClick={() => setActivePanel(p)}
+            <button
+              key={p}
+              onClick={() => {
+                /**
+                 * 离开对话面板时立即取消仍在进行的录音，
+                 * 避免麦克风在隐藏面板中继续工作。
+                 */
+                if (
+                  p !== 'chat' &&
+                  chatVoice.isActive
+                ) {
+                  chatVoice.cancel()
+                }
+
+                setActivePanel(p)
+              }}
               style={{ flex: 1, padding: '5px 0', borderRadius: '6px', border: `1px solid ${activePanel === p ? C.primary : C.border}`, background: activePanel === p ? C.primaryLight : 'transparent', fontSize: '12px', color: activePanel === p ? C.primary : C.textSec, cursor: 'pointer', fontWeight: activePanel === p ? 600 : 400 }}>
               {p === 'overview' ? '📋 整体概览' : '💬 对话评审'}
             </button>
@@ -616,6 +659,7 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
           <div style={{ padding: '10px 12px', borderTop: `1px solid ${C.border}`, background: C.card, flexShrink: 0 }}>
             <div style={{ display: 'flex', gap: '6px', alignItems: 'flex-end', background: C.bg, borderRadius: '8px', border: `1px solid ${C.border}`, padding: '6px 8px' }}>
               <textarea
+                ref={chatInputRef}
                 value={chatInput}
                 onChange={e => setChatInput(e.target.value)}
                 onKeyDown={e => {
@@ -627,18 +671,28 @@ function ReviewAISidebar({ plan }: { plan: LessonPlan }) {
                 }}
                 placeholder="问AI关于这份教案的问题..."
                 rows={2}
+                disabled={chatLoading || chatVoice.isActive}
+                style={{ flex: 1, background: 'transparent', border: 'none', outline: 'none', fontSize: '12px', color: C.text, resize: 'none', fontFamily: 'inherit', lineHeight: 1.5, opacity: chatLoading || chatVoice.isActive ? 0.5 : 1 }}
+              />
+              <VoiceInputButton
+                status={chatVoice.status}
+                isSupported={chatVoice.isSupported}
+                elapsedSeconds={chatVoice.elapsedSeconds}
                 disabled={chatLoading}
-                style={{ flex: 1, background: 'transparent', border: 'none', outline: 'none', fontSize: '12px', color: C.text, resize: 'none', fontFamily: 'inherit', lineHeight: 1.5, opacity: chatLoading ? 0.5 : 1 }}
+                error={chatVoice.error}
+                onStart={chatVoice.begin}
+                onStop={chatVoice.stop}
+                onCancel={chatVoice.cancel}
               />
               <button
                 onClick={sendChat}
-                disabled={chatLoading || !chatInput.trim()}
-                style={{ width: '26px', height: '26px', borderRadius: '50%', border: 'none', background: chatLoading || !chatInput.trim() ? '#E5E7EB' : C.primary, color: '#fff', cursor: 'pointer', fontSize: '12px', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                disabled={chatLoading || chatVoice.isActive || !chatInput.trim()}
+                style={{ width: '26px', height: '26px', borderRadius: '50%', border: 'none', background: chatLoading || chatVoice.isActive || !chatInput.trim() ? '#E5E7EB' : C.primary, color: '#fff', cursor: chatLoading || chatVoice.isActive || !chatInput.trim() ? 'not-allowed' : 'pointer', fontSize: '12px', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                 →
               </button>
             </div>
             <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '4px', textAlign: 'center' }}>
-              已自动保存草稿 · Enter发送 · Shift+Enter换行 · Ctrl/Command+Z恢复误删
+              {chatVoice.statusText || '已自动保存草稿 · 点击麦克风可语音输入 · Enter发送 · Shift+Enter换行 · Ctrl/Command+Z恢复误删'}
             </div>
           </div>
         </>

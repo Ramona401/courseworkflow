@@ -37,6 +37,41 @@ export function useAuthProvider(): AuthContextType {
     setUser(newUser)
 
     resetSubjectCache()
+
+    /**
+     * 登录响应只用于立即建立登录态。
+     *
+     * 随后重新调用/auth/me读取数据库当前真值，确保角色、学校、
+     * 教育域、教育域就绪状态和组织信息不是登录响应中的历史快照。
+     *
+     * 请求返回前若用户已经退出或切换账号，则通过token一致性判断
+     * 丢弃迟到响应，防止旧账号信息覆盖新账号运行态。
+     */
+    void getMe()
+      .then(userInfo => {
+        if (
+          localStorage.getItem('token') !==
+          newToken
+        ) {
+          return
+        }
+
+        localStorage.setItem(
+          'user',
+          JSON.stringify(userInfo),
+        )
+
+        setUser(userInfo)
+        resetSubjectCache()
+      })
+      .catch(() => {
+        /**
+         * 登录请求已经成功时，不因后续资料刷新暂时失败
+         * 立即覆盖原登录结果。
+         *
+         * 401等失效情况仍由全局HTTP拦截器清理登录态。
+         */
+      })
   }, [])
 
   const logout = useCallback(() => {

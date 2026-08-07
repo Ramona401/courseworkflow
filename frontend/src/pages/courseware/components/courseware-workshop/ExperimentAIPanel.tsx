@@ -11,6 +11,8 @@
 import { useRef, useState } from 'react'
 import { useAuth } from '@/store/auth'
 import { useProtectedDraft } from '@/hooks/useProtectedDraft'
+import { useVoiceDraftInput } from '@/hooks/useVoiceDraftInput'
+import VoiceDraftControls from '@/components/voice/VoiceDraftControls'
 import { C } from './workshopConstants'
 import { generateSubjectExperimentCode } from '@/api/subjectExperiment'
 import type { SubjectExperimentTarget } from '@/api/subjectExperiment'
@@ -239,18 +241,56 @@ export default function ExperimentAIPanel({
   const [imgBusy, setImgBusy] = useState(false)
 
   const fileRef = useRef<HTMLInputElement | null>(null)
+  const descriptionRef = useRef<HTMLTextAreaElement | null>(null)
 
   const hasCode = code.trim().length > 0
   const disabled = loading || Boolean(busyExternal)
+
+  /**
+   * 语音只写入当前自然语言描述草稿。
+   *
+   * 图片、HTML底稿和生成结果均不进入语音识别链路；
+   * final结果不会自动调用生成接口。
+   */
+  const voiceInput = useVoiceDraftInput({
+    value: desc,
+    setValue: setDesc,
+    disabled: disabled || imgBusy,
+    maxDurationSeconds: 120,
+    onFinalFocus: (finalValue) => {
+      const element = descriptionRef.current
+
+      if (!element) {
+        return
+      }
+
+      element.focus()
+      element.setSelectionRange(
+        finalValue.length,
+        finalValue.length,
+      )
+    },
+    onError: setError,
+  })
+
+  /**
+   * 录音期间锁定图片、模板切换和生成动作，
+   * 但语音按钮自身仍可停止或取消当前录音。
+   */
+  const interactionDisabled =
+    disabled ||
+    imgBusy ||
+    voiceInput.isActive
+
   const canAttachImage = !hasCode
   const canSubmit =
-    !disabled &&
+    !interactionDisabled &&
     (hasCode
       ? Boolean(desc.trim())
       : Boolean(desc.trim()) || Boolean(image))
 
   const handlePickImage = async (file: File | null) => {
-    if (!file || disabled) return
+    if (!file || interactionDisabled) return
 
     setImgBusy(true)
     setError('')
@@ -312,12 +352,12 @@ export default function ExperimentAIPanel({
   }
 
   const handleGenerate = () => {
-    if (!canSubmit) return
+    if (!canSubmit || voiceInput.isActive) return
     void runGenerate(desc.trim())
   }
 
   const handleReset = () => {
-    if (disabled) return
+    if (interactionDisabled) return
 
     onCode('')
     setImage('')
@@ -368,7 +408,7 @@ export default function ExperimentAIPanel({
 
           <button
             onClick={() => {
-              if (!disabled) onExit()
+              if (!interactionDisabled) onExit()
             }}
             style={{
               marginLeft: 'auto',
@@ -379,7 +419,7 @@ export default function ExperimentAIPanel({
               color: currentTheme.main,
               fontSize: 11.5,
               fontWeight: 750,
-              cursor: disabled ? 'not-allowed' : 'pointer',
+              cursor: interactionDisabled ? 'not-allowed' : 'pointer',
               whiteSpace: 'nowrap',
             }}
           >
@@ -422,17 +462,17 @@ export default function ExperimentAIPanel({
           {!image ? (
             <button
               onClick={() => {
-                if (!disabled && !imgBusy) {
+                if (!interactionDisabled) {
                   fileRef.current?.click()
                 }
               }}
-              disabled={disabled || imgBusy}
+              disabled={interactionDisabled}
               style={{
                 width: '100%',
                 padding: '9px 0',
                 borderRadius: 11,
                 cursor:
-                  disabled || imgBusy
+                  interactionDisabled
                     ? 'not-allowed'
                     : 'pointer',
                 border:
@@ -509,7 +549,7 @@ export default function ExperimentAIPanel({
 
               <button
                 onClick={() => {
-                  if (!disabled) setImage('')
+                  if (!interactionDisabled) setImage('')
                 }}
                 title="移除图片"
                 style={{
@@ -519,7 +559,7 @@ export default function ExperimentAIPanel({
                   height: 26,
                   borderRadius: 8,
                   fontSize: 13,
-                  cursor: disabled
+                  cursor: interactionDisabled
                     ? 'not-allowed'
                     : 'pointer',
                   color: currentTheme.main,
@@ -534,6 +574,7 @@ export default function ExperimentAIPanel({
       )}
 
       <textarea
+        ref={descriptionRef}
         value={desc}
         onChange={event => setDesc(event.target.value)}
         onKeyDown={event => {
@@ -542,7 +583,7 @@ export default function ExperimentAIPanel({
         placeholder={placeholder}
         maxLength={2400}
         rows={5}
-        disabled={disabled}
+        disabled={interactionDisabled}
         style={{
           width: '100%',
           boxSizing: 'border-box',
@@ -556,10 +597,17 @@ export default function ExperimentAIPanel({
           outline: 'none',
           resize: 'vertical',
           fontFamily: 'inherit',
-          background: disabled
+          background: interactionDisabled
             ? '#F9FAFB'
             : '#fff',
         }}
+      />
+
+      <VoiceDraftControls
+        voice={voiceInput}
+        disabled={disabled || imgBusy}
+        accentColor={currentTheme.main}
+        idleText="点击麦克风可语音描述；识别完成后仍需手动生成"
       />
 
       <div style={{ marginTop: 6, fontSize: 11, color: C.textMuted, lineHeight: 1.5 }}>
@@ -634,7 +682,7 @@ export default function ExperimentAIPanel({
               marginLeft: 6,
               color: currentTheme.main,
               fontWeight: 800,
-              cursor: disabled
+              cursor: interactionDisabled
                 ? 'not-allowed'
                 : 'pointer',
               textDecoration: 'underline',

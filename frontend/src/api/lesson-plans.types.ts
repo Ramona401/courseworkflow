@@ -1,3 +1,6 @@
+import type { ResourceEducationDomain } from '@/education-domain/types'
+import type { CourseOutlineSchoolSystem } from './course-outlines'
+
 /**
  * lesson-plans.types.ts — 教案系统类型定义
  *
@@ -108,6 +111,7 @@ export type InjectionMode = 'silent' | 'recommend' | 'on_demand'
 
 export interface LessonPlanComponent {
   id: string
+  education_domain: ResourceEducationDomain
   library_type: LibraryType
   subject: string
   grade_range: string | null
@@ -133,6 +137,7 @@ export interface LessonPlanComponent {
 
 export interface ComponentListItem {
   id: string
+  education_domain: ResourceEducationDomain
   library_type: LibraryType
   library_name: string
   subject: string
@@ -262,6 +267,19 @@ export interface LessonPlan {
   linked_pipeline_id: string | null
   recipe_id: string | null
   recipe_name: string | null
+
+  /**
+   * 精确课程大纲关联快照。
+   *
+   * course_outline_id为空表示当前没有精确挂载。
+   * 若publisher非空而id为空，则是publisher-only旧教案，只用于迁移提示，
+   * 运行时不会再模糊注入任何课程大纲。
+   */
+  course_outline_id: string | null
+  course_outline_publisher: string | null
+  course_outline_volume: string | null
+  school_system: CourseOutlineSchoolSystem | null
+
   version: number
   current_stage: string | null       // Phase 7B-9:当前阶段代码
   textbook_page_ids: string | null   // 迭代7B:关联课本图片ID的JSON数组字符串
@@ -381,10 +399,59 @@ export interface ContextReceipt {
   system_prompt_runes?: number
 }
 
+
+/* ==================== 本课共识胶囊 ==================== */
+
+/**
+ * 教师端共识胶囊的一个语义区域。
+ *
+ * 这里只包含教师可理解的教学内容，不包含文件名、资源ID、Token、
+ * 注入次数、内部状态码或完整系统提示词。
+ */
+export interface LessonPlanContextCapsuleDisplaySection {
+  key: string
+  title: string
+  items: string[]
+  emphasis?: 'stable' | 'active' | 'guard' | 'soft' | string
+}
+
+/** 教师端安全、轻量的“本课共识”展示视图 */
+export interface LessonPlanContextCapsuleDisplayView {
+  state_label: string
+  headline: string
+  summary: string
+  recent_change?: string
+  sections: LessonPlanContextCapsuleDisplaySection[]
+}
+
+/**
+ * context_capsule 非终态SSE载荷。
+ *
+ * 该事件在主回复完成后由旁路更新器发送，只用于刷新环境式共识胶囊，
+ * 不代表本轮对话结束，也不能关闭教案SSE长连接。
+ */
+export interface LessonPlanContextCapsuleEventData {
+  version: number
+  status: string
+  display?: LessonPlanContextCapsuleDisplayView
+}
+
 /** 对话消息元数据：保留扩展索引，兼容soft_retry等既有字段 */
 export interface ConversationMessageMetadata {
   context_receipt?: ContextReceipt
   soft_retry?: boolean
+
+  /**
+   * 正式教案改稿是否已经同时提交到数据库和原格式Word。
+   *
+   * write/revise阶段只有后端原子提交成功后才会返回true。
+   * 字段缺失不能被视为已提交，历史未保存稿必须fail-closed。
+   */
+  content_committed?: boolean
+
+  /** content_committed=true时对应的正式教案版本号。 */
+  content_version?: number
+
   [key: string]: unknown
 }
 
@@ -410,6 +477,14 @@ export interface StartConversationRequest {
   recipe_id?: string
   recipe_mode?: RecipeSelectionMode
   textbook_page_ids?: string[]  // 迭代7B:关联课本图片ID列表
+
+  /**
+   * 精确课程大纲唯一ID。
+   *
+   * 空值或不传表示明确不关联课程大纲。
+   * 前端不得再提交出版社字符串让后端模糊匹配。
+   */
+  course_outline_id?: string
 }
 
 export interface StartConversationResponse {
@@ -545,6 +620,7 @@ export type LPSSEEventType =
   | 'stage_output'      // Phase 7B-9:阶段产出物已生成
   | 'suggested_actions' // 迭代3.5 B-2:建议芯片事件(后端在message_done后单独广播)
   | 'retry_notice'      // 子轮二(重试可见性):空流自动重试时后端广播,提示文案在 content 字段
+  | 'context_capsule'    // 本课共识胶囊旁路更新；非终态，不关闭SSE
   | 'error'
   | 'done'
 
@@ -591,6 +667,7 @@ export interface LPSSEEvent {
   extraction_hint?: ExtractionHint
   stage_data?: StageEventData         // Phase 7B-9:阶段事件数据
   suggested_actions?: SuggestedAction[] // 迭代3.5 B-2:动态建议芯片数组(suggested_actions事件携带)
+  context_capsule?: LessonPlanContextCapsuleEventData // 本课共识胶囊旁路更新
   error?: string
   /** 子轮二(B2 轮次序号):本事件归属哪一轮 chat。仅 chat 主轮次(及其派生)非空，系统旁路为空。 */
   client_turn_id?: string
@@ -644,4 +721,3 @@ export interface SSEConnection {
 }
 
 /* ==================== API函数:组织管理 ==================== */
-

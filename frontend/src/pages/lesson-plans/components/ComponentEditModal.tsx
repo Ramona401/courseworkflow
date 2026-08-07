@@ -10,6 +10,13 @@
  */
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useSubjects } from '@/hooks/useSubjects'
+import { useEducationProfile } from '@/hooks/useEducationProfile'
+import {
+  EDUCATION_DOMAIN_LABELS,
+  RESOURCE_EDUCATION_DOMAIN_LABELS,
+  RESOURCE_EDUCATION_DOMAIN_OPTIONS,
+  type ResourceEducationDomain,
+} from '@/education-domain/types'
 import {
   getComponent, createComponent, updateComponent,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -102,6 +109,7 @@ interface ComponentEditModalProps {
 
 export default function ComponentEditModal({ componentId, presetLibraryType, onClose, onSaved }: ComponentEditModalProps) {
   const isEdit = !!componentId
+  const { domain, isMixed } = useEducationProfile()
 
   /**
    * 当前用户教育域和教学组织下的课程目录。
@@ -115,6 +123,7 @@ export default function ComponentEditModal({ componentId, presetLibraryType, onC
 
   // ---- 表单状态 ----
   const [libraryType, setLibraryType] = useState<LibraryType>(presetLibraryType || 'activity_design')
+  const [resourceDomain, setResourceDomain] = useState<ResourceEducationDomain | ''>('')
   const [subject, setSubject] = useState('general')
   const [gradeRange, setGradeRange] = useState('')
   const [injectionMode, setInjectionMode] = useState<InjectionMode>('on_demand')
@@ -202,6 +211,7 @@ export default function ComponentEditModal({ componentId, presetLibraryType, onC
       try {
         const comp = await getComponent(componentId)
         setLibraryType(comp.library_type)
+        setResourceDomain(comp.education_domain)
         setSubject(comp.subject || 'general')
         setGradeRange(comp.grade_range || '')
         setInjectionMode(comp.injection_mode)
@@ -238,6 +248,7 @@ export default function ComponentEditModal({ componentId, presetLibraryType, onC
   // ---- 保存 ----
   const handleSave = async () => {
     if (!displayLabel.trim()) { showToast('请填写展示标签', 'error'); return }
+    if (!isEdit && isMixed && !resourceDomain) { showToast('请选择目标资源域', 'error'); return }
     setSaving(true)
     try {
       const payload: Record<string, unknown> = {
@@ -253,6 +264,7 @@ export default function ComponentEditModal({ componentId, presetLibraryType, onC
         tags: JSON.stringify(tags),
         content: '{}',
       }
+      if (!isEdit && isMixed) payload.education_domain = resourceDomain
       if (isEdit && componentId) {
         await updateComponent(componentId, payload)
         showToast('组件已更新 ✓')
@@ -270,6 +282,9 @@ export default function ComponentEditModal({ componentId, presetLibraryType, onC
 
   // ---- 当前选中的组件类型信息 ----
   const currentType = LIBRARY_TYPES.find(t => t.key === libraryType)
+  const readOnlyCommon = isEdit && resourceDomain === 'common' && !isMixed
+  const saveBlocked = saving || !displayLabel.trim() || readOnlyCommon ||
+    (!isEdit && isMixed && !resourceDomain)
 
   // ==================== 渲染 ====================
   return (
@@ -311,6 +326,10 @@ export default function ComponentEditModal({ componentId, presetLibraryType, onC
             <div style={{ textAlign: 'center', padding: '40px', color: C.textMuted }}>加载中...</div>
           ) : (
             <>
+              {readOnlyCommon && <div style={{ marginBottom: '16px', padding: '10px 12px', borderRadius: '8px', background: '#FFFBEB', color: '#92400E', fontSize: '12px', lineHeight: 1.6 }}>
+                这是跨域通用组件。普通教学Actor只能查看，不能修改；请由mixed管理Actor治理。
+              </div>}
+              <fieldset disabled={readOnlyCommon} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
               {/* 组件库类型选择 */}
               <div style={{ marginBottom: '20px' }}>
                 <label style={labelStyle}>组件库类型 <span style={{ color: C.danger }}>*</span></label>
@@ -328,6 +347,17 @@ export default function ComponentEditModal({ componentId, presetLibraryType, onC
                     </button>
                   ))}
                 </div>
+              </div>
+
+              {/* 资源域创建时固化；编辑模式只展示，不允许迁移。 */}
+              <div style={{ marginBottom: '20px' }}>
+                <label style={labelStyle}>资源教育域 {!isEdit && isMixed && <span style={{ color: C.danger }}>*</span>}</label>
+                {isEdit ? <div style={{ ...inputStyle, background: C.bg, color: C.textSec }}>{resourceDomain ? RESOURCE_EDUCATION_DOMAIN_LABELS[resourceDomain] : '未返回资源域'}</div>
+                  : isMixed ? <select value={resourceDomain} onChange={e => setResourceDomain(e.target.value as ResourceEducationDomain | '')} style={selectStyle}>
+                    <option value="">请选择目标资源域</option>
+                    {RESOURCE_EDUCATION_DOMAIN_OPTIONS.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}
+                  </select>
+                  : <div style={{ ...inputStyle, background: C.bg, color: C.textSec }}>由后端按当前可信教学域“{EDUCATION_DOMAIN_LABELS[domain]}”创建</div>}
               </div>
 
               {/* 基本属性行 */}
@@ -489,6 +519,7 @@ export default function ComponentEditModal({ componentId, presetLibraryType, onC
                   </div>
                 )}
               </div>
+              </fieldset>
             </>
           )}
         </div>
@@ -498,20 +529,20 @@ export default function ComponentEditModal({ componentId, presetLibraryType, onC
           padding: '16px 24px', borderTop: `1px solid ${C.border}`,
           display: 'flex', justifyContent: 'space-between', alignItems: 'center',
         }}>
-          <div style={{ fontSize: '12px', color: C.textMuted }}>
-            {tags.length > 0 && `${tags.length} 个标签`}
+          <div style={{ fontSize: '12px', color: readOnlyCommon ? '#92400E' : C.textMuted }}>
+            {readOnlyCommon ? 'common组件对当前教学身份只读' : tags.length > 0 && `${tags.length} 个标签`}
           </div>
           <div style={{ display: 'flex', gap: '10px' }}>
             <button onClick={onClose} style={{
               padding: '9px 20px', borderRadius: '8px', border: `1px solid ${C.border}`,
               background: '#fff', color: C.textSec, fontSize: '14px', cursor: 'pointer',
             }}>取消</button>
-            <button onClick={handleSave} disabled={saving || !displayLabel.trim()} style={{
+            <button onClick={handleSave} disabled={saveBlocked} style={{
               padding: '9px 24px', borderRadius: '8px', border: 'none', fontSize: '14px', fontWeight: 600,
-              cursor: saving || !displayLabel.trim() ? 'not-allowed' : 'pointer',
-              background: saving || !displayLabel.trim() ? C.border : C.primary,
-              color: saving || !displayLabel.trim() ? C.textMuted : '#fff',
-            }}>{saving ? '保存中...' : isEdit ? '更新组件' : '创建组件'}</button>
+              cursor: saveBlocked ? 'not-allowed' : 'pointer',
+              background: saveBlocked ? C.border : C.primary,
+              color: saveBlocked ? C.textMuted : '#fff',
+            }}>{readOnlyCommon ? '只读组件' : saving ? '保存中...' : isEdit ? '更新组件' : '创建组件'}</button>
           </div>
         </div>
 

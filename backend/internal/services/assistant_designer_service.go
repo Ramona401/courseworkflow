@@ -242,10 +242,11 @@ JSON 格式的硬性约束(务必遵守):
 
 // DesignerContext 每次对话的上下文(从 Modal 透传过来)
 type DesignerContext struct {
-	Subject      string   // Modal 选的学科(可空=不限)
-	Grade        string   // Modal 选的年级(可空=不限)
-	Scenes       []string // Modal 勾选的适用场景(影响查库 library_type 推断)
-	CurrentDraft string   // 当前已有的 full_prompt 草稿(首次对话可空)
+	Subject         string   // Modal 选的学科(可空=不限)
+	Grade           string   // Modal 选的年级(可空=不限)
+	EducationDomain string   // mixed管理员显式目标域；普通Actor忽略客户端值
+	Scenes          []string // Modal 勾选的适用场景(影响查库 library_type 推断)
+	CurrentDraft    string   // 当前已有的 full_prompt 草稿(首次对话可空)
 }
 
 // DesignerMessage 对话历史中的一条消息
@@ -308,6 +309,27 @@ type flatComponent struct {
 // AssistantDesignerService — 对话式创作服务主体
 // ============================================================================
 
+// resolveDesignerComponentDomain 解析助手设计器查组件时的可信教育域。
+//
+// 普通Actor始终使用服务端可信域，客户端education_domain不能越权覆盖；
+// mixed管理员必须显式选择k12、vocational或adult；
+// nil、空值、common、mixed和非法目标域全部fail-closed。
+func resolveDesignerComponentDomain(
+	actor *AssistantActorContext,
+	designerContext *DesignerContext,
+) (string, error) {
+	requestedDomain := ""
+
+	if designerContext != nil {
+		requestedDomain = designerContext.EducationDomain
+	}
+
+	return resolveComponentMatchDomain(
+		actor,
+		requestedDomain,
+	)
+}
+
 type AssistantDesignerService struct {
 	aesKey       string
 	apiBaseURL   string
@@ -337,6 +359,7 @@ func NewAssistantDesignerService(aesKey, apiBaseURL, apiKey, defaultModel string
 func (s *AssistantDesignerService) DesignChat(
 	ctx context.Context,
 	userID string,
+	userRole string,
 	userMessage string,
 	history []DesignerMessage,
 	dCtx *DesignerContext,
@@ -393,7 +416,36 @@ func (s *AssistantDesignerService) DesignChat(
 	// ------- 分支处理 -------
 	switch decision.Action {
 	case "search_components":
-		return s.handleSearchAndDraft(ctx, aiCfg, traceCtx, userMessage, history, dCtx, decision, callbacks)
+		actor := BuildActorFromClaims(
+			ctx,
+			userID,
+			userRole,
+		)
+
+		currentDomain, domainErr :=
+			resolveDesignerComponentDomain(
+				actor,
+				dCtx,
+			)
+		if domainErr != nil {
+			callbacks.OnError(
+				domainErr.Error(),
+			)
+			return domainErr
+		}
+
+		return s.handleSearchAndDraft(
+			ctx,
+			aiCfg,
+			traceCtx,
+			currentDomain,
+			userMessage,
+			history,
+			dCtx,
+			decision,
+			callbacks,
+		)
+
 	case "draft_directly", "clarify":
 		return s.handleDirectReply(decision, callbacks)
 	default:
@@ -415,6 +467,7 @@ func (s *AssistantDesignerService) handleSearchAndDraft(
 	ctx context.Context,
 	aiCfg *ai.EffectiveConfig,
 	traceCtx *ai.TraceContext,
+	currentDomain string,
 	userMessage string,
 	history []DesignerMessage,
 	dCtx *DesignerContext,
@@ -428,7 +481,12 @@ func (s *AssistantDesignerService) handleSearchAndDraft(
 	callbacks.OnSearching(reason)
 
 	matchReq := buildMatchRequestFromParams(decision.QueryParams, dCtx)
-	groups, err := repository.MatchComponents(ctx, matchReq)
+	groups, err :=
+		repository.MatchComponentsForEducationDomain(
+			ctx,
+			matchReq,
+			currentDomain,
+		)
 	if err != nil {
 		designerLog.Warn("查库失败，降级为直接起草",
 			"error", err)

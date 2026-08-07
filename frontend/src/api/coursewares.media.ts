@@ -6,10 +6,17 @@
  * TTS 配音、资产上云 OSS、课件离线包下载。
  * 经桶文件 coursewares.ts 透出，对外 import 路径不变。
  *
- * 视频锚点轮(本轮)：generateCWVideo 新增可选参数 sourceFrameAssetId——
- *   两步流"先出首帧图→确认→生视频"时，把已确认首帧图的资产ID传入，
- *   后端据此写视频资产 metadata 溯源（{"source_frame_asset_id":"..."}）。
- *   不传则为旧的直接生视频，无溯源。
+ * 普通图片积分幂等：
+ *   - 每次调用generateCWImage代表一次教师主动生成操作；
+ *   - 调用开始时生成一个UUID operation_id；
+ *   - 同一个HTTP请求正文始终携带同一个operation_id；
+ *   - Axios或网络层对同一请求进行重放时继续复用原请求正文；
+ *   - 新一次教师点击会重新调用函数并获得新的operation_id。
+ *
+ * 视频锚点轮：
+ *   generateCWVideo支持可选参数sourceFrameAssetId。
+ *   两步流“先出首帧图→确认→生视频”时，把已确认首帧图的资产ID传入，
+ *   后端据此写视频资产metadata溯源。
  */
 import apiClient from './client'
 import { extractData } from './coursewares.types'
@@ -24,7 +31,50 @@ import type {
 
 // ==================== 图片生成+上传+管理 ====================
 
-/** v0.42: AI生成图片（调用豆包Seedream API） */
+/**
+ * 为一次图片生成业务操作创建安全UUID。
+ *
+ * 生产站点运行在HTTPS环境，现代浏览器均应提供crypto.randomUUID。
+ * 不做时间戳或Math.random降级，避免低质量随机值削弱幂等键可靠性。
+ */
+function createCWImageOperationID(): string {
+  const cryptoAPI = globalThis.crypto
+  if (!cryptoAPI || typeof cryptoAPI.randomUUID !== 'function') {
+    throw new Error('当前浏览器不支持安全UUID生成，请升级浏览器后重试')
+  }
+
+  return cryptoAPI.randomUUID()
+}
+
+/**
+ * 为一次视频生成提交创建安全UUID。
+ *
+ * 同一次提交发生网络错误时，调用组件继续复用原UUID；
+ * 收到asset_id后清空，下一次主动生成创建新UUID。
+ */
+export function createCWVideoOperationID(): string {
+  const cryptoAPI = globalThis.crypto
+
+  if (
+    !cryptoAPI ||
+    typeof cryptoAPI.randomUUID !== 'function'
+  ) {
+    throw new Error(
+      '当前浏览器不支持安全UUID生成，请升级浏览器后重试',
+    )
+  }
+
+  return cryptoAPI.randomUUID()
+}
+
+/**
+ * AI生成普通课件图片。
+ *
+ * operationId通常不需要调用方传入：
+ *   - 普通教师点击调用时，本函数自动创建一个新UUID；
+ *   - 需要显式恢复同一业务操作的受控调用方，可传入原operationId；
+ *   - 后端会再次按UUID格式校验并以此执行媒体计费幂等。
+ */
 export async function generateCWImage(
   coursewareId: string,
   pageNumber: number,
@@ -32,22 +82,29 @@ export async function generateCWImage(
   placeholderId?: string,
   size?: string,
   refImageUrl?: string,
+  operationId?: string,
 ): Promise<GenerateImageResponse> {
+  const stableOperationID = operationId?.trim() || createCWImageOperationID()
+
   const body: Record<string, string> = {
     prompt,
     placeholder_id: placeholderId || '',
     size: size || '1920x1920',
+    operation_id: stableOperationID,
   }
+
   if (refImageUrl) body.ref_image_url = refImageUrl
+
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/pages/${pageNumber}/generate-image`,
     body,
     { timeout: 60000 },
   )
+
   return extractData(resp)
 }
 
-/** v0.42: 手动上传图片 */
+/** 手动上传图片 */
 export async function uploadCWImage(
   coursewareId: string,
   pageNumber: number,
@@ -56,16 +113,26 @@ export async function uploadCWImage(
 ): Promise<UploadImageResponse> {
   const formData = new FormData()
   formData.append('file', file)
-  if (placeholderId) formData.append('placeholder_id', placeholderId)
+
+  if (placeholderId) {
+    formData.append('placeholder_id', placeholderId)
+  }
+
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/pages/${pageNumber}/upload-image`,
     formData,
-    { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 30000 },
+    {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+      timeout: 30000,
+    },
   )
+
   return extractData(resp)
 }
 
-/** v0.42: 获取页面图片列表 */
+/** 获取页面图片列表 */
 export async function listPageAssets(
   coursewareId: string,
   pageNumber: number,
@@ -73,44 +140,58 @@ export async function listPageAssets(
   const resp = await apiClient.get(
     `/coursewares/${coursewareId}/pages/${pageNumber}/assets`,
   )
+
   return extractData(resp)
 }
 
-/** v0.42: 获取课件全部图片 */
+/** 获取课件全部媒体资产 */
 export async function listCoursewareAssets(
   coursewareId: string,
 ): Promise<{ assets: CoursewareAsset[]; total: number }> {
-  const resp = await apiClient.get(`/coursewares/${coursewareId}/assets`)
+  const resp = await apiClient.get(
+    `/coursewares/${coursewareId}/assets`,
+  )
+
   return extractData(resp)
 }
 
-/** v0.42: 删除图片资产 */
+/** 删除课件资产 */
 export async function deleteCWAsset(
   coursewareId: string,
   assetId: string,
 ): Promise<void> {
-  await apiClient.delete(`/coursewares/${coursewareId}/assets/${assetId}`)
+  await apiClient.delete(
+    `/coursewares/${coursewareId}/assets/${assetId}`,
+  )
 }
 
-/** v0.42: 将图片插入到页面HTML */
+/** 将图片插入到页面HTML */
 export async function insertImageToPage(
   coursewareId: string,
   pageNumber: number,
   assetId: string,
-): Promise<{ page_number: number; html_content: string; message: string }> {
+): Promise<{
+  page_number: number
+  html_content: string
+  message: string
+}> {
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/pages/${pageNumber}/insert-image`,
-    { asset_id: assetId },
+    {
+      asset_id: assetId,
+    },
   )
+
   return extractData(resp)
 }
 
-// ==================== 批次4c+: AI 写详细提示词（图片/视频）====================
+// ==================== AI写详细提示词（图片/视频） ====================
 
 /**
- * 批次4c+/图片多提示词: AI 写详细生图提示词。
- * AI 读本页配图需求自主判断该页要几张图, 返回一条或多条建议(每条含 caption + prompt)。
- * 即使只有一张图, prompts 也是长度为 1 的数组。
+ * AI写详细生图提示词。
+ *
+ * AI读取本页配图需求，自主判断该页需要几张图，
+ * 返回一条或多条建议，每条包含caption与prompt。
  */
 export async function suggestImagePrompt(
   coursewareId: string,
@@ -119,12 +200,15 @@ export async function suggestImagePrompt(
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/pages/${pageNumber}/suggest-image-prompt`,
     {},
-    { timeout: 60000 },
+    {
+      timeout: 60000,
+    },
   )
+
   return extractData(resp)
 }
 
-/** 视频分镜(本轮): AI 写本页视频分镜数组, 每镜含 scene/image_prompt/video_prompt/narration */
+/** AI写本页视频分镜数组 */
 export async function suggestVideoPrompt(
   coursewareId: string,
   pageNumber: number,
@@ -132,14 +216,22 @@ export async function suggestVideoPrompt(
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/pages/${pageNumber}/suggest-video-prompt`,
     {},
-    { timeout: 60000 },
+    {
+      timeout: 60000,
+    },
   )
+
   return extractData(resp)
 }
 
-// ==================== 物料存储: 读已存建议/分镜 + 保存分镜（省token先读库）====================
+// ==================== 物料存储 ====================
 
-/** 物料存储: 读已存生图建议(不调AI、不计token); 库里没有时 prompts 为空数组, 调用方据此回退调 suggestImagePrompt */
+/**
+ * 读取已存生图建议。
+ *
+ * 本接口不调用AI、不产生模型积分；
+ * 数据库没有记录时prompts为空数组。
+ */
 export async function getStoredImageSuggestions(
   coursewareId: string,
   pageNumber: number,
@@ -147,10 +239,16 @@ export async function getStoredImageSuggestions(
   const resp = await apiClient.get(
     `/coursewares/${coursewareId}/pages/${pageNumber}/image-suggestions`,
   )
+
   return extractData(resp)
 }
 
-/** 物料存储: 读已存视频分镜(不调AI); 库里没有时 storyboards 为空数组 */
+/**
+ * 读取已存视频分镜。
+ *
+ * 本接口不调用AI；
+ * 数据库没有记录时storyboards为空数组。
+ */
 export async function getStoredVideoStoryboards(
   coursewareId: string,
   pageNumber: number,
@@ -158,31 +256,45 @@ export async function getStoredVideoStoryboards(
   const resp = await apiClient.get(
     `/coursewares/${coursewareId}/pages/${pageNumber}/video-storyboards`,
   )
+
   return extractData(resp)
 }
 
-/** 物料存储: 保存视频分镜(老师手动编辑/拆镜结果落库); 传空数组等价清空 */
+/**
+ * 保存老师编辑后的视频分镜。
+ *
+ * 传入空数组表示清除当前页面的已存分镜。
+ */
 export async function saveVideoStoryboards(
   coursewareId: string,
   pageNumber: number,
   storyboards: VideoStoryboardItem[],
-): Promise<{ message: string; page_number: number }> {
+): Promise<{
+  message: string
+  page_number: number
+}> {
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/pages/${pageNumber}/video-storyboards`,
-    { storyboards },
+    {
+      storyboards,
+    },
   )
+
   return extractData(resp)
 }
 
-// ==================== v0.42.1 视频生成 ====================
+// ==================== 视频生成 ====================
 
 /**
- * v0.42.1: AI生成视频（异步提交任务，返回task_id供轮询）
+ * AI生成视频。
  *
- * 视频锚点轮(本轮)：新增可选参数 sourceFrameAssetId。
- *   - 两步流"先出首帧图→确认→生视频"：把首帧图URL作 refImageUrl(图生视频锁风格人物)，
- *     首帧图资产ID作 sourceFrameAssetId(后端写 metadata 溯源)。
- *   - 旧的直接文字生视频：两参数都不传。
+ * 视频使用异步任务协议，接口先返回asset_id与task_id，
+ * 调用方随后使用queryVideoStatus轮询。
+ *
+ * sourceFrameAssetId非空时：
+ *   - 后端重新读取并校验首帧资产属于当前课件且为图片；
+ *   - 只使用数据库中的可信图片URL；
+ *   - 视频资产metadata记录首帧资产血缘。
  */
 export async function generateCWVideo(
   coursewareId: string,
@@ -190,19 +302,37 @@ export async function generateCWVideo(
   prompt: string,
   refImageUrl?: string,
   sourceFrameAssetId?: string,
+  operationId?: string,
 ): Promise<GenerateVideoResponse> {
-  const body: Record<string, string> = { prompt }
-  if (refImageUrl) body.ref_image_url = refImageUrl
-  if (sourceFrameAssetId) body.source_frame_asset_id = sourceFrameAssetId
+  const stableOperationID =
+    operationId?.trim() ||
+    createCWVideoOperationID()
+
+  const body: Record<string, string> = {
+    prompt,
+    operation_id: stableOperationID,
+  }
+
+  if (refImageUrl) {
+    body.ref_image_url = refImageUrl
+  }
+
+  if (sourceFrameAssetId) {
+    body.source_frame_asset_id = sourceFrameAssetId
+  }
+
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/pages/${pageNumber}/generate-video`,
     body,
-    { timeout: 30000 },
+    {
+      timeout: 30000,
+    },
   )
+
   return extractData(resp)
 }
 
-/** v0.42.1: 查询视频生成任务状态（前端轮询直到uploaded或failed） */
+/** 查询视频生成任务状态 */
 export async function queryVideoStatus(
   coursewareId: string,
   assetId: string,
@@ -210,27 +340,33 @@ export async function queryVideoStatus(
   const resp = await apiClient.get(
     `/coursewares/${coursewareId}/assets/${assetId}/video-status`,
   )
+
   return extractData(resp)
 }
 
-// ==================== v0.42.2 视频高级拼接 ====================
+// ==================== 视频高级拼接 ====================
 
-/** v0.42.2: 高级视频拼接（支持每段独立裁剪+转场效果） */
+/** 高级视频拼接，支持每段独立裁剪和转场效果 */
 export async function advancedConcatCWVideos(
   coursewareId: string,
   clips: VideoClip[],
 ): Promise<AdvancedConcatResponse> {
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/videos/advanced-concat`,
-    { clips },
-    { timeout: 120000 },
+    {
+      clips,
+    },
+    {
+      timeout: 120000,
+    },
   )
+
   return extractData(resp)
 }
 
-// ==================== S-V1 配音混入成片 ====================
+// ==================== 配音混入成片 ====================
 
-/** S-V1: 配音混音响应（后端 MixNarrationResponse） */
+/** 配音混音响应 */
 export interface MixNarrationResponse {
   asset_id: string
   url: string
@@ -240,129 +376,204 @@ export interface MixNarrationResponse {
   message: string
 }
 
-/** S-V1: 把字幕轨中已生成的TTS配音按时间轴混入指定视频，产出新视频资产 */
+/** 把字幕轨中已生成的TTS配音按时间轴混入指定视频 */
 export async function mixNarrationCWVideo(
   coursewareId: string,
   assetId: string,
   subtitleId: string,
   gain?: number,
 ): Promise<MixNarrationResponse> {
-  const body: Record<string, unknown> = { asset_id: assetId, subtitle_id: subtitleId }
-  if (gain && gain !== 1.0) body.gain = gain
+  const body: Record<string, unknown> = {
+    asset_id: assetId,
+    subtitle_id: subtitleId,
+  }
+
+  if (gain && gain !== 1.0) {
+    body.gain = gain
+  }
+
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/videos/mix-narration`,
     body,
-    { timeout: 180000 }, // 混音含ffmpeg处理，给足3分钟
+    {
+      timeout: 180000,
+    },
   )
+
   return extractData(resp)
 }
 
-// ==================== v0.42.4 视频静音 + 音轨分离 ====================
+// ==================== 视频静音与音轨分离 ====================
 
-/** v0.42.4: 视频静音（去除音轨，生成新的静音视频） */
+/** 视频静音，生成新的静音视频 */
 export async function muteCWVideo(
   coursewareId: string,
   assetId: string,
 ): Promise<MuteVideoResponse> {
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/videos/mute`,
-    { asset_id: assetId },
-    { timeout: 60000 },
+    {
+      asset_id: assetId,
+    },
+    {
+      timeout: 60000,
+    },
   )
+
   return extractData(resp)
 }
 
-/** v0.42.4: 音轨分离（从视频提取音频为MP3） */
+/** 从视频提取音频 */
 export async function extractCWAudio(
   coursewareId: string,
   assetId: string,
 ): Promise<ExtractAudioResponse> {
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/videos/extract-audio`,
-    { asset_id: assetId },
-    { timeout: 60000 },
+    {
+      asset_id: assetId,
+    },
+    {
+      timeout: 60000,
+    },
   )
+
   return extractData(resp)
 }
 
-// ==================== v0.42.5 视频手动上传 ====================
+// ==================== 视频手动上传 ====================
 
-/** v0.42.5: 手动上传视频文件到课件(mp4/webm/mov ≤50MB) */
+/** 手动上传视频文件到课件 */
 export async function uploadCWVideo(
   coursewareId: string,
   pageNumber: number,
   file: File,
   onProgress?: (pct: number) => void,
-): Promise<{ asset_id: string; url: string; file_name: string; file_size: number; mime_type: string }> {
+): Promise<{
+  asset_id: string
+  url: string
+  file_name: string
+  file_size: number
+  mime_type: string
+}> {
   const formData = new FormData()
   formData.append('file', file)
+
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/pages/${pageNumber}/upload-video`,
     formData,
     {
-      headers: { 'Content-Type': 'multipart/form-data' },
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
       timeout: 120000,
-      // v0.42.6+ P1.1: 利用 axios 原生上传进度回调
-      onUploadProgress: (e) => {
-        if (onProgress && e.total) {
-          const pct = Math.round((e.loaded / e.total) * 100)
-          onProgress(Math.min(100, pct))
+      onUploadProgress: event => {
+        if (onProgress && event.total) {
+          const percentage = Math.round(
+            (event.loaded / event.total) * 100,
+          )
+
+          onProgress(
+            Math.min(100, percentage),
+          )
         }
       },
     },
   )
+
   return extractData(resp)
 }
 
 // ==================== 音频手动上传 ====================
 
-/** 手动上传音频文件到课件(mp3/wav/ogg/aac/flac/m4a ≤20MB) */
+/** 手动上传音频文件到课件 */
 export async function uploadCWAudio(
   coursewareId: string,
   pageNumber: number,
   file: File,
   onProgress?: (pct: number) => void,
-): Promise<{ asset_id: string; url: string; file_name: string; file_size: number; mime_type: string }> {
+): Promise<{
+  asset_id: string
+  url: string
+  file_name: string
+  file_size: number
+  mime_type: string
+}> {
   const formData = new FormData()
   formData.append('file', file)
+
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/pages/${pageNumber}/upload-audio`,
     formData,
     {
-      headers: { 'Content-Type': 'multipart/form-data' },
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
       timeout: 60000,
-      onUploadProgress: (e) => {
-        if (onProgress && e.total) {
-          const pct = Math.round((e.loaded / e.total) * 100)
-          onProgress(Math.min(100, pct))
+      onUploadProgress: event => {
+        if (onProgress && event.total) {
+          const percentage = Math.round(
+            (event.loaded / event.total) * 100,
+          )
+
+          onProgress(
+            Math.min(100, percentage),
+          )
         }
       },
     },
   )
+
   return extractData(resp)
 }
 
-// ==================== v0.42.5 视频编辑器草稿(服务器端多版本) ====================
+// ==================== 视频编辑器草稿 ====================
 
-export async function listVideoDrafts(coursewareId: string): Promise<{ drafts: VideoDraftItem[]; total: number }> {
-  const resp = await apiClient.get(`/coursewares/${coursewareId}/video-drafts`)
+export async function listVideoDrafts(
+  coursewareId: string,
+): Promise<{
+  drafts: VideoDraftItem[]
+  total: number
+}> {
+  const resp = await apiClient.get(
+    `/coursewares/${coursewareId}/video-drafts`,
+  )
+
   return extractData(resp)
 }
 
-export async function saveVideoDraft(coursewareId: string, data: {
-  name: string; clips_data: any; clip_count: number
-}): Promise<{ id: string; created_at: string; message: string }> {
-  const resp = await apiClient.post(`/coursewares/${coursewareId}/video-drafts`, data)
+export async function saveVideoDraft(
+  coursewareId: string,
+  data: {
+    name: string
+    clips_data: any
+    clip_count: number
+  },
+): Promise<{
+  id: string
+  created_at: string
+  message: string
+}> {
+  const resp = await apiClient.post(
+    `/coursewares/${coursewareId}/video-drafts`,
+    data,
+  )
+
   return extractData(resp)
 }
 
-export async function deleteVideoDraft(coursewareId: string, draftId: string): Promise<void> {
-  await apiClient.delete(`/coursewares/${coursewareId}/video-drafts/${draftId}`)
+export async function deleteVideoDraft(
+  coursewareId: string,
+  draftId: string,
+): Promise<void> {
+  await apiClient.delete(
+    `/coursewares/${coursewareId}/video-drafts/${draftId}`,
+  )
 }
 
-// ==================== v0.42.8 字幕轨 API ====================
+// ==================== 字幕轨 API ====================
 
-/** v0.42.8: 创建/更新字幕轨（UPSERT by courseware+scope+language） */
+/** 创建或更新字幕轨 */
 export async function upsertSubtitle(
   coursewareId: string,
   data: {
@@ -374,56 +585,103 @@ export async function upsertSubtitle(
     tts_config?: string | null
   },
 ): Promise<CoursewareSubtitle> {
-  const resp = await apiClient.post(`/coursewares/${coursewareId}/subtitles`, data)
+  const resp = await apiClient.post(
+    `/coursewares/${coursewareId}/subtitles`,
+    data,
+  )
+
   return extractData(resp)
 }
 
-/** v0.42.8: 查询字幕轨列表 */
+/** 查询字幕轨列表 */
 export async function listSubtitles(
   coursewareId: string,
   scopeType?: string,
   scopeId?: string,
 ): Promise<CoursewareSubtitle[]> {
   const params: Record<string, string> = {}
-  if (scopeType) params.scope_type = scopeType
-  if (scopeId) params.scope_id = scopeId
-  const resp = await apiClient.get(`/coursewares/${coursewareId}/subtitles`, { params })
+
+  if (scopeType) {
+    params.scope_type = scopeType
+  }
+
+  if (scopeId) {
+    params.scope_id = scopeId
+  }
+
+  const resp = await apiClient.get(
+    `/coursewares/${coursewareId}/subtitles`,
+    {
+      params,
+    },
+  )
+
   return extractData(resp)
 }
 
-/** v0.42.8: 删除字幕轨 */
+/** 删除字幕轨 */
 export async function deleteSubtitle(
   coursewareId: string,
   subtitleId: string,
 ): Promise<void> {
-  await apiClient.delete(`/coursewares/${coursewareId}/subtitles/${subtitleId}`)
+  await apiClient.delete(
+    `/coursewares/${coursewareId}/subtitles/${subtitleId}`,
+  )
 }
 
-/** v0.42.8: 前端本地生成 SRT 文件并触发下载（避免 axios 拦截器对纯文本的处理问题） */
-export function exportSubtitleSRTLocal(segments: SubtitleSegment[], filename?: string): void {
-  // 格式化 SRT 时间码: HH:MM:SS,mmm
-  const fmtTime = (sec: number): string => {
-    if (sec < 0) sec = 0
-    const ms = Math.round(sec * 1000)
-    const h = Math.floor(ms / 3600000)
-    const m = Math.floor((ms % 3600000) / 60000)
-    const s = Math.floor((ms % 60000) / 1000)
-    const mill = ms % 1000
-    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(mill).padStart(3,'0')}`
+/** 前端本地生成SRT文件并触发下载 */
+export function exportSubtitleSRTLocal(
+  segments: SubtitleSegment[],
+  filename?: string,
+): void {
+  const formatTime = (seconds: number): string => {
+    const safeSeconds = seconds < 0 ? 0 : seconds
+    const milliseconds = Math.round(safeSeconds * 1000)
+    const hours = Math.floor(milliseconds / 3600000)
+    const minutes = Math.floor(
+      (milliseconds % 3600000) / 60000,
+    )
+    const secs = Math.floor(
+      (milliseconds % 60000) / 1000,
+    )
+    const millis = milliseconds % 1000
+
+    return [
+      String(hours).padStart(2, '0'),
+      String(minutes).padStart(2, '0'),
+      String(secs).padStart(2, '0'),
+    ].join(':') + ',' + String(millis).padStart(3, '0')
   }
-  const srt = segments.map((seg, i) =>
-    `${i + 1}\n${fmtTime(seg.start_sec)} --> ${fmtTime(seg.end_sec)}\n${seg.text}\n`
-  ).join('\n')
-  const blob = new Blob([srt], { type: 'text/plain;charset=utf-8' })
+
+  const srt = segments
+    .map((segment, index) => (
+      `${index + 1}\n` +
+      `${formatTime(segment.start_sec)} --> ${formatTime(segment.end_sec)}\n` +
+      `${segment.text}\n`
+    ))
+    .join('\n')
+
+  const blob = new Blob(
+    [srt],
+    {
+      type: 'text/plain;charset=utf-8',
+    },
+  )
+
   const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url; a.download = filename || 'subtitle.srt'
-  document.body.appendChild(a); a.click()
-  document.body.removeChild(a)
+  const anchor = document.createElement('a')
+
+  anchor.href = url
+  anchor.download = filename || 'subtitle.srt'
+
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
+
   URL.revokeObjectURL(url)
 }
 
-/** v0.42.8: FFmpeg 硬字幕烧录（生成新视频） */
+/** FFmpeg硬字幕烧录 */
 export async function burnInSubtitle(
   coursewareId: string,
   subtitleId: string,
@@ -431,44 +689,111 @@ export async function burnInSubtitle(
 ): Promise<BurnInSubtitleResponse> {
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/subtitles/${subtitleId}/burn-in`,
-    { video_asset_id: videoAssetId },
-    { timeout: 120000 },
+    {
+      video_asset_id: videoAssetId,
+    },
+    {
+      timeout: 120000,
+    },
   )
+
   return extractData(resp)
 }
 
-// ==================== v0.42.9 TTS 配音 API ====================
+// ==================== TTS配音 API ====================
 
-/** v0.42.9: 获取可用 TTS 音色列表 */
-export async function listTTSVoices(language?: string): Promise<{ voices: TTSVoice[]; total: number }> {
+/** 获取可用TTS音色列表 */
+export async function listTTSVoices(
+  language?: string,
+): Promise<{
+  voices: TTSVoice[]
+  total: number
+}> {
   const params: Record<string, string> = {}
-  if (language) params.language = language
-  const resp = await apiClient.get('/tts-voices', { params })
+
+  if (language) {
+    params.language = language
+  }
+
+  const resp = await apiClient.get(
+    '/tts-voices',
+    {
+      params,
+    },
+  )
+
   return extractData(resp)
 }
 
-/** v0.42.9: 批量生成字幕 TTS 配音 */
+/**
+ * 为一次字幕TTS批次创建安全UUID。
+ *
+ * 相同批次发生网络错误或服务端等待恢复时，
+ * 调用组件继续复用原UUID。
+ */
+export function createSubtitleTTSOperationID(): string {
+  const cryptoAPI = globalThis.crypto
+
+  if (
+    !cryptoAPI ||
+    typeof cryptoAPI.randomUUID !== 'function'
+  ) {
+    throw new Error(
+      '当前浏览器不支持安全UUID生成，请升级浏览器后重试',
+    )
+  }
+
+  return cryptoAPI.randomUUID()
+}
+
+/** 批量生成字幕TTS配音 */
 export async function generateSubtitleTTS(
   coursewareId: string,
   subtitleId: string,
   voice: string,
   speed?: number,
   segmentIds?: string[],
+  operationId?: string,
 ): Promise<GenerateTTSResponse> {
-  const body: GenerateTTSRequest = { voice }
-  if (speed && speed !== 1.0) body.speed = speed
-  if (segmentIds && segmentIds.length > 0) body.segment_ids = segmentIds
+  const stableOperationID =
+    operationId?.trim() ||
+    createSubtitleTTSOperationID()
+
+  const body: GenerateTTSRequest = {
+    voice,
+    operation_id:
+      stableOperationID,
+  }
+
+  if (
+    speed &&
+    speed !== 1.0
+  ) {
+    body.speed = speed
+  }
+
+  if (
+    segmentIds &&
+    segmentIds.length > 0
+  ) {
+    body.segment_ids =
+      segmentIds
+  }
+
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/subtitles/${subtitleId}/generate-tts`,
     body,
-    { timeout: 300000 }, // 5分钟超时（批量TTS可能较慢）
+    {
+      timeout: 300000,
+    },
   )
+
   return extractData(resp)
 }
 
-// ==================== v0.42.10 上传资产到阿里云OSS ====================
+// ==================== 上传资产到阿里云OSS ====================
 
-/** v0.42.10: 将课件资产（图片/视频/音频）上传到阿里云OSS，返回公网URL */
+/** 将课件资产上传到阿里云OSS */
 export async function uploadAssetToOSS(
   coursewareId: string,
   assetId: string,
@@ -476,17 +801,21 @@ export async function uploadAssetToOSS(
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/assets/${assetId}/upload-oss`,
     {},
-    { timeout: 120000 }, // 大视频上传可能较慢，2分钟超时
+    {
+      timeout: 120000,
+    },
   )
+
   return extractData(resp)
 }
 
-// ==================== 风格锚点（VAOCI 课程级风格一致性，轮3）====================
+// ==================== 风格锚点 ====================
 
 /**
- * 设置课件风格锚点（一步式同步）。
- * 后端内部：校验资产归属 → 取公网URL → 多模态读图提取VAOCI → 落库。
- * 提取VAOCI为多模态调用，耗时数秒到十几秒，故 timeout 给足 60s。
+ * 设置课件风格锚点。
+ *
+ * 后端内部完成：
+ *   校验资产归属 → 解析公网URL → 多模态提取VAOCI → 落库。
  */
 export async function setStyleAnchor(
   coursewareId: string,
@@ -494,66 +823,112 @@ export async function setStyleAnchor(
 ): Promise<SetStyleAnchorResult> {
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/style-anchor`,
-    { asset_id: assetId },
-    { timeout: 60000 },
+    {
+      asset_id: assetId,
+    },
+    {
+      timeout: 60000,
+    },
   )
+
   return extractData(resp)
 }
 
 /** 清除课件风格锚点 */
-export async function clearStyleAnchor(coursewareId: string): Promise<void> {
-  await apiClient.delete(`/coursewares/${coursewareId}/style-anchor`)
+export async function clearStyleAnchor(
+  coursewareId: string,
+): Promise<void> {
+  await apiClient.delete(
+    `/coursewares/${coursewareId}/style-anchor`,
+  )
 }
 
 // ==================== 离线打包下载 ====================
 
 /**
- * 下载课件离线包(zip)
- * 用原生 fetch 获取二进制流，绕开 axios 响应拦截器对非 JSON(blob) 的处理。
- * 鉴权头与 client.ts 保持一致：Authorization: Bearer <token>
+ * 下载课件离线包。
+ *
+ * 使用原生fetch获取二进制流，
+ * 避免Axios响应拦截器对非JSON响应进行处理。
  */
-export async function downloadCoursewareBundle(coursewareId: string, title?: string): Promise<void> {
+export async function downloadCoursewareBundle(
+  coursewareId: string,
+  title?: string,
+): Promise<void> {
   const token = localStorage.getItem('token') || ''
-  const resp = await fetch(`/api/v1/coursewares/${coursewareId}/export-bundle`, {
-    method: 'GET',
-    headers: { Authorization: `Bearer ${token}` },
-  })
-  if (!resp.ok) {
-    // 尝试解析后端 JSON 错误信息
-    let msg = `下载失败(HTTP ${resp.status})`
+
+  const response = await fetch(
+    `/api/v1/coursewares/${coursewareId}/export-bundle`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  )
+
+  if (!response.ok) {
+    let message = `下载失败(HTTP ${response.status})`
+
     try {
-      const j = await resp.json()
-      if (j && j.message) msg = j.message
-    } catch { /* 非 JSON 错误体，忽略 */ }
-    if (resp.status === 401) {
-      // 登录态失效，与 client.ts 行为保持一致
+      const errorBody = await response.json()
+      if (errorBody && errorBody.message) {
+        message = errorBody.message
+      }
+    } catch {
+      // 非JSON错误响应使用默认文案。
+    }
+
+    if (response.status === 401) {
       localStorage.removeItem('token')
       localStorage.removeItem('user')
-      if (window.location.pathname !== '/login') window.location.href = '/login'
+
+      if (window.location.pathname !== '/login') {
+        window.location.href = '/login'
+      }
     }
-    throw new Error(msg)
+
+    throw new Error(message)
   }
-  // 文件名：优先用后端 Content-Disposition，回退到 title.zip
-  let filename = (title ? title.trim() : '') || 'courseware'
-  filename = filename.replace(/[/\\:*?"<>|]/g, '_') + '.zip'
-  const cd = resp.headers.get('Content-Disposition') || ''
-  const m = cd.match(/filename\*=UTF-8''([^;]+)/i)
-  if (m && m[1]) {
-    try { filename = decodeURIComponent(m[1]) } catch { /* 解码失败用回退名 */ }
+
+  let filename = title?.trim() || 'courseware'
+  filename = filename.replace(
+    /[/\\:*?"<>|]/g,
+    '_',
+  ) + '.zip'
+
+  const contentDisposition =
+    response.headers.get('Content-Disposition') || ''
+
+  const filenameMatch = contentDisposition.match(
+    /filename\*=UTF-8''([^;]+)/i,
+  )
+
+  if (filenameMatch && filenameMatch[1]) {
+    try {
+      filename = decodeURIComponent(
+        filenameMatch[1],
+      )
+    } catch {
+      // 解码失败时继续使用前端构造的文件名。
+    }
   }
-  // 触发浏览器下载
-  const blob = await resp.blob()
+
+  const blob = await response.blob()
   const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
+  const anchor = document.createElement('a')
+
+  anchor.href = url
+  anchor.download = filename
+
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
+
   URL.revokeObjectURL(url)
 }
 
-// ==================== 音频裁剪（课件音频剪辑器专用） ====================
+// ==================== 音频裁剪 ====================
 
 /** 音频裁剪响应 */
 export interface TrimAudioResponse {
@@ -566,10 +941,7 @@ export interface TrimAudioResponse {
   message: string
 }
 
-/**
- * 音频裁剪：截取指定起止时间段，后端FFmpeg -c copy不重编码裁剪，生成新音频资产
- * 路由: POST /api/v1/coursewares/{id}/videos/trim-audio
- */
+/** 裁剪指定音频资产 */
 export async function trimCWAudio(
   coursewareId: string,
   assetId: string,
@@ -578,8 +950,15 @@ export async function trimCWAudio(
 ): Promise<TrimAudioResponse> {
   const resp = await apiClient.post(
     `/coursewares/${coursewareId}/videos/trim-audio`,
-    { asset_id: assetId, start_sec: startSec, end_sec: endSec },
-    { timeout: 60000 },
+    {
+      asset_id: assetId,
+      start_sec: startSec,
+      end_sec: endSec,
+    },
+    {
+      timeout: 60000,
+    },
   )
+
   return extractData(resp)
 }

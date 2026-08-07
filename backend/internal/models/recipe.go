@@ -239,8 +239,9 @@ type ShareRecipeRequest struct {
 
 // RecipeRecommendRequest 智能推荐配方请求
 type RecipeRecommendRequest struct {
-	Subject    string `json:"subject"`     // 学科（必填）
-	GradeRange string `json:"grade_range"` // 年级（必填）
+	EducationDomain string `json:"education_domain,omitempty"` // mixed管理员显式推荐目标域
+	Subject         string `json:"subject"`                    // 学科（必填）
+	GradeRange      string `json:"grade_range"`                // 年级（必填）
 }
 
 // ==================== 响应结构体 ====================

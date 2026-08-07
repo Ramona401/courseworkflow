@@ -113,25 +113,22 @@ var (
 	cwDivCloseRe = regexp.MustCompile(`(?i)</div\s*>`)
 )
 
-// cwCountDivTags 统计 <div 开标签与 </div> 闭标签数量。
-// <div 用前缀匹配（<div 后可能紧跟空格/属性/>），</div> 完整匹配；大小写不敏感。
+// cwCountDivTags 统计真实HTML结构中的div开闭标签。
+//
+// script/style正文按HTML原始文本元素处理，其中的innerHTML字符串、模板字符串
+// 和CSS content伪标签均不参与计数。
 func cwCountDivTags(html string) (int, int) {
-	return len(cwDivOpenRe.FindAllString(html, -1)), len(cwDivCloseRe.FindAllString(html, -1))
+	structure := cwScanHTMLStructure(html)
+	return structure.DivOpen, structure.DivClose
 }
 
-// cwEndsMidTag 判断 HTML 是否在"标签中途"结束（截断的典型尾部特征）。
-// 去尾空白后最后一个 '<' 在最后一个 '>' 之后 → 尾部卡着一个没写完的 '<...' → 明确截断。
+// cwEndsMidTag 判断HTML是否在真实标签中途结束。
+// JavaScript比较符、字符串里的“<”以及script/style正文不会造成误报。
 func cwEndsMidTag(html string) bool {
-	t := strings.TrimSpace(html)
-	if t == "" {
+	if strings.TrimSpace(html) == "" {
 		return true
 	}
-	lastOpen := strings.LastIndex(t, "<")
-	lastClose := strings.LastIndex(t, ">")
-	if lastOpen > lastClose {
-		return true
-	}
-	return false
+	return cwScanHTMLStructure(html).EndsMidTag
 }
 
 // cwTryAutoCloseDivs 尝试对"仅缺少量 </div>"的 HTML 自动补全。
@@ -168,6 +165,125 @@ func cwTryAutoCloseDivs(html string, divOpen, divClose, scriptOpen, scriptClose,
 	return sb.String(), true
 }
 
+var cwTrailingDocumentCloseRe = regexp.MustCompile(
+	`(?is)^\s*(?:<!--.*?-->\s*)*(?:</body\s*>\s*)?(?:</html\s*>\s*)?$`,
+)
+
+// cwTryRemoveSingleTrailingExtraDiv 安全修复AI结果末尾多出的一个</div>。
+//
+// 只在以下条件全部满足时处理：
+//   - 正则计数恰好多一个</div>；
+//   - script/style均配平且HTML未断在标签中途；
+//   - 按真实标签扫描后仅有一个未匹配的</div>；
+//   - 该未匹配标签之后只剩空白、注释或</body></html>。
+//
+// script/style正文里的“<div>”字符串会被忽略，避免修改JavaScript模板字符串。
+func cwTryRemoveSingleTrailingExtraDiv(
+	html string,
+	divOpen int,
+	divClose int,
+	scriptOpen int,
+	scriptClose int,
+	styleOpen int,
+	styleClose int,
+) (string, bool) {
+	if divClose-divOpen != 1 ||
+		scriptOpen != scriptClose ||
+		styleOpen != styleClose ||
+		cwEndsMidTag(html) {
+		return "", false
+	}
+
+	lower := strings.ToLower(html)
+	depth := 0
+	rawTag := ""
+	unmatchedStart := -1
+	unmatchedEnd := -1
+
+	for cursor := 0; cursor < len(html); {
+		relative := strings.Index(html[cursor:], "<")
+		if relative < 0 {
+			break
+		}
+
+		start := cursor + relative
+
+		if strings.HasPrefix(lower[start:], "<!--") {
+			commentEnd := strings.Index(lower[start+4:], "-->")
+			if commentEnd < 0 {
+				return "", false
+			}
+
+			cursor = start + 4 + commentEnd + 3
+			continue
+		}
+
+		end := findAutoAssemblyTagEnd(html, start)
+		if end < 0 {
+			return "", false
+		}
+
+		name, closing, selfClosing :=
+			parseAutoAssemblyTagToken(html[start+1 : end])
+
+		if rawTag != "" {
+			if closing && name == rawTag {
+				rawTag = ""
+			}
+
+			cursor = end + 1
+			continue
+		}
+
+		if name == "script" || name == "style" {
+			if !closing && !selfClosing {
+				rawTag = name
+			}
+
+			cursor = end + 1
+			continue
+		}
+
+		if name == "div" {
+			if closing {
+				if depth == 0 {
+					if unmatchedStart >= 0 {
+						return "", false
+					}
+
+					unmatchedStart = start
+					unmatchedEnd = end + 1
+				} else {
+					depth--
+				}
+			} else if !selfClosing {
+				depth++
+			}
+		}
+
+		cursor = end + 1
+	}
+
+	if rawTag != "" ||
+		depth != 0 ||
+		unmatchedStart < 0 ||
+		unmatchedEnd <= unmatchedStart ||
+		!cwTrailingDocumentCloseRe.MatchString(
+			html[unmatchedEnd:],
+		) {
+		return "", false
+	}
+
+	fixed :=
+		strings.TrimSpace(
+			html[:unmatchedStart] +
+				html[unmatchedEnd:],
+		)
+
+	return fixed,
+		true
+}
+
 // ==================== 主校验入口 ====================
 
 // validateRefinedPageHTML 校验"微调/重生后的 HTML"相对"原 HTML"是否完整可用。
@@ -191,47 +307,137 @@ func validateRefinedPageHTML(oldHTML, newHTML, instruction string, isRegenerate 
 	}
 
 	// ---- 校验1：结构闭合 ----
-	divOpen, divClose := cwCountDivTags(nt)
-	scriptOpen, scriptClose := cwCountTag(nt, cwScriptOpenRe, cwScriptCloseRe)
-	styleOpen, styleClose := cwCountTag(nt, cwStyleOpenRe, cwStyleCloseRe)
+	//
+	// 使用与AI输出提取器相同的词法扫描结果。script/style正文中的伪标签
+	// 不再参与div计数，避免“看似配平、实际被脚本字符串补平”的误判。
+	structure := cwScanHTMLStructure(nt)
+	divOpen, divClose := structure.DivOpen, structure.DivClose
+	scriptOpen, scriptClose := structure.ScriptOpen, structure.ScriptClose
+	styleOpen, styleClose := structure.StyleOpen, structure.StyleClose
 
 	// 脚本/样式块未闭合 → 截断硬信号，先判（这两类不做自动补全，缺一块脚本/样式往往真断在中间）。
 	if scriptOpen != scriptClose {
 		return cwRefineValidateResult{
 			OK:     false,
-			Reason: "AI 输出的脚本块未闭合（<script> 缺少配对的 </script>），疑似被截断。已保留原版，请重试。",
+			Reason: "页面处理结果中的脚本块未闭合（<script> 缺少配对的 </script>）。系统已保留原版；日志已记录AI原始输出与提取阶段结构，请重试。",
 			Detail: cwFmtTagDetail("script", divOpen, divClose, scriptOpen, scriptClose, styleOpen, styleClose),
 		}
 	}
 	if styleOpen != styleClose {
 		return cwRefineValidateResult{
 			OK:     false,
-			Reason: "AI 输出的样式块未闭合（<style> 缺少配对的 </style>），疑似被截断。已保留原版，请重试。",
+			Reason: "页面处理结果中的样式块未闭合（<style> 缺少配对的 </style>）。系统已保留原版；日志已记录AI原始输出与提取阶段结构，请重试。",
 			Detail: cwFmtTagDetail("style", divOpen, divClose, scriptOpen, scriptClose, styleOpen, styleClose),
 		}
 	}
 
-	// <div> 开闭不配对：先尝试"轻微漏闭合自动补全"，补不动才判截断。
+	// <div> 开闭不配对时分两类确定性小修：
+	//   1. 缺少1~2个闭合标签 → 在末尾补齐；
+	//   2. 仅多出一个且位于真实文档尾部 → 删除该多余闭合标签。
+	// 其它情况继续拦截，绝不对页面中部结构做猜测性修复。
 	if divOpen != divClose {
-		if fixed, ok := cwTryAutoCloseDivs(nt, divOpen, divClose, scriptOpen, scriptClose, styleOpen, styleClose); ok {
-			// 属 AI 手滑漏闭合：用补全后的 HTML 替换 nt 继续往下做资产/体量校验。
+		if fixed, ok := cwTryAutoCloseDivs(
+			nt,
+			divOpen,
+			divClose,
+			scriptOpen,
+			scriptClose,
+			styleOpen,
+			styleClose,
+		); ok {
 			missing := divOpen - divClose
 			nt = strings.TrimSpace(fixed)
-			autoFixDetail := "auto_close_div fill=" + cwItoa(missing) + " " +
-				cwFmtTagDetail("div", divOpen, divClose, scriptOpen, scriptClose, styleOpen, styleClose)
-			// 重生路径到此即可（无资产/体量校验），直接带 FixedHTML 放行。
+			autoFixDetail :=
+				"auto_close_div fill=" +
+					cwItoa(missing) +
+					" " +
+					cwFmtTagDetail(
+						"div",
+						divOpen,
+						divClose,
+						scriptOpen,
+						scriptClose,
+						styleOpen,
+						styleClose,
+					)
+
 			if isRegenerate {
-				return cwRefineValidateResult{OK: true, FixedHTML: nt, Detail: autoFixDetail}
+				return cwRefineValidateResult{
+					OK:        true,
+					FixedHTML: nt,
+					Detail:    autoFixDetail,
+				}
 			}
-			// 微调路径：继续往下校验，最终在函数末尾统一带上 FixedHTML 返回。
-			// 用闭包外的标志承载（见下方 fixedHTML 变量）。
-			return cwValidateAssetsAndSize(oldHTML, nt, instruction, nt, autoFixDetail)
+
+			return cwValidateAssetsAndSize(
+				oldHTML,
+				nt,
+				instruction,
+				nt,
+				autoFixDetail,
+			)
 		}
-		// 补不动 → 真截断，拦截。
+
+		if fixed, ok :=
+			cwTryRemoveSingleTrailingExtraDiv(
+				nt,
+				divOpen,
+				divClose,
+				scriptOpen,
+				scriptClose,
+				styleOpen,
+				styleClose,
+			); ok {
+			nt = strings.TrimSpace(fixed)
+			autoFixDetail :=
+				"auto_remove_extra_div count=1 " +
+					cwFmtTagDetail(
+						"div",
+						divOpen,
+						divClose,
+						scriptOpen,
+						scriptClose,
+						styleOpen,
+						styleClose,
+					)
+
+			if isRegenerate {
+				return cwRefineValidateResult{
+					OK:        true,
+					FixedHTML: nt,
+					Detail:    autoFixDetail,
+				}
+			}
+
+			return cwValidateAssetsAndSize(
+				oldHTML,
+				nt,
+				instruction,
+				nt,
+				autoFixDetail,
+			)
+		}
+
+		reason :=
+			"AI 输出的页面结构不完整（标签未闭合），疑似生成中途被截断。已保留原版，请重试。"
+
+		if divClose > divOpen {
+			reason =
+				"AI 输出包含无法安全定位的多余闭合标签，页面结构存在冲突。已保留原版，请重试。"
+		}
+
 		return cwRefineValidateResult{
 			OK:     false,
-			Reason: "AI 输出的页面结构不完整（标签未闭合），疑似生成中途被截断。已保留原版，请重试，或把修改拆成更小的步骤分次进行。",
-			Detail: cwFmtTagDetail("div", divOpen, divClose, scriptOpen, scriptClose, styleOpen, styleClose),
+			Reason: reason,
+			Detail: cwFmtTagDetail(
+				"div",
+				divOpen,
+				divClose,
+				scriptOpen,
+				scriptClose,
+				styleOpen,
+				styleClose,
+			),
 		}
 	}
 

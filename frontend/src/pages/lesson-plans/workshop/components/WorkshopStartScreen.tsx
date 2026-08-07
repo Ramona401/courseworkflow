@@ -9,7 +9,7 @@
 import { useNavigate } from 'react-router-dom'
 import { useEducationProfile } from '@/hooks/useEducationProfile'
 import type {
-  ConversationMessage,
+  ImportExistingPlanResponse,
   RecipeSelectionMode,
 } from '@/api/lesson-plans'
 import { C } from './workshopConstants'
@@ -59,9 +59,11 @@ interface StartScreenProps {
     recipeMode: RecipeSelectionMode,
     recipeId?: string,
     textbookPageIds?: string[],
-    coursePublisher?: string | null,
+    courseOutlineId?: string | null,
   ) => void
-  onImportSuccess: (planId: string, openingMessage: ConversationMessage) => void
+  onImportSuccess: (
+    response: ImportExistingPlanResponse,
+  ) => void | Promise<void>
 }
 
 export function StartScreen({

@@ -4,9 +4,10 @@ package services
 //
 // 本测试验证上下文13新增的Fork教育域硬闸：
 //   - k12、vocational、adult同域Fork均成功；
-//   - 来源域作为独立参数传给原子Repository；
-//   - 跨域在Repository调用前失败；
-//   - mixed、common、空来源域全部fail-closed；
+//   - 来源域和副本目标域作为独立参数传给原子Repository；
+//   - 具体来源跨域在Repository调用前失败；
+//   - common来源成功落入调用者具体教学域；
+//   - mixed、空来源域和非法来源域全部fail-closed；
 //   - 调用者无域、冲突和基础设施错误正确映射；
 //   - Repository返回错误域快照时拒绝；
 //   - 非共享或未通过来源不能Fork。
@@ -90,14 +91,22 @@ func TestForkLessonPlanWithEducationDomainGateTeachingDomains(
 					ctx context.Context,
 					sourceID string,
 					newAuthorID string,
-					educationDomain string,
+					sourceEducationDomain string,
+					targetEducationDomain string,
 				) (*models.LessonPlan, error) {
 					forkCalled = true
 
-					if educationDomain != domain {
+					if sourceEducationDomain != domain {
 						t.Fatalf(
-							"传给Repository的域错误: got=%s want=%s",
-							educationDomain,
+							"传给Repository的来源域错误: got=%s want=%s",
+							sourceEducationDomain,
+							domain,
+						)
+					}
+					if targetEducationDomain != domain {
+						t.Fatalf(
+							"传给Repository的目标域错误: got=%s want=%s",
+							targetEducationDomain,
 							domain,
 						)
 					}
@@ -185,7 +194,8 @@ func TestForkLessonPlanRejectsCrossDomainBeforeInsert(
 			ctx context.Context,
 			sourceID string,
 			newAuthorID string,
-			educationDomain string,
+			sourceEducationDomain string,
+			targetEducationDomain string,
 		) (*models.LessonPlan, error) {
 			forkCalled = true
 			return nil, nil
@@ -223,7 +233,6 @@ func TestForkLessonPlanRejectsInvalidSourceDomainBeforeInsert(
 	invalidDomains := []string{
 		"",
 		models.EducationDomainMixed,
-		models.EducationDomainCommon,
 		"invalid-domain",
 	}
 
@@ -258,7 +267,8 @@ func TestForkLessonPlanRejectsInvalidSourceDomainBeforeInsert(
 					ctx context.Context,
 					sourceID string,
 					newAuthorID string,
-					educationDomain string,
+					sourceEducationDomain string,
+					targetEducationDomain string,
 				) (*models.LessonPlan, error) {
 					forkCalled = true
 					return nil, nil
@@ -361,7 +371,8 @@ func TestForkLessonPlanMapsCallerDomainErrors(
 					ctx context.Context,
 					sourceID string,
 					newAuthorID string,
-					educationDomain string,
+					sourceEducationDomain string,
+					targetEducationDomain string,
 				) (*models.LessonPlan, error) {
 					forkCalled = true
 					return nil, nil
@@ -432,7 +443,8 @@ func TestForkLessonPlanDetectsStoredDomainMismatch(
 			ctx context.Context,
 			sourceID string,
 			newAuthorID string,
-			educationDomain string,
+			sourceEducationDomain string,
+			targetEducationDomain string,
 		) (*models.LessonPlan, error) {
 			return &models.LessonPlan{
 				ID:              "fork-1",
@@ -484,7 +496,8 @@ func TestForkLessonPlanRequiresForkableSource(
 			ctx context.Context,
 			sourceID string,
 			newAuthorID string,
-			educationDomain string,
+			sourceEducationDomain string,
+			targetEducationDomain string,
 		) (*models.LessonPlan, error) {
 			forkCalled = true
 			return nil, nil

@@ -13,7 +13,11 @@
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { C } from './VideoEditorConstants'
-import { listTTSVoices, generateSubtitleTTS } from '../../../../api/coursewares'
+import {
+  createSubtitleTTSOperationID,
+  listTTSVoices,
+  generateSubtitleTTS,
+} from '../../../../api/coursewares' 
 import type { TTSVoice } from '../../../../api/coursewares'
 import type { SubtitleSegment } from './VideoEditorSubtitleTrack'
 
@@ -62,7 +66,143 @@ export default function VideoEditorTTSModal({
   // 生成状态
   const [generating, setGenerating] = useState(false)
   const [elapsedSec, setElapsedSec] = useState(0)
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const timerRef =
+    useRef<ReturnType<typeof setInterval> | null>(null)
+
+  /**
+   * 未确定的TTS批次保存到sessionStorage。
+   *
+   * 关闭弹窗、重新打开或刷新后，
+   * 相同字幕、音色、语速和目标分段继续复用原operation_id。
+   */
+  const ttsOperationRef = useRef<{
+    fingerprint: string
+    operationId: string
+  }>({
+    fingerprint: '',
+    operationId: '',
+  })
+
+  const ttsOperationStorageKey =
+    `tedna:tts-operation:${coursewareId}:${subtitleId}`
+
+  const resolveTTSOperationID = (
+    fingerprint: string,
+  ): string => {
+    const current =
+      ttsOperationRef.current
+
+    if (
+      current.fingerprint === fingerprint &&
+      current.operationId
+    ) {
+      return current.operationId
+    }
+
+    if (
+      typeof window !== 'undefined'
+    ) {
+      try {
+        const raw =
+          window.sessionStorage.getItem(
+            ttsOperationStorageKey,
+          )
+
+        if (raw) {
+          const stored =
+            JSON.parse(raw) as {
+              fingerprint?: string
+              operationId?: string
+            }
+
+          if (
+            stored.fingerprint === fingerprint &&
+            stored.operationId
+          ) {
+            ttsOperationRef.current = {
+              fingerprint,
+              operationId:
+                stored.operationId,
+            }
+
+            return stored.operationId
+          }
+        }
+      } catch {
+        // 缓存解析失败时创建新业务UUID。
+      }
+    }
+
+    const operationId =
+      createSubtitleTTSOperationID()
+
+    ttsOperationRef.current = {
+      fingerprint,
+      operationId,
+    }
+
+    if (
+      typeof window !== 'undefined'
+    ) {
+      try {
+        window.sessionStorage.setItem(
+          ttsOperationStorageKey,
+          JSON.stringify({
+            fingerprint,
+            operationId,
+          }),
+        )
+      } catch {
+        // sessionStorage不可用不影响当前页面内的幂等恢复。
+      }
+    }
+
+    return operationId
+  }
+
+  const clearTTSOperationID = () => {
+    ttsOperationRef.current = {
+      fingerprint: '',
+      operationId: '',
+    }
+
+    if (
+      typeof window !== 'undefined'
+    ) {
+      try {
+        window.sessionStorage.removeItem(
+          ttsOperationStorageKey,
+        )
+      } catch {
+        // 清理缓存失败不影响服务端终态事实。
+      }
+    }
+  }
+
+  /**
+   * 结果不确定、处理中或等待恢复时保留operation_id。
+   *
+   * 明确终态、身份变化、余额或价格配置问题，
+   * 下次必须创建新的业务操作。
+   */
+  const shouldPreserveTTSOperationID = (
+    error: unknown,
+  ): boolean => {
+    const message =
+      error instanceof Error
+        ? error.message
+        : String(error || '')
+
+    if (
+      /已经结束|重新发起|已经变化|身份校验|尚未配置|余额不足|积分账户/i.test(
+        message,
+      )
+    ) {
+      return false
+    }
+
+    return true
+  }
   const [result, setResult] = useState<{ success: number; fail: number; errors: string[] } | null>(null)
 
   // 加载音色列表
@@ -136,32 +276,123 @@ export default function VideoEditorTTSModal({
 
   // 批量生成 TTS
   const handleGenerate = async () => {
-    if (!selectedVoice || targetCount === 0 || generating) return
+    if (
+      !selectedVoice ||
+      targetCount === 0 ||
+      generating
+    ) {
+      return
+    }
+
+    const targets =
+      getTargetSegments()
+
+    const targetIDs =
+      targets.map(
+        segment => segment.id,
+      )
+
+    const fingerprint =
+      JSON.stringify([
+        coursewareId,
+        subtitleId,
+        selectedVoice,
+        speed,
+        targets.map(segment => ({
+          id: segment.id,
+          text: segment.text.trim(),
+        })),
+      ])
+
+    let operationId = ''
+
+    try {
+      operationId =
+        resolveTTSOperationID(
+          fingerprint,
+        )
+    } catch (error) {
+      setResult({
+        success: 0,
+        fail: targets.length,
+        errors: [
+          error instanceof Error
+            ? error.message
+            : '无法创建配音任务标识',
+        ],
+      })
+      return
+    }
+
     setGenerating(true)
     setResult(null)
 
     try {
-      const segIds = scope === 'all' ? undefined : getTargetSegments().map(s => s.id)
-      const resp = await generateSubtitleTTS(coursewareId, subtitleId, selectedVoice, speed, segIds)
+      const segmentIds =
+        scope === 'all'
+          ? undefined
+          : targetIDs
+
+      const response =
+        await generateSubtitleTTS(
+          coursewareId,
+          subtitleId,
+          selectedVoice,
+          speed,
+          segmentIds,
+          operationId,
+        )
+
+      // 收到正式业务响应，当前批次已经结束。
+      clearTTSOperationID()
 
       setResult({
-        success: resp.success_count,
-        fail: resp.fail_count,
-        errors: resp.errors || [],
+        success:
+          response.success_count,
+        fail:
+          response.fail_count,
+        errors:
+          response.errors || [],
       })
 
-      // 解析更新后的 segments 并回调
-      if (resp.segments) {
+      if (response.segments) {
         try {
-          const updated = JSON.parse(resp.segments)
-          if (Array.isArray(updated)) onComplete(updated)
-        } catch { /* 解析失败不影响 */ }
+          const updated =
+            JSON.parse(
+              response.segments,
+            )
+
+          if (Array.isArray(updated)) {
+            onComplete(updated)
+          }
+        } catch {
+          // 服务端计费和字幕写入事实不受前端解析失败影响。
+        }
       }
-    } catch (err) {
+
+      if (
+        response.fail_count > 0
+      ) {
+        // 下一次只处理仍未形成tts_audio_url的分段。
+        setScope('no_tts')
+      }
+    } catch (error) {
+      if (
+        !shouldPreserveTTSOperationID(
+          error,
+        )
+      ) {
+        clearTTSOperationID()
+      }
+
       setResult({
         success: 0,
-        fail: targetCount,
-        errors: [err instanceof Error ? err.message : '生成失败'],
+        fail: targets.length,
+        errors: [
+          error instanceof Error
+            ? error.message
+            : '生成失败',
+        ],
       })
     } finally {
       setGenerating(false)
@@ -409,7 +640,7 @@ export default function VideoEditorTTSModal({
                 border: `1px solid ${C.border}`, cursor: 'pointer',
               }}>{result ? '关闭' : '取消'}</button>
             )}
-            {!result && (
+            {(!result || result.fail > 0) && (
               <button
                 onClick={handleGenerate}
                 disabled={generating || targetCount === 0 || !selectedVoice}

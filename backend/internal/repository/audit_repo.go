@@ -43,6 +43,9 @@ const (
 	ActionMarkPassed      = "pipeline.mark_passed"
 	ActionVerify          = "pipeline.verify"
 
+	// 课件评审体验只记录白名单事件、模式和计数，不记录用户输入正文。
+	ActionCoursewareReviewUsage = "courseware.review_usage"
+
 	// B13 新增：组织管理员任命相关（organization_handler 消费）
 	// 值与此前 handler 内字符串字面量逐字一致，历史日志无缝兼容
 	ActionOrgAdminAdd      = "admin.org_admin_add"       // 任命组织管理员
@@ -72,9 +75,9 @@ func WriteAuditLog(userID, action string, detail map[string]interface{}, ip stri
 		}
 
 		_, err = database.DB.Exec(ctx, `
-			INSERT INTO audit_logs (user_id, action, detail, ip)
-			VALUES ($1, $2, $3, $4)
-		`, userID, action, string(detailJSON), ip)
+                        INSERT INTO audit_logs (user_id, action, detail, ip)
+                        VALUES ($1, $2, $3, $4)
+                `, userID, action, string(detailJSON), ip)
 
 		if err != nil {
 			auditLog.Error("审计日志写入失败", "user_id", userID, "action", action, "error", err)
@@ -121,30 +124,31 @@ type AuditLogQueryParams struct {
 // 归属治理批A2 新增：教研组归属三动作 + 移出本校 + 组织CRUD + 两个存量补登记
 // 后续课件相关操作建议统一以 courseware.* 前缀,便于按业务线筛选
 var actionNameMap = map[string]string{
-	"user.login":                 "用户登录",
-	"user.logout":                "用户登出",
-	"pipeline.submit_finalize":   "提交定稿",
-	"pipeline.confirm_finalize":  "确认定稿",
-	"pipeline.reject_finalize":   "退回重审",
-	"pipeline.direct_finalize":   "直接定稿",
-	"pipeline.mark_passed":       "快捷通过",
-	"pipeline.verify":            "触发验收",
-	"admin.user_create":          "创建用户",
-	"admin.user_status":          "状态变更",
-	"admin.user_reset_password":  "重置密码",
-	"courseware.video_upload":    "上传视频", // v0.42.6+ P2.4
-	"admin.org_admin_add":        "任命组织管理员", // B13补登记
-	"admin.org_admin_remove":     "移除组织管理员", // B13补登记
-	"admin.org_admin_role_sync":  "任命同步身份",  // B13新增
-	"admin.user_update":          "编辑用户资料",  // 批A2存量补登记
-	"admin.user_batch_create":    "批量创建用户",  // 批A2存量补登记(单校/跨校共用)
-	"admin.group_member_add":     "加入教研组",   // 批A起写入
-	"admin.group_member_remove":  "移出教研组",   // 批A起写入
-	"admin.group_member_role":    "变更组内角色",  // 批A起写入
-	"admin.school_member_remove": "移出本校",    // 批A起写入(R3,detail含连带退组明细)
-	"admin.org_create":           "创建组织",    // 批A2起写入
-	"admin.org_update":           "编辑组织",    // 批A2起写入(含主管理员单字段变更)
-	"admin.org_delete":           "删除组织",    // 批A2起写入
+	"user.login":                     "用户登录",
+	"user.logout":                    "用户登出",
+	"pipeline.submit_finalize":       "提交定稿",
+	"pipeline.confirm_finalize":      "确认定稿",
+	"pipeline.reject_finalize":       "退回重审",
+	"pipeline.direct_finalize":       "直接定稿",
+	"pipeline.mark_passed":           "快捷通过",
+	"pipeline.verify":                "触发验收",
+	"courseware.review_usage":        "课件评审体验使用事件",
+	"admin.user_create":              "创建用户",
+	"admin.user_status":              "状态变更",
+	"admin.user_reset_password":      "重置密码",
+	"courseware.video_upload":        "上传视频",     // v0.42.6+ P2.4
+	"admin.org_admin_add":            "任命组织管理员",  // B13补登记
+	"admin.org_admin_remove":         "移除组织管理员",  // B13补登记
+	"admin.org_admin_role_sync":      "任命同步身份",   // B13新增
+	"admin.user_update":              "编辑用户资料",   // 批A2存量补登记
+	"admin.user_batch_create":        "批量创建用户",   // 批A2存量补登记(单校/跨校共用)
+	"admin.group_member_add":         "加入教研组",    // 批A起写入
+	"admin.group_member_remove":      "移出教研组",    // 批A起写入
+	"admin.group_member_role":        "变更组内角色",   // 批A起写入
+	"admin.school_member_remove":     "移出本校",     // 批A起写入(R3,detail含连带退组明细)
+	"admin.org_create":               "创建组织",     // 批A2起写入
+	"admin.org_update":               "编辑组织",     // 批A2起写入(含主管理员单字段变更)
+	"admin.org_delete":               "删除组织",     // 批A2起写入
 	"admin.org_admin_role_downgrade": "任命归零降级身份", // 批C起写入
 }
 
@@ -210,10 +214,10 @@ func ListAuditLogs(ctx context.Context, params AuditLogQueryParams) (*AuditLogLi
 
 	// ---- 查总数 ----
 	countSQL := fmt.Sprintf(`
-		SELECT COUNT(*)
-		FROM audit_logs al
-		LEFT JOIN users u ON u.id = al.user_id
-		%s`, where)
+                SELECT COUNT(*)
+                FROM audit_logs al
+                LEFT JOIN users u ON u.id = al.user_id
+                %s`, where)
 
 	var total int
 	if err := database.DB.QueryRow(ctx, countSQL, args...).Scan(&total); err != nil {
@@ -223,18 +227,18 @@ func ListAuditLogs(ctx context.Context, params AuditLogQueryParams) (*AuditLogLi
 	// ---- 查数据(带分页)----
 	dataArgs := append(args, params.PageSize, offset)
 	dataSQL := fmt.Sprintf(`
-		SELECT al.id, al.user_id,
-		       COALESCE(u.username, '已删除用户') AS username,
-		       COALESCE(u.display_name, '')       AS display_name,
-		       al.action,
-		       COALESCE(al.detail::text, '{}')    AS detail,
-		       COALESCE(al.ip, '')                AS ip,
-		       al.created_at
-		FROM audit_logs al
-		LEFT JOIN users u ON u.id = al.user_id
-		%s
-		ORDER BY al.created_at DESC
-		LIMIT $%d OFFSET $%d`, where, idx, idx+1)
+                SELECT al.id, al.user_id,
+                       COALESCE(u.username, '已删除用户') AS username,
+                       COALESCE(u.display_name, '')       AS display_name,
+                       al.action,
+                       COALESCE(al.detail::text, '{}')    AS detail,
+                       COALESCE(al.ip, '')                AS ip,
+                       al.created_at
+                FROM audit_logs al
+                LEFT JOIN users u ON u.id = al.user_id
+                %s
+                ORDER BY al.created_at DESC
+                LIMIT $%d OFFSET $%d`, where, idx, idx+1)
 
 	rows, err := database.DB.Query(ctx, dataSQL, dataArgs...)
 	if err != nil {

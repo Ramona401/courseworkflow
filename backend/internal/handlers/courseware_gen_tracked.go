@@ -5,8 +5,12 @@ package handlers
 // 四条路径统一使用任务键：courseware_render:<coursewareID>。
 // 同一课件不能同时执行封面预览、批量页面生成、全自动装配或3D页面生成。
 //
-// GeneratePages额外登记onDrain钩子：服务进入排空时调用CancelGenerate，
-// 停止继续派发尚未开始的页面；已经发出的AI请求仍自然完成并写库。
+// 快速部署断点续生：
+//   - GeneratePages在关停时调用CancelGenerate，停止继续派发未开始页面；
+//   - AutoAssemble在关停时调用CancelAutoAssemblyVersioned，先冻结数据库写回再停止继续派发；
+//   - 已发出的同步AI请求不等待完整返回；
+//   - 已成功落库页面保留；
+//   - 新进程再次启动任务时只处理数据库中未完成页面。
 
 import (
 	"context"
@@ -27,11 +31,18 @@ func (h *CoursewareGenHandler) GeneratePreviewTracked(
 	r *http.Request,
 ) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
 
-	claims, ok := middleware.GetClaims(r.Context())
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
@@ -46,8 +57,6 @@ func (h *CoursewareGenHandler) GeneratePreviewTracked(
 		return
 	}
 
-	// 必须在登记后台任务前完成作者专属教育域预检。
-	// 否则无权调用者也能短暂占用courseware_render任务锁。
 	scopedActor, err :=
 		h.authorizeCoursewareOwnerRuntime(
 			r.Context(),
@@ -94,23 +103,36 @@ func (h *CoursewareGenHandler) GeneratePreviewTracked(
 		},
 	)
 
-	utils.Success(w, map[string]interface{}{
-		"message":       "预览页生成已启动，请通过SSE监听进度",
-		"courseware_id": id,
-	})
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"message":       "预览页生成已启动，请通过SSE监听进度",
+			"courseware_id": id,
+		},
+	)
 }
 
-// GeneratePagesTracked 异步批量生成剩余课件页。
+// GeneratePagesTracked 异步生成尚未完成的课件页面。
+//
+// GenerateRemainingPages会重新读取数据库，
+// 只选择html_content为空的页面，因此本接口同时也是断点续生入口。
 func (h *CoursewareGenHandler) GeneratePagesTracked(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
 
-	claims, ok := middleware.GetClaims(r.Context())
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
@@ -140,8 +162,6 @@ func (h *CoursewareGenHandler) GeneratePagesTracked(
 		return
 	}
 
-	// 同一份收敛Actor同时供后台生成与服务排空取消使用。
-	// Actor只读，可安全由两个闭包共享。
 	asyncActor :=
 		services.CloneCoursewareActorContext(
 			scopedActor,
@@ -179,23 +199,36 @@ func (h *CoursewareGenHandler) GeneratePagesTracked(
 		},
 	)
 
-	utils.Success(w, map[string]interface{}{
-		"message":       "课件生成已启动（使用固定导航栏），请通过SSE监听进度",
-		"courseware_id": id,
-	})
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"message":       "课件生成或断点续生已启动，请通过SSE监听进度",
+			"courseware_id": id,
+		},
+	)
 }
 
 // AutoAssembleTracked 异步执行全自动装配。
+//
+// AutoAssemble会跳过已有HTML页面；
+// 图片生成使用IAOCI稳定索引和媒体计费幂等键恢复。
 func (h *CoursewareGenHandler) AutoAssembleTracked(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
 
-	claims, ok := middleware.GetClaims(r.Context())
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
@@ -210,11 +243,15 @@ func (h *CoursewareGenHandler) AutoAssembleTracked(
 		return
 	}
 
-	var req struct {
+	var request struct {
 		SkipVideo bool `json:"skip_video"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(
+			r.Body,
+		).Decode(
+			&request,
+		)
 	}
 
 	scopedActor, err :=
@@ -236,17 +273,45 @@ func (h *CoursewareGenHandler) AutoAssembleTracked(
 		services.CloneCoursewareActorContext(
 			scopedActor,
 		)
-	skipVideo := req.SkipVideo
+	skipVideo := request.SkipVideo
+
+	// 必须先建立精确启动票据，再登记Tracker任务。
+	//
+	// 这样部署排空或用户取消发生在800毫秒缓冲期时，
+	// 能只取消本次真实启动；空闲课件不会遗留取消状态。
+	launchToken, launchErr :=
+		services.PrepareCoursewareAutoAssemblyLaunch(
+			id,
+			skipVideo,
+		)
+	if launchErr != nil {
+		utils.Fail(
+			w,
+			http.StatusConflict,
+			"该课件已有自动装配正在启动或运行",
+		)
+		return
+	}
 
 	task, started := startTrackedBackgroundTask(
 		w,
 		trackedCoursewareRenderTaskType,
 		id,
 		services.BackgroundTaskCritical,
-		nil,
+		func() {
+			_ = h.autoAssemblyService.CancelAutoAssemblyVersioned(
+				context.Background(),
+				id,
+				asyncActor,
+			)
+		},
 		"该课件已有页面生成或装配任务正在执行",
 	)
 	if !started {
+		services.AbortCoursewareAutoAssemblyLaunch(
+			id,
+			launchToken,
+		)
 		return
 	}
 
@@ -256,20 +321,31 @@ func (h *CoursewareGenHandler) AutoAssembleTracked(
 		id,
 		800*time.Millisecond,
 		func() error {
-			return h.autoAssemblyService.AutoAssemble(
-				context.Background(),
+			// preflight或数据库领取失败时也必须清理尚未消费的票据。
+			defer services.AbortCoursewareAutoAssemblyLaunch(
 				id,
-				asyncActor,
-				skipVideo,
+				launchToken,
 			)
+
+			return h.autoAssemblyService.
+				AutoAssembleVersionedWithLaunch(
+					context.Background(),
+					id,
+					asyncActor,
+					skipVideo,
+					launchToken,
+				)
 		},
 	)
 
-	utils.Success(w, map[string]interface{}{
-		"message":       "全自动装配已启动，请通过SSE监听 assembly_* 进度事件",
-		"courseware_id": id,
-		"skip_video":    skipVideo,
-	})
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"message":       "全自动装配或断点续装已启动，请通过SSE监听进度",
+			"courseware_id": id,
+			"skip_video":    skipVideo,
+		},
+	)
 }
 
 // Generate3DPageTracked 异步生成3D互动单页。
@@ -278,11 +354,18 @@ func (h *CoursewareGenHandler) Generate3DPageTracked(
 	r *http.Request,
 ) {
 	if r.Method != http.MethodPost {
-		utils.Fail(w, http.StatusMethodNotAllowed, "仅支持POST请求")
+		utils.Fail(
+			w,
+			http.StatusMethodNotAllowed,
+			"仅支持POST请求",
+		)
 		return
 	}
 
-	claims, ok := middleware.GetClaims(r.Context())
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
 	if !ok || claims == nil {
 		utils.Unauthorized(w, "未登录")
 		return
@@ -343,8 +426,11 @@ func (h *CoursewareGenHandler) Generate3DPageTracked(
 		},
 	)
 
-	utils.Success(w, map[string]interface{}{
-		"message":       "3D互动单页生成已启动，请通过SSE监听进度",
-		"courseware_id": id,
-	})
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"message":       "3D互动单页生成已启动，请通过SSE监听进度",
+			"courseware_id": id,
+		},
+	)
 }

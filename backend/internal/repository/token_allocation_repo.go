@@ -179,91 +179,244 @@ func CreateTokenConsumptionLog(ctx context.Context, log *models.TokenConsumption
 //   - userIDs 非空     → AND cl.user_id = ANY($n)
 //
 // 说明：senior_operator 传本校成员 user_id 列表；operator/viewer 传 [自己的user_id]。
-func ListTokenConsumptionLogs(ctx context.Context, accountID string, userID string, sceneCode string, userIDs []string, limit int, offset int) ([]*models.ConsumptionListItem, int, error) {
-	where := "1=1"
-	args := []interface{}{}
-	argIdx := 1
+func ListTokenConsumptionLogs(
+        ctx context.Context,
+        accountID string,
+        userID string,
+        sceneCode string,
+        userIDs []string,
+        limit int,
+        offset int,
+) (
+        []*models.ConsumptionListItem,
+        int,
+        error,
+) {
+        where := "1=1"
+        args := []interface{}{}
+        argIdx := 1
 
-	if accountID != "" {
-		where += fmt.Sprintf(" AND cl.account_id = $%d", argIdx)
-		args = append(args, accountID)
-		argIdx++
-	}
-	if userID != "" {
-		where += fmt.Sprintf(" AND cl.user_id = $%d", argIdx)
-		args = append(args, userID)
-		argIdx++
-	}
-	if sceneCode != "" {
-		where += fmt.Sprintf(" AND cl.scene_code = $%d", argIdx)
-		args = append(args, sceneCode)
-		argIdx++
-	}
+        if accountID != "" {
+                where += fmt.Sprintf(
+                        " AND cl.account_id = $%d",
+                        argIdx,
+                )
+                args = append(
+                        args,
+                        accountID,
+                )
+                argIdx++
+        }
 
-	// v172 user_id 白名单（安全关键：nil=不过滤；空切片=匹配空集）
-	if userIDs != nil {
-		if len(userIDs) == 0 {
-			where += " AND 1=0"
-		} else {
-			where += fmt.Sprintf(" AND cl.user_id = ANY($%d)", argIdx)
-			args = append(args, userIDs)
-			argIdx++
-		}
-	}
+        if userID != "" {
+                where += fmt.Sprintf(
+                        " AND cl.user_id = $%d",
+                        argIdx,
+                )
+                args = append(
+                        args,
+                        userID,
+                )
+                argIdx++
+        }
 
-	// 统计总数
-	var total int
-	countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM token_consumption_logs cl WHERE %s`, where)
-	if err := database.DB.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("统计消费流水数失败: %w", err)
-	}
+        if sceneCode != "" {
+                where += fmt.Sprintf(
+                        " AND cl.scene_code = $%d",
+                        argIdx,
+                )
+                args = append(
+                        args,
+                        sceneCode,
+                )
+                argIdx++
+        }
 
-	if limit <= 0 {
-		limit = 50
-	}
+        // 三态白名单：
+        // nil=不限制；空切片=空集；非空=只看名单用户。
+        if userIDs != nil {
+                if len(userIDs) == 0 {
+                        where += " AND 1=0"
+                } else {
+                        where += fmt.Sprintf(
+                                " AND cl.user_id = ANY($%d)",
+                                argIdx,
+                        )
+                        args = append(
+                                args,
+                                userIDs,
+                        )
+                        argIdx++
+                }
+        }
 
-	// 分页查询（关联账户和用户获取名称）
-	listQuery := fmt.Sprintf(`
-                SELECT cl.id,
-                       COALESCE(ta.display_name, '') AS account_name,
-                       COALESCE(u.display_name, '') AS user_name,
-                       cl.amount, cl.balance_before, cl.balance_after,
-                       cl.scene_code, cl.model_used, cl.tokens_used,
-                       cl.memo, cl.created_at,
-                       cl.input_tokens, cl.output_tokens, cl.model_name, cl.provider,
-                       cl.cost_usd, cl.exchange_rate, cl.multiplier, cl.credits_consumed, cl.latency_ms
-                FROM token_consumption_logs cl
-                LEFT JOIN token_accounts ta ON ta.id = cl.account_id
-                LEFT JOIN users u ON u.id = cl.user_id
-                WHERE %s
-                ORDER BY cl.created_at DESC
-                LIMIT $%d OFFSET $%d
-        `, where, argIdx, argIdx+1)
-	args = append(args, limit, offset)
+        var total int
 
-	rows, err := database.DB.Query(ctx, listQuery, args...)
-	if err != nil {
-		return nil, 0, fmt.Errorf("查询消费流水列表失败: %w", err)
-	}
-	defer rows.Close()
+        countQuery :=
+                fmt.Sprintf(
+                        `SELECT COUNT(*)
+                         FROM token_consumption_logs cl
+                         WHERE %s`,
+                        where,
+                )
 
-	var items []*models.ConsumptionListItem
-	for rows.Next() {
-		item := &models.ConsumptionListItem{}
-		err := rows.Scan(
-			&item.ID, &item.AccountName, &item.UserName,
-			&item.Amount, &item.BalanceBefore, &item.BalanceAfter,
-			&item.SceneCode, &item.ModelUsed, &item.TokensUsed,
-			&item.Memo, &item.CreatedAt,
-			&item.InputTokens, &item.OutputTokens, &item.ModelName, &item.Provider,
-			&item.CostUSD, &item.ExchangeRate, &item.Multiplier, &item.CreditsConsumed, &item.LatencyMs,
-		)
-		if err != nil {
-			return nil, 0, fmt.Errorf("扫描消费流水行失败: %w", err)
-		}
-		items = append(items, item)
-	}
-	return items, total, nil
+        if err :=
+                database.DB.QueryRow(
+                        ctx,
+                        countQuery,
+                        args...,
+                ).Scan(
+                        &total,
+                ); err != nil {
+                return nil,
+                        0,
+                        fmt.Errorf(
+                                "统计消费流水数失败: %w",
+                                err,
+                        )
+        }
+
+        if limit <= 0 {
+                limit = 50
+        }
+
+        listQuery :=
+                fmt.Sprintf(
+                        `
+                        SELECT
+                                cl.id,
+                                COALESCE(ta.display_name, '') AS account_name,
+                                COALESCE(u.display_name, '') AS user_name,
+                                cl.amount,
+                                cl.balance_before,
+                                cl.balance_after,
+                                cl.scene_code,
+                                cl.model_used,
+                                cl.tokens_used,
+                                cl.memo,
+                                cl.created_at,
+
+                                COALESCE(cl.billing_category, 'text_ai'),
+                                COALESCE(cl.billing_node_code, ''),
+                                COALESCE(bn.display_name, ''),
+                                COALESCE(cl.media_type, ''),
+                                COALESCE(cl.media_unit, ''),
+                                COALESCE(cl.media_quantity, 0),
+
+                                cl.input_tokens,
+                                cl.output_tokens,
+                                cl.model_name,
+                                cl.provider,
+                                cl.cost_usd,
+                                cl.exchange_rate,
+                                cl.multiplier,
+                                cl.credits_consumed,
+                                cl.latency_ms
+                        FROM token_consumption_logs cl
+                        LEFT JOIN token_accounts ta
+                          ON ta.id = cl.account_id
+                        LEFT JOIN users u
+                          ON u.id = cl.user_id
+                        LEFT JOIN token_billing_nodes bn
+                          ON bn.node_code = cl.billing_node_code
+                        WHERE %s
+                        ORDER BY cl.created_at DESC
+                        LIMIT $%d OFFSET $%d
+                        `,
+                        where,
+                        argIdx,
+                        argIdx+1,
+                )
+
+        args = append(
+                args,
+                limit,
+                offset,
+        )
+
+        rows, err :=
+                database.DB.Query(
+                        ctx,
+                        listQuery,
+                        args...,
+                )
+        if err != nil {
+                return nil,
+                        0,
+                        fmt.Errorf(
+                                "查询消费流水列表失败: %w",
+                                err,
+                        )
+        }
+        defer rows.Close()
+
+        items :=
+                make(
+                        []*models.ConsumptionListItem,
+                        0,
+                )
+
+        for rows.Next() {
+                item :=
+                        &models.ConsumptionListItem{}
+
+                if err :=
+                        rows.Scan(
+                                &item.ID,
+                                &item.AccountName,
+                                &item.UserName,
+                                &item.Amount,
+                                &item.BalanceBefore,
+                                &item.BalanceAfter,
+                                &item.SceneCode,
+                                &item.ModelUsed,
+                                &item.TokensUsed,
+                                &item.Memo,
+                                &item.CreatedAt,
+
+                                &item.BillingCategory,
+                                &item.BillingNodeCode,
+                                &item.BillingNodeName,
+                                &item.MediaType,
+                                &item.MediaUnit,
+                                &item.MediaQuantity,
+
+                                &item.InputTokens,
+                                &item.OutputTokens,
+                                &item.ModelName,
+                                &item.Provider,
+                                &item.CostUSD,
+                                &item.ExchangeRate,
+                                &item.Multiplier,
+                                &item.CreditsConsumed,
+                                &item.LatencyMs,
+                        ); err != nil {
+                        return nil,
+                                0,
+                                fmt.Errorf(
+                                        "扫描积分消费流水失败: %w",
+                                        err,
+                                )
+                }
+
+                items = append(
+                        items,
+                        item,
+                )
+        }
+
+        if err := rows.Err(); err != nil {
+                return nil,
+                        0,
+                        fmt.Errorf(
+                                "遍历积分消费流水失败: %w",
+                                err,
+                        )
+        }
+
+        return items,
+                total,
+                nil
 }
 
 // GetUserConsumptionSummary 获取用户消费汇总（今日+本月+总计）

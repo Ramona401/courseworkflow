@@ -138,9 +138,12 @@ export const STAGE_FOLLOWUP_CHIPS: Record<string, ChipDef[]> = {
     { id: 'n3_edit',       emoji: '✏️', label: '我再改改', action_type: 'focus_input', requireContent: true },
     { id: 'n3_components', emoji: '🧩', label: '找点素材', action_type: 'open_tool', payload: { tool: 'components' } },
   ],
-  // N4：review 产出后 ——「要我按这两条直接改吗？」
+  // N4：review产出后。
+  // “按建议修改”直接使用既有revise完整生成链路：先切换到修订定稿阶段，
+  // 再按原Word保真提示词生成完整修订稿；后端保存成功后才展示并更新正式正文与Word版本。
   review: [
-    { id: 'n4_revise',  emoji: '🛠', label: '按建议修改', action_type: 'advance_stage', highlight: true },
+    { id: 'n4_revise',  emoji: '🛠', label: '按建议修改', action_type: 'full_generate',
+      payload: { stage: 'revise' }, highlight: true },
     { id: 'n4_publish', emoji: '✅', label: '不用改了，发布', action_type: 'publish' },
   ],
   // revise 阶段 —— 修订完成后发布收尾（v191 改动F：加"AI帮我改一版"省力路径）

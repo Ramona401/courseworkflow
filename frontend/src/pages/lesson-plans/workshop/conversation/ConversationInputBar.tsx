@@ -1,738 +1,743 @@
 /**
  * ConversationInputBar.tsx — 对话模式底部输入区
  *
- * 从 ConversationModePage.tsx 抽出的输入区整体，自上而下三块：
- * 1. 已选组件提示条；
- * 2. 「+」能力菜单、文本输入框和发送按钮；
- * 3. 教案发布入口。
+ * 语音输入规则：
+ *   1. 点击麦克风开始录音；
+ *   2. partial实时写入同一受保护草稿；
+ *   3. 点击停止后等待final；
+ *   4. final只进入输入框，不自动发送AI；
+ *   5. 识别失败恢复录音前草稿；
+ *   6. AI忙碌时禁止启动语音。
  *
- * 草稿保护：
- * 1. 输入文字按当前用户、当前教案和message字段隔离；
- * 2. 输入变化立即写入sessionStorage；
- * 3. 刷新或切换页面后返回时自动恢复；
- * 4. 支持持久化撤销和重做；
- * 5. Ctrl/Command+Z恢复误删；
- * 6. Ctrl/Command+Shift+Z或Ctrl+Y重做；
- * 7. 发送后清空输入框，但保留可撤销快照；
- * 8. 只缓存文字，不缓存参考资料正文或文件。
- *
- * 状态归属纪律：
- * 1. 输入文字由useProtectedDraft统一管理；
- * 2. showPlusMenu仍为本组件临时UI状态；
- * 3. 其余状态通过props与页面交互；
- * 4. 本组件不直接调用任何业务API。
+ * 资源提示规则：
+ *   - 不展示组件数量、附件文件名或挂载状态码；
+ *   - 只说明这些资源会怎样帮助下一轮备课；
+ *   - 清空和移除入口继续保留。
  */
 
 import {
   forwardRef,
+  useCallback,
   useImperativeHandle,
   useRef,
   useState,
 } from 'react'
 import { useAuth } from '@/store/auth'
 import { useProtectedDraft } from '@/hooks/useProtectedDraft'
+import { useVoiceInput } from '@/hooks/useVoiceInput'
+import VoiceInputButton from '@/components/voice/VoiceInputButton'
 import { C } from '../components/workshopConstants'
 import { PLUS_MENU_ITEMS } from './conversationScript'
+import ResourceMeaningPill from './ResourceMeaningPill'
+import {
+  isConversationPublishIntent,
+} from './conversationActionIntent'
 
-/**
- * 对外暴露的命令句柄。
- */
 export interface ConversationInputBarHandle {
-  /** 仅聚焦输入框。 */
   focus: () => void
-  /** 预填文字到输入框并聚焦。 */
   prefill: (text: string) => void
 }
 
-/**
- * 输入区组件Props。
- */
 export interface ConversationInputBarProps {
-  /** AI忙碌中。 */
   isBusy: boolean
-  /** 输入框占位文案。 */
   placeholder: string
-  /** 已选组件数量。 */
-  selectedCount: number
-  /** 清空已选组件。 */
-  onClearSelected: () => void
+
   /**
-   * 发送一条文字消息。
+   * 已选择组件数量。
    *
-   * 返回false表示业务明确拒绝本次发送，
-   * 输入框将继续保留原文。
-   *
-   * 现有调用方返回void或Promise<void>时，
-   * 视为请求已经被调用方受理。
+   * 仅用于判断是否存在待使用的教学策略，
+   * 教师界面不展示具体数量。
    */
+  selectedCount: number
+
+  onClearSelected: () => void
   onSend: (
     text: string,
-  ) =>
-    | void
-    | boolean
-    | Promise<void | boolean>
-  /** 教案正文是否非空。 */
+  ) => void | boolean | Promise<void | boolean>
   hasContent: boolean
-  /** 发布教案。 */
   onPublish: () => void
-  /** 「+」菜单各项可用性。 */
   plusItemAvailability: (
     tool: string,
   ) => {
-    /**
-     * false时菜单项完全不进入DOM。
-     *
-     * 用于教育域专属能力，不能仅以disabled状态泄露入口。
-     * 未提供时默认可见，兼容其它普通能力。
-     */
     visible?: boolean
     enabled: boolean
     reason: string
   }
-  /** 唤起指定能力。 */
   onOpenTool: (tool: string) => void
-  /** 参考资料附件文件名。 */
+
+  /**
+   * 参考资料名称。
+   *
+   * 只用于判断补充依据是否存在，不在输入区展示文件名。
+   */
   refMaterialName?: string
-  /** 移除参考资料附件。 */
+
   onClearRefMaterial?: () => void
 }
 
-/**
- * 安全读取当前正在备课的教案ID。
- *
- * ConversationInputBar只在chatting视图挂载；
- * 父页面在进入chatting前已经写入workshop_active_plan_id。
- */
 function getActiveConversationPlanID(): string {
   try {
-    return (
-      sessionStorage.getItem(
-        'workshop_active_plan_id',
-      ) || 'current-plan'
-    )
+    return sessionStorage.getItem(
+      'workshop_active_plan_id',
+    ) || 'current-plan'
   } catch {
     return 'current-plan'
   }
 }
 
-/**
- * 对话模式底部输入区。
- */
+function mergeVoiceText(
+  base: string,
+  speech: string,
+): string {
+  const normalized = speech.trim()
+
+  if (!normalized) {
+    return base
+  }
+
+  if (!base) {
+    return normalized
+  }
+
+  const needsSpace =
+    /[A-Za-z0-9]$/.test(base) &&
+    /^[A-Za-z0-9]/.test(normalized)
+
+  return base +
+    (needsSpace ? ' ' : '') +
+    normalized
+}
+
 const ConversationInputBar = forwardRef<
   ConversationInputBarHandle,
   ConversationInputBarProps
->(
-  function ConversationInputBar(
-    props,
-    ref,
-  ) {
-    const {
-      isBusy,
-      placeholder,
-      selectedCount,
-      onClearSelected,
-      onSend,
-      hasContent,
-      onPublish,
-      plusItemAvailability,
-      onOpenTool,
-      refMaterialName,
-      onClearRefMaterial,
-    } = props
+>(function ConversationInputBar(
+  props,
+  ref,
+) {
+  const {
+    isBusy,
+    placeholder,
+    selectedCount,
+    onClearSelected,
+    onSend,
+    hasContent,
+    onPublish,
+    plusItemAvailability,
+    onOpenTool,
+    refMaterialName,
+    onClearRefMaterial,
+  } = props
 
-    const { user } = useAuth()
+  const { user } = useAuth()
+  const activePlanID =
+    getActiveConversationPlanID()
 
-    /**
-     * 组件挂载时读取当前教案ID。
-     *
-     * 草稿键最终为：
-     * 当前用户 + lesson-plan-conversation +
-     * 当前教案ID + message。
-     */
-    const activePlanID =
-      getActiveConversationPlanID()
+  const {
+    value: inputText,
+    setValue: setInputText,
+    commit: commitInputDraft,
+    handleKeyDown: handleDraftKeyDown,
+  } = useProtectedDraft({
+    userId: user?.id,
+    scope: 'lesson-plan-conversation',
+    resourceId: activePlanID,
+    field: 'message',
+    initialValue: '',
+    maxHistory: 40,
+  })
 
-    const {
-      value: inputText,
-      setValue: setInputText,
-      commit: commitInputDraft,
-      handleKeyDown:
-        handleDraftKeyDown,
-    } = useProtectedDraft({
-      userId: user?.id,
-      scope:
-        'lesson-plan-conversation',
-      resourceId: activePlanID,
-      field: 'message',
-      initialValue: '',
-      maxHistory: 40,
-    })
+  const taRef =
+    useRef<HTMLTextAreaElement>(null)
 
-    /** 内部真正的textarea DOM引用。 */
-    const taRef =
-      useRef<HTMLTextAreaElement>(null)
+  /**
+   * 发送和发布共用单次执行锁。
+   *
+   * React忙碌状态更新前的快速双击也不能重复发消息或重复弹发布确认。
+   */
+  const submitInFlightRef =
+    useRef(false)
 
-    /**
-     * 对外暴露命令句柄。
-     */
-    useImperativeHandle(
-      ref,
-      () => ({
-        focus: () =>
-          taRef.current?.focus(),
+  const voiceBaseTextRef =
+    useRef('')
 
-        prefill: (text: string) => {
-          setInputText(text)
+  const handleVoicePartial = useCallback(
+    (text: string) => {
+      setInputText(
+        mergeVoiceText(
+          voiceBaseTextRef.current,
+          text,
+        ),
+      )
+    },
+    [setInputText],
+  )
 
-          requestAnimationFrame(() => {
-            const element =
-              taRef.current
+  const handleVoiceFinal = useCallback(
+    (text: string) => {
+      const merged = mergeVoiceText(
+        voiceBaseTextRef.current,
+        text,
+      )
 
-            if (!element) return
+      setInputText(merged)
 
-            element.focus()
-            element.setSelectionRange(
-              text.length,
-              text.length,
-            )
-          })
-        },
-      }),
-      [setInputText],
-    )
+      requestAnimationFrame(() => {
+        const element = taRef.current
 
-    /** 「+」能力菜单展开态。 */
-    const [
-      showPlusMenu,
-      setShowPlusMenu,
-    ] = useState(false)
-
-    /**
-     * 执行发送。
-     *
-     * 不再在调用onSend之前直接销毁草稿：
-     * 1. 先等待调用方受理；
-     * 2. 返回false或抛错时保留原文；
-     * 3. 受理后使用commit清空显示值；
-     * 4. commit保留撤销快照，Ctrl+Z仍可找回。
-     */
-    const doSend = async () => {
-      if (
-        !inputText.trim() ||
-        isBusy
-      ) {
-        return
-      }
-
-      const text = inputText.trim()
-
-      try {
-        const accepted =
-          await Promise.resolve(
-            onSend(text),
-          )
-
-        if (accepted === false) {
+        if (!element) {
           return
         }
 
-        commitInputDraft()
-      } catch (error) {
-        /**
-         * 调用方抛错时保持当前草稿不变。
-         * 业务错误展示由页面层负责。
-         */
-        console.error(
-          '备课消息发送未被受理，草稿已保留:',
-          error,
+        element.focus()
+        element.setSelectionRange(
+          merged.length,
+          merged.length,
         )
+      })
+    },
+    [setInputText],
+  )
+
+  const handleVoiceError = useCallback(
+    () => {
+      setInputText(
+        voiceBaseTextRef.current,
+      )
+    },
+    [setInputText],
+  )
+
+  const voice = useVoiceInput({
+    disabled: isBusy,
+    maxDurationSeconds: 120,
+    onPartial: handleVoicePartial,
+    onFinal: handleVoiceFinal,
+    onError: handleVoiceError,
+  })
+
+  const beginVoiceInput = useCallback(
+    () => {
+      voiceBaseTextRef.current =
+        inputText
+
+      void voice.start()
+    },
+    [inputText, voice.start],
+  )
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      focus: () =>
+        taRef.current?.focus(),
+
+      prefill: (text: string) => {
+        setInputText(text)
+
+        requestAnimationFrame(() => {
+          const element = taRef.current
+
+          if (!element) {
+            return
+          }
+
+          element.focus()
+          element.setSelectionRange(
+            text.length,
+            text.length,
+          )
+        })
+      },
+    }),
+    [setInputText],
+  )
+
+  const [
+    showPlusMenu,
+    setShowPlusMenu,
+  ] = useState(false)
+
+  const inputDisabled =
+    isBusy || voice.isActive
+
+  const hasSelectedStrategies =
+    selectedCount > 0
+
+  const hasReferenceEvidence =
+    Boolean(refMaterialName)
+
+  const doSend = async () => {
+    const text = inputText.trim()
+
+    if (
+      !text ||
+      inputDisabled ||
+      submitInFlightRef.current
+    ) {
+      return
+    }
+
+    submitInFlightRef.current = true
+
+    try {
+      /*
+       * 明确的定稿或发布确认语不进入AI聊天。
+       *
+       * 直接复用页面发布流程：
+       *   - 不生成用户聊天气泡；
+       *   - 不启动Harness；
+       *   - 不清空草稿，发布取消时老师仍可继续编辑；
+       *   - 发布成功后页面会离开当前工坊。
+       */
+      if (
+        isConversationPublishIntent(
+          text,
+        )
+      ) {
+        await Promise.resolve(
+          onPublish(),
+        )
+        return
       }
+
+      const accepted =
+        await Promise.resolve(
+          onSend(text),
+        )
+
+      if (accepted !== false) {
+        commitInputDraft()
+      }
+    } catch (error) {
+      console.error(
+        '备课消息发送或发布未被受理，草稿已保留:',
+        error,
+      )
+    } finally {
+      submitInFlightRef.current = false
     }
+  }
 
-    /**
-     * 菜单项点击。
-     */
-    const handleMenuItem = (
-      tool: string,
-    ) => {
-      setShowPlusMenu(false)
-      onOpenTool(tool)
-    }
+  let voiceStatusText = ''
 
-    return (
-      <>
-        {selectedCount > 0 && (
-          <div
-            style={{
-              padding: '7px 18px',
-              background: C.primaryLight,
-              borderTop:
-                `1px solid ${C.border}`,
-              fontSize: '12px',
-              color: C.primary,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent:
-                'space-between',
-              flexShrink: 0,
-            }}
-          >
-            <span>
-              🧩 已选 {selectedCount}{' '}
-              个教学组件，下一条消息发出时
-              AI 会一并参考
-            </span>
+  if (voice.status === 'connecting') {
+    voiceStatusText =
+      '正在连接语音识别…'
+  } else if (
+    voice.status === 'recording'
+  ) {
+    const minute = Math.floor(
+      voice.elapsedSeconds / 60,
+    )
 
-            <button
-              onClick={onClearSelected}
-              style={{
-                background: 'none',
-                border: 'none',
-                cursor: 'pointer',
-                color: C.textMuted,
-                fontSize: '12px',
-              }}
-            >
-              清空
-            </button>
-          </div>
-        )}
+    const second = String(
+      voice.elapsedSeconds % 60,
+    ).padStart(2, '0')
 
-        {refMaterialName && (
-          <div
-            style={{
-              padding: '7px 18px',
-              background:
-                'rgba(129,140,248,0.10)',
-              borderTop:
-                `1px solid ${C.border}`,
-              fontSize: '12px',
-              color: '#6366F1',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent:
-                'space-between',
-              flexShrink: 0,
-            }}
-          >
-            <span
-              style={{
-                overflow: 'hidden',
-                textOverflow:
-                  'ellipsis',
-                whiteSpace: 'nowrap',
-              }}
-            >
-              📎 已附参考资料「
-              {refMaterialName}
-              」，AI 每轮回复都会参考
-            </span>
+    voiceStatusText =
+      `正在听写 ${minute}:${second} · 点击红色按钮停止`
+  } else if (
+    voice.status === 'stopping'
+  ) {
+    voiceStatusText =
+      '正在整理最终文字…'
+  } else if (
+    voice.status === 'error' &&
+    voice.error
+  ) {
+    voiceStatusText =
+      `语音输入未完成：${voice.error}`
+  }
 
-            {onClearRefMaterial && (
-              <button
-                onClick={
-                  onClearRefMaterial
-                }
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  cursor: 'pointer',
-                  color: C.textMuted,
-                  fontSize: '12px',
-                  flexShrink: 0,
-                  marginLeft: '10px',
-                }}
-              >
-                移除
-              </button>
-            )}
-          </div>
-        )}
+  return (
+    <>
+      {hasSelectedStrategies && (
+        <ResourceMeaningPill
+          variant="strip"
+          icon="🧩"
+          label="已加入教学策略，下一条会结合使用"
+          title="已选择的专业策略会在下一轮帮助AI组织教学设计"
+          tone="strategy"
+          onClear={onClearSelected}
+          clearLabel="清空"
+        />
+      )}
 
+      {hasReferenceEvidence && (
+        <ResourceMeaningPill
+          variant="strip"
+          icon="📎"
+          label="已加入补充依据，后续会结合使用"
+          title="补充材料会在需要时参与本课分析和设计"
+          tone="evidence"
+          onClear={onClearRefMaterial}
+          clearLabel="移除"
+        />
+      )}
+
+      <div
+        style={{
+          padding: '12px 18px',
+          borderTop: `1px solid ${C.border}`,
+          background: C.card,
+          flexShrink: 0,
+        }}
+      >
         <div
           style={{
-            padding: '12px 18px',
-            borderTop:
-              `1px solid ${C.border}`,
-            background: C.card,
-            flexShrink: 0,
+            display: 'flex',
+            gap: '10px',
+            alignItems: 'flex-end',
           }}
         >
           <div
             style={{
-              display: 'flex',
-              gap: '10px',
-              alignItems: 'flex-end',
+              position: 'relative',
+              flexShrink: 0,
             }}
           >
-            <div
+            <button
+              type="button"
+              onClick={() =>
+                setShowPlusMenu(
+                  value => !value,
+                )
+              }
+              disabled={inputDisabled}
+              title="更多备课能力"
               style={{
-                position: 'relative',
-                flexShrink: 0,
+                width: '38px',
+                height: '38px',
+                borderRadius: '50%',
+                border: `1px solid ${C.border}`,
+                background: showPlusMenu
+                  ? C.primaryLight
+                  : C.card,
+                color: showPlusMenu
+                  ? C.primary
+                  : C.textSec,
+                fontSize: '20px',
+                cursor: inputDisabled
+                  ? 'not-allowed'
+                  : 'pointer',
+                opacity: inputDisabled
+                  ? 0.5
+                  : 1,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
               }}
             >
-              <button
-                onClick={() =>
-                  setShowPlusMenu(
-                    (value) => !value,
-                  )
-                }
-                disabled={isBusy}
-                title="更多备课能力"
-                style={{
-                  width: '38px',
-                  height: '38px',
-                  borderRadius: '50%',
-                  border:
-                    `1px solid ${C.border}`,
-                  background:
-                    showPlusMenu
-                      ? C.primaryLight
-                      : C.card,
-                  color:
-                    showPlusMenu
-                      ? C.primary
-                      : C.textSec,
-                  fontSize: '20px',
-                  cursor:
-                    isBusy
-                      ? 'not-allowed'
-                      : 'pointer',
-                  opacity:
-                    isBusy ? 0.5 : 1,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent:
-                    'center',
-                  transition:
-                    'all 150ms ease',
-                }}
-              >
-                ＋
-              </button>
+              ＋
+            </button>
 
-              {showPlusMenu && (
-                <>
-                  <div
-                    onClick={() =>
-                      setShowPlusMenu(false)
-                    }
-                    style={{
-                      position: 'fixed',
-                      top: 0,
-                      left: 0,
-                      right: 0,
-                      bottom: 0,
-                      zIndex: 998,
-                    }}
-                  />
+            {showPlusMenu && (
+              <>
+                <div
+                  onClick={() =>
+                    setShowPlusMenu(false)
+                  }
+                  style={{
+                    position: 'fixed',
+                    inset: 0,
+                    zIndex: 998,
+                  }}
+                />
 
-                  <div
-                    style={{
-                      position: 'absolute',
-                      bottom: '46px',
-                      left: 0,
-                      width: '260px',
-                      background: C.card,
-                      borderRadius: '12px',
-                      border:
-                        `1px solid ${C.border}`,
-                      boxShadow:
-                        '0 8px 32px rgba(0,0,0,0.12)',
-                      padding: '6px',
-                      zIndex: 999,
-                    }}
-                  >
-                    {PLUS_MENU_ITEMS.map(
-                      (item) => {
-                        const availability =
-                          plusItemAvailability(
-                            item.tool,
-                          )
+                <div
+                  style={{
+                    position: 'absolute',
+                    bottom: '46px',
+                    left: 0,
+                    zIndex: 999,
+                    width: '260px',
+                    padding: '6px',
+                    borderRadius: '12px',
+                    border: `1px solid ${C.border}`,
+                    background: C.card,
+                    boxShadow:
+                      '0 8px 32px rgba(0,0,0,0.12)',
+                  }}
+                >
+                  {PLUS_MENU_ITEMS.map(
+                    item => {
+                      const availability =
+                        plusItemAvailability(
+                          item.tool,
+                        )
 
-                        /**
-                         * 教育域专属能力在不适用时完全隐藏。
-                         *
-                         * 返回null意味着不会生成按钮、说明文字或禁用入口，
-                         * 但后端仍独立执行权限校验，缓存代码也不能绕过。
-                         */
-                        if (
-                          availability.visible ===
-                          false
-                        ) {
-                          return null
-                        }
+                      if (
+                        availability.visible ===
+                        false
+                      ) {
+                        return null
+                      }
 
-                        return (
-                          <button
-                            key={item.tool}
-                            onClick={() => {
-                              if (
-                                availability.enabled
-                              ) {
-                                handleMenuItem(
-                                  item.tool,
-                                )
-                              }
-                            }}
-                            disabled={
+                      return (
+                        <button
+                          type="button"
+                          key={item.tool}
+                          onClick={() => {
+                            if (
                               !availability.enabled
+                            ) {
+                              return
                             }
-                            title={
+
+                            setShowPlusMenu(false)
+                            onOpenTool(item.tool)
+                          }}
+                          disabled={
+                            !availability.enabled
+                          }
+                          title={
+                            availability.enabled
+                              ? item.desc
+                              : availability.reason
+                          }
+                          style={{
+                            width: '100%',
+                            padding: '9px 10px',
+                            display: 'flex',
+                            alignItems: 'flex-start',
+                            gap: '10px',
+                            borderRadius: '8px',
+                            border: 'none',
+                            background: 'transparent',
+                            cursor:
                               availability.enabled
-                                ? item.desc
-                                : availability.reason
-                            }
-                            style={{
-                              display: 'flex',
-                              alignItems:
-                                'flex-start',
-                              gap: '10px',
-                              width: '100%',
-                              padding:
-                                '9px 10px',
-                              borderRadius:
-                                '8px',
-                              border: 'none',
-                              background:
-                                'transparent',
-                              cursor:
-                                availability.enabled
-                                  ? 'pointer'
-                                  : 'not-allowed',
-                              opacity:
-                                availability.enabled
-                                  ? 1
-                                  : 0.45,
-                              textAlign: 'left',
-                              transition:
-                                'background 150ms ease',
-                            }}
-                            onMouseEnter={(
-                              event,
-                            ) => {
-                              if (
-                                availability.enabled
-                              ) {
-                                event.currentTarget.style.background =
-                                  '#F3F4F6'
-                              }
-                            }}
-                            onMouseLeave={(
-                              event,
-                            ) => {
+                                ? 'pointer'
+                                : 'not-allowed',
+                            opacity:
+                              availability.enabled
+                                ? 1
+                                : 0.45,
+                            textAlign: 'left',
+                          }}
+                          onMouseEnter={event => {
+                            if (
+                              availability.enabled
+                            ) {
                               event.currentTarget.style.background =
-                                'transparent'
+                                '#F3F4F6'
+                            }
+                          }}
+                          onMouseLeave={event => {
+                            event.currentTarget.style.background =
+                              'transparent'
+                          }}
+                        >
+                          <span
+                            style={{
+                              flexShrink: 0,
+                              fontSize: '17px',
+                            }}
+                          >
+                            {item.emoji}
+                          </span>
+
+                          <span
+                            style={{
+                              minWidth: 0,
                             }}
                           >
                             <span
                               style={{
-                                fontSize:
-                                  '17px',
-                                flexShrink: 0,
+                                display: 'block',
+                                color: C.text,
+                                fontSize: '13px',
+                                fontWeight: 600,
                               }}
                             >
-                              {item.emoji}
+                              {item.label}
                             </span>
 
                             <span
                               style={{
-                                minWidth: 0,
+                                display: 'block',
+                                marginTop: '1px',
+                                color: C.textMuted,
+                                fontSize: '11px',
+                                lineHeight: 1.4,
                               }}
                             >
-                              <span
-                                style={{
-                                  display:
-                                    'block',
-                                  fontSize:
-                                    '13px',
-                                  fontWeight:
-                                    600,
-                                  color: C.text,
-                                }}
-                              >
-                                {item.label}
-                              </span>
-
-                              <span
-                                style={{
-                                  display:
-                                    'block',
-                                  fontSize:
-                                    '11px',
-                                  color:
-                                    C.textMuted,
-                                  marginTop:
-                                    '1px',
-                                  lineHeight:
-                                    1.4,
-                                }}
-                              >
-                                {availability.enabled
-                                  ? item.desc
-                                  : availability.reason}
-                              </span>
+                              {availability.enabled
+                                ? item.desc
+                                : availability.reason}
                             </span>
-                          </button>
-                        )
-                      },
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
-
-            <div
-              style={{
-                flex: 1,
-                display: 'flex',
-                gap: '10px',
-                alignItems: 'flex-end',
-                background: '#F9FAFB',
-                borderRadius: '12px',
-                border:
-                  `1px solid ${C.border}`,
-                padding: '9px 12px',
-              }}
-            >
-              <textarea
-                ref={taRef}
-                value={inputText}
-                onChange={(event) =>
-                  setInputText(
-                    event.target.value,
-                  )
-                }
-                onKeyDown={(event) => {
-                  if (
-                    handleDraftKeyDown(
-                      event,
-                    )
-                  ) {
-                    return
-                  }
-
-                  if (
-                    event.key ===
-                      'Enter' &&
-                    !event.shiftKey
-                  ) {
-                    event.preventDefault()
-                    void doSend()
-                  }
-                }}
-                placeholder={placeholder}
-                rows={2}
-                disabled={isBusy}
-                style={{
-                  flex: 1,
-                  background:
-                    'transparent',
-                  border: 'none',
-                  outline: 'none',
-                  fontSize: '15px',
-                  color: C.text,
-                  resize: 'none',
-                  fontFamily: 'inherit',
-                  lineHeight: 1.6,
-                  opacity:
-                    isBusy ? 0.5 : 1,
-                }}
-              />
-
-              <button
-                onClick={() =>
-                  void doSend()
-                }
-                disabled={
-                  isBusy ||
-                  !inputText.trim()
-                }
-                style={{
-                  width: '36px',
-                  height: '36px',
-                  flexShrink: 0,
-                  borderRadius: '50%',
-                  border: 'none',
-                  background:
-                    isBusy ||
-                    !inputText.trim()
-                      ? '#E5E7EB'
-                      : C.primary,
-                  color: '#fff',
-                  cursor:
-                    isBusy ||
-                    !inputText.trim()
-                      ? 'not-allowed'
-                      : 'pointer',
-                  fontSize: '16px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent:
-                    'center',
-                }}
-              >
-                →
-              </button>
-            </div>
+                          </span>
+                        </button>
+                      )
+                    },
+                  )}
+                </div>
+              </>
+            )}
           </div>
 
           <div
             style={{
-              marginTop: '5px',
-              paddingLeft: '48px',
-              fontSize: '10px',
-              color: C.textMuted,
-              lineHeight: 1.5,
+              flex: 1,
+              minWidth: 0,
+              padding: '9px 10px',
+              display: 'flex',
+              alignItems: 'flex-end',
+              gap: '7px',
+              borderRadius: '12px',
+              border: `1px solid ${C.border}`,
+              background: '#F9FAFB',
             }}
           >
-            已自动保存草稿 ·
-            Ctrl/Command+Z恢复误删 ·
-            Shift+Enter换行
-          </div>
+            <textarea
+              ref={taRef}
+              value={inputText}
+              onChange={event =>
+                setInputText(
+                  event.target.value,
+                )
+              }
+              onKeyDown={event => {
+                if (
+                  handleDraftKeyDown(
+                    event,
+                  )
+                ) {
+                  return
+                }
 
-          {hasContent && (
-            <div
+                if (
+                  event.key === 'Enter' &&
+                  !event.shiftKey
+                ) {
+                  event.preventDefault()
+                  void doSend()
+                }
+              }}
+              placeholder={placeholder}
+              rows={2}
+              disabled={inputDisabled}
               style={{
+                flex: 1,
+                minWidth: 0,
+                border: 'none',
+                outline: 'none',
+                background: 'transparent',
+                color: C.text,
+                resize: 'none',
+                opacity: inputDisabled
+                  ? 0.5
+                  : 1,
+                fontFamily: 'inherit',
+                fontSize: '15px',
+                lineHeight: 1.6,
+              }}
+            />
+
+            <VoiceInputButton
+              status={voice.status}
+              isSupported={
+                voice.isSupported
+              }
+              elapsedSeconds={
+                voice.elapsedSeconds
+              }
+              disabled={isBusy}
+              error={voice.error}
+              onStart={beginVoiceInput}
+              onStop={voice.stop}
+              onCancel={voice.cancel}
+            />
+
+            <button
+              type="button"
+              onClick={() => void doSend()}
+              disabled={
+                inputDisabled ||
+                !inputText.trim()
+              }
+              style={{
+                width: '36px',
+                height: '36px',
+                flexShrink: 0,
+                borderRadius: '50%',
+                border: 'none',
+                background:
+                  inputDisabled ||
+                  !inputText.trim()
+                    ? '#E5E7EB'
+                    : C.primary,
+                color: '#fff',
+                cursor:
+                  inputDisabled ||
+                  !inputText.trim()
+                    ? 'not-allowed'
+                    : 'pointer',
+                fontSize: '16px',
                 display: 'flex',
-                justifyContent:
-                  'flex-end',
-                marginTop: '8px',
+                alignItems: 'center',
+                justifyContent: 'center',
               }}
             >
-              <button
-                onClick={onPublish}
-                disabled={isBusy}
-                style={{
-                  padding:
-                    '6px 16px',
-                  borderRadius:
-                    '16px',
-                  border: 'none',
-                  background:
-                    isBusy
-                      ? '#E5E7EB'
-                      : 'linear-gradient(135deg, #10B981, #34D399)',
-                  color:
-                    isBusy
-                      ? C.textMuted
-                      : '#fff',
-                  fontSize: '12px',
-                  fontWeight: 600,
-                  cursor:
-                    isBusy
-                      ? 'not-allowed'
-                      : 'pointer',
-                }}
-              >
-                🚀 发布教案
-              </button>
-            </div>
-          )}
+              →
+            </button>
+          </div>
         </div>
-      </>
-    )
-  },
-)
+
+        <div
+          style={{
+            marginTop: '5px',
+            paddingLeft: '48px',
+            color:
+              voice.status === 'error'
+                ? '#DC2626'
+                : voice.isActive
+                  ? C.primary
+                  : C.textMuted,
+            fontSize: '10px',
+            lineHeight: 1.5,
+          }}
+        >
+          {voiceStatusText ||
+            '已自动保存草稿 · 点击麦克风可语音输入 · Shift+Enter换行'}
+        </div>
+
+        {hasContent && (
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'flex-end',
+              marginTop: '8px',
+            }}
+          >
+            <button
+              type="button"
+              onClick={onPublish}
+              disabled={inputDisabled}
+              style={{
+                padding: '6px 16px',
+                borderRadius: '16px',
+                border: 'none',
+                background: inputDisabled
+                  ? '#E5E7EB'
+                  : 'linear-gradient(135deg, #10B981, #34D399)',
+                color: inputDisabled
+                  ? C.textMuted
+                  : '#fff',
+                cursor: inputDisabled
+                  ? 'not-allowed'
+                  : 'pointer',
+                fontSize: '12px',
+                fontWeight: 600,
+              }}
+            >
+              🚀 发布教案
+            </button>
+          </div>
+        )}
+      </div>
+    </>
+  )
+})
 
 export default ConversationInputBar

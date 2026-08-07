@@ -10,15 +10,19 @@ package handlers
 //   POST   /api/v1/coursewares/{id}/subtitles/{sub_id}/burn-in      — FFmpeg 硬字幕烧录
 
 import (
-	"encoding/json"
-	"net/http"
-	"strings"
+        "encoding/json"
+        "errors"
+        "net/http"
+        "strings"
 
-	"tedna/internal/ai"
-	"tedna/internal/middleware"
-	"tedna/internal/models"
-	"tedna/internal/services"
-	"tedna/internal/utils"
+        "github.com/google/uuid"
+
+        "tedna/internal/ai"
+        "tedna/internal/middleware"
+        "tedna/internal/models"
+        "tedna/internal/repository"
+        "tedna/internal/services"
+        "tedna/internal/utils"
 )
 
 // CoursewareSubtitleHandler 字幕轨处理器
@@ -466,105 +470,240 @@ func (h *CoursewareSubtitleHandler) BurnInSubtitle(
 
 // GenerateTTS POST /api/v1/coursewares/{id}/subtitles/{sub_id}/generate-tts
 func (h *CoursewareSubtitleHandler) GenerateTTS(
-	w http.ResponseWriter,
-	r *http.Request,
+        w http.ResponseWriter,
+        r *http.Request,
 ) {
-	if r.Method != http.MethodPost {
-		utils.Fail(
-			w,
-			http.StatusMethodNotAllowed,
-			"仅支持POST",
-		)
-		return
-	}
+        if r.Method != http.MethodPost {
+                utils.Fail(
+                        w,
+                        http.StatusMethodNotAllowed,
+                        "仅支持POST",
+                )
+                return
+        }
 
-	coursewareID :=
-		extractSubtitleCoursewareID(
-			r.URL.Path,
-		)
-	subtitleID :=
-		extractSubtitleID(
-			r.URL.Path,
-		)
+        coursewareID :=
+                extractSubtitleCoursewareID(
+                        r.URL.Path,
+                )
 
-	if coursewareID == "" ||
-		subtitleID == "" {
-		utils.BadRequest(
-			w,
-			"无效的路径参数",
-		)
-		return
-	}
+        subtitleID :=
+                extractSubtitleID(
+                        r.URL.Path,
+                )
 
-	claims, ok :=
-		middleware.GetClaims(
-			r.Context(),
-		)
-	if !ok || claims == nil {
-		utils.Unauthorized(
-			w,
-			"未认证",
-		)
-		return
-	}
+        if coursewareID == "" ||
+                subtitleID == "" {
+                utils.BadRequest(
+                        w,
+                        "无效的路径参数",
+                )
+                return
+        }
 
-	scopedActor, err :=
-		authorizeCoursewareSubtitleOwnerControl(
-			r.Context(),
-			coursewareID,
-			claims.UserID,
-			claims.Role,
-		)
-	if err != nil {
-		writeCoursewareSubtitleError(
-			w,
-			err,
-		)
-		return
-	}
+        claims, ok :=
+                middleware.GetClaims(
+                        r.Context(),
+                )
 
-	var req models.GenerateTTSRequest
+        if !ok ||
+                claims == nil {
+                utils.Unauthorized(
+                        w,
+                        "未认证",
+                )
+                return
+        }
 
-	if err := json.NewDecoder(
-		r.Body,
-	).Decode(&req); err != nil {
-		utils.BadRequest(
-			w,
-			"请求体解析失败",
-		)
-		return
-	}
+        scopedActor, err :=
+                authorizeCoursewareSubtitleOwnerControl(
+                        r.Context(),
+                        coursewareID,
+                        claims.UserID,
+                        claims.Role,
+                )
 
-	if strings.TrimSpace(req.Voice) == "" {
-		utils.BadRequest(
-			w,
-			"voice（音色代码）为必填",
-		)
-		return
-	}
+        if err != nil {
+                writeCoursewareSubtitleError(
+                        w,
+                        err,
+                )
+                return
+        }
 
-	result, err :=
-		h.subtitleService.GenerateTTS(
-			r.Context(),
-			coursewareID,
-			subtitleID,
-			scopedActor,
-			req.Voice,
-			req.Speed,
-			req.SegmentIDs,
-		)
-	if err != nil {
-		writeCoursewareSubtitleError(
-			w,
-			err,
-		)
-		return
-	}
+        var request struct {
+                Voice       string   `json:"voice"`
+                Speed       float64  `json:"speed,omitempty"`
+                SegmentIDs  []string `json:"segment_ids,omitempty"`
+                OperationID string   `json:"operation_id"`
+        }
 
-	utils.Success(
-		w,
-		result,
-	)
+        if err :=
+                json.NewDecoder(
+                        r.Body,
+                ).Decode(
+                        &request,
+                ); err != nil {
+                utils.BadRequest(
+                        w,
+                        "请求体解析失败",
+                )
+                return
+        }
+
+        request.Voice =
+                strings.TrimSpace(
+                        request.Voice,
+                )
+
+        request.OperationID =
+                strings.TrimSpace(
+                        request.OperationID,
+                )
+
+        if request.Voice == "" {
+                utils.BadRequest(
+                        w,
+                        "voice（音色代码）为必填",
+                )
+                return
+        }
+
+        if _, err :=
+                uuid.Parse(
+                        request.OperationID,
+                ); err != nil {
+                utils.BadRequest(
+                        w,
+                        "配音任务标识无效，请刷新窗口后重试",
+                )
+                return
+        }
+
+        result, err :=
+                h.subtitleService.GenerateTTS(
+                        r.Context(),
+                        coursewareID,
+                        subtitleID,
+                        scopedActor,
+                        request.Voice,
+                        request.Speed,
+                        request.SegmentIDs,
+                        request.OperationID,
+                )
+
+        if err != nil {
+                writeCoursewareSubtitleTTSError(
+                        w,
+                        err,
+                )
+                return
+        }
+
+        utils.Success(
+                w,
+                result,
+        )
+}
+
+// writeCoursewareSubtitleTTSError 映射TTS积分和恢复错误。
+//
+// 普通用户不接收供应商、模型、内部幂等键、单价或成本数据。
+func writeCoursewareSubtitleTTSError(
+        w http.ResponseWriter,
+        err error,
+) {
+        switch {
+        case errors.Is(
+                err,
+                services.ErrMediaBillingPriceNotConfigured,
+        ):
+                utils.Fail(
+                        w,
+                        http.StatusServiceUnavailable,
+                        "TTS积分计费尚未配置，请联系管理员",
+                )
+
+        case errors.Is(
+                err,
+                repository.ErrInsufficientBalance,
+        ):
+                utils.Fail(
+                        w,
+                        http.StatusPaymentRequired,
+                        "积分余额不足，暂时无法生成配音",
+                )
+
+        case errors.Is(
+                err,
+                repository.ErrTokenAccountNotFound,
+        ):
+                utils.Fail(
+                        w,
+                        http.StatusConflict,
+                        "尚未开通个人积分账户，暂时无法生成配音",
+                )
+
+        case errors.Is(
+                err,
+                repository.ErrAccountSuspended,
+        ):
+                utils.Fail(
+                        w,
+                        http.StatusForbidden,
+                        "积分账户当前不可用，请联系管理员",
+                )
+
+        case errors.Is(
+                err,
+                services.ErrCoursewareTTSBillingInProgress,
+        ),
+                errors.Is(
+                        err,
+                        services.ErrCoursewareTTSBillingPending,
+                ):
+                utils.Fail(
+                        w,
+                        http.StatusConflict,
+                        "同一字幕配音任务正在处理或等待恢复，请稍后重试",
+                )
+
+        case errors.Is(
+                err,
+                services.ErrCoursewareTTSBillingTerminal,
+        ):
+                utils.Fail(
+                        w,
+                        http.StatusConflict,
+                        "该字幕配音任务已经结束，请重新发起生成",
+                )
+
+        case errors.Is(
+                err,
+                services.ErrCoursewareTTSBillingIdentityMismatch,
+        ):
+                utils.Fail(
+                        w,
+                        http.StatusConflict,
+                        "字幕文本、音色或语速已经变化，请重新发起配音",
+                )
+
+        case errors.Is(
+                err,
+                services.ErrCoursewareTTSBillingOutputMissing,
+        ):
+                utils.Fail(
+                        w,
+                        http.StatusConflict,
+                        "配音调用已经完成，但音频文件未正确形成，请联系管理员处理",
+                )
+
+        default:
+                writeCoursewareSubtitleError(
+                        w,
+                        err,
+                )
+        }
 }
 
 // ListTTSVoices GET /api/v1/tts-voices?language=zh-CN

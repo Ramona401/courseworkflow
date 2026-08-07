@@ -206,6 +206,25 @@ func (s *LessonPlanGenService) Chat(
 		return err
 	}
 
+	/*
+	 * 明确的定稿或发布确认语不是AI生成任务。
+	 *
+	 * 必须在登记后台任务和写入用户消息之前fail-fast：
+	 *   - 当前前端会直接调用发布接口；
+	 *   - 旧缓存页面或手工API调用也不能启动正式产物Harness；
+	 *   - 不在对话历史留下只有用户消息、没有终态回复的半轮记录。
+	 */
+	if isLessonPlanPublishIntent(
+		req.Message,
+	) {
+		lpGenLog.Info(
+			"Chat入口拦截明确发布意图",
+			"plan_id", lp.ID,
+			"caller_id", callerID,
+		)
+		return ErrLPGenPublishIntent
+	}
+
 	// 在写入老师消息之前登记任务。
 	// draining或重复任务被拒绝时，不会留下只有用户消息、没有AI回复的半轮对话。
 	task, taskErr := startLessonPlanAITask(lp.ID)

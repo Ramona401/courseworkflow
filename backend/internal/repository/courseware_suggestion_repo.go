@@ -41,18 +41,137 @@ func GetPageVideoStoryboards(ctx context.Context, coursewareID string, pageNumbe
 	return s, nil
 }
 
-// UpdatePageImageSuggestions 覆盖写指定页的生图建议(jsonb); 空串经 nullIfEmptyJSON 写 NULL(清空)。
-func UpdatePageImageSuggestions(ctx context.Context, coursewareID string, pageNumber int, suggestionsJSON string) error {
-	sql := `UPDATE courseware_pages SET image_suggestions = $1, updated_at = now()
-        WHERE courseware_id = $2 AND page_number = $3`
-	_, err := database.DB.Exec(ctx, sql, nullIfEmptyJSON(suggestionsJSON), coursewareID, pageNumber)
+// UpdatePageImageSuggestions 覆盖写指定页的生图建议。
+//
+// 自动装配context存在时，写入必须仍属于当前running运行；普通媒体工作台
+// 不携带装配身份，继续使用原有页码定位逻辑。
+func UpdatePageImageSuggestions(
+	ctx context.Context,
+	coursewareID string,
+	pageNumber int,
+	suggestionsJSON string,
+) error {
+	if assembly, ok :=
+		coursewareAssemblyWriteContextFrom(
+			ctx,
+		); ok {
+		if coursewareID !=
+			assembly.CoursewareID {
+			return ErrCoursewareAssemblyVersionConflict
+		}
+
+		tag, err := database.DB.Exec(
+			ctx,
+			`UPDATE courseware_pages AS page
+                        SET
+                                image_suggestions = $1,
+                                updated_at = NOW()
+                        FROM coursewares AS courseware
+                        WHERE page.courseware_id = $2
+                          AND page.page_number = $3
+                          AND courseware.id = page.courseware_id
+                          AND courseware.assembly_version = $4
+                          AND courseware.assembly_status = 'running'
+                          AND courseware.active_assembly_run_id = $5`,
+			nullIfEmptyJSON(
+				suggestionsJSON,
+			),
+			coursewareID,
+			pageNumber,
+			assembly.Version,
+			assembly.RunID,
+		)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrCoursewareAssemblyVersionConflict
+		}
+
+		return nil
+	}
+
+	sql :=
+		`UPDATE courseware_pages
+                SET image_suggestions = $1, updated_at = NOW()
+                WHERE courseware_id = $2 AND page_number = $3`
+
+	_, err := database.DB.Exec(
+		ctx,
+		sql,
+		nullIfEmptyJSON(
+			suggestionsJSON,
+		),
+		coursewareID,
+		pageNumber,
+	)
+
 	return err
 }
 
-// UpdatePageVideoStoryboards 覆盖写指定页的视频分镜(jsonb); 空串写 NULL(清空)。
-func UpdatePageVideoStoryboards(ctx context.Context, coursewareID string, pageNumber int, storyboardsJSON string) error {
-	sql := `UPDATE courseware_pages SET video_storyboards = $1, updated_at = now()
-        WHERE courseware_id = $2 AND page_number = $3`
-	_, err := database.DB.Exec(ctx, sql, nullIfEmptyJSON(storyboardsJSON), coursewareID, pageNumber)
+// UpdatePageVideoStoryboards 覆盖写指定页的视频分镜。
+//
+// 装配取消后，迟到的视频分镜结果不得继续覆盖页面媒体建议。
+func UpdatePageVideoStoryboards(
+	ctx context.Context,
+	coursewareID string,
+	pageNumber int,
+	storyboardsJSON string,
+) error {
+	if assembly, ok :=
+		coursewareAssemblyWriteContextFrom(
+			ctx,
+		); ok {
+		if coursewareID !=
+			assembly.CoursewareID {
+			return ErrCoursewareAssemblyVersionConflict
+		}
+
+		tag, err := database.DB.Exec(
+			ctx,
+			`UPDATE courseware_pages AS page
+                        SET
+                                video_storyboards = $1,
+                                updated_at = NOW()
+                        FROM coursewares AS courseware
+                        WHERE page.courseware_id = $2
+                          AND page.page_number = $3
+                          AND courseware.id = page.courseware_id
+                          AND courseware.assembly_version = $4
+                          AND courseware.assembly_status = 'running'
+                          AND courseware.active_assembly_run_id = $5`,
+			nullIfEmptyJSON(
+				storyboardsJSON,
+			),
+			coursewareID,
+			pageNumber,
+			assembly.Version,
+			assembly.RunID,
+		)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrCoursewareAssemblyVersionConflict
+		}
+
+		return nil
+	}
+
+	sql :=
+		`UPDATE courseware_pages
+                SET video_storyboards = $1, updated_at = NOW()
+                WHERE courseware_id = $2 AND page_number = $3`
+
+	_, err := database.DB.Exec(
+		ctx,
+		sql,
+		nullIfEmptyJSON(
+			storyboardsJSON,
+		),
+		coursewareID,
+		pageNumber,
+	)
+
 	return err
 }

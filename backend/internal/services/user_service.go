@@ -60,15 +60,18 @@ import (
 const initialPersonalCredits = 100
 
 var (
-	ErrUsernameRequired    = errors.New("用户名不能为空")
-	ErrDisplayNameRequired = errors.New("显示名称不能为空")
-	ErrPasswordTooShort    = errors.New("密码长度不能少于6位")
-	ErrInvalidRole         = errors.New("无效的角色，可选值：admin/senior_operator/operator/viewer")
-	ErrInvalidStatus       = errors.New("无效的状态，可选值：active/disabled")
-	ErrUsernameExists      = errors.New("用户名已存在")
-	ErrCannotDisableSelf   = errors.New("不能禁用自己的账户")
-	ErrCannotChangeOwnRole = errors.New("不能修改自己的角色")
-	ErrUserNotFound        = errors.New("用户不存在")
+	ErrUsernameRequired              = errors.New("用户名不能为空")
+	ErrDisplayNameRequired           = errors.New("显示名称不能为空")
+	ErrPasswordTooShort              = errors.New("密码长度不能少于6位")
+	ErrInvalidRole                   = errors.New("无效的角色，可选值：admin/senior_operator/operator/viewer")
+	ErrInvalidStatus                 = errors.New("无效的状态，可选值：active/disabled")
+	ErrUsernameExists                = errors.New("用户名已存在")
+	ErrCannotDisableSelf             = errors.New("不能禁用自己的账户")
+	ErrCannotChangeOwnRole           = errors.New("不能修改自己的角色")
+	ErrUserNotFound                  = errors.New("用户不存在")
+	ErrSchoolRequired                = errors.New("创建骨干教师或普通教师时必须选择所属学校")
+	ErrSchoolUnavailable             = errors.New("所属学校不存在、已停用或教育类型未正确配置")
+	ErrSchoolTokenAccountUnavailable = errors.New("所属学校积分账户尚未初始化，暂不能创建教师账号")
 	// 批C(任命唯一事实源)：任命制身份不可经建号/编辑直接授予或改动
 	ErrRoleAppointmentOnly = errors.New("学校管理员/区域管理员为任命制身份：请在「组织架构」对应卡片的「🛡️ 管理员」面板任命（自动升级身份）或移除任命（末个任命移除后自动降级），不能在此直接设置")
 )
@@ -274,6 +277,39 @@ func (s *UserService) CreateUserWithSchool(ctx context.Context, req *models.Crea
 		return nil, err
 	}
 
+	// 系统管理员单建账号时，学校ID由请求体携带；学校管理员路径则由Handler
+	// 传入服务端实时解析出的学校ID，显式参数优先，客户端值只能作为空值补充。
+	schoolID = strings.TrimSpace(schoolID)
+	req.SchoolID = strings.TrimSpace(req.SchoolID)
+	if schoolID == "" {
+		schoolID = req.SchoolID
+	}
+
+	isTeachingAccount := models.IsSchoolAdminCreatableRole(req.Role)
+	if isTeachingAccount && schoolID == "" {
+		return nil, ErrSchoolRequired
+	}
+	if !isTeachingAccount && schoolID != "" {
+		// 平台管理账号不作为普通学校成员创建，避免混入学校Token范围和教学域解析。
+		return nil, ErrSchoolUnavailable
+	}
+
+	// 正式事务前先校验学校基础事实；事务内积分账户创建仍会再次联表校验，
+	// 防止校验后学校被停用或学校积分账户被修改的TOCTOU问题。
+	if schoolID != "" {
+		school, schoolErr := repository.GetOrganizationByID(ctx, schoolID)
+		if schoolErr != nil ||
+			school == nil ||
+			school.Type != models.OrgTypeSchool ||
+			school.Status != models.StatusActive ||
+			!models.IsTeachingEducationDomain(school.EducationDomain) {
+			return nil, ErrSchoolUnavailable
+		}
+		if source == "" {
+			source = "admin_create"
+		}
+	}
+
 	// 2. 事务外预查重(方案A第一道：友好错误)
 	exists, err := repository.CheckUsernameExists(ctx, req.Username)
 	if err != nil {
@@ -300,7 +336,9 @@ func (s *UserService) CreateUserWithSchool(ctx context.Context, req *models.Crea
 		Status:       models.StatusActive,
 	}
 
-	// 4. 开启事务：建用户 + (可选)入校，原子提交
+	// 4. 开启事务：
+	//    教学账号必须原子完成 users + school_members + personal token_accounts；
+	//    任一步失败整体回滚，禁止再次产生“能登录但无校籍/无积分账户”的半成品账号。
 	tx, err := database.DB.Begin(ctx)
 	if err != nil {
 		userLog.Error("开启建用户事务失败", "username", req.Username, "error", err)
@@ -319,10 +357,31 @@ func (s *UserService) CreateUserWithSchool(ctx context.Context, req *models.Crea
 		return nil, err
 	}
 
-	// 4b. 事务内入校(仅当指定了学校)
+	var personalAccountID string
+
+	// 4b. 教学账号事务内入校并创建个人积分账户。
 	if schoolID != "" {
 		if err := repository.AddSchoolMemberTx(ctx, tx, schoolID, user.ID, source); err != nil {
 			userLog.Error("写入学校成员失败(事务，将回滚)",
+				"username", req.Username, "user_id", user.ID, "school_id", schoolID, "error", err)
+			return nil, err
+		}
+
+		personalAccountID, err = repository.CreatePersonalTokenAccountForSchoolUserTx(
+			ctx,
+			tx,
+			user.ID,
+			user.DisplayName,
+			schoolID,
+			initialPersonalCredits,
+		)
+		if err != nil {
+			if errors.Is(err, repository.ErrSchoolTokenAccountNotFound) {
+				userLog.Error("学校积分账户未初始化(事务，将回滚)",
+					"username", req.Username, "school_id", schoolID, "error", err)
+				return nil, ErrSchoolTokenAccountUnavailable
+			}
+			userLog.Error("创建个人积分账户失败(事务，将回滚)",
 				"username", req.Username, "user_id", user.ID, "school_id", schoolID, "error", err)
 			return nil, err
 		}
@@ -336,10 +395,28 @@ func (s *UserService) CreateUserWithSchool(ctx context.Context, req *models.Crea
 
 	userLog.Info("创建用户成功",
 		"username", user.Username, "user_id", user.ID, "role", user.Role,
-		"school_id", schoolID, "source", source)
+		"school_id", schoolID, "source", source, "token_account_id", personalAccountID)
 
-	// 5b. B4：事务外 best-effort 开个人积分账户（失败只记 Warn，不影响建用户返回）
-	ensurePersonalTokenAccount(ctx, user.ID, user.DisplayName)
+	if personalAccountID != "" {
+		// 初始积分流水是审计旁路：账户余额已经与用户在同一事务中落库。
+		// 流水写入失败只记Warn，不回滚已完成的账号闭环。
+		initAlloc := &models.TokenAllocation{
+			FromAccountID:  personalAccountID,
+			ToAccountID:    personalAccountID,
+			Amount:         initialPersonalCredits,
+			AllocationType: models.AllocationTypeInitial,
+			Memo:           "新用户初始积分",
+			OperatorID:     user.ID,
+		}
+		if err := repository.CreateTokenAllocation(ctx, initAlloc); err != nil {
+			userLog.Warn("初始积分分配流水写入失败(不影响账号闭环)",
+				"user_id", user.ID, "account_id", personalAccountID, "error", err)
+		}
+	} else {
+		// 无学校的平台管理账号保留既有best-effort个人账户逻辑，仅用于消费留痕；
+		// admin本身受积分守卫豁免，不影响教学账号的硬闭环。
+		ensurePersonalTokenAccount(ctx, user.ID, user.DisplayName)
+	}
 
 	// 6. 回读返回(事务已提交，普通连接可见)
 	created, err := repository.FindUserByID(ctx, user.ID)

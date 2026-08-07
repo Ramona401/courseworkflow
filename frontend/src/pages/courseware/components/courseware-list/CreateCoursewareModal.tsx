@@ -25,6 +25,7 @@ import {
   createCoursewareFromPPT, createCoursewareFromDoc, createCoursewareFrom3D,
 } from '@/api/coursewares'
 import apiClient from '@/api/client'
+import { useAuth } from '@/store/auth'
 import { useSubjects } from '@/hooks/useSubjects'
 import { useEducationProfile } from '@/hooks/useEducationProfile'
 import {
@@ -34,11 +35,93 @@ import {
 import KnowledgePointSelector from '../../KnowledgePointSelector'
 import { C, btnBase, type LPItem } from './listConstants'
 
+
+/**
+ * 后端从教案创建课件只允许使用当前账号本人教案。
+ *
+ * 教案列表接口可能同时返回本人、管理范围或共享教案。
+ * 前端必须把“可查看”和“可创建课件”分开处理。
+ */
+const CREATABLE_LESSON_PLAN_STATUSES =
+  new Set<string>([
+    'published_personal',
+    'approved',
+    'published_shared',
+  ])
+
+interface LessonPlanOwnershipFields {
+  author_id?: string
+  authorId?: string
+  created_by?: string
+  createdBy?: string
+  user_id?: string
+  userId?: string
+  is_owner?: boolean
+}
+
+/**
+ * 判断教案是否属于当前登录用户。
+ *
+ * 优先使用后端显式的is_owner，其次兼容常见作者ID字段。
+ * 旧响应完全没有作者字段时，只排除最可能来自共享库的
+ * published_shared，最终创建仍由后端重新校验作者身份。
+ */
+function isCurrentUserLessonPlan(
+  plan: LPItem,
+  currentUserID: string,
+): boolean {
+  if (!currentUserID) {
+    return false
+  }
+
+  const candidate =
+    plan as LPItem &
+      LessonPlanOwnershipFields
+
+  if (
+    typeof candidate.is_owner ===
+    'boolean'
+  ) {
+    return candidate.is_owner
+  }
+
+  const ownerID = (
+    candidate.author_id ||
+    candidate.authorId ||
+    candidate.created_by ||
+    candidate.createdBy ||
+    candidate.user_id ||
+    candidate.userId ||
+    ''
+  ).trim()
+
+  if (ownerID) {
+    return ownerID ===
+      currentUserID
+  }
+
+  return plan.status !==
+    'published_shared'
+}
+
+/** 提取Axios拦截器已经规范化的真实业务错误。 */
+function coursewareCreateErrorMessage(
+  error: unknown,
+  fallback: string,
+): string {
+  return error instanceof Error &&
+    error.message.trim()
+    ? error.message
+    : fallback
+}
+
 export default function CreateCoursewareModal({ open, onClose, onCreated }: {
   open: boolean
   onClose: () => void
   onCreated: (coursewareId: string) => void
 }) {
+  const { user } = useAuth()
+
   /**
    * 课程目录来自当前登录用户的教育域和教学组织。
    * 职业教育、成人教育不会再读取K12静态学科清单。
@@ -200,26 +283,103 @@ export default function CreateCoursewareModal({ open, onClose, onCreated }: {
 
   if (!open) return null
 
-  // 选择"从教案创建"后加载教案列表(只列已发布/已审核/已共享态)
+  /**
+   * 进入“从教案创建”后，只加载当前账号本人可创建的教案。
+   *
+   * 状态过滤和作者过滤均为前端体验保护；
+   * 后端仍是最终权限事实源。
+   */
   const selectLessonPlanMode = async () => {
     setCreateMode('lesson_plan')
     setPlansLoading(true)
+    setSelectedPlanId('')
+
     try {
-      const resp = await apiClient.get('/lesson-plans/plans', { params: { limit: 100 } })
-      const data = resp?.data?.data
-      const all: LPItem[] = (data?.plans || data?.lesson_plans || []) as LPItem[]
-      setPlans(all.filter((p: LPItem) => ['published_personal', 'approved', 'published_shared'].includes(p.status)))
-    } catch { setPlans([]) } finally { setPlansLoading(false) }
+      const resp = await apiClient.get(
+        '/lesson-plans/plans',
+        {
+          params: {
+            limit: 100,
+          },
+        },
+      )
+
+      const data =
+        resp?.data?.data
+
+      const all: LPItem[] = (
+        data?.plans ||
+        data?.lesson_plans ||
+        []
+      ) as LPItem[]
+
+      const currentUserID =
+        (user?.id || '').trim()
+
+      const ownCreatablePlans =
+        all.filter(plan =>
+          CREATABLE_LESSON_PLAN_STATUSES
+            .has(plan.status) &&
+          isCurrentUserLessonPlan(
+            plan,
+            currentUserID,
+          ),
+        )
+
+      setPlans(
+        ownCreatablePlans,
+      )
+    } catch (error) {
+      setPlans([])
+
+      alert(
+        '加载可创建教案失败：' +
+        coursewareCreateErrorMessage(
+          error,
+          '请求失败',
+        ),
+      )
+    } finally {
+      setPlansLoading(false)
+    }
   }
 
   // 从教案创建
   const handleCreateFromPlan = async () => {
-    if (!selectedPlanId) { alert('请选择关联的教案'); return }
+    if (!selectedPlanId) {
+      alert('请选择关联的教案')
+      return
+    }
+
     setCreating(true)
+
     try {
-      const cw = await createCourseware({ lesson_plan_id: selectedPlanId })
+      const cw =
+        await createCourseware({
+          lesson_plan_id:
+            selectedPlanId,
+        })
+
       onCreated(cw.id)
-    } catch { alert('创建课件失败') } finally { setCreating(false) }
+    } catch (error) {
+      /**
+       * 不再吞掉后端的权限和教育域错误。
+       *
+       * 例如：
+       * - 只能从自己的教案创建课件；
+       * - 无确定教学教育域不能创建课件；
+       * - 教案教育域快照无效。
+       */
+      alert(
+        '创建课件失败：' +
+        coursewareCreateErrorMessage(
+          error,
+          '请求失败',
+        ),
+      )
+    } finally {
+      setCreating(false)
+    }
   }
 
   // 从主题创建
@@ -410,8 +570,8 @@ export default function CreateCoursewareModal({ open, onClose, onCreated }: {
             <div style={{ textAlign: 'center', padding: '40px 0', color: C.textMuted }}>加载教案列表...</div>
           ) : plans.length === 0 ? (
             <div style={{ textAlign: 'center', padding: '40px 0' }}>
-              <div style={{ fontSize: '14px', color: C.textSecondary }}>没有可用的教案</div>
-              <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '6px' }}>请先在备课工坊完成教案开发</div>
+              <div style={{ fontSize: '14px', color: C.textSecondary }}>当前账号没有可用于创建课件的本人教案</div>
+              <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '6px' }}>请先完成自己的教案；共享或他人教案需要先复制到“我的教案”</div>
             </div>
           ) : (() => {
             const kw = planSearch.trim().toLowerCase()

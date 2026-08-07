@@ -36,17 +36,25 @@ import {
   getStageStatus, advanceStage, switchToStage,
   type LessonPlan, type ConversationMessage, type ConvComponent,
   type StageProgressItem, type RecipeSelectionMode,
+  type ImportExistingPlanResponse,
 } from '@/api/lesson-plans'
 import { updatePlanUnitPlan } from '@/api/unit-plans'
 import type { LessonPlanContentRestoreResponse } from '@/api/lesson-plan-versions'
+import type {
+  LessonPlanSectionRewriteApplyResponse,
+} from '@/api/lesson-plan-section-rewrite'
 import { updatePlanTextbooks } from '@/api/lesson-plan-textbooks'
 import { updatePlanClassProfile } from '@/api/lesson-plan-class-profiles'
-import { setLessonPlanCourseOutlinePublisher } from '@/api/course-outlines'
+import {
+  clearLegacyCourseOutlineDraft,
+  readLegacyCourseOutlineDraft,
+} from './courseOutlineDraft'
 import { C, SUBJECTS, GRADES, STAGE_CODE_NAME, type StreamingState } from '../components/workshopConstants'
 import { AIBubble, UserBubble, ThinkingIndicator } from '../components/WorkshopPanels'
 import ImportPlanModal from '../components/ImportPlanModal'
 import StageComponentsModal from '../components/StageComponentsModal'
 import ConversationCanvas from './ConversationCanvas'
+import ResizableRightPanel from '../components/ResizableRightPanel'
 import ConversationStartScreen from './ConversationStartScreen'
 import ConversationInputBar from './ConversationInputBar'
 import ConversationTopBar from './ConversationTopBar'
@@ -76,8 +84,6 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     domain,
     organizationId,
     isK12,
-    profile,
-    ready: educationReady,
   } = useEducationProfile()
   const startDraftResourceId = `${domain}::${organizationId || 'no-org'}::new-plan`
   const navigate = useNavigate()
@@ -139,23 +145,65 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
   })
 
   /**
-   * 课程大纲版本需要区分：
-   * null = 不关联；
-   * '' = 通用版；
-   * 具名字符串 = 指定教材版本。
+   * 精确课程大纲草稿只保存唯一ID。
    *
-   * sessionStorage只能保存字符串，因此用独立哨兵编码null。
+   * 空字符串表示明确不关联；不再使用出版社字符串或null哨兵。
    */
-  const coursePublisherNoneDraft =
-    '__TEDNA_COURSE_PUBLISHER_NONE__'
+  const courseOutlineIDDraft =
+    useProtectedDraft({
+      userId: user?.id,
+      scope: 'lesson-plan-conversation-start',
+      resourceId: startDraftResourceId,
+      field: 'course-outline-id',
+      initialValue: '',
+    })
 
-  const coursePublisherDraft = useProtectedDraft({
-    userId: user?.id,
-    scope: 'lesson-plan-conversation-start',
-    resourceId: startDraftResourceId,
-    field: 'course-publisher',
-    initialValue: coursePublisherNoneDraft,
-  })
+  // useProtectedDraft的setValue由useCallback创建，可安全作为Hook依赖。
+  const setCourseOutlineIDDraftValue =
+    courseOutlineIDDraft.setValue
+
+  /**
+   * 旧版course-publisher草稿不能安全转换成唯一ID。
+   *
+   * 检测到旧选择时只给出提示，老师必须重新选择；
+   * 已有新ID草稿时直接清理陈旧旧键。
+   */
+  const [
+    legacyCourseOutlineNotice,
+    setLegacyCourseOutlineNotice,
+  ] = useState('')
+
+  useEffect(() => {
+    if (courseOutlineIDDraft.value.trim()) {
+      clearLegacyCourseOutlineDraft({
+        userId: user?.id,
+        resourceId: startDraftResourceId,
+      })
+      setLegacyCourseOutlineNotice('')
+      return
+    }
+
+    const legacy =
+      readLegacyCourseOutlineDraft({
+        userId: user?.id,
+        resourceId: startDraftResourceId,
+      })
+
+    setLegacyCourseOutlineNotice(
+      legacy.hasLegacySelection
+        ? `检测到旧版课程大纲关联“${legacy.label}”。出版社字符串无法安全转换为唯一大纲，请重新选择；未重新选择时将保持不关联。`
+        : '',
+    )
+  }, [
+    user?.id,
+    startDraftResourceId,
+    courseOutlineIDDraft.value,
+  ])
+
+  const [courseOutlineLoading,
+    setCourseOutlineLoading] =
+    useState(false)
+
   const recipeModeDraft = useProtectedDraft({
     userId: user?.id,
     scope: 'lesson-plan-conversation-start',
@@ -206,20 +254,51 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
   const setClassProfileId = (value: string) =>
     classProfileDraft.setValue(value)
 
-  const coursePublisher =
-    coursePublisherDraft.value ===
-    coursePublisherNoneDraft
-      ? null
-      : coursePublisherDraft.value
+  const courseOutlineId =
+    courseOutlineIDDraft.value.trim() ||
+    null
 
-  const setCoursePublisher = (
-    value: string | null,
-  ) =>
-    coursePublisherDraft.setValue(
-      value === null
-        ? coursePublisherNoneDraft
-        : value,
+  const setCourseOutlineId =
+    useCallback(
+      (value: string | null) => {
+        setCourseOutlineIDDraftValue(
+          value || '',
+        )
+
+        clearLegacyCourseOutlineDraft({
+          userId: user?.id,
+          resourceId:
+            startDraftResourceId,
+        })
+
+        setLegacyCourseOutlineNotice('')
+      },
+      [
+        setCourseOutlineIDDraftValue,
+        user?.id,
+        startDraftResourceId,
+      ],
     )
+
+  /**
+   * 切换到非K12教育域时清除可能残留的精确K12大纲ID。
+   */
+  useEffect(() => {
+    if (isK12) return
+
+    if (courseOutlineId !== null) {
+      setCourseOutlineId(null)
+    }
+
+    if (courseOutlineLoading) {
+      setCourseOutlineLoading(false)
+    }
+  }, [
+    isK12,
+    courseOutlineId,
+    courseOutlineLoading,
+    setCourseOutlineId,
+  ])
 
   const recipeModeValue =
     recipeModeDraft.value
@@ -283,7 +362,7 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
   const [refMaterialName, setRefMaterialName] = useState('')
   const refMaterialRef = useRef<string>('')
 
-  const [stageItems, setStageItems] = useState<StageProgressItem[]>([])
+  const [, setStageItems] = useState<StageProgressItem[]>([])
   const [currentStage, setCurrentStage] = useState<string>('')
   // 助手轻量选择入口 Phase 1：当前学科的助手偏好(三态) + 切换面板开关
   const [assistantPref, setAssistantPref] = useState<AssistantPref | null>(null)
@@ -518,7 +597,8 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     if (
       !topic.trim() ||
       startLoading ||
-      (recipeMode === 'selected' && !recipeId)
+      (recipeMode === 'selected' && !recipeId) ||
+      courseOutlineLoading
     ) return
     setStartLoading(true)
     try {
@@ -532,6 +612,9 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
           recipeMode === 'selected'
             ? recipeId || undefined
             : undefined,
+        course_outline_id:
+          courseOutlineId ||
+          undefined,
       })
       setPlan(resp.plan)
       setMessages([resp.opening_message])
@@ -581,86 +664,10 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
           }])
         }
       }
-      /**
-       * 创建完成后写入课程大纲挂载三态。
-       *
-       * K12：
-       *   - 按老师在首屏选择的出版社版本挂载；
-       *   - null表示不关联课程大纲。
-       *
-       * vocational/adult：
-       *   - 首屏不展示出版社；
-       *   - 自动写入空字符串，表示挂载同域普通课程大纲；
-       *   - 后端按教案教育域快照、课程和学习层级匹配；
-       *   - 不会查询或泄漏K12出版社数据。
-       *
-       * mixed或教育域未就绪时保持不挂载。
-       */
-      const isOrdinaryNonK12 =
-        educationReady &&
-        (
-          profile.code === 'vocational' ||
-          profile.code === 'adult'
-        )
-
-      const outlineMountPublisher =
-        isOrdinaryNonK12
-          ? ''
-          : coursePublisher
-
-      if (
-        outlineMountPublisher !== null &&
-        outlineMountPublisher !== undefined
-      ) {
-        try {
-          await setLessonPlanCourseOutlinePublisher(
-            resp.plan.id,
-            outlineMountPublisher,
-          )
-
-          const successMessage =
-            isOrdinaryNonK12
-              ? '📚 已关联当前课程的教学依据，接下来我会参考同教育域的课程大纲和学习层级来和你一起备课。'
-              : `📚 已关联「${
-                  outlineMountPublisher === ''
-                    ? '通用 / 不限版本'
-                    : outlineMountPublisher
-                }」课程大纲，接下来我会贴着这版教材的大纲来和你一起备课。`
-
-          setMessages(previous => [
-            ...previous,
-            {
-              id: `courseoutline_${Date.now()}`,
-              role: 'assistant' as const,
-              type: 'text' as const,
-              content: successMessage,
-              created_at:
-                new Date().toISOString(),
-            },
-          ])
-        } catch (outlineError) {
-          console.error(
-            '课程大纲关联失败:',
-            outlineError,
-          )
-
-          setMessages(previous => [
-            ...previous,
-            {
-              id: `courseoutline_err_${Date.now()}`,
-              role: 'assistant' as const,
-              type: 'text' as const,
-              content:
-                '⚠️ 课程大纲关联未成功，不影响正常备课。如需关联，可稍后重试。',
-              created_at:
-                new Date().toISOString(),
-            },
-          ])
-        }
-      }
       setUnitPlanId('') // 临时选择已固化到教案，回到首屏应重置
       setClassProfileId('') // 班级学情同款：临时选择已固化到教案，回到首屏应重置
-      setCoursePublisher(null) // 教材版本同款：临时选择已固化到教案，回到首屏应重置
+      setCourseOutlineId(null) // 精确大纲ID已在创建事务中固化，回到首屏重置为不关联
+      setCourseOutlineLoading(false)
       connectSSE(resp.plan.id)
       if (resp.plan.current_stage && resp.plan.stage_config) await refreshStages(resp.plan.id)
     } catch (err) {
@@ -669,25 +676,99 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     } finally { setStartLoading(false) }
   }
 
-  const handleImportSuccess = async (planId: string, openingMessage: ConversationMessage) => {
+  // 导入接口成功返回后立即进入聊天，不等待二次拉取。
+  const handleImportSuccess = (
+    response: ImportExistingPlanResponse,
+  ) => {
+    const importedPlan = response.plan
+    const openingMessage =
+      response.opening_message
+    const planId = importedPlan.id
+
     setShowImportModal(false)
-    try {
-      const [planData, convData] = await Promise.all([getLessonPlan(planId), getConversation(planId)])
-      setPlan(planData)
-      const serverMsgs = (convData.messages || []).filter(
-        (m: ConversationMessage) => m.role === 'user' || m.role === 'assistant' || m.role === 'system'
-      )
-      setMessages(serverMsgs.length > 0 ? serverMsgs : [openingMessage])
-      if (planData.content_markdown) setPlanContent(planData.content_markdown)
-      setPhase('chatting')
-      sessionStorage.setItem('workshop_active_plan_id', planId)
-      recordPlanMode(planId, 'conversation')
-      connectSSE(planId)
-      if (planData.current_stage && planData.stage_config) await refreshStages(planId)
-    } catch (err) {
-      console.error('导入后加载失败:', err)
-      alert('导入成功但加载失败，请刷新页面重试')
-    }
+
+    closeSSE()
+    clearTurnTimers()
+    currentTurnRef.current = ''
+    retry.resetStreak()
+
+    setPlan(importedPlan)
+    setMessages([openingMessage])
+    setPlanContent(
+      importedPlan.content_markdown || '',
+    )
+    setStageItems([])
+    setCurrentStage('')
+    setIsStageMode(false)
+    setIsThinking(false)
+    setStreaming(null)
+    setFullGenerating(false)
+    setSlowHintText('')
+    setDynamicChips([])
+    setSelectedComponentIds(new Set())
+    setPhase('chatting')
+
+    sessionStorage.setItem(
+      'workshop_active_plan_id',
+      planId,
+    )
+
+    recordPlanMode(
+      planId,
+      'conversation',
+    )
+
+    // 先连接SSE，避免错过快速完成的后台AI评审。
+    connectSSE(planId)
+
+    // 阶段和详情后台校准，不阻塞老师进入页面。
+    void refreshStages(planId)
+
+    void Promise.all([
+      getLessonPlan(planId),
+      getConversation(planId),
+    ])
+      .then(([planData, convData]) => {
+        if (
+          sessionStorage.getItem(
+            'workshop_active_plan_id',
+          ) !== planId
+        ) {
+          return
+        }
+
+        setPlan(planData)
+
+        const serverMessages =
+          (convData.messages || []).filter(
+            message =>
+              message.role === 'user' ||
+              message.role === 'assistant' ||
+              message.role === 'system',
+          )
+
+        setMessages(
+          serverMessages.length > 0
+            ? serverMessages
+            : [openingMessage],
+        )
+
+        setPlanContent(
+          planData.content_markdown ||
+          importedPlan.content_markdown ||
+          '',
+        )
+      })
+      .catch(error => {
+        console.error(
+          '导入后后台校准失败:',
+          error,
+        )
+
+        showToast(
+          '✅ 教案已导入，可直接开始对话；最新状态将自动同步',
+        )
+      })
   }
 
   // ===== 芯片上下文能力实现 =====
@@ -727,10 +808,7 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
         id: localMessageID,
         role: 'user' as const,
         type: 'text' as const,
-        content:
-          componentIds.length > 0
-            ? `${text}\n（已附 ${componentIds.length} 个参考组件）`
-            : text,
+        content: text,
         created_at:
           new Date().toISOString(),
       },
@@ -932,6 +1010,32 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     )
   }
 
+  /**
+   * 章节AI修改成功后，直接使用后端原子应用响应同步正文和版本。
+   *
+   * 响应已经来自行锁事务，不再额外执行页面旧version+1。
+   * 随后的正文同步effect仍会重新读取教案，补齐updated_at等正式字段。
+   */
+  const handleSectionRewriteApplied = (
+    result: LessonPlanSectionRewriteApplyResponse,
+  ) => {
+    setPlanContent(result.content_markdown)
+    setPlan(previous => previous
+      ? {
+          ...previous,
+          content_markdown: result.content_markdown,
+          version: result.current_version,
+        }
+      : previous
+    )
+
+    showToast(
+      result.changed
+        ? `✅ 已用AI修改当前章节，教案更新为v${result.current_version}`
+        : `ℹ️ 当前章节没有变化，仍为v${result.current_version}`,
+    )
+  }
+
   const handlePublish = async () => {
     if (!plan) return
     if (!planContent || planContent.trim().length === 0) {
@@ -1024,8 +1128,8 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     setMessages(prev => [...prev, {
       id: `tb_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
       content: pageIds.length > 0
-        ? `📷 已关联 ${pageIds.length} 张课本页，从你的下一条消息开始，我会贴着课文原文来设计。`
-        : '📷 已解除全部课本关联，之后的设计不再参考课本原文。',
+        ? '📖 已加入课文依据，接下来我会贴着课文原文来设计。'
+        : '📖 已暂不使用课文依据，之后的设计将以当前共识为主。',
       created_at: new Date().toISOString(),
     }])
   }
@@ -1094,7 +1198,8 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
     setLiveAssistantLabel('') // 可见性补丁:退出/返回入口时一并清空自动匹配名
     setUnitPlanId('') // 大单元挂载
     setClassProfileId('') // 班级学情挂载：回到首屏清空上一次的班级学情选择
-    setCoursePublisher(null) // 教材版本：回到首屏清空上一次的版本选择
+    setCourseOutlineId(null) // 精确大纲：回到首屏清空上一次的唯一ID选择
+    setCourseOutlineLoading(false)
     setRecipeId('') // 配方选择：回到首屏清空上一次的配方选择:回到首屏清空上一次的单元方案选择
     setRecipeMode('auto') // 配方模式：回到首屏恢复智能选择
     setSelectedComponentIds(new Set()); setShowComponentsModal(false)
@@ -1256,7 +1361,11 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
           duration={duration} setDuration={setDuration}
           unitPlanId={unitPlanId} setUnitPlanId={setUnitPlanId}
           classProfileId={classProfileId} setClassProfileId={setClassProfileId}
-          coursePublisher={coursePublisher} setCoursePublisher={setCoursePublisher}
+          courseOutlineId={courseOutlineId}
+          setCourseOutlineId={setCourseOutlineId}
+          courseOutlineLoading={courseOutlineLoading}
+          onCourseOutlineLoadingChange={setCourseOutlineLoading}
+          legacyCourseOutlineNotice={legacyCourseOutlineNotice}
           recipeMode={recipeMode} setRecipeMode={setRecipeMode}
           recipeId={recipeId} setRecipeId={setRecipeId}
           startLoading={startLoading}
@@ -1364,7 +1473,15 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
         )}
 
         {showCanvas && (
-          <div style={{ width: isNarrow ? '100%' : '440px', flexShrink: 0, overflow: 'hidden' }}>
+          <ResizableRightPanel
+            storageKey="lesson_plan_conversation_canvas_width"
+            defaultWidth={520}
+            minWidth={380}
+            maxWidth={760}
+            minPrimaryWidth={520}
+            disabled={isNarrow}
+            panelStyle={{ overflow: 'hidden' }}
+          >
             <ConversationCanvas
               planID={plan?.id || ''}
               content={planContent}
@@ -1382,9 +1499,10 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
               )}
               onSaveContent={handleManualContentSave}
               onContentRestored={handleContentRestored}
+              onSectionRewriteApplied={handleSectionRewriteApplied}
               onFillMissing={(label) => sendText(`请帮我补充「${label}」部分的内容，直接更新到教案正文里。`)}
             />
-          </div>
+          </ResizableRightPanel>
         )}
       </div>
 
@@ -1422,7 +1540,7 @@ export default function ConversationModePage({ onSwitchMode }: ConversationModeP
             setShowRefModal(false)
             setMessages(prev => [...prev, {
               id: `ref_${Date.now()}`, role: 'assistant' as const, type: 'text' as const,
-              content: `📎 已附参考资料「${fileName}」，从你的下一条消息开始，我会参考其中的知识点和要求。`,
+              content: '📎 已加入补充依据，从你的下一条消息开始，我会结合其中的知识点和要求。',
               created_at: new Date().toISOString(),
             }])
           }}

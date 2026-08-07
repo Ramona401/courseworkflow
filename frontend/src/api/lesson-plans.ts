@@ -5,6 +5,13 @@
  */
 
 import apiClient from './client'
+import type { ResourceEducationDomain } from '@/education-domain/types'
+import {
+  publishLessonPlanPersonalGuarded,
+  rememberLessonPlanPublishSnapshot,
+} from './lesson-plan-publish-guard'
+
+export type { ResourceEducationDomain } from '@/education-domain/types'
 
 // 类型重导出（保持外部 import 路径兼容）
 export type {
@@ -41,6 +48,9 @@ export type {
   ComponentContextReceiptItem,
   ComponentsContextReceipt,
   ContextReceipt,
+  LessonPlanContextCapsuleDisplaySection,
+  LessonPlanContextCapsuleDisplayView,
+  LessonPlanContextCapsuleEventData,
   ConversationMessageMetadata,
   ConversationMessage,
   StartConversationRequest,
@@ -85,6 +95,7 @@ import type {
   LessonPlan,
   LessonPlanListResponse,
   ConversationMessage,
+  LessonPlanContextCapsuleEventData,
   StartConversationRequest,
   StartConversationResponse,
   LessonPlanChatRequest,
@@ -100,6 +111,15 @@ import type {
   SSEConnectionState,
   SSEConnection,
 } from './lesson-plans.types'
+import {
+  activateLessonConsensusPlan,
+  deactivateLessonConsensusPlan,
+  hydrateLessonConsensusCapsule,
+  publishLessonConsensusCapsule,
+} from '@/store/lessonConsensusCapsule'
+import {
+  isLessonPlanSSEBusinessErrorEvent,
+} from './lesson-plan-sse-errors'
 
 // ==================== SSE自动重连配置常量 ====================
 // v88新增：SSE断线自动重连参数
@@ -189,11 +209,13 @@ export async function getMyGroups() {
 
 export async function getComponents(params?: {
   library_type?: LibraryType; subject?: string;
+  education_domain?: ResourceEducationDomain;
   review_status?: string; scope?: string; limit?: number; offset?: number
 }) {
   const query = new URLSearchParams()
   if (params?.library_type) query.set('library_type', params.library_type)
   if (params?.subject) query.set('subject', params.subject)
+  if (params?.education_domain) query.set('education_domain', params.education_domain)
   if (params?.review_status) query.set('review_status', params.review_status)
   if (params?.scope) query.set('scope', params.scope)
   if (params?.limit) query.set('limit', String(params.limit))
@@ -289,7 +311,9 @@ export async function getLessonPlans(params?: {
 
 export async function getLessonPlan(id: string) {
   const resp = await apiClient.get(`/lesson-plans/plans/${id}`)
-  return resp.data.data as LessonPlan
+  return rememberLessonPlanPublishSnapshot(
+    resp.data.data as LessonPlan,
+  )
 }
 
 export async function createLessonPlan(data: {
@@ -297,7 +321,9 @@ export async function createLessonPlan(data: {
   duration_minutes?: number; template_id?: string; group_id?: string; school_id?: string
 }) {
   const resp = await apiClient.post('/lesson-plans/plans', data)
-  return resp.data.data as LessonPlan
+  return rememberLessonPlanPublishSnapshot(
+    resp.data.data as LessonPlan,
+  )
 }
 
 export async function updateLessonPlan(id: string, data: Record<string, unknown>) {
@@ -311,8 +337,7 @@ export async function deleteLessonPlan(id: string) {
 }
 
 export async function publishLessonPlanPersonal(id: string) {
-  const resp = await apiClient.post(`/lesson-plans/plans/${id}/publish-personal`)
-  return resp.data.data as void
+  await publishLessonPlanPersonalGuarded(id)
 }
 
 /**
@@ -355,14 +380,23 @@ export interface StartDevelopmentResult {
 
 export async function forkLessonPlan(id: string) {
   const resp = await apiClient.post(`/lesson-plans/plans/${id}/fork`)
-  return resp.data.data as LessonPlan
+  return rememberLessonPlanPublishSnapshot(
+    resp.data.data as LessonPlan,
+  )
 }
 
 /* ==================== API函数:教案生成(Phase3)==================== */
 
 export async function startConversation(data: StartConversationRequest): Promise<StartConversationResponse> {
   const resp = await apiClient.post('/lesson-plans/plans/start-conversation', data)
-  return resp.data.data as StartConversationResponse
+  const result =
+    resp.data.data as StartConversationResponse
+
+  rememberLessonPlanPublishSnapshot(
+    result.plan,
+  )
+
+  return result
 }
 
 /**
@@ -391,8 +425,22 @@ export async function applyAISuggestions(planId: string, suggestionIds?: string[
 }
 
 export async function getConversation(planId: string) {
-  const resp = await apiClient.get(`/lesson-plans/plans/${planId}/conversation`)
-  return resp.data.data as { messages: ConversationMessage[]; total: number }
+  const resp = await apiClient.get(
+    `/lesson-plans/plans/${planId}/conversation`
+  )
+
+  const data = resp.data.data as {
+    messages: ConversationMessage[]
+    total: number
+    context_capsule?: LessonPlanContextCapsuleEventData | null
+  }
+
+  hydrateLessonConsensusCapsule(
+    planId,
+    data.context_capsule || null,
+  )
+
+  return data
 }
 
 /**
@@ -424,6 +472,8 @@ export function createLessonPlanSSE(
     onSuggestedActions?: (actions: SuggestedAction[], clientTurnId?: string) => void
     /** 子轮二(重试可见性):空流自动重试时后端广播,content 为提示文案,clientTurnId 为本轮序号 */
     onRetryNotice?: (content: string, clientTurnId?: string) => void
+    /** 本课共识胶囊旁路更新；非终态，不参与主轮次过滤 */
+    onContextCapsule?: (capsule: LessonPlanContextCapsuleEventData) => void
     onError?: (error: string, clientTurnId?: string) => void
     onDone?: () => void
     onConnectionStateChange?: (state: SSEConnectionState) => void
@@ -438,6 +488,7 @@ export function createLessonPlanSSE(
 
   const bindEventListeners = (es: EventSource) => {
     es.addEventListener('connected', () => {
+      activateLessonConsensusPlan(planId)
       retryCount = 0
       handlers.onConnectionStateChange?.('connected')
       if (!isFirstConnect) {
@@ -528,6 +579,18 @@ export function createLessonPlanSSE(
       } catch { /* 忽略解析错误 */ }
     })
 
+    // 本课共识胶囊：主回复完成后的旁路更新事件。
+    // 事件不带主轮次终态语义，不关闭SSE，也不改变思考/流式状态。
+    es.addEventListener('context_capsule', (e: MessageEvent) => {
+      try {
+        const event: LPSSEEvent = JSON.parse(e.data)
+        if (event.context_capsule) {
+          publishLessonConsensusCapsule(planId, event.context_capsule)
+          handlers.onContextCapsule?.(event.context_capsule)
+        }
+      } catch { /* 胶囊是增强能力，解析失败不影响主对话 */ }
+    })
+
     es.addEventListener('error', (e: MessageEvent) => {
       if (!e.data) return
       try {
@@ -541,10 +604,23 @@ export function createLessonPlanSSE(
     es.addEventListener('done', () => {
       handlers.onDone?.()
       isClosed = true
+      deactivateLessonConsensusPlan(planId)
       es.close()
     })
 
-    es.onerror = () => {
+    es.onerror = (event: Event) => {
+      // 后端主动发送的“event: error”也是error类型事件，
+      // 浏览器会同时分发给addEventListener和onerror属性。
+      // 带业务data的MessageEvent已经由上方业务错误监听器处理，
+      // 不得再次关闭连接并触发重连。
+      if (
+        isLessonPlanSSEBusinessErrorEvent(
+          event,
+        )
+      ) {
+        return
+      }
+
       if (isClosed) return
       es.close()
       currentES = null
@@ -573,6 +649,7 @@ export function createLessonPlanSSE(
 
   const connectSSE = () => {
     if (isClosed) return
+    activateLessonConsensusPlan(planId)
     const url = `/api/v1/lesson-plans/sse/plans/${planId}/stream?token=${encodeURIComponent(token)}`
     const es = new EventSource(url)
     currentES = es
@@ -584,6 +661,7 @@ export function createLessonPlanSSE(
   return {
     close: () => {
       isClosed = true
+      deactivateLessonConsensusPlan(planId)
       if (retryTimer) {
         clearTimeout(retryTimer)
         retryTimer = null
@@ -775,5 +853,12 @@ export interface ImportExistingPlanResponse {
 /** 导入已有教案 */
 export async function importExistingPlan(data: ImportExistingPlanRequest): Promise<ImportExistingPlanResponse> {
   const resp = await apiClient.post('/lesson-plans/plans/import-existing', data)
-  return resp.data.data as ImportExistingPlanResponse
+  const result =
+    resp.data.data as ImportExistingPlanResponse
+
+  rememberLessonPlanPublishSnapshot(
+    result.plan,
+  )
+
+  return result
 }

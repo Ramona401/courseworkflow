@@ -29,7 +29,7 @@ func normalizeLessonPlanImportSourceType(
 	)
 
 	switch normalized {
-	case "paste", "docx", "pdf":
+	case "paste", "docx", "pdf", "docx_fidelity":
 		return normalized, nil
 	default:
 		return "", fmt.Errorf(
@@ -328,14 +328,24 @@ func buildImportedLessonPlanStageOutputs(
 }
 
 // buildImportOpeningMessage 构建导入成功开场消息。
+//
+// 文案以老师当前可执行的操作为中心：
+//   - 导入完成后立即开始聊天评审或修改；
+//   - 后台质量检查独立运行，不锁定聊天和正文操作；
+//   - 不要求老师等待，也不承诺结果显示在某个固定面板。
 func buildImportOpeningMessage(
 	req *models.ImportExistingPlanRequest,
 	skippedStages []string,
 ) *models.ConversationMessage {
+	if req == nil {
+		return nil
+	}
+
 	sourceLabel := map[string]string{
-		"paste": "粘贴文本",
-		"docx":  "Word文档",
-		"pdf":   "PDF文件",
+		"paste":         "粘贴文本",
+		"docx":          "Word文档",
+		"docx_fidelity": "保留原格式Word文档",
+		"pdf":           "PDF文件",
 	}[req.SourceType]
 	if sourceLabel == "" {
 		sourceLabel = "已有文档"
@@ -349,16 +359,62 @@ func buildImportOpeningMessage(
 		),
 	)
 
-	skippedDescription := strings.Join(
-		skippedStages,
-		" → ",
+	stageLabels := map[string]string{
+		"analyze": "教学分析",
+		"design":  "教学设计",
+		"write":   "教案撰写",
+		"review":  "AI评审",
+		"revise":  "修订定稿",
+	}
+
+	skippedLabels := make(
+		[]string,
+		0,
+		len(skippedStages),
 	)
+
+	for _, stageCode := range skippedStages {
+		normalizedCode :=
+			strings.TrimSpace(
+				stageCode,
+			)
+		if normalizedCode == "" {
+			continue
+		}
+
+		label := stageLabels[normalizedCode]
+		if label == "" {
+			label = normalizedCode
+		}
+
+		skippedLabels = append(
+			skippedLabels,
+			label,
+		)
+	}
+
+	skippedDescription :=
+		strings.Join(
+			skippedLabels,
+			" → ",
+		)
+
 	if skippedDescription == "" {
 		skippedDescription =
 			"无需跳过前置阶段"
 	} else {
 		skippedDescription =
-			"已跳过：" + skippedDescription
+			"已跳过：" +
+				skippedDescription
+	}
+
+	preservationNote :=
+		"正文修改会自动形成新的历史版本。"
+
+	if req.SourceType ==
+		"docx_fidelity" {
+		preservationNote =
+			"原始Word文档和版式内容仍会保留，正文修改会自动形成新的历史版本。"
 	}
 
 	content := fmt.Sprintf(
@@ -369,19 +425,25 @@ func buildImportOpeningMessage(
 - 字数：约 %d 字
 - %s
 
-**当前状态**
-教案正文、阶段快照和评审入口均已写入系统，正在对您的教案进行 **AI质量评审**，请稍候……评审完成后会在右侧面板显示详细评分和改进建议。
+**现在可以直接开始**
+教案正文已经写入系统。您现在可以直接开始聊天评审，告诉我希望重点检查或优化的内容。
 
-**接下来您可以：**
-1. 等待右侧出现AI评审报告
-2. 现在就告诉我您希望优化哪些部分，我来帮您修改
-3. 评审满意后进入修订定稿`,
+后台质量检查会独立进行，不影响您继续聊天、查看正文、移除图片或修改教案。
+
+**您可以这样开始：**
+1. 请从教学目标、教学重难点和教学活动三个方面评审这份教案
+2. 请重点检查教学过程是否适合当前年级
+3. 请找出需要修改的内容，并逐项给出建议
+4. 请直接修改我指定的部分
+
+%s`,
 		req.Grade,
 		req.Subject,
 		req.Topic,
 		sourceLabel,
 		contentLength,
 		skippedDescription,
+		preservationNote,
 	)
 
 	return &models.ConversationMessage{

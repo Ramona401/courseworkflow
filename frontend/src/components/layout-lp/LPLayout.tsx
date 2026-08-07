@@ -71,7 +71,14 @@ function UserMenu() {
 
   // 超管收口：仅超级管理员可见 AI 管理中心 / AI 调用统计两个敏感入口。
   // is_super 缺省（undefined/老缓存）按非超管兜底，收紧方向不误放行。
-  const isSuper = user?.role === 'admin' && user?.is_super === true
+  const isSuper =
+    user?.role === 'admin' &&
+    user?.is_super === true
+
+  const isTokenManager =
+    user?.role === 'admin' ||
+    user?.role === 'senior_operator' ||
+    user?.role === 'region_admin' 
 
   // v128.1：加载个人积分余额
   useEffect(() => {
@@ -106,7 +113,7 @@ function UserMenu() {
       {/* v128.1：积分余额徽章（v129.1修复：和按钮放在同一个flex行内） */}
       {tokenBalance !== null && (
         <div
-          onClick={() => navigate('/lesson-plans/tokens')}
+          onClick={() => navigate('/tokens')}
           style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '5px 12px', borderRadius: '16px', background: 'rgba(79,123,232,0.08)', cursor: 'pointer', transition: 'all 150ms ease' }}
           onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(79,123,232,0.15)' }}
           onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(79,123,232,0.08)' }}
@@ -137,7 +144,22 @@ function UserMenu() {
           </div>
 
           <div style={{ padding: '6px' }}>
-            <LPMenuItem icon="👤" label="个人中心" onClick={() => go('/account', '/lesson-plans')} />
+            <LPMenuItem
+              icon="👤"
+              label="个人中心"
+              onClick={() => go('/account', '/lesson-plans')}
+            />
+
+            <LPMenuItem
+              icon="💎"
+              label={
+                isTokenManager
+                  ? '积分管理'
+                  : '我的积分'
+              }
+              onClick={() => go('/tokens', '/lesson-plans')}
+              highlight
+            />
             {/* admin 专属功能。用户管理不收口；AI 管理中心 / AI 调用统计仅超管可见 */}
             {user?.role === 'admin' && (
               <>

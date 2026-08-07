@@ -1,34 +1,52 @@
 package handlers
 
-// courseware_asset_anchor_handler.go — 课件「风格锚点」HTTP处理器（VAOCI 课程级风格一致性，轮2）
-//
-// 拆分说明：方法挂在 CoursewareAssetHandler 上（与 courseware_asset_handler.go 同类型、同包），
-//   单独成文件是为给主 handler 文件（已超600行约定）减负，符合既有拆分范式。
+// courseware_asset_anchor_handler.go — 课件风格锚点HTTP处理器
 //
 // 端点：
-//   POST   /api/v1/coursewares/{id}/style-anchor   — 设置风格锚点（一步式同步：取URL→提取VAOCI→落库）
-//   DELETE /api/v1/coursewares/{id}/style-anchor   — 清除风格锚点
+//   - POST   /api/v1/coursewares/{id}/style-anchor
+//   - DELETE /api/v1/coursewares/{id}/style-anchor
 //
-// 查锚点：无独立端点——前端直接读 GET /api/v1/coursewares/{id} 详情中的
-//   style_anchor_asset_id / style_anchor_vaoci 字段（轮1契约①已在装配处补齐）。
+// POST支持两种互不混用的业务模式：
 //
-// 设锚点为多模态读图调用，耗时数秒到十几秒，前端以 loading 兜底。
+//  1. 快捷预设模式：
+//
+//     {
+//       "preset_style_key": "ghibli"
+//     }
+//
+//     asset_id不再必填。
+//     后端直接使用服务器白名单及系统预生成高清图创建课程锚点，
+//     不调用图片模型，也不调用多模态模型。
+//
+//  2. 原有图片识别模式：
+//
+//     {
+//       "asset_id": "uuid"
+//     }
+//
+//     不提交preset_style_key时保持原有契约：
+//     校验资产 → 取得公网URL → 多模态提取IAOCI → 保存锚点。
+//
+// 兼容性：
+//   - 旧前端若同时提交asset_id和preset_style_key仍可使用；
+//   - 快捷预设模式会忽略asset_id；
+//   - 自定义风格工作室继续使用自身会话确认事务。
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 
 	"tedna/internal/middleware"
+	"tedna/internal/services"
 	"tedna/internal/utils"
 )
 
-// SetStyleAnchor POST /api/v1/coursewares/{id}/style-anchor
-//
-//	请求体: { "asset_id": "uuid" }   — 要设为锚点的图片资产ID（须属于本课件、且为图片）
-//	响应:   { "asset_id", "anchor_url", "vaoci" }
-//
-// 一步式同步：内部完成「校验资产归属 → 取公网URL → 多模态提取VAOCI → 落库」。
+const coursewareStyleAnchorRequestMaxBytes int64 =
+	32 << 10
+
+// SetStyleAnchor POST /api/v1/coursewares/{id}/style-anchor。
 func (h *CoursewareAssetHandler) SetStyleAnchor(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -42,9 +60,16 @@ func (h *CoursewareAssetHandler) SetStyleAnchor(
 		return
 	}
 
-	claims, ok := middleware.GetClaims(r.Context())
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
+
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(
+			w,
+			"未登录",
+		)
 		return
 	}
 
@@ -52,11 +77,16 @@ func (h *CoursewareAssetHandler) SetStyleAnchor(
 		extractAnchorCoursewareID(
 			r.URL.Path,
 		)
+
 	if coursewareID == "" {
-		utils.BadRequest(w, "缺少课件ID")
+		utils.BadRequest(
+			w,
+			"缺少课件ID",
+		)
 		return
 	}
 
+	// 必须先授权，再读取请求正文。
 	actor, allowed :=
 		requireCoursewareAssetOwnerActor(
 			w,
@@ -65,41 +95,84 @@ func (h *CoursewareAssetHandler) SetStyleAnchor(
 			claims.UserID,
 			claims.Role,
 		)
+
 	if !allowed {
 		return
 	}
 
 	var request struct {
 		AssetID string `json:"asset_id"`
+
+		PresetStyleKey string `json:"preset_style_key"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(
+	if !decodeCoursewareStyleAnchorRequest(
+		w,
+		r,
 		&request,
-	); err != nil {
+	) {
+		return
+	}
+
+	assetID :=
+		strings.TrimSpace(
+			request.AssetID,
+		)
+
+	presetStyleKey :=
+		strings.ToLower(
+			strings.TrimSpace(
+				request.PresetStyleKey,
+			),
+		)
+
+	if presetStyleKey != "" &&
+		!services.IsCoursewarePresetStyleKey(
+			presetStyleKey,
+		) {
 		utils.BadRequest(
 			w,
-			"请求参数格式错误",
+			"不支持的快捷预设画风",
 		)
 		return
 	}
 
-	assetID := strings.TrimSpace(
-		request.AssetID,
+	var (
+		result *services.SetStyleAnchorResult
+		err    error
 	)
-	if assetID == "" {
-		utils.BadRequest(
-			w,
-			"asset_id不能为空",
-		)
-		return
+
+	if presetStyleKey != "" {
+		// 快捷预设：
+		// 直接使用系统预生成高清图和服务器白名单，
+		// 不要求asset_id，也不调用图片或多模态AI。
+		result, err =
+			h.assetService.SetPresetStyleAnchor(
+				r.Context(),
+				coursewareID,
+				assetID,
+				presetStyleKey,
+				actor,
+			)
+	} else {
+		// 手动图片识别模式仍然必须提交asset_id。
+		if assetID == "" {
+			utils.BadRequest(
+				w,
+				"asset_id不能为空",
+			)
+			return
+		}
+
+		result, err =
+			h.assetService.SetStyleAnchor(
+				r.Context(),
+				coursewareID,
+				assetID,
+				actor,
+			)
 	}
 
-	result, err := h.assetService.SetStyleAnchor(
-		r.Context(),
-		coursewareID,
-		assetID,
-		actor,
-	)
 	if err != nil {
 		handleCoursewareAssetServiceError(
 			w,
@@ -108,11 +181,13 @@ func (h *CoursewareAssetHandler) SetStyleAnchor(
 		return
 	}
 
-	utils.Success(w, result)
+	utils.Success(
+		w,
+		result,
+	)
 }
 
-// ClearStyleAnchor DELETE /api/v1/coursewares/{id}/style-anchor
-// 清除课件当前的风格锚点（两字段置NULL）。
+// ClearStyleAnchor DELETE /api/v1/coursewares/{id}/style-anchor。
 func (h *CoursewareAssetHandler) ClearStyleAnchor(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -126,9 +201,16 @@ func (h *CoursewareAssetHandler) ClearStyleAnchor(
 		return
 	}
 
-	claims, ok := middleware.GetClaims(r.Context())
+	claims, ok :=
+		middleware.GetClaims(
+			r.Context(),
+		)
+
 	if !ok || claims == nil {
-		utils.Unauthorized(w, "未登录")
+		utils.Unauthorized(
+			w,
+			"未登录",
+		)
 		return
 	}
 
@@ -136,8 +218,12 @@ func (h *CoursewareAssetHandler) ClearStyleAnchor(
 		extractAnchorCoursewareID(
 			r.URL.Path,
 		)
+
 	if coursewareID == "" {
-		utils.BadRequest(w, "缺少课件ID")
+		utils.BadRequest(
+			w,
+			"缺少课件ID",
+		)
 		return
 	}
 
@@ -149,15 +235,17 @@ func (h *CoursewareAssetHandler) ClearStyleAnchor(
 			claims.UserID,
 			claims.Role,
 		)
+
 	if !allowed {
 		return
 	}
 
-	if err := h.assetService.ClearStyleAnchor(
-		r.Context(),
-		coursewareID,
-		actor,
-	); err != nil {
+	if err :=
+		h.assetService.ClearStyleAnchor(
+			r.Context(),
+			coursewareID,
+			actor,
+		); err != nil {
 		handleCoursewareAssetServiceError(
 			w,
 			err,
@@ -168,25 +256,108 @@ func (h *CoursewareAssetHandler) ClearStyleAnchor(
 	utils.Success(
 		w,
 		map[string]string{
-			"message": "风格锚点已清除",
+			"message":
+				"风格锚点已清除",
 		},
 	)
 }
 
-// extractAnchorCoursewareID 从 /api/v1/coursewares/{id}/style-anchor 提取课件ID
-func extractAnchorCoursewareID(path string) string {
-	const suffix = "/style-anchor"
-	if !strings.HasSuffix(path, suffix) && !strings.HasSuffix(path, suffix+"/") {
+// decodeCoursewareStyleAnchorRequest 严格读取设置锚点请求。
+func decodeCoursewareStyleAnchorRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	target interface{},
+) bool {
+	r.Body =
+		http.MaxBytesReader(
+			w,
+			r.Body,
+			coursewareStyleAnchorRequestMaxBytes,
+		)
+
+	decoder :=
+		json.NewDecoder(
+			r.Body,
+		)
+
+	decoder.DisallowUnknownFields()
+
+	if err :=
+		decoder.Decode(
+			target,
+		); err != nil {
+		utils.BadRequest(
+			w,
+			"请求参数格式错误",
+		)
+		return false
+	}
+
+	var extra interface{}
+
+	if err :=
+		decoder.Decode(
+			&extra,
+		); err != io.EOF {
+		utils.BadRequest(
+			w,
+			"请求正文只能包含一个JSON对象",
+		)
+		return false
+	}
+
+	return true
+}
+
+// extractAnchorCoursewareID 从风格锚点路径提取课件ID。
+func extractAnchorCoursewareID(
+	path string,
+) string {
+	const suffix =
+		"/style-anchor"
+
+	if !strings.HasSuffix(
+		path,
+		suffix,
+	) &&
+		!strings.HasSuffix(
+			path,
+			suffix+"/",
+		) {
 		return ""
 	}
-	trimmed := strings.TrimSuffix(strings.TrimSuffix(path, "/"), suffix)
-	const prefix = "/api/v1/coursewares/"
-	if !strings.HasPrefix(trimmed, prefix) {
+
+	trimmed :=
+		strings.TrimSuffix(
+			strings.TrimSuffix(
+				path,
+				"/",
+			),
+			suffix,
+		)
+
+	const prefix =
+		"/api/v1/coursewares/"
+
+	if !strings.HasPrefix(
+		trimmed,
+		prefix,
+	) {
 		return ""
 	}
-	cwID := trimmed[len(prefix):]
-	if cwID == "" || strings.Contains(cwID, "/") {
+
+	coursewareID :=
+		trimmed[
+			len(prefix):
+		]
+
+	if coursewareID == "" ||
+		strings.Contains(
+			coursewareID,
+			"/",
+		) {
 		return ""
 	}
-	return cwID
+
+	return coursewareID
 }

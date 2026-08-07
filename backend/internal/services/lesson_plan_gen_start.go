@@ -4,17 +4,12 @@ package services
 //
 // 本文件专门承载“开始对话 / 专家模式”共用的会话创建编排。
 //
-// 上下文11的核心规则：
-//   1. 不信任JWT中的历史角色，也不接受前端传入教育域；
-//   2. 创建教案前实时读取users.role；
-//   3. 调用统一解析器ResolveLessonPlanCreationEducationDomain；
-//   4. 只接受k12、vocational、adult三个具体教学域；
-//   5. 使用CreateLessonPlanWithEducationDomain显式写入资源快照；
-//   6. 阶段初始化或开场消息持久化失败时，执行同步补偿清理；
-//   7. 配方使用记录与SSE事件只在核心资源完整持久化后产生。
-//
-// 普通对话模式与专家模式都只通过StartConversation进入。
-// 专家模式传入的recipe_id只能影响配方选择，不能影响教育域解析或数据库快照。
+// 创建硬闸：
+//   - 实时解析唯一具体教学教育域；
+//   - 课本ID在INSERT前统一校验；
+//   - 精确课程大纲ID在INSERT前校验作者可见性、同域、同学科和具体年级；
+//   - 教案与精确大纲ID在同一INSERT事务中原子写入；
+//   - 阶段初始化或开场消息失败时同步补偿清理。
 
 import (
 	"context"
@@ -28,11 +23,6 @@ import (
 	"tedna/internal/repository"
 )
 
-// lessonPlanConversationCreationDeps 是会话创建阶段的最小依赖集合。
-//
-// 生产代码使用defaultLessonPlanConversationCreationDeps返回真实Repository函数；
-// 测试代码可注入脱库实现，验证三个具体教育域与fail-closed规则，
-// 不需要修改全局函数变量，也不会产生并发测试污染。
 type lessonPlanConversationCreationDeps struct {
 	findUser func(
 		ctx context.Context,
@@ -58,7 +48,6 @@ type lessonPlanConversationCreationDeps struct {
 	) error
 }
 
-// defaultLessonPlanConversationCreationDeps 返回生产环境真实依赖。
 func defaultLessonPlanConversationCreationDeps() lessonPlanConversationCreationDeps {
 	return lessonPlanConversationCreationDeps{
 		findUser: repository.FindUserByID,
@@ -72,13 +61,6 @@ func defaultLessonPlanConversationCreationDeps() lessonPlanConversationCreationD
 }
 
 // StartConversation 创建教案、初始化阶段并写入开场消息。
-//
-// 失败原子性采用“显式写域 + 同步补偿链”：
-//   - 教育域解析失败：任何INSERT前直接返回；
-//   - 教案INSERT失败：数据库事务自行回滚；
-//   - 阶段初始化失败：硬清理新教案及已产生的阶段记录；
-//   - 开场消息写入失败：硬清理新教案及阶段记录；
-//   - 补偿清理自身失败：返回500并记录高优先级错误，绝不伪装成功。
 func (s *LessonPlanGenService) StartConversation(
 	ctx context.Context,
 	req *models.StartConversationRequest,
@@ -110,20 +92,8 @@ func (s *LessonPlanGenService) StartConversation(
 	}
 
 	deps := defaultLessonPlanConversationCreationDeps()
-
-	// 配方三态解析与自动挂载。
-	//
-	// recipe_mode:
-	//   auto     -> 根据学校默认、教研组共享和学科规则自动选择；
-	//   selected -> 使用老师明确传入的recipe_id；
-	//   none     -> 老师明确不使用配方，禁止自动匹配。
-	//
-	// 旧客户端不传recipe_mode时保持兼容：
-	// 有recipe_id视为selected，无recipe_id视为auto。
 	recipeSelectionMode := normalizeStartRecipeSelection(req)
 
-	// 老师明确选择的配方只校验active状态与当前老师使用权限。
-	// 该校验只读数据库，不会在教育域异常时留下任何资源。
 	if recipeSelectionMode == models.RecipeSelectionModeSelected &&
 		strings.TrimSpace(req.RecipeID) != "" {
 		if _, recipeErr := loadRecipeForManualSelection(
@@ -172,8 +142,6 @@ func (s *LessonPlanGenService) StartConversation(
 			)
 		}
 	} else if recipeSelectionMode == models.RecipeSelectionModeNone {
-		// 明确不用配方时清空旧客户端可能残留的recipe_id，
-		// 防止“none + recipe_id”组合意外进入专家模式路径。
 		req.RecipeID = ""
 		lpGenLog.Info(
 			"老师明确选择不使用配方",
@@ -184,10 +152,6 @@ func (s *LessonPlanGenService) StartConversation(
 		)
 	}
 
-	// 统一教育域硬闸与显式写域。
-	//
-	// prepareConversationLessonPlan会实时读取users.role并调用统一解析器。
-	// mixed管理身份、无有效组织、非法域和跨域冲突都会在INSERT前失败。
 	createdPlan, createErr := prepareConversationLessonPlan(
 		ctx,
 		req,
@@ -200,9 +164,6 @@ func (s *LessonPlanGenService) StartConversation(
 	cleanupRequired := createdPlan != nil &&
 		strings.TrimSpace(createdPlan.ID) != ""
 
-	// 创建成功后直到“阶段初始化 + 开场消息持久化”全部完成前，
-	// 任一返回路径都会触发同步补偿。使用后台独立超时上下文，
-	// 避免原HTTP请求取消后清理也被立即取消。
 	defer func() {
 		if !cleanupRequired {
 			return
@@ -244,7 +205,6 @@ func (s *LessonPlanGenService) StartConversation(
 			return
 		}
 
-		// 保留原错误作为errors.Is判断链，同时附加清理失败详情。
 		resultErr = fmt.Errorf(
 			"%w；补偿清理失败: %v",
 			resultErr,
@@ -257,16 +217,15 @@ func (s *LessonPlanGenService) StartConversation(
 	}
 
 	lpGenLog.Info(
-		"开始备课会话已显式写入教育域",
+		"开始备课会话已显式写入教育域与精确大纲",
 		"plan_id", createdPlan.ID,
 		"topic", req.Topic,
 		"author", authorID,
 		"recipe_id", req.RecipeID,
+		"course_outline_id", req.CourseOutlineID,
 		"education_domain", createdPlan.EducationDomain,
 	)
 
-	// 读取配方阶段配置。配方详情读取失败时保持旧行为：
-	// 使用系统默认阶段，不把配方查询瞬时故障扩大成空教案残留。
 	recipeStagesConfig := ""
 	if strings.TrimSpace(req.RecipeID) != "" {
 		recipe, recipeErr := repository.GetRecipeByID(
@@ -322,8 +281,6 @@ func (s *LessonPlanGenService) StartConversation(
 		"education_domain", createdPlan.EducationDomain,
 	)
 
-	// AI开场白失败时使用确定性默认开场。
-	// 默认开场同样必须持久化成功，否则整次会话创建失败并补偿清理。
 	openingMsg, openingErr := s.genStageOpeningMessage(
 		ctx,
 		createdPlan,
@@ -343,8 +300,6 @@ func (s *LessonPlanGenService) StartConversation(
 		return nil, nil, errors.New("生成开场消息失败：消息为空")
 	}
 
-	// 将本次配方选择方式写入开场消息metadata。
-	// ConversationMessage整体进入conversation_log，无需新增数据库字段。
 	if openingMsg.Metadata == nil {
 		openingMsg.Metadata = make(map[string]interface{})
 	}
@@ -352,15 +307,12 @@ func (s *LessonPlanGenService) StartConversation(
 		recipeSelectionMode,
 	)
 
-	// 若关联课本图但存在未完成OCR的页面，确定性追加提醒。
 	s.appendUnrecognizedTextbookNotice(
 		ctx,
 		req,
 		openingMsg,
 	)
 
-	// 开场消息是完整会话不可缺少的核心状态。
-	// 不再像旧逻辑一样只Warn后返回成功。
 	if appendErr := s.appendMessage(
 		ctx,
 		createdPlan.ID,
@@ -377,11 +329,8 @@ func (s *LessonPlanGenService) StartConversation(
 		)
 	}
 
-	// 至此教案、阶段快照、首阶段产出和开场消息均已持久化。
-	// 关闭补偿开关后，后续旁路失败不能删除一个完整可用会话。
 	cleanupRequired = false
 
-	// 推送阶段开始事件。只有完整会话才允许对外广播。
 	GlobalLPSSEHub.Broadcast(createdPlan.ID, models.LPSSEEvent{
 		EventType: models.LPSSEStageStarted,
 		PlanID:    createdPlan.ID,
@@ -393,8 +342,6 @@ func (s *LessonPlanGenService) StartConversation(
 		},
 	})
 
-	// 配方使用记录属于旁路统计，只能在完整会话持久化后写入。
-	// 写入失败不影响主业务，也不会产生失败会话的孤立使用记录。
 	if strings.TrimSpace(req.RecipeID) != "" {
 		if usageErr := repository.RecordRecipeUsage(
 			ctx,
@@ -414,13 +361,7 @@ func (s *LessonPlanGenService) StartConversation(
 	return createdPlan, openingMsg, nil
 }
 
-// prepareConversationLessonPlan 完成会话教案的教育域解析与显式INSERT。
-//
-// 返回约定：
-//   - INSERT前失败：返回nil,error；
-//   - INSERT事务失败：通常返回带空ID的lp,error；
-//   - INSERT已提交但Service防御性复核失败：返回带ID的lp,error，
-//     由StartConversation的补偿守卫负责硬清理。
+// prepareConversationLessonPlan 完成教育域、课本与精确大纲校验后原子INSERT。
 func prepareConversationLessonPlan(
 	ctx context.Context,
 	req *models.StartConversationRequest,
@@ -500,22 +441,27 @@ func prepareConversationLessonPlan(
 	creationDomain = strings.ToLower(
 		strings.TrimSpace(creationDomain),
 	)
-	if !models.IsTeachingEducationDomain(creationDomain) {
+	if !models.IsTeachingEducationDomain(
+		creationDomain,
+	) {
 		return nil, fmt.Errorf(
 			"%w: 解析结果不是具体教学域",
 			ErrLPCreationEducationDomainResolveFailed,
 		)
 	}
 
-	// 上下文15：请求携带课本ID时，必须在任何教案INSERT前
-	// 通过K12课本统一硬闸。
-	//
-	// 非K12携带课本ID返回403；
-	// 不存在、归档、重复或学科年级不匹配的ID返回400；
-	// 数据库错误保持错误链并由Handler映射为5xx。
 	if err := ValidateStartConversationTextbooks(
 		ctx,
 		creationDomain,
+		req,
+	); err != nil {
+		return nil, err
+	}
+
+	if err := ValidateStartConversationCourseOutline(
+		ctx,
+		creationDomain,
+		authorID,
 		req,
 	); err != nil {
 		return nil, err
@@ -547,6 +493,12 @@ func prepareConversationLessonPlan(
 		recipeID := strings.TrimSpace(req.RecipeID)
 		lp.RecipeID = &recipeID
 	}
+	if strings.TrimSpace(req.CourseOutlineID) != "" {
+		outlineID := strings.TrimSpace(
+			req.CourseOutlineID,
+		)
+		lp.CourseOutlineID = &outlineID
+	}
 
 	if len(req.TextbookPageIDs) > 0 {
 		textbookIDsJSON, marshalErr := json.Marshal(
@@ -573,8 +525,11 @@ func prepareConversationLessonPlan(
 		),
 			errors.Is(
 				err,
-				repository.
-					ErrLessonPlanExplicitEducationDomainSnapshotMismatch,
+				repository.ErrLessonPlanExplicitEducationDomainSnapshotMismatch,
+			),
+			errors.Is(
+				err,
+				repository.ErrLessonPlanExactCourseOutlineSnapshotMismatch,
 			):
 			return lp, fmt.Errorf(
 				"%w: %v",
@@ -601,6 +556,20 @@ func prepareConversationLessonPlan(
 			creationDomain,
 			storedDomain,
 		)
+	}
+
+	if strings.TrimSpace(req.CourseOutlineID) != "" {
+		if lp.CourseOutlineID == nil ||
+			strings.TrimSpace(
+				*lp.CourseOutlineID,
+			) != strings.TrimSpace(
+				req.CourseOutlineID,
+			) {
+			return lp, fmt.Errorf(
+				"%w: 数据库精确大纲ID未正确固化",
+				ErrLPCreationEducationDomainResolveFailed,
+			)
+		}
 	}
 
 	return lp, nil

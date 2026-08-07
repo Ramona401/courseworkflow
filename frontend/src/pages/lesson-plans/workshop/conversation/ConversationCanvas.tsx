@@ -1,16 +1,20 @@
 /**
- * ConversationCanvas.tsx — 对话模式右栏「教案画布」
+ * ConversationCanvas.tsx — 对话模式右栏教案画布。
  *
  * 功能：
- *   - 渲染并实时同步 content_markdown。
- *   - 顶部展示产物驱动的完整度清单。
- *   - 点击缺项让AI补充对应部分。
- *   - 复用 LessonDocumentEditor，支持备课过程中直接编辑完整正文和插入图片。
+ *   - 渲染并实时同步content_markdown；
+ *   - 展示产物驱动的完整度清单；
+ *   - 点击缺项让对话AI补充；
+ *   - 复用共享编辑器完成全文编辑、图片、版本历史；
+ *   - 支持目录导航和章节AI局部修改。
  */
 
 import { C } from '../components/workshopConstants'
 import LessonDocumentEditor from '../components/LessonDocumentEditor'
 import type { LessonPlanContentRestoreResponse } from '@/api/lesson-plan-versions'
+import type {
+  LessonPlanSectionRewriteApplyResponse,
+} from '@/api/lesson-plan-section-rewrite'
 import { CANVAS_CHECKLIST } from './conversationScript'
 
 interface ConversationCanvasProps {
@@ -20,7 +24,12 @@ interface ConversationCanvasProps {
   content: string
   /** 当前教案版本号 */
   currentVersion: number
-  /** AI是否正在处理正文 */
+  /**
+   * 当前老师主动发起的对话或正文生成是否忙碌。
+   *
+   * 导入后的后台AI评审不得传入true，
+   * 否则会错误锁定正文编辑和图片移除。
+   */
   busy: boolean
   /** 当前教案状态是否允许编辑 */
   canEdit: boolean
@@ -30,7 +39,11 @@ interface ConversationCanvasProps {
   onContentRestored: (
     result: LessonPlanContentRestoreResponse,
   ) => void
-  /** 点击缺项时让AI补充 */
+  /** AI章节修改应用成功后同步父页面 */
+  onSectionRewriteApplied: (
+    result: LessonPlanSectionRewriteApplyResponse,
+  ) => void | Promise<void>
+  /** 点击缺项时让对话AI补充 */
   onFillMissing: (label: string) => void
 }
 
@@ -42,10 +55,13 @@ function detectChecklist(
   content: string,
 ): Array<{ key: string; label: string; done: boolean }> {
   const text = content || ''
+
   return CANVAS_CHECKLIST.map(item => ({
     key: item.key,
     label: item.label,
-    done: item.patterns.some(pattern => text.includes(pattern)),
+    done: item.patterns.some(pattern =>
+      text.includes(pattern),
+    ),
   }))
 }
 
@@ -57,11 +73,14 @@ export default function ConversationCanvas({
   canEdit,
   onSaveContent,
   onContentRestored,
+  onSectionRewriteApplied,
   onFillMissing,
 }: ConversationCanvasProps) {
   const items = detectChecklist(content)
-  const doneCount = items.filter(item => item.done).length
-  const hasContent = Boolean(content && content.trim())
+  const doneCount =
+    items.filter(item => item.done).length
+  const hasContent =
+    Boolean(content && content.trim())
 
   return (
     <div style={{
@@ -70,7 +89,6 @@ export default function ConversationCanvas({
       flexDirection: 'column',
       background: C.card,
     }}>
-      {/* 顶部完整度清单 */}
       <div style={{
         padding: '12px 16px',
         borderBottom: `1px solid ${C.border}`,
@@ -89,12 +107,18 @@ export default function ConversationCanvas({
           }}>
             📄 教案画布
           </span>
+
           <span style={{
             fontSize: '11px',
-            color: doneCount >= items.length ? C.success : C.textMuted,
+            color:
+              doneCount >= items.length
+                ? C.success
+                : C.textMuted,
             fontWeight: 600,
           }}>
-            {busy ? '✍️ AI正在更新…' : `完整度 ${doneCount}/${items.length}`}
+            {busy
+              ? '✍️ AI正在更新…'
+              : `完整度 ${doneCount}/${items.length}`}
           </span>
         </div>
 
@@ -108,8 +132,15 @@ export default function ConversationCanvas({
           <div style={{
             height: '100%',
             borderRadius: '3px',
-            width: `${items.length > 0 ? (doneCount / items.length) * 100 : 0}%`,
-            background: doneCount >= items.length ? C.success : C.primary,
+            width: `${
+              items.length > 0
+                ? (doneCount / items.length) * 100
+                : 0
+            }%`,
+            background:
+              doneCount >= items.length
+                ? C.success
+                : C.primary,
             transition: 'width 500ms ease',
           }} />
         </div>
@@ -122,10 +153,17 @@ export default function ConversationCanvas({
           {items.map(item => (
             <button
               key={item.key}
+              type="button"
               onClick={() => {
-                if (!item.done && hasContent) onFillMissing(item.label)
+                if (!item.done && hasContent) {
+                  onFillMissing(item.label)
+                }
               }}
-              disabled={item.done || !hasContent || busy}
+              disabled={
+                item.done ||
+                !hasContent ||
+                busy
+              }
               title={
                 item.done
                   ? `${item.label}已具备`
@@ -138,15 +176,21 @@ export default function ConversationCanvas({
                 borderRadius: '12px',
                 fontSize: '11px',
                 border: `1px solid ${
-                  item.done ? 'rgba(16,185,129,0.3)' : C.border
+                  item.done
+                    ? 'rgba(16,185,129,0.3)'
+                    : C.border
                 }`,
                 background: item.done
                   ? 'rgba(16,185,129,0.08)'
                   : 'transparent',
-                color: item.done ? C.success : C.textMuted,
+                color: item.done
+                  ? C.success
+                  : C.textMuted,
                 fontWeight: item.done ? 600 : 400,
                 cursor:
-                  item.done || !hasContent || busy
+                  item.done ||
+                  !hasContent ||
+                  busy
                     ? 'default'
                     : 'pointer',
                 transition: 'all 150ms ease',
@@ -158,8 +202,11 @@ export default function ConversationCanvas({
         </div>
       </div>
 
-      {/* 共享正文编辑器 */}
-      <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+      <div style={{
+        flex: 1,
+        minHeight: 0,
+        overflow: 'hidden',
+      }}>
         <LessonDocumentEditor
           content={content}
           planID={planID}
@@ -174,6 +221,9 @@ export default function ConversationCanvas({
           }
           onSave={onSaveContent}
           onRestored={onContentRestored}
+          onSectionRewriteApplied={
+            onSectionRewriteApplied
+          }
           compact
           emptyState={(
             <div style={{
@@ -187,8 +237,17 @@ export default function ConversationCanvas({
               textAlign: 'center',
               padding: '24px',
             }}>
-              <div style={{ fontSize: '36px', marginBottom: '14px' }}>📝</div>
-              <div style={{ fontSize: '14px', lineHeight: 1.8 }}>
+              <div style={{
+                fontSize: '36px',
+                marginBottom: '14px',
+              }}>
+                📝
+              </div>
+
+              <div style={{
+                fontSize: '14px',
+                lineHeight: 1.8,
+              }}>
                 你的教案会在这里一点点长出来
                 <br />
                 也可以点击右上角「手动填写」直接开始

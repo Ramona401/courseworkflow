@@ -112,10 +112,11 @@ type ChatMessage struct {
 
 // ChatRequest OpenAI兼容的请求体（非流式）
 type ChatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	MaxTokens   int           `json:"max_tokens"`
-	Temperature float64       `json:"temperature"`
+	Model          string        `json:"model"`
+	Messages       []ChatMessage `json:"messages"`
+	MaxTokens      int           `json:"max_tokens"`
+	Temperature    float64       `json:"temperature"`
+	EnableThinking *bool         `json:"enable_thinking,omitempty"`
 }
 
 // ChatResponse OpenAI兼容的响应体（非流式）
@@ -284,6 +285,21 @@ func getRetryDelay(attempt int) time.Duration {
 	return retryDelays[len(retryDelays)-1]
 }
 
+// disableThinkingForModel 对支持显式开关的Qwen3系列关闭深度思考。
+//
+// 只对模型名明确包含qwen3/qwen-3时发送参数，避免把供应商私有字段
+// 传给Claude、Gemini、豆包等不兼容模型或网关。
+func disableThinkingForModel(model string) *bool {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	if !strings.Contains(normalized, "qwen3") &&
+		!strings.Contains(normalized, "qwen-3") {
+		return nil
+	}
+
+	disabled := false
+	return &disabled
+}
+
 // ==================== 非流式AI调用（带重试 + Fallback + 埋点）====================
 
 // CallAI 调用AI API（OpenAI兼容格式，等待完整回复后返回）
@@ -377,10 +393,11 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 // 这是从CallAI中提取的核心重试循环，供主模型和fallback模型复用
 func callAIWithRetries(cfg *EffectiveConfig, model string, messages []ChatMessage, endpoint string, maxRetries int) (*CallResult, error) {
 	reqBody := ChatRequest{
-		Model:       model,
-		Messages:    messages,
-		MaxTokens:   cfg.MaxTokens,
-		Temperature: cfg.Temperature,
+		Model:          model,
+		Messages:       messages,
+		MaxTokens:      cfg.MaxTokens,
+		Temperature:    cfg.Temperature,
+		EnableThinking: disableThinkingForModel(model),
 	}
 
 	jsonBody, err := json.Marshal(reqBody)

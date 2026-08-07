@@ -37,10 +37,7 @@ import {
 import type {
   ClassProfileListItem,
 } from '@/api/class-profiles'
-import {
-  getAvailablePublishers,
-  publisherLabel,
-} from '@/api/course-outlines'
+import ExactCourseOutlineSelector from '../components/ExactCourseOutlineSelector'
 import {
   getAvailableRecipes,
 } from '@/api/recipes'
@@ -83,10 +80,24 @@ interface ConversationStartScreenProps {
   classProfileId: string
   setClassProfileId: (value: string) => void
 
-  coursePublisher: string | null
-  setCoursePublisher: (
+  courseOutlineId: string | null
+  setCourseOutlineId: (
     value: string | null,
   ) => void
+
+  /** 精确候选是否正在加载。加载时禁止开始请求。 */
+  courseOutlineLoading: boolean
+  onCourseOutlineLoadingChange: (
+    loading: boolean,
+  ) => void
+
+  /**
+   * 检测到旧publisher-only草稿时的迁移提示。
+   *
+   * 旧出版社字符串不能自动转成唯一大纲ID，
+   * 必须由老师重新选择或明确保持不关联。
+   */
+  legacyCourseOutlineNotice?: string
 
   recipeMode: RecipeSelectionMode
   setRecipeMode: (
@@ -116,8 +127,12 @@ export default function ConversationStartScreen({
   setUnitPlanId,
   classProfileId,
   setClassProfileId,
-  coursePublisher,
-  setCoursePublisher,
+  courseOutlineId,
+  setCourseOutlineId,
+  courseOutlineLoading,
+  onCourseOutlineLoadingChange,
+  legacyCourseOutlineNotice,
+
   recipeMode,
   setRecipeMode,
   recipeId,
@@ -183,6 +198,36 @@ export default function ConversationStartScreen({
     levelValues,
     grade,
     setGrade,
+  ])
+
+  /**
+   * 非K12或当前教育画像不支持教材版本时，
+   * 精确课程大纲必须保持明确不关联。
+   *
+   * 这里只清理前端临时选择；后端仍以教育域硬闸为最终防线。
+   */
+  useEffect(() => {
+    if (
+      isK12 &&
+      profile.publisher_enabled
+    ) {
+      return
+    }
+
+    if (courseOutlineId !== null) {
+      setCourseOutlineId(null)
+    }
+
+    if (courseOutlineLoading) {
+      onCourseOutlineLoadingChange(false)
+    }
+  }, [
+    isK12,
+    profile.publisher_enabled,
+    courseOutlineId,
+    courseOutlineLoading,
+    setCourseOutlineId,
+    onCourseOutlineLoadingChange,
   ])
 
   const [recipes, setRecipes] =
@@ -377,78 +422,6 @@ export default function ConversationStartScreen({
     setClassProfileId,
   ])
 
-  const [
-    coursePublishers,
-    setCoursePublishers,
-  ] = useState<string[]>([])
-
-  const [
-    coursePubLoading,
-    setCoursePubLoading,
-  ] = useState(false)
-
-  useEffect(() => {
-    let cancelled = false
-
-    if (
-      !isK12 ||
-      !profile.publisher_enabled ||
-      !subjectValid ||
-      !gradeValid
-    ) {
-      setCoursePublishers([])
-      setCoursePublisher(null)
-      return
-    }
-
-    setCoursePubLoading(true)
-
-    getAvailablePublishers(subject, grade)
-      .then(list => {
-        if (cancelled) return
-
-        const publishers = list || []
-        setCoursePublishers(publishers)
-
-        if (publishers.length === 0) {
-          setCoursePublisher(null)
-        } else if (
-          coursePublisher === null ||
-          !publishers.includes(coursePublisher)
-        ) {
-          setCoursePublisher(publishers[0])
-        }
-      })
-      .catch(error => {
-        if (cancelled) return
-
-        console.error(
-          '获取可用教材版本失败:',
-          error,
-        )
-        setCoursePublishers([])
-        setCoursePublisher(null)
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setCoursePubLoading(false)
-        }
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [
-    isK12,
-    profile.publisher_enabled,
-    subjectValid,
-    gradeValid,
-    subject,
-    grade,
-    coursePublisher,
-    setCoursePublisher,
-  ])
-
   const durationButtonStyle = (
     active: boolean,
   ): React.CSSProperties => ({
@@ -477,18 +450,22 @@ export default function ConversationStartScreen({
     gradeValid &&
     !subjectsLoading &&
     !subjectsEmpty &&
+    !courseOutlineLoading &&
     !startLoading &&
     recipeReady
 
-  const startButtonText = startLoading
-    ? `正在准备${profile.lesson_plan_label}环境…`
-    : isK12 && recipeMode === 'auto'
-      ? '✨ 智能匹配并开始备课'
-      : isK12 && recipeMode === 'selected'
-        ? recipeId
-          ? '📦 带指定配方开始备课'
-          : '请先选择配方'
-        : `开始${profile.lesson_plan_label}`
+  const startButtonText =
+    courseOutlineLoading
+      ? '正在加载精确课程大纲…'
+      : startLoading
+        ? `正在准备${profile.lesson_plan_label}环境…`
+        : isK12 && recipeMode === 'auto'
+          ? '✨ 智能匹配并开始备课'
+          : isK12 && recipeMode === 'selected'
+            ? recipeId
+              ? '📦 带指定配方开始备课'
+              : '请先选择配方'
+            : `开始${profile.lesson_plan_label}`
 
   return (
     <div style={{
@@ -785,61 +762,44 @@ export default function ConversationStartScreen({
           </div>
         )}
 
-        {isK12 && coursePublishers.length > 0 && (
+        {isK12 &&
+         profile.publisher_enabled && (
           <div style={{
             marginTop: '14px',
-            textAlign: 'left',
           }}>
-            <label style={{
-              display: 'block',
-              fontSize: '12px',
-              fontWeight: 600,
-              color: C.textSec,
-              marginBottom: '6px',
-            }}>
-              📚 教材版本
-            </label>
-
-            <select
-              value={
-                coursePublisher === null
-                  ? '__none__'
-                  : coursePublisher
+            <ExactCourseOutlineSelector
+              subject={subject}
+              grade={grade}
+              value={courseOutlineId}
+              onChange={setCourseOutlineId}
+              disabled={
+                startLoading ||
+                !subjectValid ||
+                !gradeValid
               }
-              disabled={coursePubLoading}
-              onChange={event =>
-                setCoursePublisher(
-                  event.target.value === '__none__'
-                    ? null
-                    : event.target.value,
-                )
+              onLoadingChange={
+                onCourseOutlineLoadingChange
               }
-              style={{
-                width: '100%',
-                padding: '11px 14px',
-                borderRadius: '12px',
-                border: `1.5px solid ${
-                  coursePublisher !== null
-                    ? '#8B5CF6'
-                    : C.border
-                }`,
-                fontSize: '14px',
-                background: C.card,
-              }}
-            >
-              {coursePublishers.map(item => (
-                <option
-                  key={item || '__generic__'}
-                  value={item}
-                >
-                  {publisherLabel(item)}
-                </option>
-              ))}
+            />
 
-              <option value="__none__">
-                不关联课程大纲
-              </option>
-            </select>
+            {legacyCourseOutlineNotice && (
+              <div
+                role="alert"
+                aria-live="polite"
+                style={{
+                  marginTop: '7px',
+                  padding: '8px 10px',
+                  borderRadius: '8px',
+                  background: '#FFF7ED',
+                  border: '1px solid #FED7AA',
+                  color: '#9A3412',
+                  fontSize: '11px',
+                  lineHeight: 1.65,
+                }}
+              >
+                ⚠️ {legacyCourseOutlineNotice}
+              </div>
+            )}
           </div>
         )}
 

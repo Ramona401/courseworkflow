@@ -380,17 +380,18 @@ func (s *RecipeService) GetRecipeForActor(
 	actor *AssistantActorContext,
 	recipeID string,
 ) (*models.RecipeDetailResponse, error) {
-	if _, err := loadVisibleRecipeForActor(
+	recipe, err := loadVisibleRecipeForActor(
 		ctx,
 		actor,
 		recipeID,
-	); err != nil {
+	)
+	if err != nil {
 		return nil, err
 	}
 
-	return s.GetRecipe(
+	return buildRecipeDetailForResourceDomain(
 		ctx,
-		recipeID,
+		recipe,
 	)
 }
 
@@ -401,18 +402,37 @@ func (s *RecipeService) UpdateRecipeForActor(
 	recipeID string,
 	req *models.UpdateRecipeRequest,
 ) error {
-	if _, err := loadManagedRecipeForActor(
+	if req == nil {
+		return ErrRecipeComponentConfigInvalid
+	}
+
+	recipe, err := loadManagedRecipeForActor(
 		ctx,
 		actor,
 		recipeID,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
+
+	validatedComponentIDs, err :=
+		ValidateRecipeComponentIDsForWrite(
+			ctx,
+			req.ComponentIDs,
+			recipe.EducationDomain,
+		)
+	if err != nil {
+		return err
+	}
+
+	validatedRequest := *req
+	validatedRequest.ComponentIDs =
+		validatedComponentIDs
 
 	return s.UpdateRecipe(
 		ctx,
 		recipeID,
-		req,
+		&validatedRequest,
 		actor.UserID,
 	)
 }
@@ -526,17 +546,18 @@ func (s *RecipeService) PreviewContextForActor(
 	actor *AssistantActorContext,
 	recipeID string,
 ) (*models.RecipeContextPreview, error) {
-	if _, err := loadVisibleRecipeForActor(
+	recipe, err := loadVisibleRecipeForActor(
 		ctx,
 		actor,
 		recipeID,
-	); err != nil {
+	)
+	if err != nil {
 		return nil, err
 	}
 
-	return s.PreviewContext(
+	return buildRecipePreviewForResourceDomain(
 		ctx,
-		recipeID,
+		recipe,
 	)
 }
 

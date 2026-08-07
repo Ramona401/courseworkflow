@@ -17,6 +17,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
+import { useEducationProfile } from '@/hooks/useEducationProfile'
 import {
   getLessonPlan,
   publishLessonPlanPersonal,
@@ -32,11 +33,17 @@ import {
 import { getAnnotations, type Annotation } from '@/api/annotations'
 import { createCourseware } from '@/api/coursewares'
 import { getInteractions, toggleInteraction, type InteractionCounts } from '@/api/lesson-plan-interactions'
+import {
+  publisherLabel,
+  schoolSystemLabel,
+  updateLessonPlanCourseOutline,
+} from '@/api/course-outlines'
 
 // ---- 子组件 ----
 import { C, TABS, type TabKey } from './components/planDetailConstants'
 import { DetailSkeleton, StatusBadge, MetaTag, ActionBar } from './components/PlanDetailHeader'
 import { ContentTab, ReviewTab, StatsTab, CoursewareTab } from './components/PlanDetailTabs'
+import ExactCourseOutlineSelector from '../workshop/components/ExactCourseOutlineSelector'
 
 // ==================== revision状态批注提示条 ====================
 
@@ -258,6 +265,7 @@ export default function PlanDetailPage() {
   const navigate  = useNavigate()
   const location  = useLocation()
   const { user }  = useAuth()
+  const { isK12 } = useEducationProfile()
 
   const [plan, setPlan]         = useState<LessonPlan | null>(null)
   const [loading, setLoading]   = useState(true)
@@ -281,6 +289,13 @@ export default function PlanDetailPage() {
     groupsLoading: boolean
   } | null>(null)
 
+  // ---- 精确课程大纲关联编辑状态 ----
+  const [courseOutlineEditorOpen, setCourseOutlineEditorOpen] = useState(false)
+  const [courseOutlineDraftId, setCourseOutlineDraftId] = useState<string | null>(null)
+  const [courseOutlineCandidateLoading, setCourseOutlineCandidateLoading] = useState(false)
+  const [courseOutlineSaving, setCourseOutlineSaving] = useState(false)
+  const [courseOutlineError, setCourseOutlineError] = useState('')
+
   // ---- Toast工具 ----
   const showToast = (msg: string, type: 'success' | 'error' = 'success') => {
     setToast({ msg, type })
@@ -295,6 +310,16 @@ export default function PlanDetailPage() {
       .then(data => { setPlan(data); setLoading(false) })
       .catch(() => { setError('加载失败，教案不存在或无权限查看'); setLoading(false) })
   }, [id])
+
+  /**
+   * 教案刷新后把服务端正式精确ID同步到编辑草稿。
+   * publisher-only旧教案的正式ID为空，仍由下方脏状态允许老师显式清理旧关联。
+   */
+  useEffect(() => {
+    setCourseOutlineDraftId(plan?.course_outline_id || null)
+    setCourseOutlineError('')
+    setCourseOutlineCandidateLoading(false)
+  }, [plan?.id, plan?.course_outline_id])
 
   // v104：统一加载批注（仅教案属主需要，其他角色不需要）
   // 在教案加载完成后触发，后续由 handleAnnotationsChange 局部更新
@@ -480,6 +505,84 @@ export default function PlanDetailPage() {
 
   const isOwner = plan.author_id === user?.id
 
+  /**
+   * 教案详情只展示创建时固化的精确课程大纲快照。
+   * publisher为null时不擅自显示“通用版”，避免把非K12普通大纲误标成K12教材版本。
+   */
+  const exactCourseOutlineSummary = (() => {
+    if (!plan.course_outline_id) return ''
+
+    const parts: string[] = []
+    if (typeof plan.course_outline_publisher === 'string') {
+      parts.push(publisherLabel(plan.course_outline_publisher))
+    }
+    if (plan.course_outline_volume) parts.push(plan.course_outline_volume)
+    if (plan.school_system) parts.push(schoolSystemLabel(plan.school_system))
+
+    return parts.join(' · ') || '已精确关联'
+  })()
+
+  const legacyCourseOutlineLabel =
+    !plan.course_outline_id && typeof plan.course_outline_publisher === 'string'
+      ? publisherLabel(plan.course_outline_publisher)
+      : ''
+
+  const courseOutlineEditableStatuses = [
+    'draft',
+    'published_personal',
+    'revision',
+    'approved',
+    'published_shared',
+  ]
+  const canEditCourseOutline =
+    isOwner && isK12 && courseOutlineEditableStatuses.includes(plan.status)
+  const courseOutlineDirty =
+    courseOutlineDraftId !== plan.course_outline_id || Boolean(legacyCourseOutlineLabel)
+
+  const openCourseOutlineEditor = () => {
+    setCourseOutlineDraftId(plan.course_outline_id)
+    setCourseOutlineCandidateLoading(false)
+    setCourseOutlineError('')
+    setCourseOutlineEditorOpen(true)
+  }
+
+  const closeCourseOutlineEditor = () => {
+    setCourseOutlineDraftId(plan.course_outline_id)
+    setCourseOutlineCandidateLoading(false)
+    setCourseOutlineError('')
+    setCourseOutlineEditorOpen(false)
+  }
+
+  const handleCourseOutlineSave = async () => {
+    if (
+      !canEditCourseOutline ||
+      courseOutlineSaving ||
+      courseOutlineCandidateLoading ||
+      !courseOutlineDirty
+    ) {
+      return
+    }
+
+    setCourseOutlineSaving(true)
+    setCourseOutlineError('')
+
+    try {
+      await updateLessonPlanCourseOutline(plan.id, courseOutlineDraftId)
+      const refreshed = await getLessonPlan(plan.id)
+      setPlan(refreshed)
+      setCourseOutlineEditorOpen(false)
+      showToast(
+        courseOutlineDraftId
+          ? '精确课程大纲已更新 ✓'
+          : '课程大纲关联已解除 ✓',
+      )
+    } catch (e) {
+      setCourseOutlineError(e instanceof Error ? e.message : '课程大纲关联保存失败')
+    } finally {
+      setCourseOutlineSaving(false)
+    }
+  }
+
   return (
     <div>
       {/* 返回按钮 */}
@@ -503,6 +606,9 @@ export default function PlanDetailPage() {
           <MetaTag icon="🎓" label="年级" value={plan.grade} />
           <MetaTag icon="⏱"  label="课时" value={`${plan.duration_minutes} 分钟`} />
           <MetaTag icon="📌" label="课题" value={plan.topic} />
+          {plan.course_outline_id && (
+            <MetaTag icon="📖" label="精确课程大纲" value={exactCourseOutlineSummary} />
+          )}
           {plan.author_name && <MetaTag icon="👤" label="作者" value={plan.author_name} />}
           {plan.recipe_name && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
@@ -527,6 +633,140 @@ export default function PlanDetailPage() {
         {/* 操作按钮组 */}
         <ActionBar plan={plan} isOwner={isOwner} actionLoading={actionLoading} onAction={handleAction} interactions={interactions} onToggleInteraction={handleToggleInteraction} />
       </div>
+
+      {canEditCourseOutline && (
+        <div style={{
+          padding: '16px 18px', borderRadius: '12px', marginBottom: '16px',
+          background: C.card, border: `1px solid ${C.border}`,
+          boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
+        }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            gap: '16px', flexWrap: 'wrap',
+          }}>
+            <div>
+              <div style={{ fontSize: '14px', fontWeight: 700, color: C.text }}>
+                📖 课程大纲关联
+              </div>
+              <div style={{ marginTop: '4px', fontSize: '12px', color: C.textSec, lineHeight: 1.6 }}>
+                {plan.course_outline_id
+                  ? `当前：${exactCourseOutlineSummary}`
+                  : legacyCourseOutlineLabel
+                    ? `当前为旧版出版社关联：${legacyCourseOutlineLabel}`
+                    : '当前未关联课程大纲'}
+              </div>
+            </div>
+
+            {!courseOutlineEditorOpen && (
+              <button
+                type="button"
+                onClick={openCourseOutlineEditor}
+                style={{
+                  padding: '8px 14px', borderRadius: '8px', border: `1px solid ${C.primary}`,
+                  background: C.primaryLight, color: C.primary, fontSize: '13px',
+                  fontWeight: 600, cursor: 'pointer',
+                }}
+              >
+                {plan.course_outline_id
+                  ? '更换或解除'
+                  : legacyCourseOutlineLabel
+                    ? '重新选择'
+                    : '关联课程大纲'}
+              </button>
+            )}
+          </div>
+
+          {courseOutlineEditorOpen && (
+            <div style={{ marginTop: '14px', paddingTop: '14px', borderTop: `1px solid ${C.border}` }}>
+              <ExactCourseOutlineSelector
+                subject={plan.subject}
+                grade={plan.grade}
+                value={courseOutlineDraftId}
+                onChange={(value) => {
+                  setCourseOutlineDraftId(value)
+                  setCourseOutlineError('')
+                }}
+                disabled={courseOutlineSaving}
+                label="选择精确课程大纲"
+                onLoadingChange={setCourseOutlineCandidateLoading}
+              />
+
+              {courseOutlineError && (
+                <div style={{
+                  marginTop: '8px', padding: '8px 10px', borderRadius: '8px',
+                  background: '#FEF2F2', border: '1px solid #FECACA',
+                  color: C.danger, fontSize: '12px', lineHeight: 1.6,
+                }}>
+                  ⚠️ {courseOutlineError}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '12px' }}>
+                <button
+                  type="button"
+                  onClick={closeCourseOutlineEditor}
+                  disabled={courseOutlineSaving}
+                  style={{
+                    padding: '8px 14px', borderRadius: '8px', border: `1px solid ${C.border}`,
+                    background: '#fff', color: C.textSec, fontSize: '13px',
+                    cursor: courseOutlineSaving ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCourseOutlineSave}
+                  disabled={
+                    courseOutlineSaving ||
+                    courseOutlineCandidateLoading ||
+                    !courseOutlineDirty
+                  }
+                  style={{
+                    padding: '8px 16px', borderRadius: '8px', border: 'none',
+                    background:
+                      courseOutlineSaving || courseOutlineCandidateLoading || !courseOutlineDirty
+                        ? C.border
+                        : C.primary,
+                    color:
+                      courseOutlineSaving || courseOutlineCandidateLoading || !courseOutlineDirty
+                        ? C.textMuted
+                        : '#fff',
+                    fontSize: '13px', fontWeight: 600,
+                    cursor:
+                      courseOutlineSaving || courseOutlineCandidateLoading || !courseOutlineDirty
+                        ? 'not-allowed'
+                        : 'pointer',
+                  }}
+                >
+                  {courseOutlineSaving
+                    ? '保存中...'
+                    : courseOutlineDraftId
+                      ? '保存精确关联'
+                      : legacyCourseOutlineLabel
+                        ? '清除旧关联'
+                        : '解除关联'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {legacyCourseOutlineLabel && (
+        <div style={{
+          padding: '13px 16px', borderRadius: '10px', marginBottom: '16px',
+          background: '#FFF7ED', border: '1px solid #FED7AA', color: '#9A3412',
+          fontSize: '13px', lineHeight: 1.7,
+        }}>
+          <div style={{ fontWeight: 700, marginBottom: '3px' }}>⚠️ 旧版课程大纲关联需要重新选择</div>
+          当前教案只保存了“{legacyCourseOutlineLabel}”出版社字符串，无法唯一定位某一份课程大纲。
+          为避免注入错误内容，运行时不会再进行模糊匹配；
+          {canEditCourseOutline
+            ? '请使用上方管理区重新选择精确课程大纲，或明确清除旧关联。'
+            : '当前教案状态不可修改，后续新建教案时请重新选择精确课程大纲。'}
+        </div>
+      )}
 
       {/* ---- revision状态：批注待处理提示条（v104：使用共享批注数据，数字实时响应） ---- */}
       {plan.status === 'revision' && isOwner && (

@@ -22,6 +22,8 @@
 import { useState, useRef } from 'react'
 import { useAuth } from '@/store/auth'
 import { useProtectedDraft } from '@/hooks/useProtectedDraft'
+import { useVoiceDraftInput } from '@/hooks/useVoiceDraftInput'
+import VoiceInputButton from '@/components/voice/VoiceInputButton'
 import { C } from './workshopConstants'
 import { generateMathGraphCode } from '@/api/mathGraph'
 
@@ -154,9 +156,34 @@ export default function MathGraphAIPanel({
   const [imgBusy, setImgBusy] = useState(false)
   // 隐藏的文件选择 input
   const fileRef = useRef<HTMLInputElement | null>(null)
+  const descInputRef = useRef<HTMLTextAreaElement | null>(null)
 
   const hasCode = code.trim().length > 0
   const disabled = loading || !!busyExternal
+
+  /**
+   * 数学图形语音写入自然语言描述草稿。
+   *
+   * 图片、底稿代码和预览错误不会进入语音文本；
+   * final只回填描述，仍需点击生成或追改按钮。
+   */
+  const voiceInput = useVoiceDraftInput({
+    value: desc,
+    setValue: setDesc,
+    disabled,
+    maxDurationSeconds: 120,
+    onFinalFocus: (finalValue) => {
+      const element = descInputRef.current
+      if (!element) return
+
+      element.focus()
+      element.setSelectionRange(
+        finalValue.length,
+        finalValue.length,
+      )
+    },
+    onError: setError,
+  })
   // 首轮且未生成时才允许附图(追改阶段题意已在代码里,不再带图)
   const canAttachImage = !hasCode
   // 一键修复条件:已有 AI 代码 + 预览确实报错了
@@ -164,7 +191,7 @@ export default function MathGraphAIPanel({
 
   // ---- 批次A+:选择题目图片 → 压缩转 data URI ----
   const handlePickImage = async (file: File | null) => {
-    if (!file || disabled) return
+    if (!file || disabled || voiceInput.isActive) return
     setImgBusy(true)
     setError('')
     try {
@@ -214,7 +241,7 @@ export default function MathGraphAIPanel({
   // ---- 生成/追改按钮 ----
   const handleGenerate = () => {
     const d = desc.trim()
-    if (disabled) return
+    if (disabled || voiceInput.isActive) return
     if (hasCode && !d) return
     if (!hasCode && !d && !image) return
     void runGenerate(d)
@@ -222,7 +249,7 @@ export default function MathGraphAIPanel({
 
   // ---- 一键 AI 修复:自动把报错信息组装为修复要求回喂(老师无需理解报错) ----
   const handleAutoFix = () => {
-    if (disabled || !canAutoFix) return
+    if (disabled || voiceInput.isActive || !canAutoFix) return
     const fixDesc = '这段代码在画板上执行时报错了,报错信息:「' + (previewError || '').trim()
       + '」。请对照常见错误自查清单定位并修复病灶,其余部分保持不动,输出修复后的完整代码。'
     void runGenerate(fixDesc, false)
@@ -230,7 +257,7 @@ export default function MathGraphAIPanel({
 
   // ---- 重置:清空 AI 代码与图片(adapt 回模板底稿预览 / create 回空画板),轮数归零 ----
   const handleReset = () => {
-    if (disabled) return
+    if (disabled || voiceInput.isActive) return
     onCode('')
     setImage('')
     setRounds(0)
@@ -243,7 +270,12 @@ export default function MathGraphAIPanel({
     : '描述一个新图形,如:画△ABC 和直线 l,作出关于 l 的对称三角形,标出对应边相等…'
 
   // 生成按钮可点条件
-  const canSubmit = !disabled && (hasCode ? !!desc.trim() : (!!desc.trim() || !!image))
+  const canSubmit =
+    !disabled &&
+    !voiceInput.isActive &&
+    (hasCode
+      ? !!desc.trim()
+      : !!desc.trim() || !!image)
 
   return (
     <div>
@@ -254,8 +286,11 @@ export default function MathGraphAIPanel({
             {mode === 'adapt' ? '🔧 改编模板' : '✨ AI 描述新图形'}
           </span>
           <button
-            onClick={() => { if (!disabled) onExit() }}
-            style={{ marginLeft: 'auto', padding: '3px 10px', borderRadius: 999, border: '1px solid #D8CEF5', background: '#fff', color: '#6D28D9', fontSize: 11, fontWeight: 700, cursor: disabled ? 'not-allowed' : 'pointer', whiteSpace: 'nowrap' }}
+            onClick={() => {
+              if (!disabled && !voiceInput.isActive) onExit()
+            }}
+            disabled={disabled || voiceInput.isActive}
+            style={{ marginLeft: 'auto', padding: '3px 10px', borderRadius: 999, border: '1px solid #D8CEF5', background: '#fff', color: '#6D28D9', fontSize: 11, fontWeight: 700, cursor: disabled || voiceInput.isActive ? 'not-allowed' : 'pointer', whiteSpace: 'nowrap' }}
           >↩ 返回模板</button>
         </div>
         <div style={{ fontSize: 11.5, color: '#7A6FA8', lineHeight: 1.6, marginTop: 5 }}>
@@ -271,7 +306,7 @@ export default function MathGraphAIPanel({
           <div style={{ fontSize: 12, fontWeight: 700, color: '#9A3412', lineHeight: 1.5 }}>⚠️ 图形代码执行出错(详见左侧红条)</div>
           <button
             onClick={handleAutoFix}
-            disabled={disabled}
+            disabled={disabled || voiceInput.isActive}
             style={{
               width: '100%', marginTop: 8, padding: '8px 0', borderRadius: 9, border: 'none', fontSize: 12.5, fontWeight: 800,
               background: disabled ? '#FDBA74' : 'linear-gradient(135deg, #F59E0B, #EA580C)',
@@ -291,8 +326,12 @@ export default function MathGraphAIPanel({
           />
           {!image ? (
             <button
-              onClick={() => { if (!disabled && !imgBusy) fileRef.current?.click() }}
-              disabled={disabled || imgBusy}
+              onClick={() => {
+                if (!disabled && !voiceInput.isActive && !imgBusy) {
+                  fileRef.current?.click()
+                }
+              }}
+              disabled={disabled || voiceInput.isActive || imgBusy}
               style={{
                 width: '100%', padding: '9px 0', borderRadius: 10, cursor: (disabled || imgBusy) ? 'not-allowed' : 'pointer',
                 border: '1.5px dashed #C4B5FD', background: '#FBFAFE', color: '#6D28D9', fontSize: 12.5, fontWeight: 700,
@@ -307,7 +346,9 @@ export default function MathGraphAIPanel({
                 <div style={{ fontSize: 11, color: '#7A6FA8', marginTop: 3, lineHeight: 1.5 }}>AI 将直接读题出图,下方可补充说明(如"只画第2小问")</div>
               </div>
               <button
-                onClick={() => { if (!disabled) setImage('') }}
+                onClick={() => {
+                  if (!disabled && !voiceInput.isActive) setImage('')
+                }}
                 title="移除图片"
                 style={{ border: 'none', background: '#F3F0FB', width: 26, height: 26, borderRadius: 8, fontSize: 13, cursor: disabled ? 'not-allowed' : 'pointer', color: '#6D28D9', flexShrink: 0 }}
               >✕</button>
@@ -318,6 +359,7 @@ export default function MathGraphAIPanel({
 
       {/* 描述输入 */}
       <textarea
+        ref={descInputRef}
         value={desc}
         onChange={e => setDesc(e.target.value)}
         onKeyDown={e => {
@@ -326,12 +368,44 @@ export default function MathGraphAIPanel({
         placeholder={hasCode ? '继续追改:如 角弧再大一点 / 把标注移到右上…' : (image ? '补充说明(可选):如 只画第2小问的图 / 把动点 P 做成滑杆…' : placeholder)}
         maxLength={2000}
         rows={4}
-        disabled={disabled}
+        disabled={disabled || voiceInput.isActive}
         style={{ width: '100%', boxSizing: 'border-box', padding: '9px 11px', borderRadius: 10, border: '1.5px solid #E9E5F5', fontSize: 12.5, lineHeight: 1.6, outline: 'none', resize: 'vertical', fontFamily: 'inherit', background: disabled ? '#F9FAFB' : '#fff' }}
       />
 
-      <div style={{ marginTop: 6, fontSize: 11, color: C.textMuted, lineHeight: 1.5 }}>
-        描述已自动保存 · 生成失败不会清除 · Ctrl/Command+Z恢复误删
+      <div
+        style={{
+          marginTop: 7,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+        }}
+      >
+        <VoiceInputButton
+          status={voiceInput.status}
+          isSupported={voiceInput.isSupported}
+          elapsedSeconds={voiceInput.elapsedSeconds}
+          disabled={disabled}
+          error={voiceInput.error}
+          onStart={voiceInput.begin}
+          onStop={voiceInput.stop}
+          onCancel={voiceInput.cancel}
+        />
+
+        <span
+          style={{
+            color:
+              voiceInput.status === 'error'
+                ? '#DC2626'
+                : voiceInput.isActive
+                  ? '#6D28D9'
+                  : C.textMuted,
+            fontSize: 11,
+            lineHeight: 1.5,
+          }}
+        >
+          {voiceInput.statusText ||
+            '描述已自动保存 · 可语音输入 · 识别文字不会自动生成'}
+        </span>
       </div>
 
       {/* 生成/追改按钮 */}

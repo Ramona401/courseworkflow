@@ -1,67 +1,76 @@
 package models
 
-// courseware_review.go — 课件多级审核数据模型（阶段3）
+// courseware_review.go
 //
-// 镜像 review_v2.go（教案多级审核），但有三处本质差异，务必理解：
+// 课件多级审核数据模型。
 //
-//  1. 审核态载体不同：教案靠 lesson_plans.status（生产状态机）承载 submitted/revision/approved；
-//     课件靠与 status【正交】的 coursewares.publish_state 承载。绝不改动 courseware.status。
-//     状态机对照：
-//       提交审核   → publish_state=submitted, review_level=0, review_school_id=作者学校
-//       L1通过(无L2) → publish_state=approved,  review_level=1（待发布，作者再 published_shared）
-//       L1通过(有L2) → publish_state=submitted, review_level=1（进入L2待审核）
-//       L2通过      → publish_state=approved,  review_level=2
-//       退回        → publish_state=revision,  review_level=0
+// 审核状态由与课件制作状态正交的publish_state承载。
+// 正式审核记录写入courseware_reviews。
 //
-//  2. 审核记录表不同：教案写 lesson_plan_reviews_v2，课件写 courseware_reviews（本期新建）。
+// V1.3复审闭环：
 //
-//  3. 审核流程配置【复用】教案的 review_flow_configs 表（按 school_id，同校 l2_enabled 教案课件共用）。
-//     因此本文件不重复定义 ReviewFlowConfig / UpdateReviewFlowConfigRequest 等——直接用 review_v2.go 里的。
-//
-// 同时，课件无 content_markdown 概念，教案侧"approved 正文非空硬校验"不适用；
-// 课件的"是否做完"由 status≥preview 表达，在【提交审核】环节校验即可。
-//
-// 审核级别常量 / 决策常量【复用】review_v2.go 中已定义的 ReviewLevelL1/L2/L3、
-// ReviewDecisionApproved/Revision/Revoked、ReviewLevelNameMap——同包内直接引用，不重复定义。
+//   - 作者在课件被退回后重新提交时，未解决的正式问题保留原问题ID；
+//   - 每条问题记录准备进入的审核级别和预计轮次；
+//   - 审核员打开当前待审课件时，审核详情直接返回本级、本轮需要复审的问题；
+//   - 审核员提交正式决定时，明确指出哪些旧问题已经解决；
+//   - 审核记录、旧问题解决、新问题交付和课件状态必须原子提交；
+//   - 复审问题响应不暴露内部AI会话、问题创建者或课件作者ID。
 
 import "time"
 
 // ==================== 数据库实体 ====================
 
-// CoursewareReview 课件多级审核记录（对应 courseware_reviews 表）
+// CoursewareReview 课件多级审核记录。
 type CoursewareReview struct {
 	ID           string     `json:"id"`
 	CoursewareID string     `json:"courseware_id"`
-	ReviewLevel  int        `json:"review_level"` // 1=L1教研组 / 2=L2学校 / 3=L3区域(预留)
+	ReviewLevel  int        `json:"review_level"`
 	ReviewerID   string     `json:"reviewer_id"`
-	Decision     string     `json:"decision"`     // approved/revision/revoked
-	Score        *float64   `json:"score"`        // 可选评分（对应 numeric(4,1)）
-	Comment      string     `json:"comment"`      // 审核意见
-	Dimensions   string     `json:"dimensions"`   // 多维度评分 JSONB 文本
-	ReviewRound  int        `json:"review_round"` // 审核轮次
+	Decision     string     `json:"decision"`
+	Score        *float64   `json:"score"`
+	Comment      string     `json:"comment"`
+	Dimensions   string     `json:"dimensions"`
+	ReviewRound  int        `json:"review_round"`
 	CreatedAt    *time.Time `json:"created_at"`
 }
 
 // ==================== 请求结构体 ====================
 
-// SubmitCoursewareReviewRequest 提交课件审核请求（作者发起）
-// 课件提交审核无需像教案那样选教研组——作者所属教研组/学校由后端反查 school_id 确定。
-// 预留空结构体便于将来扩展（如附带提交说明）。
+// SubmitCoursewareReviewRequest 提交课件审核请求。
 type SubmitCoursewareReviewRequest struct {
-	Note string `json:"note"` // 可选：提交说明（当前不落库，仅占位）
+	Note string `json:"note"`
 }
 
-// CWReviewDecisionRequest 课件审核决策请求（审核员操作）
+// CWReviewDecisionRequest 课件审核决策请求。
+//
+// AIReviewSessionID和ReviewItemIDs用于本轮新发现问题：
+//
+//   - 不使用AI辅助时可以为空；
+//   - ReviewItemIDs非空时必须同时提供AIReviewSessionID；
+//   - 后端会重新读取最终报告和选中整改项；
+//   - 前端不能提交AI报告正文。
+//
+// ResolvedReviewItemIDs用于上一轮问题复审：
+//
+//   - 只能包含审核详情返回的本级、本轮旧问题；
+//   - 审核通过时，必须包含本级、本轮全部旧问题；
+//   - 继续退回时，可以只确认其中一部分已经解决；
+//   - 未选中的旧问题继续保留，供作者下一轮整改。
 type CWReviewDecisionRequest struct {
-	Decision   string   `json:"decision"`   // approved / revision
-	Score      *float64 `json:"score"`      // 可选评分
-	Comment    string   `json:"comment"`    // 审核意见
-	Dimensions string   `json:"dimensions"` // 多维度评分 JSONB 文本
+	Decision   string   `json:"decision"`
+	Score      *float64 `json:"score"`
+	Comment    string   `json:"comment"`
+	Dimensions string   `json:"dimensions"`
+
+	AIReviewSessionID string   `json:"ai_review_session_id"`
+	ReviewItemIDs     []string `json:"review_item_ids"`
+
+	ResolvedReviewItemIDs []string `json:"resolved_review_item_ids"`
 }
 
 // ==================== 响应结构体 ====================
 
-// CWReviewListItem 课件审核记录列表项（含审核员名称）
+// CWReviewListItem 课件审核记录列表项。
 type CWReviewListItem struct {
 	ID           string     `json:"id"`
 	CoursewareID string     `json:"courseware_id"`
@@ -76,14 +85,14 @@ type CWReviewListItem struct {
 	CreatedAt    *time.Time `json:"created_at"`
 }
 
-// CWReviewHistoryResponse 课件审核历史响应
+// CWReviewHistoryResponse 课件审核历史响应。
 type CWReviewHistoryResponse struct {
 	Reviews      []*CWReviewListItem `json:"reviews"`
 	Total        int                 `json:"total"`
-	CurrentLevel int                 `json:"current_level"` // 课件当前审核层级进度（coursewares.review_level）
+	CurrentLevel int                 `json:"current_level"`
 }
 
-// CWPendingReviewItem 课件待审核列表项
+// CWPendingReviewItem 课件待审核列表项。
 type CWPendingReviewItem struct {
 	CoursewareID string     `json:"courseware_id"`
 	Title        string     `json:"title"`
@@ -97,16 +106,16 @@ type CWPendingReviewItem struct {
 	SchoolName   string     `json:"school_name"`
 	ReviewLevel  int        `json:"review_level"`
 	LevelName    string     `json:"level_name"`
-	SubmittedAt  *time.Time `json:"submitted_at"` // 取 updated_at 近似提交时间
+	SubmittedAt  *time.Time `json:"submitted_at"`
 }
 
-// CWPendingReviewListResponse 课件待审核列表响应
+// CWPendingReviewListResponse 待审核课件列表响应。
 type CWPendingReviewListResponse struct {
 	Items []*CWPendingReviewItem `json:"items"`
 	Total int                    `json:"total"`
 }
 
-// CWReviewStatsResponse 课件审核统计响应
+// CWReviewStatsResponse 课件审核统计响应。
 type CWReviewStatsResponse struct {
 	TotalPending  int `json:"total_pending"`
 	TotalReviewed int `json:"total_reviewed"`
@@ -114,7 +123,7 @@ type CWReviewStatsResponse struct {
 	TotalRevision int `json:"total_revision"`
 }
 
-// CWReviewedListItem 课件已审核记录列表项（展示审核历史）
+// CWReviewedListItem 已审核记录列表项。
 type CWReviewedListItem struct {
 	ID              string     `json:"id"`
 	CoursewareID    string     `json:"courseware_id"`
@@ -131,16 +140,62 @@ type CWReviewedListItem struct {
 	CreatedAt       *time.Time `json:"created_at"`
 }
 
-// CWReviewedListResponse 课件已审核记录列表响应
+// CWReviewedListResponse 已审核记录响应。
 type CWReviewedListResponse struct {
 	Items []*CWReviewedListItem `json:"items"`
 	Total int                   `json:"total"`
 }
 
-// CWReviewDetailResponse 课件审核详情响应（审核台用：课件基本信息 + 页面 + 批注，供审核员边看边决策）
-// 决策二落地：审核详情联动阶段2批注——审核员在同一界面看渲染页 + 该课件全部批注。
+// CWReviewCarryoverItem 是当前审核员需要复查的上一轮正式问题。
+//
+// 该结构只返回复审所需内容，不返回：
+//
+//   - source_session_id；
+//   - source_finding_id；
+//   - created_by；
+//   - owner_id；
+//   - 内部讨论消息身份。
+type CWReviewCarryoverItem struct {
+	ID string `json:"id"`
+
+	// OriginalReviewLevel和OriginalReviewRound表示问题最初正式交付的轮次。
+	OriginalReviewLevel int `json:"original_review_level"`
+	OriginalReviewRound int `json:"original_review_round"`
+
+	// PendingReviewLevel和PendingReviewRound表示当前准备接受复查的轮次。
+	PendingReviewLevel int `json:"pending_review_level"`
+	PendingReviewRound int `json:"pending_review_round"`
+
+	PageID                *string    `json:"page_id"`
+	PageNumberSnapshot    int        `json:"page_number_snapshot"`
+	PageTitleSnapshot     string     `json:"page_title_snapshot"`
+	PageHTMLHash          string     `json:"page_html_hash"`
+	PageUpdatedAtSnapshot *time.Time `json:"page_updated_at_snapshot"`
+
+	Severity  string `json:"severity"`
+	Dimension string `json:"dimension"`
+
+	Title                string `json:"title"`
+	Description          string `json:"description"`
+	ConfirmedInstruction string `json:"confirmed_instruction"`
+
+	Status          string `json:"status"`
+	AppliedPageHash string `json:"applied_page_hash"`
+
+	ConfirmedAt   *time.Time `json:"confirmed_at"`
+	AppliedAt     *time.Time `json:"applied_at"`
+	ResubmittedAt *time.Time `json:"resubmitted_at"`
+}
+
+// CWReviewDetailResponse 课件审核详情响应。
+//
+// PendingReviewRound是当前级别提交审核决定后将形成的轮次。
+// CarryoverItems是作者重新提交后，本级本轮需要复查的旧问题。
 type CWReviewDetailResponse struct {
-	Courseware  *CoursewareDetailResponse `json:"courseware"`  // 复用课件详情（含 pages）
-	Annotations []*CoursewareAnnotation   `json:"annotations"` // 该课件全部批注（阶段2复用）
-	Reviews     []*CWReviewListItem       `json:"reviews"`     // 历史审核记录
+	Courseware  *CoursewareDetailResponse `json:"courseware"`
+	Annotations []*CoursewareAnnotation   `json:"annotations"`
+	Reviews     []*CWReviewListItem       `json:"reviews"`
+
+	PendingReviewRound int                      `json:"pending_review_round"`
+	CarryoverItems     []*CWReviewCarryoverItem `json:"carryover_items"`
 }

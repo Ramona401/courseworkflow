@@ -97,50 +97,35 @@ type ConvAction struct {
 
 // ==================== 生成会话请求/响应 ====================
 
-// StartConversationRequest 开始备课会话请求
-// Phase 7A：新增 RecipeID 字段，选配方后AI带着全局知识工作
+// StartConversationRequest 开始备课会话请求。
+//
+// CourseOutlineID是老师在首屏明确选择的唯一课程大纲ID。
+// 空字符串表示不关联；非空时必须在任何教案INSERT前完成可见性、教育域、
+// 学科和具体年级校验，并与教案在同一INSERT事务中原子写入。
 type StartConversationRequest struct {
-	Subject         string              `json:"subject"`               // 学科（必填）
-	Grade           string              `json:"grade"`                 // 年级（必填）
-	Topic           string              `json:"topic"`                 // 课题（必填）
-	DurationMinutes int                 `json:"duration_minutes"`      // 课时时长（可选，默认45）
-	TemplateID      string              `json:"template_id"`           // 提示词模板ID（可选）
-	GroupID         string              `json:"group_id"`              // 教研组ID（可选）
-	RecipeID        string              `json:"recipe_id"`             // 备课配方ID（可选，Phase 7A新增）
-	RecipeMode      RecipeSelectionMode `json:"recipe_mode,omitempty"` // 配方选择三态：auto / selected / none
-	TextbookPageIDs []string            `json:"textbook_page_ids"`     // 迭代7B：备课工坊勾选的课本图片ID列表，注入写教案上下文
+	Subject         string              `json:"subject"`                     // 学科（必填）
+	Grade           string              `json:"grade"`                       // 年级（必填）
+	Topic           string              `json:"topic"`                       // 课题（必填）
+	DurationMinutes int                 `json:"duration_minutes"`            // 课时时长（可选，默认45）
+	TemplateID      string              `json:"template_id"`                 // 提示词模板ID（可选）
+	GroupID         string              `json:"group_id"`                    // 教研组ID（可选）
+	RecipeID        string              `json:"recipe_id"`                   // 备课配方ID（可选）
+	RecipeMode      RecipeSelectionMode `json:"recipe_mode,omitempty"`       // 配方选择三态
+	TextbookPageIDs []string            `json:"textbook_page_ids"`           // 关联课本图片ID
+	CourseOutlineID string              `json:"course_outline_id,omitempty"` // 精确课程大纲ID
 }
 
 // LessonPlanChatRequest 教案对话请求
-// v110(TE-DNA 3.0 P0 STEP 3) 新增 AssistantID 字段:
-//   - 空字符串 → 走原逻辑(使用阶段默认 system prompt)
-//   - 非空字符串 → 根据 ID 加载 AI 助手,用其 full_prompt 替换第4层阶段角色
-//   - 助手加载失败时静默降级到原逻辑(不中断对话流程),并记录告警日志
-//
-// v168 新增 FullGenerate 字段(功能B·一键生成完整教案):
-//   - false(默认) → 走原逐轮对话逻辑,行为完全不变
-//   - true → 仅在 write 阶段生效,后端注入"全委托一次性出稿"指令,
-//     让 AI 一次性产出完整教案正文,产出走现有 handleWriteStageOutput 链路落库
 type LessonPlanChatRequest struct {
 	PlanID             string   `json:"plan_id"`
 	Message            string   `json:"message"`
 	SelectedOptions    []string `json:"selected_options,omitempty"`
 	SelectedComponents []string `json:"selected_components,omitempty"`
 	CurrentSection     string   `json:"current_section,omitempty"`
-	AssistantID        string   `json:"assistant_id,omitempty"`  // v110 新增:可选的 AI 助手 ID
-	FullGenerate       bool     `json:"full_generate,omitempty"` // v168 新增:全委托一键生成(仅 write 阶段生效)
-	// 子轮一·B(B2 轮次序号)：前端每发起一轮 chat 自增的客户端轮次 id。
-	// 后端原样回带到该轮所有 SSE 事件的 ClientTurnID 字段，前端据此丢弃"过期轮次"的迟到回复。
-	// 空字符串(前端未传)时后端行为 100% 不变——回带空串，前端不过滤。
-	ClientTurnID string `json:"client_turn_id,omitempty"` // 子轮一·B 新增:客户端轮次序号(B2)
-	// 参考资料附件(PDF/Word)：老师上传的参考资料"最终注入文本"。
-	//   - 前端在浏览器端提取 PDF/Word 文字：短文档(<3000字)直接是原文，
-	//     长文档(≥3000字)是经 /ref-material/compress 端点 AI 压缩后的结构化要点。
-	//   - 会话级：附件挂上后每轮 chat 都携带本字段，直到老师移除或关闭对话。
-	//   - 后端在 processChatStageAsync 注入前把它拼成"参考资料"块置于 system prompt，
-	//     并做防御性截断(refMaterialInjectMaxRunes)兜底。
-	//   - 空串(未挂附件)时后端行为 100% 不变。不落库、不复用。
-	RefMaterial string `json:"ref_material,omitempty"` // 参考资料附件:会话级注入文本
+	AssistantID        string   `json:"assistant_id,omitempty"`
+	FullGenerate       bool     `json:"full_generate,omitempty"`
+	ClientTurnID       string   `json:"client_turn_id,omitempty"`
+	RefMaterial        string   `json:"ref_material,omitempty"`
 }
 
 type GenerateSectionRequest struct {
@@ -158,22 +143,17 @@ type ApplyAISuggestionsRequest struct {
 
 // ==================== 参考资料附件压缩(PDF/Word) ====================
 
-// CompressRefMaterialRequest 参考资料压缩请求
-// 前端在浏览器端提取出的长文档原文(≥3000字)POST 到 /ref-material/compress，
-// 后端用 AI 压缩成"保留知识点/要求/重点、去冗余"的结构化要点后返回。
-// 压缩只在上传时发生一次(A方案)，之后每轮 chat 携带压缩结果(短文本)。
 type CompressRefMaterialRequest struct {
-	Content  string `json:"content"`   // 提取出的原文(必填)
-	FileName string `json:"file_name"` // 文件名(可选，仅用于给 AI 提供上下文与日志)
-	Subject  string `json:"subject"`   // 学科(可选，供压缩时聚焦学科相关内容)
-	Grade    string `json:"grade"`     // 年级(可选，供压缩时聚焦学段)
+	Content  string `json:"content"`
+	FileName string `json:"file_name"`
+	Subject  string `json:"subject"`
+	Grade    string `json:"grade"`
 }
 
-// CompressRefMaterialResponse 参考资料压缩响应
 type CompressRefMaterialResponse struct {
-	Compressed    string `json:"compressed"`     // 压缩后的结构化要点(注入用)
-	OriginalLen   int    `json:"original_len"`   // 原文字数(rune 计)
-	CompressedLen int    `json:"compressed_len"` // 压缩后字数(rune 计)
+	Compressed    string `json:"compressed"`
+	OriginalLen   int    `json:"original_len"`
+	CompressedLen int    `json:"compressed_len"`
 }
 
 // ==================== AI评审模型 ====================
@@ -221,11 +201,10 @@ const (
 	LPSSEExtractionHint LPSSEEventType = "extraction_hint"
 	LPSSEError          LPSSEEventType = "error"
 	LPSSEDone           LPSSEEventType = "done"
-	// 迭代3.5 Phase B：建议芯片(suggested_actions)动态下发事件
+
 	LPSSESuggestedActions LPSSEEventType = "suggested_actions"
-	// 子轮一·B(重试可见性)：空流自动重试时广播，提示文案放在 Content 字段。
-	// 前端收到后把"思考中"替换为"刚才没接上、正在重试…"，让重试期间的等待有解释。
-	LPSSERetryNotice LPSSEEventType = "retry_notice"
+	LPSSERetryNotice      LPSSEEventType = "retry_notice"
+	LPSSEContextCapsule   LPSSEEventType = "context_capsule"
 )
 
 // ExtractionHint Phase5萃取提示数据
@@ -238,32 +217,34 @@ type ExtractionHint struct {
 }
 
 // LPSSEEvent 教案SSE推送事件结构体
-// Phase 7B-8新增：StageData字段，承载阶段化备课工坊的stage_started/stage_complete/stage_output事件数据
 type LPSSEEvent struct {
-	EventType        LPSSEEventType       `json:"type"`
-	PlanID           string               `json:"plan_id"`
-	MessageID        string               `json:"message_id,omitempty"`
-	Chunk            string               `json:"chunk,omitempty"`
-	Message          *ConversationMessage `json:"message,omitempty"`
-	Content          string               `json:"content,omitempty"`
-	Review           *AIReviewResult      `json:"review,omitempty"`
-	ExtractionHint   *ExtractionHint      `json:"extraction_hint,omitempty"`
-	StageData        *StageEventData      `json:"stage_data,omitempty"` // Phase 7B-8：阶段事件数据
-	Error            string               `json:"error,omitempty"`
-	SuggestedActions []SuggestedAction    `json:"suggested_actions,omitempty"` // 迭代3.5 Phase B：动态建议芯片
-	// 子轮一·B(B2 轮次序号)：标识本事件归属哪一轮 chat。
-	// 仅 processChatStageAsync(及其派生的软兜底/硬错误/教练建议)显式赋值为本轮 turnID；
-	// 系统旁路推送(开场白/评审/手动按钮)留空——前端对空串不过滤、照常处理。
-	ClientTurnID string `json:"client_turn_id,omitempty"` // 子轮一·B 新增:轮次序号(B2)
-	// 助手轻量选择入口·可见性补丁：本轮实际注入(匹配)的助手显示名。
-	// 仅 message_done 事件在自动匹配/偏好命中/手动选择有助手时填写;纯骨架(无助手)留空。
-	// 前端据此把顶栏"自动匹配"替换为真实助手名,让"已自动匹配"对老师可见(不写偏好不冻结)。
-	AssistantLabel string `json:"assistant_label,omitempty"`
+	EventType        LPSSEEventType                     `json:"type"`
+	PlanID           string                             `json:"plan_id"`
+	MessageID        string                             `json:"message_id,omitempty"`
+	Chunk            string                             `json:"chunk,omitempty"`
+	Message          *ConversationMessage               `json:"message,omitempty"`
+	Content          string                             `json:"content,omitempty"`
+	Review           *AIReviewResult                    `json:"review,omitempty"`
+	ExtractionHint   *ExtractionHint                    `json:"extraction_hint,omitempty"`
+	StageData        *StageEventData                    `json:"stage_data,omitempty"`
+	Error            string                             `json:"error,omitempty"`
+	SuggestedActions []SuggestedAction                  `json:"suggested_actions,omitempty"`
+	ClientTurnID     string                             `json:"client_turn_id,omitempty"`
+	AssistantLabel   string                             `json:"assistant_label,omitempty"`
+	ContextCapsule   *LessonPlanContextCapsuleEventData `json:"context_capsule,omitempty"`
 }
 
-// SuggestedAction 单个建议芯片（迭代3.5 Phase B：对话式备课唤起式交互原语）
-// 定义在 models 包，供 LPSSEEvent.SuggestedActions 字段与 services 包共同引用。
-// 字段对齐设计文档 2.3 与前端 conversationScript.ts 的 ChipDef 下发契约。
+// LessonPlanContextCapsuleEventData 是核心共识胶囊的非终态SSE载荷。
+//
+// 该事件只在旁路更新产生新版本后广播，不影响主回复完成状态，
+// 也不会使SSE处理器关闭连接。
+type LessonPlanContextCapsuleEventData struct {
+	Version int                                  `json:"version"`
+	Status  string                               `json:"status"`
+	Display *LessonPlanContextCapsuleDisplayView `json:"display,omitempty"`
+}
+
+// SuggestedAction 单个建议芯片
 type SuggestedAction struct {
 	ID         string                 `json:"id"`
 	Emoji      string                 `json:"emoji,omitempty"`
@@ -310,23 +291,22 @@ type ExtractionListResponse struct {
 
 // ==================== v108新增：已有教案导入 ====================
 
-// ImportExistingPlanRequest 导入已有教案请求
-// 支持三种来源：粘贴文本、Word解析后文本、PDF解析后文本（均在前端完成解析）
 type ImportExistingPlanRequest struct {
-	Subject         string   `json:"subject"`           // 学科（必填）
-	Grade           string   `json:"grade"`             // 年级（必填）
-	Topic           string   `json:"topic"`             // 课题（必填）
-	DurationMinutes int      `json:"duration_minutes"`  // 课时（默认45）
-	ContentMarkdown string   `json:"content_markdown"`  // 教案正文（必填，前端已解析为纯文本）
-	RecipeID        string   `json:"recipe_id"`         // 配方ID（可选）
-	GroupID         string   `json:"group_id"`          // 教研组ID（可选）
-	TextbookPageIDs []string `json:"textbook_page_ids"` // 关联课本图片（可选）
-	SourceType      string   `json:"source_type"`       // 来源：paste/docx/pdf
+	Subject             string   `json:"subject"`
+	Grade               string   `json:"grade"`
+	Topic               string   `json:"topic"`
+	DurationMinutes     int      `json:"duration_minutes"`
+	ContentMarkdown     string   `json:"content_markdown"`
+	RecipeID            string   `json:"recipe_id"`
+	GroupID             string   `json:"group_id"`
+	TextbookPageIDs     []string `json:"textbook_page_ids"`
+	SourceType          string   `json:"source_type"`
+	WordImportSessionID string   `json:"word_import_session_id,omitempty"`
 }
 
-// ImportExistingPlanResponse 导入已有教案响应
 type ImportExistingPlanResponse struct {
-	Plan           *LessonPlan          `json:"plan"`
-	OpeningMessage *ConversationMessage `json:"opening_message"`
-	SkippedStages  []string             `json:"skipped_stages"` // 跳过的阶段列表
+	Plan           *LessonPlan             `json:"plan"`
+	OpeningMessage *ConversationMessage    `json:"opening_message"`
+	SkippedStages  []string                `json:"skipped_stages"`
+	WordDocument   *LessonPlanWordDocument `json:"word_document,omitempty"`
 }

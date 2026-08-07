@@ -165,6 +165,13 @@ type CreateUserRequest struct {
 	DisplayName string `json:"display_name"`
 	Password    string `json:"password"`
 	Role        string `json:"role"`
+
+	// SchoolID 是系统管理员创建教学账号时选择的所属学校。
+	//
+	// 该字段只作为“建号请求输入”，不会写入 users 表；正式学校归属仍以
+	// school_members 为唯一事实源。学校管理员创建账号时，Handler 会使用
+	// 其真实管理学校覆盖本字段，防止客户端伪造学校扩大权限。
+	SchoolID string `json:"school_id"`
 }
 
 type UpdateUserRequest struct {

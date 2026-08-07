@@ -17,9 +17,10 @@
 import { useState, useEffect, useRef } from 'react'
 import { CW_WIDTH, CW_HEIGHT } from './workshopConstants'
 import { injectPreviewMode, NAV_KEY_MSG_TYPE } from './previewInject'
+import PlatformCoursewareAssistantOverlay from './PlatformCoursewareAssistantOverlay'
 
 export default function CWFullscreenPreview({ pages, initialPageNum, codeView, onToggleCode, onClose, onSlideshow }: {
-  pages: { page_number: number; title: string; html_content: string }[]
+  pages: { id?: string; page_number: number; title: string; html_content: string }[]
   initialPageNum: number
   codeView: boolean
   onToggleCode: () => void
@@ -133,6 +134,15 @@ export default function CWFullscreenPreview({ pages, initialPageNum, codeView, o
           </div>
         )}
       </div>
+
+      {!codeView && page?.id && (
+        <PlatformCoursewareAssistantOverlay
+          key={`platform-assistant-${page.id}`}
+          pageId={page.id}
+          pageTitle={page.title}
+          variant="fullscreen"
+        />
+      )}
     </div>
   )
 }

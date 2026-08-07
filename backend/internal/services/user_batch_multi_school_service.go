@@ -53,6 +53,13 @@ package services
 //   ensurePersonalTokenAccount 为该用户补开余额 0 的个人积分账户（幂等、失败仅 Warn，
 //   不影响该行"建成功"的判定，也不影响其它行）。逐行补比批量补更贴合本文件的逐行事务模型。
 
+//
+// 本次修复（跨校批量全部失败）：
+//   历史Handler传入的来源标记 admin_multi_school_batch_create 长度为31，超过
+//   school_members.source 的 varchar(30)，导致每行在“入校”步骤报SQLSTATE 22001，
+//   继而回滚该行用户事务。本服务现在统一使用repository稳定来源协议，并兼容归一化
+//   历史值为 admin_multi_school_batch，避免数据库扩容掩盖调用方协议错误。
+
 import (
 	"context"
 	"fmt"
@@ -126,19 +133,20 @@ type MultiSchoolBatchResult struct {
 // BatchCreateUsersMultiSchool 跨区域多校批量建用户（逐行成败 + 重名自动改名 + 超时保护）
 //
 // 流程：
-//   1. 前置校验(任一不过 → 返回 error，一行不建)：
-//      行数 1~2000；角色合法且在 operator/viewer 白名单。
-//   2. 收集去重 school_id，一次性 ListExistingActiveSchoolIDs 拿有效集合。
-//   3. 逐行处理(每行独立小事务)：
-//      a. ctx 超时检查 → 超时则剩余行全部记"超时未处理"并结束；
-//      b. 字段自检(用户名/姓名非空、密码≥6、school_id 非空且在有效集合内) → 不过则记 failure 跳过；
-//      c. 重名探测改名 → 拿到一个可用 username(原名或 xxx_N)；
-//      d. 开小事务建用户 + 入校 → 成功 Commit 记 created、失败 Rollback 记 failure；
-//         成功后 B4：best-effort 为该用户补开个人积分账户。
-//   4. 返回 created + failures 明细(error 恒为 nil，单行问题不抛 error)。
+//  1. 前置校验(任一不过 → 返回 error，一行不建)：
+//     行数 1~2000；角色合法且在 operator/viewer 白名单。
+//  2. 收集去重 school_id，一次性 ListExistingActiveSchoolIDs 拿有效集合。
+//  3. 逐行处理(每行独立小事务)：
+//     a. ctx 超时检查 → 超时则剩余行全部记"超时未处理"并结束；
+//     b. 字段自检(用户名/姓名非空、密码≥6、school_id 非空且在有效集合内) → 不过则记 failure 跳过；
+//     c. 重名探测改名 → 拿到一个可用 username(原名或 xxx_N)；
+//     d. 开小事务建用户 + 入校 → 成功 Commit 记 created、失败 Rollback 记 failure；
+//     成功后 B4：best-effort 为该用户补开个人积分账户。
+//  4. 返回 created + failures 明细(error 恒为 nil，单行问题不抛 error)。
 //
 // 注意：本方法不做"批内用户名查重"——跨校汇总表里重名是常态(各校各自命名)，
-//   重名交给"自动改名"处理，而非判失败。这是与单校批量(批内查重判失败)的关键差异。
+//
+//	重名交给"自动改名"处理，而非判失败。这是与单校批量(批内查重判失败)的关键差异。
 func (s *UserService) BatchCreateUsersMultiSchool(ctx context.Context, req *MultiSchoolBatchRequest) (*MultiSchoolBatchResult, error) {
 	total := len(req.Users)
 	result := &MultiSchoolBatchResult{
@@ -180,10 +188,15 @@ func (s *UserService) BatchCreateUsersMultiSchool(ctx context.Context, req *Mult
 		return result, fmt.Errorf("校验学校列表失败: %w", err)
 	}
 
-	source := req.Source
+	source := strings.TrimSpace(req.Source)
 	if source == "" {
-		source = "admin_multi_school_batch_create"
+		source = repository.SchoolMemberSourceAdminMultiSchoolBatch
 	}
+	normalizedSource, sourceErr := repository.NormalizeSchoolMemberSource(source)
+	if sourceErr != nil {
+		return result, fmt.Errorf("学校成员来源标记无效: %w", sourceErr)
+	}
+	source = normalizedSource
 
 	// ---------- 3. 逐行处理(每行独立小事务) ----------
 	for i, item := range req.Users {
@@ -292,7 +305,8 @@ func (s *UserService) BatchCreateUsersMultiSchool(ctx context.Context, req *Mult
 //   - 全部占用 → 返回 error "用户名冲突过多，请手动改名"(极端情况)。
 //
 // 注意：这里只是"探测"，存在探测通过后到真正 INSERT 之间被并发抢占的窗口，
-//   由 createOneUserInSchoolTx 的唯一约束兜底(撞约束则该行判失败)，故本函数不保证 100% 可建。
+//
+//	由 createOneUserInSchoolTx 的唯一约束兜底(撞约束则该行判失败)，故本函数不保证 100% 可建。
 func (s *UserService) resolveAvailableUsername(ctx context.Context, base string) (string, bool, error) {
 	// 先试原名
 	exists, err := repository.CheckUsernameExists(ctx, base)

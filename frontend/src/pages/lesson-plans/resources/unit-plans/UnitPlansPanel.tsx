@@ -25,6 +25,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useAuth } from '@/store/auth'
 import { useProtectedDraft } from '@/hooks/useProtectedDraft'
+import { useVoiceDraftInput } from '@/hooks/useVoiceDraftInput'
+import VoiceInputButton from '@/components/voice/VoiceInputButton'
 import { DEFAULT_SUBJECTS } from '@/constants/subjects'
 import type {
   CSSProperties,
@@ -445,6 +447,33 @@ export default function UnitPlansPanel() {
 
   const [sending, setSending] = useState(false)
   const [canEditCurrent, setCanEditCurrent] = useState(false)
+  const inputRef = useRef<HTMLTextAreaElement | null>(null)
+
+  /**
+   * 单元方案会话语音写入当前方案的受保护消息草稿。
+   *
+   * 语音识别不会附加课本内容、不会调用AI，也不会打开保存窗口；
+   * 点击“发送”后才按现有流程组合课本上下文并请求AI。
+   */
+  const unitVoice = useVoiceDraftInput({
+    value: input,
+    setValue: setInput,
+    disabled:
+      sending ||
+      !plan ||
+      !canEditCurrent,
+    maxDurationSeconds: 120,
+    onFinalFocus: (finalValue) => {
+      const element = inputRef.current
+      if (!element) return
+
+      element.focus()
+      element.setSelectionRange(
+        finalValue.length,
+        finalValue.length,
+      )
+    },
+  })
 
   /**
    * workingDraft 是当前等待保存的完整版本。
@@ -646,6 +675,10 @@ export default function UnitPlansPanel() {
   // ==================== 会话状态清理 ====================
 
   const clearSession = () => {
+    if (unitVoice.isActive) {
+      unitVoice.cancel()
+    }
+
     setPlan(null)
     setMessages([])
     setCanEditCurrent(false)
@@ -766,7 +799,8 @@ export default function UnitPlansPanel() {
     if (
       !plan ||
       !input.trim() ||
-      sending
+      sending ||
+      unitVoice.isActive
     ) {
       return
     }
@@ -1129,10 +1163,15 @@ export default function UnitPlansPanel() {
 
           <button
             onClick={() => setShowMaterials(true)}
+            disabled={unitVoice.isActive}
             style={{
               ...btnGhost,
               color: '#7C3AED',
               fontWeight: 600,
+              opacity: unitVoice.isActive ? 0.5 : 1,
+              cursor: unitVoice.isActive
+                ? 'not-allowed'
+                : 'pointer',
             }}
           >
             📚 本单元资料
@@ -1140,14 +1179,28 @@ export default function UnitPlansPanel() {
 
           <button
             onClick={() => setShowTextbookPicker(true)}
-            style={btnTextbook}
+            disabled={unitVoice.isActive}
+            style={{
+              ...btnTextbook,
+              opacity: unitVoice.isActive ? 0.5 : 1,
+              cursor: unitVoice.isActive
+                ? 'not-allowed'
+                : 'pointer',
+            }}
           >
             📷 上传/选择课本
           </button>
 
           <button
             onClick={openSave}
-            style={btnPrimary}
+            disabled={unitVoice.isActive}
+            style={{
+              ...btnPrimary,
+              opacity: unitVoice.isActive ? 0.5 : 1,
+              cursor: unitVoice.isActive
+                ? 'not-allowed'
+                : 'pointer',
+            }}
           >
             {isRevisionMode
               ? '💾 保存本次优化'
@@ -1314,6 +1367,7 @@ export default function UnitPlansPanel() {
           }}
         >
           <textarea
+            ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
@@ -1332,6 +1386,10 @@ export default function UnitPlansPanel() {
                 : '确认 / 补充 / 让架构师按你的意见改这一步…（Enter 发送，Shift+Enter 换行）'
             }
             rows={2}
+            disabled={
+              sending ||
+              unitVoice.isActive
+            }
             style={{
               ...inputStyle,
               resize: 'vertical',
@@ -1339,19 +1397,64 @@ export default function UnitPlansPanel() {
             }}
           />
 
+          <VoiceInputButton
+            status={unitVoice.status}
+            isSupported={unitVoice.isSupported}
+            elapsedSeconds={unitVoice.elapsedSeconds}
+            disabled={
+              sending ||
+              !plan ||
+              !canEditCurrent
+            }
+            error={unitVoice.error}
+            onStart={unitVoice.begin}
+            onStop={unitVoice.stop}
+            onCancel={unitVoice.cancel}
+          />
+
           <button
             onClick={doSend}
-            disabled={sending || !input.trim()}
+            disabled={
+              sending ||
+              unitVoice.isActive ||
+              !input.trim()
+            }
             style={{
               ...btnPrimary,
               opacity:
-                sending || !input.trim()
+                sending ||
+                unitVoice.isActive ||
+                !input.trim()
                   ? 0.5
                   : 1,
+              cursor:
+                sending ||
+                unitVoice.isActive ||
+                !input.trim()
+                  ? 'not-allowed'
+                  : 'pointer',
             }}
           >
             发送
           </button>
+        </div>
+
+        <div
+          style={{
+            marginTop: 6,
+            color:
+              unitVoice.status === 'error'
+                ? '#DC2626'
+                : unitVoice.isActive
+                  ? C.primary
+                  : C.textMuted,
+            fontSize: 11,
+            lineHeight: 1.5,
+            textAlign: 'center',
+          }}
+        >
+          {unitVoice.statusText ||
+            '点击麦克风可语音补充方案；识别文字不会自动发送'}
         </div>
 
         {/* 保存弹窗 */}

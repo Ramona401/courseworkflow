@@ -1,113 +1,412 @@
 package routes
 
-// routes_credit_policy.go — 积分策略路由注册
+// routes_credit_policy.go — 积分策略及价格同步路由。
 //
-// v129 新增（积分机制融合 · 对齐AOCI精确积分计算）
-// v129.1 修改：所有策略接口仅admin可访问
-//   - 策略列表/系统策略/学校策略（admin only）
-//   - 模型单价管理（admin only）
-//   - 模型积分预览/模拟计算（admin only）
+// 全部接口属于积分成本和模型价格配置能力，仅超级管理员可访问。
 //
-// 超管收口（本批）：本文件全部路由属"积分金融命脉配置"（策略/模型单价/预览/模拟），
-//   从 adminOnly 整体收紧为超管专属——每条 Chain 末尾追加 superAdmin(SuperAdminOnly)，
-//   二线管理员(admin 但 is_super=false)被拦。学校策略 DELETE 分支内层原有的
-//   Role != roleAdmin 判定同步收紧为 || !claims.IsSuper，保持与外层中间件语义一致。
-//   本文件无"查询下放低权限"的情况（全部本就 adminOnly），故整条收口不会误伤任何角色。
+// 价格同步服务使用主路由传入的同一份运行配置构造，避免再次加载.env。
+// 调度器启动仍严格受以下条件控制：
+//   - 主配置DisableSchedulers必须为false；
+//   - 数据库price_sync_enabled必须为true；
+//   - 单个价格目标auto_sync_enabled必须为true。
 //
-// 路由前缀：/api/v1/tokens/credit-policies/ 和 /api/v1/tokens/model-prices/
+// 本文件不参与图片、视频或TTS业务结算。
 
 import (
 	"net/http"
+
+	"tedna/internal/config"
 	"tedna/internal/handlers"
 	"tedna/internal/middleware"
+	"tedna/internal/services"
 )
 
-// registerCreditPolicyRoutes 注册积分策略路由
+// registerCreditPolicyRoutes 注册积分策略及价格同步路由。
 func registerCreditPolicyRoutes(
 	mux *http.ServeMux,
 	authMW func(http.Handler) http.Handler,
 	adminOnly func(http.Handler) http.Handler,
 	handler *handlers.CreditPolicyHandler,
+	cfg *config.Config,
 ) {
-	// 超管收口：超管专属中间件（在 adminOnly 之上再收一层 is_super=true）。
-	// 函数内自建，不改函数签名（routes.go 调用处零改动）。
 	superAdmin := middleware.SuperAdminOnly()
 
-	// ========== 策略列表（超管 only）==========
-	mux.Handle("/api/v1/tokens/credit-policies",
-		middleware.Chain(http.HandlerFunc(handler.ListPolicies), authMW, adminOnly, superAdmin))
+	secure := func(
+		handler http.Handler,
+	) http.Handler {
+		return middleware.Chain(
+			handler,
+			authMW,
+			adminOnly,
+			superAdmin,
+		)
+	}
 
-	// ========== 系统策略（超管 only）==========
-	mux.Handle("/api/v1/tokens/credit-policies/system",
-		middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.Method {
-			case http.MethodGet:
-				handler.GetSystemPolicy(w, r)
-			case http.MethodPut:
-				handler.UpdateSystemPolicy(w, r)
-			default:
-				methodNotAllowedJSON(w, "仅支持GET/PUT请求")
-			}
-		}), authMW, adminOnly, superAdmin))
+	// cfg由Setup统一加载并注入。价格同步Handler和调度器共享同一个
+	// PriceSyncService实例，确保AES密钥和DisableSchedulers口径一致。
+	priceSyncService := services.NewPriceSyncService(cfg)
+	priceSyncHandler := handlers.NewPriceSyncHandler(
+		priceSyncService,
+	)
 
-	// ========== 学校策略（超管 only）==========
-	mux.Handle("/api/v1/tokens/credit-policies/school/",
-		middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.Method {
-			case http.MethodGet:
-				handler.GetSchoolPolicy(w, r)
-			case http.MethodPut:
-				handler.UpdateSchoolPolicy(w, r)
-			case http.MethodDelete:
-				// 删除仅超管（原 Role==admin，收紧为 is_super；与外层 superAdmin 中间件语义一致）
-				claims, _ := middleware.GetClaims(r.Context())
-				if claims == nil || claims.Role != roleAdmin || !claims.IsSuper {
-					forbiddenJSON(w, "仅超级管理员可删除学校策略")
-					return
-				}
-				handler.DeleteSchoolPolicy(w, r)
-			default:
-				methodNotAllowedJSON(w, "仅支持GET/PUT/DELETE请求")
-			}
-		}), authMW, adminOnly, superAdmin))
+	if cfg != nil && !cfg.DisableSchedulers {
+		priceSyncService.StartScheduler()
+	}
 
-	// ========== 模型单价管理（超管 only）==========
-	mux.Handle("/api/v1/tokens/model-prices",
-		middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.Method {
-			case http.MethodGet:
-				handler.ListModelPrices(w, r)
-			case http.MethodPost:
-				handler.CreateModelPrice(w, r)
-			default:
-				methodNotAllowedJSON(w, "仅支持GET/POST请求")
-			}
-		}), authMW, adminOnly, superAdmin))
+	// ==================== 积分策略 ====================
 
-	// ========== 模型单价更新/删除（超管 only）==========
-	mux.Handle("/api/v1/tokens/model-prices/",
-		middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.Method {
-			case http.MethodPut:
-				handler.UpdateModelPrice(w, r)
-			case http.MethodDelete:
-				handler.DeleteModelPrice(w, r)
-			default:
-				methodNotAllowedJSON(w, "仅支持PUT/DELETE请求")
-			}
-		}), authMW, adminOnly, superAdmin))
+	mux.Handle(
+		"/api/v1/tokens/credit-policies",
+		secure(
+			http.HandlerFunc(
+				handler.ListPolicies,
+			),
+		),
+	)
 
-	// ========== 模型积分预览（超管 only）==========
-	mux.Handle("/api/v1/tokens/model-previews",
-		middleware.Chain(http.HandlerFunc(handler.GetModelPreviews), authMW, adminOnly, superAdmin))
+	mux.Handle(
+		"/api/v1/tokens/credit-policies/system",
+		secure(
+			http.HandlerFunc(
+				func(
+					writer http.ResponseWriter,
+					request *http.Request,
+				) {
+					switch request.Method {
+					case http.MethodGet:
+						handler.GetSystemPolicy(
+							writer,
+							request,
+						)
 
-	// ========== 积分模拟计算（超管 only）==========
-	mux.Handle("/api/v1/tokens/simulate",
-		middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost {
-				methodNotAllowedJSON(w, "仅支持POST请求")
-				return
-			}
-			handler.Simulate(w, r)
-		}), authMW, adminOnly, superAdmin))
+					case http.MethodPut:
+						handler.UpdateSystemPolicy(
+							writer,
+							request,
+						)
+
+					default:
+						methodNotAllowedJSON(
+							writer,
+							"仅支持GET/PUT请求",
+						)
+					}
+				},
+			),
+		),
+	)
+
+	mux.Handle(
+		"/api/v1/tokens/credit-policies/school/",
+		secure(
+			http.HandlerFunc(
+				func(
+					writer http.ResponseWriter,
+					request *http.Request,
+				) {
+					switch request.Method {
+					case http.MethodGet:
+						handler.GetSchoolPolicy(
+							writer,
+							request,
+						)
+
+					case http.MethodPut:
+						handler.UpdateSchoolPolicy(
+							writer,
+							request,
+						)
+
+					case http.MethodDelete:
+						claims, _ :=
+							middleware.GetClaims(
+								request.Context(),
+							)
+
+						if claims == nil ||
+							claims.Role != roleAdmin ||
+							!claims.IsSuper {
+							forbiddenJSON(
+								writer,
+								"仅超级管理员可删除学校策略",
+							)
+							return
+						}
+
+						handler.DeleteSchoolPolicy(
+							writer,
+							request,
+						)
+
+					default:
+						methodNotAllowedJSON(
+							writer,
+							"仅支持GET/PUT/DELETE请求",
+						)
+					}
+				},
+			),
+		),
+	)
+
+	// ==================== 模型价格管理 ====================
+
+	mux.Handle(
+		"/api/v1/tokens/model-prices",
+		secure(
+			http.HandlerFunc(
+				func(
+					writer http.ResponseWriter,
+					request *http.Request,
+				) {
+					switch request.Method {
+					case http.MethodGet:
+						handler.ListModelPrices(
+							writer,
+							request,
+						)
+
+					case http.MethodPost:
+						handler.CreateModelPrice(
+							writer,
+							request,
+						)
+
+					default:
+						methodNotAllowedJSON(
+							writer,
+							"仅支持GET/POST请求",
+						)
+					}
+				},
+			),
+		),
+	)
+
+	mux.Handle(
+		"/api/v1/tokens/model-prices/",
+		secure(
+			http.HandlerFunc(
+				func(
+					writer http.ResponseWriter,
+					request *http.Request,
+				) {
+					switch request.Method {
+					case http.MethodPut:
+						handler.UpdateModelPrice(
+							writer,
+							request,
+						)
+
+					case http.MethodDelete:
+						handler.DeleteModelPrice(
+							writer,
+							request,
+						)
+
+					default:
+						methodNotAllowedJSON(
+							writer,
+							"仅支持PUT/DELETE请求",
+						)
+					}
+				},
+			),
+		),
+	)
+
+	mux.Handle(
+		"/api/v1/tokens/model-previews",
+		secure(
+			http.HandlerFunc(
+				handler.GetModelPreviews,
+			),
+		),
+	)
+
+	mux.Handle(
+		"/api/v1/tokens/simulate",
+		secure(
+			http.HandlerFunc(
+				func(
+					writer http.ResponseWriter,
+					request *http.Request,
+				) {
+					if request.Method != http.MethodPost {
+						methodNotAllowedJSON(
+							writer,
+							"仅支持POST请求",
+						)
+						return
+					}
+
+					handler.Simulate(
+						writer,
+						request,
+					)
+				},
+			),
+		),
+	)
+
+	// ==================== 价格同步配置 ====================
+
+	mux.Handle(
+		"/api/v1/tokens/price-sync/settings",
+		secure(
+			http.HandlerFunc(
+				func(
+					writer http.ResponseWriter,
+					request *http.Request,
+				) {
+					switch request.Method {
+					case http.MethodGet:
+						priceSyncHandler.GetSettings(
+							writer,
+							request,
+						)
+
+					case http.MethodPut:
+						priceSyncHandler.UpdateSettings(
+							writer,
+							request,
+						)
+
+					default:
+						methodNotAllowedJSON(
+							writer,
+							"仅支持GET/PUT请求",
+						)
+					}
+				},
+			),
+		),
+	)
+
+	mux.Handle(
+		"/api/v1/tokens/price-sync/targets/",
+		secure(
+			http.HandlerFunc(
+				func(
+					writer http.ResponseWriter,
+					request *http.Request,
+				) {
+					if request.Method != http.MethodPut {
+						methodNotAllowedJSON(
+							writer,
+							"仅支持PUT请求",
+						)
+						return
+					}
+
+					priceSyncHandler.UpdateTarget(
+						writer,
+						request,
+					)
+				},
+			),
+		),
+	)
+
+	// ==================== 价格同步执行 ====================
+
+	mux.Handle(
+		"/api/v1/tokens/price-sync/preview",
+		secure(
+			http.HandlerFunc(
+				func(
+					writer http.ResponseWriter,
+					request *http.Request,
+				) {
+					if request.Method != http.MethodPost {
+						methodNotAllowedJSON(
+							writer,
+							"仅支持POST请求",
+						)
+						return
+					}
+
+					priceSyncHandler.Preview(
+						writer,
+						request,
+					)
+				},
+			),
+		),
+	)
+
+	mux.Handle(
+		"/api/v1/tokens/price-sync/apply",
+		secure(
+			http.HandlerFunc(
+				func(
+					writer http.ResponseWriter,
+					request *http.Request,
+				) {
+					if request.Method != http.MethodPost {
+						methodNotAllowedJSON(
+							writer,
+							"仅支持POST请求",
+						)
+						return
+					}
+
+					priceSyncHandler.Apply(
+						writer,
+						request,
+					)
+				},
+			),
+		),
+	)
+
+	mux.Handle(
+		"/api/v1/tokens/price-sync/runs",
+		secure(
+			http.HandlerFunc(
+				func(
+					writer http.ResponseWriter,
+					request *http.Request,
+				) {
+					if request.Method != http.MethodGet {
+						methodNotAllowedJSON(
+							writer,
+							"仅支持GET请求",
+						)
+						return
+					}
+
+					priceSyncHandler.ListRuns(
+						writer,
+						request,
+					)
+				},
+			),
+		),
+	)
+
+	mux.Handle(
+		"/api/v1/tokens/price-sync/runs/",
+		secure(
+			http.HandlerFunc(
+				func(
+					writer http.ResponseWriter,
+					request *http.Request,
+				) {
+					if request.Method != http.MethodGet {
+						methodNotAllowedJSON(
+							writer,
+							"仅支持GET请求",
+						)
+						return
+					}
+
+					priceSyncHandler.GetRunDetail(
+						writer,
+						request,
+					)
+				},
+			),
+		),
+	)
 }

@@ -15,6 +15,8 @@ import {
   startAssessment, chatAssessment, submitAssessment, skipAssessment,
   type AssessmentMessage, type AssessmentStartResponse, type AssessmentChatResponse,
 } from '@/api/assessment'
+import { useVoiceDraftInput } from '@/hooks/useVoiceDraftInput'
+import VoiceInputButton from '@/components/voice/VoiceInputButton'
 
 // ==================== 样式常量 ====================
 const C = {
@@ -61,6 +63,34 @@ export default function AssessmentPage() {
   const [resultRecipeId, setResultRecipeId] = useState<string | null>(null)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  /**
+   * 前测语音只填写当前回答。
+   *
+   * 最终识别文字不会自动发送，也不会自动提交风格画像；
+   * 识别失败时恢复录音开始前的回答内容。
+   */
+  const voiceInput = useVoiceDraftInput({
+    value: inputText,
+    setValue: setInputText,
+    disabled:
+      phase !== 'chatting' ||
+      isThinking ||
+      skipLoading,
+    maxDurationSeconds: 120,
+    onFinalFocus: (finalValue) => {
+      const element = inputRef.current
+      if (!element) return
+
+      element.focus()
+      element.setSelectionRange(
+        finalValue.length,
+        finalValue.length,
+      )
+    },
+    onError: setError,
+  })
 
   // 自动滚动到底部
   useEffect(() => {
@@ -98,7 +128,12 @@ export default function AssessmentPage() {
 
   // ==================== 发送消息 ====================
   const handleSend = async () => {
-    if (!inputText.trim() || isThinking || phase !== 'chatting') return
+    if (
+      !inputText.trim() ||
+      isThinking ||
+      voiceInput.isActive ||
+      phase !== 'chatting'
+    ) return
 
     const userMsg: AssessmentMessage = {
       role: 'user',
@@ -160,7 +195,7 @@ export default function AssessmentPage() {
 
   // ==================== 跳过前测 ====================
   const handleSkip = async () => {
-    if (skipLoading) return
+    if (skipLoading || voiceInput.isActive) return
     setSkipLoading(true)
     try {
       const resp = await skipAssessment()
@@ -247,7 +282,11 @@ export default function AssessmentPage() {
           </div>
           <button
             onClick={handleSkip}
-            disabled={skipLoading || phase === 'submitting'}
+            disabled={
+              skipLoading ||
+              phase === 'submitting' ||
+              voiceInput.isActive
+            }
             style={{
               padding: '6px 16px', borderRadius: '8px',
               border: `1px solid ${C.border}`, background: 'transparent',
@@ -339,6 +378,7 @@ export default function AssessmentPage() {
           border: `1px solid ${C.border}`, padding: '10px 12px',
         }}>
           <textarea
+            ref={inputRef}
             value={inputText}
             onChange={e => setInputText(e.target.value)}
             onKeyDown={e => {
@@ -349,7 +389,11 @@ export default function AssessmentPage() {
             }}
             placeholder="请回答上面的问题... (Enter发送)"
             rows={2}
-            disabled={phase === 'submitting' || isThinking}
+            disabled={
+              phase === 'submitting' ||
+              isThinking ||
+              voiceInput.isActive
+            }
             style={{
               flex: 1, background: 'transparent', border: 'none', outline: 'none',
               fontSize: '15px', color: C.text, resize: 'none',
@@ -357,13 +401,39 @@ export default function AssessmentPage() {
               opacity: phase === 'submitting' ? 0.5 : 1,
             }}
           />
+          <VoiceInputButton
+            status={voiceInput.status}
+            isSupported={voiceInput.isSupported}
+            elapsedSeconds={voiceInput.elapsedSeconds}
+            disabled={
+              phase !== 'chatting' ||
+              isThinking ||
+              skipLoading
+            }
+            error={voiceInput.error}
+            onStart={voiceInput.begin}
+            onStop={voiceInput.stop}
+            onCancel={voiceInput.cancel}
+          />
+
           <button
             onClick={handleSend}
-            disabled={!inputText.trim() || isThinking || phase === 'submitting'}
+            disabled={
+              !inputText.trim() ||
+              isThinking ||
+              voiceInput.isActive ||
+              phase === 'submitting'
+            }
             style={{
               width: '36px', height: '36px', flexShrink: 0, borderRadius: '50%',
               border: 'none',
-              background: !inputText.trim() || isThinking || phase === 'submitting' ? '#E5E7EB' : C.primary,
+              background:
+                !inputText.trim() ||
+                isThinking ||
+                voiceInput.isActive ||
+                phase === 'submitting'
+                  ? '#E5E7EB'
+                  : C.primary,
               color: '#fff', cursor: 'pointer', fontSize: '16px',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
             }}
@@ -372,7 +442,8 @@ export default function AssessmentPage() {
           </button>
         </div>
         <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '8px', textAlign: 'center' }}>
-          💡 这是一次轻松的对话，帮助AI了解您的备课习惯，大约需要2-3分钟
+          {voiceInput.statusText ||
+            '💡 点击麦克风可语音回答；识别文字不会自动发送。整个前测大约需要2-3分钟'}
         </div>
       </div>
     </div>

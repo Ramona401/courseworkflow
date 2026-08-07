@@ -3,28 +3,28 @@ package services
 // courseware_review_service.go
 //
 // 课件多级审核核心写业务：
-//   - 作者提交课件审核；
-//   - L1 教研组审核；
-//   - L2 学校审核；
+//
+//   - 作者首次提交或退回后重新提交课件；
+//   - L1教研组审核；
+//   - L2学校审核；
 //   - 审核状态流转；
 //   - 审核结果通知。
 //
-// 待审列表、统计、审核历史、已审核记录和审核详情已经拆至：
-//   courseware_review_query_service.go
+// L1/L2权限判断、AI反馈装配和原子审核决定位于：
+// courseware_review_decision_service.go。
 //
-// 权限裁决辅助方法位于：
-//   courseware_review_access.go
+// 通知旁路位于courseware_review_notify.go。
 //
-// 通知旁路位于：
-//   courseware_review_notify.go
+// V1.3重新提交边界：
 //
-// 上下文 6 不扩大区域管理员审核决策权：
-//   region_admin 只拥有辖区同域审核查看权限，不能执行 L1 或 L2 决策。
+//   - 课件状态更新和旧问题复审轮次登记必须位于同一事务；
+//   - 未解决的正式问题保留原问题身份；
+//   - 问题重新进入它原本所属的审核级别；
+//   - 页面修改成功不自动表示问题已经解决。
 
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"tedna/internal/logger"
 	"tedna/internal/models"
@@ -37,27 +37,39 @@ var (
 	ErrCWReviewCoursewareNotFound = errors.New(
 		"课件不存在",
 	)
+
 	ErrCWReviewNotSubmitted = errors.New(
 		"只有已提交审核的课件可以审核",
 	)
+
 	ErrCWReviewNotL2Status = errors.New(
 		"该课件不在L2待审核状态",
 	)
+
 	ErrCWReviewNoPermission = errors.New(
 		"您没有审核此课件的权限",
 	)
+
 	ErrCWReviewInvalidDecision = errors.New(
 		"审核决策无效，可选值：approved/revision",
 	)
+
+	ErrCWReviewFeedbackInvalid = errors.New(
+		"课件AI审核反馈参数无效或已发生变化",
+	)
+
 	ErrCWSubmitNotOwner = errors.New(
 		"只有课件作者本人可以提交审核",
 	)
+
 	ErrCWSubmitNotReady = errors.New(
 		"课件尚未生成完成，请先完成课件（至少进入预览阶段）再提交审核",
 	)
+
 	ErrCWSubmitWrongState = errors.New(
-		"当前状态不可提交审核（仅私有/个人发布/已退回的课件可提交）",
+		"当前状态不可提交审核（仅私有、个人发布或已退回的课件可提交）",
 	)
+
 	ErrCWSubmitNoSchool = errors.New(
 		"无法确定您所属的学校，请联系管理员配置组织归属后再提交审核",
 	)
@@ -77,20 +89,7 @@ func NewCoursewareReviewService() *CoursewareReviewService {
 
 // ==================== 提交审核 ====================
 
-// SubmitForReview 作者提交课件进入审核流程。
-//
-// 前置条件：
-//   - Actor 已认证且具有确定教育域；
-//   - 只有课件作者本人可以提交；
-//   - 课件至少进入 preview 阶段；
-//   - publish_state 为 private、published_personal 或 revision；
-//   - 能够确定作者所属学校。
-//
-// 成功后：
-//
-//	publish_state=submitted
-//	review_level=0
-//	review_school_id=作者学校
+// SubmitForReview 作者首次提交或退回后重新提交课件。
 func (s *CoursewareReviewService) SubmitForReview(
 	ctx context.Context,
 	coursewareID string,
@@ -101,11 +100,10 @@ func (s *CoursewareReviewService) SubmitForReview(
 		return ErrCoursewareActorRequired
 	}
 
-	courseware, err :=
-		repository.GetCoursewareByID(
-			ctx,
-			coursewareID,
-		)
+	courseware, err := repository.GetCoursewareByID(
+		ctx,
+		coursewareID,
+	)
 	if err != nil {
 		return ErrCWReviewCoursewareNotFound
 	}
@@ -121,8 +119,13 @@ func (s *CoursewareReviewService) SubmitForReview(
 		return ErrCWSubmitNotOwner
 	}
 
-	if models.CoursewareStatusOrder[courseware.Status] <
-		models.CoursewareStatusOrder[models.CoursewareStatusPreview] {
+	currentStatusOrder :=
+		models.CoursewareStatusOrder[courseware.Status]
+
+	previewStatusOrder :=
+		models.CoursewareStatusOrder[models.CoursewareStatusPreview]
+
+	if currentStatusOrder < previewStatusOrder {
 		return ErrCWSubmitNotReady
 	}
 
@@ -134,23 +137,50 @@ func (s *CoursewareReviewService) SubmitForReview(
 		return ErrCWSubmitWrongState
 	}
 
-	schoolID, _ :=
-		repository.GetSchoolIDByUserID(
-			ctx,
-			actor.UserID,
-		)
+	schoolID, _ := repository.GetSchoolIDByUserID(
+		ctx,
+		actor.UserID,
+	)
 	if schoolID == "" {
 		return ErrCWSubmitNoSchool
 	}
 
-	if err := repository.UpdateCoursewarePublishState(
-		ctx,
-		coursewareID,
-		models.CWPublishSubmitted,
-		0,
-		&schoolID,
-	); err != nil {
-		return err
+	result, err :=
+		repository.CommitCoursewareReviewSubmission(
+			ctx,
+			coursewareID,
+			actor.UserID,
+			schoolID,
+		)
+	if err != nil {
+		switch {
+		case errors.Is(
+			err,
+			repository.ErrCWReviewSubmissionCoursewareNotFound,
+		):
+			return ErrCWReviewCoursewareNotFound
+
+		case errors.Is(
+			err,
+			repository.ErrCWReviewSubmissionOwnerMismatch,
+		):
+			return ErrCWSubmitNotOwner
+
+		case errors.Is(
+			err,
+			repository.ErrCWReviewSubmissionStateConflict,
+		):
+			return ErrCWSubmitWrongState
+
+		default:
+			return err
+		}
+	}
+
+	var carryoverCount int64
+	if result != nil {
+		carryoverCount =
+			result.CarryoverItemCount
 	}
 
 	cwReviewLog.Info(
@@ -163,6 +193,8 @@ func (s *CoursewareReviewService) SubmitForReview(
 		schoolID,
 		"education_domain",
 		courseware.EducationDomain,
+		"carryover_review_item_count",
+		carryoverCount,
 	)
 
 	s.notifyL1ReviewersOnSubmit(
@@ -173,364 +205,36 @@ func (s *CoursewareReviewService) SubmitForReview(
 	return nil
 }
 
-// ==================== L1 教研组审核 ====================
+// ==================== L1 / L2 审核 ====================
 
-// ReviewL1 执行课件 L1 审核。
-//
-// 权限阶梯：
-//   - admin；
-//   - 审核学校的 senior_operator；
-//   - 作者所在教研组的 lead/backbone。
-//
-// region_admin 不在决策权限阶梯中。
+// ReviewL1 执行课件L1审核。
 func (s *CoursewareReviewService) ReviewL1(
 	ctx context.Context,
 	coursewareID string,
 	actor *CoursewareActorContext,
 	req *models.CWReviewDecisionRequest,
 ) error {
-	if actor == nil ||
-		actor.UserID == "" {
-		return ErrCoursewareActorRequired
-	}
-
-	courseware, err :=
-		repository.GetCoursewareByID(
-			ctx,
-			coursewareID,
-		)
-	if err != nil {
-		return ErrCWReviewCoursewareNotFound
-	}
-
-	if err := ValidateCoursewareReviewEducationDomain(
-		actor,
-		courseware,
-	); err != nil {
-		return err
-	}
-
-	if courseware.PublishState !=
-		models.CWPublishSubmitted ||
-		courseware.ReviewLevel != 0 {
-		return ErrCWReviewNotSubmitted
-	}
-
-	reviewerID := actor.UserID
-	reviewerRole := actor.Role
-
-	allowed := reviewerRole == models.RoleAdmin
-
-	if !allowed &&
-		reviewerRole == models.RoleSeniorOperator {
-		allowed = s.isSeniorOfReviewSchool(
-			ctx,
-			courseware,
-			reviewerID,
-		)
-	}
-
-	if !allowed {
-		hasPermission, permissionErr :=
-			s.isReviewerInAuthorGroupAsLeadOrBackbone(
-				ctx,
-				courseware.UserID,
-				reviewerID,
-			)
-		if permissionErr != nil {
-			return fmt.Errorf(
-				"校验审核权限失败: %w",
-				permissionErr,
-			)
-		}
-
-		allowed = hasPermission
-	}
-
-	if !allowed {
-		return ErrCWReviewNoPermission
-	}
-
-	if req == nil ||
-		(req.Decision !=
-			models.ReviewDecisionApproved &&
-			req.Decision !=
-				models.ReviewDecisionRevision) {
-		return ErrCWReviewInvalidDecision
-	}
-
-	existingCount, _ :=
-		repository.CountCoursewareReviewsByLevel(
-			ctx,
-			coursewareID,
-			models.ReviewLevelL1,
-		)
-	round := existingCount + 1
-
-	review := &models.CoursewareReview{
-		CoursewareID: coursewareID,
-		ReviewLevel:  models.ReviewLevelL1,
-		ReviewerID:   reviewerID,
-		Decision:     req.Decision,
-		Score:        req.Score,
-		Comment:      req.Comment,
-		Dimensions:   req.Dimensions,
-		ReviewRound:  round,
-	}
-
-	if err := repository.CreateCoursewareReview(
+	return s.reviewCoursewareAtLevel(
 		ctx,
-		review,
-	); err != nil {
-		return err
-	}
-
-	switch req.Decision {
-	case models.ReviewDecisionApproved:
-		schoolID := s.resolveReviewSchoolID(
-			ctx,
-			courseware,
-		)
-
-		var schoolIDPtr *string
-		if schoolID != "" {
-			schoolIDPtr = &schoolID
-		}
-
-		needL2 := false
-		if schoolID != "" {
-			config, configErr :=
-				repository.GetReviewFlowConfig(
-					ctx,
-					schoolID,
-				)
-			if configErr == nil &&
-				config.L2Enabled {
-				needL2 = true
-			}
-		}
-
-		if needL2 {
-			_ = repository.UpdateCoursewarePublishState(
-				ctx,
-				coursewareID,
-				models.CWPublishSubmitted,
-				models.ReviewLevelL1,
-				schoolIDPtr,
-			)
-
-			cwReviewLog.Info(
-				"课件L1审核通过，进入L2",
-				"courseware_id",
-				coursewareID,
-				"school_id",
-				schoolID,
-				"round",
-				round,
-			)
-		} else {
-			_ = repository.UpdateCoursewarePublishState(
-				ctx,
-				coursewareID,
-				models.CWPublishApproved,
-				models.ReviewLevelL1,
-				schoolIDPtr,
-			)
-
-			cwReviewLog.Info(
-				"课件L1审核通过，直接终审",
-				"courseware_id",
-				coursewareID,
-				"round",
-				round,
-			)
-
-			s.notifyAuthorReviewResult(
-				ctx,
-				courseware,
-				reviewerID,
-				models.ReviewDecisionApproved,
-				"",
-			)
-		}
-
-	case models.ReviewDecisionRevision:
-		_ = repository.UpdateCoursewarePublishState(
-			ctx,
-			coursewareID,
-			models.CWPublishRevision,
-			0,
-			nil,
-		)
-
-		cwReviewLog.Info(
-			"课件L1审核退回",
-			"courseware_id",
-			coursewareID,
-			"round",
-			round,
-		)
-
-		s.notifyAuthorReviewResult(
-			ctx,
-			courseware,
-			reviewerID,
-			models.ReviewDecisionRevision,
-			req.Comment,
-		)
-	}
-
-	return nil
+		coursewareID,
+		actor,
+		req,
+		models.ReviewLevelL1,
+	)
 }
 
-// ==================== L2 学校审核 ====================
-
-// ReviewL2 执行课件 L2 审核。
-//
-// 只有 admin 或审核学校的 senior_operator 可以执行。
+// ReviewL2 执行课件L2审核。
 func (s *CoursewareReviewService) ReviewL2(
 	ctx context.Context,
 	coursewareID string,
 	actor *CoursewareActorContext,
 	req *models.CWReviewDecisionRequest,
 ) error {
-	if actor == nil ||
-		actor.UserID == "" {
-		return ErrCoursewareActorRequired
-	}
-
-	courseware, err :=
-		repository.GetCoursewareByID(
-			ctx,
-			coursewareID,
-		)
-	if err != nil {
-		return ErrCWReviewCoursewareNotFound
-	}
-
-	if err := ValidateCoursewareReviewEducationDomain(
-		actor,
-		courseware,
-	); err != nil {
-		return err
-	}
-
-	if courseware.PublishState !=
-		models.CWPublishSubmitted ||
-		courseware.ReviewLevel !=
-			models.ReviewLevelL1 {
-		return ErrCWReviewNotL2Status
-	}
-
-	reviewerID := actor.UserID
-	reviewerRole := actor.Role
-
-	if reviewerRole !=
-		models.RoleSeniorOperator &&
-		reviewerRole !=
-			models.RoleAdmin {
-		return ErrCWReviewNoPermission
-	}
-
-	if reviewerRole == models.RoleSeniorOperator {
-		school, schoolErr :=
-			repository.GetSchoolByAdminUserID(
-				ctx,
-				reviewerID,
-			)
-		if schoolErr != nil ||
-			courseware.ReviewSchoolID == nil ||
-			*courseware.ReviewSchoolID !=
-				school.ID {
-			return ErrCWReviewNoPermission
-		}
-	}
-
-	if req == nil ||
-		(req.Decision !=
-			models.ReviewDecisionApproved &&
-			req.Decision !=
-				models.ReviewDecisionRevision) {
-		return ErrCWReviewInvalidDecision
-	}
-
-	existingCount, _ :=
-		repository.CountCoursewareReviewsByLevel(
-			ctx,
-			coursewareID,
-			models.ReviewLevelL2,
-		)
-	round := existingCount + 1
-
-	review := &models.CoursewareReview{
-		CoursewareID: coursewareID,
-		ReviewLevel:  models.ReviewLevelL2,
-		ReviewerID:   reviewerID,
-		Decision:     req.Decision,
-		Score:        req.Score,
-		Comment:      req.Comment,
-		Dimensions:   req.Dimensions,
-		ReviewRound:  round,
-	}
-
-	if err := repository.CreateCoursewareReview(
+	return s.reviewCoursewareAtLevel(
 		ctx,
-		review,
-	); err != nil {
-		return err
-	}
-
-	switch req.Decision {
-	case models.ReviewDecisionApproved:
-		_ = repository.UpdateCoursewarePublishState(
-			ctx,
-			coursewareID,
-			models.CWPublishApproved,
-			models.ReviewLevelL2,
-			courseware.ReviewSchoolID,
-		)
-
-		cwReviewLog.Info(
-			"课件L2审核通过",
-			"courseware_id",
-			coursewareID,
-			"round",
-			round,
-		)
-
-		s.notifyAuthorReviewResult(
-			ctx,
-			courseware,
-			reviewerID,
-			models.ReviewDecisionApproved,
-			"",
-		)
-
-	case models.ReviewDecisionRevision:
-		_ = repository.UpdateCoursewarePublishState(
-			ctx,
-			coursewareID,
-			models.CWPublishRevision,
-			0,
-			nil,
-		)
-
-		cwReviewLog.Info(
-			"课件L2审核退回",
-			"courseware_id",
-			coursewareID,
-			"round",
-			round,
-		)
-
-		s.notifyAuthorReviewResult(
-			ctx,
-			courseware,
-			reviewerID,
-			models.ReviewDecisionRevision,
-			req.Comment,
-		)
-	}
-
-	return nil
+		coursewareID,
+		actor,
+		req,
+		models.ReviewLevelL2,
+	)
 }

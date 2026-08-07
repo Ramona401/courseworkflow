@@ -1,34 +1,58 @@
 /**
- * 课件工坊 API —— 协作层 (coursewares.collab.ts)（阶段2新建：页级批注）
+ * 课件工坊 API —— 协作层
  *
- * 页级批注：评审员/同组老师对课件某一页留意见，作者能看到、能标记已处理。
- * 镜像教案批注(annotations.ts)，挂载点从"段落号"换成"页码 page_number"。
+ * 页级批注使用稳定page_id关联课件页面：
+ *   - 页面重排后，批注继续跟随原页面；
+ *   - page_number由后端解析为页面当前页码；
+ *   - page_number_snapshot保留创建批注时的历史页码；
+ *   - 页面被删除后page_id为null，批注历史仍然保留。
  *
- * 权限(后端裁决，前端只管调用与展示)：
- *   - 写/读：能"看到"该课件的人(作者本人 / admin / 能看到该共享课件的同校同组成员)。
- *   - 删/标记：批注作者本人 / 课件作者本人 / admin。
- *
- * 经桶文件 coursewares.ts 透出，对外 import 路径不变(import { X } from '@/api/coursewares')。
+ * page_id和page_number_snapshot暂时声明为可选，
+ * 用于兼容前后端滚动部署期间尚未返回新字段的旧接口。
  */
 import apiClient from './client'
 import { extractData } from './coursewares.types'
 
 // ==================== 类型 ====================
 
-/** 课件页级批注单条（对应后端 CoursewareAnnotation） */
+/** 课件页级批注单条 */
 export interface CoursewareAnnotation {
   id: string
   courseware_id: string
-  page_number: number      // 挂在第几页
-  reviewer_id: string      // 批注人ID
-  reviewer_name: string    // 批注人显示名
-  content: string          // 批注内容
-  status: string           // pending 待处理 / resolved 已处理 / archived 已归档(阶段3用)
+
+  /**
+   * 稳定页面ID。
+   *
+   * string：页面仍存在；
+   * null：原页面已删除；
+   * undefined：滚动部署期间旧后端尚未返回该字段。
+   */
+  page_id?: string | null
+
+  /**
+   * 页面当前页码。
+   *
+   * 页面仍存在时由后端通过page_id动态解析；
+   * 页面已删除时回退为创建时页码。
+   */
+  page_number: number
+
+  /**
+   * 创建批注时的历史页码。
+   *
+   * undefined仅用于兼容尚未返回该字段的旧后端。
+   */
+  page_number_snapshot?: number
+
+  reviewer_id: string
+  reviewer_name: string
+  content: string
+  status: string
   created_at: string
   updated_at: string
 }
 
-/** 批注列表响应（前端按 page_number 分组挂到胶片条对应页） */
+/** 批注列表响应 */
 export interface CWAnnotationListResponse {
   annotations: CoursewareAnnotation[]
   total: number
@@ -36,13 +60,26 @@ export interface CWAnnotationListResponse {
 
 // ==================== API ====================
 
-/** 列出某课件的全部批注（按页号→时间排序，前端自行分组） */
-export async function listCWAnnotations(coursewareId: string): Promise<CWAnnotationListResponse> {
-  const resp = await apiClient.get('/coursewares/' + coursewareId + '/annotations')
+/**
+ * 列出某课件的全部批注。
+ *
+ * 后端按页面当前页码排序；
+ * 页面已删除时按创建时页码快照排序。
+ */
+export async function listCWAnnotations(
+  coursewareId: string,
+): Promise<CWAnnotationListResponse> {
+  const resp = await apiClient.get(
+    '/coursewares/' + coursewareId + '/annotations',
+  )
   return extractData(resp)
 }
 
-/** 在某课件某页创建一条批注 */
+/**
+ * 在当前页创建批注。
+ *
+ * 请求继续提交当前页码；后端在写入事务中解析并保存稳定page_id。
+ */
 export async function createCWAnnotation(
   coursewareId: string,
   pageNumber: number,
@@ -50,15 +87,15 @@ export async function createCWAnnotation(
 ): Promise<CoursewareAnnotation> {
   const resp = await apiClient.post(
     '/coursewares/' + coursewareId + '/annotations',
-    { page_number: pageNumber, content },
+    {
+      page_number: pageNumber,
+      content,
+    },
   )
   return extractData(resp)
 }
 
-/**
- * 标记批注处理状态（resolved 已处理 / pending 重新待处理）。
- * 注意：端点是集合级 /coursewares/annotations/{aid}/resolve（不带课件ID，避免被当 courseware_id）。
- */
+/** 标记批注已处理或重新待处理。 */
 export async function resolveCWAnnotation(
   annotationId: string,
   status: 'resolved' | 'pending',
@@ -70,11 +107,12 @@ export async function resolveCWAnnotation(
   return extractData(resp)
 }
 
-/**
- * 删除一条批注。
- * 端点同为集合级 /coursewares/annotations/{aid}（不带课件ID）。
- */
-export async function deleteCWAnnotation(annotationId: string): Promise<{ message: string }> {
-  const resp = await apiClient.delete('/coursewares/annotations/' + annotationId)
+/** 删除一条批注。 */
+export async function deleteCWAnnotation(
+  annotationId: string,
+): Promise<{ message: string }> {
+  const resp = await apiClient.delete(
+    '/coursewares/annotations/' + annotationId,
+  )
   return extractData(resp)
 }

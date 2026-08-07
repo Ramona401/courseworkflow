@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+        "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,12 +36,55 @@ import (
 // 模块日志
 var videoLog = logger.WithModule("ai_video")
 
+// VideoSubmitError 描述提交结果是否可能已被供应商受理。
+//
+// HTTP网络错误、成功响应读取失败或成功响应无法解析时，
+// 上层不得立即释放积分并自动重复提交。
+type VideoSubmitError struct {
+        Cause     error
+        Uncertain bool
+}
+
+func (err *VideoSubmitError) Error() string {
+        if err == nil ||
+                err.Cause == nil {
+                return "视频任务提交失败"
+        }
+
+        return err.Cause.Error()
+}
+
+func (err *VideoSubmitError) Unwrap() error {
+        if err == nil {
+                return nil
+        }
+
+        return err.Cause
+}
+
+// IsVideoSubmitUncertain 判断提交结果是否存在重复调用风险。
+func IsVideoSubmitUncertain(
+        err error,
+) bool {
+        var submitErr *VideoSubmitError
+
+        return errors.As(
+                err,
+                &submitErr,
+        ) &&
+                submitErr.Uncertain
+}
+
 // ==================== 请求/响应结构体 ====================
 
 // VideoGenerateRequest 视频生成请求体（豆包 contents/generations/tasks 格式）
 type VideoGenerateRequest struct {
-	Model   string              `json:"model"`             // 模型名
-	Content []VideoContentBlock `json:"content"`           // 内容块数组（文本+可选图片）
+        Model         string              `json:"model"`
+        Content       []VideoContentBlock `json:"content"`
+        Resolution    string              `json:"resolution"`
+        Ratio         string              `json:"ratio"`
+        Duration      int                 `json:"duration"`
+        GenerateAudio bool                `json:"generate_audio"`
 }
 
 // VideoContentBlock 视频生成内容块（文本或图片）
@@ -130,125 +174,331 @@ type VideoConfig struct {
 //   - prompt: 视频描述提示词
 //   - refImageURL: 参考图URL（空则纯文生视频，非空则图生视频）
 //   - traceCtx: 追踪上下文（可为nil）
-func SubmitVideoTask(ctx context.Context, cfg *VideoConfig, prompt string, refImageURL string, traceCtx *TraceContext) (*VideoSubmitResult, error) {
-	if cfg == nil {
-		return nil, fmt.Errorf("视频生成配置为空")
-	}
-	if cfg.APIBaseURL == "" || cfg.APIKey == "" {
-		return nil, fmt.Errorf("视频生成API未配置（请在AI管理中心配置图片/视频生成API地址和密钥）")
-	}
-	if cfg.Model == "" {
-		return nil, fmt.Errorf("视频生成模型未配置")
-	}
-	if prompt == "" {
-		return nil, fmt.Errorf("视频生成提示词不能为空")
-	}
+func SubmitVideoTask(
+        ctx context.Context,
+        cfg *VideoConfig,
+        prompt string,
+        refImageURL string,
+        traceCtx *TraceContext,
+) (*VideoSubmitResult, error) {
+        if cfg == nil {
+                return nil,
+                        fmt.Errorf("视频生成配置为空")
+        }
 
-	// 构建API URL
-	apiURL := strings.TrimRight(cfg.APIBaseURL, "/") + "/contents/generations/tasks"
+        if strings.TrimSpace(
+                cfg.APIBaseURL,
+        ) == "" ||
+                strings.TrimSpace(
+                        cfg.APIKey,
+                ) == "" {
+                return nil,
+                        fmt.Errorf("视频生成API未配置")
+        }
 
-	// 构建请求体：content数组
-	var contentBlocks []VideoContentBlock
+        if strings.TrimSpace(
+                cfg.Model,
+        ) == "" {
+                return nil,
+                        fmt.Errorf("视频生成模型未配置")
+        }
 
-	// 图生视频：先放图片块，再放文本块
-	if refImageURL != "" {
-		contentBlocks = append(contentBlocks, VideoContentBlock{
-			Type:     "image_url",
-			ImageURL: &VideoImageURL{URL: refImageURL},
-		})
-	}
+        prompt =
+                strings.TrimSpace(
+                        prompt,
+                )
 
-	// 文本描述块（必须有）
-	contentBlocks = append(contentBlocks, VideoContentBlock{
-		Type: "text",
-		Text: prompt,
-	})
+        refImageURL =
+                strings.TrimSpace(
+                        refImageURL,
+                )
 
-	reqBody := VideoGenerateRequest{
-		Model:   cfg.Model,
-		Content: contentBlocks,
-	}
+        if prompt == "" {
+                return nil,
+                        fmt.Errorf("视频生成提示词不能为空")
+        }
 
-	bodyJSON, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("序列化视频请求失败: %w", err)
-	}
+        apiURL :=
+                strings.TrimRight(
+                        cfg.APIBaseURL,
+                        "/",
+                ) +
+                        "/contents/generations/tasks"
 
-	videoLog.Info("提交视频生成任务",
-		"url", apiURL,
-		"model", cfg.Model,
-		"prompt_len", len(prompt),
-		"has_ref_image", refImageURL != "",
-	)
+        contentBlocks :=
+                make(
+                        []VideoContentBlock,
+                        0,
+                        2,
+                )
 
-	// 创建HTTP请求
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(bodyJSON))
-	if err != nil {
-		return nil, fmt.Errorf("创建HTTP请求失败: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+        if refImageURL != "" {
+                contentBlocks =
+                        append(
+                                contentBlocks,
+                                VideoContentBlock{
+                                        Type:
+                                                "image_url",
+                                        ImageURL:
+                                                &VideoImageURL{
+                                                        URL:
+                                                                refImageURL,
+                                                },
+                                },
+                        )
+        }
 
-	// 发送请求（30秒超时，仅提交任务不需要很长）
-	client := &http.Client{Timeout: 30 * time.Second}
-	startTime := time.Now()
-	httpResp, err := client.Do(httpReq)
-	latencyMs := time.Since(startTime).Milliseconds()
+        contentBlocks =
+                append(
+                        contentBlocks,
+                        VideoContentBlock{
+                                Type:
+                                        "text",
+                                Text:
+                                        prompt,
+                        },
+                )
 
-	if err != nil {
-		videoLog.Error("视频任务提交HTTP请求失败", "error", err, "latency_ms", latencyMs)
-		return nil, fmt.Errorf("视频任务提交失败: %w", err)
-	}
-	defer httpResp.Body.Close()
+        requestBody :=
+                VideoGenerateRequest{
+                        Model:
+                                strings.TrimSpace(
+                                        cfg.Model,
+                                ),
+                        Content:
+                                contentBlocks,
+                        Resolution:
+                                "720p",
+                        Ratio:
+                                "16:9",
+                        Duration:
+                                5,
+                        GenerateAudio:
+                                false,
+                }
 
-	// 读取响应体
-	respBody, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("读取视频任务响应失败: %w", err)
-	}
+        bodyJSON, err :=
+                json.Marshal(
+                        requestBody,
+                )
 
-	// 检查HTTP状态码
-	if httpResp.StatusCode != http.StatusOK {
-		videoLog.Error("视频任务提交API返回错误",
-			"status", httpResp.StatusCode,
-			"body", truncateStr(string(respBody), 500),
-			"latency_ms", latencyMs,
-		)
-		return nil, fmt.Errorf("视频任务提交失败(HTTP %d): %s", httpResp.StatusCode, truncateStr(string(respBody), 200))
-	}
+        if err != nil {
+                return nil,
+                        fmt.Errorf(
+                                "序列化视频请求失败: %w",
+                                err,
+                        )
+        }
 
-	// 解析响应：成功时返回 {"id": "cgt-xxx"}
-	var taskResp VideoTaskResponse
-	if err := json.Unmarshal(respBody, &taskResp); err != nil {
-		return nil, fmt.Errorf("解析视频任务响应失败: %w", err)
-	}
+        videoLog.Info(
+                "提交视频生成任务",
+                "url",
+                apiURL,
+                "model",
+                cfg.Model,
+                "prompt_len",
+                len(prompt),
+                "has_ref_image",
+                refImageURL != "",
+                "resolution",
+                requestBody.Resolution,
+                "ratio",
+                requestBody.Ratio,
+                "duration",
+                requestBody.Duration,
+                "generate_audio",
+                requestBody.GenerateAudio,
+        )
 
-	if taskResp.ID == "" {
-		return nil, fmt.Errorf("视频任务提交成功但未返回任务ID")
-	}
+        httpRequest, err :=
+                http.NewRequestWithContext(
+                        ctx,
+                        http.MethodPost,
+                        apiURL,
+                        bytes.NewReader(
+                                bodyJSON,
+                        ),
+                )
 
-	videoLog.Info("视频任务提交成功",
-		"task_id", taskResp.ID,
-		"model", cfg.Model,
-		"latency_ms", latencyMs,
-	)
+        if err != nil {
+                return nil,
+                        fmt.Errorf(
+                                "创建视频任务请求失败: %w",
+                                err,
+                        )
+        }
 
-	// 写入追踪记录（提交阶段，tokens后续查询时补充）
-	if traceCtx != nil {
-		go func() {
-			emitTrace(
-				traceCtx, cfg.Model,
-				0, 0, 0,
-				latencyMs, "success", "",
-				0, false, false, "",
-			)
-		}()
-	}
+        httpRequest.Header.Set(
+                "Content-Type",
+                "application/json",
+        )
 
-	return &VideoSubmitResult{
-		TaskID:    taskResp.ID,
-		ModelUsed: cfg.Model,
-	}, nil
+        httpRequest.Header.Set(
+                "Authorization",
+                "Bearer "+cfg.APIKey,
+        )
+
+        client :=
+                &http.Client{
+                        Timeout:
+                                30 * time.Second,
+                }
+
+        startedAt :=
+                time.Now()
+
+        httpResponse, err :=
+                client.Do(
+                        httpRequest,
+                )
+
+        latencyMS :=
+                time.Since(
+                        startedAt,
+                ).Milliseconds()
+
+        if err != nil {
+                videoLog.Error(
+                        "视频任务提交HTTP结果不确定",
+                        "error",
+                        err,
+                        "latency_ms",
+                        latencyMS,
+                )
+
+                return nil,
+                        &VideoSubmitError{
+                                Cause:
+                                        fmt.Errorf(
+                                                "视频任务提交网络结果不确定: %w",
+                                                err,
+                                        ),
+                                Uncertain:
+                                        true,
+                        }
+        }
+
+        defer httpResponse.Body.Close()
+
+        responseBody, err :=
+                io.ReadAll(
+                        httpResponse.Body,
+                )
+
+        if err != nil {
+                return nil,
+                        &VideoSubmitError{
+                                Cause:
+                                        fmt.Errorf(
+                                                "读取视频任务响应失败: %w",
+                                                err,
+                                        ),
+                                Uncertain:
+                                        true,
+                        }
+        }
+
+        if httpResponse.StatusCode !=
+                http.StatusOK {
+                videoLog.Error(
+                        "视频任务提交API返回明确错误",
+                        "status",
+                        httpResponse.StatusCode,
+                        "body",
+                        truncateStr(
+                                string(
+                                        responseBody,
+                                ),
+                                500,
+                        ),
+                        "latency_ms",
+                        latencyMS,
+                )
+
+                return nil,
+                        fmt.Errorf(
+                                "视频任务提交失败(HTTP %d): %s",
+                                httpResponse.StatusCode,
+                                truncateStr(
+                                        string(
+                                                responseBody,
+                                        ),
+                                        200,
+                                ),
+                        )
+        }
+
+        var taskResponse VideoTaskResponse
+
+        if err :=
+                json.Unmarshal(
+                        responseBody,
+                        &taskResponse,
+                ); err != nil {
+                return nil,
+                        &VideoSubmitError{
+                                Cause:
+                                        fmt.Errorf(
+                                                "解析视频任务成功响应失败: %w",
+                                                err,
+                                        ),
+                                Uncertain:
+                                        true,
+                        }
+        }
+
+        taskID :=
+                strings.TrimSpace(
+                        taskResponse.ID,
+                )
+
+        if taskID == "" {
+                return nil,
+                        &VideoSubmitError{
+                                Cause:
+                                        fmt.Errorf(
+                                                "视频任务提交成功但未返回任务ID",
+                                        ),
+                                Uncertain:
+                                        true,
+                        }
+        }
+
+        videoLog.Info(
+                "视频任务提交成功",
+                "task_id",
+                taskID,
+                "model",
+                cfg.Model,
+                "latency_ms",
+                latencyMS,
+        )
+
+        if traceCtx != nil {
+                go func() {
+                        emitTrace(
+                                traceCtx,
+                                cfg.Model,
+                                0,
+                                0,
+                                0,
+                                latencyMS,
+                                "success",
+                                "",
+                                0,
+                                false,
+                                false,
+                                "",
+                        )
+                }()
+        }
+
+        return &VideoSubmitResult{
+                TaskID:
+                        taskID,
+                ModelUsed:
+                        cfg.Model,
+        }, nil
 }
 
 // ==================== 视频任务状态查询 ====================

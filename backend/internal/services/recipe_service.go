@@ -19,7 +19,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 
 	"tedna/internal/logger"
@@ -124,38 +123,6 @@ func (s *RecipeService) CreateRecipe(ctx context.Context, req *models.CreateReci
 }
 
 // ==================== 查询 ====================
-
-// GetRecipe 获取配方详情（含组件摘要）
-func (s *RecipeService) GetRecipe(ctx context.Context, recipeID string) (*models.RecipeDetailResponse, error) {
-	r, err := repository.GetRecipeByID(ctx, recipeID)
-	if err != nil {
-		if errors.Is(err, repository.ErrRecipeNotFound) {
-			return nil, ErrRecipeNotFound
-		}
-		return nil, err
-	}
-
-	// 解析组件ID列表
-	var componentIDs []string
-	_ = json.Unmarshal([]byte(r.ComponentIDs), &componentIDs)
-
-	// 查询组件摘要
-	components, _ := repository.GetRecipeComponentBriefs(ctx, componentIDs)
-
-	// 查询作者名
-	authorName := ""
-	if user, err := repository.FindUserByID(ctx, r.AuthorID); err == nil {
-		authorName = user.DisplayName
-	}
-
-	return &models.RecipeDetailResponse{
-		TeachingRecipe: *r,
-		ComponentCount: len(componentIDs),
-		Components:     components,
-		AuthorName:     authorName,
-		ScopeName:      models.RecipeScopeNameMap[r.Scope],
-	}, nil
-}
 
 // ListRecipes 查询配方列表
 func (s *RecipeService) ListRecipes(ctx context.Context, authorID string, scope string, scopeRefID string, subject string, gradeRange string, limit int, offset int) (*models.RecipeListResponse, error) {
@@ -286,109 +253,6 @@ func (s *RecipeService) ShareRecipe(ctx context.Context, recipeID string, req *m
 	}
 	recipeLog.Info("共享配方成功", "recipe_id", recipeID, "scope", req.Scope, "scope_ref_id", req.ScopeRefID)
 	return nil
-}
-
-// ==================== 构建AI上下文 ====================
-
-// BuildRecipeContext 将配方转化为AI系统提示词上下文
-// 这是核心函数：把组件+学情+风格+心得+自定义拼成完整的背景知识文本
-func (s *RecipeService) BuildRecipeContext(ctx context.Context, recipe *models.TeachingRecipe) string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("【备课配方：%s v%d】\n", recipe.Name, recipe.Version))
-
-	// 1. 解析并加载绑定组件的完整内容
-	var componentIDs []string
-	_ = json.Unmarshal([]byte(recipe.ComponentIDs), &componentIDs)
-
-	if len(componentIDs) > 0 {
-		groups, err := repository.GetRecipeComponentContents(ctx, componentIDs)
-		if err == nil && len(groups) > 0 {
-			for _, g := range groups {
-				sb.WriteString(fmt.Sprintf("\n== %s ==\n", g.LibraryName))
-				for _, c := range g.Components {
-					sb.WriteString(fmt.Sprintf("▸ %s\n", c.DisplayLabel))
-					if c.DesignLogic != "" {
-						sb.WriteString(fmt.Sprintf("  设计逻辑：%s\n", c.DesignLogic))
-					}
-					if c.FullGuide != "" {
-						sb.WriteString(fmt.Sprintf("  完整指引：%s\n", c.FullGuide))
-					}
-				}
-			}
-		}
-	}
-
-	// 2. 学情档案
-	if strings.TrimSpace(recipe.StudentProfile) != "" {
-		sb.WriteString(fmt.Sprintf("\n== 学情档案 ==\n%s\n", recipe.StudentProfile))
-	}
-
-	// 3. 教学风格偏好
-	if strings.TrimSpace(recipe.TeachingStyle) != "" {
-		sb.WriteString(fmt.Sprintf("\n== 教师偏好 ==\n%s\n", recipe.TeachingStyle))
-	}
-
-	// 4. 学校要求
-	if strings.TrimSpace(recipe.SchoolRequirements) != "" {
-		sb.WriteString(fmt.Sprintf("\n== 学校要求 ==\n%s\n", recipe.SchoolRequirements))
-	}
-
-	// 5. 备课心得
-	if strings.TrimSpace(recipe.CustomNotes) != "" {
-		sb.WriteString(fmt.Sprintf("\n== 备课心得 ==\n%s\n", recipe.CustomNotes))
-	}
-
-	// 6. 自定义提示词（高级用户直接写的指令）
-	if strings.TrimSpace(recipe.CustomPrompt) != "" {
-		sb.WriteString(fmt.Sprintf("\n== 自定义指令 ==\n%s\n", recipe.CustomPrompt))
-	}
-
-	return sb.String()
-}
-
-// PreviewContext 预览配方注入给AI的完整上下文文本
-func (s *RecipeService) PreviewContext(ctx context.Context, recipeID string) (*models.RecipeContextPreview, error) {
-	r, err := repository.GetRecipeByID(ctx, recipeID)
-	if err != nil {
-		if errors.Is(err, repository.ErrRecipeNotFound) {
-			return nil, ErrRecipeNotFound
-		}
-		return nil, err
-	}
-
-	contextText := s.BuildRecipeContext(ctx, r)
-
-	return &models.RecipeContextPreview{
-		RecipeID:      r.ID,
-		RecipeName:    r.Name,
-		ContextText:   contextText,
-		TokenEstimate: len(contextText) / 2, // 粗估：中文约2字符/token
-	}, nil
-}
-
-// ==================== 智能推荐 ====================
-
-// RecommendComponents 根据学科+年级，自动匹配推荐的组件组合
-// 返回按组件类型分组的推荐列表，老师可以一键采纳创建配方
-func (s *RecipeService) RecommendComponents(ctx context.Context, subject string, gradeRange string) ([]*models.MatchedComponentGroup, error) {
-	if strings.TrimSpace(subject) == "" {
-		return nil, ErrRecipeSubjectRequired
-	}
-
-	// 匹配所有注入模式的已审核组件（silent+recommend+on_demand）
-	groups, err := repository.MatchComponents(ctx, &models.MatchComponentsRequest{
-		Subject:    subject,
-		GradeRange: gradeRange,
-		Limit:      3, // 每种类型取前3个
-	})
-	if err != nil {
-		recipeLog.Error("智能推荐匹配失败", "subject", subject, "error", err)
-		return nil, err
-	}
-	if groups == nil {
-		groups = []*models.MatchedComponentGroup{}
-	}
-	return groups, nil
 }
 
 // ==================== 配方效果统计 ====================

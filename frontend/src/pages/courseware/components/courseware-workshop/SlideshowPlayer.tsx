@@ -24,9 +24,10 @@
 import { useState, useEffect, useRef } from 'react'
 import { C, CW_WIDTH, CW_HEIGHT } from './workshopConstants'
 import { injectPreviewMode, NAV_KEY_MSG_TYPE } from './previewInject'
+import PlatformCoursewareAssistantOverlay from './PlatformCoursewareAssistantOverlay'
 
 export default function SlideshowPlayer({ pages, initialPage, onClose }: {
-  pages: { page_number: number; title: string; html_content: string }[]
+  pages: { id?: string; page_number: number; title: string; html_content: string }[]
   initialPage: number
   // P1-02: 退出时回传「当前停留页」给父组件（可选参数），父组件据此记住下次初值；
   //   不传参时父组件按各自逻辑处理（保持兼容）。翻页过程中绝不回调，避免双源打架。
@@ -219,6 +220,15 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
           title={`放映-第${curPage}页`}
         />
       </div>
+
+      {data.id && (
+        <PlatformCoursewareAssistantOverlay
+          key={`platform-assistant-${data.id}`}
+          pageId={data.id}
+          pageTitle={data.title}
+          variant="slideshow"
+        />
+      )}
 
       {/* v5.2: 去掉了手动绘制的黑色填充div，白色背景自然融合 */}
 

@@ -1,216 +1,201 @@
 package services
 
-// lp_sse_hub_test.go — 教案系统SSE广播中心单元测试
+// lp_sse_hub_test.go — 教案SSE多订阅与独立注销回归测试
 //
-// 测试范围：
-//   - NewLPSSEHub：创建实例
-//   - Subscribe：独占模式（新连接关闭旧连接）
-//   - Unsubscribe：取消订阅
-//   - Broadcast：事件广播（含channel满处理）
-//   - 并发安全性
+// 覆盖本次故障的核心场景：
+//   - 同一教案建立第二条连接时不得关闭第一条连接；
+//   - 广播事件必须送达同一教案的全部活动订阅者；
+//   - 注销其中一条连接不得影响其它连接；
+//   - 不同教案之间的事件必须保持隔离；
+//   - Subscribe必须维持历史单返回值协议，现有排空测试可以继续编译。
 
 import (
-"sync"
-"testing"
-"time"
+	"testing"
+	"time"
 
-"tedna/internal/models"
+	"tedna/internal/models"
 )
 
-// ==================== 基础功能测试 ====================
+const lessonPlanSSETestTimeout = 500 * time.Millisecond
 
-// TestNewLPSSEHub 测试创建新的教案SSE Hub
-func TestNewLPSSEHub(t *testing.T) {
-hub := NewLPSSEHub()
-if hub == nil {
-t.Fatal("NewLPSSEHub不应返回nil")
-}
-if hub.subscribers == nil {
-t.Fatal("subscribers map不应为nil")
-}
-}
+func receiveLessonPlanSSETestEvent(
+	t *testing.T,
+	ch <-chan models.LPSSEEvent,
+) models.LPSSEEvent {
+	t.Helper()
 
-// TestLPSSEHub_Subscribe 测试订阅
-func TestLPSSEHub_Subscribe(t *testing.T) {
-hub := NewLPSSEHub()
-ch := hub.Subscribe("plan-1")
-if ch == nil {
-t.Fatal("Subscribe不应返回nil channel")
-}
-// channel缓冲应为2000
-if cap(ch) != 2000 {
-t.Errorf("channel缓冲应为2000，实际%d", cap(ch))
-}
+	select {
+	case event, open := <-ch:
+		if !open {
+			t.Fatal("预期收到SSE事件，但channel已经关闭")
+		}
+		return event
+
+	case <-time.After(lessonPlanSSETestTimeout):
+		t.Fatal("等待SSE事件超时")
+		return models.LPSSEEvent{}
+	}
 }
 
-// TestLPSSEHub_SubscribeExclusiveMode 独占模式：新订阅关闭旧连接
-func TestLPSSEHub_SubscribeExclusiveMode(t *testing.T) {
-hub := NewLPSSEHub()
+func assertLessonPlanSSETestChannelClosed(
+	t *testing.T,
+	ch <-chan models.LPSSEEvent,
+) {
+	t.Helper()
 
-// 第一次订阅
-ch1 := hub.Subscribe("plan-1")
+	select {
+	case _, open := <-ch:
+		if open {
+			t.Fatal("预期channel已经关闭，但仍收到活动数据")
+		}
 
-// 第二次订阅同一planID——ch1应被关闭
-ch2 := hub.Subscribe("plan-1")
-
-// ch1应已关闭
-select {
-case _, ok := <-ch1:
-if ok {
-t.Error("旧channel应已关闭（ok应为false）")
-}
-default:
-t.Error("旧channel应已关闭且可读取到关闭信号")
+	case <-time.After(lessonPlanSSETestTimeout):
+		t.Fatal("等待SSE channel关闭超时")
+	}
 }
 
-// ch2应正常可用
-if ch2 == nil {
-t.Error("新channel不应为nil")
+// TestLPSSEHubAllowsMultipleSubscribersForSamePlan
+// 验证同一教案的第二条连接不会关闭第一条连接。
+func TestLPSSEHubAllowsMultipleSubscribersForSamePlan(
+	t *testing.T,
+) {
+	hub := NewLPSSEHub()
+	planID := "plan-multiple-subscribers"
+
+	first := hub.Subscribe(planID)
+
+	if count := hub.SubscriberCount(planID); count != 1 {
+		t.Fatalf(
+			"第一条连接后的订阅数量错误：got=%d want=1",
+			count,
+		)
+	}
+
+	second := hub.Subscribe(planID)
+
+	if count := hub.SubscriberCount(planID); count != 2 {
+		t.Fatalf(
+			"第二条连接后的订阅数量错误：got=%d want=2",
+			count,
+		)
+	}
+
+	event := models.LPSSEEvent{
+		EventType: models.LPSSEThinking,
+		PlanID:    planID,
+	}
+
+	hub.Broadcast(planID, event)
+
+	firstEvent := receiveLessonPlanSSETestEvent(t, first)
+	secondEvent := receiveLessonPlanSSETestEvent(t, second)
+
+	if firstEvent.EventType != models.LPSSEThinking {
+		t.Fatalf(
+			"第一条连接收到错误事件：%s",
+			firstEvent.EventType,
+		)
+	}
+
+	if secondEvent.EventType != models.LPSSEThinking {
+		t.Fatalf(
+			"第二条连接收到错误事件：%s",
+			secondEvent.EventType,
+		)
+	}
+
+	hub.Unsubscribe(planID, first)
+	assertLessonPlanSSETestChannelClosed(t, first)
+
+	if count := hub.SubscriberCount(planID); count != 1 {
+		t.Fatalf(
+			"注销第一条连接后的订阅数量错误：got=%d want=1",
+			count,
+		)
+	}
+
+	followUp := models.LPSSEEvent{
+		EventType: models.LPSSEContentUpdate,
+		PlanID:    planID,
+		Content:   "更新后的教案正文",
+	}
+
+	hub.Broadcast(planID, followUp)
+
+	secondFollowUp := receiveLessonPlanSSETestEvent(
+		t,
+		second,
+	)
+
+	if secondFollowUp.EventType != models.LPSSEContentUpdate ||
+		secondFollowUp.Content != "更新后的教案正文" {
+		t.Fatalf(
+			"注销第一条连接后，第二条连接收到的事件错误：%#v",
+			secondFollowUp,
+		)
+	}
+
+	hub.Unsubscribe(planID, second)
+	assertLessonPlanSSETestChannelClosed(t, second)
+
+	if count := hub.SubscriberCount(planID); count != 0 {
+		t.Fatalf(
+			"全部连接注销后的订阅数量错误：got=%d want=0",
+			count,
+		)
+	}
 }
 
-// 只有1个活跃订阅
-hub.mu.Lock()
-subs, exists := hub.subscribers["plan-1"]
-subCount := 0
-if exists {
-subCount = len(subs)
-}
-hub.mu.Unlock()
-if subCount != 1 {
-t.Errorf("独占模式下应只有1个订阅者，实际%d", subCount)
-}
-}
+// TestLPSSEHubKeepsPlansIsolated 验证不同教案之间不会串流。
+func TestLPSSEHubKeepsPlansIsolated(
+	t *testing.T,
+) {
+	hub := NewLPSSEHub()
 
-// TestLPSSEHub_Unsubscribe 测试取消订阅
-func TestLPSSEHub_Unsubscribe(t *testing.T) {
-hub := NewLPSSEHub()
-ch := hub.Subscribe("plan-1")
+	firstPlanChannel := hub.Subscribe("plan-first")
+	secondPlanChannel := hub.Subscribe("plan-second")
 
-hub.Unsubscribe("plan-1", ch)
+	hub.Broadcast(
+		"plan-first",
+		models.LPSSEEvent{
+			EventType: models.LPSSEMessageDone,
+			PlanID:    "plan-first",
+		},
+	)
 
-// channel应已关闭
-select {
-case _, ok := <-ch:
-if ok {
-t.Error("取消订阅后channel应已关闭")
-}
-default:
-t.Error("取消订阅后channel应已关闭且可读")
-}
+	firstEvent := receiveLessonPlanSSETestEvent(
+		t,
+		firstPlanChannel,
+	)
 
-// map条目应已清理
-hub.mu.Lock()
-_, exists := hub.subscribers["plan-1"]
-hub.mu.Unlock()
-if exists {
-t.Error("取消后map条目应已清理")
-}
-}
+	if firstEvent.PlanID != "plan-first" {
+		t.Fatalf(
+			"第一份教案收到错误plan_id：%s",
+			firstEvent.PlanID,
+		)
+	}
 
-// TestLPSSEHub_UnsubscribeNonExistent 取消不存在的订阅不panic
-func TestLPSSEHub_UnsubscribeNonExistent(t *testing.T) {
-hub := NewLPSSEHub()
-fakeCh := make(chan models.LPSSEEvent, 1)
-// 不应panic
-hub.Unsubscribe("non-existent", fakeCh)
-}
+	select {
+	case event, open := <-secondPlanChannel:
+		if !open {
+			t.Fatal("第二份教案的连接被错误关闭")
+		}
 
-// ==================== 广播测试 ====================
+		t.Fatalf(
+			"第二份教案错误收到第一份教案事件：%#v",
+			event,
+		)
 
-// TestLPSSEHub_Broadcast 测试正常广播
-func TestLPSSEHub_Broadcast(t *testing.T) {
-hub := NewLPSSEHub()
-ch := hub.Subscribe("plan-1")
+	case <-time.After(50 * time.Millisecond):
+		// 预期：第二份教案没有收到任何事件。
+	}
 
-event := models.LPSSEEvent{
-EventType: models.LPSSEChunk,
-PlanID:    "plan-1",
-Chunk:     "Hello",
-}
-hub.Broadcast("plan-1", event)
-
-select {
-case received := <-ch:
-if received.EventType != models.LPSSEChunk {
-t.Errorf("事件类型应为chunk，实际%s", string(received.EventType))
-}
-if received.Chunk != "Hello" {
-t.Errorf("Chunk应为Hello，实际%s", received.Chunk)
-}
-case <-time.After(100 * time.Millisecond):
-t.Error("广播超时未收到事件")
-}
-}
-
-// TestLPSSEHub_BroadcastNoSubscribers 无订阅者时广播不panic
-func TestLPSSEHub_BroadcastNoSubscribers(t *testing.T) {
-hub := NewLPSSEHub()
-event := models.LPSSEEvent{EventType: models.LPSSEChunk, PlanID: "plan-1"}
-// 不应panic
-hub.Broadcast("plan-1", event)
-hub.Broadcast("non-existent", event)
-}
-
-// TestLPSSEHub_BroadcastIsolation 不同Plan的广播互不干扰
-func TestLPSSEHub_BroadcastIsolation(t *testing.T) {
-hub := NewLPSSEHub()
-ch1 := hub.Subscribe("plan-1")
-ch2 := hub.Subscribe("plan-2")
-
-hub.Broadcast("plan-1", models.LPSSEEvent{EventType: models.LPSSEChunk, PlanID: "plan-1"})
-
-select {
-case <-ch1:
-// 正常
-case <-time.After(100 * time.Millisecond):
-t.Error("plan-1订阅者应收到事件")
-}
-
-select {
-case <-ch2:
-t.Error("plan-2订阅者不应收到plan-1的事件")
-case <-time.After(50 * time.Millisecond):
-// 正常
-}
-}
-
-// ==================== 并发安全性测试 ====================
-
-// TestLPSSEHub_ConcurrentOperations 并发操作不panic
-func TestLPSSEHub_ConcurrentOperations(t *testing.T) {
-hub := NewLPSSEHub()
-var wg sync.WaitGroup
-
-for i := 0; i < 30; i++ {
-wg.Add(1)
-go func() {
-defer wg.Done()
-ch := hub.Subscribe("plan-concurrent")
-hub.Broadcast("plan-concurrent", models.LPSSEEvent{EventType: models.LPSSEChunk})
-hub.Unsubscribe("plan-concurrent", ch)
-}()
-}
-
-wg.Wait()
-}
-
-// TestLPSSEHub_SubscribeMultipleThenBroadcast 多次独占订阅后广播
-func TestLPSSEHub_SubscribeMultipleThenBroadcast(t *testing.T) {
-hub := NewLPSSEHub()
-
-// 连续订阅3次，只有最后一个有效
-_ = hub.Subscribe("plan-1")
-_ = hub.Subscribe("plan-1")
-ch3 := hub.Subscribe("plan-1")
-
-hub.Broadcast("plan-1", models.LPSSEEvent{EventType: models.LPSSEMessageDone, PlanID: "plan-1"})
-
-select {
-case received := <-ch3:
-if received.EventType != models.LPSSEMessageDone {
-t.Errorf("最后一个订阅者应收到message_done，实际%s", string(received.EventType))
-}
-case <-time.After(100 * time.Millisecond):
-t.Error("最后一个订阅者应收到广播")
-}
+	hub.Unsubscribe(
+		"plan-first",
+		firstPlanChannel,
+	)
+	hub.Unsubscribe(
+		"plan-second",
+		secondPlanChannel,
+	)
 }

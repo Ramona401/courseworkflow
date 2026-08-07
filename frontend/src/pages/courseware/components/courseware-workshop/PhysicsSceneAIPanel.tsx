@@ -5,6 +5,8 @@
 import { useRef, useState } from 'react'
 import { useAuth } from '@/store/auth'
 import { useProtectedDraft } from '@/hooks/useProtectedDraft'
+import { useVoiceDraftInput } from '@/hooks/useVoiceDraftInput'
+import VoiceDraftControls from '@/components/voice/VoiceDraftControls'
 import { C } from './workshopConstants'
 import { generatePhysicsSceneCode } from '@/api/physicsSceneAI'
 
@@ -103,15 +105,53 @@ export default function PhysicsSceneAIPanel({
   const [image, setImage] = useState('')
   const [imgBusy, setImgBusy] = useState(false)
   const fileRef = useRef<HTMLInputElement | null>(null)
+  const descriptionRef = useRef<HTMLTextAreaElement | null>(null)
 
   const hasCode = code.trim().length > 0
   const disabled = loading || !!busyExternal
+
+  /**
+   * 力学场景语音只写入自然语言描述。
+   *
+   * Matter.js底稿、执行报错和生成代码不会进入语音识别；
+   * final结果只回填，不自动触发生成或自动修复。
+   */
+  const voiceInput = useVoiceDraftInput({
+    value: desc,
+    setValue: setDesc,
+    disabled: disabled || imgBusy,
+    maxDurationSeconds: 120,
+    onFinalFocus: (finalValue) => {
+      const element = descriptionRef.current
+
+      if (!element) {
+        return
+      }
+
+      element.focus()
+      element.setSelectionRange(
+        finalValue.length,
+        finalValue.length,
+      )
+    },
+    onError: setError,
+  })
+
+  const interactionDisabled =
+    disabled ||
+    imgBusy ||
+    voiceInput.isActive
+
   const canAttachImage = !hasCode
   const canAutoFix = hasCode && !!previewError?.trim()
-  const canSubmit = !disabled && (hasCode ? !!desc.trim() : (!!desc.trim() || !!image))
+  const canSubmit =
+    !interactionDisabled &&
+    (hasCode
+      ? !!desc.trim()
+      : !!desc.trim() || !!image)
 
   const handlePickImage = async (file: File | null) => {
-    if (!file || disabled) return
+    if (!file || interactionDisabled) return
     setImgBusy(true)
     setError('')
     try {
@@ -156,19 +196,19 @@ export default function PhysicsSceneAIPanel({
   }
 
   const handleGenerate = () => {
-    if (!canSubmit) return
+    if (!canSubmit || voiceInput.isActive) return
     void runGenerate(desc.trim())
   }
 
   const handleAutoFix = () => {
-    if (disabled || !canAutoFix) return
+    if (interactionDisabled || !canAutoFix) return
     const fixDesc = '这段 Matter.js setup 代码在预览中执行时报错了，报错信息是：' + (previewError || '').trim()
       + '。请只修复导致报错的问题，保持场景主体和教学设计不变，输出修复后的完整 setup 代码。'
     void runGenerate(fixDesc, false)
   }
 
   const handleReset = () => {
-    if (disabled) return
+    if (interactionDisabled) return
     onCode('')
     setImage('')
     setRounds(0)
@@ -187,8 +227,8 @@ export default function PhysicsSceneAIPanel({
             {mode === 'adapt' ? '🔧 AI 改编力学场景' : '✨ AI 新建力学场景'}
           </span>
           <button
-            onClick={() => { if (!disabled) onExit() }}
-            style={{ marginLeft: 'auto', padding: '4px 10px', borderRadius: 999, border: '1px solid #FBD5D5', background: '#fff', color: '#B91C1C', fontSize: 11.5, fontWeight: 750, cursor: disabled ? 'not-allowed' : 'pointer', whiteSpace: 'nowrap' }}
+            onClick={() => { if (!interactionDisabled) onExit() }}
+            style={{ marginLeft: 'auto', padding: '4px 10px', borderRadius: 999, border: '1px solid #FBD5D5', background: '#fff', color: '#B91C1C', fontSize: 11.5, fontWeight: 750, cursor: interactionDisabled ? 'not-allowed' : 'pointer', whiteSpace: 'nowrap' }}
           >↩ 返回模板</button>
         </div>
         <div style={{ fontSize: 11.6, color: '#B07070', lineHeight: 1.65, marginTop: 6 }}>
@@ -203,11 +243,11 @@ export default function PhysicsSceneAIPanel({
           <div style={{ fontSize: 12, fontWeight: 750, color: '#9A3412', lineHeight: 1.5 }}>⚠️ 预览执行报错，可让 AI 自动修复。</div>
           <button
             onClick={handleAutoFix}
-            disabled={disabled}
+            disabled={interactionDisabled}
             style={{
               width: '100%', marginTop: 8, padding: '8px 0', borderRadius: 9, border: 'none', fontSize: 12.5, fontWeight: 850,
-              background: disabled ? '#FDBA74' : 'linear-gradient(135deg,#F59E0B,#EA580C)',
-              color: '#fff', cursor: disabled ? 'not-allowed' : 'pointer',
+              background: interactionDisabled ? '#FDBA74' : 'linear-gradient(135deg,#F59E0B,#EA580C)',
+              color: '#fff', cursor: interactionDisabled ? 'not-allowed' : 'pointer',
             }}
           >🔧 让 AI 修复此错误</button>
         </div>
@@ -224,13 +264,13 @@ export default function PhysicsSceneAIPanel({
           />
           {!image ? (
             <button
-              onClick={() => { if (!disabled && !imgBusy) fileRef.current?.click() }}
-              disabled={disabled || imgBusy}
+              onClick={() => { if (!interactionDisabled) fileRef.current?.click() }}
+              disabled={interactionDisabled}
               style={{
                 width: '100%',
                 padding: '9px 0',
                 borderRadius: 11,
-                cursor: (disabled || imgBusy) ? 'not-allowed' : 'pointer',
+                cursor: interactionDisabled ? 'not-allowed' : 'pointer',
                 border: '1.5px dashed #FBD5D5',
                 background: '#fff',
                 color: '#B91C1C',
@@ -246,9 +286,9 @@ export default function PhysicsSceneAIPanel({
                 <div style={{ fontSize: 11, color: '#B07070', marginTop: 3, lineHeight: 1.5 }}>AI 会参考图片生成力学场景，可在下方补充说明。</div>
               </div>
               <button
-                onClick={() => { if (!disabled) setImage('') }}
+                onClick={() => { if (!interactionDisabled) setImage('') }}
                 title="移除图片"
-                style={{ border: 'none', background: '#fff', width: 26, height: 26, borderRadius: 8, fontSize: 13, cursor: disabled ? 'not-allowed' : 'pointer', color: '#B91C1C', flexShrink: 0 }}
+                style={{ border: 'none', background: '#fff', width: 26, height: 26, borderRadius: 8, fontSize: 13, cursor: interactionDisabled ? 'not-allowed' : 'pointer', color: '#B91C1C', flexShrink: 0 }}
               >✕</button>
             </div>
           )}
@@ -256,6 +296,7 @@ export default function PhysicsSceneAIPanel({
       )}
 
       <textarea
+        ref={descriptionRef}
         value={desc}
         onChange={e => setDesc(e.target.value)}
         onKeyDown={e => {
@@ -264,8 +305,15 @@ export default function PhysicsSceneAIPanel({
         placeholder={placeholder}
         maxLength={2400}
         rows={5}
-        disabled={disabled}
-        style={{ width: '100%', boxSizing: 'border-box', padding: '10px 11px', borderRadius: 11, border: '1.5px solid #FBD5D5', fontSize: 12.5, lineHeight: 1.6, outline: 'none', resize: 'vertical', fontFamily: 'inherit', background: disabled ? '#F9FAFB' : '#fff' }}
+        disabled={interactionDisabled}
+        style={{ width: '100%', boxSizing: 'border-box', padding: '10px 11px', borderRadius: 11, border: '1.5px solid #FBD5D5', fontSize: 12.5, lineHeight: 1.6, outline: 'none', resize: 'vertical', fontFamily: 'inherit', background: interactionDisabled ? '#F9FAFB' : '#fff' }}
+      />
+
+      <VoiceDraftControls
+        voice={voiceInput}
+        disabled={disabled || imgBusy}
+        accentColor="#B91C1C"
+        idleText="点击麦克风可语音描述；识别完成后仍需手动生成"
       />
 
       <div style={{ marginTop: 6, fontSize: 11, color: C.textMuted, lineHeight: 1.5 }}>
@@ -301,7 +349,7 @@ export default function PhysicsSceneAIPanel({
       {hasCode && !loading && (
         <div style={{ marginTop: 10, padding: '9px 11px', borderRadius: 10, background: '#D1FAE5', color: '#047857', fontSize: 12, lineHeight: 1.6 }}>
           ✅ 已生成第 {rounds} 轮。请在中间预览区按播放测试；不满意可继续追改。
-          <span onClick={handleReset} style={{ marginLeft: 6, color: '#B91C1C', fontWeight: 800, cursor: disabled ? 'not-allowed' : 'pointer', textDecoration: 'underline' }}>重置</span>
+          <span onClick={handleReset} style={{ marginLeft: 6, color: '#B91C1C', fontWeight: 800, cursor: interactionDisabled ? 'not-allowed' : 'pointer', textDecoration: 'underline' }}>重置</span>
         </div>
       )}
 

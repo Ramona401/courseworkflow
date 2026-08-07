@@ -8,7 +8,6 @@
 import {
   useEffect,
   useMemo,
-  useRef,
   useState,
 } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -22,8 +21,8 @@ import {
   importExistingPlan,
 } from '@/api/lesson-plans'
 import type {
-  ConversationMessage,
   ImportExistingPlanRequest,
+  ImportExistingPlanResponse,
 } from '@/api/lesson-plans'
 import { useSubjects } from '@/hooks/useSubjects'
 import {
@@ -33,156 +32,23 @@ import {
   getEducationLevelOptions,
   getTopicPlaceholder,
 } from '@/education-domain/options'
+import {
+  importWordFidelityPlan,
+} from '@/api/lesson-plan-word-import'
+import LessonPlanImportSourceSection from './LessonPlanImportSourceSection'
+import type {
+  LessonPlanImportSourceSelection,
+} from './LessonPlanImportSourceSection'
 import { C } from './workshopConstants'
 
 interface ImportPlanModalProps {
   onSuccess: (
-    planId: string,
-    openingMessage: ConversationMessage,
-  ) => void
+    response: ImportExistingPlanResponse,
+  ) => void | Promise<void>
   onCancel: () => void
 }
 
-type SourceType = 'paste' | 'docx' | 'pdf'
 type Step = 1 | 2
-
-const LIBS_BASE =
-  'https://workflow.pkuailab.com/uploads/courseware-assets/libs'
-
-const JSZIP_URL =
-  LIBS_BASE + '/jszip/3.10.1/jszip.min.js'
-
-const PDFJS_URL =
-  LIBS_BASE + '/pdfjs-dist/3.11.174/build/pdf.min.js'
-
-const PDFJS_WORKER_URL =
-  LIBS_BASE + '/pdfjs-dist/3.11.174/build/pdf.worker.min.js'
-
-function loadScript(
-  src: string,
-  globalKey: string,
-): Promise<void> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  if ((window as any)[globalKey]) {
-    return Promise.resolve()
-  }
-
-  return new Promise((resolve, reject) => {
-    const existing =
-      document.querySelector(`script[src="${src}"]`)
-
-    if (existing) {
-      existing.addEventListener(
-        'load',
-        () => resolve(),
-      )
-      existing.addEventListener(
-        'error',
-        () => reject(
-          new Error(`加载失败: ${src}`),
-        ),
-      )
-      return
-    }
-
-    const script = document.createElement('script')
-    script.src = src
-    script.onload = () => resolve()
-    script.onerror = () =>
-      reject(new Error(`脚本加载失败: ${src}`))
-
-    document.head.appendChild(script)
-  })
-}
-
-async function parseDocxFile(
-  file: File,
-): Promise<string> {
-  await loadScript(JSZIP_URL, 'JSZip')
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const JSZip = (window as any).JSZip
-  if (!JSZip) {
-    throw new Error('JSZip加载失败')
-  }
-
-  const zip = await JSZip.loadAsync(
-    await file.arrayBuffer(),
-  )
-
-  const documentFile =
-    zip.file('word/document.xml')
-
-  if (!documentFile) {
-    throw new Error('不是有效的docx文件')
-  }
-
-  const xml = await documentFile.async('string')
-  const xmlDocument = new DOMParser()
-    .parseFromString(xml, 'application/xml')
-
-  const paragraphs =
-    xmlDocument.querySelectorAll('w\\:p, p')
-
-  const lines: string[] = []
-
-  paragraphs.forEach(paragraph => {
-    const texts =
-      paragraph.querySelectorAll('w\\:t, t')
-
-    const line = Array.from(texts)
-      .map(item => item.textContent || '')
-      .join('')
-      .trim()
-
-    if (line) lines.push(line)
-  })
-
-  return lines.join('\n')
-}
-
-async function parsePdfFile(
-  file: File,
-): Promise<string> {
-  await loadScript(PDFJS_URL, 'pdfjsLib')
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const pdfjsLib = (window as any).pdfjsLib
-
-  if (!pdfjsLib) {
-    throw new Error('pdf.js加载失败')
-  }
-
-  pdfjsLib.GlobalWorkerOptions.workerSrc =
-    PDFJS_WORKER_URL
-
-  const pdf = await pdfjsLib
-    .getDocument({
-      data: await file.arrayBuffer(),
-    })
-    .promise
-
-  const pages: string[] = []
-
-  for (
-    let pageNumber = 1;
-    pageNumber <= pdf.numPages;
-    pageNumber += 1
-  ) {
-    const page = await pdf.getPage(pageNumber)
-    const content = await page.getTextContent()
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const text = content.items
-      .map((item: any) => item.str)
-      .join(' ')
-      .trim()
-
-    if (text) pages.push(text)
-  }
-
-  return pages.join('\n\n')
-}
 
 export default function EducationAwareImportPlanModal({
   onSuccess,
@@ -225,26 +91,19 @@ export default function EducationAwareImportPlanModal({
   const [topic, setTopic] = useState('')
   const [duration, setDuration] = useState(45)
 
-  const [sourceType, setSourceType] =
-    useState<SourceType>('paste')
-
-  const [pasteContent, setPasteContent] =
-    useState('')
-
-  const [parsedContent, setParsedContent] =
-    useState('')
-
-  const [fileName, setFileName] =
-    useState('')
-
-  const [parseError, setParseError] =
-    useState('')
-
-  const [parsing, setParsing] =
-    useState(false)
-
-  const fileInputRef =
-    useRef<HTMLInputElement>(null)
+  const [
+    sourceSelection,
+    setSourceSelection,
+  ] = useState<
+    LessonPlanImportSourceSelection
+  >({
+    sourceType: 'paste',
+    content: '',
+    fileName: '',
+    ready: true,
+    wordImportSessionID: undefined,
+    wordPreview: null,
+  })
 
   const [textbooks, setTextbooks] =
     useState<TextbookListItem[]>([])
@@ -266,9 +125,8 @@ export default function EducationAwareImportPlanModal({
     useState('')
 
   const effectiveContent =
-    sourceType === 'paste'
-      ? pasteContent
-      : parsedContent
+    sourceSelection.content
+
 
   useEffect(() => {
     if (subjectsLoading) return
@@ -330,61 +188,6 @@ export default function EducationAwareImportPlanModal({
     grade,
   ])
 
-  const handleFileChange = async (
-    event: React.ChangeEvent<HTMLInputElement>,
-  ) => {
-    const file = event.target.files?.[0]
-    if (!file) return
-
-    setFileName(file.name)
-    setParseError('')
-    setParsedContent('')
-    setParsing(true)
-
-    try {
-      const text =
-        sourceType === 'docx'
-          ? await parseDocxFile(file)
-          : await parsePdfFile(file)
-
-      if (!text.trim()) {
-        setParseError(
-          sourceType === 'pdf'
-            ? '该PDF为扫描件或无可提取文字，请改用粘贴方式'
-            : '文档内容为空或无法提取，请改用粘贴方式',
-        )
-      } else {
-        setParsedContent(text.trim())
-      }
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : ''
-
-      setParseError(
-        message.includes('加载失败')
-          ? '解析库加载失败，请检查网络或改用粘贴方式'
-          : '文件解析失败，请检查文件格式或改用粘贴方式',
-      )
-    } finally {
-      setParsing(false)
-
-      if (fileInputRef.current) {
-        fileInputRef.current.value = ''
-      }
-    }
-  }
-
-  const changeSourceType = (
-    next: SourceType,
-  ) => {
-    setSourceType(next)
-    setParsedContent('')
-    setFileName('')
-    setParseError('')
-  }
-
   const toggleTextbook = (id: string) => {
     setSelectedTextbookIds(previous => {
       const next = new Set(previous)
@@ -404,6 +207,7 @@ export default function EducationAwareImportPlanModal({
     levelValues.includes(grade) &&
     topic.trim().length > 0 &&
     effectiveContent.trim().length >= 50 &&
+    sourceSelection.ready &&
     !subjectsLoading &&
     !subjectsEmpty
 
@@ -414,31 +218,82 @@ export default function EducationAwareImportPlanModal({
     setSubmitError('')
 
     try {
-      const request: ImportExistingPlanRequest = {
+      const textbookPageIDs =
+        isK12 &&
+        selectedTextbookIds.size > 0
+          ? Array.from(
+              selectedTextbookIds,
+            )
+          : undefined
+
+      if (
+        sourceSelection.sourceType ===
+        'docx_fidelity'
+      ) {
+        if (
+          !sourceSelection
+            .wordImportSessionID
+        ) {
+          throw new Error(
+            'Word预解析会话尚未就绪，请重新选择文件',
+          )
+        }
+
+        const response =
+          await importWordFidelityPlan({
+            subject,
+            grade,
+            topic: topic.trim(),
+            duration_minutes: duration,
+
+            // 后端会从可信会话读取并覆盖正式正文。
+            content_markdown: '',
+            source_type: 'docx_fidelity',
+            word_import_session_id:
+              sourceSelection
+                .wordImportSessionID,
+            textbook_page_ids:
+              textbookPageIDs,
+          })
+
+        await onSuccess(response)
+
+        return
+      }
+
+      const ordinarySourceType:
+        ImportExistingPlanRequest[
+          'source_type'
+        ] =
+        sourceSelection.sourceType ===
+        'paste'
+          ? 'paste'
+          : sourceSelection.sourceType ===
+              'docx'
+            ? 'docx'
+            : 'pdf'
+
+      const request:
+        ImportExistingPlanRequest = {
         subject,
         grade,
         topic: topic.trim(),
         duration_minutes: duration,
         content_markdown:
           effectiveContent.trim(),
-        source_type: sourceType,
+        source_type:
+          ordinarySourceType,
       }
 
-      if (
-        isK12 &&
-        selectedTextbookIds.size > 0
-      ) {
+      if (textbookPageIDs) {
         request.textbook_page_ids =
-          Array.from(selectedTextbookIds)
+          textbookPageIDs
       }
 
       const response =
         await importExistingPlan(request)
 
-      onSuccess(
-        response.plan.id,
-        response.opening_message,
-      )
+      await onSuccess(response)
     } catch (error) {
       setSubmitError(
         error instanceof Error
@@ -510,7 +365,7 @@ export default function EducationAwareImportPlanModal({
               fontSize: '13px',
               color: C.textSec,
             }}>
-              导入后由AI自动评审并提供改进建议
+              导入完成后可立即开始聊天评审，后台质量检查独立进行
             </p>
           </div>
 
@@ -682,172 +537,15 @@ export default function EducationAwareImportPlanModal({
                 </div>
               </div>
 
-              <div>
-                <label style={{
-                  display: 'block',
-                  fontSize: '13px',
-                  fontWeight: 600,
-                  marginBottom: '8px',
-                }}>
-                  {profile.lesson_plan_label}来源
-                </label>
-
-                <div style={{
-                  display: 'flex',
-                  gap: '8px',
-                }}>
-                  {([
-                    {
-                      key: 'paste',
-                      label: '📋 粘贴文本',
-                    },
-                    {
-                      key: 'docx',
-                      label: '📝 Word文档',
-                    },
-                    {
-                      key: 'pdf',
-                      label: '📄 PDF文件',
-                    },
-                  ] as {
-                    key: SourceType
-                    label: string
-                  }[]).map(item => (
-                    <button
-                      key={item.key}
-                      onClick={() =>
-                        changeSourceType(item.key)
-                      }
-                      style={{
-                        flex: 1,
-                        padding: '10px',
-                        borderRadius: '9px',
-                        border: `1.5px solid ${
-                          sourceType === item.key
-                            ? C.primary
-                            : C.border
-                        }`,
-                        background:
-                          sourceType === item.key
-                            ? C.primaryLight
-                            : '#fff',
-                        cursor: 'pointer',
-                      }}
-                    >
-                      {item.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {sourceType === 'paste' ? (
-                <div>
-                  <textarea
-                    value={pasteContent}
-                    onChange={event =>
-                      setPasteContent(
-                        event.target.value,
-                      )
-                    }
-                    rows={12}
-                    placeholder={
-                      `将已有${profile.lesson_plan_label}内容粘贴到这里，至少50字`
-                    }
-                    style={{
-                      width: '100%',
-                      boxSizing: 'border-box',
-                      padding: '12px 14px',
-                      borderRadius: '8px',
-                      border: `1px solid ${C.border}`,
-                      fontSize: '13px',
-                      lineHeight: 1.8,
-                      resize: 'vertical',
-                    }}
-                  />
-
-                  <div style={{
-                    marginTop: '4px',
-                    textAlign: 'right',
-                    color: C.textMuted,
-                    fontSize: '11px',
-                  }}>
-                    已输入
-                    {' '}
-                    {
-                      pasteContent
-                        .replace(/\s/g, '')
-                        .length
-                    }
-                    {' '}
-                    字
-                  </div>
-                </div>
-              ) : (
-                <div>
-                  <div
-                    onClick={() =>
-                      fileInputRef.current?.click()
-                    }
-                    style={{
-                      border: `2px dashed ${
-                        parsedContent
-                          ? C.success
-                          : parseError
-                            ? C.danger
-                            : C.border
-                      }`,
-                      borderRadius: '10px',
-                      padding: '28px',
-                      textAlign: 'center',
-                      cursor: 'pointer',
-                      background: '#FAFAFA',
-                    }}
-                  >
-                    {parsing
-                      ? '⏳ 正在解析文档...'
-                      : parsedContent
-                        ? `✅ ${fileName} · 已提取${parsedContent.replace(/\s/g, '').length}字`
-                        : `点击选择${sourceType === 'docx' ? 'Word文档' : 'PDF文件'}`}
-                  </div>
-
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept={
-                      sourceType === 'docx'
-                        ? '.docx'
-                        : '.pdf'
-                    }
-                    onChange={handleFileChange}
-                    style={{ display: 'none' }}
-                  />
-
-                  {parseError && (
-                    <div style={{
-                      marginTop: '8px',
-                      color: C.danger,
-                      fontSize: '12px',
-                    }}>
-                      ⚠️ {parseError}
-                    </div>
-                  )}
-
-                  {parsedContent && (
-                    <div style={{
-                      marginTop: '8px',
-                      padding: '10px 12px',
-                      borderRadius: '8px',
-                      background: '#F9FAFB',
-                      maxHeight: '110px',
-                      overflowY: 'auto',
-                      fontSize: '12px',
-                      whiteSpace: 'pre-wrap',
-                    }}>
-                      {parsedContent.slice(0, 400)}
-                    </div>
-                  )}
-                </div>
-              )}
+              <LessonPlanImportSourceSection
+                lessonPlanLabel={
+                  profile.lesson_plan_label
+                }
+                value={sourceSelection}
+                onChange={
+                  setSourceSelection
+                }
+              />
 
               {submitError && (
                 <div style={{
@@ -875,6 +573,44 @@ export default function EducationAwareImportPlanModal({
               }}>
                 内容已就绪。关联课本图片是可选步骤。
               </div>
+
+              {/* 正式导入失败提示：必须在第二步直接可见。 */}
+              {submitError && (
+                <div
+                  role="alert"
+                  aria-live="assertive"
+                  style={{
+                    padding: '10px 12px',
+                    borderRadius: '8px',
+                    background: '#FEF2F2',
+                    border: '1px solid #FECACA',
+                    color: C.danger,
+                    fontSize: '12px',
+                    lineHeight: 1.65,
+                    marginBottom: '16px',
+                  }}
+                >
+                  <div style={{
+                    fontWeight: 700,
+                    marginBottom: '3px',
+                  }}>
+                    ⚠️ 导入未完成
+                  </div>
+
+                  <div>
+                    {submitError}
+                  </div>
+
+                  <div style={{
+                    marginTop: '5px',
+                    color: '#991B1B',
+                    fontSize: '11px',
+                  }}>
+                    可直接再次点击“导入并进入评审对话”重试，
+                    或返回上一步重新选择文档。
+                  </div>
+                </div>
+              )}
 
               {textbooksLoading ? (
                 <div style={{
@@ -1021,7 +757,7 @@ export default function EducationAwareImportPlanModal({
             >
               {submitting
                 ? '导入中...'
-                : `开始导入并AI评审`}
+                : `导入并进入评审对话`}
             </button>
           )}
 

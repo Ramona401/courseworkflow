@@ -1,66 +1,47 @@
 package services
 
-// credit_policy_service.go — 积分策略业务逻辑 + 积分计算引擎
+// credit_policy_service.go — 积分策略业务逻辑与文本积分计算引擎。
 //
-// v129 新增（积分机制融合 · 对齐AOCI精确积分计算）：
-//   - 策略管理：系统策略/学校策略 CRUD
-//   - 积分计算引擎：CalculateCredits（核心！）
-//   - 模型单价管理：CRUD
-//   - 模拟计算：Simulate
-//   - 模型积分预览：GetModelPreviews
+// 核心公式：
+//   cost_usd =
+//     input_tokens / 1000 × input_price +
+//     output_tokens / 1000 × output_price
 //
-// v141 改进：log.Printf → logger.WithModule 结构化日志
+//   credits =
+//     cost_usd × exchange_rate × multiplier
 //
-// 积分计算公式（对齐AOCI的credit_policy.go）：
-//   cost_usd = (input_tokens/1000 × cost_per_1k_input) + (output_tokens/1000 × cost_per_1k_output)
-//   credits  = cost_usd × exchange_rate × multiplier
+// 价格查询链：
+//   1. token_model_prices精确模型名；
+//   2. 对明确识别的版本化模型应用实际价格及阶梯规则；
+//   3. 数据库无精确记录时使用实际模型兜底规则；
+//   4. 完全未知模型使用中档安全兜底并记录告警。
 //
-// 策略查询链（对齐AOCI的getPolicyForModel）：
-//   学校策略(school, schoolID) → 系统策略(system, NULL) → 默认兜底(7.0 × 1.0)
+// 价格修正只影响后续调用，不重新计算历史消费记录。
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"tedna/internal/logger"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 )
 
-// 模块日志
-var cpLog = logger.WithModule("credit_policy")
+var cpLog = logger.WithModule(
+	"credit_policy",
+)
 
-// ==================== CreditPolicyService 结构体 ====================
-
-// CreditPolicyService 积分策略服务（对齐AOCI的credit_policy.go service）
+// CreditPolicyService 提供积分策略与模型价格能力。
 type CreditPolicyService struct{}
 
-// NewCreditPolicyService 创建CreditPolicyService实例
+// NewCreditPolicyService 创建积分策略服务。
 func NewCreditPolicyService() *CreditPolicyService {
 	return &CreditPolicyService{}
 }
 
-// ==================== 核心：积分计算引擎 ====================
-
-// CalculateCredits 根据真实token消耗计算积分（核心方法）
-//
-// 对齐AOCI: credit_policy.go → CalculateCreditsForCall
-//
-// 计算步骤：
-//   1. 查模型单价 → 计算美元成本
-//   2. 查策略（学校→系统→兜底）→ 获取汇率×倍率
-//   3. 积分 = 美元成本 × 汇率 × 倍率
-//
-// 参数：
-//   modelUsed    — AI实际使用的模型名称（来自API响应）
-//   inputTokens  — 输入token数（来自API响应的usage.prompt_tokens）
-//   outputTokens — 输出token数（来自API响应的usage.completion_tokens）
-//   totalTokens  — 总token数（来自API响应的usage.total_tokens，当分开的不可用时兜底）
-//   schoolID     — 用户所属学校ID（可为nil，用于查学校策略）
-//   latencyMs    — 调用耗时（毫秒）
-func (s *CreditPolicyService) CalculateCredits(
+// CalculateCredits 根据真实Token消耗计算积分。
+func (service *CreditPolicyService) CalculateCredits(
 	ctx context.Context,
 	modelUsed string,
 	inputTokens int,
@@ -69,45 +50,87 @@ func (s *CreditPolicyService) CalculateCredits(
 	schoolID *string,
 	latencyMs int64,
 ) *models.CreditCalculation {
-
-	// 如果没有分开的token统计，用总token数按6:4比例估算
-	if inputTokens == 0 && outputTokens == 0 && totalTokens > 0 {
-		inputTokens = totalTokens * 6 / 10
-		outputTokens = totalTokens - inputTokens
+	// 部分兼容接口只返回total_tokens。
+	// 无输入输出拆分时继续使用原系统6:4估算。
+	if inputTokens == 0 &&
+		outputTokens == 0 &&
+		totalTokens > 0 {
+		inputTokens =
+			totalTokens * 6 / 10
+		outputTokens =
+			totalTokens - inputTokens
 	}
 
-	// token数全部为0，返回零消费
-	if inputTokens == 0 && outputTokens == 0 {
+	if inputTokens == 0 &&
+		outputTokens == 0 {
 		return &models.CreditCalculation{
 			ModelName: modelUsed,
 			LatencyMs: latencyMs,
 		}
 	}
 
-	// 1. 查模型单价
-	price, err := repository.GetModelPriceByName(ctx, modelUsed)
+	// 先查数据库中的精确模型名。
+	price, err :=
+		repository.GetModelPriceByName(
+			ctx,
+			modelUsed,
+		)
+
 	if err != nil {
-		// 模型单价未配置，尝试模糊匹配
-		price = s.estimateModelPrice(modelUsed)
-		if price == nil {
-			cpLog.Warn("模型未配置单价且无法估算，积分为0", "model", modelUsed)
-			return &models.CreditCalculation{
-				InputTokens:  inputTokens,
-				OutputTokens: outputTokens,
-				ModelName:    modelUsed,
-				LatencyMs:    latencyMs,
-			}
+		if !errors.Is(
+			err,
+			repository.ErrModelPriceNotFound,
+		) {
+			cpLog.Warn(
+				"查询模型单价失败，使用实际模型兜底",
+				"model",
+				modelUsed,
+				"error",
+				err,
+			)
+		}
+
+		price = service.estimateModelPrice(
+			modelUsed,
+			inputTokens,
+		)
+	} else {
+		// 即使数据库中已有基础价，
+		// 仍需处理Sonnet 5日期切换和Gemini Pro阶梯价。
+		price = service.applyActualModelPrice(
+			modelUsed,
+			inputTokens,
+			price,
+		)
+	}
+
+	if price == nil {
+		cpLog.Warn(
+			"模型无可用单价，积分为0",
+			"model",
+			modelUsed,
+		)
+
+		return &models.CreditCalculation{
+			InputTokens:  inputTokens,
+			OutputTokens: outputTokens,
+			ModelName:    modelUsed,
+			LatencyMs:    latencyMs,
 		}
 	}
 
-	// 2. 计算美元成本
-	costUSD := price.CalculateCostUSD(inputTokens, outputTokens)
+	costUSD := price.CalculateCostUSD(
+		inputTokens,
+		outputTokens,
+	)
 
-	// 3. 查策略（学校→系统→兜底）
-	policy := s.GetEffectivePolicy(ctx, schoolID)
+	policy := service.GetEffectivePolicy(
+		ctx,
+		schoolID,
+	)
 
-	// 4. 计算积分
-	credits := policy.CalculateCredits(costUSD)
+	credits :=
+		policy.CalculateCredits(costUSD)
 
 	return &models.CreditCalculation{
 		InputTokens:     inputTokens,
@@ -122,229 +145,354 @@ func (s *CreditPolicyService) CalculateCredits(
 	}
 }
 
-// GetEffectivePolicy 获取有效策略（对齐AOCI的策略查询链）
-// 查询链: 学校策略 → 系统策略 → 默认兜底(7.0 × 1.0)
-func (s *CreditPolicyService) GetEffectivePolicy(ctx context.Context, schoolID *string) *models.CreditPolicy {
-	// 1. 尝试学校级策略
-	if schoolID != nil && *schoolID != "" {
-		policy, err := repository.GetSchoolCreditPolicy(ctx, *schoolID)
-		if err == nil && policy != nil {
+// GetEffectivePolicy 按学校、系统、默认顺序取得有效策略。
+func (service *CreditPolicyService) GetEffectivePolicy(
+	ctx context.Context,
+	schoolID *string,
+) *models.CreditPolicy {
+	if schoolID != nil &&
+		*schoolID != "" {
+		policy, err :=
+			repository.GetSchoolCreditPolicy(
+				ctx,
+				*schoolID,
+			)
+
+		if err == nil &&
+			policy != nil {
 			return policy
 		}
 	}
-	// 2. 回退系统策略
-	policy, err := repository.GetSystemCreditPolicy(ctx)
-	if err == nil && policy != nil {
+
+	policy, err :=
+		repository.GetSystemCreditPolicy(ctx)
+
+	if err == nil &&
+		policy != nil {
 		return policy
 	}
-	// 3. 兜底默认
+
 	return &models.CreditPolicy{
 		ExchangeRate: models.DefaultExchangeRate,
 		Multiplier:   models.DefaultMultiplier,
 	}
 }
 
-// estimateModelPrice 未配置模型的兜底估价
-// 按模型名称关键词推断供应商和价格区间
-func (s *CreditPolicyService) estimateModelPrice(modelName string) *models.ModelPrice {
-	nameLower := strings.ToLower(modelName)
-
-	// Anthropic模型估价
-	if strings.Contains(nameLower, "haiku") {
-		return &models.ModelPrice{
-			ModelName: modelName, Provider: "anthropic",
-			CostPer1kInput: 0.0008, CostPer1kOutput: 0.004,
-		}
-	}
-	if strings.Contains(nameLower, "opus") {
-		return &models.ModelPrice{
-			ModelName: modelName, Provider: "anthropic",
-			CostPer1kInput: 0.015, CostPer1kOutput: 0.075,
-		}
-	}
-	if strings.Contains(nameLower, "sonnet") || strings.Contains(nameLower, "claude") {
-		return &models.ModelPrice{
-			ModelName: modelName, Provider: "anthropic",
-			CostPer1kInput: 0.003, CostPer1kOutput: 0.015,
-		}
-	}
-
-	// Google模型估价
-	if strings.Contains(nameLower, "gemini") {
-		if strings.Contains(nameLower, "flash") {
-			return &models.ModelPrice{
-				ModelName: modelName, Provider: "google",
-				CostPer1kInput: 0.00015, CostPer1kOutput: 0.0006,
-			}
-		}
-		return &models.ModelPrice{
-			ModelName: modelName, Provider: "google",
-			CostPer1kInput: 0.00125, CostPer1kOutput: 0.01,
-		}
-	}
-
-	// 完全未知的模型，按Sonnet价格兜底（中间档，不会过高或过低）
-	return &models.ModelPrice{
-		ModelName: modelName, Provider: "unknown",
-		CostPer1kInput: 0.003, CostPer1kOutput: 0.015,
-	}
+// GetSystemPolicy 获取系统级策略。
+func (service *CreditPolicyService) GetSystemPolicy(
+	ctx context.Context,
+) (*models.CreditPolicy, error) {
+	return repository.GetSystemCreditPolicy(
+		ctx,
+	)
 }
 
-// ==================== 策略管理 ====================
+// UpdateSystemPolicy 更新系统级策略。
+func (service *CreditPolicyService) UpdateSystemPolicy(
+	ctx context.Context,
+	request *models.UpdateCreditPolicyRequest,
+	updatedBy string,
+) (*models.CreditPolicy, error) {
+	current, _ :=
+		repository.GetSystemCreditPolicy(
+			ctx,
+		)
 
-// GetSystemPolicy 获取系统级策略
-func (s *CreditPolicyService) GetSystemPolicy(ctx context.Context) (*models.CreditPolicy, error) {
-	return repository.GetSystemCreditPolicy(ctx)
-}
+	exchangeRate :=
+		models.DefaultExchangeRate
 
-// UpdateSystemPolicy 更新系统级策略
-func (s *CreditPolicyService) UpdateSystemPolicy(ctx context.Context, req *models.UpdateCreditPolicyRequest, updatedBy string) (*models.CreditPolicy, error) {
-	// 先获取当前策略
-	current, _ := repository.GetSystemCreditPolicy(ctx)
-	exchangeRate := models.DefaultExchangeRate
-	multiplier := models.DefaultMultiplier
+	multiplier :=
+		models.DefaultMultiplier
+
 	description := ""
+
 	if current != nil {
-		exchangeRate = current.ExchangeRate
-		multiplier = current.Multiplier
-		description = current.Description
+		exchangeRate =
+			current.ExchangeRate
+		multiplier =
+			current.Multiplier
+		description =
+			current.Description
 	}
 
-	// 合并更新
-	if req.ExchangeRate != nil {
-		exchangeRate = *req.ExchangeRate
-	}
-	if req.Multiplier != nil {
-		multiplier = *req.Multiplier
-	}
-	if req.Description != nil {
-		description = *req.Description
+	if request.ExchangeRate != nil {
+		exchangeRate =
+			*request.ExchangeRate
 	}
 
-	return repository.UpsertCreditPolicy(ctx, models.PolicyScopeSystem, nil, exchangeRate, multiplier, description, &updatedBy)
+	if request.Multiplier != nil {
+		multiplier =
+			*request.Multiplier
+	}
+
+	if request.Description != nil {
+		description =
+			*request.Description
+	}
+
+	return repository.UpsertCreditPolicy(
+		ctx,
+		models.PolicyScopeSystem,
+		nil,
+		exchangeRate,
+		multiplier,
+		description,
+		&updatedBy,
+	)
 }
 
-// GetSchoolPolicy 获取学校级策略
-func (s *CreditPolicyService) GetSchoolPolicy(ctx context.Context, schoolID string) (*models.CreditPolicy, error) {
-	return repository.GetSchoolCreditPolicy(ctx, schoolID)
+// GetSchoolPolicy 获取学校级策略。
+func (service *CreditPolicyService) GetSchoolPolicy(
+	ctx context.Context,
+	schoolID string,
+) (*models.CreditPolicy, error) {
+	return repository.GetSchoolCreditPolicy(
+		ctx,
+		schoolID,
+	)
 }
 
-// UpdateSchoolPolicy 更新学校级策略
-func (s *CreditPolicyService) UpdateSchoolPolicy(ctx context.Context, schoolID string, req *models.UpdateCreditPolicyRequest, updatedBy string) (*models.CreditPolicy, error) {
-	// 先获取当前策略（可能不存在）
-	current, _ := repository.GetSchoolCreditPolicy(ctx, schoolID)
-	exchangeRate := models.DefaultExchangeRate
-	multiplier := models.DefaultMultiplier
+// UpdateSchoolPolicy 更新学校级策略。
+func (service *CreditPolicyService) UpdateSchoolPolicy(
+	ctx context.Context,
+	schoolID string,
+	request *models.UpdateCreditPolicyRequest,
+	updatedBy string,
+) (*models.CreditPolicy, error) {
+	current, _ :=
+		repository.GetSchoolCreditPolicy(
+			ctx,
+			schoolID,
+		)
+
+	exchangeRate :=
+		models.DefaultExchangeRate
+
+	multiplier :=
+		models.DefaultMultiplier
+
 	description := ""
+
 	if current != nil {
-		exchangeRate = current.ExchangeRate
-		multiplier = current.Multiplier
-		description = current.Description
+		exchangeRate =
+			current.ExchangeRate
+		multiplier =
+			current.Multiplier
+		description =
+			current.Description
 	}
 
-	if req.ExchangeRate != nil {
-		exchangeRate = *req.ExchangeRate
-	}
-	if req.Multiplier != nil {
-		multiplier = *req.Multiplier
-	}
-	if req.Description != nil {
-		description = *req.Description
+	if request.ExchangeRate != nil {
+		exchangeRate =
+			*request.ExchangeRate
 	}
 
-	return repository.UpsertCreditPolicy(ctx, models.PolicyScopeSchool, &schoolID, exchangeRate, multiplier, description, &updatedBy)
+	if request.Multiplier != nil {
+		multiplier =
+			*request.Multiplier
+	}
+
+	if request.Description != nil {
+		description =
+			*request.Description
+	}
+
+	return repository.UpsertCreditPolicy(
+		ctx,
+		models.PolicyScopeSchool,
+		&schoolID,
+		exchangeRate,
+		multiplier,
+		description,
+		&updatedBy,
+	)
 }
 
-// DeleteSchoolPolicy 删除学校级策略
-func (s *CreditPolicyService) DeleteSchoolPolicy(ctx context.Context, schoolID string) error {
-	return repository.DeleteSchoolCreditPolicy(ctx, schoolID)
+// DeleteSchoolPolicy 删除学校级策略。
+func (service *CreditPolicyService) DeleteSchoolPolicy(
+	ctx context.Context,
+	schoolID string,
+) error {
+	return repository.DeleteSchoolCreditPolicy(
+		ctx,
+		schoolID,
+	)
 }
 
-// ListPolicies 列出所有策略
-func (s *CreditPolicyService) ListPolicies(ctx context.Context) ([]*models.CreditPolicyListItem, error) {
+// ListPolicies 列出全部积分策略。
+func (service *CreditPolicyService) ListPolicies(
+	ctx context.Context,
+) ([]*models.CreditPolicyListItem, error) {
 	return repository.ListCreditPolicies(ctx)
 }
 
-// ==================== 模型单价管理 ====================
-
-// ListModelPrices 列出模型单价
-func (s *CreditPolicyService) ListModelPrices(ctx context.Context, includeInactive bool) ([]models.ModelPrice, error) {
-	return repository.ListModelPrices(ctx, includeInactive)
+// ListModelPrices 列出文本模型单价。
+func (service *CreditPolicyService) ListModelPrices(
+	ctx context.Context,
+	includeInactive bool,
+) ([]models.ModelPrice, error) {
+	return repository.ListModelPrices(
+		ctx,
+		includeInactive,
+	)
 }
 
-// CreateModelPrice 创建模型单价
-func (s *CreditPolicyService) CreateModelPrice(ctx context.Context, req *models.CreateModelPriceRequest, updatedBy string) (*models.ModelPrice, error) {
-	if req.ModelName == "" {
-		return nil, fmt.Errorf("模型名称不能为空")
-	}
-	if req.Provider == "" {
-		return nil, fmt.Errorf("供应商不能为空")
+// CreateModelPrice 创建文本模型单价。
+func (service *CreditPolicyService) CreateModelPrice(
+	ctx context.Context,
+	request *models.CreateModelPriceRequest,
+	updatedBy string,
+) (*models.ModelPrice, error) {
+	if request.ModelName == "" {
+		return nil,
+			fmt.Errorf("模型名称不能为空")
 	}
 
-	mp := &models.ModelPrice{
-		ModelName:       req.ModelName,
-		Provider:        req.Provider,
-		CostPer1kInput:  req.CostPer1kInput,
-		CostPer1kOutput: req.CostPer1kOutput,
-		DisplayName:     req.DisplayName,
+	if request.Provider == "" {
+		return nil,
+			fmt.Errorf("供应商不能为空")
+	}
+
+	price := &models.ModelPrice{
+		ModelName:       request.ModelName,
+		Provider:        request.Provider,
+		CostPer1kInput:  request.CostPer1kInput,
+		CostPer1kOutput: request.CostPer1kOutput,
+		DisplayName:     request.DisplayName,
 		IsActive:        true,
 		UpdatedBy:       &updatedBy,
 	}
-	if err := repository.CreateModelPrice(ctx, mp); err != nil {
-		if errors.Is(err, repository.ErrModelPriceDuplicate) {
+
+	if err :=
+		repository.CreateModelPrice(
+			ctx,
+			price,
+		); err != nil {
+		if errors.Is(
+			err,
+			repository.ErrModelPriceDuplicate,
+		) {
 			return nil, err
 		}
-		return nil, fmt.Errorf("创建模型单价失败: %w", err)
-	}
-	return mp, nil
-}
 
-// UpdateModelPrice 更新模型单价
-func (s *CreditPolicyService) UpdateModelPrice(ctx context.Context, id string, req *models.UpdateModelPriceRequest, updatedBy string) (*models.ModelPrice, error) {
-	return repository.UpdateModelPrice(ctx, id, req.CostPer1kInput, req.CostPer1kOutput,
-		req.DisplayName, req.IsActive, &updatedBy)
-}
-
-// DeleteModelPrice 删除模型单价
-func (s *CreditPolicyService) DeleteModelPrice(ctx context.Context, id string) error {
-	return repository.DeleteModelPrice(ctx, id)
-}
-
-// ==================== 模拟计算 + 预览 ====================
-
-// Simulate 模拟积分计算（供前端预估）
-func (s *CreditPolicyService) Simulate(ctx context.Context, req *models.SimulateCreditRequest) (*models.CreditCalculation, error) {
-	if req.ModelName == "" {
-		return nil, fmt.Errorf("模型名称不能为空")
-	}
-	if req.InputTokens <= 0 && req.OutputTokens <= 0 {
-		return nil, fmt.Errorf("输入/输出token数至少填一个")
+		return nil,
+			fmt.Errorf(
+				"创建模型单价失败: %w",
+				err,
+			)
 	}
 
-	calc := s.CalculateCredits(ctx, req.ModelName, req.InputTokens, req.OutputTokens, 0, req.SchoolID, 0)
-	return calc, nil
+	return price, nil
 }
 
-// GetModelPreviews 获取所有活跃模型的积分预览（按系统策略计算）
-func (s *CreditPolicyService) GetModelPreviews(ctx context.Context) ([]models.ModelPricePreview, error) {
-	prices, err := repository.ListModelPrices(ctx, false) // 仅活跃模型
+// UpdateModelPrice 更新文本模型单价。
+func (service *CreditPolicyService) UpdateModelPrice(
+	ctx context.Context,
+	id string,
+	request *models.UpdateModelPriceRequest,
+	updatedBy string,
+) (*models.ModelPrice, error) {
+	return repository.UpdateModelPrice(
+		ctx,
+		id,
+		request.CostPer1kInput,
+		request.CostPer1kOutput,
+		request.DisplayName,
+		request.IsActive,
+		&updatedBy,
+	)
+}
+
+// DeleteModelPrice 删除文本模型单价。
+func (service *CreditPolicyService) DeleteModelPrice(
+	ctx context.Context,
+	id string,
+) error {
+	return repository.DeleteModelPrice(
+		ctx,
+		id,
+	)
+}
+
+// Simulate 模拟一次积分计算。
+func (service *CreditPolicyService) Simulate(
+	ctx context.Context,
+	request *models.SimulateCreditRequest,
+) (*models.CreditCalculation, error) {
+	if request.ModelName == "" {
+		return nil,
+			fmt.Errorf("模型名称不能为空")
+	}
+
+	if request.InputTokens <= 0 &&
+		request.OutputTokens <= 0 {
+		return nil,
+			fmt.Errorf(
+				"输入/输出token数至少填一个",
+			)
+	}
+
+	calculation :=
+		service.CalculateCredits(
+			ctx,
+			request.ModelName,
+			request.InputTokens,
+			request.OutputTokens,
+			0,
+			request.SchoolID,
+			0,
+		)
+
+	return calculation, nil
+}
+
+// GetModelPreviews 返回当前基础价格的积分预览。
+//
+// 阶梯模型在真实调用时仍会根据input_tokens应用对应档位。
+func (service *CreditPolicyService) GetModelPreviews(
+	ctx context.Context,
+) ([]models.ModelPricePreview, error) {
+	prices, err :=
+		repository.ListModelPrices(
+			ctx,
+			false,
+		)
+
 	if err != nil {
 		return nil, err
 	}
 
-	policy := s.GetEffectivePolicy(ctx, nil) // 系统策略
+	policy :=
+		service.GetEffectivePolicy(
+			ctx,
+			nil,
+		)
 
-	var previews []models.ModelPricePreview
-	for _, p := range prices {
-		previews = append(previews, models.ModelPricePreview{
-			ModelName:          p.ModelName,
-			Provider:           p.Provider,
-			DisplayName:        p.DisplayName,
-			CostPer1kInput:     p.CostPer1kInput,
-			CostPer1kOutput:    p.CostPer1kOutput,
-			CreditsPer1kInput:  p.CostPer1kInput * policy.ExchangeRate * policy.Multiplier,
-			CreditsPer1kOutput: p.CostPer1kOutput * policy.ExchangeRate * policy.Multiplier,
-		})
+	previews :=
+		make(
+			[]models.ModelPricePreview,
+			0,
+			len(prices),
+		)
+
+	for _, price := range prices {
+		previews = append(
+			previews,
+			models.ModelPricePreview{
+				ModelName:       price.ModelName,
+				Provider:        price.Provider,
+				DisplayName:     price.DisplayName,
+				CostPer1kInput:  price.CostPer1kInput,
+				CostPer1kOutput: price.CostPer1kOutput,
+				CreditsPer1kInput: price.CostPer1kInput *
+					policy.ExchangeRate *
+					policy.Multiplier,
+				CreditsPer1kOutput: price.CostPer1kOutput *
+					policy.ExchangeRate *
+					policy.Multiplier,
+			},
+		)
 	}
+
 	return previews, nil
 }

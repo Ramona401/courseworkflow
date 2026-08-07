@@ -21,13 +21,63 @@ import type {
   ConvComponent,
 } from '@/api/lesson-plans'
 import { C, renderMarkdown } from './workshopConstants'
-import ContextReceiptCard from './context-receipt/ContextReceiptCard'
+import LessonConsensusCapsulePortal from './lesson-consensus/LessonConsensusCapsulePortal'
 
 // ==================== 首屏备课表单 ====================
 
 // ==================== 首屏备课表单 ====================
 
 export { default as StartForm } from './EducationAwareStartForm'
+
+/**
+ * sanitizeTeacherFacingWorkshopMessage — 历史消息的教师端安全清洗
+ *
+ * 旧版本已经把部分资源管理细节写入会话记录，例如：
+ *   - “已附N个参考组件”；
+ *   - “已关联N张课本页”；
+ *   - 参考资料文件名；
+ *   - “已选择N个组件”。
+ *
+ * 数据库原记录继续保留，便于审计和兼容；本函数只改变教师端显示，
+ * 把机械挂载信息转换成教学意义，不改写教师真实表达和AI正式内容。
+ */
+function sanitizeTeacherFacingWorkshopMessage(
+  content: string,
+): string {
+  let next = String(content || '')
+
+  next = next.replace(
+    /\n?（已附\s*\d+\s*个参考组件）/g,
+    '',
+  )
+
+  next = next.replace(
+    /📷\s*已关联\s*\d+\s*张课本页，从你的下一条消息开始，我会贴着课文原文来设计。/g,
+    '📖 已加入课文依据，接下来我会贴着课文原文来设计。',
+  )
+
+  next = next.replace(
+    /📷\s*已解除全部课本关联，之后的设计不再参考课本原文。/g,
+    '📖 已暂不使用课文依据，之后的设计将以当前共识为主。',
+  )
+
+  next = next.replace(
+    /📎\s*已附参考资料「[^」]*」，从你的下一条消息开始，我会参考其中的知识点和要求。/g,
+    '📎 已加入补充依据，从你的下一条消息开始，我会结合其中的知识点和要求。',
+  )
+
+  next = next.replace(
+    /已选择\s*\d+\s*个教学组件/g,
+    '已加入教学策略',
+  )
+
+  next = next.replace(
+    /已选择\s*\d+\s*个组件/g,
+    '已加入教学策略',
+  )
+
+  return next.trim()
+}
 
 // ==================== AI消息气泡 ====================
 
@@ -37,8 +87,8 @@ interface AIBubbleProps {
   onSelectComponent: (comp: ConvComponent) => void
   selectedComponentIds: Set<string>
   /**
-   * 消息列表层计算后的回执显示结果。
-   * 默认true，兼容其它尚未接入列表去重的调用点。
+   * 旧机械回执显示参数暂时保留以兼容两个大型页面。
+   * AIBubble已经不再渲染回执卡片，后续拆页时可删除此参数。
    */
   showContextReceipt?: boolean
 }
@@ -48,28 +98,24 @@ export function AIBubble({
   streaming = false,
   onSelectComponent,
   selectedComponentIds,
-  showContextReceipt = true,
 }: AIBubbleProps) {
   const [expandedComponent, setExpandedComponent] = useState<string | null>(null)
+  const teacherFacingContent = sanitizeTeacherFacingWorkshopMessage(msg.content)
 
   return (
-    <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', alignItems: 'flex-start' }}>
+    <>
+      <LessonConsensusCapsulePortal />
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', alignItems: 'flex-start' }}>
       <div style={{ width: '32px', height: '32px', flexShrink: 0, background: 'linear-gradient(135deg, #4F7BE8, #818CF8)', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px' }}>✨</div>
       <div style={{ flex: 1, maxWidth: 'calc(100% - 42px)' }}>
-        {msg.content && (
+        {teacherFacingContent && (
           <div style={{ background: C.aiBubble, borderRadius: '0 12px 12px 12px', padding: '12px 16px', wordBreak: 'break-word' }}>
-            {renderMarkdown(msg.content)}
+            {renderMarkdown(teacherFacingContent)}
             {streaming && (
               <span style={{ display: 'inline-block', width: '2px', height: '1em', background: C.primary, marginLeft: '2px', verticalAlign: 'text-bottom', animation: 'cursor-blink 0.8s step-end infinite' }} />
             )}
             <style>{`@keyframes cursor-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }`}</style>
           </div>
-        )}
-
-        {showContextReceipt && (
-          <ContextReceiptCard
-            receipt={msg.metadata?.context_receipt}
-          />
         )}
 
         {msg.type === 'components' && msg.components && msg.components.length > 0 && (
@@ -82,7 +128,6 @@ export function AIBubble({
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: '14px', fontWeight: 600, color: C.text }}>{comp.display_label}</div>
-                      {comp.usage_count > 0 && <div style={{ fontSize: '12px', color: C.textMuted, marginTop: '2px' }}>{comp.usage_count}位老师用过 · 质量分{comp.quality_score.toFixed(1)}</div>}
                     </div>
                     <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexShrink: 0, marginLeft: '12px' }}>
                       {comp.design_logic && (
@@ -107,16 +152,22 @@ export function AIBubble({
         )}
       </div>
     </div>
+    </>
   )
 }
 
 // ==================== 用户消息气泡 ====================
 
 export function UserBubble({ msg }: { msg: ConversationMessage }) {
+  const teacherFacingContent =
+    sanitizeTeacherFacingWorkshopMessage(
+      msg.content,
+    )
+
   return (
     <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '16px' }}>
       <div style={{ maxWidth: '75%', background: C.userBubble, border: `1px solid ${C.border}`, borderRadius: '12px 0 12px 12px', padding: '10px 14px', fontSize: '15px', color: C.text, lineHeight: 1.7, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-        {msg.content}
+        {teacherFacingContent}
       </div>
     </div>
   )

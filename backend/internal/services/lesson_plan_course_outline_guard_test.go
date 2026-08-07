@@ -7,7 +7,7 @@ package services
 //   - vocational/adult拒绝具名出版社；
 //   - 非K12允许以空字符串挂载普通课程大纲；
 //   - K12伪造不存在的出版社被拒绝；
-//   - 运行时查询必须显式携带教案快照域；
+//   - publisher-only旧兼容入口只负责挂载校验，不再参与运行时大纲解析；
 //   - 非K12自由学习层级采用完整文本精确匹配。
 
 import (
@@ -21,12 +21,24 @@ import (
 func preserveCourseOutlineGuardDependency(
 	t *testing.T,
 ) {
-	original :=
+	originalListReader :=
 		courseOutlineListActiveByDomain
+	originalSnapshotReader :=
+		lessonPlanCourseOutlineSnapshotReader
+	originalExactReader :=
+		activeCourseOutlineExactReader
+	originalVisibleReader :=
+		visibleCourseOutlineReader
 
 	t.Cleanup(func() {
 		courseOutlineListActiveByDomain =
-			original
+			originalListReader
+		lessonPlanCourseOutlineSnapshotReader =
+			originalSnapshotReader
+		activeCourseOutlineExactReader =
+			originalExactReader
+		visibleCourseOutlineReader =
+			originalVisibleReader
 	})
 }
 
@@ -216,86 +228,6 @@ func TestCourseOutlineMountRejectsUnavailableK12Publisher(
 		t.Fatalf(
 			"错误类型不正确: %v",
 			err,
-		)
-	}
-}
-
-func TestResolveCourseOutlinesUsesLessonPlanSnapshotDomain(
-	t *testing.T,
-) {
-	preserveCourseOutlineGuardDependency(t)
-
-	courseOutlineListActiveByDomain = func(
-		ctx context.Context,
-		subject string,
-		educationDomain string,
-	) ([]*models.CourseOutline, error) {
-		if subject != "数字技能培训" {
-			t.Fatalf(
-				"查询学科错误: %s",
-				subject,
-			)
-		}
-
-		if educationDomain !=
-			models.EducationDomainAdult {
-			t.Fatalf(
-				"未使用教案教育域快照: %s",
-				educationDomain,
-			)
-		}
-
-		return []*models.CourseOutline{
-			{
-				ID:        "adult-outline-1",
-				Subject:   subject,
-				Grade:     "零基础",
-				Publisher: "",
-				Content:   "成人教育课程大纲",
-			},
-			{
-				ID:        "adult-outline-2",
-				Subject:   subject,
-				Grade:     "有经验",
-				Publisher: "",
-				Content:   "不应命中",
-			},
-		}, nil
-	}
-
-	publisher := ""
-
-	lessonPlan := &models.LessonPlan{
-		Subject:                "数字技能培训",
-		Grade:                  "零基础",
-		EducationDomain:        models.EducationDomainAdult,
-		CourseOutlinePublisher: &publisher,
-	}
-
-	hits, err :=
-		ResolveLessonPlanCourseOutlines(
-			context.Background(),
-			lessonPlan,
-		)
-	if err != nil {
-		t.Fatalf(
-			"运行时课程大纲解析失败: %v",
-			err,
-		)
-	}
-
-	if len(hits) != 1 {
-		t.Fatalf(
-			"命中数量错误: %d",
-			len(hits),
-		)
-	}
-
-	if hits[0].ID !=
-		"adult-outline-1" {
-		t.Fatalf(
-			"命中了错误大纲: %s",
-			hits[0].ID,
 		)
 	}
 }

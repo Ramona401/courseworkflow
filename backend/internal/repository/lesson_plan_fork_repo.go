@@ -2,16 +2,17 @@ package repository
 
 // lesson_plan_fork_repo.go — 教案Fork原子Repository
 //
-// 本文件承载上下文13的安全Fork写入：
-//   1. 严格校验显式来源教育域；
+// 本文件承载上下文13的安全Fork写入，并在上下文17扩展common来源：
+//   1. 严格校验显式来源资源域与副本具体教学域；
 //   2. 事务锁定来源教案；
-//   3. 重新确认来源状态和教育域；
-//   4. 显式写入副本education_domain；
-//   5. 校验数据库最终快照；
+//   3. 重新确认来源状态和来源资源域；
+//   4. 同域来源写回原具体域，common来源写入调用者具体域；
+//   5. 校验数据库最终副本快照；
 //   6. 同事务递增来源fork_count；
 //   7. 任一步失败时整体回滚。
 //
-// 不依赖数据库触发器推导作者域，也不允许调用者域覆盖来源资源域。
+// 不依赖数据库触发器推导作者域。具体域来源不能被调用者域覆盖；
+// common只作为公共来源快照，副本必须落入调用者唯一具体教学域。
 // 副本只继承旧Fork已有语义中的正文、结构、生成配置、组件、
 // 模板、配方和课本引用；不继承对话、阶段运行状态、评审结果、
 // 单元方案、班级学情或课程大纲版本。
@@ -30,21 +31,21 @@ import (
 
 var (
 	// ErrLessonPlanForkEducationDomainRequired
-	// 表示Fork没有收到具体来源教育域。
+	// 表示Fork没有收到合法来源资源域或副本具体教学域。
 	ErrLessonPlanForkEducationDomainRequired = errors.New(
-		"Fork必须显式提供来源教案的具体教学教育域",
+		"Fork必须显式提供合法来源资源域和副本具体教学域",
 	)
 
 	// ErrLessonPlanForkEducationDomainMismatch
-	// 表示事务中重新读取的来源域与Service传入域不一致。
+	// 表示事务中来源资源域变化，或具体来源与副本域不一致。
 	ErrLessonPlanForkEducationDomainMismatch = errors.New(
-		"Fork来源教案教育域与调用者教育域不一致",
+		"Fork来源资源域与副本教育域不兼容",
 	)
 
 	// ErrLessonPlanForkEducationDomainSnapshotMismatch
-	// 表示副本数据库最终快照与来源域不一致。
+	// 表示副本数据库最终快照与目标具体教学域不一致。
 	ErrLessonPlanForkEducationDomainSnapshotMismatch = errors.New(
-		"Fork副本教育域快照与来源教案不一致",
+		"Fork副本教育域快照与目标教学域不一致",
 	)
 
 	// ErrLessonPlanForkSourceNotForkable
@@ -54,17 +55,17 @@ var (
 	)
 )
 
-// normalizeLessonPlanForkEducationDomain
-// 规范化并严格校验Fork来源教育域。
-func normalizeLessonPlanForkEducationDomain(
+// normalizeLessonPlanForkSourceDomain 规范化并校验来源资源域。
+// 来源允许k12、vocational、adult和common，mixed及非法值拒绝。
+func normalizeLessonPlanForkSourceDomain(
 	educationDomain string,
 ) (string, error) {
 	domain := strings.ToLower(
 		strings.TrimSpace(educationDomain),
 	)
-	if !models.IsTeachingEducationDomain(domain) {
+	if !models.IsResourceEducationDomain(domain) {
 		return "", fmt.Errorf(
-			"%w: %q",
+			"%w: source=%q",
 			ErrLessonPlanForkEducationDomainRequired,
 			educationDomain,
 		)
@@ -73,13 +74,54 @@ func normalizeLessonPlanForkEducationDomain(
 	return domain, nil
 }
 
-// ForkLessonPlanWithEducationDomain
-// 原子复制教案并显式继承来源教案教育域。
+// normalizeLessonPlanForkTargetDomain 规范化并校验副本具体教学域。
+// common不能成为副本运行域；副本必须落入调用者的唯一具体教学域。
+func normalizeLessonPlanForkTargetDomain(
+	educationDomain string,
+) (string, error) {
+	domain := strings.ToLower(
+		strings.TrimSpace(educationDomain),
+	)
+	if !models.IsTeachingEducationDomain(domain) {
+		return "", fmt.Errorf(
+			"%w: target=%q",
+			ErrLessonPlanForkEducationDomainRequired,
+			educationDomain,
+		)
+	}
+
+	return domain, nil
+}
+
+// ForkLessonPlanWithEducationDomain 保留上下文13旧签名兼容。
+//
+// 旧调用方只支持具体域来源，因此来源域和副本域使用同一个值。
+// 上下文17正式Service使用ForkLessonPlanWithEducationDomains。
 func ForkLessonPlanWithEducationDomain(
 	ctx context.Context,
 	sourceID string,
 	newAuthorID string,
 	educationDomain string,
+) (*models.LessonPlan, error) {
+	return ForkLessonPlanWithEducationDomains(
+		ctx,
+		sourceID,
+		newAuthorID,
+		educationDomain,
+		educationDomain,
+	)
+}
+
+// ForkLessonPlanWithEducationDomains 原子复制教案。
+//
+// sourceEducationDomain是来源资源快照，可为common；
+// targetEducationDomain必须是调用者唯一具体教学域。
+func ForkLessonPlanWithEducationDomains(
+	ctx context.Context,
+	sourceID string,
+	newAuthorID string,
+	sourceEducationDomain string,
+	targetEducationDomain string,
 ) (*models.LessonPlan, error) {
 	sourceID = strings.TrimSpace(sourceID)
 	newAuthorID = strings.TrimSpace(newAuthorID)
@@ -90,12 +132,31 @@ func ForkLessonPlanWithEducationDomain(
 		)
 	}
 
-	domain, err :=
-		normalizeLessonPlanForkEducationDomain(
-			educationDomain,
+	sourceDomain, err :=
+		normalizeLessonPlanForkSourceDomain(
+			sourceEducationDomain,
 		)
 	if err != nil {
 		return nil, err
+	}
+
+	targetDomain, err :=
+		normalizeLessonPlanForkTargetDomain(
+			targetEducationDomain,
+		)
+	if err != nil {
+		return nil, err
+	}
+
+	// 具体域来源只能Fork到同一具体域；common来源可落入任一具体教学域。
+	if sourceDomain != models.EducationDomainCommon &&
+		sourceDomain != targetDomain {
+		return nil, fmt.Errorf(
+			"%w: source=%s target=%s",
+			ErrLessonPlanForkEducationDomainMismatch,
+			sourceDomain,
+			targetDomain,
+		)
 	}
 
 	tx, err := database.DB.Begin(ctx)
@@ -127,26 +188,26 @@ func ForkLessonPlanWithEducationDomain(
 	)
 
 	err = tx.QueryRow(ctx, `
-		SELECT
-			title,
-			subject,
-			grade,
-			topic,
-			duration_minutes,
-			COALESCE(content_markdown, ''),
-			COALESCE(content_structured::text, '{}'),
-			COALESCE(generation_config::text, '{}'),
-			COALESCE(matched_components::text, '[]'),
-			template_id::text,
-			recipe_id::text,
-			COALESCE(textbook_page_ids::text, '[]'),
-			COALESCE(education_domain, ''),
-			status
-		FROM lesson_plans
-		WHERE id = $1
-		  AND deleted_at IS NULL
-		FOR UPDATE
-	`, sourceID).Scan(
+                SELECT
+                        title,
+                        subject,
+                        grade,
+                        topic,
+                        duration_minutes,
+                        COALESCE(content_markdown, ''),
+                        COALESCE(content_structured::text, '{}'),
+                        COALESCE(generation_config::text, '{}'),
+                        COALESCE(matched_components::text, '[]'),
+                        template_id::text,
+                        recipe_id::text,
+                        COALESCE(textbook_page_ids::text, '[]'),
+                        COALESCE(education_domain, ''),
+                        status
+                FROM lesson_plans
+                WHERE id = $1
+                  AND deleted_at IS NULL
+                FOR UPDATE
+        `, sourceID).Scan(
 		&sourceTitle,
 		&sourceSubject,
 		&sourceGrade,
@@ -184,15 +245,18 @@ func ForkLessonPlanWithEducationDomain(
 			sourceStoredDomain,
 		),
 	)
-	if !models.IsTeachingEducationDomain(
+	if !models.IsResourceEducationDomain(
 		sourceStoredDomain,
 	) ||
-		sourceStoredDomain != domain {
+		sourceStoredDomain != sourceDomain ||
+		(sourceStoredDomain != models.EducationDomainCommon &&
+			sourceStoredDomain != targetDomain) {
 		return nil, fmt.Errorf(
-			"%w: service=%s source=%s",
+			"%w: expected_source=%s source=%s target=%s",
 			ErrLessonPlanForkEducationDomainMismatch,
-			domain,
+			sourceDomain,
 			sourceStoredDomain,
+			targetDomain,
 		)
 	}
 
@@ -247,62 +311,62 @@ func ForkLessonPlanWithEducationDomain(
 		RecipeID:   recipeID,
 
 		TextbookPageIDs: sourceTextbookPageIDs,
-		EducationDomain: domain,
+		EducationDomain: targetDomain,
 	}
 
 	storedDomain := ""
 
 	err = tx.QueryRow(ctx, `
-		INSERT INTO lesson_plans (
-			title,
-			subject,
-			grade,
-			topic,
-			duration_minutes,
-			content_markdown,
-			content_structured,
-			generation_config,
-			matched_components,
-			conversation_log,
-			status,
-			visibility,
-			author_id,
-			group_id,
-			school_id,
-			template_id,
-			recipe_id,
-			textbook_page_ids,
-			education_domain,
-			forked_from
-		)
-		VALUES (
-			$1,
-			$2,
-			$3,
-			$4,
-			$5,
-			$6,
-			$7,
-			$8,
-			$9,
-			$10,
-			$11,
-			$12,
-			$13,
-			NULL,
-			NULL,
-			$14,
-			$15,
-			$16,
-			$17,
-			$18
-		)
-		RETURNING
-			id,
-			education_domain,
-			created_at,
-			updated_at
-	`,
+                INSERT INTO lesson_plans (
+                        title,
+                        subject,
+                        grade,
+                        topic,
+                        duration_minutes,
+                        content_markdown,
+                        content_structured,
+                        generation_config,
+                        matched_components,
+                        conversation_log,
+                        status,
+                        visibility,
+                        author_id,
+                        group_id,
+                        school_id,
+                        template_id,
+                        recipe_id,
+                        textbook_page_ids,
+                        education_domain,
+                        forked_from
+                )
+                VALUES (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5,
+                        $6,
+                        $7,
+                        $8,
+                        $9,
+                        $10,
+                        $11,
+                        $12,
+                        $13,
+                        NULL,
+                        NULL,
+                        $14,
+                        $15,
+                        $16,
+                        $17,
+                        $18
+                )
+                RETURNING
+                        id,
+                        education_domain,
+                        created_at,
+                        updated_at
+        `,
 		newLessonPlan.Title,
 		newLessonPlan.Subject,
 		newLessonPlan.Grade,
@@ -319,7 +383,7 @@ func ForkLessonPlanWithEducationDomain(
 		newLessonPlan.TemplateID,
 		newLessonPlan.RecipeID,
 		newLessonPlan.TextbookPageIDs,
-		domain,
+		targetDomain,
 		sourceID,
 	).Scan(
 		&newLessonPlan.ID,
@@ -337,30 +401,30 @@ func ForkLessonPlanWithEducationDomain(
 	storedDomain = strings.ToLower(
 		strings.TrimSpace(storedDomain),
 	)
-	if storedDomain != domain ||
+	if storedDomain != targetDomain ||
 		!models.IsTeachingEducationDomain(
 			storedDomain,
 		) {
 		return nil, fmt.Errorf(
-			"%w: source=%s database=%s",
+			"%w: target=%s database=%s",
 			ErrLessonPlanForkEducationDomainSnapshotMismatch,
-			domain,
+			targetDomain,
 			storedDomain,
 		)
 	}
 
 	result, err := tx.Exec(ctx, `
-		UPDATE lesson_plans
-		SET
-			fork_count = fork_count + 1,
-			updated_at = NOW()
-		WHERE id = $1
-		  AND deleted_at IS NULL
-		  AND education_domain = $2
-		  AND status IN ($3, $4)
-	`,
+                UPDATE lesson_plans
+                SET
+                        fork_count = fork_count + 1,
+                        updated_at = NOW()
+                WHERE id = $1
+                  AND deleted_at IS NULL
+                  AND education_domain = $2
+                  AND status IN ($3, $4)
+        `,
 		sourceID,
-		domain,
+		sourceDomain,
 		models.LPStatusPublishedShared,
 		models.LPStatusApproved,
 	)

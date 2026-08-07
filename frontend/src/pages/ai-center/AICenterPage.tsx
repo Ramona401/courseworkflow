@@ -7,6 +7,7 @@
  *   - 场景配置Tab → components/SceneConfigPanel.tsx
  *   - 本文件保留：主页面框架 + 状态管理 + 连接配置Tab
  * S-V1.5b：连接配置Tab新增TTS语音合成配置卡片 → components/TTSConfigCard.tsx
+ * 语音输入：新增独立ASR配置卡片，避免与TTS应用凭据互相覆盖。
  */
 import { useState, useEffect, useCallback } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
@@ -20,6 +21,7 @@ import { AI_PROVIDERS, C, Toast, ProviderItem, ModelSelect } from './components/
 import type { AIProvider } from './components/AICenterConstants'
 import SceneConfigPanel from './components/SceneConfigPanel'
 import TTSConfigCard from './components/TTSConfigCard'
+import ASRConfigCard from './components/ASRConfigCard'
 import DomesticGatewayCard from './components/DomesticGatewayCard'
 import GatewayNamingCard from './components/GatewayNamingCard'
 import ModelAliasCard from './components/ModelAliasCard'
@@ -451,6 +453,8 @@ export default function AICenterPage() {
             {/* S-V1.5b：TTS语音合成配置卡片（独立组件，复用页面Toast通道） */}
             {/* 批一：境内文本网关配置卡片（双网关分流降级通道，置于TTS卡片之前） */}
             <DomesticGatewayCard showToast={showToast} />
+            {/* 语音输入：ASR与TTS使用不同火山应用，必须独立配置。 */}
+            <ASRConfigCard showToast={showToast} />
             <TTSConfigCard showToast={showToast} />
             </>
           )}

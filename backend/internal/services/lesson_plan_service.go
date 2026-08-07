@@ -4,11 +4,12 @@ package services
 //
 // 本文件承载：
 //   - 教案普通创建入口；
-//   - 教案详情、列表、更新和删除；
+//   - 教案更新和删除；
 //   - 提示词模板管理；
 //   - 公共错误和基础辅助方法。
 //
 // 教案状态流转与课件开发位于lesson_plan_service_actions.go。
+// 共享列表和详情读取位于lesson_plan_shared_read_service.go。
 // Fork教育域继承硬闸位于lesson_plan_fork_service.go。
 // 普通创建教育域硬闸位于lesson_plan_creation_service.go。
 
@@ -103,211 +104,6 @@ func (s *LessonPlanService) CreateLessonPlan(
 	)
 }
 
-// GetLessonPlan 获取教案详情。
-func (s *LessonPlanService) GetLessonPlan(
-	ctx context.Context,
-	id string,
-) (*models.LessonPlanDetailResponse, error) {
-	lessonPlan, err := repository.GetLessonPlanByID(
-		ctx,
-		id,
-	)
-	if err != nil {
-		if errors.Is(
-			err,
-			repository.ErrLessonPlanNotFound,
-		) {
-			return nil, ErrLPNotFound
-		}
-		return nil, err
-	}
-
-	_ = repository.IncrementLessonPlanView(
-		ctx,
-		id,
-	)
-
-	authorName := ""
-	if author, authorErr := repository.FindUserByID(
-		ctx,
-		lessonPlan.AuthorID,
-	); authorErr == nil {
-		authorName = author.DisplayName
-	}
-
-	groupName := ""
-	if lessonPlan.GroupID != nil {
-		if group, groupErr :=
-			repository.GetTeachingGroupByID(
-				ctx,
-				*lessonPlan.GroupID,
-			); groupErr == nil {
-			groupName = group.Name
-		}
-	}
-
-	reviews, reviewErr :=
-		repository.ListLessonPlanReviews(
-			ctx,
-			id,
-		)
-	if reviewErr != nil {
-		reviews = []*models.LessonPlanReviewItem{}
-	}
-
-	recipeName := ""
-	if lessonPlan.RecipeID != nil &&
-		*lessonPlan.RecipeID != "" {
-		if recipe, recipeErr :=
-			repository.GetRecipeByID(
-				ctx,
-				*lessonPlan.RecipeID,
-			); recipeErr == nil {
-			recipeName = recipe.Name
-		}
-	}
-
-	var linkedPipelineID *string
-	linkedPipeline, pipelineErr :=
-		repository.GetPipelineByLessonPlanID(
-			id,
-		)
-	if pipelineErr == nil &&
-		linkedPipeline != nil {
-		linkedPipelineID = &linkedPipeline.ID
-	}
-
-	interactionCounts, _ :=
-		repository.GetInteractionCounts(
-			ctx,
-			id,
-			lessonPlan.AuthorID,
-		)
-
-	likeCount := 0
-	favoriteCount := 0
-	if interactionCounts != nil {
-		likeCount = interactionCounts.LikeCount
-		favoriteCount =
-			interactionCounts.FavoriteCount
-	}
-
-	return &models.LessonPlanDetailResponse{
-		ID: lessonPlan.ID,
-
-		Title:           lessonPlan.Title,
-		Subject:         lessonPlan.Subject,
-		Grade:           lessonPlan.Grade,
-		Topic:           lessonPlan.Topic,
-		DurationMinutes: lessonPlan.DurationMinutes,
-
-		ContentMarkdown:   lessonPlan.ContentMarkdown,
-		ContentStructured: lessonPlan.ContentStructured,
-		GenerationConfig:  lessonPlan.GenerationConfig,
-		MatchedComponents: lessonPlan.MatchedComponents,
-
-		AIReviewScore:   lessonPlan.AIReviewScore,
-		AIReviewResult:  lessonPlan.AIReviewResult,
-		AIReviewHistory: lessonPlan.AIReviewHistory,
-
-		Status:     lessonPlan.Status,
-		StatusName: models.LPStatusNameMap[lessonPlan.Status],
-		Visibility: lessonPlan.Visibility,
-
-		AuthorID:   lessonPlan.AuthorID,
-		AuthorName: authorName,
-		GroupID:    lessonPlan.GroupID,
-		GroupName:  groupName,
-		SchoolID:   lessonPlan.SchoolID,
-
-		ForkedFrom: lessonPlan.ForkedFrom,
-		ForkCount:  lessonPlan.ForkCount,
-		ViewCount:  lessonPlan.ViewCount,
-		UseCount:   lessonPlan.UseCount,
-		Version:    lessonPlan.Version,
-
-		RecipeID:   lessonPlan.RecipeID,
-		RecipeName: recipeName,
-
-		LessonIndex:          lessonPlan.LessonIndex,
-		IdxCognitiveLevel:    lessonPlan.IdxCognitiveLevel,
-		IdxPedagogyIntensity: lessonPlan.IdxPedagogyIntensity,
-		IdxStructureType:     lessonPlan.IdxStructureType,
-		IdxQualityLevel:      lessonPlan.IdxQualityLevel,
-
-		CurrentStage: lessonPlan.CurrentStage,
-		StageConfig:  lessonPlan.StageConfig,
-
-		LikeCount:        likeCount,
-		FavoriteCount:    favoriteCount,
-		Reviews:          reviews,
-		LinkedPipelineID: linkedPipelineID,
-
-		CreatedAt: lessonPlan.CreatedAt,
-		UpdatedAt: lessonPlan.UpdatedAt,
-	}, nil
-}
-
-// ListLessonPlans 获取教案列表。
-//
-// DataScope缺失时按非管理员和空白名单处理，绝不放大权限。
-func (s *LessonPlanService) ListLessonPlans(
-	ctx context.Context,
-	callerID string,
-	authorID string,
-	groupID string,
-	status string,
-	subject string,
-	grade string,
-	limit int,
-	offset int,
-	qualityLevel int,
-	structureType int,
-	cognitiveLevel int,
-	pedagogyIntensity int,
-	scope *DataScope,
-) (*models.LessonPlanListResponse, error) {
-	var scopeUserIDs []string
-	scopeIsAdmin := false
-
-	if scope != nil {
-		scopeIsAdmin = scope.IsAdmin
-		scopeUserIDs = scope.UserIDs
-	} else {
-		scopeUserIDs = []string{}
-	}
-
-	items, total, err := repository.ListLessonPlans(
-		ctx,
-		callerID,
-		authorID,
-		groupID,
-		status,
-		subject,
-		grade,
-		limit,
-		offset,
-		qualityLevel,
-		structureType,
-		cognitiveLevel,
-		pedagogyIntensity,
-		scopeUserIDs,
-		scopeIsAdmin,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	if items == nil {
-		items = []*models.LessonPlanListItem{}
-	}
-
-	return &models.LessonPlanListResponse{
-		LessonPlans: items,
-		Total:       total,
-	}, nil
-}
-
 // UpdateLessonPlan 更新教案内容。
 func (s *LessonPlanService) UpdateLessonPlan(
 	ctx context.Context,
@@ -354,19 +150,22 @@ func (s *LessonPlanService) UpdateLessonPlan(
 		duration = lessonPlan.DurationMinutes
 	}
 
-	if err := repository.UpdateLessonPlanContent(
+	_, err = UpdateLessonPlanContentPreservingWord(
 		ctx,
-		id,
-		title,
-		req.ContentMarkdown,
-		"",
-		duration,
-		models.LessonPlanVersionMeta{
-			ChangeSource:  models.LPVersionSourceManual,
-			ChangedBy:     &callerID,
-			ChangeSummary: "老师手动编辑教案正文",
+		LessonPlanContentMutationInput{
+			PlanID:            id,
+			CallerID:          callerID,
+			Title:             title,
+			ContentMarkdown:   req.ContentMarkdown,
+			ContentStructured: lessonPlan.ContentStructured,
+			DurationMinutes:   duration,
+			ExpectedVersion:   lessonPlan.Version,
+			ExpectedContent:   lessonPlan.ContentMarkdown,
+			ChangeSource:      models.LessonPlanWordChangeSourceManual,
+			ChangeSummary:     "老师手动编辑教案正文",
 		},
-	); err != nil {
+	)
+	if err != nil {
 		lpLog.Error(
 			"更新教案失败",
 			"plan_id", id,

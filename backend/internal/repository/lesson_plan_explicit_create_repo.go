@@ -2,26 +2,16 @@ package repository
 
 // lesson_plan_explicit_create_repo.go
 //
-// 本文件只承载“普通教案创建”显式写入教育域的Repository方法。
-//
-// 为什么不直接修改既有CreateLessonPlan：
-//   - 既有方法仍被对话备课、导入和Fork调用；
-//   - 上述入口分别属于后续上下文11、12、13；
-//   - 本上下文不能提前改变它们的创建语义。
-//
-// 因此本文件新增CreateLessonPlanWithEducationDomain：
-//   - Service必须把上下文9解析出的具体教学域作为独立参数传入；
-//   - SQL明确写入lesson_plans.education_domain；
-//   - 只接受k12、vocational和adult；
-//   - 使用事务验证数据库RETURNING快照与传入值完全一致；
-//   - 快照不一致时回滚，绝不留下半成品；
-//   - 原CreateLessonPlan继续保留给尚未迁移的创建入口。
-//
-// 数据库现有BEFORE INSERT触发器在收到合法显式域时会直接RETURN NEW，
-// 因此无需修改触发器，也不再依赖其作者归属推导或K12默认回退。
+// 普通教案创建必须显式写入教育域。
+// 精确课程大纲选择与教案在同一INSERT事务中落库：
+//   - course_outline_id为空时保持未挂载；
+//   - 非空时数据库触发器校验active、教育域、学科和具体年级；
+//   - 触发器同时固化出版社、册次和学制快照；
+//   - Repository在提交前复核数据库返回的精确ID和快照完整性。
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -31,36 +21,25 @@ import (
 )
 
 var (
-	// ErrLessonPlanExplicitEducationDomainRequired 表示显式创建参数不是具体教学域。
 	ErrLessonPlanExplicitEducationDomainRequired = errors.New(
 		"普通教案创建必须显式提供具体教学教育域",
 	)
 
-	// ErrLessonPlanExplicitEducationDomainSnapshotMismatch
-	// 表示数据库最终快照与Service解析结果不一致。
-	//
-	// 该错误在事务提交前返回，因此INSERT会被回滚，不会留下错误快照。
 	ErrLessonPlanExplicitEducationDomainSnapshotMismatch = errors.New(
 		"教案数据库教育域快照与解析结果不一致",
 	)
+
+	ErrLessonPlanExactCourseOutlineSnapshotMismatch = errors.New(
+		"教案数据库精确课程大纲快照与请求不一致",
+	)
 )
 
-// ActionLessonPlanCreate 是普通教案创建成功的审计动作。
 const ActionLessonPlanCreate = "lesson_plan.create"
 
-// init 将本上下文新增的审计动作登记为中文名称。
-//
-// actionNameMap定义在audit_repo.go中；同属repository包，
-// 在所有包变量完成初始化后执行本init函数是安全的。
 func init() {
 	actionNameMap[ActionLessonPlanCreate] = "创建教案"
 }
 
-// normalizeLessonPlanExplicitEducationDomain
-// 规范化并严格校验普通教案显式写入域。
-//
-// 返回值只可能是k12、vocational或adult。
-// 不调用NormalizeEducationDomain，避免非法值回退K12。
 func normalizeLessonPlanExplicitEducationDomain(
 	educationDomain string,
 ) (string, error) {
@@ -78,17 +57,7 @@ func normalizeLessonPlanExplicitEducationDomain(
 	return domain, nil
 }
 
-// CreateLessonPlanWithEducationDomain
-// 创建普通教案并显式写入Service解析出的教育域。
-//
-// educationDomain是独立参数，不信任lp中可能被其它调用方构造的字段值。
-//
-// 原子性规则：
-//  1. 开启事务；
-//  2. INSERT显式写入education_domain；
-//  3. 读取RETURNING中的数据库最终快照；
-//  4. 最终快照必须与传入域完全一致；
-//  5. 一致才提交，否则回滚。
+// CreateLessonPlanWithEducationDomain 创建教案并显式固化教育域与精确大纲。
 func CreateLessonPlanWithEducationDomain(
 	ctx context.Context,
 	lp *models.LessonPlan,
@@ -136,32 +105,22 @@ func CreateLessonPlanWithEducationDomain(
 			template_id,
 			recipe_id,
 			textbook_page_ids,
+			course_outline_id,
 			education_domain
 		)
 		VALUES (
-			$1,
-			$2,
-			$3,
-			$4,
-			$5,
-			$6,
-			$7,
-			$8,
-			$9,
-			$10,
-			$11,
-			$12,
-			$13,
-			$14,
-			$15,
-			$16,
-			$17,
-			$18,
-			$19
+			$1,$2,$3,$4,$5,
+			$6,$7,$8,$9,$10,
+			$11,$12,$13,$14,$15,
+			$16,$17,$18,$19,$20
 		)
 		RETURNING
 			id,
 			education_domain,
+			course_outline_id::text,
+			course_outline_publisher,
+			course_outline_volume,
+			school_system,
 			created_at,
 			updated_at
 	`
@@ -206,7 +165,24 @@ func CreateLessonPlanWithEducationDomain(
 		textbookPageIDs = "[]"
 	}
 
-	storedDomain := ""
+	requestedOutlineID := ""
+	var outlineIDValue interface{}
+	if lp.CourseOutlineID != nil {
+		requestedOutlineID = strings.TrimSpace(
+			*lp.CourseOutlineID,
+		)
+		if requestedOutlineID != "" {
+			outlineIDValue = requestedOutlineID
+		}
+	}
+
+	var (
+		storedDomain    string
+		storedOutlineID sql.NullString
+		storedPublisher sql.NullString
+		storedVolume    sql.NullString
+		storedSystem    sql.NullString
+	)
 
 	err = tx.QueryRow(
 		ctx,
@@ -229,10 +205,15 @@ func CreateLessonPlanWithEducationDomain(
 		lp.TemplateID,
 		lp.RecipeID,
 		textbookPageIDs,
+		outlineIDValue,
 		domain,
 	).Scan(
 		&lp.ID,
 		&storedDomain,
+		&storedOutlineID,
+		&storedPublisher,
+		&storedVolume,
+		&storedSystem,
 		&lp.CreatedAt,
 		&lp.UpdatedAt,
 	)
@@ -256,6 +237,27 @@ func CreateLessonPlanWithEducationDomain(
 		)
 	}
 
+	if requestedOutlineID == "" {
+		if storedOutlineID.Valid ||
+			storedVolume.Valid ||
+			storedSystem.Valid {
+			return ErrLessonPlanExactCourseOutlineSnapshotMismatch
+		}
+	} else {
+		if !storedOutlineID.Valid ||
+			strings.TrimSpace(storedOutlineID.String) !=
+				requestedOutlineID ||
+			!storedPublisher.Valid ||
+			!storedVolume.Valid ||
+			strings.TrimSpace(storedVolume.String) == "" ||
+			!storedSystem.Valid ||
+			!models.IsValidCourseOutlineSchoolSystem(
+				strings.TrimSpace(storedSystem.String),
+			) {
+			return ErrLessonPlanExactCourseOutlineSnapshotMismatch
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf(
 			"提交普通教案创建事务失败: %w",
@@ -272,6 +274,28 @@ func CreateLessonPlanWithEducationDomain(
 	lp.ConversationLog = conversationLog
 	lp.TextbookPageIDs = textbookPageIDs
 	lp.EducationDomain = storedDomain
+
+	lp.CourseOutlineID = nil
+	lp.CourseOutlinePublisher = nil
+	lp.CourseOutlineVolume = nil
+	lp.SchoolSystem = nil
+
+	if storedOutlineID.Valid {
+		value := strings.TrimSpace(storedOutlineID.String)
+		lp.CourseOutlineID = &value
+	}
+	if storedPublisher.Valid {
+		value := strings.TrimSpace(storedPublisher.String)
+		lp.CourseOutlinePublisher = &value
+	}
+	if storedVolume.Valid {
+		value := strings.TrimSpace(storedVolume.String)
+		lp.CourseOutlineVolume = &value
+	}
+	if storedSystem.Valid {
+		value := strings.TrimSpace(storedSystem.String)
+		lp.SchoolSystem = &value
+	}
 
 	return nil
 }

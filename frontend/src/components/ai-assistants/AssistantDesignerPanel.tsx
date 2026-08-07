@@ -50,6 +50,8 @@ import {
 import { renderMarkdown } from '@/pages/lesson-plans/plan-detail/components/planDetailConstants'
 import { useAuth } from '@/store/auth'
 import { useProtectedDraft } from '@/hooks/useProtectedDraft'
+import { useVoiceDraftInput } from '@/hooks/useVoiceDraftInput'
+import VoiceInputButton from '@/components/voice/VoiceInputButton'
 
 /* ==================== 样式常量(与 EditModal/Selector 保持一致) ==================== */
 const C = {
@@ -225,6 +227,30 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
   const scrollEndRef = useRef<HTMLDivElement>(null)               // 对话区自动滚底锚点
   const inputRef = useRef<HTMLTextAreaElement>(null)              // 输入框 ref(发送后聚焦)
 
+
+  /**
+   * 语音识别结果写入现有受保护消息草稿。
+   *
+   * 失败恢复录音前文字；final只回填，不自动发送。
+   */
+  const voiceInput = useVoiceDraftInput({
+    value: input,
+    setValue: setInput,
+    disabled: isStreaming,
+    maxDurationSeconds: 120,
+    onFinalFocus: (finalValue) => {
+      const element = inputRef.current
+      if (!element) return
+
+      element.focus()
+      element.setSelectionRange(
+        finalValue.length,
+        finalValue.length,
+      )
+    },
+    onError: setErrorMsg,
+  })
+
   // ==================== 自动滚底 ====================
   useEffect(() => {
     scrollEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -254,7 +280,7 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
   // ==================== 发送消息 ====================
   const handleSend = useCallback(() => {
     const text = input.trim()
-    if (!text || isStreaming) return
+    if (!text || isStreaming || voiceInput.isActive) return
 
     setErrorMsg('')
 
@@ -372,7 +398,7 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
 
     // 6. 发送后输入框聚焦(下一轮对话可以直接打字)
     setTimeout(() => inputRef.current?.focus(), 50)
-  }, [input, isStreaming, messages, subject, grade, scenes, localDraft, commitInputDraft])
+  }, [input, isStreaming, messages, subject, grade, scenes, localDraft, commitInputDraft, voiceInput.isActive])
 
   // ==================== 切换组件参考折叠态 ====================
   const toggleComponents = (msgIndex: number) => {
@@ -394,7 +420,7 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
 
   // ==================== 清空当前对话 ====================
   const handleClearChat = () => {
-    if (isStreaming) return
+    if (isStreaming || voiceInput.isActive) return
     if (messages.length === 0) return
     if (!confirm('确认清空当前对话?草稿内容不会被清除。')) return
     connRef.current?.close()
@@ -464,13 +490,19 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
             )}
             <button
               onClick={handleClearChat}
-              disabled={isStreaming || messages.length === 0}
+              disabled={isStreaming || voiceInput.isActive || messages.length === 0}
               style={{
                 background: 'none',
                 border: 'none',
                 fontSize: '11px',
-                color: isStreaming || messages.length === 0 ? C.textMuted : C.textSec,
-                cursor: isStreaming || messages.length === 0 ? 'not-allowed' : 'pointer',
+                color:
+                  isStreaming || voiceInput.isActive || messages.length === 0
+                    ? C.textMuted
+                    : C.textSec,
+                cursor:
+                  isStreaming || voiceInput.isActive || messages.length === 0
+                    ? 'not-allowed'
+                    : 'pointer',
                 padding: '2px 6px',
               }}
             >
@@ -752,7 +784,7 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
               }}
               placeholder={messages.length === 0 ? '描述您想要的助手风格...' : '继续聊,比如"再严苛一点""给我举个例子"...'}
               rows={2}
-              disabled={isStreaming}
+              disabled={isStreaming || voiceInput.isActive}
               style={{
                 flex: 1,
                 background: 'transparent',
@@ -763,21 +795,31 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
                 resize: 'none',
                 fontFamily: 'inherit',
                 lineHeight: 1.5,
-                opacity: isStreaming ? 0.5 : 1,
+                opacity: isStreaming || voiceInput.isActive ? 0.5 : 1,
               }}
+            />
+            <VoiceInputButton
+              status={voiceInput.status}
+              isSupported={voiceInput.isSupported}
+              elapsedSeconds={voiceInput.elapsedSeconds}
+              disabled={isStreaming}
+              error={voiceInput.error}
+              onStart={voiceInput.begin}
+              onStop={voiceInput.stop}
+              onCancel={voiceInput.cancel}
             />
             <button
               type="button"
               onClick={handleSend}
-              disabled={isStreaming || !input.trim()}
+              disabled={isStreaming || voiceInput.isActive || !input.trim()}
               style={{
                 width: '28px',
                 height: '28px',
                 borderRadius: '50%',
                 border: 'none',
-                background: isStreaming || !input.trim() ? '#E5E7EB' : C.primary,
+                background: isStreaming || voiceInput.isActive || !input.trim() ? '#E5E7EB' : C.primary,
                 color: '#fff',
-                cursor: isStreaming || !input.trim() ? 'not-allowed' : 'pointer',
+                cursor: isStreaming || voiceInput.isActive || !input.trim() ? 'not-allowed' : 'pointer',
                 fontSize: '13px',
                 display: 'flex',
                 alignItems: 'center',
@@ -796,7 +838,7 @@ export default function AssistantDesignerPanel(props: AssistantDesignerPanelProp
               textAlign: 'center',
             }}
           >
-            已自动保存草稿 · Enter发送 · Shift+Enter换行 · Ctrl/Command+Z恢复误删
+            {voiceInput.statusText || '已自动保存草稿 · 点击麦克风可语音输入 · Enter发送 · Shift+Enter换行 · Ctrl/Command+Z恢复误删'}
           </div>
         </div>
       </div>

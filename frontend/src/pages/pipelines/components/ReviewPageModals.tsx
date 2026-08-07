@@ -17,7 +17,7 @@
  *        也无法用 key 重置（因为父组件需要保持自己的引用），故此处的同步 setState 是必要的
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import type { GeneratedPageFull } from '@/api/pipelines'
 import { aiFixPageStream, rollbackPageHTML } from '@/api/pipelines'
 import {
@@ -30,6 +30,8 @@ import {
   exitTrueFullscreen, isTrueFullscreen,
   CodeView, HTMLPreview,
 } from './ReviewPageParts'
+import { useVoiceDraftInput } from '@/hooks/useVoiceDraftInput'
+import VoiceInputButton from '@/components/voice/VoiceInputButton'
 
 // ==================== AI快修弹窗 ====================
 
@@ -46,32 +48,111 @@ export function AIFixModal({ pageNumber, pageTitle, loading, instruction, onInst
   fixSummary: string; streamText?: string
 }) {
   const [selectedRefs, setSelectedRefs] = useState<number[]>([])
+  const instructionInputRef = useRef<HTMLTextAreaElement | null>(null)
   const toggleRef = (pn: number) => { setSelectedRefs(prev => prev.includes(pn) ? prev.filter(x => x !== pn) : [...prev, pn]) }
 
+  /**
+   * AI快修语音只写入当前修复指令。
+   *
+   * 识别完成后仍需人工点击“执行修复”，不会自动修改页面HTML。
+   */
+  const voiceInput = useVoiceDraftInput({
+    value: instruction,
+    setValue: onInstructionChange,
+    disabled: loading,
+    maxDurationSeconds: 120,
+    onFinalFocus: (finalValue) => {
+      const element = instructionInputRef.current
+      if (!element) return
+
+      element.focus()
+      element.setSelectionRange(
+        finalValue.length,
+        finalValue.length,
+      )
+    },
+  })
+
+  const handleClose = useCallback(() => {
+    if (loading) return
+
+    if (voiceInput.isActive) {
+      voiceInput.cancel()
+    }
+
+    onClose()
+  }, [
+    loading,
+    onClose,
+    voiceInput.cancel,
+    voiceInput.isActive,
+  ])
+
   useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === 'Escape' && !loading) { e.stopPropagation(); onClose() } }
+    const h = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !loading) {
+        e.stopPropagation()
+        handleClose()
+      }
+    }
     window.addEventListener('keydown', h, true)
     return () => window.removeEventListener('keydown', h, true)
-  }, [onClose, loading])
+  }, [handleClose, loading])
 
   return (
-    <div onClick={e => { if (e.target === e.currentTarget && !loading) onClose() }} style={{ position: 'fixed', inset: 0, zIndex: 10001, background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 40 }}>
+    <div onClick={e => { if (e.target === e.currentTarget && !loading) handleClose() }} style={{ position: 'fixed', inset: 0, zIndex: 10001, background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 40 }}>
       <div style={{ background: '#fff', borderRadius: 16, maxWidth: 640, width: '100%', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(0,0,0,0.2)' }}>
         {/* 标题栏 */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '16px 20px', borderBottom: '1px solid rgba(0,0,0,0.06)' }}>
           <Wand2 size={16} color="#e65100" />
           <span style={{ fontSize: 15, fontWeight: 600, color: '#1c1c1e', flex: 1 }}>AI快修 — {formatPageLabel(pageNumber, pageTitle)}. {pageTitle || '无标题'}</span>
-          <button onClick={onClose} disabled={loading} style={{ padding: '4px 12px', borderRadius: 8, border: '1px solid rgba(0,0,0,0.08)', background: '#f5f5f5', fontSize: 12, fontWeight: 500, color: '#3c3c43', cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.5 : 1, display: 'inline-flex', alignItems: 'center', gap: 4 }}><X size={12} /> 关闭</button>
+          <button onClick={handleClose} disabled={loading} style={{ padding: '4px 12px', borderRadius: 8, border: '1px solid rgba(0,0,0,0.08)', background: '#f5f5f5', fontSize: 12, fontWeight: 500, color: '#3c3c43', cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.5 : 1, display: 'inline-flex', alignItems: 'center', gap: 4 }}><X size={12} /> 关闭</button>
         </div>
         {/* 提示 */}
         <div style={{ padding: '12px 20px', background: '#fff8e1', borderBottom: '1px solid rgba(230,81,0,0.08)', fontSize: 12, color: '#e65100', lineHeight: 1.6 }}>输入修改指令，AI将基于当前页面HTML进行修复。</div>
         {/* 输入区 */}
         <div style={{ padding: '16px 20px' }}>
-          <textarea value={instruction} onChange={e => onInstructionChange(e.target.value)}
+          <textarea
+            ref={instructionInputRef}
+            value={instruction}
+            onChange={e => onInstructionChange(e.target.value)}
             onKeyDown={e => { if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)) e.stopPropagation() }}
-            placeholder="请输入修复指令..." disabled={loading}
+            placeholder="请输入修复指令..."
+            disabled={loading || voiceInput.isActive}
             style={{ width: '100%', minHeight: 120, border: '1px solid rgba(0,0,0,0.1)', borderRadius: 10, padding: 12, fontSize: 13, lineHeight: 1.6, fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', resize: 'vertical', outline: 'none', boxSizing: 'border-box', background: loading ? '#f9f9f9' : '#fff' }}
           />
+
+          <div
+            style={{
+              marginTop: 7,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              color:
+                voiceInput.status === 'error'
+                  ? '#ff3b30'
+                  : voiceInput.isActive
+                    ? '#e65100'
+                    : '#8e8e93',
+              fontSize: 11,
+              lineHeight: 1.5,
+            }}
+          >
+            <VoiceInputButton
+              status={voiceInput.status}
+              isSupported={voiceInput.isSupported}
+              elapsedSeconds={voiceInput.elapsedSeconds}
+              disabled={loading}
+              error={voiceInput.error}
+              onStart={voiceInput.begin}
+              onStop={voiceInput.stop}
+              onCancel={voiceInput.cancel}
+            />
+            <span>
+              {voiceInput.statusText ||
+                '点击麦克风可语音描述；识别文字不会自动执行修复'}
+            </span>
+          </div>
         </div>
         {/* 参考页面选择 */}
         <div style={{ padding: '0 20px 12px', maxHeight: 160, overflow: 'auto' }}>
@@ -104,8 +185,47 @@ export function AIFixModal({ pageNumber, pageTitle, loading, instruction, onInst
         )}
         {/* 操作按钮 */}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '12px 20px', borderTop: '1px solid rgba(0,0,0,0.06)' }}>
-          <button onClick={onClose} disabled={loading} style={{ padding: '8px 20px', borderRadius: 10, border: '1px solid rgba(0,0,0,0.08)', background: '#fff', fontSize: 13, fontWeight: 500, color: '#3c3c43', cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.5 : 1 }}>取消</button>
-          <button onClick={() => onSubmit(selectedRefs)} disabled={loading || !instruction.trim()} style={{ padding: '8px 24px', borderRadius: 10, border: 'none', background: loading || !instruction.trim() ? '#e5e5ea' : '#e65100', color: loading || !instruction.trim() ? '#aeaeb2' : '#fff', fontSize: 13, fontWeight: 600, cursor: loading || !instruction.trim() ? 'not-allowed' : 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <button onClick={handleClose} disabled={loading} style={{ padding: '8px 20px', borderRadius: 10, border: '1px solid rgba(0,0,0,0.08)', background: '#fff', fontSize: 13, fontWeight: 500, color: '#3c3c43', cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.5 : 1 }}>取消</button>
+          <button
+            onClick={() => {
+              if (!voiceInput.isActive) {
+                onSubmit(selectedRefs)
+              }
+            }}
+            disabled={
+              loading ||
+              voiceInput.isActive ||
+              !instruction.trim()
+            }
+            style={{
+              padding: '8px 24px',
+              borderRadius: 10,
+              border: 'none',
+              background:
+                loading ||
+                voiceInput.isActive ||
+                !instruction.trim()
+                  ? '#e5e5ea'
+                  : '#e65100',
+              color:
+                loading ||
+                voiceInput.isActive ||
+                !instruction.trim()
+                  ? '#aeaeb2'
+                  : '#fff',
+              fontSize: 13,
+              fontWeight: 600,
+              cursor:
+                loading ||
+                voiceInput.isActive ||
+                !instruction.trim()
+                  ? 'not-allowed'
+                  : 'pointer',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+            }}
+          >
             {loading ? <><Loader size={14} style={{ animation: 'spin 1s linear infinite' }} /> AI修复中...</> : <><Wand2 size={14} /> 执行修复</>}
           </button>
         </div>

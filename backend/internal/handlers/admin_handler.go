@@ -199,9 +199,10 @@ type regionSchoolItem struct {
 // ListSchoolsByRegion GET /api/v1/admin/region-schools?region_id=xxx
 //
 // 用途:
-//   "跨区域多校批量导入"下载 Excel 模板时,前端先选一个区域,本端点返回该区域下全部
-//   active 学校的 (id, name)。前端据此在模板内生成"学校清单 + 所属学校下拉列",
-//   老师选自己学校,汇总上传时每行自带准确 school_id,匹配零误差。
+//
+//	"跨区域多校批量导入"下载 Excel 模板时,前端先选一个区域,本端点返回该区域下全部
+//	active 学校的 (id, name)。前端据此在模板内生成"学校清单 + 所属学校下拉列",
+//	老师选自己学校,汇总上传时每行自带准确 school_id,匹配零误差。
 //
 // 权限: 仅 admin(路由层 adminOnly 已保证;此功能不下放 senior/region_admin)。
 // 数据: 复用 repository.GetSchoolsByRegion(只返 parent_id=region 且 type='school' status='active')。
@@ -345,22 +346,67 @@ func (h *AdminHandler) CreateAdminUser(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// senior_operator 创建前,先反查其管理的学校(供事务内自动入校用)
-	// admin 创建用户不自动入校(targetSchoolID 保持空)
+	// 单用户建号的学校归属规则：
+	//   - 学校管理员：学校只取服务端实时解析的管理学校，忽略客户端 school_id；
+	//   - 系统管理员创建 operator/viewer 教学账号：必须显式选择启用且教育域合法的学校；
+	//   - 系统管理员创建 admin/district_inspector 管理账号：不写普通校籍。
+	//
+	// 这里先完成学校真实性校验，再把学校ID交给 UserService。UserService 仍会在
+	// 正式事务前二次校验，并把 users + school_members + personal token_accounts
+	// 放进同一事务，Handler 校验不能替代 Service 的最终安全边界。
 	var targetSchoolID string
 	var source string
-	if claims.Role == models.RoleSeniorOperator {
+
+	switch claims.Role {
+	case models.RoleSeniorOperator:
 		school, err := repository.GetSchoolByAdminUserID(r.Context(), claims.UserID)
 		if err != nil || school == nil || school.ID == "" {
 			utils.Forbidden(w, "您尚未绑定学校,无法创建本校用户")
 			return
 		}
 		targetSchoolID = school.ID
-		source = "admin_create"
+		source = "school_admin_create"
+		req.SchoolID = targetSchoolID
+
+	case models.RoleAdmin:
+		req.SchoolID = strings.TrimSpace(req.SchoolID)
+
+		if models.IsSchoolAdminCreatableRole(req.Role) {
+			if req.SchoolID == "" {
+				utils.BadRequest(w, "创建骨干教师或普通教师时必须选择所属学校")
+				return
+			}
+
+			school, err := repository.GetOrganizationByID(r.Context(), req.SchoolID)
+			if err != nil ||
+				school == nil ||
+				school.Type != models.OrgTypeSchool ||
+				school.Status != models.StatusActive ||
+				!models.IsTeachingEducationDomain(school.EducationDomain) {
+				utils.BadRequest(w, "所选学校不存在、已停用或教育类型未正确配置")
+				return
+			}
+
+			targetSchoolID = school.ID
+			source = "admin_create"
+			req.SchoolID = targetSchoolID
+		} else {
+			// 管理身份不作为普通教学账号入校，防止把平台管理账号混入学校成员范围。
+			req.SchoolID = ""
+		}
+
+	default:
+		utils.Forbidden(w, "权限不足")
+		return
 	}
 
-	// Phase 3.2: 事务化建用户+入校（targetSchoolID 为空时只建用户）
-	userInfo, err := h.userService.CreateUserWithSchool(r.Context(), &req, targetSchoolID, source)
+	// 用户、校籍和个人积分账户在 UserService 内按事务闭环创建。
+	userInfo, err := h.userService.CreateUserWithSchool(
+		r.Context(),
+		&req,
+		targetSchoolID,
+		source,
+	)
 	if err != nil {
 		handleAdminUserError(w, err)
 		return
@@ -388,12 +434,14 @@ func (h *AdminHandler) CreateAdminUser(w http.ResponseWriter, r *http.Request) {
 //   - admin          : effectiveSchoolID = 前端传入的 school_id(必须非空,否则 400);
 //   - senior_operator: effectiveSchoolID 强制本校(忽略前端)。
 //   - region_admin   : 只读——handler 双保险 + resolveSchoolScope default 双双拒绝。
+//
 // 角色白名单 operator/viewer; source 按角色区分审计语义。
 //
 // 返回: 整批校验失败 → 200 + Success=false + Failures; 系统级异常 → 500; 全成功 → 200 + Success=true。
 //
 // ⚠️ 这是"单校批量"。"跨区域多校批量"(逐行 school_id + 逐行成败 + 重名自动改名)是另一条
-//    并存的路,见下方 BatchCreateMultiSchoolUsers,本端点不动。
+//
+//	并存的路,见下方 BatchCreateMultiSchoolUsers,本端点不动。
 func (h *AdminHandler) BatchCreateAdminUsers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		utils.Fail(w, http.StatusMethodNotAllowed, utils.MsgMethodPostOnly)
@@ -487,10 +535,12 @@ func (h *AdminHandler) BatchCreateAdminUsers(w http.ResponseWriter, r *http.Requ
 //   - 每行 school_id : 前端由"学校名→ID"反查填入,后端会一次性批量校验有效性。
 //
 // 数据范围/权限: 仅 admin(路由层 adminOnly 已挡;此处再确认一次以防直连)。
-//   senior/region_admin 不走此端点(跨校是 admin 专属能力)。
+//
+//	senior/region_admin 不走此端点(跨校是 admin 专属能力)。
 //
 // 超时: 给 service 一个 5 分钟超时 ctx,防 2000 人逐行事务长时间卡住;
-//       超时则已建成的保留、剩余行在 result.failures 标"超时未处理"。
+//
+//	超时则已建成的保留、剩余行在 result.failures 标"超时未处理"。
 //
 // 返回:
 //   - 前置异常(行数超限/角色非法) → service 返 error → 本 handler 400;
@@ -574,11 +624,12 @@ func (h *AdminHandler) BatchCreateMultiSchoolUsers(w http.ResponseWriter, r *htt
 // 编辑用户"显示名称 + 系统角色"(前端 UserDetailModal「资料与角色」区块调用)。
 //
 // 安全加固:
-//   1. senior 目标级别守卫: ensureSeniorTargetIsTeacher——目标当前角色必须是骨干/普通教师;
-//   2. senior 角色白名单收紧: 仅可授予 operator/viewer(原实现只拦 admin/senior,
-//      region_admin/district_inspector 可穿透);
-//   3. 补审计日志 admin.user_update(角色变更敏感操作留痕)。
-//   4. 本批: region_admin 只读双保险。
+//  1. senior 目标级别守卫: ensureSeniorTargetIsTeacher——目标当前角色必须是骨干/普通教师;
+//  2. senior 角色白名单收紧: 仅可授予 operator/viewer(原实现只拦 admin/senior,
+//     region_admin/district_inspector 可穿透);
+//  3. 补审计日志 admin.user_update(角色变更敏感操作留痕)。
+//  4. 本批: region_admin 只读双保险。
+//
 // service 层另有"不能修改自己的角色"(ErrCannotChangeOwnRole)保护。
 func (h *AdminHandler) UpdateAdminUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
@@ -827,13 +878,14 @@ func (h *AdminHandler) UpdateAdminUserAssignments(w http.ResponseWriter, r *http
 
 // ensureUserInScope 校验目标用户是否在登录者的数据范围内
 // v122 方案B: senior 校验从 IsUserInSchoolByGroup 换为 IsUserInSchool
-//   (school_members 主判 + teaching_group_members 兜底)
-// - admin: 总是允许
-// - senior_operator: 目标用户必须属于其管理的学校(通过 school_members 或 教研组)
-// - region_admin(本批新增): 目标用户必须属于其辖区学校
-//   (repository.IsUserInSchools, school_members ∪ teaching_group_members 与用户列表 SQL 同口径,
-//    保证"列表里看得到的人,详情一定点得开"——若用 data_scope 的 ListSchoolMemberIDs 口径
-//    会漏掉只在教研组的历史用户,列表可见详情却 403)
+//
+//	(school_members 主判 + teaching_group_members 兜底)
+//   - admin: 总是允许
+//   - senior_operator: 目标用户必须属于其管理的学校(通过 school_members 或 教研组)
+//   - region_admin(本批新增): 目标用户必须属于其辖区学校
+//     (repository.IsUserInSchools, school_members ∪ teaching_group_members 与用户列表 SQL 同口径,
+//     保证"列表里看得到的人,详情一定点得开"——若用 data_scope 的 ListSchoolMemberIDs 口径
+//     会漏掉只在教研组的历史用户,列表可见详情却 403)
 //
 // ⚠️ 本函数只回答"目标是否范围内成员",不回答"目标级别是否可管"——后者由
 // ensureSeniorTargetIsTeacher 负责,senior 的写端点须两道守卫都过;
@@ -914,8 +966,12 @@ func handleAdminUserError(w http.ResponseWriter, err error) {
 		services.ErrUsernameExists,
 		services.ErrCannotDisableSelf,
 		services.ErrCannotChangeOwnRole,
-		services.ErrRoleAppointmentOnly:
+		services.ErrRoleAppointmentOnly,
+		services.ErrSchoolRequired,
+		services.ErrSchoolUnavailable:
 		utils.BadRequest(w, err.Error())
+	case services.ErrSchoolTokenAccountUnavailable:
+		utils.Fail(w, http.StatusConflict, err.Error())
 	case services.ErrUserNotFound:
 		utils.Fail(w, http.StatusNotFound, err.Error())
 	default:
@@ -1002,7 +1058,9 @@ func formatRoleName(role string) string {
 	return role
 }
 
-func isSchoolAdmin(_ interface{ Value(key interface{}) interface{} }, _ string) (string, bool) {
+func isSchoolAdmin(_ interface {
+	Value(key interface{}) interface{}
+}, _ string) (string, bool) {
 	return "", false
 }
 

@@ -1,208 +1,378 @@
-// Package config 配置模块单元测试
+// Package config 配置模块单元测试。
 //
 // 测试范围：
-//   - AppVersion：格式校验+当前版本
-//   - getEnv：环境变量读取+默认值回退
-//   - GetIntEnv：整型环境变量解析+错误处理
-//   - Load：配置加载+必要配置校验
-//   - GetAESKey：AES密钥获取方法
+//   - AppVersion格式和当前版本；
+//   - 字符串、整数和布尔环境变量读取；
+//   - 教学智能体两个功能开关；
+//   - 教师端开关关闭时公开开关强制收敛；
+//   - AES密钥读取；
+//   - Config结构体关键字段。
 package config
 
 import (
-"os"
-"strings"
-"testing"
+	"os"
+	"strings"
+	"testing"
 )
 
-// ==================== AppVersion 测试 ====================
+// ==================== AppVersion ====================
 
-// TestAppVersionFormat 测试版本号格式是否符合语义化版本规范
 func TestAppVersionFormat(t *testing.T) {
-if AppVersion == "" {
-t.Fatal("AppVersion不应为空字符串")
-}
-parts := strings.Split(AppVersion, ".")
-if len(parts) != 3 {
-t.Fatalf("AppVersion应为X.Y.Z格式, 实际: %s (分段数=%d)", AppVersion, len(parts))
-}
-for i, part := range parts {
-if part == "" {
-t.Errorf("AppVersion第%d段不应为空", i+1)
-}
-for _, c := range part {
-if c < '0' || c > '9' {
-t.Errorf("AppVersion段 %q 含非数字字符: %c", part, c)
-}
-}
-}
-t.Logf("AppVersion验证通过: %s", AppVersion)
+	if AppVersion == "" {
+		t.Fatal("AppVersion不应为空字符串")
+	}
+
+	parts := strings.Split(AppVersion, ".")
+	if len(parts) != 3 {
+		t.Fatalf(
+			"AppVersion应为X.Y.Z格式，实际为%s",
+			AppVersion,
+		)
+	}
+
+	for index, part := range parts {
+		if part == "" {
+			t.Fatalf(
+				"AppVersion第%d段不能为空",
+				index+1,
+			)
+		}
+
+		for _, character := range part {
+			if character < '0' ||
+				character > '9' {
+				t.Fatalf(
+					"AppVersion段%q包含非数字字符%c",
+					part,
+					character,
+				)
+			}
+		}
+	}
 }
 
-// TestAppVersionIsCurrentVersion 测试当前版本号
 func TestAppVersionIsCurrentVersion(t *testing.T) {
-expected := "0.37.0"
-if AppVersion != expected {
-t.Logf("注意：AppVersion=%s，文档记录版本为%s", AppVersion, expected)
-} else {
-t.Logf("版本号匹配: %s", AppVersion)
-}
-}
+	const expected = "0.43.0"
 
-// ==================== getEnv 测试 ====================
-
-// TestGetEnv_ExistingVar 环境变量存在时返回实际值
-func TestGetEnv_ExistingVar(t *testing.T) {
-key := "TEDNA_TEST_ENV_VAR_EXISTING"
-expected := "test_value_12345"
-os.Setenv(key, expected)
-defer os.Unsetenv(key)
-
-result := getEnv(key, "default_value")
-if result != expected {
-t.Errorf("应返回环境变量值%q，实际%q", expected, result)
-}
+	if AppVersion != expected {
+		t.Fatalf(
+			"AppVersion不一致：expected=%s actual=%s",
+			expected,
+			AppVersion,
+		)
+	}
 }
 
-// TestGetEnv_NonExistingVar 环境变量不存在时返回默认值
-func TestGetEnv_NonExistingVar(t *testing.T) {
-key := "TEDNA_TEST_ENV_VAR_NON_EXISTING_XXXXXX"
-os.Unsetenv(key) // 确保不存在
+// ==================== getEnv ====================
 
-result := getEnv(key, "my_default")
-if result != "my_default" {
-t.Errorf("不存在的环境变量应返回默认值my_default，实际%q", result)
-}
-}
+func TestGetEnvExistingValue(t *testing.T) {
+	const (
+		key      = "TEDNA_TEST_ENV_EXISTING"
+		expected = "test-value"
+	)
 
-// TestGetEnv_EmptyVar 环境变量为空字符串时返回默认值
-func TestGetEnv_EmptyVar(t *testing.T) {
-key := "TEDNA_TEST_ENV_VAR_EMPTY"
-os.Setenv(key, "")
-defer os.Unsetenv(key)
+	t.Setenv(key, expected)
 
-result := getEnv(key, "fallback")
-if result != "fallback" {
-t.Errorf("空环境变量应返回默认值fallback，实际%q", result)
-}
+	if actual := getEnv(key, "fallback"); actual != expected {
+		t.Fatalf(
+			"环境变量读取错误：expected=%q actual=%q",
+			expected,
+			actual,
+		)
+	}
 }
 
-// ==================== GetIntEnv 测试 ====================
+func TestGetEnvMissingOrEmptyUsesDefault(t *testing.T) {
+	const key = "TEDNA_TEST_ENV_DEFAULT"
 
-// TestGetIntEnv_ValidInt 有效整数环境变量
-func TestGetIntEnv_ValidInt(t *testing.T) {
-key := "TEDNA_TEST_INT_ENV"
-os.Setenv(key, "42")
-defer os.Unsetenv(key)
+	_ = os.Unsetenv(key)
 
-result := GetIntEnv(key, 10)
-if result != 42 {
-t.Errorf("应返回42，实际%d", result)
-}
-}
+	if actual := getEnv(key, "fallback"); actual != "fallback" {
+		t.Fatalf(
+			"缺失变量没有使用默认值：actual=%q",
+			actual,
+		)
+	}
 
-// TestGetIntEnv_InvalidInt 非数字环境变量返回默认值
-func TestGetIntEnv_InvalidInt(t *testing.T) {
-key := "TEDNA_TEST_INT_ENV_INVALID"
-os.Setenv(key, "not_a_number")
-defer os.Unsetenv(key)
+	t.Setenv(key, "")
 
-result := GetIntEnv(key, 99)
-if result != 99 {
-t.Errorf("非数字应返回默认值99，实际%d", result)
-}
+	if actual := getEnv(key, "fallback"); actual != "fallback" {
+		t.Fatalf(
+			"空变量没有使用默认值：actual=%q",
+			actual,
+		)
+	}
 }
 
-// TestGetIntEnv_EmptyVar 空值返回默认值
-func TestGetIntEnv_EmptyVar(t *testing.T) {
-key := "TEDNA_TEST_INT_ENV_EMPTY"
-os.Unsetenv(key) // 确保不存在
+// ==================== GetIntEnv ====================
 
-result := GetIntEnv(key, 55)
-if result != 55 {
-t.Errorf("空值应返回默认值55，实际%d", result)
+func TestGetIntEnv(t *testing.T) {
+	const key = "TEDNA_TEST_INT_ENV"
+
+	cases := []struct {
+		name         string
+		value        string
+		defaultValue int
+		expected     int
+	}{
+		{
+			name:         "正整数",
+			value:        "42",
+			defaultValue: 10,
+			expected:     42,
+		},
+		{
+			name:         "零",
+			value:        "0",
+			defaultValue: 10,
+			expected:     0,
+		},
+		{
+			name:         "负整数",
+			value:        "-5",
+			defaultValue: 10,
+			expected:     -5,
+		},
+		{
+			name:         "非数字",
+			value:        "invalid",
+			defaultValue: 99,
+			expected:     99,
+		},
+		{
+			name:         "浮点数",
+			value:        "3.14",
+			defaultValue: 88,
+			expected:     88,
+		},
+	}
+
+	for _, item := range cases {
+		t.Run(
+			item.name,
+			func(t *testing.T) {
+				t.Setenv(key, item.value)
+
+				actual :=
+					GetIntEnv(
+						key,
+						item.defaultValue,
+					)
+
+				if actual != item.expected {
+					t.Fatalf(
+						"整数环境变量错误：expected=%d actual=%d",
+						item.expected,
+						actual,
+					)
+				}
+			},
+		)
+	}
 }
+
+func TestGetIntEnvMissingUsesDefault(t *testing.T) {
+	const key = "TEDNA_TEST_INT_ENV_MISSING"
+
+	_ = os.Unsetenv(key)
+
+	if actual := GetIntEnv(key, 55); actual != 55 {
+		t.Fatalf(
+			"缺失整数变量没有使用默认值：actual=%d",
+			actual,
+		)
+	}
 }
 
-// TestGetIntEnv_ZeroValue 零值是合法整数
-func TestGetIntEnv_ZeroValue(t *testing.T) {
-key := "TEDNA_TEST_INT_ENV_ZERO"
-os.Setenv(key, "0")
-defer os.Unsetenv(key)
+// ==================== GetBoolEnv ====================
 
-result := GetIntEnv(key, 100)
-if result != 0 {
-t.Errorf("0是合法整数，应返回0，实际%d", result)
+func TestGetBoolEnvAcceptedValues(t *testing.T) {
+	const key = "TEDNA_TEST_BOOL_ENV"
+
+	cases := []struct {
+		value    string
+		expected bool
+	}{
+		{value: "true", expected: true},
+		{value: "TRUE", expected: true},
+		{value: "1", expected: true},
+		{value: "yes", expected: true},
+		{value: "on", expected: true},
+		{value: "false", expected: false},
+		{value: "FALSE", expected: false},
+		{value: "0", expected: false},
+		{value: "no", expected: false},
+		{value: "off", expected: false},
+	}
+
+	for _, item := range cases {
+		t.Run(
+			item.value,
+			func(t *testing.T) {
+				t.Setenv(key, item.value)
+
+				actual :=
+					GetBoolEnv(
+						key,
+						!item.expected,
+					)
+
+				if actual != item.expected {
+					t.Fatalf(
+						"布尔环境变量解析错误：value=%q expected=%t actual=%t",
+						item.value,
+						item.expected,
+						actual,
+					)
+				}
+			},
+		)
+	}
 }
+
+func TestGetBoolEnvMissingUsesDefault(t *testing.T) {
+	const key = "TEDNA_TEST_BOOL_ENV_MISSING"
+
+	_ = os.Unsetenv(key)
+
+	if !GetBoolEnv(key, true) {
+		t.Fatal("缺失布尔变量没有返回true默认值")
+	}
+
+	if GetBoolEnv(key, false) {
+		t.Fatal("缺失布尔变量没有返回false默认值")
+	}
 }
 
-// TestGetIntEnv_NegativeValue 负数是合法整数
-func TestGetIntEnv_NegativeValue(t *testing.T) {
-key := "TEDNA_TEST_INT_ENV_NEGATIVE"
-os.Setenv(key, "-5")
-defer os.Unsetenv(key)
+func TestGetBoolEnvInvalidUsesDefault(t *testing.T) {
+	const key = "TEDNA_TEST_BOOL_ENV_INVALID"
 
-result := GetIntEnv(key, 100)
-if result != -5 {
-t.Errorf("负数-5应返回-5，实际%d", result)
-}
-}
+	t.Setenv(key, "not-a-boolean")
 
-// TestGetIntEnv_FloatValue 浮点数不是合法整数
-func TestGetIntEnv_FloatValue(t *testing.T) {
-key := "TEDNA_TEST_INT_ENV_FLOAT"
-os.Setenv(key, "3.14")
-defer os.Unsetenv(key)
+	if !GetBoolEnv(key, true) {
+		t.Fatal("非法布尔变量没有返回true默认值")
+	}
 
-result := GetIntEnv(key, 100)
-if result != 100 {
-t.Errorf("浮点数3.14应返回默认值100，实际%d", result)
-}
+	if GetBoolEnv(key, false) {
+		t.Fatal("非法布尔变量没有返回false默认值")
+	}
 }
 
-// ==================== GetAESKey 测试 ====================
+// ==================== 教学智能体开关 ====================
 
-// TestGetAESKey 测试GetAESKey返回配置中的AES密钥
+func setRequiredLoadEnvironment(t *testing.T) {
+	t.Helper()
+
+	t.Setenv("DB_PASSWORD", "test-database-password")
+	t.Setenv("JWT_SECRET", "test-jwt-secret")
+	t.Setenv(
+		"AES_KEY",
+		"test-aes-key-32bytes-long-000000",
+	)
+	t.Setenv(
+		"ASSISTANT_RUNTIME_PRIVACY_SALT",
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	)
+	t.Setenv(
+		"ASSISTANT_RUNTIME_TOKEN_TTL_MINUTES",
+		"15",
+	)
+}
+
+func TestLoadCoursewareAssistantFlags(t *testing.T) {
+	setRequiredLoadEnvironment(t)
+
+	t.Setenv(
+		"COURSEWARE_ASSISTANT_ENABLED",
+		"true",
+	)
+	t.Setenv(
+		"COURSEWARE_ASSISTANT_PUBLIC_RUNTIME_ENABLED",
+		"false",
+	)
+
+	cfg := Load()
+
+	if !cfg.CoursewareAssistantEnabled {
+		t.Fatal("教师端教学智能体开关应为true")
+	}
+
+	if cfg.CoursewareAssistantPublicRuntimeEnabled {
+		t.Fatal("公开运行开关应为false")
+	}
+}
+
+func TestLoadForcesPublicRuntimeOffWhenTeacherFeatureDisabled(
+	t *testing.T,
+) {
+	setRequiredLoadEnvironment(t)
+
+	t.Setenv(
+		"COURSEWARE_ASSISTANT_ENABLED",
+		"false",
+	)
+	t.Setenv(
+		"COURSEWARE_ASSISTANT_PUBLIC_RUNTIME_ENABLED",
+		"true",
+	)
+
+	cfg := Load()
+
+	if cfg.CoursewareAssistantEnabled {
+		t.Fatal("教师端教学智能体开关应为false")
+	}
+
+	if cfg.CoursewareAssistantPublicRuntimeEnabled {
+		t.Fatal(
+			"教师端开关关闭时公开运行开关必须强制收敛为false",
+		)
+	}
+}
+
+// ==================== 其他配置 ====================
+
 func TestGetAESKey(t *testing.T) {
-cfg := &Config{AESKey: "test-aes-key-32bytes-long-xxxxx"}
-if cfg.GetAESKey() != "test-aes-key-32bytes-long-xxxxx" {
-t.Errorf("GetAESKey应返回配置中的AESKey，实际%q", cfg.GetAESKey())
-}
+	cfg := &Config{
+		AESKey: "test-aes-key-32bytes-long-xxxxx",
+	}
+
+	if actual := cfg.GetAESKey(); actual != cfg.AESKey {
+		t.Fatalf(
+			"GetAESKey返回错误：expected=%q actual=%q",
+			cfg.AESKey,
+			actual,
+		)
+	}
 }
 
-// TestGetAESKey_Empty 空AES密钥
-func TestGetAESKey_Empty(t *testing.T) {
-cfg := &Config{AESKey: ""}
-if cfg.GetAESKey() != "" {
-t.Errorf("空AESKey应返回空字符串，实际%q", cfg.GetAESKey())
-}
-}
+func TestConfigKeyFields(t *testing.T) {
+	cfg := Config{
+		DBHost:     "localhost",
+		DBPort:     "5432",
+		DBUser:     "test-user",
+		DBPassword: "test-password",
+		DBName:     "test-database",
+		Port:       "9090",
+		GinMode:    "debug",
 
-// ==================== Config 结构体字段测试 ====================
+		CoursewareAssistantEnabled:              true,
+		CoursewareAssistantPublicRuntimeEnabled: false,
 
-// TestConfigDefaults 测试Config结构体默认字段
-func TestConfigDefaults(t *testing.T) {
-// 通过直接构造验证字段类型和赋值
-cfg := Config{
-DBHost:         "localhost",
-DBPort:         "5432",
-DBUser:         "test_user",
-DBPassword:     "test_pass",
-DBName:         "test_db",
-Port:           "9090",
-GinMode:        "debug",
-JWTSecret:      "my-secret",
-AESKey:         "my-aes-key",
-AIAPIBaseURL:   "https://api.example.com",
-AIAPIKey:       "sk-test",
-AIDefaultModel: "gpt-4",
-}
-if cfg.DBHost != "localhost" {
-t.Error("DBHost字段赋值失败")
-}
-if cfg.Port != "9090" {
-t.Error("Port字段赋值失败")
-}
-if cfg.AIDefaultModel != "gpt-4" {
-t.Error("AIDefaultModel字段赋值失败")
-}
+		JWTSecret:      "test-jwt-secret",
+		AESKey:         "test-aes-key",
+		AIAPIBaseURL:   "https://api.example.com",
+		AIAPIKey:       "test-api-key",
+		AIDefaultModel: "test-model",
+	}
+
+	if cfg.DBHost != "localhost" ||
+		cfg.Port != "9090" ||
+		cfg.AIDefaultModel != "test-model" ||
+		!cfg.CoursewareAssistantEnabled ||
+		cfg.CoursewareAssistantPublicRuntimeEnabled {
+		t.Fatalf(
+			"Config关键字段赋值错误：cfg=%+v",
+			cfg,
+		)
+	}
 }

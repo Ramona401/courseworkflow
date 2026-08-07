@@ -10,6 +10,10 @@
  *   - 新增模拟计算API
  *   - ConsumptionListItem 新增9个精确计算字段
  *
+ * 成本隐私收口（本批）：
+ *   - 普通响应不包含模型、供应商、Token明细和美元成本字段；
+ *   - 对应字段改为可选，仅超级管理员完整响应保证存在。
+ *
  * 究极彻底版·批次1 新增（账户选择/搜索基础设施）：
  *   - getTokenAccounts 的 params 增加 keyword（按账户名模糊搜索，后端 ILIKE）
  *   - 新增 getAllocatableTargets：拿某来源账户的"合法下级账户"（究极版分配弹窗用）
@@ -109,20 +113,37 @@ export interface ConsumptionListItem {
   balance_before: number
   balance_after: number
   scene_code: string
-  model_used: string
-  tokens_used: number
   memo: string
   created_at: string
-  // v129新增：精确积分计算字段
-  input_tokens: number
-  output_tokens: number
-  model_name: string
-  provider: string
-  cost_usd: number
-  exchange_rate: number
-  multiplier: number
   credits_consumed: number
   latency_ms: number
+
+  /**
+   * 普通响应中的安全业务字段。
+   * 不含供应商、模型、Token明细或美元成本。
+   */
+  business_name?: string
+  media_type?: string
+  usage_quantity?: number
+  usage_unit?: string
+
+  /** 超级管理员完整响应中的内部业务计量字段。 */
+  billing_category?: string
+  billing_node_code?: string
+  billing_node_name?: string
+  media_unit?: string
+  media_quantity?: number
+
+  /** 超级管理员完整响应中的内部成本字段。 */
+  model_used?: string
+  tokens_used?: number
+  input_tokens?: number
+  output_tokens?: number
+  model_name?: string
+  provider?: string
+  cost_usd?: number
+  exchange_rate?: number
+  multiplier?: number
 }
 
 /** 采购记录列表项 */
@@ -260,7 +281,7 @@ export interface ConsumptionSummaryRow {
   key: string       // 维度键（区域ID/学校ID/user_id/模型名/场景码/日期）
   label: string     // 展示名（中文/友好名，后端已翻译 scene 中文）
   credits: number   // 该维度消费积分合计
-  cost_usd: number  // 该维度美元成本合计（仅 admin 前端展示）
+  cost_usd?: number // 该维度美元成本合计（仅超级管理员响应包含）
   calls: number     // 该维度调用次数
   percent: number   // 占总积分百分比（0-100，后端算好）
 }
@@ -271,7 +292,7 @@ export interface ConsumptionSummaryResponse {
   from: string                       // 回显时间范围起（空=不限）
   to: string                         // 回显时间范围止（空=不限）
   total_credits: number              // scope内总消费积分
-  total_cost_usd: number             // scope内总成本USD
+  total_cost_usd?: number            // scope内总成本USD（仅超级管理员响应包含）
   total_calls: number                // scope内总调用次数
   rows: ConsumptionSummaryRow[]      // 排行/趋势数据
   scope_blocked?: boolean            // 范围被收窄为空集

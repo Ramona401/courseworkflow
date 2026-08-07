@@ -31,7 +31,11 @@ import {
   generateCWImage, uploadCWImage, listPageAssets, deleteCWAsset,
   advancedConcatCWVideos, uploadCWVideo, burnInSubtitle,
 } from '@/api/coursewares'
-import type { CoursewareAsset, CoursewareDetail } from '@/api/coursewares'
+import type {
+  CoursewareAsset,
+  CoursewareDetail,
+  SetStyleAnchorResult,
+} from '@/api/coursewares'
 import { mixNarrationCWVideo, uploadCWAudio } from '@/api/coursewares.media'
 import { C, CW_IMG_STYLES } from './workshopConstants'
 import VideoStoryboardPanel from '../VideoStoryboardPanel'
@@ -41,6 +45,7 @@ import MediaImageSuggestPanel from './MediaImageSuggestPanel'
 import { ImageAssetList, VideoAssetList, AudioAssetList } from './MediaAssetCards'
 import { makeAsset } from './makeAsset'
 import AudioEditorModal from '../audio-editor/AudioEditorModal'
+import StyleStudioModal from '../style-studio/StyleStudioModal'
 
 // ==================== 批次5c: 按钮风格优先——纯函数工具 ====================
 
@@ -70,6 +75,8 @@ interface Props {
   anchorClearing: boolean
   onSetAnchor: (assetId: string, notify: (msg: string) => void) => void
   onClearAnchor: (notify: (msg: string) => void) => void
+  /** 自定义美术风格确认后，通知父级乐观更新课程锚点。 */
+  onAnchorChanged?: (result: SetStyleAnchorResult) => void
   /** 批次1a: stroke/formula/music 已迁出到 SubjectToolsPanel，收窄回三值 */
   mediaTab: 'image' | 'video' | 'audio'
   onPageUpdated?: (pageNum: number, html: string) => void
@@ -159,7 +166,7 @@ function parseMediaImageDraftForm(
   }
 }
 
-export default function MediaManagerPanel({ coursewareId, pageNum, courseware, anchorSetting, anchorClearing, onSetAnchor, onClearAnchor, mediaTab }: Props) {
+export default function MediaManagerPanel({ coursewareId, pageNum, courseware, anchorSetting, anchorClearing, onSetAnchor, onClearAnchor, onAnchorChanged, mediaTab }: Props) {
   // ==================== 共享状态 ====================
   const { user } = useAuth()
 
@@ -256,6 +263,7 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
   const [mediaMessage, setMediaMessage] = useState('')
   const [mediaPreviewUrl, setMediaPreviewUrl] = useState('')
   const [mediaRefUrl, setMediaRefUrl] = useState('')
+  const [styleStudioOpen, setStyleStudioOpen] = useState(false)
   const [editorOpen, setEditorOpen] = useState(false)
   const [editorExporting, setEditorExporting] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<CoursewareAsset | null>(null)
@@ -316,6 +324,37 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
     setStylePrefixText(prefix)
     setMediaGenPrompt(prefix + base)
     setMediaStyleKey(key)
+  }
+
+  /**
+   * 课程自定义画风确认后，清除当前表单中的快捷风格前缀。
+   *
+   * 统一画风已经由课程锚点负责，
+   * 不再让单张图片提示词中的快捷前缀与锚点互相冲突。
+   */
+  const clearManualStyleSelection = () => {
+    let base = mediaGenPrompt
+
+    if (stylePrefixText) {
+      if (base.startsWith(stylePrefixText)) {
+        base = base.slice(stylePrefixText.length)
+      } else if (base.includes(stylePrefixText)) {
+        base = base.replace(stylePrefixText, '')
+      }
+    }
+
+    base = base.replace(/^\s+/, '')
+
+    if (strippedStyleTail) {
+      base = base
+        ? base.trimEnd() + '\n' + strippedStyleTail
+        : strippedStyleTail
+    }
+
+    setStylePrefixText('')
+    setStrippedStyleTail('')
+    setMediaStyleKey('')
+    setMediaGenPrompt(base)
   }
 
   const handleConfirmDelete = async () => {
@@ -444,8 +483,19 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
             <div style={{ fontSize: 13, fontWeight: 600, color: C.textPrimary, marginBottom: 8 }}>🤖 生成图片</div>
             <div style={{ marginBottom: 8 }}>
               {courseware.style_anchor_asset_id ? (
-                <div style={{ padding: '8px 12px', borderRadius: 8, background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', fontSize: 11, color: '#B45309', lineHeight: 1.6 }}>
-                  ⭐ 已设风格锚点，配图将<b>自动套用锚点风格</b>以保持全课件统一，无需再选画面风格（如需手动指定风格，请先在顶部清除锚点）。
+                <div style={{ padding: '8px 12px', borderRadius: 8, background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+                  <div style={{ flex: 1, minWidth: 220, fontSize: 11, color: '#B45309', lineHeight: 1.6 }}>
+                    ⭐ 已设统一画风，生成图片时会自动保持全课件视觉一致。
+                  </div>
+                  <button
+                    type="button"
+                    disabled={mediaGenerating}
+                    onClick={() => setStyleStudioOpen(true)}
+                    title="调整课程图片画风"
+                    style={{ padding: '5px 11px', borderRadius: 7, border: '1px solid #7C3AED', background: 'rgba(124,58,237,0.06)', color: '#7C3AED', fontSize: 11, fontWeight: 700, cursor: mediaGenerating ? 'default' : 'pointer', whiteSpace: 'nowrap' }}
+                  >
+                    ✨ 自定义
+                  </button>
                 </div>
               ) : (
                 <>
@@ -460,6 +510,15 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
                         </button>
                       )
                     })}
+                    <button
+                      type="button"
+                      onClick={() => setStyleStudioOpen(true)}
+                      disabled={mediaGenerating}
+                      title="通过对话或参考图自定义课程图片画风"
+                      style={{ padding: '5px 10px', borderRadius: 14, border: '1px solid #7C3AED', background: 'rgba(124,58,237,0.06)', color: '#7C3AED', fontSize: 11, fontWeight: 700, cursor: mediaGenerating ? 'default' : 'pointer' }}
+                    >
+                      ✨ 自定义
+                    </button>
                   </div>
                 </>
               )}
@@ -711,6 +770,22 @@ export default function MediaManagerPanel({ coursewareId, pageNum, courseware, a
 
       {/* 音频提示消息 */}
       {mediaTab === 'audio' && mediaMessage && <div style={{ marginTop: 12, padding: '10px 14px', borderRadius: 8, background: mediaMessage.startsWith('❌') ? '#FEE2E2' : '#D1FAE5', color: mediaMessage.startsWith('❌') ? '#DC2626' : '#059669', fontSize: 13 }}>{mediaMessage}</div>}
+
+      {/* 手动生成图片时按需打开自定义美术风格。 */}
+      {styleStudioOpen && (
+        <StyleStudioModal
+          open
+          coursewareId={coursewareId}
+          coursewareTitle={courseware.title}
+          onClose={() => setStyleStudioOpen(false)}
+          onConfirmed={(result) => {
+            clearManualStyleSelection()
+            setStyleStudioOpen(false)
+            onAnchorChanged?.(result)
+            setMediaMessage('✅ 自定义画风已更新，后续生成图片将自动保持统一')
+          }}
+        />
+      )}
 
       {/* 图片大图预览弹窗 */}
       {mediaPreviewUrl && (

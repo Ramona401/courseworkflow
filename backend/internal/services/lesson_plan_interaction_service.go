@@ -1,11 +1,10 @@
 package services
 
-// lesson_plan_interaction_service.go — 教案互动（点赞/收藏）业务逻辑层
+// lesson_plan_interaction_service.go — 共享教案互动业务逻辑
 //
-// 职责：
-//   - Toggle 点赞/收藏（参数校验 + 教案存在性检查）
-//   - 查询教案互动统计
-//   - 查询用户收藏列表
+// 点赞、收藏、互动统计和我的收藏均属于共享教案市场能力。
+// 所有入口必须先通过统一共享可见性底座，不能通过直接提交教案ID绕过。
+// 历史非共享互动记录不主动删除，但不会继续出现在安全收藏列表中。
 
 import (
 	"context"
@@ -16,53 +15,101 @@ import (
 	"tedna/internal/repository"
 )
 
-// ==================== 错误常量 ====================
-
 var (
-	ErrInvalidInteractionType = errors.New("互动类型无效，可选值：like / favorite")
+	ErrInvalidInteractionType = errors.New(
+		"互动类型无效，可选值：like / favorite",
+	)
 )
 
-// LessonPlanInteractionService 教案互动服务
-type LessonPlanInteractionService struct{}
-
-var lpInterLog = logger.WithModule("lesson_plan_interaction")
-
-// NewLessonPlanInteractionService 创建教案互动服务实例
-func NewLessonPlanInteractionService() *LessonPlanInteractionService {
-	return &LessonPlanInteractionService{}
+// LessonPlanInteractionService 复用LessonPlanService的统一可见性底座。
+type LessonPlanInteractionService struct {
+	lpService *LessonPlanService
 }
 
-// ==================== Toggle 互动 ====================
+var lpInterLog = logger.WithModule(
+	"lesson_plan_interaction",
+)
 
-// ToggleInteraction 切换点赞/收藏状态
-// 返回切换后的状态 + 最新计数
-func (s *LessonPlanInteractionService) ToggleInteraction(ctx context.Context, userID, planID, interactionType string) (*models.ToggleInteractionResponse, error) {
-	// 校验互动类型
-	if interactionType != models.InteractionTypeLike && interactionType != models.InteractionTypeFavorite {
+// NewLessonPlanInteractionService 创建互动服务。
+func NewLessonPlanInteractionService() *LessonPlanInteractionService {
+	return &LessonPlanInteractionService{
+		lpService: &LessonPlanService{},
+	}
+}
+
+// loadVisibleSharedPlan 在任何统计或写入前校验目标共享资源。
+func (
+	s *LessonPlanInteractionService,
+) loadVisibleSharedPlan(
+	ctx context.Context,
+	userID string,
+	planID string,
+) error {
+	if s == nil || s.lpService == nil {
+		return errors.New("教案互动服务未初始化")
+	}
+
+	_, err := s.lpService.loadSharedLessonPlanForRead(
+		ctx,
+		planID,
+		userID,
+		nil,
+	)
+	return err
+}
+
+// ToggleInteraction 切换点赞或收藏。
+func (
+	s *LessonPlanInteractionService,
+) ToggleInteraction(
+	ctx context.Context,
+	userID string,
+	planID string,
+	interactionType string,
+) (*models.ToggleInteractionResponse, error) {
+	if interactionType != models.InteractionTypeLike &&
+		interactionType != models.InteractionTypeFavorite {
 		return nil, ErrInvalidInteractionType
 	}
 
-	// 校验教案存在
-	_, err := repository.GetLessonPlanByID(ctx, planID)
-	if err != nil {
-		if errors.Is(err, repository.ErrLessonPlanNotFound) {
-			return nil, ErrLPNotFound
-		}
+	if err := s.loadVisibleSharedPlan(
+		ctx,
+		userID,
+		planID,
+	); err != nil {
 		return nil, err
 	}
 
-	// Toggle
-	active, err := repository.ToggleInteraction(ctx, userID, planID, interactionType)
+	active, err := repository.ToggleInteraction(
+		ctx,
+		userID,
+		planID,
+		interactionType,
+	)
 	if err != nil {
-		lpInterLog.Error("切换互动状态失败", "user_id", userID, "plan_id", planID, "type", interactionType, "error", err)
+		lpInterLog.Error(
+			"切换互动状态失败",
+			"user_id", userID,
+			"plan_id", planID,
+			"type", interactionType,
+			"error", err,
+		)
 		return nil, err
 	}
 
-	// 查询最新计数
-	newCount, err := repository.GetInteractionCount(ctx, planID, interactionType)
+	newCount, err := repository.GetInteractionCount(
+		ctx,
+		planID,
+		interactionType,
+	)
 	if err != nil {
-		lpInterLog.Error("查询互动计数失败", "plan_id", planID, "type", interactionType, "error", err)
-		// 计数查询失败不阻断，返回 0
+		// 互动写入已完成，计数查询属于响应增强，不回滚主操作。
+		lpInterLog.Error(
+			"查询互动计数失败",
+			"plan_id", planID,
+			"type", interactionType,
+			"error", err,
+		)
 		newCount = 0
 	}
 
@@ -70,7 +117,14 @@ func (s *LessonPlanInteractionService) ToggleInteraction(ctx context.Context, us
 	if active {
 		action = "添加"
 	}
-	lpInterLog.Info("互动操作完成", "user_id", userID, "plan_id", planID, "type", interactionType, "action", action, "new_count", newCount)
+	lpInterLog.Info(
+		"互动操作完成",
+		"user_id", userID,
+		"plan_id", planID,
+		"type", interactionType,
+		"action", action,
+		"new_count", newCount,
+	)
 
 	return &models.ToggleInteractionResponse{
 		Active:   active,
@@ -78,20 +132,74 @@ func (s *LessonPlanInteractionService) ToggleInteraction(ctx context.Context, us
 	}, nil
 }
 
-// ==================== 查询互动统计 ====================
+// GetInteractionCounts 在聚合前校验目标共享教案。
+func (
+	s *LessonPlanInteractionService,
+) GetInteractionCounts(
+	ctx context.Context,
+	planID string,
+	currentUserID string,
+) (*models.InteractionCounts, error) {
+	if err := s.loadVisibleSharedPlan(
+		ctx,
+		currentUserID,
+		planID,
+	); err != nil {
+		return nil, err
+	}
 
-// GetInteractionCounts 查询教案的互动统计（含当前用户状态）
-func (s *LessonPlanInteractionService) GetInteractionCounts(ctx context.Context, planID, currentUserID string) (*models.InteractionCounts, error) {
-	return repository.GetInteractionCounts(ctx, planID, currentUserID)
+	return repository.GetInteractionCounts(
+		ctx,
+		planID,
+		currentUserID,
+	)
 }
 
-// ==================== 收藏列表 ====================
+// ListMyFavorites 只返回当前用户仍有权访问的共享收藏。
+func (
+	s *LessonPlanInteractionService,
+) ListMyFavorites(
+	ctx context.Context,
+	userID string,
+	limit int,
+	offset int,
+) (*models.FavoriteListResponse, error) {
+	access, err := resolveLessonPlanSharedAccessContext(
+		ctx,
+		userID,
+		nil,
+	)
+	if err != nil {
+		if errors.Is(
+			err,
+			errLPSharedAccessUnavailable,
+		) {
+			return &models.FavoriteListResponse{
+				Items: []*models.FavoriteListItem{},
+				Total: 0,
+			}, nil
+		}
+		return nil, err
+	}
 
-// ListMyFavorites 查询当前用户的收藏列表
-func (s *LessonPlanInteractionService) ListMyFavorites(ctx context.Context, userID string, limit, offset int) (*models.FavoriteListResponse, error) {
-	items, total, err := repository.ListUserFavorites(ctx, userID, limit, offset)
+	items, total, err :=
+		repository.ListUserFavoritesWithSharedAccess(
+			ctx,
+			userID,
+			limit,
+			offset,
+			access.VisibleAuthorIDs,
+			access.CurrentEducationDomain,
+		)
 	if err != nil {
 		return nil, err
 	}
-	return &models.FavoriteListResponse{Items: items, Total: total}, nil
+	if items == nil {
+		items = []*models.FavoriteListItem{}
+	}
+
+	return &models.FavoriteListResponse{
+		Items: items,
+		Total: total,
+	}, nil
 }

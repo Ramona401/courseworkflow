@@ -62,6 +62,9 @@ func (s *CoursewareService) UpdatePageIndex(ctx context.Context, coursewareID st
 }
 
 // AddPage 手动添加课件页面
+//
+// 该旧方法保留供内部兼容调用，仍按追加末页处理。
+// 正式HTTP新增页面入口已经改走AddPageAtForActor，支持insert_at指定位置。
 func (s *CoursewareService) AddPage(ctx context.Context, coursewareID string, userID string, req *models.AddCWPageRequest) (*models.CoursewarePage, error) {
 	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
 	if err != nil {
@@ -71,7 +74,17 @@ func (s *CoursewareService) AddPage(ctx context.Context, coursewareID string, us
 		return nil, fmt.Errorf("无权操作此课件")
 	}
 
-	count, _ := repository.CountCoursewarePages(ctx, coursewareID)
+	count, err := repository.CountCoursewarePages(
+		ctx,
+		coursewareID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"读取课件当前页数失败: %w",
+			err,
+		)
+	}
+
 	page := &models.CoursewarePage{
 		CoursewareID:        coursewareID,
 		PageNumber:          count + 1,
@@ -87,11 +100,33 @@ func (s *CoursewareService) AddPage(ctx context.Context, coursewareID string, us
 	if page.EstimatedComplexity <= 0 {
 		page.EstimatedComplexity = 1
 	}
+
 	if err := repository.CreateCoursewarePage(ctx, page); err != nil {
 		return nil, fmt.Errorf("添加页面失败: %w", err)
 	}
-	_ = repository.UpdateCoursewarePageCount(ctx, coursewareID, count+1)
-	_ = s.ResyncCWPageNumbers(ctx, coursewareID)
+
+	_ = repository.UpdateCoursewarePageCount(
+		ctx,
+		coursewareID,
+		count+1,
+	)
+
+	// 旧内部调用保持增强动作语义，校准失败不把已经成功创建的页面伪装为创建失败。
+	if resyncErr := s.ResyncCWPageNumbers(
+		ctx,
+		coursewareID,
+	); resyncErr != nil {
+		cwServiceLog.Warn(
+			"追加页面成功，但页码校准失败",
+			"courseware_id",
+			coursewareID,
+			"page_id",
+			page.ID,
+			"error",
+			resyncErr,
+		)
+	}
+
 	return page, nil
 }
 
@@ -104,16 +139,43 @@ func (s *CoursewareService) DeletePage(ctx context.Context, coursewareID string,
 	if cw.UserID != userID {
 		return fmt.Errorf("无权操作此课件")
 	}
-	if err := repository.DeleteCoursewarePage(ctx, coursewareID, pageNumber); err != nil {
+
+	if err := repository.DeleteCoursewarePage(
+		ctx,
+		coursewareID,
+		pageNumber,
+	); err != nil {
 		return err
 	}
-	count, _ := repository.CountCoursewarePages(ctx, coursewareID)
-	_ = repository.UpdateCoursewarePageCount(ctx, coursewareID, count)
-	_ = s.ResyncCWPageNumbers(ctx, coursewareID)
+
+	// 删除已经成功时，不因后续增强校准失败而诱导客户端重复删除。
+	if resyncErr := s.ResyncCWPageNumbers(
+		ctx,
+		coursewareID,
+	); resyncErr != nil {
+		cwServiceLog.Warn(
+			"删除页面成功，但页码校准失败",
+			"courseware_id",
+			coursewareID,
+			"deleted_page_number",
+			pageNumber,
+			"error",
+			resyncErr,
+		)
+	}
+
 	return nil
 }
 
-// ReorderPages 重新排序课件页面
+// ReorderPages 重新排序课件页面。
+//
+// 本入口同时承担前端“一键校准页码”：
+//   - 拖拽排序时，pageIDs是拖拽后的目标顺序；
+//   - 一键校准时，pageIDs是当前视觉顺序。
+//
+// 无论顺序是否改变，都会在同一事务内重新写入：
+//   page_number、导航栏当前页码、导航栏总页数和coursewares.page_count。
+// 任一步失败明确返回错误，不吞掉校准失败。
 func (s *CoursewareService) ReorderPages(ctx context.Context, coursewareID string, userID string, pageIDs []string) error {
 	cw, err := repository.GetCoursewareByID(ctx, coursewareID)
 	if err != nil {
@@ -122,11 +184,12 @@ func (s *CoursewareService) ReorderPages(ctx context.Context, coursewareID strin
 	if cw.UserID != userID {
 		return fmt.Errorf("无权操作此课件")
 	}
-	if err := repository.ReorderCoursewarePages(ctx, coursewareID, pageIDs); err != nil {
-		return err
-	}
-	_ = s.ResyncCWPageNumbers(ctx, coursewareID)
-	return nil
+
+	return s.ResyncCWPageNumbersByOrder(
+		ctx,
+		coursewareID,
+		pageIDs,
+	)
 }
 
 // ==================== 步骤回退 ====================

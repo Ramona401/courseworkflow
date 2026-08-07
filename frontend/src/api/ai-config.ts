@@ -5,6 +5,7 @@
  * - 连通性测试：验证AI API连接状态
  * - 可用模型查询：查询当前Key下可用模型列表
  * - TTS语音合成配置：查看/保存/服务端自测（S-V1.5b新增）
+ * - ASR流式语音识别配置：独立凭据查看/保存/握手测试
  * - 境内文本网关配置：查看/保存/服务端自测（批一新增，双网关分流降级通道）
  * - 仅 admin 可调用
  */
@@ -113,6 +114,48 @@ export interface TestTTSResult {
   message: string             // 人类可读结论
 }
 
+// ==================== ASR流式语音识别配置类型 ====================
+
+/**
+ * ASR独立配置视图。
+ *
+ * credential_source为asr时使用独立凭据；
+ * 历史环境没有独立配置时可能暂时返回tts，管理后台应提示保存独立配置。
+ */
+export interface ASRConfigView {
+  credential_source: string
+  using_separate_credentials: boolean
+  configured: boolean
+  app_id: string
+  access_token: string
+  access_token_set: boolean
+  ws_url: string
+  resource_id: string
+  max_duration_seconds: number
+  service_name: string
+  billing_mode: string
+}
+
+/** 保存ASR独立配置。Access Token留空表示保留当前值。 */
+export interface UpdateASRConfigRequest {
+  app_id?: string
+  access_token?: string
+  ws_url?: string
+  resource_id?: string
+  max_duration_seconds?: number
+}
+
+/** ASR握手与首包确认测试结果。 */
+export interface TestASRResult {
+  success: boolean
+  latency_ms: number
+  resource_id: string
+  ws_url: string
+  request_id?: string
+  log_id?: string
+  message: string
+}
+
 // ==================== 境内文本网关配置类型（批一新增） ====================
 
 /**
@@ -205,6 +248,45 @@ export async function updateTTSConfig(req: UpdateTTSConfigRequest): Promise<TTSC
  */
 export async function testTTSConnection(): Promise<TestTTSResult> {
   const res = await client.post<{ code: number; data: TestTTSResult }>('/admin/tts-config/test', {})
+  return res.data.data
+}
+
+// ==================== ASR流式语音识别配置 API ====================
+
+/** 获取ASR独立配置，Token仅返回脱敏结果。 */
+export async function getASRConfig(): Promise<ASRConfigView> {
+  const res = await client.get<{ code: number; data: ASRConfigView }>(
+    '/admin/asr-config'
+  )
+  return res.data.data
+}
+
+/**
+ * 保存ASR独立配置。
+ *
+ * 保存成功后后端会原子写入全部配置并切换为独立ASR凭据，
+ * 不会覆盖现有TTS APP ID或Access Token。
+ */
+export async function updateASRConfig(
+  req: UpdateASRConfigRequest,
+): Promise<ASRConfigView> {
+  const res = await client.put<{ code: number; data: ASRConfigView }>(
+    '/admin/asr-config',
+    req,
+  )
+  return res.data.data
+}
+
+/**
+ * 测试ASR链路。
+ *
+ * 后端只建立WebSocket并等待首包确认，不采集麦克风、不上传音频。
+ */
+export async function testASRConnection(): Promise<TestASRResult> {
+  const res = await client.post<{ code: number; data: TestASRResult }>(
+    '/admin/asr-config/test',
+    {},
+  )
   return res.data.data
 }
 

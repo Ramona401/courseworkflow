@@ -2,15 +2,15 @@ package services
 
 // courseware_service.go — 课件工坊核心服务
 //
-// 课件CRUD、状态流转、风格、Logo与导航栏模板保存。
+// 课件详情、列表、状态流转、风格、Logo与导航栏模板保存。
 //
-// 页面操作、步骤回退、主题创建、3D创建与课程知识库编码校验
-// 已拆分到courseware_service_curriculum.go，避免单文件超过600行。
+// 从教案创建已拆分到courseware_creation_service.go；页面操作、步骤回退、
+// 主题创建、3D创建与课程知识库编码校验已拆分到
+// courseware_service_curriculum.go，确保本文件保持600行以内。
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -57,16 +57,6 @@ var cwLogoMimeToExt = map[string]string{
 
 var cwServiceLog = logger.WithModule("courseware_service")
 
-// 从教案创建课件的稳定错误，供Handler准确映射HTTP状态码。
-var (
-	ErrCoursewareLessonPlanRequired = errors.New(
-		"教案ID不能为空",
-	)
-	ErrCoursewareLessonPlanNotFound = errors.New(
-		"关联教案不存在",
-	)
-)
-
 // CoursewareService 课件工坊服务
 type CoursewareService struct{}
 
@@ -76,71 +66,6 @@ func NewCoursewareService() *CoursewareService {
 }
 
 // ==================== 课件CRUD ====================
-
-// CreateCourseware 创建课件（从教案出发）
-// 自动读取教案的标题、学科、年级信息
-func (s *CoursewareService) CreateCourseware(
-	ctx context.Context,
-	actor *CoursewareActorContext,
-	req *models.CreateCoursewareRequest,
-) (*models.Courseware, error) {
-	if req == nil || strings.TrimSpace(req.LessonPlanID) == "" {
-		return nil, ErrCoursewareLessonPlanRequired
-	}
-
-	lessonPlanID := strings.TrimSpace(req.LessonPlanID)
-
-	// 教案是课件教育域快照的唯一来源。
-	// 不得重新根据创建者当前学校推导，否则老师换校后会把历史教案静默重分类。
-	lp, err := repository.GetLessonPlanByID(
-		ctx,
-		lessonPlanID,
-	)
-	if err != nil {
-		if errors.Is(err, repository.ErrLessonPlanNotFound) {
-			return nil, ErrCoursewareLessonPlanNotFound
-		}
-		return nil, fmt.Errorf(
-			"查询关联教案失败: %w",
-			err,
-		)
-	}
-
-	domain, err :=
-		ResolveCoursewareEducationDomainFromLessonPlan(
-			actor,
-			lp,
-		)
-	if err != nil {
-		return nil, err
-	}
-
-	title := strings.TrimSpace(req.Title)
-	if title == "" {
-		title = lp.Title
-	}
-
-	cw := &models.Courseware{
-		LessonPlanID:    &lessonPlanID,
-		UserID:          actor.UserID,
-		Title:           title,
-		Subject:         lp.Subject,
-		Grade:           lp.Grade,
-		EducationDomain: domain,
-		Status:          models.CoursewareStatusDraft,
-		SourceType:      models.CWSourceLessonPlan,
-		PageCount:       0,
-	}
-
-	if err := repository.CreateCourseware(ctx, cw); err != nil {
-		return nil, fmt.Errorf(
-			"创建课件失败: %w",
-			err,
-		)
-	}
-
-	return cw, nil
-}
 
 // GetCourseware 获取课件详情（含全部页面）
 // Phase 4C: 新增NavTemplateHTML传递
@@ -406,10 +331,10 @@ func (s *CoursewareService) ConfirmStyle(ctx context.Context, id string, userID 
 	return repository.UpdateCoursewareStatus(ctx, id, models.CoursewareStatusGenerating)
 }
 
-// SaveNavTemplate Phase 4C P0-1: 保存用户确认的导航栏HTML模板
-// P0-1改造：
-//   - 如果前端传入nav_html为空字符串"auto"，则自动从封面页HTML中按标记提取
-//   - 提取后自动将硬编码页码替换为 {{PAGE_NUM}} / {{TOTAL_PAGES}} 占位符
+// SaveNavTemplate 保存用户确认的导航栏HTML模板。
+// 自动模式从封面提取导航；显式模式接收前端微调结果。两种模式都会移除真实页码，
+// 并从封面完整HTML提取导航依赖CSS后限定到tedna-nav-shell作用域。
+// 这避免模板首页正常、批量页却因丢失CSS而出现Logo巨大和导航样式失真。
 func (s *CoursewareService) SaveNavTemplate(ctx context.Context, id string, userID string, navHTML string) error {
 	cw, err := repository.GetCoursewareByID(ctx, id)
 	if err != nil {
@@ -418,45 +343,54 @@ func (s *CoursewareService) SaveNavTemplate(ctx context.Context, id string, user
 	if cw.UserID != userID {
 		return fmt.Errorf("无权操作此课件")
 	}
-	// generating或preview状态下都允许保存导航栏模板
 	if cw.Status != models.CoursewareStatusGenerating && cw.Status != models.CoursewareStatusPreview {
 		return fmt.Errorf("当前状态不允许保存导航栏模板: %s", cw.Status)
 	}
 
-	// P0-1: 如果传入"auto"或空值，自动从封面页提取导航栏
-	if navHTML == "" || navHTML == "auto" {
-		cwServiceLog.Info("自动从封面页提取导航栏", "courseware_id", id)
-		pages, pErr := repository.ListCoursewarePages(ctx, id)
-		if pErr != nil || len(pages) == 0 {
-			return fmt.Errorf("无法获取封面页用于提取导航栏")
-		}
-		// 找第1页（封面页）
-		var coverPage *models.CoursewarePage
-		for _, p := range pages {
-			if p.PageNumber == 1 && p.HTMLContent != "" {
-				coverPage = p
+	// 自动提取和显式提交都读取最新封面。显式提交读取失败时仅缺少CSS补全，
+	// 不影响导航本体保存；自动提取则必须有有效封面。
+	coverPageHTML := ""
+	pages, pagesErr := repository.ListCoursewarePages(ctx, id)
+	if pagesErr == nil {
+		for _, page := range pages {
+			if page.PageNumber == 1 && strings.TrimSpace(page.HTMLContent) != "" {
+				coverPageHTML = page.HTMLContent
 				break
 			}
 		}
-		if coverPage == nil {
-			return fmt.Errorf("封面页尚未生成，无法提取导航栏")
-		}
-		// 按标记提取导航栏
-		extracted := ExtractNavByMarkers(coverPage.HTMLContent)
-		if extracted == "" {
-			return fmt.Errorf("无法从封面页中提取导航栏（未找到NAV_START/NAV_END标记）")
-		}
-		navHTML = extracted
 	}
 
+	if navHTML == "" || navHTML == "auto" {
+		cwServiceLog.Info("自动从封面页提取导航栏", "courseware_id", id)
+		if pagesErr != nil || len(pages) == 0 {
+			return fmt.Errorf("无法获取封面页用于提取导航栏")
+		}
+		if strings.TrimSpace(coverPageHTML) == "" {
+			return fmt.Errorf("封面页尚未生成，无法提取导航栏")
+		}
+		navHTML = ExtractNavByMarkers(coverPageHTML)
+		if strings.TrimSpace(navHTML) == "" {
+			return fmt.Errorf("无法从封面页中提取导航栏")
+		}
+	}
 	if strings.TrimSpace(navHTML) == "" {
 		return fmt.Errorf("导航栏HTML不能为空")
 	}
 
-	// P0-1: 自动将硬编码页码替换为占位符
-	navHTML = ReplaceNavPageNumbers(navHTML)
+	// 页码只由后端组装链回填；保存时同时补齐模板导航CSS依赖并移除cw-page画布语义。
+	navHTML = prepareNavTemplateForStorage(
+		ReplaceNavPageNumbers(navHTML),
+		coverPageHTML,
+	)
+	if strings.TrimSpace(navHTML) == "" {
+		return fmt.Errorf("导航栏模板规范化后为空")
+	}
 
-	cwServiceLog.Info("保存导航栏模板", "courseware_id", id, "nav_len", len(navHTML))
+	cwServiceLog.Info("保存导航栏模板",
+		"courseware_id", id,
+		"nav_len", len(navHTML),
+		"captured_scoped_css", strings.Contains(navHTML, cwNavScopedStyleMarker),
+	)
 	return repository.UpdateCoursewareNavTemplate(ctx, id, navHTML)
 }
 

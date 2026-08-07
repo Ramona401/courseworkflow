@@ -23,6 +23,27 @@
  */
 import type { LessonPlanStatus } from '@/api/lesson-plans'
 
+export interface RenderedMarkdownImage {
+  key: string
+  alt: string
+  url: string
+  markdown: string
+  occurrence: number
+}
+
+export interface RenderMarkdownOptions {
+  /** 传入后，在图片右上角显示快捷移除按钮。 */
+  onRemoveImage?: (
+    image: RenderedMarkdownImage,
+  ) => void
+  /** 当前状态是否禁止图片操作。 */
+  imageActionDisabled?: boolean
+  /** 当前正在保存移除操作的图片标识。 */
+  removingImageKey?: string
+  /** 区分前言和不同章节中的同名图片。 */
+  imageKeyPrefix?: string
+}
+
 // ==================== 颜色常量 ====================
 export const C = {
   primary:      '#4F7BE8',
@@ -139,13 +160,137 @@ function splitTableCells(line: string): string[] {
  *     ![alt](url)  行内小图 (v124 新增)
  *     [text](url)  链接,新标签页打开 (v124 新增)
  */
-export function renderMarkdown(text: string): React.ReactNode {
+export function renderMarkdown(
+  text: string,
+  options: RenderMarkdownOptions = {},
+): React.ReactNode {
   if (!text) return null
   const lines = text.split('\n')
   const nodes: React.ReactNode[] = []
   let listItems: React.ReactNode[] = []
   let listType: 'ul' | 'ol' | null = null
   let key = 0
+
+  const imageOccurrenceByMarkdown =
+    new Map<string, number>()
+
+  const registerImage = (
+    alt: string,
+    url: string,
+    markdown: string,
+  ): RenderedMarkdownImage => {
+    const occurrence =
+      (
+        imageOccurrenceByMarkdown.get(
+          markdown,
+        ) || 0
+      ) + 1
+
+    imageOccurrenceByMarkdown.set(
+      markdown,
+      occurrence,
+    )
+
+    return {
+      key: `${
+        options.imageKeyPrefix ||
+        'document'
+      }::${markdown}::${occurrence}`,
+      alt,
+      url,
+      markdown,
+      occurrence,
+    }
+  }
+
+  const renderImageRemoveButton = (
+    image: RenderedMarkdownImage,
+    compactButton = false,
+  ): React.ReactNode => {
+    if (!options.onRemoveImage) {
+      return null
+    }
+
+    const removing =
+      options.removingImageKey ===
+      image.key
+
+    const actionDisabled =
+      Boolean(
+        options.imageActionDisabled,
+      ) ||
+      removing
+
+    return (
+      <button
+        type="button"
+        aria-label={`从当前教案正文移除图片：${image.alt || '未命名图片'}`}
+        title={
+          actionDisabled
+            ? '当前暂不能移除图片'
+            : '从当前教案正文移除，原Word母版和历史版本仍保留'
+        }
+        disabled={actionDisabled}
+        onClick={event => {
+          event.preventDefault()
+          event.stopPropagation()
+
+          if (!actionDisabled) {
+            options.onRemoveImage?.(
+              image,
+            )
+          }
+        }}
+        style={{
+          position: 'absolute',
+          top: compactButton
+            ? '3px'
+            : '8px',
+          right: compactButton
+            ? '3px'
+            : '8px',
+          zIndex: 4,
+          minWidth: compactButton
+            ? '26px'
+            : '72px',
+          height: compactButton
+            ? '26px'
+            : '29px',
+          padding: compactButton
+            ? '0 6px'
+            : '0 10px',
+          borderRadius: compactButton
+            ? '999px'
+            : '7px',
+          border:
+            '1px solid rgba(239,68,68,0.42)',
+          background:
+            'rgba(255,255,255,0.96)',
+          color: actionDisabled
+            ? '#D1D5DB'
+            : C.danger,
+          fontSize: compactButton
+            ? '14px'
+            : '11px',
+          fontWeight: 700,
+          lineHeight: 1,
+          cursor: actionDisabled
+            ? 'not-allowed'
+            : 'pointer',
+          boxShadow: actionDisabled
+            ? 'none'
+            : '0 2px 9px rgba(17,24,39,0.16)',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {removing
+          ? '…'
+          : compactButton
+            ? '×'
+            : '🗑 移除'}
+      </button>
+    )
+  }
 
   /**
    * 解析行内元素(粗体/图片/链接)
@@ -165,17 +310,44 @@ export function renderMarkdown(text: string): React.ReactNode {
       // 行内图片(放在文字中,最大高 200px 不破坏行高)
       const imgM = p.match(/^!\[([^\]]*)\]\(([^)]+)\)$/)
       if (imgM) {
+        const image = registerImage(
+          imgM[1],
+          imgM[2],
+          p,
+        )
+
         return (
-          <img
+          <span
             key={i}
-            src={imgM[2]}
-            alt={imgM[1]}
             style={{
-              maxWidth: '100%', maxHeight: '200px',
-              verticalAlign: 'middle', borderRadius: '4px', margin: '0 4px',
+              position: 'relative',
+              display: 'inline-block',
+              maxWidth: '100%',
+              verticalAlign: 'middle',
+              margin: '0 4px',
             }}
-            onError={(e) => { (e.currentTarget as HTMLImageElement).style.opacity = '0.3' }}
-          />
+          >
+            <img
+              src={imgM[2]}
+              alt={imgM[1]}
+              style={{
+                maxWidth: '100%',
+                maxHeight: '200px',
+                verticalAlign: 'middle',
+                borderRadius: '4px',
+                display: 'block',
+              }}
+              onError={event => {
+                event.currentTarget.style.opacity =
+                  '0.3'
+              }}
+            />
+
+            {renderImageRemoveButton(
+              image,
+              true,
+            )}
+          </span>
         )
       }
       // 链接
@@ -267,8 +439,24 @@ export function renderMarkdown(text: string): React.ReactNode {
       flushList()
       const alt = imgOnly[1]
       const url = imgOnly[2]
+      const image = registerImage(
+        alt,
+        url,
+        t,
+      )
+
       nodes.push(
-        <div key={key++} style={{ textAlign: 'center', margin: '14px 0' }}>
+        <div
+          key={key++}
+          style={{
+            position: 'relative',
+            textAlign: 'center',
+            margin: '14px 0',
+          }}
+        >
+          {renderImageRemoveButton(
+            image,
+          )}
           <img
             src={url}
             alt={alt}

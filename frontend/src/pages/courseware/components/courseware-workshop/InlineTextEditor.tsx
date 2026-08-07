@@ -1,24 +1,12 @@
 /**
- * InlineTextEditor.tsx — 课件页「就地编辑」全屏浮层编辑器 v3
+ * InlineTextEditor.tsx — 课件页就地编辑器。
  *
- * v3 重构：iframe 注入脚本抽出为 inlineEditorInject.ts，本文件只含 React 组件。
- *
- * 支持四种编辑模式：
- *   📝 文字：整段改内容/字号/颜色 + 拖选部分加粗/改色/改字体（选即生效）
- *   🖼️ 图片：上传替换 / AI参考修改 / AI全新生成 / 尺寸调整 / 视频占位→真视频
- *   🎬 视频：上传新视频替换（真 <video> 标签）
- *   📦 模块：绝对定位元素拖拽移动/缩放 + 数字输入精确调整 + 快捷操作
- *
- * 【v5.6 热点精确定位增强】block 模式面板增加：
- *   - 元素标识显示（id / class），方便区分多个同类热点
- *   - ±1px / ±5px / ±10px 微调步进按钮，精确定位不靠拖拽
- *
- * 【v5.7 四模式互切配套】配合 inlineEditorInject.ts v5.7：
- *   - 消息处理增加 'deselect' 分支：iframe 内点空白处或按 ESC 取消选中后，
- *     右侧面板同步清空选中态，回到未选中提示界面
- *   - 模块面板"含文字内容"提示更新：说明可再点一次切换为文字编辑
- *   - 未选中提示面板补充四模式互切与取消选中的操作说明
+ * 支持文字、图片、视频和绝对定位模块四种模式：
+ * 文字保留行内格式；图片支持替换、AI生成与原位转视频；
+ * 视频支持上传替换和AI重新生成；模块支持拖拽、缩放及精确定位。
+ * iframe内部识别与DOM写回协议位于 inlineEditorInject.ts。
  */
+
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { getCoursewarePages, savePageHtml, uploadCWImage, generateCWImage, uploadCWVideo, generateCWVideo, queryVideoStatus } from '@/api/coursewares'
 import { C, CW_WIDTH, CW_HEIGHT } from './workshopConstants'
@@ -57,6 +45,7 @@ interface VideoSelectedInfo {
   mode: 'video'
   path: string
   src: string
+  poster: string
   width: number
   height: number
 }
@@ -146,11 +135,11 @@ export default function InlineTextEditor({ coursewareId, pageNum, onPageUpdated,
   const [imageGenerating, setImageGenerating] = useState(false)
   const [imagePrompt, setImagePrompt] = useState('')
   const [imageMode, setImageMode] = useState<'none' | 'ref' | 'new'>('none')
-  /* 视频占位→真视频 */
+  /* 任意图片→原位真视频 */
   const [videoGenStatus, setVideoGenStatus] = useState<'' | 'submitting' | 'polling' | 'done' | 'failed'>('')
   const [videoGenMessage, setVideoGenMessage] = useState('')
   const [videoPromptForGen, setVideoPromptForGen] = useState('')
-  const [videoGenMode, setVideoGenMode] = useState<'none' | 'upload' | 'ref' | 'new'>('none')
+  const [videoGenMode, setVideoGenMode] = useState<'none' | 'ref' | 'new'>('none')
   /* 真 <video> 上传 */
   const [videoUploading, setVideoUploading] = useState(false)
   const [videoUploadProgress, setVideoUploadProgress] = useState(0)
@@ -199,7 +188,14 @@ export default function InlineTextEditor({ coursewareId, pageNum, onPageUpdated,
         if (m === 'image') {
           setSelected({ mode: 'image', path: d.payload.path, src: d.payload.src || '', width: d.payload.width || 0, height: d.payload.height || 0, naturalWidth: d.payload.naturalWidth || 0, naturalHeight: d.payload.naturalHeight || 0, isVideoPlaceholder: !!d.payload.isVideoPlaceholder })
         } else if (m === 'video') {
-          setSelected({ mode: 'video', path: d.payload.path, src: d.payload.src || '', width: d.payload.width || 0, height: d.payload.height || 0 })
+          setSelected({
+            mode: 'video',
+            path: d.payload.path,
+            src: d.payload.src || '',
+            poster: d.payload.poster || '',
+            width: d.payload.width || 0,
+            height: d.payload.height || 0,
+          })
         } else if (m === 'block') {
           setSelected({
             mode: 'block', path: d.payload.path, tagName: d.payload.tagName || 'DIV',
@@ -327,16 +323,42 @@ export default function InlineTextEditor({ coursewareId, pageNum, onPageUpdated,
     } finally { setImageGenerating(false) }
   }
 
-  // ==================== 视频占位→真视频 ====================
+  // ==================== 图片/已有视频就地生成视频 ====================
 
-  const replaceImgWithVideo = (videoUrl: string) => {
-    if (!selected || selected.mode !== 'image') return
-    postToIframe('replace_img_with_video', { path: selected.path, src: videoUrl })
-    setDirty(true); setSelected(null)
+  const applyVideoToTarget = (
+    target: ImageSelectedInfo | VideoSelectedInfo,
+    videoUrl: string,
+  ) => {
+    if (!videoUrl) return
+
+    if (target.mode === 'image') {
+      postToIframe(
+        'replace_img_with_video',
+        { path: target.path, src: videoUrl },
+      )
+      setSelected(prev => (
+        prev?.mode === 'image' && prev.path === target.path
+          ? null
+          : prev
+      ))
+    } else {
+      postToIframe(
+        'replace_video',
+        { path: target.path, src: videoUrl },
+      )
+      setSelected(prev => (
+        prev?.mode === 'video' && prev.path === target.path
+          ? { ...prev, src: videoUrl }
+          : prev
+      ))
+    }
+
+    setDirty(true)
   }
 
-  const handleUploadVideoForPlaceholder = () => {
+  const handleUploadVideoForImage = () => {
     if (!selected || selected.mode !== 'image') return
+    const target = selected
     const inp = document.createElement('input')
     inp.type = 'file'; inp.accept = 'video/mp4,video/webm,video/quicktime'
     inp.onchange = async (ev) => {
@@ -346,8 +368,8 @@ export default function InlineTextEditor({ coursewareId, pageNum, onPageUpdated,
       setVideoGenStatus('submitting'); setVideoGenMessage('⏳ 正在上传视频...'); setError('')
       try {
         const result = await uploadCWVideo(coursewareId, pageNum, f, (pct) => setVideoGenMessage('⏳ 上传中 ' + pct + '%...'))
-        replaceImgWithVideo(result.url)
-        setVideoGenStatus('done'); setVideoGenMessage('✅ 视频已上传并替换占位图'); setVideoGenMode('none')
+        applyVideoToTarget(target, result.url)
+        setVideoGenStatus('done'); setVideoGenMessage('✅ 视频已上传并原位替换当前图片'); setVideoGenMode('none')
       } catch (e) {
         setVideoGenStatus('failed'); setVideoGenMessage('❌ 上传失败: ' + (e instanceof Error ? e.message : '未知错误'))
       }
@@ -356,10 +378,29 @@ export default function InlineTextEditor({ coursewareId, pageNum, onPageUpdated,
   }
 
   const handleAIVideoGen = async () => {
-    if (!selected || selected.mode !== 'image' || !videoPromptForGen.trim()) return
+    if (
+      !selected ||
+      (selected.mode !== 'image' && selected.mode !== 'video') ||
+      !videoPromptForGen.trim()
+    ) return
+
+    const target = selected
+    const refUrl = videoGenMode === 'ref'
+      ? (
+          target.mode === 'image'
+            ? target.src
+            : target.poster
+        )
+      : undefined
+
+    if (videoGenMode === 'ref' && !refUrl) {
+      setVideoGenStatus('failed')
+      setVideoGenMessage('❌ 当前媒体没有可用封面图，请改用“AI全新生成视频”')
+      return
+    }
+
     setVideoGenStatus('submitting'); setVideoGenMessage('⏳ 正在提交视频生成任务...'); setError('')
     try {
-      const refUrl = videoGenMode === 'ref' ? selected.src : undefined
       const result = await generateCWVideo(coursewareId, pageNum, videoPromptForGen.trim(), refUrl)
       if (!result.asset_id) throw new Error('未返回任务ID')
       setVideoGenStatus('polling'); setVideoGenMessage('⏳ AI 正在生成视频（约30-120秒）...')
@@ -369,8 +410,13 @@ export default function InlineTextEditor({ coursewareId, pageNum, onPageUpdated,
         try {
           const status = await queryVideoStatus(coursewareId, result.asset_id)
           if (status.status === 'uploaded' && status.video_url) {
-            replaceImgWithVideo(status.video_url)
-            setVideoGenStatus('done'); setVideoGenMessage('✅ 视频已生成并替换占位图')
+            applyVideoToTarget(target, status.video_url)
+            setVideoGenStatus('done')
+            setVideoGenMessage(
+              target.mode === 'image'
+                ? '✅ 视频已生成并原位替换当前图片'
+                : '✅ 新视频已生成并替换当前视频',
+            )
             setVideoPromptForGen(''); setVideoGenMode('none'); return
           } else if (status.status === 'failed') {
             setVideoGenStatus('failed'); setVideoGenMessage('❌ 视频生成失败: ' + (status.error_msg || '未知错误')); return
@@ -465,7 +511,7 @@ export default function InlineTextEditor({ coursewareId, pageNum, onPageUpdated,
           <label style={labelStyle}>整段文字内容</label>
           <textarea value={s.text} onChange={e => onChangeText(e.target.value)} rows={3}
             style={{ width: '100%', padding: '8px 10px', borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 13, outline: 'none', resize: 'vertical', fontFamily: 'inherit', lineHeight: 1.6, boxSizing: 'border-box' }} />
-          <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>修改这里会替换该元素全部文字（含格式）</div>
+          <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>修改这里只替换文字内容，保留原有加粗、颜色、字体等行内格式；新增文字沿用相邻格式</div>
         </div>
         <div>
           <label style={labelStyle}>整段字号（px）</label>
@@ -541,43 +587,49 @@ export default function InlineTextEditor({ coursewareId, pageNum, onPageUpdated,
         <div style={{ borderRadius: 8, overflow: 'hidden', border: `1px solid ${C.border}`, background: '#F9FAFB' }}>
           {s.src ? (<img src={s.src} alt="当前图片" style={{ width: '100%', maxHeight: 160, objectFit: 'contain', display: 'block' }} />) : (<div style={{ padding: 16, textAlign: 'center', color: C.textMuted, fontSize: 13 }}>无图片源</div>)}
         </div>
-        {/* 视频占位操作区 */}
-        {s.isVideoPlaceholder && (
-          <div style={{ padding: '10px 12px', borderRadius: 8, background: '#FFFBEB', border: '1px solid #F59E0B' }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: '#D97706', marginBottom: 8 }}>🎬 检测到视频占位图</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <button onClick={handleUploadVideoForPlaceholder} disabled={videoGenStatus === 'submitting' || videoGenStatus === 'polling'}
-                style={{ padding: '8px 12px', borderRadius: 6, border: 'none', background: '#F59E0B', color: '#fff', fontSize: 12, fontWeight: 600, cursor: (videoGenStatus === 'submitting' || videoGenStatus === 'polling') ? 'default' : 'pointer', width: '100%' }}>
-                📤 上传视频替换此占位图
-              </button>
-              <button onClick={() => setVideoGenMode(videoGenMode === 'ref' ? 'none' : 'ref')} disabled={videoGenStatus === 'submitting' || videoGenStatus === 'polling'}
-                style={{ padding: '8px 12px', borderRadius: 6, border: videoGenMode === 'ref' ? '2px solid #7C3AED' : '1px solid #E5E7EB', background: videoGenMode === 'ref' ? '#F5F3FF' : '#fff', color: videoGenMode === 'ref' ? '#7C3AED' : '#374151', fontSize: 12, fontWeight: 600, cursor: (videoGenStatus === 'submitting' || videoGenStatus === 'polling') ? 'default' : 'pointer', width: '100%' }}>
-                🎨 以此图为首帧 AI 生成视频
-              </button>
-              <button onClick={() => setVideoGenMode(videoGenMode === 'new' ? 'none' : 'new')} disabled={videoGenStatus === 'submitting' || videoGenStatus === 'polling'}
-                style={{ padding: '8px 12px', borderRadius: 6, border: videoGenMode === 'new' ? '2px solid #F59E0B' : '1px solid #E5E7EB', background: videoGenMode === 'new' ? '#FFFBEB' : '#fff', color: videoGenMode === 'new' ? '#D97706' : '#374151', fontSize: 12, fontWeight: 600, cursor: (videoGenStatus === 'submitting' || videoGenStatus === 'polling') ? 'default' : 'pointer', width: '100%' }}>
-                ✨ AI 全新生成视频
+        {/* 任意图片原位转视频操作区 */}
+        <div style={{ padding: '10px 12px', borderRadius: 8, background: '#FFFBEB', border: '1px solid #F59E0B' }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#D97706', marginBottom: 5 }}>
+            {s.isVideoPlaceholder
+              ? '🎬 检测到视频占位图'
+              : '🎬 将当前图片原位转换为视频'}
+          </div>
+          <div style={{ marginBottom: 8, color: '#92400E', fontSize: 11, lineHeight: 1.5 }}>
+            生成或上传成功后只替换当前图片节点，不会清空同一容器中的标题、按钮或装饰；点击“保存修改”后才写回课件。
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <button onClick={handleUploadVideoForImage} disabled={videoGenStatus === 'submitting' || videoGenStatus === 'polling'}
+              style={{ padding: '8px 12px', borderRadius: 6, border: 'none', background: '#F59E0B', color: '#fff', fontSize: 12, fontWeight: 600, cursor: (videoGenStatus === 'submitting' || videoGenStatus === 'polling') ? 'default' : 'pointer', width: '100%' }}>
+              📤 上传视频原位替换当前图片
+            </button>
+            <button onClick={() => setVideoGenMode(videoGenMode === 'ref' ? 'none' : 'ref')} disabled={videoGenStatus === 'submitting' || videoGenStatus === 'polling'}
+              style={{ padding: '8px 12px', borderRadius: 6, border: videoGenMode === 'ref' ? '2px solid #7C3AED' : '1px solid #E5E7EB', background: videoGenMode === 'ref' ? '#F5F3FF' : '#fff', color: videoGenMode === 'ref' ? '#7C3AED' : '#374151', fontSize: 12, fontWeight: 600, cursor: (videoGenStatus === 'submitting' || videoGenStatus === 'polling') ? 'default' : 'pointer', width: '100%' }}>
+              🎨 以此图为首帧 AI 生成视频
+            </button>
+            <button onClick={() => setVideoGenMode(videoGenMode === 'new' ? 'none' : 'new')} disabled={videoGenStatus === 'submitting' || videoGenStatus === 'polling'}
+              style={{ padding: '8px 12px', borderRadius: 6, border: videoGenMode === 'new' ? '2px solid #F59E0B' : '1px solid #E5E7EB', background: videoGenMode === 'new' ? '#FFFBEB' : '#fff', color: videoGenMode === 'new' ? '#D97706' : '#374151', fontSize: 12, fontWeight: 600, cursor: (videoGenStatus === 'submitting' || videoGenStatus === 'polling') ? 'default' : 'pointer', width: '100%' }}>
+              ✨ AI 全新生成视频
+            </button>
+          </div>
+          {(videoGenMode === 'ref' || videoGenMode === 'new') && (
+            <div style={{ marginTop: 8 }}>
+              <textarea value={videoPromptForGen} onChange={e => setVideoPromptForGen(e.target.value)}
+                placeholder={videoGenMode === 'ref' ? '描述要生成什么样的视频动效（AI会以当前图为首帧）...' : '描述要生成什么样的视频...'}
+                rows={2} disabled={videoGenStatus === 'submitting' || videoGenStatus === 'polling'}
+                style={{ width: '100%', padding: '6px 8px', borderRadius: 6, border: '1px solid #E5E7EB', fontSize: 12, outline: 'none', resize: 'vertical', fontFamily: 'inherit', lineHeight: 1.5, boxSizing: 'border-box' }} />
+              <button onClick={handleAIVideoGen} disabled={!videoPromptForGen.trim() || videoGenStatus === 'submitting' || videoGenStatus === 'polling'}
+                style={{ marginTop: 6, padding: '8px 12px', borderRadius: 6, border: 'none', background: (videoPromptForGen.trim() && videoGenStatus !== 'submitting' && videoGenStatus !== 'polling') ? (videoGenMode === 'ref' ? '#7C3AED' : '#F59E0B') : '#E5E7EB', color: (videoPromptForGen.trim() && videoGenStatus !== 'submitting' && videoGenStatus !== 'polling') ? '#fff' : '#9CA3AF', fontSize: 12, fontWeight: 600, cursor: (videoPromptForGen.trim() && videoGenStatus !== 'submitting' && videoGenStatus !== 'polling') ? 'pointer' : 'default', width: '100%' }}>
+                {videoGenStatus === 'polling' ? '⏳ AI 生成中...' : videoGenStatus === 'submitting' ? '⏳ 提交中...' : (videoGenMode === 'ref' ? '🎨 开始生成' : '✨ 开始生成')}
               </button>
             </div>
-            {(videoGenMode === 'ref' || videoGenMode === 'new') && (
-              <div style={{ marginTop: 8 }}>
-                <textarea value={videoPromptForGen} onChange={e => setVideoPromptForGen(e.target.value)}
-                  placeholder={videoGenMode === 'ref' ? '描述要生成什么样的视频动效（AI会以当前图为首帧）...' : '描述要生成什么样的视频...'}
-                  rows={2} disabled={videoGenStatus === 'submitting' || videoGenStatus === 'polling'}
-                  style={{ width: '100%', padding: '6px 8px', borderRadius: 6, border: '1px solid #E5E7EB', fontSize: 12, outline: 'none', resize: 'vertical', fontFamily: 'inherit', lineHeight: 1.5, boxSizing: 'border-box' }} />
-                <button onClick={handleAIVideoGen} disabled={!videoPromptForGen.trim() || videoGenStatus === 'submitting' || videoGenStatus === 'polling'}
-                  style={{ marginTop: 6, padding: '8px 12px', borderRadius: 6, border: 'none', background: (videoPromptForGen.trim() && videoGenStatus !== 'submitting' && videoGenStatus !== 'polling') ? (videoGenMode === 'ref' ? '#7C3AED' : '#F59E0B') : '#E5E7EB', color: (videoPromptForGen.trim() && videoGenStatus !== 'submitting' && videoGenStatus !== 'polling') ? '#fff' : '#9CA3AF', fontSize: 12, fontWeight: 600, cursor: (videoPromptForGen.trim() && videoGenStatus !== 'submitting' && videoGenStatus !== 'polling') ? 'pointer' : 'default', width: '100%' }}>
-                  {videoGenStatus === 'polling' ? '⏳ AI 生成中...' : videoGenStatus === 'submitting' ? '⏳ 提交中...' : (videoGenMode === 'ref' ? '🎨 开始生成' : '✨ 开始生成')}
-                </button>
-              </div>
-            )}
-            {videoGenMessage && (
-              <div style={{ marginTop: 6, padding: '6px 8px', borderRadius: 6, fontSize: 11, lineHeight: 1.5, background: videoGenMessage.startsWith('❌') ? '#FEE2E2' : videoGenMessage.startsWith('✅') ? '#D1FAE5' : '#EFF6FF', color: videoGenMessage.startsWith('❌') ? '#DC2626' : videoGenMessage.startsWith('✅') ? '#059669' : '#2563EB' }}>
-                {videoGenMessage}
-              </div>
-            )}
-          </div>
-        )}
+          )}
+          {videoGenMessage && (
+            <div style={{ marginTop: 6, padding: '6px 8px', borderRadius: 6, fontSize: 11, lineHeight: 1.5, background: videoGenMessage.startsWith('❌') ? '#FEE2E2' : videoGenMessage.startsWith('✅') ? '#D1FAE5' : '#EFF6FF', color: videoGenMessage.startsWith('❌') ? '#DC2626' : videoGenMessage.startsWith('✅') ? '#059669' : '#2563EB' }}>
+              {videoGenMessage}
+            </div>
+          )}
+        </div>
+        
         {/* 图片三操作 */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <button onClick={handleReplaceImage} disabled={busy} style={{ padding: '9px 14px', borderRadius: 8, border: 'none', background: busy ? '#E5E7EB' : '#0EA5E9', color: busy ? '#9CA3AF' : '#fff', fontSize: 13, fontWeight: 600, cursor: busy ? 'default' : 'pointer', width: '100%' }}>
@@ -632,22 +684,29 @@ export default function InlineTextEditor({ coursewareId, pageNum, onPageUpdated,
   const renderVideoTools = () => {
     if (!selected || selected.mode !== 'video') return null
     const s = selected
+    const videoBusy = videoGenStatus === 'submitting' || videoGenStatus === 'polling'
     return (
       <>
         <div style={{ fontSize: 13, fontWeight: 600, color: '#D97706' }}>🎬 已选中视频</div>
         <div style={{ borderRadius: 8, overflow: 'hidden', border: '1px solid ' + C.border, background: '#1F2937' }}>
-          {s.src ? (<video src={s.src} style={{ width: '100%', maxHeight: 160, display: 'block' }} controls muted />) : (<div style={{ padding: 16, textAlign: 'center', color: '#9CA3AF', fontSize: 13 }}>无视频源</div>)}
+          {s.src ? (<video src={s.src} poster={s.poster || undefined} style={{ width: '100%', maxHeight: 160, display: 'block' }} controls muted />) : (<div style={{ padding: 16, textAlign: 'center', color: '#9CA3AF', fontSize: 13 }}>无视频源</div>)}
         </div>
         <button onClick={handleReplaceVideo} disabled={videoUploading}
           style={{ padding: '10px 14px', borderRadius: 8, border: 'none', background: videoUploading ? '#E5E7EB' : '#F59E0B', color: videoUploading ? '#9CA3AF' : '#fff', fontSize: 13, fontWeight: 600, cursor: videoUploading ? 'default' : 'pointer', width: '100%' }}>
           {videoUploading ? '⏳ 上传中...' : '📤 上传新视频替换'}
         </button>
-        {videoUploading && videoUploadProgress > 0 && (
-          <div style={{ width: '100%', height: 6, borderRadius: 3, background: '#E5E7EB', overflow: 'hidden' }}>
-            <div style={{ width: videoUploadProgress + '%', height: '100%', background: '#F59E0B', borderRadius: 3, transition: 'width 0.3s' }} />
+        {videoUploading && videoUploadProgress > 0 && <div style={{ width: '100%', height: 6, borderRadius: 3, background: '#E5E7EB', overflow: 'hidden' }}><div style={{ width: videoUploadProgress + '%', height: '100%', background: '#F59E0B' }} /></div>}
+        <div style={{ padding: 10, borderRadius: 8, border: '1px solid #F59E0B', background: '#FFFBEB' }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#D97706', marginBottom: 6 }}>🤖 AI 重新生成当前视频</div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button onClick={() => setVideoGenMode(videoGenMode === 'ref' ? 'none' : 'ref')} disabled={!s.poster || videoBusy} style={{ ...quickBtnStyle, flex: 1, opacity: s.poster ? 1 : 0.45 }}>🎨 参考封面</button>
+            <button onClick={() => setVideoGenMode(videoGenMode === 'new' ? 'none' : 'new')} disabled={videoBusy} style={{ ...quickBtnStyle, flex: 1 }}>✨ 全新生成</button>
           </div>
-        )}
-        <div style={{ fontSize: 11, color: C.textMuted, lineHeight: 1.6 }}>支持 MP4/WebM/MOV 格式，最大 50MB。</div>
+          {videoGenMode !== 'none' && <><textarea value={videoPromptForGen} onChange={e => setVideoPromptForGen(e.target.value)} rows={2} placeholder="描述希望生成的视频内容和动效..." disabled={videoBusy} style={{ width: '100%', marginTop: 7, padding: 7, borderRadius: 6, border: '1px solid #E5E7EB', boxSizing: 'border-box', resize: 'vertical' }} /><button onClick={handleAIVideoGen} disabled={!videoPromptForGen.trim() || videoBusy} style={{ ...quickBtnStyle, width: '100%', marginTop: 6, background: '#F59E0B', color: '#fff' }}>{videoBusy ? '⏳ 生成中...' : '开始生成并替换'}</button></>}
+          {videoGenMessage && <div style={{ marginTop: 6, fontSize: 11, color: videoGenMessage.startsWith('❌') ? '#DC2626' : '#2563EB' }}>{videoGenMessage}</div>}
+          <div style={{ marginTop: 6, fontSize: 11, color: '#92400E' }}>生成完成后仍需点击“保存修改”才写回课件。</div>
+        </div>
+        <div style={{ fontSize: 11, color: C.textMuted, lineHeight: 1.6 }}>点击自定义视频封面、播放按钮或封面文字，也会选中其下方真实视频。</div>
       </>
     )
   }
@@ -789,8 +848,8 @@ export default function InlineTextEditor({ coursewareId, pageNum, onPageUpdated,
               <div style={{ color: C.textMuted, fontSize: 13, lineHeight: 1.7, marginTop: 8 }}>
                 👈 在左侧页面上<b>点选元素</b>。<br /><br />
                 <span style={{ color: '#7C3AED' }}>📝 文字</span>：紫色虚线框，改内容/字号/颜色/加粗/字体。<br /><br />
-                <span style={{ color: '#0EA5E9' }}>🖼️ 图片</span>：蓝色虚线框，上传替换/AI修改/AI新生成/调尺寸。<br /><br />
-                <span style={{ color: '#D97706' }}>🎬 视频</span>：橙色虚线框，上传新视频替换。<br /><br />
+                <span style={{ color: '#0EA5E9' }}>🖼️ 图片</span>：蓝色虚线框，上传替换/AI修改/AI新生成/调尺寸/原位转视频。<br /><br />
+                <span style={{ color: '#D97706' }}>🎬 视频</span>：橙色虚线框，上传替换或AI重新生成；自定义封面也可直接点选。<br /><br />
                 <span style={{ color: '#10B981' }}>📦 模块</span>：绿色虚线框，可鼠标拖拽移动/缩放或输入精确数值。适用于热点圆点、装饰卡片等绝对定位元素。<br /><br />
                 <span style={{ color: C.textSecondary, fontSize: 12 }}>提示：四种类型可随时互相切换——模块内的文字可直接点选；若整个模块就是一段文字，先点选为模块（可拖拽），再点一次即切换为文字编辑；点空白处或按 ESC 取消选中。</span>
               </div>
@@ -799,7 +858,7 @@ export default function InlineTextEditor({ coursewareId, pageNum, onPageUpdated,
           </div>
         </div>
         <div style={{ padding: '10px 20px', borderTop: `1px solid ${C.border}`, fontSize: 12, color: C.textMuted, textAlign: 'center' }}>
-          就地编辑：文字（改内容/字号/颜色/加粗/字体）+ 图片（上传/AI修改/AI生成/尺寸）+ 视频（上传替换）+ 模块（拖拽/缩放/位置/热点微调）。保存前系统自动存旧版，可在「📜 历史版本」回退。
+          就地编辑：文字（保留原格式）+ 图片（上传/AI生成/尺寸/原位转视频）+ 视频（上传替换/AI重新生成）+ 模块（拖拽/缩放/位置/热点微调）。保存前系统自动存旧版，可在「📜 历史版本」回退。
         </div>
       </div>
     </div>

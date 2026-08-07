@@ -17,6 +17,18 @@ export type EducationDomain =
   | 'mixed'
 
 /**
+ * 教学资源教育域。
+ *
+ * common只表示可供三个具体教学域共同使用的资源；
+ * mixed仅是管理上下文，绝不能写入教学资源。
+ */
+export type ResourceEducationDomain =
+  | 'k12'
+  | 'vocational'
+  | 'adult'
+  | 'common'
+
+/**
  * 后端随登录信息下发的教育画像。
  *
  * 页面不应散落大量 domain === 'vocational' 判断，
@@ -47,6 +59,34 @@ export const EDUCATION_DOMAIN_LABELS: Record<EducationDomain, string> = {
   vocational: '职业教育',
   adult: '成人教育',
   mixed: '跨域管理',
+}
+
+/** 教学资源教育域固定中文名，不包含mixed。 */
+export const RESOURCE_EDUCATION_DOMAIN_LABELS: Record<
+  ResourceEducationDomain,
+  string
+> = {
+  k12: '中小学',
+  vocational: '职业教育',
+  adult: '成人教育',
+  common: '跨域通用',
+}
+
+/** mixed管理员创建资源时使用的完整目标域选项。 */
+export const RESOURCE_EDUCATION_DOMAIN_OPTIONS = (
+  Object.entries(RESOURCE_EDUCATION_DOMAIN_LABELS) as Array<
+    [ResourceEducationDomain, string]
+  >
+).map(([value, label]) => ({ value, label }))
+
+/** 判断字符串是否为合法教学资源教育域。 */
+export function isResourceEducationDomain(
+  value: unknown,
+): value is ResourceEducationDomain {
+  return value === 'k12'
+    || value === 'vocational'
+    || value === 'adult'
+    || value === 'common'
 }
 
 /** 判断字符串是否为合法教育域。 */

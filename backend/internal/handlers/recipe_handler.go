@@ -19,12 +19,15 @@ import (
 // RecipeHandler 配方HTTP处理器
 type RecipeHandler struct {
 	recipeService *services.RecipeService
-	compService   *services.ComponentService
 }
 
 // NewRecipeHandler 创建配方处理器
-func NewRecipeHandler(rs *services.RecipeService, cs *services.ComponentService) *RecipeHandler {
-	return &RecipeHandler{recipeService: rs, compService: cs}
+func NewRecipeHandler(
+	rs *services.RecipeService,
+) *RecipeHandler {
+	return &RecipeHandler{
+		recipeService: rs,
+	}
 }
 
 // buildRecipeActor 从当前JWT构造可信配方Actor。
@@ -341,44 +344,111 @@ func (h *RecipeHandler) PreviewContext(w http.ResponseWriter, r *http.Request) {
 
 // ==================== 智能推荐 ====================
 
-func (h *RecipeHandler) RecommendComponents(w http.ResponseWriter, r *http.Request) {
+func (h *RecipeHandler) RecommendComponents(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	actor, ok := buildRecipeActor(
+		w,
+		r,
+	)
+	if !ok {
+		return
+	}
+
 	var req models.RecipeRecommendRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, utils.MsgBadRequestArgs)
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			utils.MsgBadRequestArgs,
+		)
 		return
 	}
-	groups, err := h.recipeService.RecommendComponents(r.Context(), req.Subject, req.GradeRange)
+
+	groups, err :=
+		h.recipeService.
+			RecommendComponentsForActor(
+				r.Context(),
+				actor,
+				&req,
+			)
 	if err != nil {
-		handleRecipeError(w, err)
+		handleRecipeError(
+			w,
+			err,
+		)
 		return
 	}
-	utils.Success(w, map[string]interface{}{"groups": groups})
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"groups": groups,
+		},
+	)
 }
 
 // ==================== 画像感知智能推荐 ====================
 
-func (h *RecipeHandler) SmartRecommendComponents(w http.ResponseWriter, r *http.Request) {
-	claims, ok := middleware.GetClaims(r.Context())
-	if !ok || claims == nil {
-		utils.Unauthorized(w, utils.MsgNotLoggedIn)
+func (h *RecipeHandler) SmartRecommendComponents(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	actor, ok := buildRecipeActor(
+		w,
+		r,
+	)
+	if !ok {
 		return
 	}
+
 	var req models.RecipeRecommendRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.BadRequest(w, utils.MsgBadRequestArgs)
+	if err := json.NewDecoder(
+		r.Body,
+	).Decode(&req); err != nil {
+		utils.BadRequest(
+			w,
+			utils.MsgBadRequestArgs,
+		)
 		return
 	}
+
 	var profile *models.TeachingProfile
-	tp, err := repository.GetTeachingProfile(r.Context(), claims.UserID)
-	if err == nil && tp != nil {
-		profile = tp
+
+	storedProfile, profileErr :=
+		repository.GetTeachingProfile(
+			r.Context(),
+			actor.UserID,
+		)
+	if profileErr == nil &&
+		storedProfile != nil {
+		profile = storedProfile
 	}
-	groups, err := h.compService.SmartRecommendComponents(r.Context(), req.Subject, req.GradeRange, profile)
+
+	groups, err :=
+		h.recipeService.
+			SmartRecommendComponentsForActor(
+				r.Context(),
+				actor,
+				&req,
+				profile,
+			)
 	if err != nil {
-		utils.InternalError(w, "智能推荐失败: "+err.Error())
+		handleRecipeError(
+			w,
+			err,
+		)
 		return
 	}
-	utils.Success(w, map[string]interface{}{"groups": groups})
+
+	utils.Success(
+		w,
+		map[string]interface{}{
+			"groups": groups,
+		},
+	)
 }
 
 // ==================== 预设流程模板 ====================
@@ -494,21 +564,79 @@ func atoi(s string) int {
 	return n
 }
 
-func handleRecipeError(w http.ResponseWriter, err error) {
+func handleRecipeError(
+	w http.ResponseWriter,
+	err error,
+) {
 	switch {
-	case errors.Is(err, services.ErrRecipeNotFound):
-		utils.Fail(w, 404, "配方不存在")
-	case errors.Is(err, services.ErrRecipeUnauthorized):
-		utils.Fail(w, 403, "无权操作此配方")
-	case errors.Is(err, services.ErrRecipeNameRequired):
-		utils.BadRequest(w, "配方名称不能为空")
-	case errors.Is(err, services.ErrRecipeSubjectRequired):
-		utils.BadRequest(w, "学科不能为空")
-	case errors.Is(err, services.ErrRecipeGradeRequired):
-		utils.BadRequest(w, "年级不能为空")
-	case errors.Is(err, services.ErrRecipeShareInvalid):
-		utils.BadRequest(w, err.Error())
+	case errors.Is(
+		err,
+		services.ErrRecipeNotFound,
+	):
+		utils.Fail(
+			w,
+			http.StatusNotFound,
+			"配方不存在",
+		)
+
+	case errors.Is(
+		err,
+		services.ErrRecipeUnauthorized,
+	),
+		errors.Is(
+			err,
+			services.ErrComponentEducationDomainForbidden,
+		):
+		utils.Forbidden(
+			w,
+			err.Error(),
+		)
+
+	case errors.Is(
+		err,
+		services.ErrRecipeNameRequired,
+	),
+		errors.Is(
+			err,
+			services.ErrRecipeSubjectRequired,
+		),
+		errors.Is(
+			err,
+			services.ErrRecipeGradeRequired,
+		),
+		errors.Is(
+			err,
+			services.ErrRecipeShareInvalid,
+		),
+		errors.Is(
+			err,
+			services.ErrComponentSelectionInvalid,
+		),
+		errors.Is(
+			err,
+			services.ErrComponentEducationDomainRequired,
+		),
+		errors.Is(
+			err,
+			services.ErrComponentEducationDomainInvalid,
+		),
+		errors.Is(
+			err,
+			services.ErrComponentMatchRequestRequired,
+		),
+		errors.Is(
+			err,
+			services.ErrComponentMatchSubjectRequired,
+		):
+		utils.BadRequest(
+			w,
+			err.Error(),
+		)
+
 	default:
-		utils.InternalError(w, "操作失败: "+err.Error())
+		utils.InternalError(
+			w,
+			"操作失败: "+err.Error(),
+		)
 	}
 }

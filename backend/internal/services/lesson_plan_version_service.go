@@ -3,21 +3,25 @@ package services
 // lesson_plan_version_service.go — 教案正文版本历史业务层
 //
 // 权限规则：
-//   - 版本列表、详情和恢复目前只允许教案作者本人操作。
-//   - submitted/developing/completed状态保持既有锁定规则，不允许恢复。
-//   - 恢复历史版本时先由统一更新事务保存当前正文，恢复操作天然可逆。
+//   - 版本列表、详情和恢复目前只允许教案作者本人操作；
+//   - submitted、developing、completed等锁定状态不允许恢复；
+//   - 普通教案恢复仍保存当前正文快照并递增版本；
+//   - Word保真教案必须同时恢复对应的不可变DOCX、结构、图片和语义正文；
+//   - 当前Word即使已经stale，也只能通过可信历史Word快照恢复为active；
+//   - 恢复不会回退教案审核或发布状态。
 
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"tedna/internal/models"
 	"tedna/internal/repository"
 )
 
 // ErrLPVersionNotFound 教案历史版本不存在。
-var ErrLPVersionNotFound = errors.New("教案历史版本不存在")
+var ErrLPVersionNotFound = errors.New(
+	"教案历史版本不存在",
+)
 
 // ListContentVersions 查询作者自己的教案版本历史。
 func (s *LessonPlanService) ListContentVersions(
@@ -27,7 +31,11 @@ func (s *LessonPlanService) ListContentVersions(
 	limit int,
 	offset int,
 ) (*models.LessonPlanContentVersionListResponse, error) {
-	plan, err := repository.GetLessonPlanByID(ctx, planID)
+	plan, err :=
+		repository.GetLessonPlanByID(
+			ctx,
+			planID,
+		)
 	if err != nil {
 		return nil, s.mapNotFoundErr(err)
 	}
@@ -43,7 +51,10 @@ func (s *LessonPlanService) ListContentVersions(
 			offset,
 		)
 	if err != nil {
-		if errors.Is(err, repository.ErrLessonPlanNotFound) {
+		if errors.Is(
+			err,
+			repository.ErrLessonPlanNotFound,
+		) {
 			return nil, ErrLPNotFound
 		}
 		return nil, err
@@ -63,7 +74,11 @@ func (s *LessonPlanService) GetContentVersion(
 	versionID string,
 	callerID string,
 ) (*models.LessonPlanContentVersion, error) {
-	plan, err := repository.GetLessonPlanByID(ctx, planID)
+	plan, err :=
+		repository.GetLessonPlanByID(
+			ctx,
+			planID,
+		)
 	if err != nil {
 		return nil, s.mapNotFoundErr(err)
 	}
@@ -71,13 +86,17 @@ func (s *LessonPlanService) GetContentVersion(
 		return nil, ErrLPNotAuthor
 	}
 
-	version, err := repository.GetLessonPlanContentVersion(
-		ctx,
-		planID,
-		versionID,
-	)
+	version, err :=
+		repository.GetLessonPlanContentVersion(
+			ctx,
+			planID,
+			versionID,
+		)
 	if err != nil {
-		if errors.Is(err, repository.ErrLessonPlanVersionNotFound) {
+		if errors.Is(
+			err,
+			repository.ErrLessonPlanVersionNotFound,
+		) {
 			return nil, ErrLPVersionNotFound
 		}
 		return nil, err
@@ -88,19 +107,26 @@ func (s *LessonPlanService) GetContentVersion(
 
 // RestoreContentVersion 恢复指定历史版本。
 //
-// UpdateLessonPlanContent在覆盖前会保存当前正文，因此：
+// 普通教案：
 //
-//	当前v6 → 恢复历史v3
+//	当前v6 → 恢复历史v3，会保存v6快照并生成新的v7。
 //
-// 会先把当前v6保存为历史快照，再把v3正文写成新的v7。
-// 老师之后仍可从历史记录恢复到刚才的v6，不会形成不可逆覆盖。
+// Word保真教案：
+//
+//	同时选择与历史v3正文对应的不可变DOCX，复制为新的Word版本，
+//	再在同一数据库事务中生成新的正文版本和Word版本。
+//	因此页面正文、下载DOCX、图片、表格和原版式恢复到同一版本边界。
 func (s *LessonPlanService) RestoreContentVersion(
 	ctx context.Context,
 	planID string,
 	versionID string,
 	callerID string,
 ) (*models.LessonPlanContentRestoreResponse, error) {
-	plan, err := repository.GetLessonPlanByID(ctx, planID)
+	plan, err :=
+		repository.GetLessonPlanByID(
+			ctx,
+			planID,
+		)
 	if err != nil {
 		return nil, s.mapNotFoundErr(err)
 	}
@@ -119,40 +145,38 @@ func (s *LessonPlanService) RestoreContentVersion(
 		return nil, ErrLPCannotEdit
 	}
 
-	target, err := repository.GetLessonPlanContentVersion(
-		ctx,
-		planID,
-		versionID,
-	)
+	target, err :=
+		repository.GetLessonPlanContentVersion(
+			ctx,
+			planID,
+			versionID,
+		)
 	if err != nil {
-		if errors.Is(err, repository.ErrLessonPlanVersionNotFound) {
+		if errors.Is(
+			err,
+			repository.ErrLessonPlanVersionNotFound,
+		) {
 			return nil, ErrLPVersionNotFound
 		}
 		return nil, err
 	}
 
-	summary := fmt.Sprintf(
-		"恢复历史版本 v%d",
-		target.VersionNumber,
-	)
-
-	if err := repository.UpdateLessonPlanContent(
-		ctx,
-		planID,
-		target.Title,
-		target.ContentMarkdown,
-		target.ContentStructured,
-		target.DurationMinutes,
-		models.LessonPlanVersionMeta{
-			ChangeSource:  models.LPVersionSourceRestore,
-			ChangedBy:     &callerID,
-			ChangeSummary: summary,
-		},
-	); err != nil {
+	result, err :=
+		RestoreLessonPlanContentVersionPreservingWord(
+			ctx,
+			plan,
+			target,
+			callerID,
+		)
+	if err != nil {
 		return nil, s.mapNotFoundErr(err)
 	}
 
-	refreshed, err := repository.GetLessonPlanByID(ctx, planID)
+	refreshed, err :=
+		repository.GetLessonPlanByID(
+			ctx,
+			planID,
+		)
 	if err != nil {
 		return nil, s.mapNotFoundErr(err)
 	}
@@ -162,6 +186,7 @@ func (s *LessonPlanService) RestoreContentVersion(
 		"plan_id", planID,
 		"restored_from_version", target.VersionNumber,
 		"current_version", refreshed.Version,
+		"changed", result.Changed,
 		"caller", callerID,
 	)
 
