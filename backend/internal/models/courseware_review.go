@@ -14,7 +14,15 @@ package models
 //   - 审核员打开当前待审课件时，审核详情直接返回本级、本轮需要复审的问题；
 //   - 审核员提交正式决定时，明确指出哪些旧问题已经解决；
 //   - 审核记录、旧问题解决、新问题交付和课件状态必须原子提交；
-//   - 复审问题响应不暴露内部AI会话、问题创建者或课件作者ID。
+//   - 复审问题响应不暴露内部AI会话、问题创建者或课件作者ID；
+//   - R-01.1开始后，复审默认展示与普通整改项共用同一套教师视图字段。
+//
+// 浏览器安全边界：
+//
+//   - PageHTMLHash和AppliedPageHash继续保留字段形状兼容旧客户端，但响应组装固定为空；
+//   - Title和Description只作为教师化兼容字段，不再直接暴露整改项原始技术文案；
+//   - 教师默认展示应读取TeacherTitle、WhatHappened、TeachingImpact、
+//     ImprovementGoal和AcceptanceChecks。
 
 import "time"
 
@@ -154,7 +162,11 @@ type CWReviewedListResponse struct {
 //   - source_finding_id；
 //   - created_by；
 //   - owner_id；
-//   - 内部讨论消息身份。
+//   - 内部讨论消息身份；
+//   - 真实页面哈希或修改完成哈希。
+//
+// R-01.1教师展示字段与AI整改项安全视图保持一致。
+// Title、Description继续保留给旧前端兼容，但内容同样来自教师视图。
 type CWReviewCarryoverItem struct {
 	ID string `json:"id"`
 
@@ -175,8 +187,19 @@ type CWReviewCarryoverItem struct {
 	Severity  string `json:"severity"`
 	Dimension string `json:"dimension"`
 
-	Title                string `json:"title"`
-	Description          string `json:"description"`
+	// 旧字段继续返回教师化兼容内容。
+	Title       string `json:"title"`
+	Description string `json:"description"`
+
+	// 新教师视图字段供复审共享教师改进卡直接使用。
+	TeacherTitle        string   `json:"teacher_title"`
+	WhatHappened        string   `json:"what_happened"`
+	TeachingImpact      string   `json:"teaching_impact"`
+	ImprovementGoal     string   `json:"improvement_goal"`
+	AcceptanceChecks    []string `json:"acceptance_checks"`
+	TeacherContext      string   `json:"teacher_context"`
+	ManualCheckRequired bool     `json:"manual_check_required"`
+
 	ConfirmedInstruction string `json:"confirmed_instruction"`
 
 	Status          string `json:"status"`

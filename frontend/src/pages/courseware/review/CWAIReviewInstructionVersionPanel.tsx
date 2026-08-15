@@ -1,14 +1,17 @@
 /**
  * CWAIReviewInstructionVersionPanel.tsx
  *
- * 单条整改项的当前草稿、当前确认版本和历史版本面板。
+ * 单条整改项的当前修改要求/方案和不可变历史。
  *
- * 本组件负责：
- *   1. 显示最新确认版本号、确认时间和状态；
- *   2. 明确提示当前编辑草稿是否偏离确认版本；
- *   3. 使用最近读取的当前版本ID执行乐观并发确认；
- *   4. “保存为新版并确认”成功后刷新版本历史；
- *   5. 正式整改作者以只读方式查看实际交付版本。
+ * 教师界面原则：
+ *   - 当前确认内容始终优先；
+ *   - 不向教师显示V1/V2、哈希、版本状态或内部来源代码；
+ *   - “以前的修改记录”默认折叠；
+ *   - 新确认只追加历史，绝不覆盖旧记录；
+ *   - 正式整改作者只读审核员交付的当前要求，不可改写；
+ *   - 技术上的版本ID仍只在内部用于乐观并发；
+ *   - 调整后的文字疑似偏离当前问题时，先明确询问教师意图；
+ *   - 正式审核确认后会进入本次修改清单。
  */
 
 import {
@@ -22,10 +25,20 @@ import {
   confirmCWAIReviewInstructionVersion,
   listCWAIReviewInstructionVersions,
   type CWAIReviewInstructionVersion,
+  type CWAIReviewItem,
   type CWAIReviewItemDiscussion,
 } from "@/api/coursewares";
 
+import {
+  createCWAIReviewRelatedImprovement,
+} from "@/api/coursewares.ai-review-goal-drift";
+
 import DiscussionMarkdown from "@/pages/courseware/components/courseware-workshop/DiscussionMarkdown";
+
+import {
+  shouldWarnCWAIReviewGoalDrift,
+} from "./CWAIReviewGoalDrift.shared";
+import CWAIReviewGoalDriftPrompt from "./CWAIReviewGoalDriftPrompt";
 
 import {
   type CWAIReviewItemExperience,
@@ -34,49 +47,15 @@ import {
 } from "./CWAIReviewItemPresentation.shared";
 
 export interface CWAIReviewInstructionVersionPanelProps {
-  experience:
-    CWAIReviewItemExperience;
-
-  itemId: string;
-
+  experience: CWAIReviewItemExperience;
+  item: CWAIReviewItem;
   fallbackContent: string;
-
   draftText: string;
-
   canEdit: boolean;
-
-  onDraftTextChange: (
-    value: string,
-  ) => void;
-
-  onConfirmed: (
-    result:
-      CWAIReviewItemDiscussion,
-  ) => void;
+  onDraftTextChange: (value: string) => void;
+  onConfirmed: (result: CWAIReviewItemDiscussion) => void;
+  onRelatedImprovementCreated: (item: CWAIReviewItem) => void;
 }
-
-const VERSION_STATUS_LABEL:
-  Record<
-    CWAIReviewInstructionVersion["status"],
-    string
-  > = {
-    draft: "草稿",
-    confirmed: "当前有效",
-    superseded: "已被新版替代",
-    invalid_for_page: "页面已变化，不可执行",
-  };
-
-const VERSION_SOURCE_LABEL:
-  Record<
-    CWAIReviewInstructionVersion["source_type"],
-    string
-  > = {
-    legacy_backfill: "历史确认内容",
-    legacy_direct_update: "旧版确认入口",
-    manual: "人工编辑",
-    ai_candidate: "AI候选",
-    global_discussion: "全局讨论候选",
-  };
 
 function formatDateTime(
   value: string | null,
@@ -85,8 +64,7 @@ function formatDateTime(
     return "";
   }
 
-  const date =
-    new Date(value);
+  const date = new Date(value);
 
   if (
     Number.isNaN(
@@ -103,12 +81,13 @@ function formatDateTime(
 
 export default function CWAIReviewInstructionVersionPanel({
   experience,
-  itemId,
+  item,
   fallbackContent,
   draftText,
   canEdit,
   onDraftTextChange,
   onConfirmed,
+  onRelatedImprovementCreated,
 }: CWAIReviewInstructionVersionPanelProps) {
   const copy =
     resolveCWAIReviewItemExperienceCopy(
@@ -118,71 +97,101 @@ export default function CWAIReviewInstructionVersionPanel({
   const [
     versions,
     setVersions,
-  ] = useState<
-    CWAIReviewInstructionVersion[]
-  >([]);
+  ] =
+    useState<
+      CWAIReviewInstructionVersion[]
+    >([]);
 
   const [
     currentVersionId,
     setCurrentVersionId,
-  ] = useState("");
+  ] =
+    useState("");
 
-  const [loading, setLoading] =
+  const [
+    loading,
+    setLoading,
+  ] =
     useState(true);
 
   const [
     confirming,
     setConfirming,
-  ] = useState(false);
+  ] =
+    useState(false);
+
+  const [
+    creatingRelated,
+    setCreatingRelated,
+  ] =
+    useState(false);
 
   const [
     historyOpen,
     setHistoryOpen,
-  ] = useState(false);
+  ] =
+    useState(false);
 
-  const [error, setError] =
+  const [
+    goalDriftOpen,
+    setGoalDriftOpen,
+  ] =
+    useState(false);
+
+  const [
+    notice,
+    setNotice,
+  ] =
     useState("");
 
   const [
-    successMessage,
-    setSuccessMessage,
-  ] = useState("");
+    error,
+    setError,
+  ] =
+    useState("");
+
+  const busy =
+    confirming ||
+    creatingRelated;
 
   const loadVersions =
-    useCallback(async () => {
-      setLoading(true);
+    useCallback(
+      async () => {
+        setLoading(true);
 
-      try {
-        const result =
-          await listCWAIReviewInstructionVersions(
-            itemId,
+        try {
+          const result =
+            await listCWAIReviewInstructionVersions(
+              item.id,
+            );
+
+          setVersions(
+            result.versions || [],
           );
 
-        setVersions(
-          result.versions || [],
-        );
-
-        setCurrentVersionId(
-          result
-            .current_instruction_version_id
-            ?.trim() || "",
-        );
-      } catch (cause) {
-        setError(
-          cause instanceof Error
-            ? cause.message
-            : "读取整改指令版本失败",
-        );
-      } finally {
-        setLoading(false);
-      }
-    }, [
-      itemId,
-    ]);
+          setCurrentVersionId(
+            result
+              .current_instruction_version_id
+              ?.trim() ||
+              "",
+          );
+        } catch (cause) {
+          setError(
+            cause instanceof Error
+              ? cause.message
+              : "读取修改要求记录失败",
+          );
+        } finally {
+          setLoading(false);
+        }
+      },
+      [item.id],
+    );
 
   useEffect(() => {
     setError("");
-    setSuccessMessage("");
+    setNotice("");
+    setGoalDriftOpen(false);
     setHistoryOpen(false);
 
     void loadVersions();
@@ -205,6 +214,21 @@ export default function CWAIReviewInstructionVersionPanel({
       ],
     );
 
+  const historicalVersions =
+    useMemo(
+      () =>
+        versions.filter(
+          (version) =>
+            version.id !==
+              currentVersion?.id &&
+            !version.is_current,
+        ),
+      [
+        currentVersion,
+        versions,
+      ],
+    );
+
   const normalizedDraft =
     draftText.trim();
 
@@ -213,10 +237,14 @@ export default function CWAIReviewInstructionVersionPanel({
       ?.content
       .trim() || "";
 
+  const comparisonBaseline =
+    normalizedConfirmed ||
+    fallbackContent.trim();
+
   const draftDiffers =
-    !!currentVersion &&
+    !!comparisonBaseline &&
     normalizedDraft !==
-      normalizedConfirmed;
+      comparisonBaseline;
 
   const readOnlyContent =
     currentVersion
@@ -224,11 +252,31 @@ export default function CWAIReviewInstructionVersionPanel({
       .trim() ||
     fallbackContent.trim();
 
-  const handleConfirm =
+  const currentTitle =
+    experience === "self"
+      ? "当前修改方案"
+      : "当前修改要求";
+
+  const draftTitle =
+    experience === "self"
+      ? "完善当前修改方案"
+      : "完善当前修改要求";
+
+  const historyTitle =
+    experience === "self"
+      ? "以前的修改方案"
+      : "以前的修改记录";
+
+  const confirmActionLabel =
+    experience === "review"
+      ? "确认并加入本次修改清单"
+      : "确认当前修改方案";
+
+  const confirmDraft =
     async () => {
       if (
         !canEdit ||
-        confirming ||
+        busy ||
         !normalizedDraft
       ) {
         return;
@@ -236,25 +284,18 @@ export default function CWAIReviewInstructionVersionPanel({
 
       setConfirming(true);
       setError("");
-      setSuccessMessage("");
+      setNotice("");
+      setGoalDriftOpen(false);
 
       try {
         const result =
           await confirmCWAIReviewInstructionVersion(
-            itemId,
+            item.id,
             normalizedDraft,
             currentVersionId,
           );
 
-        onConfirmed(
-          result,
-        );
-
-        setSuccessMessage(
-          currentVersion
-            ? `已保存为V${currentVersion.version_no + 1}并确认。旧版本仍保留在历史中。`
-            : "首个确认版本已保存。",
-        );
+        onConfirmed(result);
 
         await loadVersions();
       } catch (cause) {
@@ -263,16 +304,142 @@ export default function CWAIReviewInstructionVersionPanel({
             ? cause.message
             : experience ===
                 "review"
-              ? "保存新版整改要求失败"
-              : "保存新版修改方案失败",
+              ? "确认修改要求失败"
+              : "确认修改方案失败",
         );
 
-        // 并发确认失败时立即刷新当前版本，
-        // 让用户看到另一个窗口已经形成的新版本。
+        // 并发确认失败时重新读取教师当前可见记录，
+        // 不在浏览器侧猜测哪个窗口的内容应该生效。
         void loadVersions();
       } finally {
         setConfirming(false);
       }
+    };
+
+  const handleConfirm =
+    async () => {
+      if (
+        !canEdit ||
+        busy ||
+        !normalizedDraft
+      ) {
+        return;
+      }
+
+      setError("");
+      setNotice("");
+
+      const shouldWarn =
+        shouldWarnCWAIReviewGoalDrift({
+          draft:
+            normalizedDraft,
+
+          baseline:
+            comparisonBaseline,
+
+          item,
+        });
+
+      if (shouldWarn) {
+        setGoalDriftOpen(
+          true,
+        );
+
+        return;
+      }
+
+      await confirmDraft();
+    };
+
+  const handleContinueCurrent =
+    async () => {
+      if (
+        busy ||
+        !goalDriftOpen
+      ) {
+        return;
+      }
+
+      setGoalDriftOpen(
+        false,
+      );
+
+      await confirmDraft();
+    };
+
+  const handleCreateRelated =
+    async () => {
+      if (
+        busy ||
+        !goalDriftOpen ||
+        !normalizedDraft
+      ) {
+        return;
+      }
+
+      setCreatingRelated(
+        true,
+      );
+
+      setError("");
+      setNotice("");
+
+      try {
+        const result =
+          await createCWAIReviewRelatedImprovement(
+            item.id,
+            normalizedDraft,
+          );
+
+        onRelatedImprovementCreated(
+          result.item,
+        );
+
+        // 新文字已经成为独立问题。
+        // 当前问题恢复仍然有效的确认内容，
+        // 不把新问题文字继续留作当前草稿。
+        if (
+          comparisonBaseline
+        ) {
+          onDraftTextChange(
+            comparisonBaseline,
+          );
+        }
+
+        setGoalDriftOpen(
+          false,
+        );
+
+        setNotice(
+          "已创建新的独立改进项，当前问题没有改变。",
+        );
+      } catch (cause) {
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "创建新的独立改进项失败",
+        );
+      } finally {
+        setCreatingRelated(
+          false,
+        );
+      }
+    };
+
+  const handleDraftChange =
+    (
+      value: string,
+    ) => {
+      onDraftTextChange(
+        value,
+      );
+
+      // 文字变化后，上一轮意图选择不再对应当前草稿。
+      setGoalDriftOpen(
+        false,
+      );
+
+      setNotice("");
     };
 
   if (
@@ -287,7 +454,7 @@ export default function CWAIReviewInstructionVersionPanel({
           fontSize: "10px",
         }}
       >
-        正在读取确认版本…
+        正在读取当前修改要求…
       </div>
     );
   }
@@ -303,20 +470,8 @@ export default function CWAIReviewInstructionVersionPanel({
         background: "#FAFAFA",
       }}
     >
-      <div
-        style={{
-          display: "flex",
-          alignItems: "flex-start",
-          gap: "8px",
-          flexWrap: "wrap",
-        }}
-      >
-        <div
-          style={{
-            minWidth: 0,
-            flex: 1,
-          }}
-        >
+      {canEdit ? (
+        <>
           <div
             style={{
               color: C.text,
@@ -324,138 +479,77 @@ export default function CWAIReviewInstructionVersionPanel({
               fontWeight: 700,
             }}
           >
-            {canEdit
-              ? copy.finalTextTitle
-              : copy.readOnlyRequirementTitle}
+            {comparisonBaseline
+              ? draftTitle
+              : currentTitle}
           </div>
 
-          {currentVersion ? (
-            <div
-              style={{
-                marginTop: "3px",
-                color: C.textSec,
-                fontSize: "9px",
-                lineHeight: 1.5,
-              }}
-            >
-              当前确认版本 V
-              {currentVersion.version_no}
-              {currentVersion.confirmed_at
-                ? ` · ${formatDateTime(currentVersion.confirmed_at)}`
-                : ""}
-              {" · "}
-              {
-                VERSION_STATUS_LABEL[
-                  currentVersion.status
-                ]
-              }
-            </div>
-          ) : (
-            <div
-              style={{
-                marginTop: "3px",
-                color: C.textMuted,
-                fontSize: "9px",
-                lineHeight: 1.5,
-              }}
-            >
-              尚未形成确认版本
-            </div>
-          )}
-        </div>
-
-        {versions.length > 0 && (
-          <button
-            type="button"
-            onClick={() =>
-              setHistoryOpen(
-                (previous) =>
-                  !previous,
-              )
-            }
-            style={{
-              flexShrink: 0,
-              padding: "5px 8px",
-              borderRadius: "6px",
-              border:
-                `1px solid ${C.border}`,
-              background: "#FFFFFF",
-              color: C.primary,
-              fontSize: "9px",
-              fontWeight: 700,
-              cursor: "pointer",
-            }}
-          >
-            {historyOpen
-              ? "收起版本历史"
-              : `版本历史 ${versions.length}`}
-          </button>
-        )}
-      </div>
-
-      {canEdit ? (
-        <>
           <textarea
             value={draftText}
-            onChange={(event) =>
-              onDraftTextChange(
-                event.target.value,
+            onChange={(
+              event,
+            ) =>
+              handleDraftChange(
+                event.target
+                  .value,
               )
             }
             rows={4}
             placeholder={
-              copy.finalTextPlaceholder
+              copy
+                .finalTextPlaceholder
             }
-            disabled={
-              confirming
-            }
+            disabled={busy}
             style={{
               width: "100%",
               boxSizing:
                 "border-box",
               marginTop: "8px",
               padding: "8px 9px",
-              borderRadius:
-                "7px",
+              borderRadius: "7px",
+
               border:
                 `1px solid ${
                   draftDiffers
                     ? "#F59E0B"
                     : C.border
                 }`,
+
               resize: "vertical",
-              fontFamily:
-                "inherit",
+              fontFamily: "inherit",
               fontSize: "11px",
               lineHeight: 1.6,
               outline: "none",
-              background: "#FFFFFF",
+              background:
+                "#FFFFFF",
             }}
           />
 
-          {currentVersion && (
+          {comparisonBaseline && (
             <div
               style={{
                 marginTop: "6px",
                 padding: "6px 8px",
-                borderRadius:
-                  "6px",
+                borderRadius: "6px",
+
                 background:
                   draftDiffers
                     ? "#FFF7ED"
                     : "#ECFDF5",
+
                 color:
                   draftDiffers
                     ? C.warning
                     : C.success,
+
                 fontSize: "9px",
                 fontWeight: 600,
                 lineHeight: 1.5,
               }}
             >
               {draftDiffers
-                ? `当前草稿与已确认的V${currentVersion.version_no}不同。只有保存为新版并确认后，新内容才可交付或执行。`
-                : `当前草稿与已确认的V${currentVersion.version_no}一致。`}
+                ? "这里有尚未确认的调整。确认前，原来的修改要求仍然有效。"
+                : "这里与当前已经确认的修改要求一致。"}
             </div>
           )}
 
@@ -465,37 +559,59 @@ export default function CWAIReviewInstructionVersionPanel({
               void handleConfirm()
             }
             disabled={
-              confirming ||
+              busy ||
               !normalizedDraft
             }
             style={{
               width: "100%",
               marginTop: "7px",
               padding: "8px",
-              borderRadius:
-                "7px",
+              borderRadius: "7px",
               border: "none",
+
               background:
-                confirming ||
+                busy ||
                 !normalizedDraft
                   ? "#CBD5E1"
                   : C.success,
+
               color: "#FFFFFF",
               fontSize: "11px",
               fontWeight: 700,
+
               cursor:
-                confirming ||
+                busy ||
                 !normalizedDraft
                   ? "not-allowed"
                   : "pointer",
             }}
           >
             {confirming
-              ? "正在保存并确认…"
-              : currentVersion
-                ? "保存为新版并确认"
-                : "保存并确认"}
+              ? "正在确认…"
+              : creatingRelated
+                ? "正在创建新改进项…"
+                : confirmActionLabel}
           </button>
+
+          {goalDriftOpen && (
+            <CWAIReviewGoalDriftPrompt
+              busy={busy}
+              creatingRelated={
+                creatingRelated
+              }
+              onContinueCurrent={() =>
+                void handleContinueCurrent()
+              }
+              onCreateRelated={() =>
+                void handleCreateRelated()
+              }
+              onCancel={() =>
+                setGoalDriftOpen(
+                  false,
+                )
+              }
+            />
+          )}
 
           <div
             style={{
@@ -505,33 +621,57 @@ export default function CWAIReviewInstructionVersionPanel({
               lineHeight: 1.5,
             }}
           >
-            每次确认都会形成连续的新版本；旧版本不可覆盖，可以在下方历史中回看。
+            {experience ===
+            "review"
+              ? "确认后会加入本次修改清单；每次重新确认都会保留以前的记录，不会覆盖已经确认过的内容。"
+              : "每次重新确认都会保留以前的记录，不会覆盖已经确认过的内容。"}
           </div>
         </>
       ) : (
-        <div
-          style={{
-            marginTop: "8px",
-          }}
-        >
-          {readOnlyContent ? (
-            <DiscussionMarkdown
-              content={
-                readOnlyContent
-              }
-              compact
-            />
-          ) : (
-            <div
-              style={{
-                color: C.textMuted,
-                fontSize: "10px",
-                lineHeight: 1.6,
-              }}
-            >
-              暂无可执行的文字说明，请联系审核员确认。
-            </div>
-          )}
+        <div>
+          <div
+            style={{
+              color: C.text,
+              fontSize: "11px",
+              fontWeight: 700,
+            }}
+          >
+            {currentTitle}
+          </div>
+
+          <div
+            style={{
+              marginTop: "8px",
+              padding: "8px 9px",
+              borderRadius: "7px",
+              border:
+                `1px solid ${C.border}`,
+              background:
+                "#FFFFFF",
+            }}
+          >
+            {readOnlyContent ? (
+              <DiscussionMarkdown
+                content={
+                  readOnlyContent
+                }
+                compact
+              />
+            ) : (
+              <div
+                style={{
+                  color:
+                    C.textMuted,
+                  fontSize:
+                    "10px",
+                  lineHeight:
+                    1.6,
+                }}
+              >
+                暂无可执行的文字说明，请联系审核员确认。
+              </div>
+            )}
+          </div>
 
           <div
             style={{
@@ -541,14 +681,33 @@ export default function CWAIReviewInstructionVersionPanel({
               lineHeight: 1.5,
             }}
           >
-            {currentVersion
-              ? `这是正式交付或当前可见的V${currentVersion.version_no}，内容只读。`
-              : copy.readOnlyRequirementHelp}
+            正式审核已经确认的修改要求保持只读。
+            作者可以补充本次执行情况，但不能改写原要求。
           </div>
         </div>
       )}
 
-      {historyOpen && (
+      {notice && (
+        <div
+          role="status"
+          style={{
+            marginTop: "8px",
+            padding: "7px 8px",
+            borderRadius: "6px",
+            background:
+              "#ECFDF5",
+            color: C.success,
+            fontSize: "10px",
+            fontWeight: 600,
+            lineHeight: 1.5,
+          }}
+        >
+          {notice}
+        </div>
+      )}
+
+      {historicalVersions.length >
+        0 && (
         <div
           style={{
             marginTop: "10px",
@@ -557,135 +716,104 @@ export default function CWAIReviewInstructionVersionPanel({
               `1px solid ${C.border}`,
           }}
         >
-          {versions.map(
-            (version) => (
-              <div
-                key={version.id}
-                style={{
-                  marginTop: "7px",
-                  padding: "8px",
-                  borderRadius:
-                    "7px",
-                  border:
-                    `1px solid ${
-                      version.is_current ||
-                      version.id ===
-                        currentVersionId
-                        ? "#A7F3D0"
-                        : C.border
-                    }`,
-                  background:
-                    version.is_current ||
-                    version.id ===
-                      currentVersionId
-                      ? "#F0FDF4"
-                      : "#FFFFFF",
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems:
-                      "center",
-                    gap: "6px",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <span
-                    style={{
-                      color: C.text,
-                      fontSize: "10px",
-                      fontWeight: 700,
-                    }}
-                  >
-                    V{version.version_no}
-                  </span>
+          <button
+            type="button"
+            onClick={() =>
+              setHistoryOpen(
+                (previous) =>
+                  !previous,
+              )
+            }
+            aria-expanded={
+              historyOpen
+            }
+            style={{
+              padding: "5px 8px",
+              borderRadius: "6px",
+              border:
+                `1px solid ${C.border}`,
+              background:
+                "#FFFFFF",
+              color: C.primary,
+              fontSize: "9px",
+              fontWeight: 700,
+              cursor: "pointer",
+            }}
+          >
+            {historyOpen
+              ? `收起${historyTitle}`
+              : `${historyTitle} ${historicalVersions.length}`}
+          </button>
 
-                  <span
-                    style={{
-                      color:
-                        version.status ===
-                        "invalid_for_page"
-                          ? C.danger
-                          : version.status ===
-                              "confirmed"
-                            ? C.success
-                            : C.textMuted,
-                      fontSize: "9px",
-                      fontWeight: 700,
-                    }}
-                  >
-                    {
-                      VERSION_STATUS_LABEL[
-                        version.status
-                      ]
+          {historyOpen && (
+            <div
+              style={{
+                marginTop: "8px",
+              }}
+            >
+              {historicalVersions.map(
+                (version) => (
+                  <div
+                    key={
+                      version.id
                     }
-                  </span>
-
-                  <span
                     style={{
-                      color: C.textMuted,
-                      fontSize: "9px",
+                      marginTop:
+                        "7px",
+                      padding:
+                        "8px",
+                      borderRadius:
+                        "7px",
+                      border:
+                        `1px solid ${C.border}`,
+                      background:
+                        "#FFFFFF",
                     }}
                   >
-                    {
-                      VERSION_SOURCE_LABEL[
-                        version.source_type
-                      ]
-                    }
-                  </span>
-
-                  {version.confirmed_at && (
-                    <span
+                    <div
                       style={{
-                        marginLeft:
-                          "auto",
                         color:
                           C.textMuted,
-                        fontSize: "9px",
+                        fontSize:
+                          "9px",
+                        lineHeight:
+                          1.5,
                       }}
                     >
-                      {formatDateTime(
-                        version.confirmed_at,
-                      )}
-                    </span>
-                  )}
-                </div>
+                      {version
+                        .confirmed_at
+                        ? `以前确认于 ${formatDateTime(
+                            version.confirmed_at,
+                          )}`
+                        : "以前确认的修改记录"}
+                    </div>
 
-                <div
-                  style={{
-                    marginTop: "6px",
-                    color: C.textSec,
-                    fontSize: "10px",
-                    lineHeight: 1.6,
-                    whiteSpace:
-                      "pre-wrap",
-                    wordBreak:
-                      "break-word",
-                  }}
-                >
-                  {version.content}
-                </div>
-              </div>
-            ),
+                    <div
+                      style={{
+                        marginTop:
+                          "6px",
+                        color:
+                          C.textSec,
+                        fontSize:
+                          "10px",
+                        lineHeight:
+                          1.6,
+                        whiteSpace:
+                          "pre-wrap",
+                        wordBreak:
+                          "break-word",
+                      }}
+                    >
+                      {
+                        version
+                          .content
+                      }
+                    </div>
+                  </div>
+                ),
+              )}
+            </div>
           )}
-        </div>
-      )}
-
-      {successMessage && (
-        <div
-          style={{
-            marginTop: "8px",
-            padding: "7px 8px",
-            borderRadius: "6px",
-            background: "#ECFDF5",
-            color: C.success,
-            fontSize: "9px",
-            fontWeight: 600,
-            lineHeight: 1.5,
-          }}
-        >
-          {successMessage}
         </div>
       )}
 

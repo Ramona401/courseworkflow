@@ -112,6 +112,12 @@ export interface CWReviewWorkbenchSidebarProps {
     pageNumber: number,
   ) => void;
 
+  /**
+   * 兼容旧Workbench参数。
+   *
+   * R-08上线后formal模式不再向AI报告透传该回调，
+   * 正式人工审核意见只能通过R-08差异确认写回。
+   */
   onUseReviewComment: (
     comment: string,
   ) => void;
@@ -210,7 +216,6 @@ export default function CWReviewWorkbenchSidebar({
   sideTab,
   onSideTabChange,
   onSelectPage,
-  onUseReviewComment,
   onReviewContextChange,
   onCarryoverResolvedChange,
 }: CWReviewWorkbenchSidebarProps) {
@@ -406,9 +411,6 @@ export default function CWReviewWorkbenchSidebar({
               }
               onSelectPage={
                 onSelectPage
-              }
-              onUseReviewComment={
-                onUseReviewComment
               }
               onReviewContextChange={
                 onReviewContextChange

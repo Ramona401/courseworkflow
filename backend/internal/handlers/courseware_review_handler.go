@@ -11,6 +11,7 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -139,20 +140,29 @@ func (h *CoursewareReviewHandler) ReviewL1(
 		claims.Role,
 	)
 
-	if err := h.reviewService.ReviewL1(
+	result, err := h.reviewService.ReviewL1WithResult(
 		r.Context(),
 		id,
 		actor,
 		&req,
-	); err != nil {
+	)
+	if err != nil {
 		h.handleReviewError(w, err)
 		return
+	}
+
+	deliveredItemCount := 0
+	if result != nil {
+		deliveredItemCount = result.DeliveredItemCount
 	}
 
 	utils.Success(
 		w,
 		map[string]string{
-			"message": "L1审核完成",
+			"message": fmt.Sprintf(
+				"L1审核完成，本次正式交付 %d 条修改要求",
+				deliveredItemCount,
+			),
 		},
 	)
 }
@@ -205,20 +215,29 @@ func (h *CoursewareReviewHandler) ReviewL2(
 		claims.Role,
 	)
 
-	if err := h.reviewService.ReviewL2(
+	result, err := h.reviewService.ReviewL2WithResult(
 		r.Context(),
 		id,
 		actor,
 		&req,
-	); err != nil {
+	)
+	if err != nil {
 		h.handleReviewError(w, err)
 		return
+	}
+
+	deliveredItemCount := 0
+	if result != nil {
+		deliveredItemCount = result.DeliveredItemCount
 	}
 
 	utils.Success(
 		w,
 		map[string]string{
-			"message": "L2审核完成",
+			"message": fmt.Sprintf(
+				"L2审核完成，本次正式交付 %d 条修改要求",
+				deliveredItemCount,
+			),
 		},
 	)
 }

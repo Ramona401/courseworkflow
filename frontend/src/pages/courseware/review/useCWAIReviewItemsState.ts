@@ -1,14 +1,15 @@
 /**
  * useCWAIReviewItemsState.ts
  *
- * 课件AI审核整改项加载、采纳、更新和正式交付选择状态。
+ * 课件AI审核整改项加载、采纳、更新、数据库真值刷新和正式交付选择状态。
  *
  * 交付选择规则：
  *   - 已确认且存在确认指令的正式整改项可以交付；
  *   - 首次加载时可交付项默认选中；
- *   - 新确认或恢复成confirmed时自动选中；
+ *   - 单条问题从不可交付变为可交付时自动选中；
  *   - 忽略、失效或进入其他不可交付状态时自动移除；
- *   - 作者自审项不进入正式审核交付选择。
+ *   - 作者自审项不进入正式审核交付选择；
+ *   - R-07 Atomic Apply后的整表刷新只移除已失效选择，不重新勾选教师手动取消的项。
  */
 
 import {
@@ -87,23 +88,12 @@ export function useCWAIReviewItemsState({
       [],
     );
 
-  const loadSessionItems =
+  const applyLoadedSessionItems =
     useCallback(
-      async (
-        sessionId: string,
+      (
+        nextItems: CWAIReviewItem[],
+        preserveManualSelection: boolean,
       ) => {
-        const result =
-          await getCWAIReviewSessionItems(
-            sessionId,
-          );
-
-        if (!mountedRef.current) {
-          return;
-        }
-
-        const nextItems =
-          result.items || [];
-
         setItems(nextItems);
 
         if (isSelfReview) {
@@ -111,20 +101,86 @@ export function useCWAIReviewItemsState({
           return;
         }
 
-        setSelectedItemIds(
+        const deliverableIDs =
           nextItems
             .filter(
               isDeliverableFormalReviewItem,
             )
             .map(
               (item) => item.id,
+            );
+
+        if (!preserveManualSelection) {
+          setSelectedItemIds(
+            deliverableIDs,
+          );
+          return;
+        }
+
+        const deliverableIDSet =
+          new Set(deliverableIDs);
+
+        setSelectedItemIds(
+          (previous) =>
+            previous.filter(
+              (itemID) =>
+                deliverableIDSet.has(
+                  itemID,
+                ),
             ),
         );
       },
+      [isSelfReview],
+    );
+
+  const loadSessionItems =
+    useCallback(
+      async (
+        sessionId: string,
+        preserveManualSelection = false,
+      ): Promise<CWAIReviewItem[]> => {
+        const result =
+          await getCWAIReviewSessionItems(
+            sessionId,
+          );
+
+        const nextItems =
+          result.items || [];
+
+        if (!mountedRef.current) {
+          return nextItems;
+        }
+
+        applyLoadedSessionItems(
+          nextItems,
+          preserveManualSelection,
+        );
+
+        return nextItems;
+      },
       [
-        isSelfReview,
+        applyLoadedSessionItems,
         mountedRef,
       ],
+    );
+
+  /**
+   * 重新从数据库读取当前会话整改项。
+   *
+   * 用于R-07 Atomic Apply之后的真值刷新。
+   * 与首次加载不同，该入口保留教师已经手动取消的正式交付勾选，
+   * 只移除因状态变化而已经不可交付的ID。
+   */
+  const refreshSessionItems =
+    useCallback(
+      (
+        sessionId: string,
+      ) =>
+        loadSessionItems(
+          sessionId,
+          true,
+        ),
+      [loadSessionItems],
     );
 
   useEffect(() => {
@@ -137,6 +193,7 @@ export function useCWAIReviewItemsState({
 
     void loadSessionItems(
       session.id,
+      false,
     ).catch((cause) => {
       if (!mountedRef.current) {
         return;
@@ -343,6 +400,7 @@ export function useCWAIReviewItemsState({
     materializingFindingIds,
 
     resetReviewItems,
+    refreshSessionItems,
     handleRemoveSelectedItem,
     handleAdoptFinding,
     handleToggleItemSelection,

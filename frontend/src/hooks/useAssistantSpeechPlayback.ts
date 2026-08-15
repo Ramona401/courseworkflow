@@ -3,7 +3,7 @@
  *
  * 播放策略：
  *   1. 完整回答先请求后端豆包TTS；
- *   2. 中文默认vivi 2.0，英文或字母为主默认Tim，音色由后端统一决定；
+ *   2. 中文音色跟随课堂人物：女老师vivi 2.0、男老师云舟；英文或字母为主继续Tim；
  *   3. 成功MP3保留在当前页面内存中，暂停、继续、停止和重播不重复计费；
  *   4. 网络响应丢失后的手动重试复用同一operation_id，由后端幂等恢复；
  *   5. 豆包不可用时自动降级到浏览器本地语音，保证课堂不中断；
@@ -17,6 +17,24 @@ const ASSISTANT_TTS_MAX_RUNES = 3950
 const BROWSER_SPEECH_CHUNK_MAX_RUNES = 180
 
 export type AssistantSpeechProvider = 'doubao' | 'browser' | 'none'
+type AssistantSpeechCharacter = 'female' | 'male'
+
+const CLASSROOM_DIGITAL_HUMAN_CHARACTER_KEY =
+  'tedna:classroom-digital-human:character'
+
+function readAssistantSpeechCharacter(): AssistantSpeechCharacter {
+  if (typeof window === 'undefined') {
+    return 'female'
+  }
+
+  try {
+    return window.localStorage.getItem(CLASSROOM_DIGITAL_HUMAN_CHARACTER_KEY) === 'male'
+      ? 'male'
+      : 'female'
+  } catch {
+    return 'female'
+  }
+}
 
 export interface AssistantSpeechPlaybackResult {
   isSupported: boolean
@@ -242,6 +260,7 @@ export function useAssistantSpeechPlayback(
   const audioURLRef = useRef('')
   const lastTextRef = useRef('')
   const lastOperationIDRef = useRef('')
+  const lastCharacterRef = useRef<AssistantSpeechCharacter>('female')
   const browserQueueRef = useRef<string[]>([])
   const browserPlayNextRef = useRef<(token: number, text: string) => void>(
     () => undefined,
@@ -452,6 +471,7 @@ export function useAssistantSpeechPlayback(
     async (
       text: string,
       operationID: string,
+      character: AssistantSpeechCharacter,
       token: number,
     ) => {
       if (!doubaoSupported || !normalizedDeploymentID) {
@@ -479,6 +499,7 @@ export function useAssistantSpeechPlayback(
           normalizedDeploymentID,
           text,
           operationID,
+          character,
           controller.signal,
         )
 
@@ -541,10 +562,12 @@ export function useAssistantSpeechPlayback(
       setAudioElement(null)
 
       const token = playbackTokenRef.current
+      const character = readAssistantSpeechCharacter()
       let operationID = ''
 
       lastTextRef.current = normalizedText
       lastOperationIDRef.current = ''
+      lastCharacterRef.current = character
       setLastText(normalizedText)
 
       try {
@@ -559,6 +582,7 @@ export function useAssistantSpeechPlayback(
       void requestDoubaoSpeech(
         normalizedText,
         operationID,
+        character,
         token,
       )
     },
@@ -608,8 +632,12 @@ export function useAssistantSpeechPlayback(
 
     stopCurrentPlayback()
     const token = playbackTokenRef.current
+    const character = readAssistantSpeechCharacter()
 
-    if (audioURLRef.current) {
+    if (
+      audioURLRef.current
+      && character === lastCharacterRef.current
+    ) {
       playDoubaoAudio(
         text,
         audioURLRef.current,
@@ -619,10 +647,41 @@ export function useAssistantSpeechPlayback(
       return
     }
 
+    if (character !== lastCharacterRef.current) {
+      revokeAudioURL()
+      audioRef.current = null
+      setAudioElement(null)
+
+      let operationID = ''
+
+      try {
+        operationID = createAssistantTTSOperationID()
+      } catch (cause) {
+        startBrowserFallback(text, errorMessage(cause), token)
+        return
+      }
+
+      lastCharacterRef.current = character
+      lastOperationIDRef.current = operationID
+
+      void requestDoubaoSpeech(
+        text,
+        operationID,
+        character,
+        token,
+      )
+      return
+    }
+
     const operationID = lastOperationIDRef.current
 
     if (operationID) {
-      void requestDoubaoSpeech(text, operationID, token)
+      void requestDoubaoSpeech(
+        text,
+        operationID,
+        character,
+        token,
+      )
       return
     }
 
@@ -630,6 +689,7 @@ export function useAssistantSpeechPlayback(
   }, [
     playDoubaoAudio,
     requestDoubaoSpeech,
+    revokeAudioURL,
     startBrowserFallback,
     stopCurrentPlayback,
     voiceLabel,
@@ -642,6 +702,7 @@ export function useAssistantSpeechPlayback(
     setAudioElement(null)
     lastTextRef.current = ''
     lastOperationIDRef.current = ''
+    lastCharacterRef.current = readAssistantSpeechCharacter()
     setLastText('')
     setProvider('none')
     setVoiceLabel('')
@@ -689,4 +750,3 @@ export function useAssistantSpeechPlayback(
 }
 
 export default useAssistantSpeechPlayback
-

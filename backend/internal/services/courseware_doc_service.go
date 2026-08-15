@@ -81,13 +81,34 @@ func (s *CoursewarePPTService) UploadDocAndCreateCourseware(
 
 	// ---- 1. 校验文件大小 ----
 	if header.Size > DocMaxSize {
-		return nil, nil, fmt.Errorf("Word文件过大，最大支持30MB（当前%.1fMB）", float64(header.Size)/(1024*1024))
+		return nil, nil, newCoursewareSourceUploadError(
+			CoursewareSourceUploadTooLarge,
+			fmt.Sprintf(
+				"Word文件过大，最大支持30MB（当前%.1fMB）",
+				float64(header.Size)/(1024*1024),
+			),
+			nil,
+		)
+	}
+	if header.Size <= 0 {
+		return nil, nil, newCoursewareSourceUploadError(
+			CoursewareSourceUploadInvalidFormat,
+			"这个Word文件为空，请重新选择有效的.docx文件。",
+			nil,
+		)
 	}
 
 	// ---- 2. 校验文件扩展名 ----
 	ext := strings.ToLower(filepath.Ext(header.Filename))
 	if ext != ".docx" {
-		return nil, nil, fmt.Errorf("仅支持.docx格式的Word文件（当前: %s）", ext)
+		return nil, nil, newCoursewareSourceUploadError(
+			CoursewareSourceUploadInvalidExtension,
+			fmt.Sprintf(
+				"仅支持.docx格式的Word文件（当前: %s）",
+				ext,
+			),
+			nil,
+		)
 	}
 
 	// ---- 3. 保存文件到磁盘 ----
@@ -118,15 +139,35 @@ func (s *CoursewarePPTService) UploadDocAndCreateCourseware(
 	// ---- 4. 解析Word内容 ----
 	extractResult, err := s.ExtractDocContent(fullPath)
 	if err != nil {
-		pptServiceLog.Warn("Word解析失败，课件仍会创建",
+		pptServiceLog.Warn(
+			"Word上传文件结构无效，已拒绝创建空课件",
 			"path", fullPath,
 			"error", err.Error(),
 		)
-		extractResult = &DocExtractResult{
-			FileName: header.Filename,
-		}
-	} else {
-		extractResult.FileName = header.Filename
+		_ = os.Remove(fullPath)
+		return nil, nil, newCoursewareSourceUploadError(
+			CoursewareSourceUploadInvalidFormat,
+			"无法读取这个Word文件：文件扩展名虽然是.docx，但内部不是有效的Word DOCX文档。请用Word/WPS打开原文件，选择“另存为 Word 文档（.docx）”后重新上传。",
+			err,
+		)
+	}
+	extractResult.FileName = header.Filename
+
+	if extractResult.WordCount < 50 {
+		pptServiceLog.Warn(
+			"Word上传未提取到足够文字，已拒绝创建空课件",
+			"path", fullPath,
+			"word_count", extractResult.WordCount,
+		)
+		_ = os.Remove(fullPath)
+		return nil, nil, newCoursewareSourceUploadError(
+			CoursewareSourceUploadNoUsableContent,
+			fmt.Sprintf(
+				"这个Word文件可以打开，但只提取到%d字，无法生成课件。请确认文档中包含可选择的正文文字；如果主要内容是扫描图片，请先转换为可提取文字的DOCX后重新上传。",
+				extractResult.WordCount,
+			),
+			nil,
+		)
 	}
 
 	// ---- 5. 确定课件标题 ----

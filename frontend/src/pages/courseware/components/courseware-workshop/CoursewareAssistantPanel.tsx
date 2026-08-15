@@ -11,6 +11,7 @@
  */
 
 import {
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -47,6 +48,12 @@ import type {
 import {
   EMPTY_COURSEWARE_ASSISTANT_DEPLOYMENT_DOCK_STATE,
 } from "./coursewareAssistantDeploymentDock";
+
+import {
+  COURSEWARE_ASSISTANT_VALIDITY_NAVIGATION_EVENT,
+  COURSEWARE_ASSISTANT_VALIDITY_SECTION_ID,
+  consumeCoursewareAssistantValiditySettingsRequest,
+} from "./coursewareAssistantValidityNavigation";
 
 import {
   COURSEWARE_ASSISTANT_EDITOR_COLORS,
@@ -152,14 +159,14 @@ export default function CoursewareAssistantPanel({
       EMPTY_COURSEWARE_ASSISTANT_DEPLOYMENT_DOCK_STATE,
     );
 
-  const [deploymentRevision, setDeploymentRevision] =
-    useState(0);
-
   const [activeMainTab, setActiveMainTab] =
     useState<MainTab>("learning");
 
   const [activeContentTab, setActiveContentTab] =
     useState<ContentTab>("basics");
+
+  const [validityFocusSequence, setValidityFocusSequence] =
+    useState(0);
 
   const C = COURSEWARE_ASSISTANT_EDITOR_COLORS;
 
@@ -189,6 +196,7 @@ export default function CoursewareAssistantPanel({
       : "";
 
   const hasSavedSlot = Boolean(editor.serverSlot);
+  const selectedPageID = selectedPage?.pageId || "";
 
   useEffect(() => {
     setActiveMainTab("learning");
@@ -196,20 +204,129 @@ export default function CoursewareAssistantPanel({
     setDeploymentState({
       ...EMPTY_COURSEWARE_ASSISTANT_DEPLOYMENT_DOCK_STATE,
     });
-  }, [selectedPage?.pageId]);
+    setValidityFocusSequence(0);
+  }, [selectedPageID]);
 
-  const openDelivery = () => {
+  const openDelivery = useCallback(() => {
     setActiveMainTab("delivery");
 
-    window.setTimeout(() => {
-      document
-        .getElementById(DELIVERY_SECTION_ID)
-        ?.scrollIntoView({
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        document.getElementById(DELIVERY_SECTION_ID)?.scrollIntoView({
           behavior: "smooth",
           block: "start",
         });
-    }, 0);
-  };
+      });
+    });
+  }, []);
+
+  const openValiditySettings = useCallback(() => {
+    setActiveMainTab("delivery");
+    setValidityFocusSequence((previous) => previous + 1);
+  }, []);
+
+  useEffect(() => {
+    if (!validityFocusSequence || activeMainTab !== "delivery") return;
+
+    let cancelled = false;
+    let timer: number | null = null;
+    let attempts = 0;
+
+    const focusValiditySection = () => {
+      if (cancelled) return;
+
+      const section = document.getElementById(
+        COURSEWARE_ASSISTANT_VALIDITY_SECTION_ID,
+      );
+
+      if (section && section.getClientRects().length > 0) {
+        section.scrollIntoView({
+          behavior: "smooth",
+          block: "center",
+        });
+
+        const focusTarget = section.querySelector<HTMLElement>(
+          "button:not(:disabled), input:not(:disabled)",
+        );
+
+        window.setTimeout(() => {
+          focusTarget?.focus({ preventScroll: true });
+        }, 220);
+
+        if (typeof section.animate === "function") {
+          section.animate(
+            [
+              { boxShadow: "0 0 0 0 rgba(79,123,232,0)" },
+              { boxShadow: "0 0 0 4px rgba(79,123,232,0.20)" },
+              { boxShadow: "0 0 0 0 rgba(79,123,232,0)" },
+            ],
+            {
+              duration: 1400,
+              easing: "ease-out",
+            },
+          );
+        }
+
+        setValidityFocusSequence(0);
+        return;
+      }
+
+      attempts += 1;
+      if (attempts < 30) {
+        timer = window.setTimeout(
+          focusValiditySection,
+          50,
+        );
+      }
+    };
+
+    const frame = window.requestAnimationFrame(
+      focusValiditySection,
+    );
+
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frame);
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [
+    activeMainTab,
+    validityFocusSequence,
+  ]);
+
+  useEffect(() => {
+    if (!selectedPageID) return;
+
+    const consumeRequest = () => {
+      if (
+        consumeCoursewareAssistantValiditySettingsRequest(
+          coursewareId,
+          selectedPageID,
+        )
+      ) {
+        openValiditySettings();
+      }
+    };
+
+    consumeRequest();
+    window.addEventListener(
+      COURSEWARE_ASSISTANT_VALIDITY_NAVIGATION_EVENT,
+      consumeRequest,
+    );
+
+    return () => {
+      window.removeEventListener(
+        COURSEWARE_ASSISTANT_VALIDITY_NAVIGATION_EVENT,
+        consumeRequest,
+      );
+    };
+  }, [
+    coursewareId,
+    openValiditySettings,
+    selectedPageID,
+  ]);
 
   const handleDelete = () => {
     if (!editor.serverSlot) {
@@ -500,11 +617,6 @@ export default function CoursewareAssistantPanel({
                   visible={
                     activeMainTab === "delivery"
                   }
-                  onChanged={() => {
-                    setDeploymentRevision(
-                      (previous) => previous + 1,
-                    );
-                  }}
                   onStateChange={setDeploymentState}
                 />
 
@@ -515,7 +627,6 @@ export default function CoursewareAssistantPanel({
                     pageTitle={selectedPage.pageTitle}
                     hasSavedSlot={hasSavedSlot}
                     hasUnsavedChanges={editor.isDirty}
-                    refreshKey={deploymentRevision}
                     disabled={editorBusy}
                   />
                 )}

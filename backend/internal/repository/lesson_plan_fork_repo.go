@@ -14,8 +14,10 @@ package repository
 // 不依赖数据库触发器推导作者域。具体域来源不能被调用者域覆盖；
 // common只作为公共来源快照，副本必须落入调用者唯一具体教学域。
 // 副本只继承旧Fork已有语义中的正文、结构、生成配置、组件、
-// 模板、配方和课本引用；不继承对话、阶段运行状态、评审结果、
-// 单元方案、班级学情或课程大纲版本。
+// 模板、配方、课本引用和阶段配置模板；不继承对话、阶段进度、评审结果、
+// 单元方案、班级学情或课程大纲版本。因为Fork复制的是已经存在的完整正文，
+// 新副本在同一事务内按“已有完整教案”语义进入review-ready：review之前阶段skipped，
+// review为唯一in_progress，保证Fork返回时正文与备课运行态语义一致。
 
 import (
 	"context"
@@ -181,6 +183,7 @@ func ForkLessonPlanWithEducationDomains(
 		sourceGenerationConfig  string
 		sourceMatchedComponents string
 		sourceTextbookPageIDs   string
+		sourceStageConfig       string
 		sourceStoredDomain      string
 		sourceStatus            string
 		sourceTemplateID        sql.NullString
@@ -201,6 +204,7 @@ func ForkLessonPlanWithEducationDomains(
                         template_id::text,
                         recipe_id::text,
                         COALESCE(textbook_page_ids::text, '[]'),
+                        COALESCE(stage_config::text, '[]'),
                         COALESCE(education_domain, ''),
                         status
                 FROM lesson_plans
@@ -220,6 +224,7 @@ func ForkLessonPlanWithEducationDomains(
 		&sourceTemplateID,
 		&sourceRecipeID,
 		&sourceTextbookPageIDs,
+		&sourceStageConfig,
 		&sourceStoredDomain,
 		&sourceStatus,
 	)
@@ -288,6 +293,19 @@ func ForkLessonPlanWithEducationDomains(
 		sourceTextbookPageIDs = "[]"
 	}
 
+	stageBootstrap, err :=
+		resolveLessonPlanForkStageBootstrapTx(
+			ctx,
+			tx,
+			sourceStageConfig,
+		)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"初始化Fork阶段运行态失败: %w",
+			err,
+		)
+	}
+
 	newLessonPlan := &models.LessonPlan{
 		Title: sourceTitle + "（副本）",
 
@@ -312,9 +330,13 @@ func ForkLessonPlanWithEducationDomains(
 
 		TextbookPageIDs: sourceTextbookPageIDs,
 		EducationDomain: targetDomain,
+		CurrentStage:    stageBootstrap.CurrentStage.StageCode,
+		StageConfig:     stageBootstrap.ConfigJSON,
 	}
 
 	storedDomain := ""
+	storedCurrentStage := ""
+	storedStageConfig := ""
 
 	err = tx.QueryRow(ctx, `
                 INSERT INTO lesson_plans (
@@ -337,7 +359,9 @@ func ForkLessonPlanWithEducationDomains(
                         recipe_id,
                         textbook_page_ids,
                         education_domain,
-                        forked_from
+                        forked_from,
+                        current_stage,
+                        stage_config
                 )
                 VALUES (
                         $1,
@@ -359,11 +383,15 @@ func ForkLessonPlanWithEducationDomains(
                         $15,
                         $16,
                         $17,
-                        $18
+                        $18,
+                        $19,
+                        $20
                 )
                 RETURNING
                         id,
                         education_domain,
+                        current_stage,
+                        stage_config::text,
                         created_at,
                         updated_at
         `,
@@ -385,9 +413,13 @@ func ForkLessonPlanWithEducationDomains(
 		newLessonPlan.TextbookPageIDs,
 		targetDomain,
 		sourceID,
+		newLessonPlan.CurrentStage,
+		newLessonPlan.StageConfig,
 	).Scan(
 		&newLessonPlan.ID,
 		&storedDomain,
+		&storedCurrentStage,
+		&storedStageConfig,
 		&newLessonPlan.CreatedAt,
 		&newLessonPlan.UpdatedAt,
 	)
@@ -411,6 +443,25 @@ func ForkLessonPlanWithEducationDomains(
 			targetDomain,
 			storedDomain,
 		)
+	}
+
+	if storedCurrentStage !=
+		stageBootstrap.CurrentStage.StageCode ||
+		strings.TrimSpace(storedStageConfig) == "" ||
+		strings.TrimSpace(storedStageConfig) == "[]" {
+		return nil, fmt.Errorf(
+			"Fork副本阶段运行态快照不一致: stage=%q",
+			storedCurrentStage,
+		)
+	}
+
+	if err := createLessonPlanForkStageOutputsTx(
+		ctx,
+		tx,
+		newLessonPlan.ID,
+		stageBootstrap.StageOutputs,
+	); err != nil {
+		return nil, err
 	}
 
 	result, err := tx.Exec(ctx, `
@@ -449,5 +500,7 @@ func ForkLessonPlanWithEducationDomains(
 	}
 
 	newLessonPlan.EducationDomain = storedDomain
+	newLessonPlan.CurrentStage = storedCurrentStage
+	newLessonPlan.StageConfig = storedStageConfig
 	return newLessonPlan, nil
 }

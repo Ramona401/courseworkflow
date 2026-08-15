@@ -2,8 +2,8 @@ package services
 
 // courseware_auto_assembly_version.go — 自动装配数据库业务版本包装
 //
-// 本文件不改动原AutoAssemble主编排，也不改动IAOCI逐槽位实现。
-// 它只负责在进入原流程前后建立数据库业务运行边界：
+// 本文件负责在进入主编排前后建立数据库业务运行边界，并在新run创建前读取上一轮完整性事实，
+// 把可信的定向补生成范围注入context；它不接受浏览器提交page_id，也不改IAOCI逐槽位协议。
 //
 //   1. 在领取数据库运行前执行作者权限和轻量前置检查；
 //   2. 原子领取单调递增assembly_version和run_id；
@@ -12,12 +12,11 @@ package services
 //   5. 取消时先把数据库状态改为cancel_requested，再关闭进程内停止信号；
 //   6. 正常、失败、取消和panic路径最终都收敛courseware_assembly_runs。
 //
-// 这样能够避免对1300余行主编排做高风险完整覆盖，同时保留现有断点续装、
-// IAOCI稳定索引、导航保护、背景处理和媒体计费幂等能力。
+// 版本身份、定向补生成范围、取消语义与终态对账都在本层收敛，主编排只消费可信context，
+// 从而保留IAOCI稳定索引、导航保护、背景处理和媒体计费幂等能力。
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -25,6 +24,11 @@ import (
 
 	"tedna/internal/models"
 	"tedna/internal/repository"
+)
+
+var (
+	// ErrCoursewareAutoAssemblyRunKindMismatch 表示自动装配停止入口碰到了普通批量生成运行。
+	ErrCoursewareAutoAssemblyRunKindMismatch = errors.New("当前活动运行不是自动装配")
 )
 
 // preflightAutoAssemblyVersioned 在创建数据库运行记录前完成轻量预检。
@@ -136,6 +140,8 @@ func (s *CoursewareAutoAssemblyService) AutoAssembleVersionedWithLaunch(
 		return ErrCoursewareActorRequired
 	}
 
+	repairMode := coursewareImageRepairModeFromContext(ctx)
+
 	scopedActor, preflightErr :=
 		s.preflightAutoAssemblyVersioned(
 			ctx,
@@ -183,11 +189,33 @@ func (s *CoursewareAutoAssemblyService) AutoAssembleVersionedWithLaunch(
 		return nil
 	}
 
+	// 普通装配必须在创建新run之前读取上一轮HTML完整性补页范围；
+	// 图片智能补配与HTML完整性正交，repair模式严格不消费该范围。
+	retryScope := coursewareAutoAssemblyRetryScope{}
+	if !repairMode {
+		var retryErr error
+		retryScope, retryErr =
+			resolveCoursewareAutoAssemblyRetryScope(
+				ctx,
+				coursewareID,
+			)
+		if retryErr != nil {
+			lifecycleLock.Unlock()
+
+			s.pushError(
+				coursewareID,
+				retryErr.Error(),
+			)
+			return retryErr
+		}
+	}
+
 	run, err :=
-		repository.BeginCoursewareAssembly(
+		beginCoursewareGenerationRun(
 			ctx,
 			coursewareID,
 			scopedActor.UserID,
+			models.CoursewareGenerationRunKindAssembly,
 			skipVideo,
 		)
 
@@ -217,6 +245,31 @@ func (s *CoursewareAutoAssemblyService) AutoAssembleVersionedWithLaunch(
 			},
 		)
 
+	if retryScope.Enabled {
+		assemblyCtx =
+			withCoursewareAutoAssemblyRetryScope(
+				assemblyCtx,
+				retryScope,
+			)
+
+		cwAssemblyLog.Info(
+			"自动装配进入完整性定向补生成",
+			"courseware_id", coursewareID,
+			"assembly_version", run.Version,
+			"retry_pages", len(retryScope.PageIDs),
+			"force_pages", len(retryScope.ForcePageIDs),
+		)
+	}
+
+	if repairMode {
+		assemblyCtx = WithCoursewareImageRepairMode(assemblyCtx)
+		cwAssemblyLog.Info(
+			"自动装配进入失败配图定向智能补配",
+			"courseware_id", coursewareID,
+			"assembly_version", run.Version,
+		)
+	}
+
 	defer func() {
 		recovered := recover()
 
@@ -230,22 +283,13 @@ func (s *CoursewareAutoAssemblyService) AutoAssembleVersionedWithLaunch(
 				5*time.Second,
 			)
 
-		state, stateErr :=
-			repository.GetCoursewareAssemblyState(
+		cancelRequested, stateErr :=
+			coursewareGenerationRunCancelRequested(
 				stateCtx,
-				coursewareID,
+				run,
 			)
 
 		stateCancel()
-
-		cancelRequested :=
-			stateErr == nil &&
-				state != nil &&
-				state.ActiveRunID != nil &&
-				*state.ActiveRunID == run.ID &&
-				state.Version == run.Version &&
-				state.Status ==
-					models.CoursewareAssemblyStatusCancelRequested
 
 		switch {
 		case recovered != nil:
@@ -276,48 +320,17 @@ func (s *CoursewareAutoAssemblyService) AutoAssembleVersionedWithLaunch(
 				)
 		}
 
-		metadataPayload :=
-			map[string]interface{}{
-				"wrapper":          "database_versioned",
-				"assembly_version": run.Version,
-				"assembly_run_id":  run.ID,
-				"skip_video":       skipVideo,
-				"finished_at": time.Now().UTC().
-					Format(
-						time.RFC3339Nano,
-					),
-			}
-
-		if errorMessage != "" {
-			metadataPayload["error"] =
-				errorMessage
-		}
-
-		metadataJSON := "{}"
-		if encoded, encodeErr :=
-			json.Marshal(
-				metadataPayload,
-			); encodeErr == nil {
-			metadataJSON =
-				string(encoded)
-		}
-
-		finishCtx, finishCancel :=
-			context.WithTimeout(
-				context.Background(),
-				5*time.Second,
-			)
-		defer finishCancel()
-
-		finishErr :=
-			repository.FinishCoursewareAssembly(
-				finishCtx,
-				coursewareID,
-				run.Version,
-				run.ID,
+		resolvedStatus,
+			resolvedError,
+			_,
+			finishErr :=
+			finalizeCoursewareGenerationRun(
+				run,
+				models.CoursewareGenerationRunKindAssembly,
+				skipVideo,
 				finalStatus,
 				errorMessage,
-				metadataJSON,
+				"database_versioned",
 			)
 
 		if finishErr != nil &&
@@ -334,7 +347,7 @@ func (s *CoursewareAutoAssemblyService) AutoAssembleVersionedWithLaunch(
 				"assembly_run_id",
 				run.ID,
 				"final_status",
-				finalStatus,
+				resolvedStatus,
 				"error",
 				finishErr,
 			)
@@ -348,10 +361,34 @@ func (s *CoursewareAutoAssemblyService) AutoAssembleVersionedWithLaunch(
 			}
 		}
 
+		if returnErr == nil &&
+			recovered == nil &&
+			resolvedStatus ==
+				models.CoursewareAssemblyStatusFailed {
+			returnErr = fmt.Errorf(
+				"%w: %s",
+				ErrCoursewareGenerationIntegrityIncomplete,
+				strings.TrimSpace(
+					resolvedError,
+				),
+			)
+		}
+
 		if recovered != nil {
 			panic(recovered)
 		}
 	}()
+
+	if repairMode {
+		returnErr =
+			s.RepairFailedCoursewareImages(
+				assemblyCtx,
+				coursewareID,
+				scopedActor,
+				skipVideo,
+			)
+		return returnErr
+	}
 
 	returnErr =
 		s.AutoAssemble(
@@ -360,6 +397,32 @@ func (s *CoursewareAutoAssemblyService) AutoAssembleVersionedWithLaunch(
 			scopedActor,
 			skipVideo,
 		)
+	if returnErr != nil {
+		return returnErr
+	}
+
+	// HTML完整不代表媒体完整。只把已经确认属于两类可智能修复错误的失败收敛为运行失败，
+	// 这样前端不会在“配图仍失败”时自动跳进工作台；其它非修复型媒体错误保持原有best-effort语义。
+	repairState, repairStateErr :=
+		ReadCoursewareImageRepairState(
+			assemblyCtx,
+			coursewareID,
+			scopedActor,
+		)
+	if repairStateErr != nil {
+		returnErr = fmt.Errorf(
+			"读取自动装配配图失败事实失败: %w",
+			repairStateErr,
+		)
+		return returnErr
+	}
+	if repairState != nil && repairState.RetryableCount > 0 {
+		returnErr = fmt.Errorf(
+			"%w: 仍有%d处可智能补配的图片失败",
+			ErrCoursewareImageRepairIncomplete,
+			repairState.RetryableCount,
+		)
+	}
 
 	return returnErr
 }
@@ -410,6 +473,22 @@ func (s *CoursewareAutoAssemblyService) CancelAutoAssemblyVersioned(
 			operationCtx,
 			coursewareID,
 		)
+
+	activeBatchRun :=
+		stateErr == nil &&
+			state != nil &&
+			state.ActiveRunID != nil &&
+			state.RunKind ==
+				models.CoursewareGenerationRunKindBatch &&
+			(state.Status ==
+				models.CoursewareAssemblyStatusRunning ||
+				state.Status ==
+					models.CoursewareAssemblyStatusCancelRequested)
+
+	if activeBatchRun {
+		lifecycleLock.Unlock()
+		return ErrCoursewareAutoAssemblyRunKindMismatch
+	}
 
 	activeDatabaseRun :=
 		stateErr == nil &&

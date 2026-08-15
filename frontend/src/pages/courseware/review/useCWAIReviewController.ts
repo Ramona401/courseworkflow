@@ -7,12 +7,13 @@
  *   - 加载后端最新会话；
  *   - 计算批次进度和最终报告；
  *   - 向正式审核工作台回传已选整改项；
- *   - 管理助手选择和助手管理入口。
+ *   - 管理助手选择和助手管理入口；
+ *   - 向Panel暴露整改项数据库真值刷新入口。
  *
  * 职责拆分：
  *   - useCWAIReviewConfigState.ts：R-02配置草稿和会话快照；
  *   - useCWAIReviewExecution.ts：会话创建、批次执行和失败恢复；
- *   - useCWAIReviewItemsState.ts：整改项和正式交付选择；
+ *   - useCWAIReviewItemsState.ts：整改项、数据库真值刷新和正式交付选择；
  *   - cwAIReviewControllerHelpers.ts：纯合并和筛选函数。
  */
 
@@ -24,9 +25,7 @@ import {
   useState,
 } from "react";
 
-import {
-  useNavigate,
-} from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 
 import {
   getLatestCWAIReview,
@@ -37,6 +36,7 @@ import {
 
 import {
   collectCWAIReviewBatchFindings,
+  isDeliverableFormalReviewItem,
 } from "./cwAIReviewControllerHelpers";
 
 import {
@@ -89,8 +89,7 @@ export function useCWAIReviewController({
   mode,
   onReviewContextChange,
 }: UseCWAIReviewControllerOptions) {
-  const navigate =
-    useNavigate();
+  const navigate = useNavigate();
 
   const isSelfReview =
     mode === "self";
@@ -116,19 +115,15 @@ export function useCWAIReviewController({
   const [
     assistantId,
     setAssistantId,
-  ] =
-    useState<string | null>(
-      null,
-    );
+  ] = useState<string | null>(null);
 
   const [
     bundle,
     setBundle,
-  ] =
-    useState<CWAIReviewSessionBundle>({
-      session: null,
-      batches: [],
-    });
+  ] = useState<CWAIReviewSessionBundle>({
+    session: null,
+    batches: [],
+  });
 
   const [
     loading,
@@ -153,8 +148,7 @@ export function useCWAIReviewController({
     };
   }, []);
 
-  const session =
-    bundle.session;
+  const session = bundle.session;
 
   const completedBatches =
     bundle.batches.filter(
@@ -181,10 +175,8 @@ export function useCWAIReviewController({
       : 0;
 
   const canContinue =
-    session?.status ===
-      "reviewing" ||
-    session?.status ===
-      "aggregating";
+    session?.status === "reviewing" ||
+    session?.status === "aggregating";
 
   const canRestart =
     !session ||
@@ -208,6 +200,43 @@ export function useCWAIReviewController({
       setError,
     });
 
+  /**
+   * 正式交付只暴露“仍然可交付且同时存在于当前问题集合”的规范化交集。
+   *
+   * 顶部清单数量、实际展示数量和提交payload的review_item_ids
+   * 始终共享同一事实源；状态变化或异步刷新造成的孤立ID不会进入正式提交。
+   */
+  const deliverySelectedItems =
+    useMemo(() => {
+      if (isSelfReview) {
+        return [];
+      }
+
+      const selectedIDSet =
+        new Set(
+          reviewItems.selectedItemIds,
+        );
+
+      return reviewItems.items.filter(
+        (item) =>
+          selectedIDSet.has(item.id) &&
+          isDeliverableFormalReviewItem(item),
+      );
+    }, [
+      isSelfReview,
+      reviewItems.items,
+      reviewItems.selectedItemIds,
+    ]);
+
+  const deliverySelectedItemIds =
+    useMemo(
+      () =>
+        deliverySelectedItems.map(
+          (item) => item.id,
+        ),
+      [deliverySelectedItems],
+    );
+
   const loadLatest =
     useCallback(
       async () => {
@@ -226,16 +255,12 @@ export function useCWAIReviewController({
           }
 
           setBundle({
-            session:
-              result.session,
-
-            batches:
-              result.batches || [],
+            session: result.session,
+            batches: result.batches || [],
           });
 
           setAssistantId(
-            result.session
-              ?.assistant_id ||
+            result.session?.assistant_id ||
               null,
           );
 
@@ -246,8 +271,7 @@ export function useCWAIReviewController({
 
           if (
             !result.session ||
-            result.session.status !==
-              "done"
+            result.session.status !== "done"
           ) {
             reviewItems
               .resetReviewItems();
@@ -270,10 +294,8 @@ export function useCWAIReviewController({
       },
       [
         coursewareId,
-        reviewConfig
-          .applyLoadedSessionConfig,
-        reviewItems
-          .resetReviewItems,
+        reviewConfig.applyLoadedSessionConfig,
+        reviewItems.resetReviewItems,
         reviewLevel,
       ],
     );
@@ -296,48 +318,26 @@ export function useCWAIReviewController({
         selectedItemIds: [],
         selectedItems: [],
         removeSelectedItem:
-          reviewItems
-            .handleRemoveSelectedItem,
+          reviewItems.handleRemoveSelectedItem,
       });
 
       return;
     }
 
-    const selectedItemIDSet =
-      new Set(
-        reviewItems.selectedItemIds,
-      );
-
     onReviewContextChange({
       sessionId: session.id,
-
       selectedItemIds:
-        isSelfReview
-          ? []
-          : reviewItems
-              .selectedItemIds,
-
+        deliverySelectedItemIds,
       selectedItems:
-        isSelfReview
-          ? []
-          : reviewItems.items.filter(
-              (item) =>
-                selectedItemIDSet.has(
-                  item.id,
-                ),
-            ),
-
+        deliverySelectedItems,
       removeSelectedItem:
-        reviewItems
-          .handleRemoveSelectedItem,
+        reviewItems.handleRemoveSelectedItem,
     });
   }, [
-    isSelfReview,
+    deliverySelectedItemIds,
+    deliverySelectedItems,
     onReviewContextChange,
-    reviewItems
-      .handleRemoveSelectedItem,
-    reviewItems.items,
-    reviewItems.selectedItemIds,
+    reviewItems.handleRemoveSelectedItem,
     session,
   ]);
 
@@ -375,20 +375,16 @@ export function useCWAIReviewController({
       mountedRef,
 
       reviewConfigDraft:
-        reviewConfig
-          .reviewConfigDraft,
+        reviewConfig.reviewConfigDraft,
 
       reviewConfigError:
-        reviewConfig
-          .reviewConfigError,
+        reviewConfig.reviewConfigError,
 
       applyLoadedSessionConfig:
-        reviewConfig
-          .applyLoadedSessionConfig,
+        reviewConfig.applyLoadedSessionConfig,
 
       resetReviewItems:
-        reviewItems
-          .resetReviewItems,
+        reviewItems.resetReviewItems,
     });
 
   const handleManageAssistants =
@@ -427,32 +423,25 @@ export function useCWAIReviewController({
     setAssistantId,
 
     reviewConfigDraft:
-      reviewConfig
-        .reviewConfigDraft,
+      reviewConfig.reviewConfigDraft,
 
     sessionReviewConfig:
-      reviewConfig
-        .sessionReviewConfig,
+      reviewConfig.sessionReviewConfig,
 
     reviewConfigEditable:
-      reviewConfig
-        .reviewConfigEditable,
+      reviewConfig.reviewConfigEditable,
 
     reviewConfigError:
-      reviewConfig
-        .reviewConfigError,
+      reviewConfig.reviewConfigError,
 
     handleToggleReviewDimension:
-      reviewConfig
-        .handleToggleReviewDimension,
+      reviewConfig.handleToggleReviewDimension,
 
     setCustomDimensionDescription:
-      reviewConfig
-        .setCustomDimensionDescription,
+      reviewConfig.setCustomDimensionDescription,
 
     setLessonReferenceMode:
-      reviewConfig
-        .setLessonReferenceMode,
+      reviewConfig.setLessonReferenceMode,
 
     bundle,
     session,
@@ -461,12 +450,10 @@ export function useCWAIReviewController({
       reviewItems.items,
 
     selectedItemIds:
-      reviewItems
-        .selectedItemIds,
+      deliverySelectedItemIds,
 
     materializingFindingIds:
-      reviewItems
-        .materializingFindingIds,
+      reviewItems.materializingFindingIds,
 
     loading,
     running,
@@ -487,20 +474,24 @@ export function useCWAIReviewController({
       execution.handleContinue,
 
     handleAdoptFinding:
-      reviewItems
-        .handleAdoptFinding,
+      reviewItems.handleAdoptFinding,
 
     handleToggleItemSelection:
-      reviewItems
-        .handleToggleItemSelection,
+      reviewItems.handleToggleItemSelection,
 
     handleRemoveSelectedItem:
-      reviewItems
-        .handleRemoveSelectedItem,
+      reviewItems.handleRemoveSelectedItem,
 
     handleItemChanged:
-      reviewItems
-        .handleItemChanged,
+      reviewItems.handleItemChanged,
+
+    /**
+     * R-07 Atomic Apply完成后供Panel重新读取整改项数据库真值。
+     *
+     * 该入口不接受Impact Plan payload，也不根据浏览器状态推断整改项结果。
+     */
+    refreshSessionItems:
+      reviewItems.refreshSessionItems,
 
     handleManageAssistants,
   };

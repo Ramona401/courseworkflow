@@ -148,21 +148,33 @@ func (s *CoursewareAutoAssemblyService) assemblePageImagesIAOCI(
 		)
 	if err != nil {
 		result.imageOK = false
-		result.errMsg = fmt.Sprintf(
-			"第%d页图片IAOCI规划失败: %v",
-			page.PageNumber,
-			err,
-		)
+
+		repairablePlanFailure :=
+			isCoursewareImageIAOCIPlanRepairableError(err)
+		placeholderState := "plan_error"
+		if repairablePlanFailure {
+			placeholderState = "plan_failed"
+			result.errMsg = fmt.Sprintf(
+				"第%d页图片规划格式自动修复后仍未通过",
+				page.PageNumber,
+			)
+		} else {
+			result.errMsg = fmt.Sprintf(
+				"第%d页图片规划暂时失败",
+				page.PageNumber,
+			)
+		}
 
 		currentHTML := page.HTMLContent
 
-		// 规划失败时隐藏所有真实占位，避免交付裂框。
+		// 只有“原规划+一次协议修复”仍失败才标成可智能补配的plan_failed。
+		// 网络、配置、鉴权等其它规划错误使用plan_error，避免教师按钮给出错误修复语义。
 		for _, slot := range slots {
 			currentHTML, _ =
 				cwHideImagePlaceholder(
 					currentHTML,
 					slot.PlaceholderID,
-					"plan_failed",
+					placeholderState,
 				)
 		}
 
@@ -177,6 +189,7 @@ func (s *CoursewareAutoAssemblyService) assemblePageImagesIAOCI(
 		cwAssemblyLog.Warn(
 			"图片IAOCI规划失败",
 			"page", page.PageNumber,
+			"repairable", repairablePlanFailure,
 			"error", err,
 		)
 
@@ -215,6 +228,47 @@ func (s *CoursewareAutoAssemblyService) assemblePageImagesIAOCI(
 	failures := make([]string, 0)
 
 	for _, plan := range plans {
+		reusedHTML, reused, reuseErr :=
+			s.reuseGeneratedIAOCIPlan(
+				ctx,
+				pageContext.coursewareID,
+				freshPage,
+				plan,
+				currentHTML,
+			)
+		if reuseErr != nil {
+			cwAssemblyLog.Warn(
+				"复用已成功IAOCI图片失败，继续按当前槽位生成链处理",
+				"page", page.PageNumber,
+				"placeholder_id", plan.PlaceholderID,
+				"image_key", plan.ImageKey,
+				"error", reuseErr,
+			)
+		} else if reused {
+			currentHTML = reusedHTML
+			successCount++
+
+			GlobalCWSSEHub.Broadcast(
+				pageContext.coursewareID,
+				CWSSEEvent{
+					EventType: "assembly_page_image",
+					Data: map[string]interface{}{
+						"page_number":    page.PageNumber,
+						"stage":          "image_slot_reused",
+						"placeholder_id": plan.PlaceholderID,
+						"image_key":      plan.ImageKey,
+						"message": fmt.Sprintf(
+							"第 %d 页：已复用成功配图 %s，不重复生图。",
+							page.PageNumber,
+							plan.PlaceholderID,
+						),
+					},
+				},
+			)
+
+			continue
+		}
+
 		GlobalCWSSEHub.Broadcast(
 			pageContext.coursewareID,
 			CWSSEEvent{
@@ -244,18 +298,12 @@ func (s *CoursewareAutoAssemblyService) assemblePageImagesIAOCI(
 			)
 
 		imageResponse, generationErr :=
-			s.assetService.GenerateImageFromIAOCI(
+			s.generateImageFromIAOCIWithAutoRepair(
 				ctx,
-				&GenerateImageIAOCIRequest{
-					CoursewareID:        pageContext.coursewareID,
-					PageNumber:          page.PageNumber,
-					PlaceholderID:       plan.PlaceholderID,
-					ImageKey:            plan.ImageKey,
-					Prompt:              plan.Prompt,
-					Size:                plan.Size,
-					RelationRefImageURL: relationReference,
-					Actor:               pageContext.actor,
-				},
+				pageContext,
+				page,
+				plan,
+				relationReference,
 			)
 
 		if generationErr != nil ||
@@ -303,11 +351,19 @@ func (s *CoursewareAutoAssemblyService) assemblePageImagesIAOCI(
 				failureMessage,
 			)
 
+			failureState := "generation_failed"
+			if errors.Is(
+				generationErr,
+				ErrCoursewareImageContentReviewRejected,
+			) {
+				failureState = "content_review_failed"
+			}
+
 			currentHTML, _ =
 				cwHideImagePlaceholder(
 					currentHTML,
 					plan.PlaceholderID,
-					"generation_failed",
+					failureState,
 				)
 
 			if persistErr :=
@@ -483,6 +539,109 @@ func (s *CoursewareAutoAssemblyService) assemblePageImagesIAOCI(
 			strings.Join(failures, "；"),
 		)
 	}
+}
+
+// reuseGeneratedIAOCIPlan 复用同一稳定image_key已经成功绑定的图片资产。
+//
+// 该入口只填回当前HTML占位并落库，不调用图片供应商、不新建资产、不产生新的媒体计费。
+func (s *CoursewareAutoAssemblyService) reuseGeneratedIAOCIPlan(
+	ctx context.Context,
+	coursewareID string,
+	page *models.CoursewarePage,
+	plan CoursewareImageAOCIPlanItem,
+	currentHTML string,
+) (
+	string,
+	bool,
+	error,
+) {
+	index, err :=
+		repository.GetCoursewareImageIndexByKey(
+			ctx,
+			coursewareID,
+			plan.ImageKey,
+		)
+	if err != nil ||
+		index == nil ||
+		index.Status !=
+			models.CWImageIndexStatusGenerated ||
+		index.AssetID == nil ||
+		strings.TrimSpace(
+			*index.AssetID,
+		) == "" {
+		return currentHTML, false, nil
+	}
+
+	asset, err :=
+		repository.GetCWAssetByID(
+			ctx,
+			*index.AssetID,
+		)
+	if err != nil {
+		return currentHTML,
+			false,
+			fmt.Errorf(
+				"已生成图片资产不可读取: %w",
+				err,
+			)
+	}
+	if asset == nil {
+		return currentHTML,
+			false,
+			fmt.Errorf(
+				"已生成图片资产不存在",
+			)
+	}
+
+	imageURL :=
+		resolveAssetPublicURL(asset)
+	if strings.TrimSpace(imageURL) == "" {
+		return currentHTML,
+			false,
+			fmt.Errorf(
+				"已生成图片资产缺少可用URL",
+			)
+	}
+
+	filledHTML, filled :=
+		cwFillImagePlaceholder(
+			currentHTML,
+			plan.PlaceholderID,
+			imageURL,
+			index.FocusText,
+		)
+	if !filled {
+		return currentHTML,
+			false,
+			fmt.Errorf(
+				"已生成图片未找到对应HTML占位",
+			)
+	}
+
+	if err :=
+		s.persistIAOCIAssemblyHTML(
+			ctx,
+			page,
+			filledHTML,
+		); err != nil {
+		return currentHTML,
+			false,
+			fmt.Errorf(
+				"复用已生成图片写回HTML失败: %w",
+				err,
+			)
+	}
+
+	cwAssemblyLog.Info(
+		"IAOCI图片槽位复用已成功资产",
+		"courseware_id", coursewareID,
+		"page", page.PageNumber,
+		"placeholder_id", plan.PlaceholderID,
+		"image_key", plan.ImageKey,
+		"asset_id", *index.AssetID,
+	)
+
+	return filledHTML, true, nil
 }
 
 // resolveImageIAOCIRelationReference 解析第一张可用的显式R参考图。

@@ -59,7 +59,7 @@ interface CoursewareAssistantDeploymentManagerProps {
   disabled?: boolean;
   visible?: boolean;
 
-  onChanged: () => void;
+  onChanged?: () => void;
   onStateChange?: (
     state: CoursewareAssistantDeploymentDockState,
   ) => void;

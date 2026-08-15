@@ -6,7 +6,10 @@ package services
 //
 // 生命周期：
 //
-//	confirmed -> applying -> applied
+//      confirmed -> applying -> applied
+//                         ^        |
+//                         |        |
+//                         +--------+  自审“继续调整”再次进入页面修改
 //
 // applied表示页面修改已经完成，但不自动等于问题已经解决：
 //   - 正式审核问题需要等待审核员复审确认；
@@ -20,8 +23,9 @@ package services
 //   5. 开始应用时在事务内重新校验版本状态、可信正文和页面哈希；
 //   6. Begin返回事务确认的稳定page_id、页码和页面哈希；
 //   7. 页面AI服务必须绑定该守卫，并在最终写入时执行CAS；
-//   8. AI微调失败时允许applying回退confirmed并清除临时版本绑定；
-//   9. 页面写入成功后只记录applied，不能自动记录resolved。
+//   8. 首次AI微调失败时允许applying回退confirmed；
+//   9. 自审再次调整失败时恢复上一次applied事实，不丢失既有成功修改；
+//  10. 页面写入成功后只记录applied，不能自动记录resolved。
 
 import (
 	"context"
@@ -184,9 +188,10 @@ func BeginCWReviewItemApplication(
 	}, nil
 }
 
-// AbortCWReviewItemApplication 在页面AI微调失败时恢复confirmed，允许作者重试。
+// AbortCWReviewItemApplication 在页面AI微调失败时恢复安全的上一个状态。
 //
-// 数据库守卫会在applying且尚未形成applied事实时清除临时应用版本引用。
+// 首次修改失败恢复confirmed；
+// 自审“继续调整”失败则恢复上一次applied事实，并重新检查修改完成后的页面指纹。
 func AbortCWReviewItemApplication(
 	ctx context.Context,
 	itemID string,
@@ -216,14 +221,43 @@ func AbortCWReviewItemApplication(
 		return repository.ErrCoursewareReviewItemConflict
 	}
 
-	return repository.TransitionCoursewareReviewItemStatus(
+	if item.SourceType ==
+		models.CWReviewItemSourceSelf &&
+		strings.TrimSpace(
+			item.AppliedPageHash,
+		) != "" {
+		err :=
+			repository.RestoreSelfCoursewareReviewItemAfterReapplyAbort(
+				ctx,
+				item.ID,
+				actor.UserID,
+			)
+		if err != nil {
+			switch {
+			case errors.Is(
+				err,
+				repository.ErrCoursewareReviewItemAppliedPageChanged,
+			):
+				return ErrCWReviewItemStale
+
+			case errors.Is(
+				err,
+				repository.ErrCoursewareReviewItemAppliedPageMissing,
+			):
+				return ErrCWReviewItemOrphaned
+
+			default:
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	return repository.AbortCoursewareReviewItemInitialApplication(
 		ctx,
 		item.ID,
 		actor.UserID,
-		models.CWReviewItemStatusConfirmed,
-		[]string{
-			models.CWReviewItemStatusApplying,
-		},
 	)
 }
 
@@ -291,16 +325,37 @@ func CompleteCWReviewItemApplication(
 
 	if currentHash != expectedHash {
 		// 页面在微调写入后又发生变化，不能宣称本次修改已经稳定完成。
-		_ = repository.TransitionCoursewareReviewItemStatus(
-			ctx,
-			item.ID,
-			actor.UserID,
-			models.CWReviewItemStatusStale,
-			[]string{
-				models.CWReviewItemStatusApplying,
-				models.CWReviewItemStatusApplied,
-			},
-		)
+		if item.Status == models.CWReviewItemStatusApplying &&
+			item.SourceType == models.CWReviewItemSourceSelf &&
+			strings.TrimSpace(item.AppliedPageHash) != "" {
+			restoreErr :=
+				repository.RestoreSelfCoursewareReviewItemAfterReapplyAbort(
+					ctx,
+					item.ID,
+					actor.UserID,
+				)
+			if restoreErr != nil &&
+				!errors.Is(
+					restoreErr,
+					repository.ErrCoursewareReviewItemAppliedPageChanged,
+				) &&
+				!errors.Is(
+					restoreErr,
+					repository.ErrCoursewareReviewItemAppliedPageMissing,
+				) {
+				return nil, restoreErr
+			}
+		} else if item.Status == models.CWReviewItemStatusApplying {
+			if err :=
+				repository.InvalidateCoursewareReviewItemInitialApplication(
+					ctx,
+					item.ID,
+					actor.UserID,
+					models.CWReviewItemStatusStale,
+				); err != nil {
+				return nil, err
+			}
+		}
 
 		return nil, ErrCoursewarePageMutationConflict
 	}

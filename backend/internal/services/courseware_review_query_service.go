@@ -19,6 +19,13 @@ package services
 //   4. 作者重新提交时将问题登记到本级、本轮；
 //   5. 问题尚未被人工确认解决。
 //
+// R-01.1复审教师契约：
+//
+//   - CarryoverItems与普通整改项使用同一个BuildCWReviewItemTeacherView；
+//   - 前端默认展示只消费教师字段；
+//   - 旧Title/Description只作为教师化兼容映射；
+//   - 页面与修改完成哈希固定不进入浏览器响应。
+//
 // Repository查询错误直接向上返回，不返回部分列表。
 
 import (
@@ -601,6 +608,10 @@ func (s *CoursewareReviewService) GetReviewDetail(
 	}, nil
 }
 
+// buildCWReviewCarryoverItems 把数据库正式整改项转换为审核员复审安全视图。
+//
+// 教师内容统一复用BuildCWReviewItemTeacherView，不在复审链重新解析技术证据。
+// 页面哈希和应用哈希只供后端状态校验，浏览器响应固定为空串。
 func buildCWReviewCarryoverItems(
 	items []*models.CoursewareReviewItem,
 ) []*models.CWReviewCarryoverItem {
@@ -616,6 +627,11 @@ func buildCWReviewCarryoverItems(
 			continue
 		}
 
+		teacherView :=
+			BuildCWReviewItemTeacherView(
+				item,
+			)
+
 		result = append(
 			result,
 			&models.CWReviewCarryoverItem{
@@ -630,18 +646,30 @@ func buildCWReviewCarryoverItems(
 				PageID:                item.PageID,
 				PageNumberSnapshot:    item.PageNumberSnapshot,
 				PageTitleSnapshot:     item.PageTitleSnapshot,
-				PageHTMLHash:          item.PageHTMLHash,
+				PageHTMLHash:          "",
 				PageUpdatedAtSnapshot: item.PageUpdatedAtSnapshot,
 
 				Severity:  item.Severity,
 				Dimension: item.Dimension,
 
-				Title:                item.Title,
-				Description:          item.Description,
+				Title:       teacherView.TeacherTitle,
+				Description: teacherView.WhatHappened,
+
+				TeacherTitle:    teacherView.TeacherTitle,
+				WhatHappened:    teacherView.WhatHappened,
+				TeachingImpact:  teacherView.TeachingImpact,
+				ImprovementGoal: teacherView.ImprovementGoal,
+				AcceptanceChecks: append(
+					[]string{},
+					teacherView.AcceptanceChecks...,
+				),
+				TeacherContext:      teacherView.TeacherContext,
+				ManualCheckRequired: teacherView.ManualCheckRequired,
+
 				ConfirmedInstruction: item.ConfirmedInstruction,
 
 				Status:          item.Status,
-				AppliedPageHash: item.AppliedPageHash,
+				AppliedPageHash: "",
 
 				ConfirmedAt:   item.ConfirmedAt,
 				AppliedAt:     item.AppliedAt,

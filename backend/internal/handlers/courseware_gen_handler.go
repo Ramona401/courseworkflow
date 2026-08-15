@@ -427,19 +427,35 @@ func (h *CoursewareGenHandler) CancelGenerate(
 		return
 	}
 
-	if err := h.genService.CancelGenerate(
+	if err := h.genService.CancelGenerateVersioned(
 		r.Context(),
 		id,
 		scopedActor,
 	); err != nil {
-		writeCoursewareOwnerRuntimeError(w, err)
+		switch {
+		case errors.Is(
+			err,
+			services.ErrCoursewareBatchRunKindMismatch,
+		):
+			utils.Fail(
+				w,
+				http.StatusConflict,
+				"当前运行是全自动装配，请使用“停止装配”操作",
+			)
+
+		default:
+			writeCoursewareOwnerRuntimeError(
+				w,
+				err,
+			)
+		}
 		return
 	}
 
 	utils.Success(
 		w,
 		map[string]string{
-			"message":       "已发送停止信号",
+			"message":       "已发送停止信号；已完成页面保留，未完成页可稍后只补生成",
 			"courseware_id": id,
 		},
 	)

@@ -97,7 +97,7 @@ export interface CWAIReviewReportViewProps {
     pageNumber: number,
   ) => void;
 
-  onUseReviewComment: (
+  onUseReviewComment?: (
     comment: string,
   ) => void;
 
@@ -579,7 +579,7 @@ export default function CWAIReviewReportView({
           >
             {isSelfReview
               ? "AI自审修改摘要"
-              : "AI审核意见草稿"}
+              : "AI初始审核意见草稿（只读参考）"}
           </div>
 
           <div
@@ -600,31 +600,32 @@ export default function CWAIReviewReportView({
             />
           </div>
 
-          <button
-            type="button"
-            onClick={() =>
-              onUseReviewComment(
-                finalReport
-                  .review_comment_draft,
-              )
-            }
-            style={{
-              width: "100%",
-              marginTop: "9px",
-              padding: "7px",
-              borderRadius: "7px",
-              border: "none",
-              background: C.primary,
-              color: "#fff",
-              fontSize: "11px",
-              fontWeight: 700,
-              cursor: "pointer",
-            }}
-          >
-            {isSelfReview
-              ? "复制自审修改摘要"
-              : "填入人工审核意见"}
-          </button>
+          {isSelfReview &&
+            onUseReviewComment && (
+            <button
+              type="button"
+              onClick={() =>
+                onUseReviewComment(
+                  finalReport
+                    .review_comment_draft,
+                )
+              }
+              style={{
+                width: "100%",
+                marginTop: "9px",
+                padding: "7px",
+                borderRadius: "7px",
+                border: "none",
+                background: C.primary,
+                color: "#fff",
+                fontSize: "11px",
+                fontWeight: 700,
+                cursor: "pointer",
+              }}
+            >
+              复制自审修改摘要
+            </button>
+          )}
 
           <div
             style={{
@@ -636,7 +637,7 @@ export default function CWAIReviewReportView({
           >
             {isSelfReview
               ? "自审项仅作者可见；确认后的指令仍需手动注入页面微调。"
-              : "所有已确认整改项会自动进入退回清单；审核者仍可手动排除。"}
+              : "这是最终综合阶段生成的初始参考，不会直接写入人工审核意见。正式审核请使用“审核意见重新整理”，基于当前修改清单生成候选并确认差异。"}
           </div>
         </div>
       )}

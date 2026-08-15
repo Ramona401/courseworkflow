@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"tedna/internal/logger"
 	"tedna/internal/models"
@@ -136,7 +137,11 @@ func (s *WorkshopStageService) GetStageStatus(
 		return nil, ErrStageNotInitialized
 	}
 
-	outputs, _ := repository.ListStageOutputs(ctx, lessonPlanID)
+	outputs, err := repository.ListStageOutputs(ctx, lessonPlanID)
+	if err != nil {
+		return nil, err
+	}
+
 	outputByStage := make(
 		map[string]*models.WorkshopStageOutput,
 		len(outputs),
@@ -208,17 +213,41 @@ func (s *WorkshopStageService) GetStageOutput(
 	}
 
 	return &models.StageOutputResponse{
-		StageCode:       output.StageCode,
-		StageName:       stageCodeToName(output.StageCode),
+		StageCode:        output.StageCode,
+		StageName:        stageCodeToName(output.StageCode),
 		StructuredOutput: output.StructuredOutput,
-		NarrativeOutput: output.NarrativeOutput,
-		Status:          output.Status,
-		ModelUsed:       output.ModelUsed,
-		TokensUsed:      output.TokensUsed,
+		NarrativeOutput:  output.NarrativeOutput,
+		Status:           output.Status,
+		ModelUsed:        output.ModelUsed,
+		TokensUsed:       output.TokensUsed,
 	}, nil
 }
 
+// EnsureStageOutput 确保教案阶段快照中的目标阶段拥有产出记录。
+//
+// 这是阶段生命周期的统一入口：调用方只传教案ID和阶段代码，stage_order 必须由服务端
+// lesson_plans.stage_config 快照解析，禁止从浏览器或AI回复中信任阶段序号。
+func (s *WorkshopStageService) EnsureStageOutput(
+	ctx context.Context,
+	lessonPlanID string,
+	stageCode string,
+) error {
+	snapshot, err := s.stageSnapshotForPlan(ctx, lessonPlanID, stageCode)
+	if err != nil {
+		return err
+	}
+
+	return s.ensureStageOutputForSnapshot(
+		ctx,
+		lessonPlanID,
+		*snapshot,
+		"{}",
+	)
+}
+
 // SaveStageOutput 保存阶段结构化产出和自然语言摘要。
+//
+// 合法阶段记录缺失时由Repository幂等创建，避免“正文已提交但阶段产出不存在”的双事实源。
 func (s *WorkshopStageService) SaveStageOutput(
 	ctx context.Context,
 	lessonPlanID string,
@@ -228,15 +257,114 @@ func (s *WorkshopStageService) SaveStageOutput(
 	modelUsed string,
 	tokensUsed int,
 ) error {
-	return repository.UpdateStageOutputContent(
+	snapshot, err := s.stageSnapshotForPlan(ctx, lessonPlanID, stageCode)
+	if err != nil {
+		return err
+	}
+
+	return repository.UpsertStageOutputContent(
 		ctx,
 		lessonPlanID,
-		stageCode,
+		snapshot.StageCode,
+		snapshot.StageOrder,
 		structuredJSON,
 		narrative,
 		modelUsed,
 		tokensUsed,
 	)
+}
+
+// SaveCompletedStageOutput 原子保存正式阶段产出并标记为 completed。
+//
+// write/revise 正式正文已经通过正文事务提交后，必须使用本入口一次性固化阶段内容和完成状态，
+// 禁止再执行“先Complete、后Save”两次独立UPDATE。
+func (s *WorkshopStageService) SaveCompletedStageOutput(
+	ctx context.Context,
+	lessonPlanID string,
+	stageCode string,
+	structuredJSON string,
+	narrative string,
+	modelUsed string,
+	tokensUsed int,
+	conversationSnapshot string,
+) error {
+	snapshot, err := s.stageSnapshotForPlan(ctx, lessonPlanID, stageCode)
+	if err != nil {
+		return err
+	}
+
+	return repository.UpsertCompletedStageOutputContent(
+		ctx,
+		lessonPlanID,
+		snapshot.StageCode,
+		snapshot.StageOrder,
+		structuredJSON,
+		narrative,
+		modelUsed,
+		tokensUsed,
+		conversationSnapshot,
+	)
+}
+
+// ensureStageOutputForSnapshot 使用已经由服务端解析的阶段快照幂等创建产出记录。
+// initialStructured 只在首次创建时生效；记录已存在时不会覆盖既有正式产出。
+func (s *WorkshopStageService) ensureStageOutputForSnapshot(
+	ctx context.Context,
+	lessonPlanID string,
+	snapshot models.StageConfigSnapshot,
+	initialStructured string,
+) error {
+	if strings.TrimSpace(initialStructured) == "" {
+		initialStructured = "{}"
+	}
+
+	output := &models.WorkshopStageOutput{
+		LessonPlanID:         lessonPlanID,
+		StageCode:            snapshot.StageCode,
+		StageOrder:           snapshot.StageOrder,
+		StructuredOutput:     initialStructured,
+		NarrativeOutput:      "",
+		ConversationSnapshot: "[]",
+		Status:               models.StageOutputInProgress,
+	}
+
+	return repository.EnsureStageOutput(ctx, output)
+}
+
+// stageSnapshotForPlan 从教案固化的阶段配置中解析目标阶段。
+func (s *WorkshopStageService) stageSnapshotForPlan(
+	ctx context.Context,
+	lessonPlanID string,
+	stageCode string,
+) (*models.StageConfigSnapshot, error) {
+	lessonPlanID = strings.TrimSpace(lessonPlanID)
+	stageCode = strings.TrimSpace(stageCode)
+	if lessonPlanID == "" || stageCode == "" {
+		return nil, ErrStageInvalidTarget
+	}
+
+	lessonPlan, err := repository.GetLessonPlanByID(ctx, lessonPlanID)
+	if err != nil {
+		return nil, err
+	}
+
+	var snapshots []models.StageConfigSnapshot
+	if lessonPlan.StageConfig != "" && lessonPlan.StageConfig != "[]" {
+		if err := json.Unmarshal([]byte(lessonPlan.StageConfig), &snapshots); err != nil {
+			return nil, fmt.Errorf("解析教案阶段配置失败: %w", err)
+		}
+	}
+	if len(snapshots) == 0 {
+		return nil, ErrStageNotInitialized
+	}
+
+	targetIndex := findStageIndex(snapshots, stageCode)
+	if targetIndex < 0 {
+		return nil, ErrStageInvalidTarget
+	}
+
+	snapshot := snapshots[targetIndex]
+	return &snapshot, nil
 }
 
 // resolveStages 解析阶段快照并定位当前阶段。

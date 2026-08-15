@@ -593,6 +593,13 @@ func (s *CoursewareAssetService) downloadAndSaveImageWithMetadata(
 			)
 	}
 
+	// os.CreateTemp 默认创建私有临时文件，os.Rename 会保留原文件权限。
+	// 图片已经完成下载、签名校验和原子改名后，才开放为 Nginx 可读的正式静态资产。
+	if err := os.Chmod(fullPath, CWAssetPublicFileMode); err != nil {
+		_ = os.Remove(fullPath)
+		return nil, fmt.Errorf("设置生成图片公开读取权限失败: %w", err)
+	}
+
 	removeTemporary =
 		false
 

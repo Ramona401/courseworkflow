@@ -590,6 +590,26 @@ func handleStageError(
 	switch {
 	case errors.Is(
 		err,
+		services.ErrLPGenTaskRunning,
+	):
+		utils.Fail(
+			w,
+			http.StatusConflict,
+			err.Error(),
+		)
+
+	case errors.Is(
+		err,
+		services.ErrLPGenServiceDraining,
+	):
+		utils.Fail(
+			w,
+			http.StatusServiceUnavailable,
+			err.Error(),
+		)
+
+	case errors.Is(
+		err,
 		services.ErrStageNotInitialized,
 	):
 		utils.Fail(
@@ -673,7 +693,7 @@ func handleStageError(
 		errors.Is(
 			err,
 			repository.ErrLessonPlanKnowledgeLineageSourceUnavailable,
-	),
+		),
 		errors.Is(
 			err,
 			repository.ErrLessonPlanKnowledgeLineageConfirmedStageUnavailable,
@@ -741,4 +761,3 @@ func handleStageError(
 		)
 	}
 }
-

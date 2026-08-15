@@ -1,7 +1,7 @@
 /**
  * useExternalRefineInstruction.ts
  *
- * 将正式审核或作者自审中已经独立确认的修改指令，
+ * 将正式审核或作者自审中已经独立确认的修改要求，
  * 写入当前页面的受保护微调草稿。
  *
  * 安全边界：
@@ -9,7 +9,7 @@
  *   2. 保留老师当前尚未提交的草稿；
  *   3. 相同注入ID只消费一次；
  *   4. 注入后切换到安全默认的保留结构微调；
- *   5. 父组件收到消费回调后清除一次性注入信号。
+ *   5. 页面真正修改成功后，父组件再解除一次性注入信号。
  */
 
 import {
@@ -30,7 +30,7 @@ import type {
   ProtectedDraftSetter,
 } from "@/hooks/useProtectedDraft";
 
-/** 父组件传入的一次性整改指令。 */
+/** 父组件传入的一次性整改要求。 */
 export interface RefinePanelExternalInstruction {
   /** 每次注入使用唯一ID，防止重复追加草稿。 */
   id: string;
@@ -44,7 +44,7 @@ export interface RefinePanelExternalInstruction {
   /** 稳定页面解析后的当前页码。 */
   targetPageNumber: number;
 
-  /** 用户已经独立确认的最终修改指令。 */
+  /** 用户已经独立确认的最终修改要求或修改方案。 */
   content: string;
 }
 
@@ -54,7 +54,6 @@ export interface UseExternalRefineInstructionOptions {
     | null;
 
   coursewareId: string;
-
   pageNum: number;
 
   updateRefineInput:
@@ -69,11 +68,10 @@ export interface UseExternalRefineInstructionOptions {
     Dispatch<
       SetStateAction<string>
     >;
-
 }
 
 /**
- * 消费外部确认指令并写入受保护草稿。
+ * 消费外部确认要求并写入受保护草稿。
  */
 export function useExternalRefineInstruction({
   externalInstruction,
@@ -93,20 +91,24 @@ export function useExternalRefineInstruction({
   useEffect(() => {
     if (
       !externalInstruction ||
-      externalInstruction.coursewareId !==
+      externalInstruction
+        .coursewareId !==
         coursewareId ||
-      externalInstruction.targetPageNumber !==
+      externalInstruction
+        .targetPageNumber !==
         pageNum
     ) {
       return;
     }
 
     const instructionID =
-      externalInstruction.id.trim();
+      externalInstruction
+        .id.trim();
 
     if (
       !instructionID ||
-      lastConsumedIDRef.current ===
+      lastConsumedIDRef
+        .current ===
         instructionID
     ) {
       return;
@@ -116,37 +118,39 @@ export function useExternalRefineInstruction({
       instructionID;
 
     const content =
-      externalInstruction.content.trim();
+      externalInstruction
+        .content.trim();
 
-    if (content) {
-      updateRefineInput(
-        (previous) => {
-          const current =
-            previous.trim();
-
-          if (
-            current.includes(
-              content,
-            )
-          ) {
-            return previous;
-          }
-
-          return current
-            ? `${current}\n\n${content}`
-            : content;
-        },
-      );
-
-      setRefineMode(
-        "preserve",
-      );
-
-      setMessage(
-        "✅ 已把确认的审核修改指令注入当前页草稿，请检查后手动点击“AI微调”",
-      );
+    if (!content) {
+      return;
     }
 
+    updateRefineInput(
+      (previous) => {
+        const current =
+          previous.trim();
+
+        if (
+          current.includes(
+            content,
+          )
+        ) {
+          return previous;
+        }
+
+        return current
+          ? `${current}\n\n${content}`
+          : content;
+      },
+    );
+
+    setRefineMode(
+      "preserve",
+    );
+
+    setMessage(
+      "✅ 已把当前确认的修改要求带入本页草稿，请检查后手动点击“AI微调”",
+    );
   }, [
     externalInstruction,
     coursewareId,

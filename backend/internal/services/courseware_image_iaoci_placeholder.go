@@ -44,13 +44,21 @@ var (
 	cwImagePlaceholderClassRe = regexp.MustCompile(
 		`(?i)\bclass\s*=\s*["'][^"']*img-placeholder[^"']*["']`,
 	)
+	cwImagePlaceholderClassValueRe = regexp.MustCompile(
+		`(?i)\bclass\s*=\s*["']([^"']*)["']`,
+	)
 
 	cwImagePlaceholderIDAttrRe = regexp.MustCompile(
 		`(?i)\bdata-placeholder-id\s*=\s*["']([^"']*)["']`,
 	)
-
 	cwImagePlaceholderDescAttrRe = regexp.MustCompile(
 		`(?i)\bdata-desc\s*=\s*["']([^"']*)["']`,
+	)
+	cwImagePlaceholderStateAttrRe = regexp.MustCompile(
+		`(?i)\bdata-image-state\s*=\s*["']([^"']*)["']`,
+	)
+	cwImagePlaceholderStyleAttrRe = regexp.MustCompile(
+		`(?i)\bstyle\s*=\s*["']([^"']*)["']`,
 	)
 )
 
@@ -190,6 +198,196 @@ func cwNextImagePlaceholderID(
 	}
 }
 
+// cwSetImagePlaceholderFailureOpenTag 保留槽位原始语义，只追加失败状态与隐藏标记。
+//
+// 过去失败时会把整个open tag重建成只有placeholder_id的新div，导致data-desc等教学语义丢失；
+// 后续补配只能看到“页面第N个内容配图槽位”。现在保留原属性和样式，并在保留原style的基础上追加display:none控制不可见。
+func cwSetImagePlaceholderFailureOpenTag(
+	openTag string,
+	state string,
+) string {
+	openTag = cwSetImagePlaceholderClassFlag(
+		openTag,
+		"iaoci-image-hidden",
+		true,
+	)
+	openTag = cwSetImagePlaceholderStateAttribute(
+		openTag,
+		state,
+	)
+
+	return cwAppendImagePlaceholderDisplayNone(
+		openTag,
+	)
+}
+
+// cwRestoreImagePlaceholderOpenTag 在补配成功时恢复槽位可见性。
+// 同时兼容历史版本留下的style="display:none"隐藏占位。
+func cwRestoreImagePlaceholderOpenTag(
+	openTag string,
+) string {
+	openTag = cwSetImagePlaceholderClassFlag(
+		openTag,
+		"iaoci-image-hidden",
+		false,
+	)
+	openTag = cwImagePlaceholderStateAttrRe.ReplaceAllString(
+		openTag,
+		"",
+	)
+	return cwRemoveLegacyImagePlaceholderDisplayNone(
+		openTag,
+	)
+}
+
+func cwSetImagePlaceholderClassFlag(
+	openTag string,
+	className string,
+	enabled bool,
+) string {
+	match := cwImagePlaceholderClassValueRe.FindStringSubmatchIndex(
+		openTag,
+	)
+	if len(match) < 4 {
+		if !enabled {
+			return openTag
+		}
+		return cwInsertImagePlaceholderAttribute(
+			openTag,
+			` class="`+stdhtml.EscapeString(className)+`"`,
+		)
+	}
+
+	current := strings.Fields(
+		stdhtml.UnescapeString(openTag[match[2]:match[3]]),
+	)
+	classes := make([]string, 0, len(current)+1)
+	found := false
+	for _, item := range current {
+		if item == className {
+			found = true
+			if !enabled {
+				continue
+			}
+		}
+		classes = append(classes, item)
+	}
+	if enabled && !found {
+		classes = append(classes, className)
+	}
+
+	replacement := `class="` +
+		stdhtml.EscapeString(strings.Join(classes, " ")) +
+		`"`
+	return openTag[:match[0]] +
+		replacement +
+		openTag[match[1]:]
+}
+
+func cwSetImagePlaceholderStateAttribute(
+	openTag string,
+	state string,
+) string {
+	state = strings.TrimSpace(state)
+	replacement := `data-image-state="` +
+		stdhtml.EscapeString(state) + `"`
+
+	match := cwImagePlaceholderStateAttrRe.FindStringIndex(openTag)
+	if len(match) == 2 {
+		return openTag[:match[0]] +
+			replacement +
+			openTag[match[1]:]
+	}
+
+	return cwInsertImagePlaceholderAttribute(
+		openTag,
+		" "+replacement,
+	)
+}
+
+func cwInsertImagePlaceholderAttribute(
+	openTag string,
+	attribute string,
+) string {
+	insertAt := strings.LastIndex(openTag, ">")
+	if insertAt < 0 {
+		return openTag
+	}
+	return openTag[:insertAt] + attribute + openTag[insertAt:]
+}
+
+func cwAppendImagePlaceholderDisplayNone(
+	openTag string,
+) string {
+	match := cwImagePlaceholderStyleAttrRe.FindStringSubmatchIndex(openTag)
+	if len(match) < 4 {
+		return cwInsertImagePlaceholderAttribute(
+			openTag,
+			` style="display:none"`,
+		)
+	}
+
+	styleText := strings.TrimSpace(
+		stdhtml.UnescapeString(openTag[match[2]:match[3]]),
+	)
+	if styleText != "" && !strings.HasSuffix(styleText, ";") {
+		styleText += ";"
+	}
+	styleText += "display:none"
+
+	replacement := `style="` +
+		stdhtml.EscapeString(styleText) +
+		`"`
+	return openTag[:match[0]] +
+		replacement +
+		openTag[match[1]:]
+}
+
+func cwRemoveLegacyImagePlaceholderDisplayNone(
+	openTag string,
+) string {
+	match := cwImagePlaceholderStyleAttrRe.FindStringSubmatchIndex(openTag)
+	if len(match) < 4 {
+		return openTag
+	}
+
+	styleText := stdhtml.UnescapeString(
+		openTag[match[2]:match[3]],
+	)
+	kept := make([]string, 0)
+	for _, declaration := range strings.Split(styleText, ";") {
+		declaration = strings.TrimSpace(declaration)
+		if declaration == "" {
+			continue
+		}
+
+		separator := strings.Index(declaration, ":")
+		if separator > 0 &&
+			strings.EqualFold(
+				strings.TrimSpace(declaration[:separator]),
+				"display",
+			) &&
+			strings.EqualFold(
+				strings.TrimSpace(declaration[separator+1:]),
+				"none",
+			) {
+			continue
+		}
+		kept = append(kept, declaration)
+	}
+
+	if len(kept) == 0 {
+		return openTag[:match[0]] + openTag[match[1]:]
+	}
+
+	replacement := `style="` +
+		stdhtml.EscapeString(strings.Join(kept, ";")) +
+		`"`
+	return openTag[:match[0]] +
+		replacement +
+		openTag[match[1]:]
+}
+
 // cwFindImagePlaceholderRange 定位指定占位的完整div区间。
 func cwFindImagePlaceholderRange(
 	pageHTML string,
@@ -239,14 +437,14 @@ func cwFindImagePlaceholderRange(
 		}
 
 		if cwImagePlaceholderContainsNested(
-                                pageHTML,
-                                location[1],
-                                closeStart,
-                        ) {
-                                return 0, 0, 0, false
-                        }
+			pageHTML,
+			location[1],
+			closeStart,
+		) {
+			return 0, 0, 0, false
+		}
 
-                        return location[0],
+		return location[0],
 			location[1],
 			closeStart,
 			true
@@ -271,7 +469,9 @@ func cwFillImagePlaceholder(
 		return pageHTML, false
 	}
 
-	openTag := pageHTML[start:openEnd]
+	openTag := cwRestoreImagePlaceholderOpenTag(
+		pageHTML[start:openEnd],
+	)
 
 	afterClose :=
 		pageHTML[closeStart+len("</div>"):]
@@ -303,7 +503,7 @@ func cwHideImagePlaceholder(
 	placeholderID string,
 	state string,
 ) (string, bool) {
-	start, _, closeStart, ok :=
+	start, openEnd, closeStart, ok :=
 		cwFindImagePlaceholderRange(
 			pageHTML,
 			placeholderID,
@@ -314,19 +514,14 @@ func cwHideImagePlaceholder(
 
 	afterClose :=
 		pageHTML[closeStart+len("</div>"):]
-
-	hidden := fmt.Sprintf(
-		`<div class="img-placeholder iaoci-image-hidden" data-placeholder-id="%s" data-image-state="%s" style="display:none"></div>`,
-		stdhtml.EscapeString(
-			placeholderID,
-		),
-		stdhtml.EscapeString(
-			state,
-		),
+	openTag := cwSetImagePlaceholderFailureOpenTag(
+		pageHTML[start:openEnd],
+		state,
 	)
 
 	return pageHTML[:start] +
-			hidden +
+			openTag +
+			"</div>" +
 			afterClose,
 		true
 }

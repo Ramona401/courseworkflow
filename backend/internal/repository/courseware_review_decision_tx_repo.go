@@ -6,19 +6,28 @@ package repository
 //
 // 同一事务内依次完成：
 //
-//   1. 锁定课件主记录；
-//   2. 再次确认课件仍处于预期待审状态；
-//   3. 校验AI审核会话属于当前课件、审核员和审核级别；
-//   4. 计算本次审核轮次；
-//   5. 锁定本级、本轮需要复查的旧问题；
-//   6. 校验审核员提交的“已解决旧问题”选择；
-//   7. 重新检查问题是否已经完成修改及页面内容指纹；
-//   8. 写courseware_reviews审核记录；
-//   9. 将审核员确认解决的旧问题写为resolved；
-//  10. 写不可变的courseware_review_feedback快照；
-//  11. 绑定本轮新确认并交付作者的问题；
-//  12. 更新课件发布状态和审核层级；
-//  13. 提交事务。
+//   1. 取得同课件页面集合事务级咨询锁；
+//   2. 锁定课件主记录；
+//   3. 再次确认课件仍处于预期待审状态；
+//   4. 校验AI审核会话属于当前课件、审核员和审核级别；
+//   5. 计算本次审核轮次；
+//   6. 锁定本级、本轮需要复查的旧问题；
+//   7. 校验审核员提交的“已解决旧问题”选择；
+//   8. 重新检查问题是否已经完成修改及页面内容指纹；
+//   9. 写courseware_reviews审核记录；
+//  10. 冻结本次审核提交时的全部课件页面；
+//  11. 将审核员确认解决的旧问题写为resolved；
+//  12. 写不可变的courseware_review_feedback快照；
+//  13. 绑定本轮新确认并交付作者的问题；
+//  14. 更新课件发布状态和审核层级；
+//  15. 提交事务。
+//
+// 页面锁序：
+//
+//   - 页码重排、校准和指定位置插页统一先取得
+//     lockCoursewarePageSequenceTx，再FOR UPDATE页面，最后更新coursewares；
+//   - 正式审核必须复用相同的课件页面集合咨询锁，并且在锁coursewares之前取得；
+//   - 禁止恢复为“先coursewares、后页面”的反向锁序，否则会与页序事务形成死锁环。
 //
 // 复审规则：
 //
@@ -106,6 +115,8 @@ func CommitCoursewareReviewDecision(
 			)
 	}
 
+	coursewareID := strings.TrimSpace(input.CoursewareID)
+
 	tx, err :=
 		database.DB.Begin(
 			ctx,
@@ -120,6 +131,28 @@ func CommitCoursewareReviewDecision(
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+
+	// 必须在取得coursewares行锁之前拿到同课件页面集合咨询锁。
+	//
+	// 页码重排、校准与插页事务的固定顺序是：
+	// advisory(courseware) -> page FOR UPDATE -> UPDATE coursewares。
+	//
+	// 如果正式审核先锁coursewares再等待页面，会形成反向锁序：
+	// review持有coursewares等待page，
+	// sequence持有page等待coursewares。
+	//
+	// 因此正式审核先复用同一咨询锁，使两类事务在取得实体行锁前串行。
+	if err := lockCoursewarePageSequenceTx(
+		ctx,
+		tx,
+		coursewareID,
+	); err != nil {
+		return nil, nil,
+			fmt.Errorf(
+				"取得正式审核课件页面集合事务锁失败: %w",
+				err,
+			)
+	}
 
 	var (
 		currentPublishState string
@@ -136,9 +169,7 @@ func CommitCoursewareReviewDecision(
 		WHERE id = $1
 		  AND deleted_at IS NULL
 		FOR UPDATE`,
-		strings.TrimSpace(
-			input.CoursewareID,
-		),
+		coursewareID,
 	).Scan(
 		&currentPublishState,
 		&currentReviewLevel,
@@ -192,9 +223,7 @@ func CommitCoursewareReviewDecision(
 				  AND status = 'done'
 			)`,
 			sessionID,
-			strings.TrimSpace(
-				input.CoursewareID,
-			),
+			coursewareID,
 			strings.TrimSpace(
 				input.ReviewerID,
 			),
@@ -223,10 +252,8 @@ func CommitCoursewareReviewDecision(
 
 	review :=
 		&models.CoursewareReview{
-			CoursewareID: strings.TrimSpace(
-				input.CoursewareID,
-			),
-			ReviewLevel: input.ReviewLevel,
+			CoursewareID: coursewareID,
+			ReviewLevel:  input.ReviewLevel,
 			ReviewerID: strings.TrimSpace(
 				input.ReviewerID,
 			),
@@ -336,6 +363,26 @@ func CommitCoursewareReviewDecision(
 				"创建课件审核记录失败: %w",
 				err,
 			)
+	}
+
+	pageSnapshotCount, snapshotErr :=
+		CreateCoursewareReviewPageSnapshotsTx(
+			ctx,
+			tx,
+			review.ID,
+			review.CoursewareID,
+		)
+	if snapshotErr != nil {
+		return nil, nil,
+			fmt.Errorf(
+				"冻结课件正式审核页面快照失败: %w",
+				snapshotErr,
+			)
+	}
+
+	if pageSnapshotCount <= 0 {
+		return nil, nil,
+			ErrCoursewareReviewPageSnapshotEmpty
 	}
 
 	if len(

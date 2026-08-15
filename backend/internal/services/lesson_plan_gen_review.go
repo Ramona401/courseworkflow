@@ -252,26 +252,9 @@ func (s *LessonPlanGenService) handleWriteStageOutput(
 	lp.Version =
 		mutation.CurrentVersion
 
-	if err :=
-		repository.CompleteStageOutput(
-			ctx,
-			planID,
-			lp.CurrentStage,
-			"[]",
-		); err != nil {
-		lpGenLog.Warn(
-			"自动完成write/revise阶段产出失败",
-			"plan_id", planID,
-			"stage", lp.CurrentStage,
-			"error", err,
-		)
-	} else {
-		lpGenLog.Info(
-			"write/revise阶段产出自动标记completed",
-			"plan_id", planID,
-			"stage", lp.CurrentStage,
-		)
-	}
+	// 阶段产出内容与 completed 状态由提交层在正文成功后通过
+	// SaveCompletedStageOutput 一次性原子固化；这里不再提前单独 Complete，
+	// 避免“正文已更新、完成状态更新失败、随后产出保存又失败”的双事实源。
 
 	lpGenLog.Info(
 		"write/revise阶段教案正文已安全更新",

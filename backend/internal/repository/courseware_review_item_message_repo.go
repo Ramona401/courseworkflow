@@ -80,6 +80,83 @@ func AppendCoursewareReviewItemMessage(
 	return nil
 }
 
+// AppendCoursewareReviewItemExecutionNote 追加作者正式整改过程中的“本次执行补充”。
+//
+// 与通用消息写入不同，本入口在同一条INSERT ... SELECT中再次校验：
+//   - 当前操作者仍是课件作者；
+//   - 整改项仍是已经正式交付的formal项；
+//   - 状态仍处于作者整改或待复审生命周期。
+//
+// 这样即使Service校验后发生并发状态变化，也不会把补充写进已经解决的历史记录。
+func AppendCoursewareReviewItemExecutionNote(
+	ctx context.Context,
+	message *models.CoursewareReviewItemMessage,
+	ownerID string,
+) error {
+	if message == nil {
+		return errors.New("课件整改执行补充消息不能为空")
+	}
+
+	message.Content = strings.TrimSpace(message.Content)
+	ownerID = strings.TrimSpace(ownerID)
+	if message.Content == "" || ownerID == "" {
+		return errors.New("课件整改执行补充内容或作者不能为空")
+	}
+
+	err := database.DB.QueryRow(
+		ctx,
+		`
+                INSERT INTO courseware_ai_review_messages (
+                        session_id,
+                        review_item_id,
+                        user_id,
+                        role,
+                        content,
+                        citations_json,
+                        tokens_used,
+                        model_used,
+                        created_at
+                )
+                SELECT
+                        $1, $2, $3, 'user', $4, $5::jsonb, 0, '', NOW()
+                FROM courseware_review_items item
+                WHERE item.id = $2
+                  AND item.source_session_id = $1
+                  AND item.owner_id = $3
+                  AND item.source_type = 'formal'
+                  AND item.courseware_review_id IS NOT NULL
+                  AND item.feedback_id IS NOT NULL
+                  AND item.delivered_instruction_version_id IS NOT NULL
+                  AND item.status IN (
+                        'confirmed',
+                        'applying',
+                        'applied',
+                        'stale',
+                        'orphaned'
+                  )
+                RETURNING id, created_at`,
+		strings.TrimSpace(message.SessionID),
+		strings.TrimSpace(message.ReviewItemID),
+		ownerID,
+		message.Content,
+		cwAIReviewJSONOrDefault(
+			message.CitationsJSON,
+			"{}",
+		),
+	).Scan(&message.ID, &message.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrCoursewareReviewItemConflict
+		}
+		return fmt.Errorf(
+			"追加课件整改执行补充失败: %w",
+			err,
+		)
+	}
+
+	return nil
+}
+
 // ListCoursewareReviewItemMessages 按时间正序返回单条整改项讨论。
 func ListCoursewareReviewItemMessages(
 	ctx context.Context,

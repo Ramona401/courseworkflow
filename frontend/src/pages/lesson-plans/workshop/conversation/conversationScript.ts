@@ -11,11 +11,10 @@
  *   - 新增 PLUS_MENU_ITEMS「+」菜单定义（Phase C 能力注册表的最小先行版）；
  *   - 新增 STAGES_WITH_COMPONENTS 组件阶段表（与 WorkshopPage 同名常量对齐）。
  *
- * A2-2 批次新增（课本中途挂载）：
- *   - N0 开场芯片恢复剧本第三枚「📷 先传课本图片」（open_tool textbook）——
- *     后端 PUT /plans/{id}/textbooks 端点已上线，引擎每轮重读 textbook_page_ids，
- *     挂载后下一轮对话自动携带课本OCR上下文；
- *   - 「+」菜单课本项由页面侧解除灰显（菜单定义本就包含，可用性在页面计算）。
+ * v234 统一附件入口：
+ *   - N0 开场区不再放“先传课本图片”，避免老师把图片上传误解为唯一附件入口；
+ *   - 文件统一从底部输入区拖入或通过“+ → 添加文件”选择；
+ *   - 正式教材依据仍保留独立入口“+ → 添加教材依据”，继续走课本上传/OCR/挂载硬链。
  *
  * v200 批次新增（design 阶段一键生成入口 + 写正文改名）：
  *   - design 芯片组补一枚 ⚡「一键生成教学设计」（full_generate, payload.stage=design）——
@@ -74,8 +73,7 @@ export interface ChipDef {
 
 /**
  * N0 开场芯片 —— StartConversation 返回开场白后、老师尚未发言时显示。
- * 剧本 N0：「按步骤来(默认高亮) / 直接出完整教案 / 先传课本图片」。
- * A2-2：第三枚「📷 先传课本图片」上线（后端中途挂载端点已就绪）。
+ * 这里只保留备课路径选择；文件和教材入口统一收到底部输入区。
  */
 export const N0_CHIPS: ChipDef[] = [
   {
@@ -92,13 +90,6 @@ export const N0_CHIPS: ChipDef[] = [
     label: '直接出完整教案',
     action_type: 'full_generate',
     payload: { stage: 'write' },
-  },
-  {
-    id: 'n0_textbook',
-    emoji: '📷',
-    label: '先传课本图片',
-    action_type: 'open_tool',
-    payload: { tool: 'textbook' },
   },
 ]
 
@@ -169,10 +160,30 @@ export interface PlusMenuItem {
 }
 
 export const PLUS_MENU_ITEMS: PlusMenuItem[] = [
-  { tool: 'components', emoji: '🧩', label: '教学组件', desc: '从组件库挑选参考组件加入对话' },
-  { tool: 'textbook',   emoji: '📷', label: '课本图片', desc: '让AI贴着课文原文来设计（下一轮生效）' },
-  { tool: 'import',     emoji: '📂', label: '导入教案', desc: '上传已有教案，AI评审并改进' },
-  { tool: 'ref_material', emoji: '📎', label: '参考资料', desc: '上传PDF/Word，AI备课时参考（本次对话内有效）' },
+  {
+    tool: 'attachment',
+    emoji: '📎',
+    label: '添加文件',
+    desc: 'PDF / Word / PPT / 文本 / 图片，作为当前对话参考资料',
+  },
+  {
+    tool: 'textbook',
+    emoji: '📚',
+    label: '添加教材依据',
+    desc: '选择已有教材页或上传教材图片，进入课本OCR与一致性校验',
+  },
+  {
+    tool: 'components',
+    emoji: '🧩',
+    label: '教学组件',
+    desc: '从组件库挑选参考组件加入对话',
+  },
+  {
+    tool: 'import',
+    emoji: '📂',
+    label: '导入已有教案',
+    desc: '把完整旧教案导入为可继续修改的教案',
+  },
 ]
 
 /**

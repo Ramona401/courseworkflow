@@ -105,6 +105,19 @@ func Setup(cfg *config.Config) http.Handler {
 	pipelineService.SetEngine(engine)
 
 	authHandler := handlers.NewAuthHandler(authService)
+
+	// Identity Phase 1使用惰性运行时：
+	// 这里只复制已经加载的本地JWT root secret用于Flow领域隔离派生，
+	// 不读取IDENTITY_CLIENT_SECRET，也不会因为Identity尚未配置而阻断TE-DNA启动。
+	identityAccountLinkProvider :=
+		services.NewIdentityAccountLinkServiceProvider(
+			cfg.JWTSecret,
+		)
+	identityAccountLinkHandler :=
+		handlers.NewIdentityAccountLinkHandler(
+			identityAccountLinkProvider,
+		)
+
 	userHandler := handlers.NewUserHandler(userService)
 	aiConfigHandler := handlers.NewAIConfigHandler(aiConfigService)
 	promptHandler := handlers.NewPromptHandler(promptService)
@@ -352,6 +365,32 @@ func Setup(cfg *config.Config) http.Handler {
 	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
 	mux.Handle("/api/v1/auth/me", middleware.Chain(http.HandlerFunc(authHandler.GetMe), authMW))
 	mux.Handle("/api/v1/auth/logout", middleware.Chain(http.HandlerFunc(authHandler.Logout), authMW))
+
+	// Identity Phase 1账号关联：
+	// Link/Unlink只能由现有TE-DNA JWT用户发起；OIDC callback不要求Bearer，
+	// 但真正的本地用户主体只能从AES-GCM认证的HttpOnly Flow Cookie恢复。
+	mux.Handle(
+		"/api/v1/auth/identity/link-url",
+		middleware.Chain(
+			http.HandlerFunc(
+				identityAccountLinkHandler.GetLinkURL,
+			),
+			authMW,
+		),
+	)
+	mux.Handle(
+		"/api/v1/auth/identity/unlink-url",
+		middleware.Chain(
+			http.HandlerFunc(
+				identityAccountLinkHandler.GetUnlinkURL,
+			),
+			authMW,
+		),
+	)
+	mux.HandleFunc(
+		"/api/v1/auth/identity/callback",
+		identityAccountLinkHandler.Callback,
+	)
 
 	mux.Handle("/api/v1/account/profile", middleware.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {

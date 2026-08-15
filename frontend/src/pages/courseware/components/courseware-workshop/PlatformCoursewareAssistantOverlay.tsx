@@ -8,7 +8,11 @@
  *   - AI完整回答的done事件到达后请求豆包自然语音，不朗读流式半成品；
  *   - 中文默认vivi 2.0，英文或字母为主默认Tim，失败时自动降级设备语音；
  *   - 开始录音前停止当前朗读和未完成的TTS请求，避免扬声器声音重新进入麦克风；
- *   - 全屏和放映默认启用课堂大字，嵌入预览可手动切换；
+ *   - 全屏和放映默认使用极简数字人课堂：人物靠右、当前回答气泡在左、麦克风与回答互斥；
+ *   - 课堂数字人支持男女老师两套动作资产，人物选择只放在完整智能体中；
+ *   - 数字人支持课堂隐藏和右侧边缘唤醒，隐藏期间不自动朗读新回答；
+ *   - 完整智能体只在老师主动展开时显示历史、文字输入和语音高级控制，并与数字人互斥；
+ *   - 嵌入预览继续保留完整聊天面板，便于老师调试；
  *   - 文字输入继续作为语音不可用或识别失败时的备用入口；
  *   - 面板关闭、页面切换和会话结束时停止当前朗读。
  *
@@ -16,7 +20,7 @@
  *   - 学生体验卡只展示学习任务、提示方式和互动轮数；
  *   - 教师身份、发布版本和积分说明放在学生体验卡之外；
  *   - 不在模拟学生界面中出现external、模型或结算技术术语；
- *   - 打开面板不创建会话，教师点击“开始学习”后才启动预览；
+ *   - 打开教学智能体后自动建立教师课堂预览会话，智能体先用已发布开场语主动问候；
  *   - 页面切换和组件卸载时由Hook清理令牌与流连接。
  */
 
@@ -27,19 +31,21 @@ import { useParams } from 'react-router-dom'
 import useAssistantSpeechPlayback from '@/hooks/useAssistantSpeechPlayback'
 import type { VoiceInputStatus } from '@/hooks/useVoiceInput'
 
-import ClassroomDigitalHuman from './ClassroomDigitalHuman'
 import type { ClassroomDigitalHumanState } from './ClassroomDigitalHuman'
-import DiscussionMarkdown from './DiscussionMarkdown'
+import CoursewareAssistantValidityRecoveryNotice from './CoursewareAssistantValidityRecoveryNotice'
+import { MessageBubble, StartPanel } from './PlatformCoursewareAssistantOverlayParts'
+import PlatformCoursewareAssistantClassroomStage
+  from './PlatformCoursewareAssistantClassroomStage'
 import PlatformCoursewareAssistantVoiceControls
   from './PlatformCoursewareAssistantVoiceControls'
 import { useCoursewareAssistantPreview } from './useCoursewareAssistantPreview'
+import { requestCoursewareAssistantValiditySettings } from './coursewareAssistantValidityNavigation'
 
 import {
   composerStyle,
   conversationStyle,
   floatingButtonStyle,
   headerButtonStyle,
-  messageBubbleStyle,
   noticeStyle,
   overlayLayout,
   overlayRootBaseStyle,
@@ -81,6 +87,16 @@ export default function PlatformCoursewareAssistantOverlay({
     preview.activeDeployment?.id || '',
   )
 
+  const activeDeployment = preview.activeDeployment
+  const validUntilTimestamp = activeDeployment?.valid_until
+    ? Date.parse(activeDeployment.valid_until)
+    : Number.NaN
+  const deploymentExpired = Boolean(
+    activeDeployment
+    && Number.isFinite(validUntilTimestamp)
+    && validUntilTimestamp <= Date.now(),
+  )
+
   const [open, setOpen] = useState(false)
   const [input, setInput] = useState('')
   const [autoSpeak, setAutoSpeak] = useState(true)
@@ -88,11 +104,34 @@ export default function PlatformCoursewareAssistantOverlay({
     variant !== 'embedded',
   )
   const [voiceStatus, setVoiceStatus] = useState<VoiceInputStatus>('idle')
+  const [classroomAssistantHidden, setClassroomAssistantHidden] = useState(false)
+
+  const projected = variant !== 'embedded'
+  const classroomHiddenStorageKey = projected && resolvedCoursewareID
+    ? `tedna:courseware-assistant:hidden:${resolvedCoursewareID}`
+    : ''
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const handledReplySequenceRef = useRef(0)
+  const autoStartAttemptRef = useRef('')
+  const greetedSessionRef = useRef('')
 
   useEffect(() => {
+    if (!classroomHiddenStorageKey || typeof window === 'undefined') {
+      setClassroomAssistantHidden(false)
+      return
+    }
+
+    try {
+      setClassroomAssistantHidden(window.sessionStorage.getItem(classroomHiddenStorageKey) === '1')
+    } catch {
+      setClassroomAssistantHidden(false)
+    }
+  }, [classroomHiddenStorageKey])
+
+  useEffect(() => {
+    autoStartAttemptRef.current = ''
+    greetedSessionRef.current = ''
     setOpen(false)
     setInput('')
     setVoiceStatus('idle')
@@ -105,7 +144,85 @@ export default function PlatformCoursewareAssistantOverlay({
 
   useEffect(() => {
     if (!open) {
+      autoStartAttemptRef.current = ''
+      return
+    }
+
+    if (
+      !activeDeployment
+      || deploymentExpired
+      || preview.session
+      || preview.starting
+      || preview.deploymentLoading
+    ) {
+      return
+    }
+
+    const attemptKey = [
+      resolvedCoursewareID,
+      resolvedPageID,
+      activeDeployment.id,
+      activeDeployment.updated_at || String(activeDeployment.current_version),
+    ].join(':')
+
+    if (autoStartAttemptRef.current === attemptKey) {
+      return
+    }
+
+    autoStartAttemptRef.current = attemptKey
+    void preview.startPreview()
+  }, [
+    activeDeployment,
+    deploymentExpired,
+    open,
+    preview.deploymentLoading,
+    preview.session,
+    preview.startPreview,
+    preview.starting,
+    resolvedCoursewareID,
+    resolvedPageID,
+  ])
+
+  const sessionGreeting = preview.session
+    ? (
+        preview.messages.find(message => message.role === 'assistant')?.content.trim()
+        || `同学们好，我们一起来学习${pageTitle ? `《${pageTitle}》` : '这一页'}。你可以直接说出你的想法。`
+      )
+    : ''
+
+  useEffect(() => {
+    const sessionID = preview.session?.id || ''
+
+    if (
+      !open
+      || !sessionID
+      || !sessionGreeting
+      || greetedSessionRef.current === sessionID
+    ) {
+      return
+    }
+
+    greetedSessionRef.current = sessionID
+
+    if (autoSpeak && !classroomAssistantHidden) {
+      speech.speak(sessionGreeting)
+    }
+  }, [
+    autoSpeak,
+    classroomAssistantHidden,
+    open,
+    preview.session,
+    sessionGreeting,
+    speech.speak,
+  ])
+
+  useEffect(() => {
+    if (!open) {
       speech.stop()
+      return
+    }
+
+    if (projected) {
       return
     }
 
@@ -116,6 +233,7 @@ export default function PlatformCoursewareAssistantOverlay({
     open,
     preview.messages,
     preview.streamingText,
+    projected,
     speech.stop,
   ])
 
@@ -131,11 +249,16 @@ export default function PlatformCoursewareAssistantOverlay({
 
     handledReplySequenceRef.current = completedReply.sequence
 
-    if (open && autoSpeak) {
+    if (
+      open
+      && autoSpeak
+      && !classroomAssistantHidden
+    ) {
       speech.speak(completedReply.text)
     }
   }, [
     autoSpeak,
+    classroomAssistantHidden,
     open,
     preview.completedReply,
     speech.speak,
@@ -144,9 +267,15 @@ export default function PlatformCoursewareAssistantOverlay({
   if (
     !resolvedCoursewareID
     || !resolvedPageID
-    || !preview.activeDeployment
+    || !activeDeployment
   ) {
     return null
+  }
+
+  const openValiditySettings = () => {
+    speech.stop()
+    const opened = requestCoursewareAssistantValiditySettings(resolvedCoursewareID, resolvedPageID)
+    if (opened) setOpen(false)
   }
 
   const submitMessage = (rawMessage: string): boolean => {
@@ -166,11 +295,35 @@ export default function PlatformCoursewareAssistantOverlay({
     setOpen(false)
   }
 
+  const writeClassroomHiddenPreference = (hidden: boolean) => {
+    if (!classroomHiddenStorageKey || typeof window === 'undefined') return
+
+    try {
+      window.sessionStorage.setItem(classroomHiddenStorageKey, hidden ? '1' : '0')
+    } catch {
+      // sessionStorage不可用时只保留当前组件内存状态。
+    }
+  }
+
+  const hideClassroomAssistant = () => {
+    speech.stop()
+    setVoiceStatus('idle')
+    setClassroomAssistantHidden(true)
+    writeClassroomHiddenPreference(true)
+  }
+
+  const wakeClassroomAssistant = () => {
+    setVoiceStatus('idle')
+    setClassroomAssistantHidden(false)
+    writeClassroomHiddenPreference(false)
+  }
+
   const endSession = () => {
     speech.stop()
     setVoiceStatus('idle')
     preview.clearSession()
     setInput('')
+    setOpen(false)
   }
 
   const toggleAutoSpeak = () => {
@@ -203,8 +356,15 @@ export default function PlatformCoursewareAssistantOverlay({
           ? 'thinking'
           : 'idle'
 
+  const classroomSubtitleText = preview.streamingText.trim()
+    ? preview.streamingText
+    : preview.sending
+      ? ''
+      : preview.completedReply?.text || sessionGreeting
+
   return (
     <div
+      data-courseware-assistant-overlay-root="true"
       onClick={stopPropagation}
       onDoubleClick={stopPropagation}
       onMouseDown={stopPropagation}
@@ -223,9 +383,17 @@ export default function PlatformCoursewareAssistantOverlay({
         <button
           type="button"
           onClick={() => {
+            if (projected && classroomAssistantHidden) {
+              wakeClassroomAssistant()
+            }
+
             setOpen(true)
           }}
-          title="打开当前页面的教学智能体"
+          title={
+            projected && classroomAssistantHidden
+              ? '唤醒当前页面的课堂助教'
+              : '打开当前页面的教学智能体'
+          }
           style={floatingButtonStyle(variant)}
         >
           <span
@@ -238,7 +406,11 @@ export default function PlatformCoursewareAssistantOverlay({
             🤖
           </span>
 
-          <span>教学智能体</span>
+          <span>
+            {projected && classroomAssistantHidden
+              ? '唤醒助教'
+              : '教学智能体'}
+          </span>
 
           <span
             aria-hidden="true"
@@ -253,27 +425,60 @@ export default function PlatformCoursewareAssistantOverlay({
         </button>
       )}
 
-      {open && (
-        <div
-          style={{
-            position: 'absolute',
-            right: layout.width + (classroomMode ? 18 : 12),
-            bottom: 0,
-            pointerEvents: 'none',
+      {open && projected && (
+        <PlatformCoursewareAssistantClassroomStage
+          pageTitle={pageTitle}
+          variant={variant}
+          classroomMode={classroomMode}
+          hidden={classroomAssistantHidden}
+          digitalHumanState={digitalHumanState}
+          audioElement={speech.audioElement}
+          speechProvider={speech.provider}
+          speechPaused={speech.paused}
+          sessionPresent={Boolean(preview.session)}
+          sessionStatus={preview.session?.status || ''}
+          currentVersion={activeDeployment.current_version}
+          maximumTurns={activeDeployment.per_session_turn_limit}
+          turnCount={preview.session?.turn_count || 0}
+          remainingTurns={preview.remainingTurns}
+          starting={preview.starting}
+          sending={preview.sending}
+          canSend={preview.canSend}
+          notice={deploymentExpired
+            ? { kind: 'error', text: '教学智能体使用时间已到，请修改课堂使用时间后继续。' }
+            : preview.notice}
+          messages={preview.messages}
+          streamingText={preview.streamingText}
+          subtitleText={classroomSubtitleText}
+          input={input}
+          autoSpeak={autoSpeak}
+          speechSupported={speech.isSupported}
+          speechPreparing={speech.preparing}
+          speechSpeaking={speech.speaking}
+          speechError={speech.error}
+          speechWarning={speech.warning}
+          speechVoiceLabel={speech.voiceLabel}
+          canReplay={Boolean(speech.lastText)}
+          onStart={deploymentExpired ? openValiditySettings : () => { void preview.startPreview() }}
+          onEndSession={endSession}
+          onClose={closePanel}
+          onHide={hideClassroomAssistant}
+          onWake={wakeClassroomAssistant}
+          onToggleClassroomMode={() => {
+            setClassroomMode(current => !current)
           }}
-        >
-          <ClassroomDigitalHuman
-            state={digitalHumanState}
-            audioElement={speech.audioElement}
-            speechProvider={speech.provider}
-            speechPaused={speech.paused}
-            classroomMode={classroomMode}
-            variant={variant}
-          />
-        </div>
+          onInputChange={setInput}
+          onSubmitMessage={submitMessage}
+          onBeforeVoiceStart={speech.stop}
+          onToggleAutoSpeak={toggleAutoSpeak}
+          onToggleSpeechPause={speech.togglePause}
+          onStopSpeech={speech.stop}
+          onReplaySpeech={speech.replay}
+          onVoiceStatusChange={setVoiceStatus}
+        />
       )}
 
-      {open && (
+      {open && !projected && (
         <div
           role="dialog"
           aria-label="教学智能体教师预览"
@@ -371,27 +576,25 @@ export default function PlatformCoursewareAssistantOverlay({
             </div>
           </div>
 
-          {preview.notice && (
-            <div
-              style={noticeStyle(
-                preview.notice.kind,
-                classroomMode,
-              )}
-            >
+          {deploymentExpired ? (
+            <CoursewareAssistantValidityRecoveryNotice
+              classroomMode={classroomMode}
+              onAdjust={openValiditySettings}
+            />
+          ) : preview.notice ? (
+            <div style={noticeStyle(preview.notice.kind, classroomMode)}>
               {preview.notice.text}
             </div>
-          )}
+          ) : null}
 
           {!preview.session && (
             <StartPanel
               pageTitle={pageTitle}
-              currentVersion={preview.activeDeployment.current_version}
-              maximumTurns={preview.activeDeployment.per_session_turn_limit}
+              currentVersion={activeDeployment.current_version}
+              maximumTurns={activeDeployment.per_session_turn_limit}
               starting={preview.starting}
+              expired={deploymentExpired}
               classroomMode={classroomMode}
-              onStart={() => {
-                void preview.startPreview()
-              }}
             />
           )}
 
@@ -579,190 +782,3 @@ export default function PlatformCoursewareAssistantOverlay({
     </div>
   )
 }
-
-function StartPanel({
-  pageTitle,
-  currentVersion,
-  maximumTurns,
-  starting,
-  classroomMode,
-  onStart,
-}: {
-  pageTitle: string
-  currentVersion: number
-  maximumTurns: number
-  starting: boolean
-  classroomMode: boolean
-  onStart: () => void
-}) {
-  return (
-    <div style={{ padding: classroomMode ? 20 : 15 }}>
-      <div
-        style={{
-          padding: classroomMode ? 20 : 14,
-          borderRadius: classroomMode ? 17 : 13,
-          border: '1px solid #DBEAFE',
-          background: 'linear-gradient(145deg, #F8FAFF, #EFF6FF)',
-        }}
-      >
-        <div
-          style={{
-            display: 'inline-flex',
-            padding: classroomMode ? '5px 9px' : '3px 7px',
-            borderRadius: 999,
-            background: 'rgba(79,123,232,0.10)',
-            color: '#4F7BE8',
-            fontSize: classroomMode ? 13 : 8.5,
-            fontWeight: 800,
-          }}
-        >
-          老师课堂体验
-        </div>
-
-        <div
-          style={{
-            marginTop: classroomMode ? 13 : 9,
-            color: '#1E293B',
-            fontSize: classroomMode ? 23 : 14,
-            fontWeight: 850,
-            lineHeight: 1.4,
-          }}
-        >
-          开始本页语音学习互动
-        </div>
-
-        {pageTitle && (
-          <div
-            style={{
-              marginTop: classroomMode ? 6 : 3,
-              overflow: 'hidden',
-              color: '#64748B',
-              fontSize: classroomMode ? 15 : 9,
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }}
-          >
-            {pageTitle}
-          </div>
-        )}
-
-        <div
-          style={{
-            marginTop: classroomMode ? 13 : 8,
-            color: '#475569',
-            fontSize: classroomMode ? 17 : 10.5,
-            lineHeight: 1.75,
-          }}
-        >
-          点击开始后，老师可以直接说话。系统识别完成会自动向教学智能体提问，
-          回答完成后优先使用豆包自然音色朗读，并同时在屏幕上显示大字内容。
-        </div>
-
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: 12,
-            marginTop: classroomMode ? 18 : 13,
-          }}
-        >
-          <div
-            style={{
-              color: '#64748B',
-              fontSize: classroomMode ? 15 : 10,
-            }}
-          >
-            最多互动{' '}
-            <strong
-              style={{
-                color: '#1E293B',
-                fontSize: classroomMode ? 19 : 12,
-              }}
-            >
-              {maximumTurns}
-            </strong>{' '}
-            轮
-          </div>
-
-          <button
-            type="button"
-            onClick={onStart}
-            disabled={starting}
-            style={primaryButtonStyle(
-              starting,
-              classroomMode,
-            )}
-          >
-            {starting ? '正在准备…' : '开始学习'}
-          </button>
-        </div>
-      </div>
-
-      <div
-        style={{
-          marginTop: classroomMode ? 13 : 10,
-          padding: classroomMode ? '12px 14px' : '9px 10px',
-          borderRadius: classroomMode ? 12 : 9,
-          border: '1px solid #E2E8F0',
-          background: '#FFFFFF',
-          color: '#64748B',
-          fontSize: classroomMode ? 13 : 9,
-          lineHeight: 1.65,
-        }}
-      >
-        <strong style={{ color: '#475569' }}>
-          教师预览 · V{currentVersion}
-        </strong>
-        ：这里使用真实发布版本进行体验。发送消息和豆包朗读会按照实际用量结算教师教学积分。
-      </div>
-    </div>
-  )
-}
-
-function MessageBubble({
-  role,
-  content,
-  classroomMode,
-  streaming = false,
-}: {
-  role: 'student' | 'assistant'
-  content: string
-  classroomMode: boolean
-  streaming?: boolean
-}) {
-  const assistant = role === 'assistant'
-
-  return (
-    <div
-      style={{
-        display: 'flex',
-        justifyContent: assistant ? 'flex-start' : 'flex-end',
-        marginBottom: classroomMode ? 13 : 8,
-      }}
-    >
-      <div style={messageBubbleStyle(assistant, classroomMode)}>
-        {assistant ? (
-          <DiscussionMarkdown
-            content={content}
-            compact={!classroomMode}
-          />
-        ) : (
-          content
-        )}
-
-        {streaming && (
-          <span
-            style={{
-              marginLeft: 3,
-              color: '#4F7BE8',
-            }}
-          >
-            ▍
-          </span>
-        )}
-      </div>
-    </div>
-  )
-}
-

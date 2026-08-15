@@ -72,6 +72,52 @@ func (h *CoursewareIndexHandler) SetAlignmentService(alignmentService *services.
 	h.alignmentService = alignmentService
 }
 
+// writeCoursewareSourceUploadError 只把“老师可以自行纠正”的文件问题映射为4xx。
+// 其它未知错误保持5xx通用提示，避免把数据库、文件系统或内部实现细节回传浏览器。
+func writeCoursewareSourceUploadError(
+	w http.ResponseWriter,
+	err error,
+) {
+	uploadErr, ok :=
+		services.AsCoursewareSourceUploadError(err)
+	if !ok {
+		utils.InternalError(
+			w,
+			"创建课件失败，请稍后重试",
+		)
+		return
+	}
+
+	switch uploadErr.Kind {
+	case services.CoursewareSourceUploadTooLarge:
+		utils.Fail(
+			w,
+			http.StatusRequestEntityTooLarge,
+			uploadErr.Error(),
+		)
+
+	case services.CoursewareSourceUploadInvalidExtension:
+		utils.BadRequest(
+			w,
+			uploadErr.Error(),
+		)
+
+	case services.CoursewareSourceUploadInvalidFormat,
+		services.CoursewareSourceUploadNoUsableContent:
+		utils.Fail(
+			w,
+			http.StatusUnprocessableEntity,
+			uploadErr.Error(),
+		)
+
+	default:
+		utils.BadRequest(
+			w,
+			uploadErr.Error(),
+		)
+	}
+}
+
 // ==================== 触发索引生成 ====================
 
 // GenerateIndex POST /api/v1/coursewares/{id}/generate-index — 触发AI生成课件索引
@@ -461,7 +507,10 @@ func (h *CoursewareIndexHandler) CreateFromPPT(
 		title,
 	)
 	if err != nil {
-		utils.InternalError(w, "创建课件失败: "+err.Error())
+		writeCoursewareSourceUploadError(
+			w,
+			err,
+		)
 		return
 	}
 
@@ -553,7 +602,10 @@ func (h *CoursewareIndexHandler) CreateFromDoc(
 		title,
 	)
 	if err != nil {
-		utils.InternalError(w, "创建课件失败: "+err.Error())
+		writeCoursewareSourceUploadError(
+			w,
+			err,
+		)
 		return
 	}
 

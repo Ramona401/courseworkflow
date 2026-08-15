@@ -27,6 +27,8 @@
  *     计时器启停由页面在发起/结束一轮时调用 startTurnTimers/clearTurnTimers 驱动。
  *
  * 状态归属纪律：会话业务状态仍由页面持有，本 Hook 经 params 的 setter / 回调回写。
+ * stage_continuation_ 专用轮次属于“用户可见的阶段自然承接”：复用现有思考气泡与流式气泡，
+ * 但仍与导入评审等真正后台旁路隔离，不改 currentTurnRef。
  */
 import { useState, useRef, useEffect, useCallback } from 'react'
 import {
@@ -43,6 +45,11 @@ import {
 import {
   classifyConversationSSEEvent,
 } from './conversationSSEEventScope'
+import {
+  finishStageContinuationActivity,
+  isStageContinuationTurnID,
+  markStageContinuationStarted,
+} from './stageContinuationActivity'
 
 /** 第一层·软提示触发阈值（毫秒）：发起一轮后多久没等到首 chunk 就安抚一句 */
 const SLOW_HINT_MS = 8000
@@ -148,16 +155,26 @@ export function useConversationSSE(params: UseConversationSSEParams): UseConvers
    */
   const getEventScope = (
     clientTurnId?: string,
-  ) =>
-    classifyConversationSSEEvent(
+  ) => {
+    if (
+      isStageContinuationTurnID(
+        clientTurnId,
+      )
+    ) {
+      return 'background' as const
+    }
+
+    return classifyConversationSSEEvent(
       clientTurnId,
       paramsRef.current
         .currentTurnRef.current,
     )
+  }
 
   // 组件卸载：关连接 + 清计时器
   useEffect(() => {
     return () => {
+      finishStageContinuationActivity()
       sseRef.current?.close()
       if (slowHintTimerRef.current) clearTimeout(slowHintTimerRef.current)
       if (watchdogTimerRef.current) clearTimeout(watchdogTimerRef.current)
@@ -172,6 +189,20 @@ export function useConversationSSE(params: UseConversationSSEParams): UseConvers
     planIdRef.current = planId
     sseRef.current = createLessonPlanSSE(planId, p.token, {
       onThinking: (clientTurnId?: string) => {
+        if (
+          isStageContinuationTurnID(
+            clientTurnId,
+          )
+        ) {
+          const cur = paramsRef.current
+
+          markStageContinuationStarted()
+          cur.setDynamicChips([])
+          cur.setIsThinking(true)
+          cur.setStreaming(null)
+          return
+        }
+
         const scope =
           getEventScope(clientTurnId)
 
@@ -186,6 +217,32 @@ export function useConversationSSE(params: UseConversationSSEParams): UseConvers
         paramsRef.current.setStreaming(null)
       },
       onChunk: (chunk: string, clientTurnId?: string) => {
+        if (
+          isStageContinuationTurnID(
+            clientTurnId,
+          )
+        ) {
+          const cur = paramsRef.current
+
+          markStageContinuationStarted()
+          cur.setDynamicChips([])
+          cur.setIsThinking(false)
+          cur.setStreaming(previous =>
+            previous
+              ? {
+                  ...previous,
+                  content:
+                    previous.content + chunk,
+                }
+              : {
+                  id:
+                    `stream_${Date.now()}`,
+                  content: chunk,
+                }
+          )
+          return
+        }
+
         const scope =
           getEventScope(clientTurnId)
 
@@ -218,6 +275,29 @@ export function useConversationSSE(params: UseConversationSSEParams): UseConvers
         clientTurnId?: string,
         assistantLabel?: string,
       ) => {
+        if (
+          isStageContinuationTurnID(
+            clientTurnId,
+          )
+        ) {
+          const cur = paramsRef.current
+
+          finishStageContinuationActivity()
+          cur.setIsThinking(false)
+          cur.setStreaming(null)
+          cur.setFullGenerating(false)
+          cur.onAssistantLabel?.(
+            assistantLabel || '',
+          )
+          cur.setMessages(
+            previous => [
+              ...previous,
+              msg,
+            ],
+          )
+          return
+        }
+
         const scope =
           getEventScope(clientTurnId)
 
@@ -328,6 +408,21 @@ export function useConversationSSE(params: UseConversationSSEParams): UseConvers
         content: string,
         clientTurnId?: string,
       ) => {
+        if (
+          isStageContinuationTurnID(
+            clientTurnId,
+          )
+        ) {
+          const cur = paramsRef.current
+
+          markStageContinuationStarted()
+          cur.setDynamicChips([])
+          cur.setIsThinking(true)
+          cur.setStreaming(null)
+          cur.onRetryNotice(content)
+          return
+        }
+
         const scope =
           getEventScope(clientTurnId)
 
@@ -349,6 +444,20 @@ export function useConversationSSE(params: UseConversationSSEParams): UseConvers
         err: string,
         clientTurnId?: string,
       ) => {
+        if (
+          isStageContinuationTurnID(
+            clientTurnId,
+          )
+        ) {
+          const cur = paramsRef.current
+
+          finishStageContinuationActivity()
+          cur.setIsThinking(false)
+          cur.setStreaming(null)
+          cur.setFullGenerating(false)
+          cur.setDynamicChips([])
+        }
+
         const scope =
           getEventScope(clientTurnId)
 
@@ -441,6 +550,7 @@ export function useConversationSSE(params: UseConversationSSEParams): UseConvers
         // 只有达到最大重试次数、确认断开后才结束本地等待；
         // 真正断线只由顶栏状态条提示，不插入AI消息。
         if (state === 'disconnected') {
+          finishStageContinuationActivity()
           clearTurnTimers()
 
           const cur =
@@ -453,6 +563,8 @@ export function useConversationSSE(params: UseConversationSSEParams): UseConvers
         }
       },
       onReconnected: async () => {
+        finishStageContinuationActivity()
+
         const pid = planIdRef.current
         if (!pid) return
         const cur = paramsRef.current
@@ -482,6 +594,7 @@ export function useConversationSSE(params: UseConversationSSEParams): UseConvers
 
   /** 关闭连接并复位连接状态（退出备课用） */
   const closeSSE = useCallback(() => {
+    finishStageContinuationActivity()
     clearTurnTimers()
     sseRef.current?.close()
     sseRef.current = null

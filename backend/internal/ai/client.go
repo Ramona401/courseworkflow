@@ -86,6 +86,7 @@ var retryDelays = []time.Duration{
 
 // EffectiveConfig 合并后的有效AI配置
 type EffectiveConfig struct {
+	SceneCode      string   // 场景代码快照，用于统一系统级输出策略；不得作为权限依据
 	APIBaseURL     string   // API基础地址
 	APIKey         string   // 解密后的API Key（明文）
 	Model          string   // 使用的模型名称
@@ -171,7 +172,7 @@ func GetEffectiveConfig(
 	fallbackKey string,
 	fallbackModel string,
 ) (*EffectiveConfig, error) {
-	cfg := &EffectiveConfig{}
+	cfg := &EffectiveConfig{SceneCode: strings.TrimSpace(sceneCode)}
 
 	// -------- 第1步：读取全局配置作为基础 --------
 	globalConfigs, err := repository.GetAllConfigs()
@@ -193,7 +194,8 @@ func GetEffectiveConfig(
 		cfg.APIBaseURL = coalesce(global["api_base_url"], fallbackBaseURL)
 
 		// API Key：从数据库解密
-		if encKey, ok := global["api_key_enc"]; ok && encKey != "" && encKey != "PLACEHOLDER_SET_IN_ADMIN" {
+		if encKey, ok := global["api_key_enc"]; ok && encKey != "" &&
+			encKey != "PLACEHOLDER_SET_IN_ADMIN" {
 			plain, decErr := utils.DecryptAES(encKey, aesKey)
 			if decErr != nil {
 				cfg.APIKey = encKey // 解密失败尝试当明文用
@@ -308,12 +310,20 @@ func disableThinkingForModel(model string) *bool {
 // v85新增：主模型所有重试耗尽后，依次尝试fallback模型
 //
 // traceCtx参数用于关联trace记录到业务实体，如果为nil不记录trace
-func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceCtx *TraceContext) (*CallResult, error) {
+func CallAI(
+	cfg *EffectiveConfig,
+	systemPrompt string,
+	userPrompt string,
+	traceCtx *TraceContext,
+) (*CallResult, error) {
 	var messages []ChatMessage
 	if strings.TrimSpace(systemPrompt) != "" {
 		messages = append(messages, ChatMessage{Role: "system", Content: systemPrompt})
 	}
 	messages = append(messages, ChatMessage{Role: "user", Content: userPrompt})
+
+	// 教案与课件生成场景在统一AI边界追加Unicode数学符号系统约束，避免业务Prompt重复维护。
+	messages = applyMathOutputPolicy(cfg, messages, traceCtx)
 
 	endpoint := strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
 	startTime := time.Now()
@@ -327,7 +337,8 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 	// 未授权学校（含无 SchoolID）一律降级境内模型（qwen-max/豆包）
 	applyModelPolicy(cfg, traceCtx)
 
-	// v197修复：分流可能整通道切换 cfg.APIBaseURL，endpoint 须在分流后重算，否则境内key发到境外网关致401
+	// v197修复：分流可能整通道切换 cfg.APIBaseURL，endpoint 须在分流后重算，
+	// 否则境内key发到境外网关致401。
 	endpoint = strings.TrimRight(cfg.APIBaseURL, "/") + "/chat/completions"
 
 	// -------- 第1阶段：主模型调用（带完整重试）--------
@@ -336,17 +347,27 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 	if err == nil {
 		// 主模型调用成功
 		latMs := time.Since(startTime).Milliseconds()
-		emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
-			latMs, "success", "", len(result.Content), false, false, "")
+		emitTrace(
+			traceCtx,
+			result.ModelUsed,
+			result.TokensUsed,
+			0,
+			0,
+			latMs,
+			"success",
+			"",
+			len(result.Content),
+			false,
+			false,
+			"",
+		)
 		// v129新增：积分消费回调（对齐AOCI的ConsumeCredits）
 		invokeCreditConsume(traceCtx, result.ModelUsed, 0, 0, result.TokensUsed, latMs)
 		return result, nil
 	}
 
 	primaryErr := err
-	aiLog.Warn("主模型所有重试失败",
-		"model", primaryModel,
-		"error", err.Error())
+	aiLog.Warn("主模型所有重试失败", "model", primaryModel, "error", err.Error())
 
 	// -------- 第2阶段：依次尝试fallback模型（v85新增）--------
 	for i, fbModel := range cfg.FallbackModels {
@@ -355,43 +376,85 @@ func CallAI(cfg *EffectiveConfig, systemPrompt string, userPrompt string, traceC
 			continue
 		}
 
-		aiLog.Info("尝试降级模型",
+		aiLog.Info(
+			"尝试降级模型",
 			"index", i+1,
 			"total", len(cfg.FallbackModels),
 			"fallback_model", fbModel,
-			"scene", getSceneFromTrace(traceCtx))
+			"scene", getSceneFromTrace(traceCtx),
+		)
 
 		result, err = callAIWithRetries(cfg, fbModel, messages, endpoint, MaxFallbackRetries)
 		if err == nil {
 			// fallback模型调用成功
 			fbLatMs := time.Since(startTime).Milliseconds()
-			aiLog.Info("降级模型调用成功",
+			aiLog.Info(
+				"降级模型调用成功",
 				"fallback_model", fbModel,
-				"original_model", primaryModel)
-			emitTrace(traceCtx, result.ModelUsed, result.TokensUsed, 0, 0,
-				fbLatMs, "success", "", len(result.Content), false,
-				true, primaryModel)
+				"original_model", primaryModel,
+			)
+			emitTrace(
+				traceCtx,
+				result.ModelUsed,
+				result.TokensUsed,
+				0,
+				0,
+				fbLatMs,
+				"success",
+				"",
+				len(result.Content),
+				false,
+				true,
+				primaryModel,
+			)
 			// v129新增：降级模型成功也扣减积分
-			invokeCreditConsume(traceCtx, result.ModelUsed, 0, 0, result.TokensUsed, fbLatMs)
+			invokeCreditConsume(
+				traceCtx,
+				result.ModelUsed,
+				0,
+				0,
+				result.TokensUsed,
+				fbLatMs,
+			)
 			return result, nil
 		}
 
-		aiLog.Warn("降级模型也失败",
-			"fallback_model", fbModel,
-			"error", err.Error())
+		aiLog.Warn("降级模型也失败", "fallback_model", fbModel, "error", err.Error())
 	}
 
 	// 所有模型（主+fallback）都失败
 	totalLatency := time.Since(startTime).Milliseconds()
-	emitTrace(traceCtx, primaryModel, 0, 0, 0,
-		totalLatency, "error", primaryErr.Error(), 0, false, false, "")
-	return nil, fmt.Errorf("AI调用失败（主模型 %s + %d个降级模型均失败）: %w",
-		primaryModel, len(cfg.FallbackModels), primaryErr)
+	emitTrace(
+		traceCtx,
+		primaryModel,
+		0,
+		0,
+		0,
+		totalLatency,
+		"error",
+		primaryErr.Error(),
+		0,
+		false,
+		false,
+		"",
+	)
+	return nil, fmt.Errorf(
+		"AI调用失败（主模型 %s + %d个降级模型均失败）: %w",
+		primaryModel,
+		len(cfg.FallbackModels),
+		primaryErr,
+	)
 }
 
 // callAIWithRetries 使用指定模型执行非流式AI调用（带重试）
 // 这是从CallAI中提取的核心重试循环，供主模型和fallback模型复用
-func callAIWithRetries(cfg *EffectiveConfig, model string, messages []ChatMessage, endpoint string, maxRetries int) (*CallResult, error) {
+func callAIWithRetries(
+	cfg *EffectiveConfig,
+	model string,
+	messages []ChatMessage,
+	endpoint string,
+	maxRetries int,
+) (*CallResult, error) {
 	reqBody := ChatRequest{
 		Model:          model,
 		Messages:       messages,
@@ -410,19 +473,19 @@ func callAIWithRetries(cfg *EffectiveConfig, model string, messages []ChatMessag
 		// 非首次调用时等待退避时间
 		if attempt > 0 {
 			delay := getRetryDelay(attempt - 1)
-			aiLog.Info("非流式重试等待",
+			aiLog.Info(
+				"非流式重试等待",
 				"model", model,
 				"attempt", attempt,
-				"delay", delay)
+				"delay", delay,
+			)
 			time.Sleep(delay)
 		}
 
 		result, err := callAIOnce(cfg, endpoint, jsonBody)
 		if err == nil {
 			if attempt > 0 {
-				aiLog.Info("非流式重试成功",
-					"model", model,
-					"attempt", attempt)
+				aiLog.Info("非流式重试成功", "model", model, "attempt", attempt)
 			}
 			return result, nil
 		}
@@ -434,18 +497,29 @@ func callAIWithRetries(cfg *EffectiveConfig, model string, messages []ChatMessag
 			return nil, err
 		}
 
-		aiLog.Warn("非流式调用失败",
+		aiLog.Warn(
+			"非流式调用失败",
 			"model", model,
 			"attempt", attempt+1,
 			"max_attempts", maxRetries+1,
-			"error", err.Error())
+			"error", err.Error(),
+		)
 	}
 
-	return nil, fmt.Errorf("模型 %s 在%d次尝试后失败: %w", model, maxRetries+1, lastErr)
+	return nil, fmt.Errorf(
+		"模型 %s 在%d次尝试后失败: %w",
+		model,
+		maxRetries+1,
+		lastErr,
+	)
 }
 
 // callAIOnce 执行单次非流式AI调用（不含重试逻辑）
-func callAIOnce(cfg *EffectiveConfig, endpoint string, jsonBody []byte) (*CallResult, error) {
+func callAIOnce(
+	cfg *EffectiveConfig,
+	endpoint string,
+	jsonBody []byte,
+) (*CallResult, error) {
 	httpReq, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("创建HTTP请求失败: %w", err)
@@ -460,7 +534,11 @@ func callAIOnce(cfg *EffectiveConfig, endpoint string, jsonBody []byte) (*CallRe
 	latencyMs := time.Since(startTime).Milliseconds()
 	if err != nil {
 		return nil, &retryableError{
-			msg: fmt.Sprintf("AI API调用失败（网络错误，超时%s）: %s", AICallTimeout.String(), err.Error()),
+			msg: fmt.Sprintf(
+				"AI API调用失败（网络错误，超时%s）: %s",
+				AICallTimeout.String(),
+				err.Error(),
+			),
 		}
 	}
 	defer resp.Body.Close()
@@ -477,10 +555,18 @@ func callAIOnce(cfg *EffectiveConfig, endpoint string, jsonBody []byte) (*CallRe
 		errMsg := extractErrorMessage(respBody)
 		if isRetryableError(resp.StatusCode, respBody) {
 			return nil, &retryableError{
-				msg: fmt.Sprintf("AI API返回错误(HTTP %d): %s", resp.StatusCode, errMsg),
+				msg: fmt.Sprintf(
+					"AI API返回错误(HTTP %d): %s",
+					resp.StatusCode,
+					errMsg,
+				),
 			}
 		}
-		return nil, fmt.Errorf("AI API返回错误(HTTP %d): %s", resp.StatusCode, errMsg)
+		return nil, fmt.Errorf(
+			"AI API返回错误(HTTP %d): %s",
+			resp.StatusCode,
+			errMsg,
+		)
 	}
 
 	var chatResp ChatResponse

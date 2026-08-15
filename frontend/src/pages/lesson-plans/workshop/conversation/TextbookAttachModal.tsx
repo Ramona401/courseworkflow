@@ -19,6 +19,11 @@ import {
 import { useAuth } from '@/store/auth'
 import { useEducationProfile } from '@/hooks/useEducationProfile'
 import ProtectedTextbookImage from '@/components/textbooks/ProtectedTextbookImage'
+import { getSelectedTextbookOCRReadiness } from '../textbookOCRReadiness'
+import TextbookAttachOCRStatus from './TextbookAttachOCRStatus'
+import {
+  consumePendingTextbookImageFiles,
+} from './ConversationAttachmentInput'
 
 /* ==================== 颜色常量 ==================== */
 const C = {
@@ -64,11 +69,36 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
 
   // 操作状态
   const [deletingId, setDeletingId] = useState<string | null>(null)
-  const [ocrRunningId, setOcrRunningId] = useState<string | null>(null)
+  const [ocrInProgress, setOcrInProgress] = useState<Set<string>>(new Set())
+  const [ocrFailed, setOcrFailed] = useState<Set<string>>(new Set())
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null)
   const showToast = (msg: string, type: 'success' | 'error' = 'success') => {
     setToast({ msg, type }); setTimeout(() => setToast(null), 2600)
   }
+
+  /**
+   * 从统一附件卡切换为“教材依据”时，把刚才拖入的图片带入正式教材面板。
+   *
+   * 这里只预填文件，不自动上传：教材名称、学期、单元、页码仍由老师确认，
+   * 最终仍走本组件原有 upload → OCR → readiness gate → 关联链。
+   */
+  useEffect(() => {
+    const pendingFiles = consumePendingTextbookImageFiles()
+    if (pendingFiles.length === 0) return
+
+    setUpFiles(pendingFiles)
+    setShowUpload(true)
+    setToast({
+      msg: `已带入 ${pendingFiles.length} 张教材图片，请补充教材信息后确认上传`,
+      type: 'success',
+    })
+
+    const timer = window.setTimeout(
+      () => setToast(null),
+      3200,
+    )
+    return () => window.clearTimeout(timer)
+  }, [])
 
   // ==================== 加载课本列表（按当前教案学科+年级过滤）====================
   const loadPages = useCallback(async () => {
@@ -93,9 +123,97 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
 
   useEffect(() => { loadPages() }, [loadPages])
 
-  // ==================== 切换选择 ====================
+  // ==================== OCR运行与切换选择 ====================
+  const recognizePage = async (
+    id: string,
+    options?: {
+      announceSuccess?: boolean
+      announceFailure?: boolean
+    },
+  ): Promise<boolean> => {
+    if (!isK12) {
+      if (options?.announceFailure !== false) {
+        showToast('当前教育域暂无课本能力', 'error')
+      }
+      return false
+    }
+
+    if (ocrInProgress.has(id)) {
+      return false
+    }
+
+    setOcrInProgress(previous => {
+      const next = new Set(previous)
+      next.add(id)
+      return next
+    })
+    setOcrFailed(previous => {
+      const next = new Set(previous)
+      next.delete(id)
+      return next
+    })
+
+    try {
+      await triggerTextbookOCR(id)
+      setPages(previous =>
+        previous.map(item =>
+          item.id === id
+            ? {
+                ...item,
+                has_ocr: true,
+              }
+            : item,
+        ),
+      )
+      if (options?.announceSuccess) {
+        showToast('识别完成 ✓')
+      }
+      return true
+    } catch (err: unknown) {
+      setOcrFailed(previous => {
+        const next = new Set(previous)
+        next.add(id)
+        return next
+      })
+      if (options?.announceFailure !== false) {
+        showToast(
+          err instanceof Error
+            ? err.message
+            : 'AI识别失败，请重试',
+          'error',
+        )
+      }
+      return false
+    } finally {
+      setOcrInProgress(previous => {
+        const next = new Set(previous)
+        next.delete(id)
+        return next
+      })
+    }
+  }
+
   const toggleSelect = (id: string) => {
-    setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id])
+    const willSelect = !selectedIds.includes(id)
+
+    setSelectedIds(previous =>
+      previous.includes(id)
+        ? previous.filter(itemID => itemID !== id)
+        : [...previous, id],
+    )
+
+    if (!willSelect) return
+
+    const page = pages.find(item => item.id === id)
+    if (
+      page &&
+      !page.has_ocr &&
+      !ocrInProgress.has(id)
+    ) {
+      void recognizePage(id, {
+        announceFailure: true,
+      })
+    }
   }
 
   // ==================== 批量上传（页码自动递增，上传后自动选中+自动OCR）====================
@@ -109,9 +227,12 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
     if (upFiles.length === 0 || !upName.trim()) {
       showToast('请选择图片并填写教材名称', 'error'); return
     }
+
     setUploading(true)
-    const newIds: string[] = []
-    const failed: string[] = []
+    const uploaded: Array<{ id: string; fileName: string }> = []
+    const uploadFailed: string[] = []
+    const ocrFailedNames: string[] = []
+
     try {
       for (let i = 0; i < upFiles.length; i++) {
         const file = upFiles[i]
@@ -127,27 +248,64 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
         fd.append('page_number', String(upStartPage + i))
         fd.append('description', '')
         fd.append('scope', 'public') // 默认所有人可见
+
         try {
           const resp = await uploadTextbook(fd)
-          newIds.push(resp.id)
-        } catch { failed.push(file.name) }
+          uploaded.push({
+            id: resp.id,
+            fileName: file.name,
+          })
+        } catch {
+          uploadFailed.push(file.name)
+        }
       }
-      if (failed.length === 0) showToast(`成功上传 ${newIds.length} 张，正在自动识别文字…`)
-      else showToast(`成功 ${newIds.length} 张，失败 ${failed.length} 张`, 'error')
 
-      // 上传成功的自动选中
+      const newIds = uploaded.map(item => item.id)
+
+      // 上传成功的页面先保留为当前选择，但在OCR全部成功前绝不允许提交关联。
       if (newIds.length > 0) {
-        setSelectedIds(prev => Array.from(new Set([...prev, ...newIds])))
+        setSelectedIds(previous =>
+          Array.from(new Set([...previous, ...newIds])),
+        )
       }
+
       setUpFiles([])
-      setUpStartPage(upStartPage + newIds.length) // 起始页码自动推进
+      setUpStartPage(upStartPage + newIds.length)
       await loadPages()
 
-      // 新上传的图片自动触发OCR识别（后台逐张，不阻塞）
-      for (const id of newIds) {
-        try { await triggerTextbookOCR(id) } catch { /* 单张失败忽略，老师可在详情里手动重试 */ }
+      for (let i = 0; i < uploaded.length; i++) {
+        const item = uploaded[i]
+        setUpProgress(
+          `识别文字 ${i + 1}/${uploaded.length}：${item.fileName}`,
+        )
+        const recognized = await recognizePage(item.id, {
+          announceFailure: false,
+        })
+        if (!recognized) {
+          ocrFailedNames.push(item.fileName)
+        }
       }
-      await loadPages() // OCR完刷新has_ocr状态
+
+      await loadPages()
+
+      if (
+        uploadFailed.length === 0 &&
+        ocrFailedNames.length === 0
+      ) {
+        showToast(`成功上传并识别 ${uploaded.length} 张 ✓`)
+      } else {
+        const details: string[] = []
+        if (uploadFailed.length > 0) {
+          details.push(`上传失败 ${uploadFailed.length} 张`)
+        }
+        if (ocrFailedNames.length > 0) {
+          details.push(`识别失败 ${ocrFailedNames.length} 张`)
+        }
+        showToast(
+          `${details.join('，')}。未识别页面不会被允许关联，请重试识别。`,
+          'error',
+        )
+      }
     } finally {
       setUploading(false)
       setUpProgress('')
@@ -178,27 +336,67 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
   // ==================== 单张手动OCR ====================
   const handleOCR = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation()
-    // 非K12不能通过缓存弹窗触发OCR。
+    await recognizePage(id, {
+      announceSuccess: true,
+      announceFailure: true,
+    })
+    await loadPages()
+  }
+
+  const selectedOCRReadiness =
+    getSelectedTextbookOCRReadiness(
+      pages,
+      selectedIds,
+    )
+
+  const selectedOCRBusy =
+    selectedIds.some(id => ocrInProgress.has(id))
+
+  // ==================== 确认关联（保持原回调签名：只传ID数组）====================
+  const handleConfirm = async () => {
     if (!isK12) {
       showToast('当前教育域暂无课本能力', 'error')
       return
     }
 
-    setOcrRunningId(id)
-    try {
-      await triggerTextbookOCR(id)
-      showToast('识别完成 ✓')
-      await loadPages()
-    } catch (err: unknown) {
-      showToast(err instanceof Error ? err.message : 'AI识别失败', 'error')
-    } finally { setOcrRunningId(null) }
-  }
-
-  // ==================== 确认关联（保持原回调签名：只传ID数组）====================
-  const handleConfirm = () => {
-    if (!isK12) {
-      showToast('当前教育域暂无课本能力', 'error')
+    if (uploading || selectedOCRBusy) {
+      showToast('课本文字仍在识别中，请稍候', 'error')
       return
+    }
+
+    if (selectedOCRReadiness.missingIds.length > 0) {
+      showToast(
+        '已选课本状态已变化，正在刷新列表，请重新确认',
+        'error',
+      )
+      await loadPages()
+      return
+    }
+
+    if (selectedOCRReadiness.unrecognizedIds.length > 0) {
+      showToast(
+        `已选课本还有 ${selectedOCRReadiness.unrecognizedIds.length} 张未识别，正在先完成文字识别…`,
+      )
+
+      let allRecognized = true
+      for (const id of selectedOCRReadiness.unrecognizedIds) {
+        const recognized = await recognizePage(id, {
+          announceFailure: true,
+        })
+        if (!recognized) {
+          allRecognized = false
+        }
+      }
+
+      await loadPages()
+
+      if (!allRecognized) {
+        showToast(
+          '仍有课本页识别失败，已阻止关联。请点击“重试识别”后再确认。',
+          'error',
+        )
+        return
+      }
     }
 
     onSuccess(selectedIds)
@@ -218,6 +416,7 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
   if (!isK12) {
     return (
       <div
+        data-conversation-file-drop-scope="textbook"
         style={{
           position: 'fixed',
           inset: 0,
@@ -332,7 +531,9 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
   }
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}
+    <div
+      data-conversation-file-drop-scope="textbook"
+      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}
       onClick={e => { if (e.target === e.currentTarget) onCancel() }}>
       <div style={{ background: C.card, borderRadius: '16px', width: '760px', maxHeight: '88vh', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(0,0,0,0.3)' }}>
 
@@ -485,15 +686,12 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
                       </div>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '4px' }}>
                         {/* OCR状态/按钮 */}
-                        {ocrRunningId === item.id ? (
-                          <span style={{ fontSize: '9px', color: C.primary }}>识别中…</span>
-                        ) : item.has_ocr ? (
-                          <span style={{ fontSize: '9px', padding: '1px 5px', borderRadius: '4px', background: 'rgba(16,185,129,0.08)', color: C.success }}>已识别</span>
-                        ) : (
-                          <button onClick={e => handleOCR(e, item.id)}
-                            style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: '9px', color: C.primary, padding: 0, textDecoration: 'underline' }}
-                            title="AI识别文字">识别文字</button>
-                        )}
+                        <TextbookAttachOCRStatus
+                          hasOCR={item.has_ocr}
+                          running={ocrInProgress.has(item.id)}
+                          failed={ocrFailed.has(item.id)}
+                          onRecognize={event => handleOCR(event, item.id)}
+                        />
                         {/* 删除按钮：仅自己上传的可见 */}
                         {isMine && (
                           <button onClick={e => handleDelete(e, item)} disabled={deletingId === item.id}
@@ -516,17 +714,28 @@ export default function TextbookAttachModal({ planId, subject, grade, currentPag
           <span style={{ fontSize: '13px', color: C.textSec }}>已选 {selectedIds.length} 张课本页</span>
           <div style={{ display: 'flex', gap: '10px' }}>
             <button onClick={onCancel} style={{ padding: '8px 18px', borderRadius: '8px', border: `1px solid ${C.border}`, background: 'transparent', color: C.textSec, fontSize: '13px', cursor: 'pointer' }}>取消</button>
-            <button onClick={handleConfirm} style={{
-              padding: '8px 22px', borderRadius: '8px', border: 'none',
-              background: C.primary,
-              color: '#fff',
-              fontSize: '13px', fontWeight: 600, cursor: 'pointer',
-            }}>
-              {selectedIds.length === 0
-                ? currentPageIds.length > 0
-                  ? '解除全部关联'
-                  : '确认不关联课本'
-                : `确认关联 (${selectedIds.length})`}
+            <button
+              onClick={handleConfirm}
+              disabled={loading || uploading || selectedOCRBusy}
+              style={{
+                padding: '8px 22px', borderRadius: '8px', border: 'none',
+                background: loading || uploading || selectedOCRBusy ? C.border : C.primary,
+                color: loading || uploading || selectedOCRBusy ? C.textMuted : '#fff',
+                fontSize: '13px', fontWeight: 600,
+                cursor: loading || uploading || selectedOCRBusy ? 'not-allowed' : 'pointer',
+              }}
+            >
+              {uploading
+                ? '正在上传并识别…'
+                : selectedOCRBusy
+                  ? '正在识别课本文字…'
+                  : selectedIds.length === 0
+                    ? currentPageIds.length > 0
+                      ? '解除全部关联'
+                      : '确认不关联课本'
+                    : selectedOCRReadiness.ready
+                      ? `确认关联 (${selectedIds.length})`
+                      : `先完成文字识别 (${selectedOCRReadiness.unrecognizedIds.length})`}
             </button>
           </div>
         </div>

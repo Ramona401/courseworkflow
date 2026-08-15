@@ -2,15 +2,12 @@ package services
 
 // courseware_auto_assembly_media.go —— 全自动装配「单页处理」实现
 //
-// 本文件是 courseware_auto_assembly_service.go（主编排）的搭档，专注单页级别的三条干活链：
-//   ①  generateOnePageHTML     —— 单页 HTML 生成（复用 gen_service 私有零件，与批量生成完全一致）
-//   ② assembleOnePageMedia    —— 单页配图链 + 视频首帧占位链的统一入口
-//        · 配图链：SuggestImagePrompt(取主图) → GenerateImage(带锚点) → 上云回写 →
-//              · 封面页(第1页)：占位直填（字符串替换，不重排、不调 RefinePage，保住标题版式）
-//              · 非封面页：RefinePage 融图（AI 重写把图融进占位，版面协调）→ postProcessPageImages 收尾
-//        · 视频占位链：关键词命中页 SuggestVideoPrompt(取首镜) → 首帧图 → 上云 → 落到分镜
-//          （交付模式"HTML+配图不做视频"即 pc.skipVideo=true 时，所有页一律跳过视频占位链）
+// 本文件是 courseware_auto_assembly_service.go（主编排）的媒体处理搭档。
 //
+// 单页HTML生成已经拆到 courseware_auto_assembly_html.go；
+// 本文件只负责HTML就绪后的配图、融图收尾、导航复位和视频首帧占位。
+// 这样HTML生成失败重试与媒体资产处理保持职责隔离，避免单文件继续膨胀。
+
 // 【封面为何单独走"占位直填"，而非 RefinePage 融图】—— v0.44 关键修复
 //   RefinePage 是"整页重写融图"：对普通内容页版面协调效果好，但对封面这种强排版页（大标题居中、
 //   精心的品牌/学科年级布局）会挪动、覆盖、冲乱标题版式（历史反馈"封面被改坏"的根因）。
@@ -47,9 +44,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"time"
 
-	"tedna/internal/ai"
 	"tedna/internal/models"
 	"tedna/internal/repository"
 )
@@ -57,146 +52,6 @@ import (
 // cwAssemblyVideoKeywords 视频首帧占位触发关键词
 // （方案 MediaRequirements/VisualFormat/InteractionType 命中任一即为该页生成首帧占位）
 var cwAssemblyVideoKeywords = []string{"视频", "动画", "演示", "短片", "影片", "动效", "video", "animation"}
-
-// ==================== 链① 单页 HTML 生成 ====================
-
-// generateOnePageHTML 生成单页完整 HTML 并落库，返回组装后的完整 HTML。
-//
-// 完全复刻 GenerateRemainingPages 的单页生成链路，保证与批量生成产出一致：
-//
-//	匹配组件 → 构建 batch user prompt → 调 AI → 抽取内容区HTML → 后端拼接导航模板组装完整页 → 落库。
-//
-// 出错返回 error，由主编排记为该页 HTML 失败（该页不再进入配图流水线）。
-func (s *CoursewareAutoAssemblyService) generateOnePageHTML(
-	ctx context.Context, pc *cwAssemblyPageContext, page *models.CoursewarePage,
-) (string, error) {
-	// 1. 匹配组件（真实签名：matchComponentsForPage(ctx, page, subject, grade)）
-	matched := s.genService.matchComponentsForPage(ctx, page, pc.cw.Subject, pc.cw.Grade)
-
-	// 2. 构建批量模式 user prompt（真实签名 9 参：
-	//    page, pageNum, totalPages, tplInfo, logoURL, orgName, matchedComps, cw, lessonContext）
-	userPrompt := s.genService.buildBatchUserPrompt(
-		page, page.PageNumber, pc.totalPages,
-		pc.tplInfo, pc.logoURL, pc.orgName,
-		matched, pc.cw, pc.lessonContext,
-	)
-	// 封面页(第1页)补封面提示（与 RegenerateSinglePage 对齐；批量提示词默认不含封面提示）
-	if page.PageNumber == 1 {
-		userPrompt = "⚠️ 这是封面页（第1页），请生成大标题居中的封面设计，突出课件标题、学科年级与机构品牌。\n\n" + userPrompt
-	}
-
-	// 3. 调AI生成内容区。
-	// API错误、空HTML或互动契约未落实时，均在当前页自动纠偏重试。
-	traceCtx := &ai.TraceContext{
-		SceneCode: "courseware_generate",
-		UserID:    &pc.userID,
-		SchoolID:  schoolIDPtr(pc.schoolID),
-	}
-
-	var lastErr error
-	fullHTML := ""
-	attemptPrompt := userPrompt
-
-	for attempt := 1; attempt <= cwGenMaxAttempts; attempt++ {
-		callResult, callErr := ai.CallAI(
-			pc.aiCfg,
-			pc.genPrompt.Content,
-			attemptPrompt,
-			traceCtx,
-		)
-		lastErr = callErr
-
-		if lastErr == nil &&
-			(callResult == nil ||
-				strings.TrimSpace(callResult.Content) == "") {
-			lastErr = fmt.Errorf("AI返回空内容")
-		}
-
-		if lastErr == nil {
-			contentHTML := s.genService.extractHTMLFromAIOutput(
-				callResult.Content,
-			)
-			if strings.TrimSpace(contentHTML) == "" {
-				lastErr = fmt.Errorf("抽取HTML为空")
-			} else {
-				// 只检查AI生成的内容区，避免系统导航栏事件干扰互动类型验收。
-				interactionCheck :=
-					validateGeneratedPageInteraction(
-						page.InteractionType,
-						contentHTML,
-					)
-
-				if interactionCheck.OK {
-					fullHTML = s.genService.assembleFullPage(
-						contentHTML,
-						pc.navHTML,
-						page.PageNumber,
-						pc.totalPages,
-						pc.tplInfo,
-					)
-
-					if attempt > 1 {
-						cwAssemblyLog.Info(
-							"全自动装配互动契约纠偏成功",
-							"page", page.PageNumber,
-							"interaction_type", page.InteractionType,
-							"attempt", attempt,
-						)
-					}
-					break
-				}
-
-				lastErr = fmt.Errorf(
-					"互动方式未落实: %s",
-					interactionCheck.Reason,
-				)
-				attemptPrompt = buildCWInteractionRepairPrompt(
-					userPrompt,
-					page,
-					interactionCheck,
-				)
-
-				cwAssemblyLog.Warn(
-					"全自动装配互动契约验收失败，准备纠偏重试",
-					"page", page.PageNumber,
-					"interaction_type", page.InteractionType,
-					"reason", interactionCheck.Reason,
-					"detail", interactionCheck.Detail,
-					"attempt", attempt,
-					"max_attempts", cwGenMaxAttempts,
-				)
-			}
-		}
-
-		if lastErr != nil && attempt < cwGenMaxAttempts {
-			time.Sleep(
-				time.Duration(attempt) *
-					cwGenRetryBaseDelay,
-			)
-		}
-	}
-
-	if strings.TrimSpace(fullHTML) == "" {
-		if lastErr == nil {
-			lastErr = fmt.Errorf(
-				"未形成通过互动契约验收的有效HTML",
-			)
-		}
-		return "", fmt.Errorf(
-			"单页生成失败(共尝试%d次): %v",
-			cwGenMaxAttempts,
-			lastErr,
-		)
-	}
-
-	// 6. 落库（真实签名 6 参：UpdateCWPageHTML(ctx, pageID, html, placeholderMap, matchedIDs, status)）
-	matchedIDs := s.genService.buildMatchedComponentIDs(matched)
-	if err := repository.UpdateCWPageHTML(ctx, page.ID, fullHTML, "", matchedIDs, models.CWPageStatusGenerated); err != nil {
-		return "", fmt.Errorf("HTML落库失败: %w", err)
-	}
-
-	return fullHTML, nil
-}
 
 // ==================== 链② 单页配图 + 视频首帧占位 ====================
 

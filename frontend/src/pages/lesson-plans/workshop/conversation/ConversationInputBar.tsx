@@ -32,6 +32,12 @@ import ResourceMeaningPill from './ResourceMeaningPill'
 import {
   isConversationPublishIntent,
 } from './conversationActionIntent'
+import {
+  useStageContinuationActivity,
+} from './stageContinuationActivity'
+import ConversationAttachmentInput, {
+  type ConversationAttachmentInputHandle,
+} from './ConversationAttachmentInput'
 
 export interface ConversationInputBarHandle {
   focus: () => void
@@ -130,6 +136,8 @@ const ConversationInputBar = forwardRef<
   } = props
 
   const { user } = useAuth()
+  const stageContinuationActive =
+    useStageContinuationActivity()
   const activePlanID =
     getActiveConversationPlanID()
 
@@ -149,6 +157,14 @@ const ConversationInputBar = forwardRef<
 
   const taRef =
     useRef<HTMLTextAreaElement>(null)
+
+  const attachmentInputRef =
+    useRef<ConversationAttachmentInputHandle>(null)
+
+  const [
+    attachmentBlocking,
+    setAttachmentBlocking,
+  ] = useState(false)
 
   /**
    * 发送和发布共用单次执行锁。
@@ -209,7 +225,9 @@ const ConversationInputBar = forwardRef<
   )
 
   const voice = useVoiceInput({
-    disabled: isBusy,
+    disabled:
+      isBusy ||
+      stageContinuationActive,
     maxDurationSeconds: 120,
     onPartial: handleVoicePartial,
     onFinal: handleVoiceFinal,
@@ -259,7 +277,17 @@ const ConversationInputBar = forwardRef<
   ] = useState(false)
 
   const inputDisabled =
-    isBusy || voice.isActive
+    isBusy ||
+    stageContinuationActive ||
+    voice.isActive
+
+  /*
+   * 附件处理中仍允许老师继续打字、继续追加文件。
+   * 只有真正发送动作需要等待附件处理完成，交互更接近对话composer。
+   */
+  const sendDisabled =
+    inputDisabled ||
+    attachmentBlocking
 
   const hasSelectedStrategies =
     selectedCount > 0
@@ -267,12 +295,15 @@ const ConversationInputBar = forwardRef<
   const hasReferenceEvidence =
     Boolean(refMaterialName)
 
+  const textbookAvailability =
+    plusItemAvailability('textbook')
+
   const doSend = async () => {
     const text = inputText.trim()
 
     if (
       !text ||
-      inputDisabled ||
+      sendDisabled ||
       submitInFlightRef.current
     ) {
       return
@@ -352,6 +383,17 @@ const ConversationInputBar = forwardRef<
 
   return (
     <>
+      <ConversationAttachmentInput
+        ref={attachmentInputRef}
+        planID={activePlanID}
+        textbookEnabled={
+          textbookAvailability.visible !== false &&
+          textbookAvailability.enabled
+        }
+        onBlockingChange={setAttachmentBlocking}
+        onOpenTextbook={() => onOpenTool('textbook')}
+      />
+
       {hasSelectedStrategies && (
         <ResourceMeaningPill
           variant="strip"
@@ -463,9 +505,17 @@ const ConversationInputBar = forwardRef<
                   {PLUS_MENU_ITEMS.map(
                     item => {
                       const availability =
-                        plusItemAvailability(
-                          item.tool,
-                        )
+                        item.tool === 'attachment'
+                          ? {
+                              visible: true,
+                              enabled: !inputDisabled,
+                              reason: inputDisabled
+                                ? '请等待当前操作完成'
+                                : '',
+                            }
+                          : plusItemAvailability(
+                              item.tool,
+                            )
 
                       if (
                         availability.visible ===
@@ -486,6 +536,13 @@ const ConversationInputBar = forwardRef<
                             }
 
                             setShowPlusMenu(false)
+
+                            if (item.tool === 'attachment') {
+                              attachmentInputRef.current
+                                ?.openFilePicker()
+                              return
+                            }
+
                             onOpenTool(item.tool)
                           }}
                           disabled={
@@ -642,7 +699,10 @@ const ConversationInputBar = forwardRef<
               elapsedSeconds={
                 voice.elapsedSeconds
               }
-              disabled={isBusy}
+              disabled={
+                isBusy ||
+                stageContinuationActive
+              }
               error={voice.error}
               onStart={beginVoiceInput}
               onStop={voice.stop}
@@ -653,7 +713,7 @@ const ConversationInputBar = forwardRef<
               type="button"
               onClick={() => void doSend()}
               disabled={
-                inputDisabled ||
+                sendDisabled ||
                 !inputText.trim()
               }
               style={{
@@ -699,7 +759,7 @@ const ConversationInputBar = forwardRef<
           }}
         >
           {voiceStatusText ||
-            '已自动保存草稿 · 点击麦克风可语音输入 · Shift+Enter换行'}
+            '已自动保存草稿 · 可直接拖入PDF/Word/PPT/图片 · Shift+Enter换行'}
         </div>
 
         {hasContent && (

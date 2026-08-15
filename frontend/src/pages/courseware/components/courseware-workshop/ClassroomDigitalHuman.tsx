@@ -1,23 +1,48 @@
 /**
  * ClassroomDigitalHuman.tsx — 老师端课堂卡通数字人表现层。
  *
+ * 8.11语义动作版：
+ * - 每位老师使用一张统一WebP图集，核心表情与可用动作都在同一资源中；
+ * - 页面始终只有一个完整人物DOM层，动作切换只改变background-position；
+ * - 不叠加第二个人物、不透明交叉、不重新创建人物节点，避免穿帮与闪白；
+ * - 待机偶尔眨眼，AI思考使用思考眉形，朗读结束短暂微笑；
+ * - AI朗读以五档口型为主，豆包MP3优先用真实音量驱动；
+ * - 8.11动作由独立Hook按回答语义和音频播放进度低频触发；
+ * - 男女老师都启用列举、指向课件、展开、邀请、强调、鼓励、鼓掌；
+ * - 鼓掌只用于较强正向反馈，普通“很好/不错”优先使用轻鼓励；
+ * - 手势期间继续按同一音量口径切换五档完整人物口型帧。
+ *
  * 职责边界：
- * - 只负责人物视觉，不拥有ASR、AI会话或TTS业务逻辑。
- * - 待机、倾听、思考、讲话由上层教学智能体状态显式驱动。
- * - 豆包MP3优先通过HTMLMediaElement.captureStream读取真实音频振幅驱动嘴型。
- * - captureStream不可用或降级设备语音时，只降级为节奏嘴型，不影响课堂语音播放。
- * - 人物素材使用平台自有PNG图集，不依赖第三方数字人SDK或运行时授权。
+ * - 本组件只负责人像显示、口型、眨眼和单层帧选择；
+ * - 动作语义与时间调度放在useClassroomDigitalHumanGesture；
+ * - 不拥有ASR、AI会话、TTS请求、计费或人物选择状态。
  */
 
 import { useEffect, useRef, useState } from 'react'
 
 import type { AssistantSpeechProvider } from '@/hooks/useAssistantSpeechPlayback'
 import type { PlatformAssistantOverlayVariant } from './PlatformCoursewareAssistantOverlay.styles'
+import useClassroomDigitalHumanGesture from './useClassroomDigitalHumanGesture'
+import type { ClassroomDigitalHumanGesture } from './useClassroomDigitalHumanGesture'
 
 export type ClassroomDigitalHumanState = 'idle' | 'listening' | 'thinking' | 'speaking'
+export type ClassroomDigitalHumanCharacter = 'female' | 'male'
+
+type MouthLevel = 'closed' | 'small' | 'medium' | 'open' | 'round'
+type PortraitFrame =
+  | 'idle'
+  | 'blink'
+  | 'thinking'
+  | 'small'
+  | 'medium'
+  | 'open'
+  | 'round'
+  | 'smile'
 
 interface ClassroomDigitalHumanProps {
   state: ClassroomDigitalHumanState
+  character: ClassroomDigitalHumanCharacter
+  speechText: string
   audioElement: HTMLAudioElement | null
   speechProvider: AssistantSpeechProvider
   speechPaused: boolean
@@ -25,42 +50,11 @@ interface ClassroomDigitalHumanProps {
   variant: PlatformAssistantOverlayVariant
 }
 
-interface AtlasPatch {
-  x: number
-  y: number
-  width: number
-  height: number
-  left: number
-  top: number
-}
-
-const ATLAS_URL = '/assets/classroom-digital-human/teacher-female-atlas.png'
-const ATLAS_WIDTH = 1440
-const ATLAS_HEIGHT = 720
-const FRAME_WIDTH = 480
-const FRAME_HEIGHT = 640
-
-const FRAME_X: Record<ClassroomDigitalHumanState, number> = {
-  idle: 0,
-  listening: 480,
-  thinking: 960,
-  speaking: 0,
-}
-
-const MOUTH_PATCHES: Record<'small' | 'medium' | 'wide' | 'round', AtlasPatch> = {
-  small: { x: 0, y: 650, width: 91, height: 44, left: 194, top: 172 },
-  medium: { x: 103, y: 650, width: 91, height: 44, left: 194, top: 172 },
-  wide: { x: 206, y: 650, width: 91, height: 44, left: 194, top: 172 },
-  round: { x: 309, y: 650, width: 91, height: 44, left: 194, top: 172 },
-}
-
-const BLINK_PATCH: AtlasPatch = {
-  x: 422,
-  y: 650,
-  width: 186,
-  height: 69,
-  left: 144,
-  top: 94,
+interface CharacterAtlasConfig {
+  url: string
+  columns: number
+  rows: number
+  gestureStarts: Record<ClassroomDigitalHumanGesture, number>
 }
 
 type CaptureStreamAudioElement = HTMLAudioElement & {
@@ -69,6 +63,62 @@ type CaptureStreamAudioElement = HTMLAudioElement & {
 }
 
 type AudioContextConstructor = typeof AudioContext
+
+const FRAME_WIDTH = 360
+const FRAME_HEIGHT = 480
+
+const CHARACTER_ATLAS: Record<
+  ClassroomDigitalHumanCharacter,
+  CharacterAtlasConfig
+> = {
+  female: {
+    url: '/assets/classroom-digital-human/teacher-female-unified-v2.webp',
+    columns: 8,
+    rows: 6,
+    gestureStarts: {
+      enumerate: 8,
+      point_left: 13,
+      expand: 18,
+      invite: 23,
+      emphasis: 28,
+      encourage: 33,
+      applause: 38,
+    },
+  },
+  male: {
+    url: '/assets/classroom-digital-human/teacher-male-unified-v2.webp',
+    columns: 8,
+    rows: 6,
+    gestureStarts: {
+      enumerate: 8,
+      point_left: 13,
+      expand: 18,
+      invite: 23,
+      emphasis: 28,
+      encourage: 33,
+      applause: 38,
+    },
+  },
+}
+
+const CORE_FRAME_INDEX: Record<PortraitFrame, number> = {
+  idle: 0,
+  blink: 1,
+  thinking: 2,
+  small: 3,
+  medium: 4,
+  open: 5,
+  round: 6,
+  smile: 7,
+}
+
+const MOUTH_OFFSET: Record<MouthLevel, number> = {
+  closed: 0,
+  small: 1,
+  medium: 2,
+  open: 3,
+  round: 4,
+}
 
 function resolveAudioContextConstructor(): AudioContextConstructor | null {
   if (typeof window === 'undefined') return null
@@ -84,49 +134,85 @@ function digitalHumanScale(
   variant: PlatformAssistantOverlayVariant,
   classroomMode: boolean,
 ): number {
-  if (variant === 'slideshow') return classroomMode ? 0.38 : 0.29
-  if (variant === 'fullscreen') return classroomMode ? 0.35 : 0.27
-  return classroomMode ? 0.30 : 0.22
+  if (variant === 'slideshow') return classroomMode ? 0.67 : 0.57
+  if (variant === 'fullscreen') return classroomMode ? 0.65 : 0.55
+  return classroomMode ? 0.47 : 0.39
 }
 
-function digitalHumanStatus(state: ClassroomDigitalHumanState) {
-  switch (state) {
-  case 'listening':
-    return { text: '正在听老师说话', background: '#EFF6FF', color: '#1D4ED8' }
-  case 'thinking':
-    return { text: '正在思考', background: '#F5F3FF', color: '#6D28D9' }
-  case 'speaking':
-    return { text: '正在讲解', background: '#ECFDF5', color: '#047857' }
+function mouthLevelForAudio(
+  level: number,
+  animationTick: number,
+): MouthLevel {
+  if (level < 0.09) return 'closed'
+  if (level < 0.28) return 'small'
+  if (level < 0.48) return 'medium'
+
+  if (level < 0.72) {
+    return animationTick % 5 === 0 ? 'round' : 'open'
+  }
+
+  return animationTick % 3 === 0 ? 'round' : 'open'
+}
+
+function frameForMouth(level: MouthLevel): PortraitFrame {
+  switch (level) {
+  case 'small':
+    return 'small'
+  case 'medium':
+    return 'medium'
+  case 'open':
+    return 'open'
+  case 'round':
+    return 'round'
   default:
-    return { text: '课堂助教待机', background: '#F8FAFC', color: '#64748B' }
+    return 'idle'
   }
 }
 
-function mouthPatchForLevel(level: number, animationTick: number): AtlasPatch | null {
-  if (level < 0.08) return null
-  if (level < 0.23) return MOUTH_PATCHES.small
-  if (level < 0.42) return MOUTH_PATCHES.medium
-  if (level < 0.68) return animationTick % 4 === 0 ? MOUTH_PATCHES.round : MOUTH_PATCHES.wide
-  return animationTick % 3 === 0 ? MOUTH_PATCHES.round : MOUTH_PATCHES.wide
+function frameIndexForDisplay(
+  atlas: CharacterAtlasConfig,
+  displayFrame: PortraitFrame,
+  activeGesture: ClassroomDigitalHumanGesture | null,
+  mouthLevel: MouthLevel,
+): number {
+  if (activeGesture) {
+    return atlas.gestureStarts[activeGesture] + MOUTH_OFFSET[mouthLevel]
+  }
+
+  return CORE_FRAME_INDEX[displayFrame]
 }
 
-function patchStyle(patch: AtlasPatch): React.CSSProperties {
+function atlasFrameStyle(
+  atlas: CharacterAtlasConfig,
+  frameIndex: number,
+): React.CSSProperties {
+  const safeIndex = Math.max(
+    0,
+    Math.min(frameIndex, atlas.columns * atlas.rows - 1),
+  )
+  const column = safeIndex % atlas.columns
+  const row = Math.floor(safeIndex / atlas.columns)
+
   return {
     position: 'absolute',
-    left: patch.left,
-    top: patch.top,
-    width: patch.width,
-    height: patch.height,
-    pointerEvents: 'none',
-    backgroundImage: `url("${ATLAS_URL}")`,
+    inset: 0,
+    width: FRAME_WIDTH,
+    height: FRAME_HEIGHT,
+    backgroundImage: `url("${atlas.url}")`,
     backgroundRepeat: 'no-repeat',
-    backgroundSize: `${ATLAS_WIDTH}px ${ATLAS_HEIGHT}px`,
-    backgroundPosition: `-${patch.x}px -${patch.y}px`,
+    backgroundSize: `${atlas.columns * FRAME_WIDTH}px ${atlas.rows * FRAME_HEIGHT}px`,
+    backgroundPosition: `-${column * FRAME_WIDTH}px -${row * FRAME_HEIGHT}px`,
+    opacity: 1,
+    transition: 'none',
+    willChange: 'background-position',
+    pointerEvents: 'none',
   }
 }
 
 export default function ClassroomDigitalHuman({
   state,
+  character,
+  speechText,
   audioElement,
   speechProvider,
   speechPaused,
@@ -135,15 +221,117 @@ export default function ClassroomDigitalHuman({
 }: ClassroomDigitalHumanProps) {
   const [audioLevel, setAudioLevel] = useState(0)
   const [animationTick, setAnimationTick] = useState(0)
-  const [blinking, setBlinking] = useState(false)
   const [realAudioTracking, setRealAudioTracking] = useState(false)
+  const [blinkClosed, setBlinkClosed] = useState(false)
+  const [endingSmile, setEndingSmile] = useState(false)
 
   const speakingRef = useRef(false)
+  const previousStateRef = useRef<ClassroomDigitalHumanState>(state)
+
   speakingRef.current = state === 'speaking' && !speechPaused
+
+  const atlas = CHARACTER_ATLAS[character]
+  const gesture = useClassroomDigitalHumanGesture({
+    state,
+    character,
+    speechText,
+    speechPaused,
+    audioElement,
+  })
+
+  /**
+   * 当前人物全部核心表情和动作都在同一张图集。
+   * 先异步解码，后续口型和动作只移动background-position。
+   */
+  useEffect(() => {
+    if (typeof Image === 'undefined') return
+
+    const preload = new Image()
+    preload.decoding = 'async'
+    preload.src = atlas.url
+
+    if (typeof preload.decode === 'function') {
+      void preload.decode().catch(() => undefined)
+    }
+  }, [atlas.url])
+
+  /** 回答真正朗读结束后短暂微笑；暂停时禁止误触发。 */
+  useEffect(() => {
+    const previousState = previousStateRef.current
+    previousStateRef.current = state
+
+    if (
+      previousState === 'speaking'
+      && state === 'idle'
+      && !speechPaused
+    ) {
+      setEndingSmile(true)
+
+      const timer = window.setTimeout(() => {
+        setEndingSmile(false)
+      }, 720)
+
+      return () => {
+        window.clearTimeout(timer)
+      }
+    }
+
+    setEndingSmile(false)
+  }, [
+    speechPaused,
+    state,
+  ])
+
+  /** 待机和倾听阶段偶尔眨眼；讲话和思考时不与其他高频表情竞争。 */
+  useEffect(() => {
+    setBlinkClosed(false)
+
+    if (
+      state === 'speaking'
+      || state === 'thinking'
+      || endingSmile
+    ) {
+      return
+    }
+
+    let cancelled = false
+    let blinkTimer = 0
+    let reopenTimer = 0
+
+    const scheduleBlink = () => {
+      const delay = 3200 + Math.floor(Math.random() * 2500)
+
+      blinkTimer = window.setTimeout(() => {
+        if (cancelled) return
+
+        setBlinkClosed(true)
+
+        reopenTimer = window.setTimeout(() => {
+          if (cancelled) return
+
+          setBlinkClosed(false)
+          scheduleBlink()
+        }, 110 + Math.floor(Math.random() * 55))
+      }, delay)
+    }
+
+    scheduleBlink()
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(blinkTimer)
+      window.clearTimeout(reopenTimer)
+      setBlinkClosed(false)
+    }
+  }, [
+    character,
+    endingSmile,
+    state,
+  ])
 
   /**
    * 使用captureStream旁路读取豆包音频，不通过createMediaElementSource接管播放器输出。
-   * 这样即使AudioContext受浏览器策略限制，原有豆包声音也不会被数字人口型功能静音。
+   * 即使AudioContext受浏览器策略限制，原有豆包声音也不会被数字人口型功能静音。
    */
   useEffect(() => {
     setRealAudioTracking(false)
@@ -180,20 +368,29 @@ export default function ClassroomDigitalHuman({
       const sample = (timestamp: number) => {
         if (cancelled || !analyser) return
 
-        if (timestamp - lastSampleAt >= 72) {
+        if (timestamp - lastSampleAt >= 78) {
           lastSampleAt = timestamp
 
-          if (speakingRef.current && !audioElement.paused && !audioElement.ended) {
+          if (
+            speakingRef.current
+            && !audioElement.paused
+            && !audioElement.ended
+          ) {
             analyser.getByteTimeDomainData(samples)
 
             let squareSum = 0
+
             for (let index = 0; index < samples.length; index += 1) {
               const centered = (samples[index] - 128) / 128
               squareSum += centered * centered
             }
 
             const rms = Math.sqrt(squareSum / samples.length)
-            const normalized = Math.max(0, Math.min(1, (rms - 0.012) / 0.19))
+            const normalized = Math.max(
+              0,
+              Math.min(1, (rms - 0.012) / 0.19),
+            )
+
             setAudioLevel(normalized)
             setAnimationTick(current => current + 1)
           } else {
@@ -222,81 +419,94 @@ export default function ClassroomDigitalHuman({
       }
 
       stream?.getTracks().forEach(track => track.stop())
-      if (audioContext) void audioContext.close().catch(() => undefined)
-    }
-  }, [audioElement, speechProvider])
 
-  /** captureStream不可用或设备语音兜底时使用轻量节奏嘴型，不影响语音本身。 */
+      if (audioContext) {
+        void audioContext.close().catch(() => undefined)
+      }
+    }
+  }, [
+    audioElement,
+    speechProvider,
+  ])
+
+  /** captureStream不可用或设备语音兜底时只模拟口型节奏，不切换人物身体。 */
   useEffect(() => {
     if (state !== 'speaking' || speechPaused || realAudioTracking) {
       if (!realAudioTracking) setAudioLevel(0)
       return
     }
 
-    const timer = setInterval(() => {
-      setAudioLevel(0.20 + Math.random() * 0.62)
+    const timer = window.setInterval(() => {
+      setAudioLevel(0.16 + Math.random() * 0.66)
       setAnimationTick(current => current + 1)
-    }, 105)
+    }, 112)
 
     return () => {
-      clearInterval(timer)
+      window.clearInterval(timer)
       setAudioLevel(0)
     }
-  }, [realAudioTracking, speechPaused, state])
-
-  /**
-   * 待机和讲话时自然眨眼。倾听和思考素材已有独立微表情，不叠加中性闭眼帧，
-   * 避免不同完整人物状态之间发生面部错位。
-   */
-  useEffect(() => {
-    if (state !== 'idle' && state !== 'speaking') {
-      setBlinking(false)
-      return
-    }
-
-    let blinkTimer: ReturnType<typeof setTimeout> | null = null
-    let reopenTimer: ReturnType<typeof setTimeout> | null = null
-
-    const scheduleBlink = () => {
-      blinkTimer = setTimeout(() => {
-        setBlinking(true)
-        reopenTimer = setTimeout(() => {
-          setBlinking(false)
-          scheduleBlink()
-        }, 125)
-      }, 3200 + Math.floor(Math.random() * 2600))
-    }
-
-    scheduleBlink()
-
-    return () => {
-      if (blinkTimer) clearTimeout(blinkTimer)
-      if (reopenTimer) clearTimeout(reopenTimer)
-    }
-  }, [state])
+  }, [
+    realAudioTracking,
+    speechPaused,
+    state,
+  ])
 
   const scale = digitalHumanScale(variant, classroomMode)
-  const status = digitalHumanStatus(state)
-  const mouthPatch = state === 'speaking' && !speechPaused
-    ? mouthPatchForLevel(audioLevel, animationTick)
-    : null
   const displayWidth = Math.round(FRAME_WIDTH * scale)
   const displayHeight = Math.round(FRAME_HEIGHT * scale)
 
+  const mouthLevel = state === 'speaking' && !speechPaused
+    ? mouthLevelForAudio(audioLevel, animationTick)
+    : 'closed'
+
+  let displayFrame: PortraitFrame = 'idle'
+
+  if (endingSmile) {
+    displayFrame = 'smile'
+  } else if (state === 'thinking') {
+    displayFrame = 'thinking'
+  } else if (state === 'speaking' && !speechPaused) {
+    displayFrame = frameForMouth(mouthLevel)
+  } else if (blinkClosed) {
+    displayFrame = 'blink'
+  }
+
+  const activeGesture = state === 'speaking' && !speechPaused
+    ? gesture
+    : null
+
+  const frameIndex = frameIndexForDisplay(
+    atlas,
+    displayFrame,
+    activeGesture,
+    mouthLevel,
+  )
+
+  const calmMotion = state === 'idle' || state === 'listening'
+
   return (
     <div
-      aria-label={`课堂卡通老师：${status.text}`}
-      style={{ width: displayWidth, pointerEvents: 'none', userSelect: 'none' }}
+      aria-label={`课堂卡通老师：${character === 'male' ? '男老师' : '女老师'}`}
+      data-character={character}
+      data-state={state}
+      data-frame={displayFrame}
+      data-gesture={activeGesture || 'none'}
+      data-frame-index={frameIndex}
+      data-speaking-text-length={speechText.length}
+      style={{
+        width: displayWidth,
+        pointerEvents: 'none',
+        userSelect: 'none',
+      }}
     >
       <div
         style={{
           width: displayWidth,
           height: displayHeight,
-          overflow: 'hidden',
-          borderRadius: classroomMode ? 22 : 16,
-          border: '1px solid rgba(148,163,184,0.34)',
-          background: '#FFFFFF',
-          boxShadow: '0 16px 42px rgba(15,23,42,0.20)',
+          overflow: 'visible',
+          animation: calmMotion
+            ? 'tednaDigitalHumanCalm 5.8s ease-in-out infinite'
+            : 'none',
         }}
       >
         <div
@@ -306,43 +516,26 @@ export default function ClassroomDigitalHuman({
             height: FRAME_HEIGHT,
             transform: `scale(${scale})`,
             transformOrigin: 'top left',
-            backgroundImage: `url("${ATLAS_URL}")`,
-            backgroundRepeat: 'no-repeat',
-            backgroundSize: `${ATLAS_WIDTH}px ${ATLAS_HEIGHT}px`,
-            backgroundPosition: `-${FRAME_X[state]}px 0px`,
-            animation: state === 'idle' || state === 'speaking'
-              ? 'tednaDigitalHumanBreathe 4.8s ease-in-out infinite'
-              : 'none',
+            filter: 'drop-shadow(0 14px 16px rgba(15,23,42,0.16))',
           }}
         >
-          {mouthPatch && <div aria-hidden="true" style={patchStyle(mouthPatch)} />}
-          {blinking && <div aria-hidden="true" style={patchStyle(BLINK_PATCH)} />}
+          <div
+            aria-hidden="true"
+            style={atlasFrameStyle(
+              atlas,
+              frameIndex,
+            )}
+          />
         </div>
       </div>
 
-      <div
-        style={{
-          marginTop: classroomMode ? 8 : 6,
-          padding: classroomMode ? '6px 10px' : '4px 7px',
-          borderRadius: 999,
-          background: status.background,
-          color: status.color,
-          fontSize: classroomMode ? 13 : 10,
-          fontWeight: 800,
-          lineHeight: 1.3,
-          textAlign: 'center',
-          boxShadow: '0 6px 18px rgba(15,23,42,0.08)',
-        }}
-      >
-        {status.text}
-      </div>
-
       <style>{`
-        @keyframes tednaDigitalHumanBreathe {
+        @keyframes tednaDigitalHumanCalm {
           0%, 100% { transform: translateY(0); }
-          50% { transform: translateY(-3px); }
+          50% { transform: translateY(-1px); }
         }
       `}</style>
     </div>
   )
 }
+

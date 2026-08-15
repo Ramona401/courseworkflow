@@ -112,13 +112,23 @@ func dispatchSubtitleRoutes(
 		return
 	}
 
-	subtitleIndex := strings.Index(path, "/subtitles/")
+	subtitleIndex :=
+		strings.Index(
+			path,
+			"/subtitles/",
+		)
 	if subtitleIndex >= 0 {
-		rest := path[subtitleIndex+len("/subtitles/"):]
-		rest = strings.TrimSuffix(rest, "/")
+		rest :=
+			path[subtitleIndex+
+				len("/subtitles/"):]
+		rest = strings.TrimSuffix(
+			rest,
+			"/",
+		)
 
 		if rest != "" {
-			if r.Method == http.MethodDelete {
+			if r.Method ==
+				http.MethodDelete {
 				handler.DeleteSubtitle(w, r)
 				return
 			}
@@ -159,55 +169,117 @@ func registerCoursewareReviewRoutes(
 ) {
 	cwReviewHandlerRef = coursewareReviewHandler
 
-	reviewMux := middleware.Chain(
-		http.HandlerFunc(
-			func(
-				w http.ResponseWriter,
-				r *http.Request,
-			) {
-				path := r.URL.Path
-				rest := strings.TrimPrefix(
-					path,
-					"/api/v1/courseware-reviews/",
-				)
+	reviewMux :=
+		middleware.Chain(
+			http.HandlerFunc(
+				func(
+					w http.ResponseWriter,
+					r *http.Request,
+				) {
+					path := r.URL.Path
+					rest :=
+						strings.TrimPrefix(
+							path,
+							"/api/v1/courseware-reviews/",
+						)
 
-				switch {
-				case rest == "pending" &&
-					r.Method == http.MethodGet:
-					coursewareReviewHandler.GetPendingReviews(w, r)
-					return
+					switch {
+					case rest == "pending" &&
+						r.Method == http.MethodGet:
+						coursewareReviewHandler.
+							GetPendingReviews(
+								w,
+								r,
+							)
+						return
 
-				case rest == "reviewed" &&
-					r.Method == http.MethodGet:
-					coursewareReviewHandler.GetReviewedRecords(w, r)
-					return
+					case rest == "reviewed" &&
+						r.Method == http.MethodGet:
+						coursewareReviewHandler.
+							GetReviewedRecords(
+								w,
+								r,
+							)
+						return
 
-				case rest == "stats" &&
-					r.Method == http.MethodGet:
-					coursewareReviewHandler.GetReviewStats(w, r)
-					return
-				}
+					case rest == "stats" &&
+						r.Method == http.MethodGet:
+						coursewareReviewHandler.
+							GetReviewStats(
+								w,
+								r,
+							)
+						return
 
-				switch {
-				case strings.HasSuffix(path, "/l1"):
-					coursewareReviewHandler.ReviewL1(w, r)
+					// R-03历史记录路由必须在通用/detail之前识别，
+					// 避免把records误当作旧接口courseware_id。
+					case strings.HasPrefix(
+						rest,
+						"records/",
+					) &&
+						strings.HasSuffix(
+							rest,
+							"/detail",
+						):
+						coursewareReviewHandler.
+							GetReviewHistoryDetail(
+								w,
+								r,
+							)
+						return
+					}
 
-				case strings.HasSuffix(path, "/l2"):
-					coursewareReviewHandler.ReviewL2(w, r)
+					switch {
+					case strings.HasSuffix(
+						path,
+						"/l1",
+					):
+						coursewareReviewHandler.
+							ReviewL1(
+								w,
+								r,
+							)
 
-				case strings.HasSuffix(path, "/history"):
-					coursewareReviewHandler.GetReviewHistory(w, r)
+					case strings.HasSuffix(
+						path,
+						"/l2",
+					):
+						coursewareReviewHandler.
+							ReviewL2(
+								w,
+								r,
+							)
 
-				case strings.HasSuffix(path, "/detail"):
-					coursewareReviewHandler.GetReviewDetail(w, r)
+					case strings.HasSuffix(
+						path,
+						"/history",
+					):
+						coursewareReviewHandler.
+							GetReviewHistory(
+								w,
+								r,
+							)
 
-				default:
-					http.NotFound(w, r)
-				}
-			},
-		),
-		authMW,
-	)
+					case strings.HasSuffix(
+						path,
+						"/detail",
+					):
+						coursewareReviewHandler.
+							GetReviewDetail(
+								w,
+								r,
+							)
+
+					default:
+						http.NotFound(
+							w,
+							r,
+						)
+					}
+				},
+			),
+			authMW,
+		)
 
 	mux.Handle(
 		"/api/v1/courseware-reviews",

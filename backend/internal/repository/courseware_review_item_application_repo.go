@@ -4,24 +4,26 @@ package repository
 //
 // 课件审核整改项页面应用的版本绑定事务仓储。
 //
-// 本文件负责 confirmed -> applying 的原子开始动作：
-//   1. 锁定整改项；
-//   2. 复核课件作者、课件归属和整改项状态；
-//   3. 正式问题必须使用正式交付版本，自审问题必须使用当前确认版本；
-//   4. 复核请求version_id对应的版本归属、状态和可信正文；
-//   5. 复核稳定page_id、当前页码、问题快照哈希和版本确认时页面哈希；
-//   6. 页面变化或删除时提交stale或orphaned状态；
-//   7. 校验通过后同时写入applying和applied_instruction_version_id；
-//   8. 返回本事务确认的稳定page_id、页码和页面HTML哈希。
+// 本文件负责两类页面应用的原子开始动作：
+//
+//   1. 首次修改：confirmed -> applying；
+//   2. 自审继续调整：applied -> applying。
+//
+// 两类动作共同复核课件作者、课件归属、稳定page_id、指令版本和可信正文。
+// 首次修改以问题快照和版本确认快照为页面起点；
+// 自审继续调整以最近一次applied_page_hash为页面起点，避免把教师已经完成的
+// 第一次正常修改误判为页面变化。
 //
 // 浏览器提交的指令正文只用于确认其完整包含可信版本正文。
-// 版本归属、页面快照、版本内容和页面守卫均以数据库记录为准。
+// 版本归属、页面快照、版本内容、页面守卫和状态迁移均以数据库记录为准。
+// page_id因页面删除而被SET NULL时，page_number_snapshot负责保留“原来是页级问题”事实。
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -106,39 +108,47 @@ func BeginCoursewareReviewItemApplicationWithVersion(
 
 	tx, err := database.DB.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"开始课件整改项页面应用事务失败: %w",
-			err,
-		)
+		return nil, fmt.Errorf("开始课件整改项页面应用事务失败: %w", err)
 	}
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
 
 	var (
+		sourceSessionID    string
 		itemCoursewareID   string
 		sourceType         string
 		itemStatus         string
 		pageID             string
+		pageNumberSnapshot int
 		itemPageHash       string
 		currentVersionID   string
 		deliveredVersionID string
 		appliedVersionID   string
-		alreadyApplied     bool
+		appliedPageHash    string
+		appliedAt          *time.Time
+		alreadyDelivered   bool
 	)
 
 	err = tx.QueryRow(
 		ctx,
 		`SELECT
+			source_session_id,
 			courseware_id,
 			source_type,
 			status,
 			COALESCE(page_id::text, ''),
+			page_number_snapshot,
 			COALESCE(page_html_hash, ''),
 			COALESCE(current_instruction_version_id::text, ''),
 			COALESCE(delivered_instruction_version_id::text, ''),
 			COALESCE(applied_instruction_version_id::text, ''),
-			(applied_at IS NOT NULL)
+			COALESCE(applied_page_hash, ''),
+			applied_at,
+			(
+				courseware_review_id IS NOT NULL
+				OR feedback_id IS NOT NULL
+			)
 		 FROM courseware_review_items
 		 WHERE id = $1
 		   AND owner_id = $2
@@ -146,35 +156,98 @@ func BeginCoursewareReviewItemApplicationWithVersion(
 		itemID,
 		actorID,
 	).Scan(
+		&sourceSessionID,
 		&itemCoursewareID,
 		&sourceType,
 		&itemStatus,
 		&pageID,
+		&pageNumberSnapshot,
 		&itemPageHash,
 		&currentVersionID,
 		&deliveredVersionID,
 		&appliedVersionID,
-		&alreadyApplied,
+		&appliedPageHash,
+		&appliedAt,
+		&alreadyDelivered,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrCoursewareReviewItemNotFound
 		}
-		return nil, fmt.Errorf(
-			"锁定待应用课件整改项失败: %w",
-			err,
-		)
+		return nil, fmt.Errorf("锁定待应用课件整改项失败: %w", err)
 	}
 
 	if itemCoursewareID != coursewareID {
 		return nil, ErrCoursewareReviewItemNotFound
 	}
-	if itemStatus != models.CWReviewItemStatusConfirmed ||
-		appliedVersionID != "" ||
-		alreadyApplied {
+
+	initialApply :=
+		itemStatus == models.CWReviewItemStatusConfirmed &&
+			appliedVersionID == "" &&
+			appliedAt == nil
+
+	selfReapply :=
+		itemStatus == models.CWReviewItemStatusApplied &&
+			sourceType == models.CWReviewItemSourceSelf &&
+			!alreadyDelivered &&
+			appliedVersionID != "" &&
+			appliedAt != nil &&
+			strings.TrimSpace(appliedPageHash) != ""
+
+	if !initialApply && !selfReapply {
 		return nil, ErrCoursewareReviewItemConflict
 	}
-	if pageID == "" {
+
+	if strings.TrimSpace(pageID) == "" {
+		if pageNumberSnapshot > 0 {
+			if selfReapply {
+				record := &cwSelfReviewPostApplyRecord{
+					ID:                          itemID,
+					SessionID:                   sourceSessionID,
+					CoursewareID:                coursewareID,
+					SourceType:                  sourceType,
+					OwnerID:                     actorID,
+					Status:                      itemStatus,
+					PageID:                      "",
+					PageNumberSnapshot:          pageNumberSnapshot,
+					AppliedAt:                   appliedAt,
+					AppliedPageHash:             appliedPageHash,
+					AppliedInstructionVersionID: appliedVersionID,
+					AlreadyDelivered:            alreadyDelivered,
+				}
+
+				if markErr := invalidateSelfCoursewareReviewPostApplyTx(
+					ctx,
+					tx,
+					record,
+					actorID,
+					models.CWReviewItemStatusApplied,
+					models.CWReviewItemStatusOrphaned,
+					"原页面已不存在，需要人工重新检查相关页面后再继续处理。",
+				); markErr != nil {
+					return nil, markErr
+				}
+			} else {
+				if markErr := markCoursewareReviewItemApplicationInvalidTx(
+					ctx,
+					tx,
+					itemID,
+					models.CWReviewItemStatusOrphaned,
+				); markErr != nil {
+					return nil, markErr
+				}
+			}
+
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return nil, fmt.Errorf(
+					"提交整改项页面删除状态失败: %w",
+					commitErr,
+				)
+			}
+
+			return nil, ErrCoursewareReviewItemApplicationPageOrphaned
+		}
+
 		return nil, ErrCoursewareReviewItemApplicationPageMismatch
 	}
 
@@ -188,6 +261,9 @@ func BeginCoursewareReviewItemApplicationWithVersion(
 		expectedVersionID = currentVersionID
 	}
 
+	if selfReapply && appliedVersionID != expectedVersionID {
+		return nil, ErrCoursewareReviewItemApplicationVersionMismatch
+	}
 	if expectedVersionID == "" ||
 		instructionVersionID != expectedVersionID {
 		return nil, ErrCoursewareReviewItemApplicationVersionMismatch
@@ -220,10 +296,7 @@ func BeginCoursewareReviewItemApplicationWithVersion(
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrCoursewareReviewItemApplicationVersionMismatch
 		}
-		return nil, fmt.Errorf(
-			"读取页面应用指令版本失败: %w",
-			err,
-		)
+		return nil, fmt.Errorf("读取页面应用指令版本失败: %w", err)
 	}
 
 	if versionStatus != models.CWReviewInstructionVersionStatusConfirmed {
@@ -267,13 +340,42 @@ func BeginCoursewareReviewItemApplicationWithVersion(
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			if markErr := markCoursewareReviewItemApplicationInvalidTx(
-				ctx,
-				tx,
-				itemID,
-				models.CWReviewItemStatusOrphaned,
-			); markErr != nil {
-				return nil, markErr
+			if selfReapply {
+				record := &cwSelfReviewPostApplyRecord{
+					ID:                          itemID,
+					SessionID:                   sourceSessionID,
+					CoursewareID:                coursewareID,
+					SourceType:                  sourceType,
+					OwnerID:                     actorID,
+					Status:                      itemStatus,
+					PageID:                      pageID,
+					PageNumberSnapshot:          pageNumberSnapshot,
+					AppliedAt:                   appliedAt,
+					AppliedPageHash:             appliedPageHash,
+					AppliedInstructionVersionID: appliedVersionID,
+					AlreadyDelivered:            alreadyDelivered,
+				}
+
+				if markErr := invalidateSelfCoursewareReviewPostApplyTx(
+					ctx,
+					tx,
+					record,
+					actorID,
+					models.CWReviewItemStatusApplied,
+					models.CWReviewItemStatusOrphaned,
+					"原页面已不存在，需要人工重新检查相关页面后再继续处理。",
+				); markErr != nil {
+					return nil, markErr
+				}
+			} else {
+				if markErr := markCoursewareReviewItemApplicationInvalidTx(
+					ctx,
+					tx,
+					itemID,
+					models.CWReviewItemStatusOrphaned,
+				); markErr != nil {
+					return nil, markErr
+				}
 			}
 
 			if commitErr := tx.Commit(ctx); commitErr != nil {
@@ -286,10 +388,7 @@ func BeginCoursewareReviewItemApplicationWithVersion(
 			return nil, ErrCoursewareReviewItemApplicationPageOrphaned
 		}
 
-		return nil, fmt.Errorf(
-			"读取整改项当前页面失败: %w",
-			err,
-		)
+		return nil, fmt.Errorf("读取整改项当前页面失败: %w", err)
 	}
 
 	if currentPageNumber != input.PageNumber {
@@ -298,9 +397,48 @@ func BeginCoursewareReviewItemApplicationWithVersion(
 
 	itemPageHash = strings.TrimSpace(itemPageHash)
 	versionPageHash = strings.TrimSpace(versionPageHash)
+	appliedPageHash = strings.TrimSpace(appliedPageHash)
 	currentPageHash = strings.ToLower(strings.TrimSpace(currentPageHash))
 
-	if itemPageHash == "" ||
+	if selfReapply {
+		if currentPageHash != appliedPageHash {
+			record := &cwSelfReviewPostApplyRecord{
+				ID:                          itemID,
+				SessionID:                   sourceSessionID,
+				CoursewareID:                coursewareID,
+				SourceType:                  sourceType,
+				OwnerID:                     actorID,
+				Status:                      itemStatus,
+				PageID:                      pageID,
+				PageNumberSnapshot:          pageNumberSnapshot,
+				AppliedAt:                   appliedAt,
+				AppliedPageHash:             appliedPageHash,
+				AppliedInstructionVersionID: appliedVersionID,
+				AlreadyDelivered:            alreadyDelivered,
+			}
+
+			if err := invalidateSelfCoursewareReviewPostApplyTx(
+				ctx,
+				tx,
+				record,
+				actorID,
+				models.CWReviewItemStatusApplied,
+				models.CWReviewItemStatusStale,
+				"页面内容已变化，需要人工重新检查当前页面后再继续处理。",
+			); err != nil {
+				return nil, err
+			}
+
+			if err := tx.Commit(ctx); err != nil {
+				return nil, fmt.Errorf(
+					"提交自审继续调整页面变化状态失败: %w",
+					err,
+				)
+			}
+
+			return nil, ErrCoursewareReviewItemApplicationPageStale
+		}
+	} else if itemPageHash == "" ||
 		versionPageHash == "" ||
 		currentPageHash != itemPageHash ||
 		currentPageHash != versionPageHash {
@@ -323,26 +461,68 @@ func BeginCoursewareReviewItemApplicationWithVersion(
 		return nil, ErrCoursewareReviewItemApplicationPageStale
 	}
 
-	updateResult, err := tx.Exec(
-		ctx,
-		`UPDATE courseware_review_items
-		 SET
-			status = 'applying',
-			applied_instruction_version_id = $3,
-			updated_at = NOW()
-		 WHERE id = $1
-		   AND owner_id = $2
-		   AND status = 'confirmed'
-		   AND applied_instruction_version_id IS NULL
-		   AND applied_at IS NULL
-		   AND COALESCE(
-				delivered_instruction_version_id,
-				current_instruction_version_id
-		   ) = $3`,
-		itemID,
-		actorID,
-		instructionVersionID,
-	)
+	var updateResult pgconn.CommandTag
+
+	if selfReapply {
+		if appliedAt == nil {
+			return nil, ErrCoursewareReviewItemConflict
+		}
+
+		if err := appendSelfCoursewareReviewItemReapplyStartedTx(
+			ctx,
+			tx,
+			sourceSessionID,
+			itemID,
+			actorID,
+			*appliedAt,
+		); err != nil {
+			return nil, err
+		}
+
+		updateResult, err = tx.Exec(
+			ctx,
+			`UPDATE courseware_review_items
+			 SET
+				status = 'applying',
+				applied_at = NULL,
+				updated_at = NOW()
+			 WHERE id = $1
+			   AND owner_id = $2
+			   AND source_type = 'self'
+			   AND status = 'applied'
+			   AND applied_instruction_version_id = $3
+			   AND applied_at = $4
+			   AND BTRIM(COALESCE(applied_page_hash, '')) = $5
+			   AND courseware_review_id IS NULL
+			   AND feedback_id IS NULL`,
+			itemID,
+			actorID,
+			instructionVersionID,
+			*appliedAt,
+			appliedPageHash,
+		)
+	} else {
+		updateResult, err = tx.Exec(
+			ctx,
+			`UPDATE courseware_review_items
+			 SET
+				status = 'applying',
+				applied_instruction_version_id = $3,
+				updated_at = NOW()
+			 WHERE id = $1
+			   AND owner_id = $2
+			   AND status = 'confirmed'
+			   AND applied_instruction_version_id IS NULL
+			   AND applied_at IS NULL
+			   AND COALESCE(
+					delivered_instruction_version_id,
+					current_instruction_version_id
+			   ) = $3`,
+			itemID,
+			actorID,
+			instructionVersionID,
+		)
+	}
 	if err != nil {
 		return nil, mapCoursewareReviewItemApplicationWriteError(
 			"绑定页面应用指令版本失败",

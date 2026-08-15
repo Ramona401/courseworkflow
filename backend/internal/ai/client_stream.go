@@ -79,33 +79,14 @@ func CallAIStreamContext(
 ) (*CallResult, error) {
 	messages := make([]ChatMessage, 0, 2)
 	if strings.TrimSpace(systemPrompt) != "" {
-		messages = append(
-			messages,
-			ChatMessage{
-				Role:    "system",
-				Content: systemPrompt,
-			},
-		)
+		messages = append(messages, ChatMessage{Role: "system", Content: systemPrompt})
 	}
-	messages = append(
-		messages,
-		ChatMessage{
-			Role:    "user",
-			Content: userPrompt,
-		},
-	)
+	messages = append(messages, ChatMessage{Role: "user", Content: userPrompt})
 
-	result, err := CallAIStreamMessagesContext(
-		ctx,
-		cfg,
-		messages,
-		onChunk,
-		traceCtx,
-	)
+	result, err := CallAIStreamMessagesContext(ctx, cfg, messages, onChunk, traceCtx)
 	if err != nil {
 		return nil, err
 	}
-
 	return &result.CallResult, nil
 }
 
@@ -121,53 +102,31 @@ func CallAIStreamMessagesContext(
 		ctx = context.Background()
 	}
 	if cfg == nil {
-		return nil, fmt.Errorf(
-			"AI流式配置不能为空",
-		)
+		return nil, fmt.Errorf("AI流式配置不能为空")
 	}
-	if err := validateAIStreamMessages(
-		messages,
-	); err != nil {
+	if err := validateAIStreamMessages(messages); err != nil {
 		return nil, err
 	}
 
-	runtimeConfig := cloneAIStreamConfig(
-		cfg,
-	)
+	// 在完整消息入口统一应用系统级数学输出策略，覆盖旧system+user入口和正式历史消息入口。
+	runtimeMessages := applyMathOutputPolicy(cfg, messages, traceCtx)
+	runtimeConfig := cloneAIStreamConfig(cfg)
 	startTime := time.Now()
 
-	if allowed, errMsg := invokeCreditCheck(
-		traceCtx,
-	); !allowed {
-		return nil, fmt.Errorf(
-			"%s",
-			errMsg,
-		)
+	if allowed, errMsg := invokeCreditCheck(traceCtx); !allowed {
+		return nil, fmt.Errorf("%s", errMsg)
 	}
 
 	// 分流必须先于endpoint和模型尝试链计算。
-	applyModelPolicy(
+	applyModelPolicy(runtimeConfig, traceCtx)
+	endpoint := strings.TrimRight(runtimeConfig.APIBaseURL, "/") + "/chat/completions"
+
+	response, actualModel, usedFallback, err := openAIStreamResponse(
+		ctx,
 		runtimeConfig,
-		traceCtx,
+		endpoint,
+		runtimeMessages,
 	)
-
-	endpoint :=
-		strings.TrimRight(
-			runtimeConfig.APIBaseURL,
-			"/",
-		) +
-			"/chat/completions"
-
-	response,
-		actualModel,
-		usedFallback,
-		err :=
-		openAIStreamResponse(
-			ctx,
-			runtimeConfig,
-			endpoint,
-			messages,
-		)
 	if err != nil {
 		emitTrace(
 			traceCtx,
@@ -175,9 +134,7 @@ func CallAIStreamMessagesContext(
 			0,
 			0,
 			0,
-			time.Since(
-				startTime,
-			).Milliseconds(),
+			time.Since(startTime).Milliseconds(),
 			"error",
 			err.Error(),
 			0,
@@ -189,22 +146,9 @@ func CallAIStreamMessagesContext(
 	}
 	defer response.Body.Close()
 
-	readResult, err :=
-		readAIStreamResponse(
-			response,
-			onChunk,
-		)
-
-	latencyMs :=
-		time.Since(
-			startTime,
-		).Milliseconds()
-
-	modelUsed :=
-		coalesce(
-			readResult.ModelUsed,
-			actualModel,
-		)
+	readResult, err := readAIStreamResponse(response, onChunk)
+	latencyMs := time.Since(startTime).Milliseconds()
+	modelUsed := coalesce(readResult.ModelUsed, actualModel)
 
 	if err != nil {
 		emitTrace(
@@ -216,9 +160,7 @@ func CallAIStreamMessagesContext(
 			latencyMs,
 			"error",
 			err.Error(),
-			len(
-				readResult.Content,
-			),
+			len(readResult.Content),
 			true,
 			usedFallback,
 			runtimeConfig.Model,
@@ -226,19 +168,9 @@ func CallAIStreamMessagesContext(
 		return nil, err
 	}
 
-	content :=
-		stripThinking(
-			readResult.Content,
-		)
-
-	if strings.TrimSpace(
-		content,
-	) == "" {
-		err =
-			fmt.Errorf(
-				"AI流式返回内容为空",
-			)
-
+	content := stripThinking(readResult.Content)
+	if strings.TrimSpace(content) == "" {
+		err = fmt.Errorf("AI流式返回内容为空")
 		emitTrace(
 			traceCtx,
 			modelUsed,
@@ -253,20 +185,16 @@ func CallAIStreamMessagesContext(
 			usedFallback,
 			runtimeConfig.Model,
 		)
-
 		return nil, err
 	}
 
-	promptTokens,
-		completionTokens,
-		totalTokens :=
-		normalizeAIStreamTokenUsage(
-			messages,
-			content,
-			readResult.PromptTokens,
-			readResult.CompletionTokens,
-			readResult.TotalTokens,
-		)
+	promptTokens, completionTokens, totalTokens := normalizeAIStreamTokenUsage(
+		runtimeMessages,
+		content,
+		readResult.PromptTokens,
+		readResult.CompletionTokens,
+		readResult.TotalTokens,
+	)
 
 	emitTrace(
 		traceCtx,

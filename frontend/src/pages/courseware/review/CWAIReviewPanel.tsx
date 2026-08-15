@@ -3,17 +3,21 @@
  *
  * 课件AI审核面板编排壳。
  *
- * 状态和API调用位于useCWAIReviewController.ts；
+ * 状态和整改项API调用位于useCWAIReviewController.ts；
  * 配置与进度卡片位于CWAIReviewProgressCards.tsx；
  * 跨页面、跨问题讨论位于CWAIReviewGlobalDiscussion.tsx；
- * 最终报告、配置摘要、问题工作台和关系治理位于
- * CWAIReviewReportView.tsx。
+ * R-06正式问题组位于CWAIReviewItemGroups.tsx；
+ * 最终报告、问题工作台和直接关系治理位于CWAIReviewReportView.tsx。
  *
  * 本层明确区分：
  *   1. workSelectedItemIds：临时工作选择；
  *   2. controller.selectedItemIds：正式退回交付选择。
  *
- * 临时选择不会进入正式审核决定payload。
+ * R-07 Atomic Apply成功后：
+ *   - 重新GET整改项；
+ *   - 重新GET持久化关系；
+ *   - 重新GET正式问题组；
+ *   - 不根据Impact Plan Preview payload乐观伪造业务状态。
  */
 
 import {
@@ -23,9 +27,12 @@ import {
   useState,
 } from "react";
 
-import type {
-  CWAIReviewItem,
-  CWAIReviewItemRelation,
+import {
+  getCWAIReviewItemGroups,
+  getCWAIReviewItemRelations,
+  type CWAIReviewItem,
+  type CWAIReviewItemGroup,
+  type CWAIReviewItemRelation,
 } from "@/api/coursewares";
 
 import {
@@ -33,6 +40,7 @@ import {
 } from "./CWAIReviewGlobalDiscussion.shared";
 
 import CWAIReviewGlobalDiscussion from "./CWAIReviewGlobalDiscussion";
+import CWAIReviewItemGroups from "./CWAIReviewItemGroups";
 import CWAIReviewProgressCards from "./CWAIReviewProgressCards";
 
 import CWAIReviewReportView, {
@@ -67,7 +75,7 @@ export interface CWAIReviewPanelProps {
     pageNumber: number,
   ) => void;
 
-  onUseReviewComment: (
+  onUseReviewComment?: (
     comment: string,
   ) => void;
 
@@ -111,6 +119,19 @@ export default function CWAIReviewPanel({
       CWAIReviewItemRelation[]
     >([]);
 
+  const [
+    itemGroups,
+    setItemGroups,
+  ] =
+    useState<
+      CWAIReviewItemGroup[]
+    >([]);
+
+  const [
+    governanceRefreshError,
+    setGovernanceRefreshError,
+  ] = useState("");
+
   /**
    * 统一问题工作台的临时工作选择。
    *
@@ -142,8 +163,24 @@ export default function CWAIReviewPanel({
   const selectionRequestSequenceRef =
     useRef(0);
 
+  const completedSession =
+    controller.session
+      ?.status === "done"
+      ? controller.session
+      : null;
+
+  const completedSessionID =
+    completedSession?.id || "";
+
+  const completedSessionIDRef =
+    useLatestValueRef(
+      completedSessionID,
+    );
+
   useEffect(() => {
     setGovernanceRelations([]);
+    setItemGroups([]);
+    setGovernanceRefreshError("");
     setWorkSelectedItemIds([]);
 
     setDiscussionSelectionRequest(
@@ -155,6 +192,192 @@ export default function CWAIReviewPanel({
     );
   }, [
     controller.session?.id,
+  ]);
+
+  /**
+   * 会话完成后读取关系和问题组数据库真值。
+   *
+   * 整改项由useCWAIReviewItemsState负责加载，避免双重所有权。
+   */
+  useEffect(() => {
+    if (!completedSessionID) {
+      return;
+    }
+
+    let cancelled = false;
+
+    setGovernanceRefreshError("");
+
+    void Promise.all([
+      getCWAIReviewItemRelations(
+        completedSessionID,
+      ),
+      getCWAIReviewItemGroups(
+        completedSessionID,
+      ),
+    ])
+      .then(
+        ([
+          relationResult,
+          groupResult,
+        ]) => {
+          if (cancelled) {
+            return;
+          }
+
+          setGovernanceRelations(
+            relationResult.relations || [],
+          );
+
+          setItemGroups(
+            groupResult.groups || [],
+          );
+        },
+      )
+      .catch((cause) => {
+        if (cancelled) {
+          return;
+        }
+
+        setGovernanceRefreshError(
+          cause instanceof Error
+            ? cause.message
+            : "加载问题治理数据失败",
+        );
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [completedSessionID]);
+
+  /**
+   * R-07 Atomic Apply完成后必须重新读取三类数据库真值。
+   *
+   * 自定义事件只作为“需要刷新”的通知，不携带任何业务对象真值。
+   */
+  useEffect(() => {
+    if (!completedSessionID) {
+      return;
+    }
+
+    const handleImpactPlanApplied =
+      (
+        rawEvent: Event,
+      ) => {
+        const event =
+          rawEvent as CustomEvent<{
+            sessionId?: string;
+            planId?: string;
+          }>;
+
+        if (
+          event.detail?.sessionId !==
+          completedSessionID
+        ) {
+          return;
+        }
+
+        setGovernanceRefreshError("");
+
+        void Promise.all([
+          controller
+            .refreshSessionItems(
+              completedSessionID,
+            ),
+          getCWAIReviewItemRelations(
+            completedSessionID,
+          ),
+          getCWAIReviewItemGroups(
+            completedSessionID,
+          ),
+        ])
+          .then(
+            ([
+              nextItems,
+              relationResult,
+              groupResult,
+            ]) => {
+              if (
+                completedSessionIDRef
+                  .current !==
+                completedSessionID
+              ) {
+                return;
+              }
+
+              setGovernanceRelations(
+                relationResult.relations ||
+                  [],
+              );
+
+              setItemGroups(
+                groupResult.groups || [],
+              );
+
+              const actionableIDSet =
+                new Set(
+                  nextItems
+                    .filter(
+                      isCWGlobalDiscussionActionableItem,
+                    )
+                    .map(
+                      (item) =>
+                        item.id,
+                    ),
+                );
+
+              setWorkSelectedItemIds(
+                (previous) =>
+                  previous.filter(
+                    (itemID) =>
+                      actionableIDSet.has(
+                        itemID,
+                      ),
+                  ),
+              );
+
+              setDiscussionSelectionRequest(
+                null,
+              );
+
+              setRelationSelectionRequest(
+                null,
+              );
+            },
+          )
+          .catch((cause) => {
+            if (
+              completedSessionIDRef
+                .current !==
+              completedSessionID
+            ) {
+              return;
+            }
+
+            setGovernanceRefreshError(
+              cause instanceof Error
+                ? cause.message
+                : "影响方案已应用，但刷新问题治理视图失败，请手动刷新",
+            );
+          });
+      };
+
+    window.addEventListener(
+      "tedna:cw-ai-review-impact-plan-applied",
+      handleImpactPlanApplied,
+    );
+
+    return () => {
+      window.removeEventListener(
+        "tedna:cw-ai-review-impact-plan-applied",
+        handleImpactPlanApplied,
+      );
+    };
+  }, [
+    completedSessionID,
+    completedSessionIDRef,
+    controller.refreshSessionItems,
   ]);
 
   /**
@@ -192,6 +415,19 @@ export default function CWAIReviewPanel({
       ) => {
         setGovernanceRelations(
           relations || [],
+        );
+      },
+      [],
+    );
+
+  const handleGroupsChanged =
+    useCallback(
+      (
+        groups:
+          CWAIReviewItemGroup[],
+      ) => {
+        setItemGroups(
+          groups || [],
         );
       },
       [],
@@ -328,12 +564,6 @@ export default function CWAIReviewPanel({
       ],
     );
 
-  const completedSession =
-    controller.session
-      ?.status === "done"
-      ? controller.session
-      : null;
-
   return (
     <div
       style={{
@@ -356,6 +586,24 @@ export default function CWAIReviewPanel({
           lessonPlanId
         }
       />
+
+      {governanceRefreshError && (
+        <div
+          style={{
+            padding: "8px 10px",
+            borderRadius: "8px",
+            border:
+              "1px solid #FECACA",
+            background:
+              "#FEF2F2",
+            color: "#B91C1C",
+            fontSize: "10px",
+            lineHeight: 1.5,
+          }}
+        >
+          {governanceRefreshError}
+        </div>
+      )}
 
       {!controller.loading &&
         completedSession &&
@@ -389,6 +637,35 @@ export default function CWAIReviewPanel({
             }
           />
         </div>
+      )}
+
+      {!controller.loading &&
+        completedSession &&
+        controller.items.length >
+          0 && (
+        <CWAIReviewItemGroups
+          sessionId={
+            completedSession.id
+          }
+          items={
+            controller.items
+          }
+          groups={
+            itemGroups
+          }
+          workSelectedItemIds={
+            workSelectedItemIds
+          }
+          onSelectPage={
+            onSelectPage
+          }
+          onClearWorkSelection={
+            handleClearWorkSelection
+          }
+          onGroupsChanged={
+            handleGroupsChanged
+          }
+        />
       )}
 
       {!controller.loading && (
@@ -432,7 +709,9 @@ export default function CWAIReviewPanel({
             onSelectPage
           }
           onUseReviewComment={
-            onUseReviewComment
+            mode === "self"
+              ? onUseReviewComment
+              : undefined
           }
           onAdoptFinding={
             controller

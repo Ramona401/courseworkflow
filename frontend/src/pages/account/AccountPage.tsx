@@ -3,7 +3,7 @@
  *
  * 功能：
  * 1) 基本信息Tab（个人信息卡片 + 编辑显示名称）
- * 2) 安全设置Tab（修改密码）
+ * 2) 安全设置Tab（Identity Phase 1账号关联 + 修改密码）
  *
  * 学校管理入口已移至两个系统顶部Header下拉菜单
  */
@@ -12,6 +12,7 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import { useAuth } from '@/store/auth'
 import { getProfile, updateProfile, changePassword } from '@/api/account'
 import type { ProfileInfo } from '@/api/account'
+import IdentityAccountLinkCard from './IdentityAccountLinkCard'
 import MyOrganizationTab from './MyOrganizationTab'
 
 const COLORS = {
@@ -222,45 +223,51 @@ export default function AccountPage() {
 
         {/* 安全设置 Tab */}
         {activeTab === 'security' && (
-          <div style={{ background: COLORS.white, borderRadius: '16px', border: `1px solid ${COLORS.border}`, padding: '24px 28px', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}>
-            <h2 style={{ fontSize: '16px', fontWeight: 600, color: COLORS.text, margin: '0 0 20px 0' }}>安全设置</h2>
-            {!showPwdForm ? (
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px', borderRadius: '12px', background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
-                <div>
-                  <div style={{ fontSize: '15px', fontWeight: 500, color: COLORS.text }}>登录密码</div>
-                  <div style={{ fontSize: '13px', color: COLORS.textMuted, marginTop: '2px' }}>建议定期修改密码以保证账户安全</div>
+          <>
+            <IdentityAccountLinkCard
+              onError={message => showToast(message, 'error')}
+            />
+
+            <div style={{ background: COLORS.white, borderRadius: '16px', border: `1px solid ${COLORS.border}`, padding: '24px 28px', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}>
+              <h2 style={{ fontSize: '16px', fontWeight: 600, color: COLORS.text, margin: '0 0 20px 0' }}>安全设置</h2>
+              {!showPwdForm ? (
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px', borderRadius: '12px', background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+                  <div>
+                    <div style={{ fontSize: '15px', fontWeight: 500, color: COLORS.text }}>登录密码</div>
+                    <div style={{ fontSize: '13px', color: COLORS.textMuted, marginTop: '2px' }}>建议定期修改密码以保证账户安全</div>
+                  </div>
+                  <button onClick={() => setShowPwdForm(true)} style={{ padding: '8px 20px', borderRadius: '8px', border: `1px solid ${COLORS.primary}`, background: COLORS.primaryLight, color: COLORS.primary, fontSize: '14px', fontWeight: 600, cursor: 'pointer' }}>修改密码</button>
                 </div>
-                <button onClick={() => setShowPwdForm(true)} style={{ padding: '8px 20px', borderRadius: '8px', border: `1px solid ${COLORS.primary}`, background: COLORS.primaryLight, color: COLORS.primary, fontSize: '14px', fontWeight: 600, cursor: 'pointer' }}>修改密码</button>
-              </div>
-            ) : (
-              <div style={{ padding: '20px', borderRadius: '12px', background: COLORS.bg, border: `1.5px solid ${COLORS.primary}` }}>
-                <div style={{ marginBottom: '16px', fontSize: '15px', fontWeight: 600, color: COLORS.text }}>修改密码</div>
-                <div style={{ marginBottom: '14px' }}>
-                  <label style={{ display: 'block', fontSize: '13px', color: COLORS.textSec, marginBottom: '6px' }}>旧密码</label>
-                  <div style={{ position: 'relative' }}>
-                    <input type={showOldPwd ? 'text' : 'password'} value={pwdForm.old_password} onChange={e => setPwdForm(p => ({ ...p, old_password: e.target.value }))} placeholder="请输入旧密码" style={{ width: '100%', padding: '10px 40px 10px 14px', borderRadius: '8px', border: `1px solid ${COLORS.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box', background: COLORS.white }} />
-                    <button onClick={() => setShowOldPwd(p => !p)} style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted, fontSize: '16px' }}>{showOldPwd ? '🙈' : '👁'}</button>
+              ) : (
+                <div style={{ padding: '20px', borderRadius: '12px', background: COLORS.bg, border: `1.5px solid ${COLORS.primary}` }}>
+                  <div style={{ marginBottom: '16px', fontSize: '15px', fontWeight: 600, color: COLORS.text }}>修改密码</div>
+                  <div style={{ marginBottom: '14px' }}>
+                    <label style={{ display: 'block', fontSize: '13px', color: COLORS.textSec, marginBottom: '6px' }}>旧密码</label>
+                    <div style={{ position: 'relative' }}>
+                      <input type={showOldPwd ? 'text' : 'password'} value={pwdForm.old_password} onChange={e => setPwdForm(p => ({ ...p, old_password: e.target.value }))} placeholder="请输入旧密码" style={{ width: '100%', padding: '10px 40px 10px 14px', borderRadius: '8px', border: `1px solid ${COLORS.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box', background: COLORS.white }} />
+                      <button onClick={() => setShowOldPwd(p => !p)} style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted, fontSize: '16px' }}>{showOldPwd ? '🙈' : '👁'}</button>
+                    </div>
+                  </div>
+                  <div style={{ marginBottom: '14px' }}>
+                    <label style={{ display: 'block', fontSize: '13px', color: COLORS.textSec, marginBottom: '6px' }}>新密码（至少6位）</label>
+                    <div style={{ position: 'relative' }}>
+                      <input type={showNewPwd ? 'text' : 'password'} value={pwdForm.new_password} onChange={e => setPwdForm(p => ({ ...p, new_password: e.target.value }))} placeholder="请输入新密码" style={{ width: '100%', padding: '10px 40px 10px 14px', borderRadius: '8px', border: `1px solid ${COLORS.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box', background: COLORS.white }} />
+                      <button onClick={() => setShowNewPwd(p => !p)} style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted, fontSize: '16px' }}>{showNewPwd ? '🙈' : '👁'}</button>
+                    </div>
+                  </div>
+                  <div style={{ marginBottom: '20px' }}>
+                    <label style={{ display: 'block', fontSize: '13px', color: COLORS.textSec, marginBottom: '6px' }}>确认新密码</label>
+                    <input type="password" value={pwdForm.confirm} onChange={e => setPwdForm(p => ({ ...p, confirm: e.target.value }))} onKeyDown={e => { if (e.key === 'Enter') handleChangePassword() }} placeholder="再次输入新密码" style={{ width: '100%', padding: '10px 14px', borderRadius: '8px', border: `1px solid ${pwdForm.confirm && pwdForm.confirm !== pwdForm.new_password ? COLORS.danger : COLORS.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box', background: COLORS.white }} />
+                    {pwdForm.confirm && pwdForm.confirm !== pwdForm.new_password && (<div style={{ fontSize: '12px', color: COLORS.danger, marginTop: '4px' }}>两次密码不一致</div>)}
+                  </div>
+                  <div style={{ display: 'flex', gap: '10px' }}>
+                    <button onClick={handleChangePassword} disabled={pwdSaving} style={{ flex: 1, padding: '10px', borderRadius: '8px', border: 'none', background: pwdSaving ? COLORS.textMuted : 'linear-gradient(135deg,#4F7BE8,#7C3AED)', color: '#fff', fontSize: '14px', fontWeight: 600, cursor: pwdSaving ? 'not-allowed' : 'pointer' }}>{pwdSaving ? '修改中...' : '确认修改'}</button>
+                    <button onClick={() => { setShowPwdForm(false); setPwdForm({ old_password: '', new_password: '', confirm: '' }) }} style={{ padding: '10px 20px', borderRadius: '8px', border: `1px solid ${COLORS.border}`, background: COLORS.white, color: COLORS.textSec, fontSize: '14px', cursor: 'pointer' }}>取消</button>
                   </div>
                 </div>
-                <div style={{ marginBottom: '14px' }}>
-                  <label style={{ display: 'block', fontSize: '13px', color: COLORS.textSec, marginBottom: '6px' }}>新密码（至少6位）</label>
-                  <div style={{ position: 'relative' }}>
-                    <input type={showNewPwd ? 'text' : 'password'} value={pwdForm.new_password} onChange={e => setPwdForm(p => ({ ...p, new_password: e.target.value }))} placeholder="请输入新密码" style={{ width: '100%', padding: '10px 40px 10px 14px', borderRadius: '8px', border: `1px solid ${COLORS.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box', background: COLORS.white }} />
-                    <button onClick={() => setShowNewPwd(p => !p)} style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted, fontSize: '16px' }}>{showNewPwd ? '🙈' : '👁'}</button>
-                  </div>
-                </div>
-                <div style={{ marginBottom: '20px' }}>
-                  <label style={{ display: 'block', fontSize: '13px', color: COLORS.textSec, marginBottom: '6px' }}>确认新密码</label>
-                  <input type="password" value={pwdForm.confirm} onChange={e => setPwdForm(p => ({ ...p, confirm: e.target.value }))} onKeyDown={e => { if (e.key === 'Enter') handleChangePassword() }} placeholder="再次输入新密码" style={{ width: '100%', padding: '10px 14px', borderRadius: '8px', border: `1px solid ${pwdForm.confirm && pwdForm.confirm !== pwdForm.new_password ? COLORS.danger : COLORS.border}`, fontSize: '14px', outline: 'none', boxSizing: 'border-box', background: COLORS.white }} />
-                  {pwdForm.confirm && pwdForm.confirm !== pwdForm.new_password && (<div style={{ fontSize: '12px', color: COLORS.danger, marginTop: '4px' }}>两次密码不一致</div>)}
-                </div>
-                <div style={{ display: 'flex', gap: '10px' }}>
-                  <button onClick={handleChangePassword} disabled={pwdSaving} style={{ flex: 1, padding: '10px', borderRadius: '8px', border: 'none', background: pwdSaving ? COLORS.textMuted : 'linear-gradient(135deg,#4F7BE8,#7C3AED)', color: '#fff', fontSize: '14px', fontWeight: 600, cursor: pwdSaving ? 'not-allowed' : 'pointer' }}>{pwdSaving ? '修改中...' : '确认修改'}</button>
-                  <button onClick={() => { setShowPwdForm(false); setPwdForm({ old_password: '', new_password: '', confirm: '' }) }} style={{ padding: '10px 20px', borderRadius: '8px', border: `1px solid ${COLORS.border}`, background: COLORS.white, color: COLORS.textSec, fontSize: '14px', cursor: 'pointer' }}>取消</button>
-                </div>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          </>
         )}
       </main>
     </div>

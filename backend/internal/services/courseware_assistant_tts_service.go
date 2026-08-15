@@ -16,9 +16,11 @@ package services
 //   - 本服务不写课件素材，不修改教学智能体会话和消息记录。
 //
 // 音色策略：
-//   - 中文或中英混合回答默认使用vivi 2.0；
-//   - 纯英文或英文显著占优的回答使用Tim；
-//   - 两种音色均走现有Seed TTS 2.0正式通道。
+//   - 女老师中文或中英混合回答使用vivi 2.0；
+//   - 男老师中文或中英混合回答使用云舟；
+//   - 纯英文或英文显著占优的回答继续使用Tim；
+//   - 前端只能提交female/male人物枚举，不能提交任意speaker；
+//   - 三种音色均走现有Seed TTS 2.0正式通道。
 
 import (
 	"context"
@@ -47,8 +49,12 @@ const (
 	coursewareAssistantTTSSceneCode   = "courseware_assistant_tts"
 	coursewareAssistantTTSProvider    = "volcengine"
 
-	coursewareAssistantTTSChineseVoice = "zh_female_vv_uranus_bigtts"
-	coursewareAssistantTTSEnglishVoice = "en_male_tim_uranus_bigtts"
+	coursewareAssistantTTSFemaleChineseVoice = "zh_female_vv_uranus_bigtts"
+	coursewareAssistantTTSMaleChineseVoice   = "zh_male_m191_uranus_bigtts"
+	coursewareAssistantTTSEnglishVoice       = "en_male_tim_uranus_bigtts"
+
+	coursewareAssistantTTSCharacterFemale = "female"
+	coursewareAssistantTTSCharacterMale   = "male"
 
 	coursewareAssistantTTSDefaultSpeed = 1.0
 	coursewareAssistantTTSMaxRunes     = 4000
@@ -118,6 +124,7 @@ func (s *CoursewareAssistantTTSService) Synthesize(
 	deploymentID string,
 	teacherUserID string,
 	text string,
+	character string,
 	operationID string,
 ) (
 	*CoursewareAssistantTTSResult,
@@ -137,6 +144,13 @@ func (s *CoursewareAssistantTTSService) Synthesize(
 	teacherUserID = strings.TrimSpace(teacherUserID)
 	text = normalizeCoursewareAssistantTTSText(text)
 	operationID = strings.TrimSpace(operationID)
+
+	normalizedCharacter, err := normalizeCoursewareAssistantTTSCharacter(
+		character,
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	if deploymentID == "" ||
 		teacherUserID == "" ||
@@ -170,7 +184,10 @@ func (s *CoursewareAssistantTTSService) Synthesize(
 		return nil, err
 	}
 
-	voice, language := selectCoursewareAssistantTTSVoice(text)
+	voice, language := selectCoursewareAssistantTTSVoice(
+		text,
+		normalizedCharacter,
+	)
 	speed := coursewareAssistantTTSDefaultSpeed
 	schoolID := coursewareAssistantTTSSchoolID(
 		deployment.SchoolID,
@@ -211,6 +228,7 @@ func (s *CoursewareAssistantTTSService) Synthesize(
 		"deployment_id": deployment.ID,
 		"text_hash":     textHash,
 		"voice":         voice,
+		"character":     normalizedCharacter,
 		"language":      language,
 		"speed":         speed,
 		"cache_path":    cachePath,
@@ -587,7 +605,29 @@ func normalizeCoursewareAssistantTTSText(text string) string {
 	return strings.TrimSpace(strings.Join(parts, " "))
 }
 
-func selectCoursewareAssistantTTSVoice(text string) (
+func normalizeCoursewareAssistantTTSCharacter(
+	value string,
+) (
+	string,
+	error,
+) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "",
+		coursewareAssistantTTSCharacterFemale:
+		return coursewareAssistantTTSCharacterFemale, nil
+
+	case coursewareAssistantTTSCharacterMale:
+		return coursewareAssistantTTSCharacterMale, nil
+
+	default:
+		return "", ErrCoursewareAssistantTTSInvalidRequest
+	}
+}
+
+func selectCoursewareAssistantTTSVoice(
+	text string,
+	character string,
+) (
 	voice string,
 	language string,
 ) {
@@ -615,7 +655,11 @@ func selectCoursewareAssistantTTSVoice(text string) (
 		return coursewareAssistantTTSEnglishVoice, "en-US"
 	}
 
-	return coursewareAssistantTTSChineseVoice, "zh-CN"
+	if character == coursewareAssistantTTSCharacterMale {
+		return coursewareAssistantTTSMaleChineseVoice, "zh-CN"
+	}
+
+	return coursewareAssistantTTSFemaleChineseVoice, "zh-CN"
 }
 
 func coursewareAssistantTTSTextHash(text string) string {

@@ -381,6 +381,26 @@ func (t *BackgroundTaskTracker) IsDraining() bool {
 	return t.draining
 }
 
+// IsRunning 按任务类型和资源ID查询指定唯一任务是否正在运行。
+//
+// 该方法只读取Tracker内存状态，不创建任务、不改变draining状态。
+// 阶段状态机用它做并发硬闸，防止AI仍在处理旧阶段时提前修改current_stage。
+func (t *BackgroundTaskTracker) IsRunning(
+	taskType string,
+	resourceID string,
+) bool {
+	key := buildBackgroundTaskKey(taskType, resourceID)
+	if key == "" {
+		return false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	_, exists := t.tasks[key]
+	return exists
+}
+
 // Wait 等待全部已登记任务结束。
 //
 // ctx超时或取消时返回ctx.Err；任务归零时返回nil。

@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -78,6 +79,69 @@ type ImageGenerateResult struct {
 	RevisedPrompt string   // 修改后的提示词
 }
 
+// ImageProviderError 是图片供应商明确返回的结构化HTTP错误。
+//
+// 业务层只能依赖StatusCode与Code做稳定分类，禁止解析Error()文本或供应商原始响应体。
+// Message仅用于服务端诊断；Error()刻意不拼接Message，避免请求ID或供应商内部信息进入教师端。
+type ImageProviderError struct {
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (e *ImageProviderError) Error() string {
+	if e == nil {
+		return "图片生成供应商返回错误"
+	}
+	if strings.TrimSpace(e.Code) != "" {
+		return fmt.Sprintf(
+			"图片生成API返回错误(HTTP %d, code=%s)",
+			e.StatusCode,
+			strings.TrimSpace(e.Code),
+		)
+	}
+	return fmt.Sprintf(
+		"图片生成API返回错误(HTTP %d)",
+		e.StatusCode,
+	)
+}
+
+// IsImageInputTextSensitiveError 判断是否为供应商明确的“输入文本内容审核未通过”。
+//
+// 该判断只接受结构化provider error，不允许对普通错误文本做模糊匹配，避免把网络、配置、
+// 下载或计费错误误判为内容审核并自动重试。
+func IsImageInputTextSensitiveError(err error) bool {
+	var providerErr *ImageProviderError
+	if !errors.As(err, &providerErr) || providerErr == nil {
+		return false
+	}
+	return strings.TrimSpace(providerErr.Code) ==
+		"InputTextSensitiveContentDetected"
+}
+
+// parseImageProviderError 把供应商错误响应解析为稳定类型；解析失败时仍保留HTTP状态码。
+func parseImageProviderError(
+	statusCode int,
+	body []byte,
+) error {
+	envelope := struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}{}
+
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &envelope)
+	}
+
+	return &ImageProviderError{
+		StatusCode: statusCode,
+		Code:       strings.TrimSpace(envelope.Error.Code),
+		Message:    strings.TrimSpace(envelope.Error.Message),
+	}
+}
+
 // ImageConfig 图片生成API配置（从AI配置中心加载）
 type ImageConfig struct {
 	APIBaseURL string // API基地址
@@ -90,11 +154,11 @@ type ImageConfig struct {
 // normalizeImageSize 校验并纠正图片尺寸，保证总像素满足豆包下限。
 //
 // 逻辑：
-//   1. 空字符串 → 返回默认尺寸 doubaoDefaultSize；
-//   2. 无法解析为 "宽x高"（如 "1024x1024"）→ 记 Warn，返回默认尺寸兜底；
-//   3. 总像素已达标 → 原样返回；
-//   4. 总像素不足 → 按原始宽高比等比放大到刚好达标，宽高对齐到 doubaoSizeAlign 的倍数，
-//      并记一条 INFO 说明"自动放大"，返回纠正后的尺寸。
+//  1. 空字符串 → 返回默认尺寸 doubaoDefaultSize；
+//  2. 无法解析为 "宽x高"（如 "1024x1024"）→ 记 Warn，返回默认尺寸兜底；
+//  3. 总像素已达标 → 原样返回；
+//  4. 总像素不足 → 按原始宽高比等比放大到刚好达标，宽高对齐到 doubaoSizeAlign 的倍数，
+//     并记一条 INFO 说明"自动放大"，返回纠正后的尺寸。
 //
 // 返回：纠正后的尺寸字符串（形如 "2560x1440"）。永不返回不合法尺寸。
 func normalizeImageSize(size string) string {
@@ -309,7 +373,10 @@ func GenerateImage(ctx context.Context, cfg *ImageConfig, prompt string, size st
 			"body", truncateStr(string(respBody), 500),
 			"latency_ms", latencyMs,
 		)
-		return nil, fmt.Errorf("图片生成API返回错误(HTTP %d): %s", httpResp.StatusCode, truncateStr(string(respBody), 200))
+		return nil, parseImageProviderError(
+			httpResp.StatusCode,
+			respBody,
+		)
 	}
 
 	// 解析响应

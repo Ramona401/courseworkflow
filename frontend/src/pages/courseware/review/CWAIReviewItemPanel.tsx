@@ -3,60 +3,55 @@
  *
  * 单条课件问题的状态与操作容器。
  *
- * 页面会根据当前使用场景自动切换主要目标：
- *   - 审核员：明确整改要求并决定是否退回；
- *   - 自审作者：形成修改方案并修改自己的课件；
- *   - 整改作者：理解审核要求并完成修改。
+ * R-01.1职责：
+ *   - 解析正式审核、自审和作者整改场景；
+ *   - 计算当前问题可用能力；
+ *   - 选择唯一主要操作；
+ *   - 把教师可见问题事实交给TeacherImprovementCard；
+ *   - 把展开后的关系、状态操作和讨论交给CWAIReviewItemDetails；
+ *   - AI成功只通过短时Toast反馈。
+ *
+ * 正式审核的交付选择已经并入唯一主要操作，
+ * 不再同时展示独立复选框制造第二个“确认”入口。
  */
 
-import {
-  useMemo,
-  useState,
-} from "react";
+import { useMemo } from "react";
 
-import {
-  dismissCWAIReviewItem,
-  generateCWAIReviewItemInstruction,
-  parseCWAIReviewItemEvidence,
-  restoreCWAIReviewItem,
-  type CWAIReviewItem,
-  type CWAIReviewItemRelation,
+import type {
+  CWAIReviewItem,
+  CWAIReviewItemRelation,
 } from "@/api/coursewares";
 
 import CWAIReviewItemDetails from "./CWAIReviewItemDetails";
+import CWAIReviewItemFeedback from "./CWAIReviewItemFeedback";
+import CWAIReviewSelfAppliedActions from "./CWAIReviewSelfAppliedActions";
 import {
-  CW_AI_REVIEW_ITEM_COLORS as C,
-  type CWAIReviewItemStateAction,
-  type CWAIReviewPrimaryActionTone,
-  CWAIReviewItemFeedback,
+  resolveCWAIReviewItemPrimaryAction,
+} from "./CWAIReviewItemPrimaryAction";
+import {
   canPauseCWAIReviewItem,
   canPrepareCWAIReviewItemModification,
   canResumeCWAIReviewItem,
   cwAIReviewPrimaryButtonStyle,
   cwAIReviewSecondaryButtonStyle,
   resolveCWAIReviewItemExperience,
-  resolveCWAIReviewItemExperienceCopy,
+  resolveCWAIReviewItemNextStep,
   resolveCWAIReviewItemSourceLabel,
-  resolveCWAIReviewItemStatus,
 } from "./CWAIReviewItemPresentation.shared";
-import CWAIReviewItemSummary from "./CWAIReviewItemSummary";
+import TeacherImprovementCard from "./TeacherImprovementCard";
 import {
-  useCWAIReviewItemResolutionActions,
-} from "./useCWAIReviewItemResolutionActions";
+  useCWAIReviewItemPanelController,
+} from "./useCWAIReviewItemPanelController";
+import CWReviewToast from "./CWReviewToast";
 
 export interface CWAIReviewItemPanelProps {
   item: CWAIReviewItem;
-
   allItems?: CWAIReviewItem[];
-
   governanceRelations?: CWAIReviewItemRelation[];
 
-  /**
-   * 只有审核员的正式审核界面可以决定本次是否退回给作者。
-   */
+  /** 正式审核场景是否允许把问题加入本轮修改清单。 */
   selectable?: boolean;
   selected?: boolean;
-
   onSelectedChange?: (
     itemID: string,
     selected: boolean,
@@ -70,27 +65,13 @@ export interface CWAIReviewItemPanelProps {
     item: CWAIReviewItem,
   ) => void;
 
-  /**
-   * 聚焦工作区使用。开启后详情始终展开，并隐藏“更多信息/收起详情”切换按钮。
-   *
-   * 该属性只改变展示方式，不改变问题状态、操作权限或API调用。
-   */
+  /** 只改变展示方式，不改变状态、权限或API行为。 */
   forceDetailsOpen?: boolean;
 
-  /**
-   * 作者自审或作者整改时，允许把修改方案带入页面修改。
-   * 审核员正式审核时不会显示直接修改作者课件的入口。
-   */
+  /** 作者自审或正式整改时，把确认方案带入页面微调草稿。 */
   onInjectToRefine?: (
     item: CWAIReviewItem,
   ) => void;
-}
-
-interface PrimaryAction {
-  label: string;
-  tone: CWAIReviewPrimaryActionTone;
-  opensDetails: boolean;
-  onClick: () => void;
 }
 
 export default function CWAIReviewItemPanel({
@@ -105,27 +86,6 @@ export default function CWAIReviewItemPanel({
   forceDetailsOpen = false,
   onInjectToRefine,
 }: CWAIReviewItemPanelProps) {
-  const [detailsOpen, setDetailsOpen] =
-    useState(false);
-  const [discussionVersion, setDiscussionVersion] =
-    useState(0);
-  const [generating, setGenerating] =
-    useState(false);
-  const [showPauseForm, setShowPauseForm] =
-    useState(false);
-  const [pauseReason, setPauseReason] =
-    useState("");
-  const [stateAction, setStateAction] =
-    useState<CWAIReviewItemStateAction>(null);
-  const [stateError, setStateError] =
-    useState("");
-  const [stateMessage, setStateMessage] =
-    useState("");
-
-  const detailsVisible =
-    forceDetailsOpen ||
-    detailsOpen;
-
   const experience =
     resolveCWAIReviewItemExperience(
       item,
@@ -133,43 +93,34 @@ export default function CWAIReviewItemPanel({
       !!onInjectToRefine,
     );
 
-  const copy =
-    resolveCWAIReviewItemExperienceCopy(
-      experience,
-    );
+  const itemMap =
+    useMemo(() => {
+      const result =
+        new Map<
+          string,
+          CWAIReviewItem
+        >();
 
-  const evidence = useMemo(
-    () =>
-      parseCWAIReviewItemEvidence(
-        item,
-      ),
-    [item],
-  );
+      for (
+        const current of
+        allItems || []
+      ) {
+        result.set(
+          current.id,
+          current,
+        );
+      }
 
-  const itemMap = useMemo(() => {
-    const result =
-      new Map<string, CWAIReviewItem>();
-
-    for (
-      const current of
-      allItems || []
-    ) {
       result.set(
-        current.id,
-        current,
+        item.id,
+        item,
       );
-    }
 
-    result.set(
-      item.id,
+      return result;
+    }, [
+      allItems,
       item,
-    );
-
-    return result;
-  }, [
-    allItems,
-    item,
-  ]);
+    ]);
 
   const activeRelations =
     useMemo(
@@ -182,9 +133,11 @@ export default function CWAIReviewItemPanel({
             relation.status ===
               "active" &&
             (
-              relation.source_item_id ===
+              relation
+                .source_item_id ===
                 item.id ||
-              relation.target_item_id ===
+              relation
+                .target_item_id ===
                 item.id
             ),
         ),
@@ -196,7 +149,9 @@ export default function CWAIReviewItemPanel({
 
   const manuallyAdded =
     item.origin_type ===
-      "global_discussion_manual";
+      "global_discussion_manual" ||
+    item.origin_type ===
+      "goal_drift_manual";
 
   const sourceLabel =
     resolveCWAIReviewItemSourceLabel(
@@ -209,26 +164,25 @@ export default function CWAIReviewItemPanel({
       ? `P${item.page_number_snapshot}`
       : "整课";
 
-  const evidenceSummary =
-    typeof evidence.page_evidence ===
-    "string"
-      ? evidence.page_evidence
-      : "";
-
-  const summaryTitle =
-    item.title.trim() ||
-    item.description.trim() ||
-    "未填写问题标题";
-
-  const summaryDescription =
-    item.title.trim()
-      ? item.description.trim()
-      : "";
-
   const canOpenPageModification =
     experience !== "review" &&
     !!onInjectToRefine &&
-    item.status === "confirmed" &&
+    item.status ===
+      "confirmed" &&
+    !!item.page_id &&
+    item.page_number_snapshot >
+      0 &&
+    !!item
+      .confirmed_instruction
+      .trim();
+
+  const selfApplied =
+    experience === "self" &&
+    item.status === "applied";
+
+  const canContinueSelfAfterApply =
+    selfApplied &&
+    !!onInjectToRefine &&
     !!item.page_id &&
     item.page_number_snapshot > 0 &&
     !!item.confirmed_instruction.trim();
@@ -236,643 +190,337 @@ export default function CWAIReviewItemPanel({
   const canSelectForReturn =
     experience === "review" &&
     selectable &&
-    item.status === "confirmed" &&
-    !!item.confirmed_instruction.trim();
+    item.status ===
+      "confirmed" &&
+    !!item
+      .confirmed_instruction
+      .trim();
 
   const canPrepare =
-    experience !== "remediation" &&
+    experience !==
+      "remediation" &&
     canPrepareCWAIReviewItemModification(
       item,
     );
 
   const canPause =
-    experience !== "remediation" &&
-    canPauseCWAIReviewItem(
-      item,
+    experience !==
+      "remediation" &&
+    (
+      canPauseCWAIReviewItem(
+        item,
+      ) ||
+      selfApplied
     );
 
   const canResume =
-    experience !== "remediation" &&
+    experience !==
+      "remediation" &&
     canResumeCWAIReviewItem(
       item,
     );
 
-  const stateBusy =
-    generating ||
-    stateAction !== null;
-
-  const handlePrepareModification =
-    async () => {
-      if (
-        !canPrepare ||
-        stateBusy
-      ) {
-        return;
-      }
-
-      setGenerating(true);
-      setStateError("");
-      setStateMessage("");
-
-      try {
-        const result =
-          await generateCWAIReviewItemInstruction(
-            item.id,
-          );
-
-        onChanged(
-          result.item,
-        );
-
-        setDiscussionVersion(
-          (previous) =>
-            previous + 1,
-        );
-
-        setDetailsOpen(true);
-        setShowPauseForm(false);
-        setStateMessage(
-          copy.prepareSuccess,
-        );
-      } catch (cause) {
-        setStateError(
-          cause instanceof Error
-            ? cause.message
-            : experience === "review"
-              ? "准备整改建议失败"
-              : "准备修改方案失败",
-        );
-      } finally {
-        setGenerating(false);
-      }
-    };
-
-  const handlePause =
-    async () => {
-      const reason =
-        pauseReason.trim();
-
-      const reasonLength =
-        Array.from(
-          reason,
-        ).length;
-
-      if (
-        !reason ||
-        reasonLength > 500 ||
-        stateBusy
-      ) {
-        setStateError(
-          reasonLength > 500
-            ? "说明不能超过500字"
-            : "请补充说明，方便以后回看",
-        );
-        return;
-      }
-
-      setStateAction("dismiss");
-      setStateError("");
-      setStateMessage("");
-
-      try {
-        const result =
-          await dismissCWAIReviewItem(
-            item.id,
-            reason,
-          );
-
-        onChanged(
-          result.item,
-        );
-
-        setPauseReason("");
-        setShowPauseForm(false);
-        setDetailsOpen(false);
-        setStateMessage(
-          copy.pauseSuccess,
-        );
-      } catch (cause) {
-        setStateError(
-          cause instanceof Error
-            ? cause.message
-            : experience === "review"
-              ? "保存本次不退回的决定失败"
-              : "保存暂不调整的决定失败",
-        );
-      } finally {
-        setStateAction(null);
-      }
-    };
-
-  const handleResume =
-    async () => {
-      if (stateBusy) {
-        return;
-      }
-
-      setStateAction("restore");
-      setStateError("");
-      setStateMessage("");
-
-      try {
-        const result =
-          await restoreCWAIReviewItem(
-            item.id,
-          );
-
-        onChanged(
-          result.item,
-        );
-
-        setDiscussionVersion(
-          (previous) =>
-            previous + 1,
-        );
-
-        setDetailsOpen(false);
-        setStateMessage(
-          result.item.status ===
-            "confirmed"
-            ? copy.resumeConfirmedSuccess
-            : copy.resumePendingSuccess,
-        );
-      } catch (cause) {
-        setStateError(
-          cause instanceof Error
-            ? cause.message
-            : "恢复处理失败",
-        );
-      } finally {
-        setStateAction(null);
-      }
-    };
-
-  const {
-    handleRecheckItem,
-    handleResolveSelfItem,
-  } =
-    useCWAIReviewItemResolutionActions({
+  const nextStep =
+    resolveCWAIReviewItemNextStep(
+      experience,
       item,
-      experience,
-      stateBusy,
-      onChanged,
-      setDiscussionVersion,
-      setDetailsOpen,
-      setStateAction,
-      setStateError,
-      setStateMessage,
-    });
-
-  const primaryAction:
-    PrimaryAction =
-    (() => {
-      if (
-        experience === "remediation"
-      ) {
-        if (
-          item.status ===
-            "confirmed" &&
-          canOpenPageModification
-        ) {
-          return {
-            label: copy.pageAction,
-            tone: "success",
-            opensDetails: false,
-            onClick: () =>
-              onInjectToRefine?.(
-                item,
-              ),
-          };
-        }
-
-        if (
-          item.status ===
-            "applying" &&
-          onInjectToRefine
-        ) {
-          return {
-            label: copy.applyingAction,
-            tone: "warning",
-            opensDetails: false,
-            onClick: () =>
-              onInjectToRefine(
-                item,
-              ),
-          };
-        }
-
-        if (
-          item.status ===
-          "applied"
-        ) {
-          return {
-            label: copy.appliedAction,
-            tone: "primary",
-            opensDetails: true,
-            onClick: () =>
-              setDetailsOpen(true),
-          };
-        }
-
-        if (
-          item.status ===
-          "stale"
-        ) {
-          return {
-            label:
-              stateAction ===
-              "recheck"
-                ? "正在检查…"
-                : copy.staleAction,
-            tone: "warning",
-            opensDetails: false,
-            onClick: () =>
-              void handleRecheckItem(),
-          };
-        }
-
-        if (
-          item.status ===
-          "orphaned"
-        ) {
-          return {
-            label: copy.orphanedAction,
-            tone: "neutral",
-            opensDetails: true,
-            onClick: () =>
-              setDetailsOpen(true),
-          };
-        }
-
-        if (
-          item.status ===
-          "resolved"
-        ) {
-          return {
-            label: copy.resolvedAction,
-            tone: "neutral",
-            opensDetails: true,
-            onClick: () =>
-              setDetailsOpen(true),
-          };
-        }
-
-        return {
-          label: copy.confirmedAction,
-          tone: "primary",
-          opensDetails: true,
-          onClick: () =>
-            setDetailsOpen(true),
-        };
-      }
-
-      if (canResume) {
-        return {
-          label:
-            stateAction ===
-            "restore"
-              ? "正在恢复…"
-              : copy.resumeAction,
-          tone: "primary",
-          opensDetails: false,
-          onClick: () =>
-            void handleResume(),
-        };
-      }
-
-      if (
-        item.status ===
-        "detected"
-      ) {
-        return {
-          label: generating
-            ? "正在准备…"
-            : copy.prepareAction,
-          tone: "primary",
-          opensDetails: false,
-          onClick: () =>
-            void handlePrepareModification(),
-        };
-      }
-
-      if (
-        item.status ===
-        "discussing"
-      ) {
-        return {
-          label: copy.continueAction,
-          tone: "primary",
-          opensDetails: true,
-          onClick: () =>
-            setDetailsOpen(true),
-        };
-      }
-
-      if (
-        experience === "self" &&
-        item.status ===
-          "confirmed" &&
-        canOpenPageModification
-      ) {
-        return {
-          label: copy.pageAction,
-          tone: "success",
-          opensDetails: false,
-          onClick: () =>
-            onInjectToRefine?.(
-              item,
-            ),
-        };
-      }
-
-      if (
-        item.status ===
-        "confirmed"
-      ) {
-        return {
-          label: copy.confirmedAction,
-          tone: "success",
-          opensDetails: true,
-          onClick: () =>
-            setDetailsOpen(true),
-        };
-      }
-
-      if (
-        item.status ===
-        "applying"
-      ) {
-        return {
-          label: copy.applyingAction,
-          tone: "warning",
-          opensDetails: true,
-          onClick: () =>
-            setDetailsOpen(true),
-        };
-      }
-
-      if (
-        item.status ===
-        "applied"
-      ) {
-        if (
-          experience ===
-          "self"
-        ) {
-          return {
-            label:
-              stateAction ===
-              "resolve"
-                ? "正在确认…"
-                : copy.appliedAction,
-            tone: "success",
-            opensDetails: false,
-            onClick: () =>
-              void handleResolveSelfItem(),
-          };
-        }
-
-        return {
-          label: copy.appliedAction,
-          tone: "primary",
-          opensDetails: true,
-          onClick: () =>
-            setDetailsOpen(true),
-        };
-      }
-
-      if (
-        item.status ===
-        "resolved"
-      ) {
-        return {
-          label: copy.resolvedAction,
-          tone: "neutral",
-          opensDetails: true,
-          onClick: () =>
-            setDetailsOpen(true),
-        };
-      }
-
-      if (
-        item.status ===
-        "stale"
-      ) {
-        if (
-          experience ===
-          "self"
-        ) {
-          return {
-            label:
-              stateAction ===
-              "recheck"
-                ? "正在检查…"
-                : copy.staleAction,
-            tone: "warning",
-            opensDetails: false,
-            onClick: () =>
-              void handleRecheckItem(),
-          };
-        }
-
-        return {
-          label: copy.staleAction,
-          tone: "warning",
-          opensDetails: true,
-          onClick: () =>
-            setDetailsOpen(true),
-        };
-      }
-
-      return {
-        label: copy.orphanedAction,
-        tone: "neutral",
-        opensDetails: true,
-        onClick: () =>
-          setDetailsOpen(true),
-      };
-    })();
-
-  const status =
-    resolveCWAIReviewItemStatus(
-      experience,
-      item.status,
+      selected,
+      canOpenPageModification,
     );
 
-  return (
-    <article
-      style={{
-        marginTop: "8px",
-        padding: "10px",
-        borderRadius: "9px",
-        border:
-          `1px solid ${status.color}35`,
-        background: C.card,
-        opacity:
-          item.status ===
-          "dismissed"
-            ? 0.88
-            : 1,
-      }}
-    >
-      <CWAIReviewItemSummary
-        experience={experience}
-        item={item}
-        activeRelations={
-          activeRelations
-        }
-        sourceLabel={sourceLabel}
-        pageLabel={pageLabel}
-        summaryTitle={summaryTitle}
-        summaryDescription={
-          summaryDescription
-        }
-        selectable={
-          experience === "review" &&
-          selectable
-        }
-        selected={selected}
-        canSelectForReturn={
-          canSelectForReturn
-        }
-        canOpenPageModification={
-          canOpenPageModification
-        }
-        onSelectedChange={
-          onSelectedChange
-        }
-      />
+  const controller =
+    useCWAIReviewItemPanelController({
+      item,
+      experience,
+      canPrepare,
+      onChanged,
+    });
 
-      <div
-        style={{
-          display: "flex",
-          gap: "6px",
-          flexWrap: "wrap",
-          marginTop: "8px",
-        }}
+  const detailsVisible =
+    forceDetailsOpen ||
+    controller.detailsOpen;
+
+  const primaryAction =
+    resolveCWAIReviewItemPrimaryAction({
+      item,
+      experience,
+      copy:
+        controller.copy,
+
+      stateAction:
+        controller
+          .stateAction,
+
+      generating:
+        controller
+          .generating,
+
+      selected,
+      canSelectForReturn,
+      onSelectedChange,
+      canResume,
+      canOpenPageModification,
+      onInjectToRefine,
+
+      openDetails:
+        controller
+          .openDetails,
+
+      handleResume:
+        controller
+          .handleResume,
+
+      handlePrepareModification:
+        controller
+          .handlePrepareModification,
+
+      handleRecheckItem:
+        controller
+          .handleRecheckItem,
+
+      handleResolveSelfItem:
+        controller
+          .handleResolveSelfItem,
+    });
+
+  const actionArea = (
+    <>
+      <button
+        type="button"
+        onClick={
+          primaryAction.onClick
+        }
+        disabled={
+          controller
+            .stateBusy
+        }
+        style={
+          cwAIReviewPrimaryButtonStyle(
+            primaryAction.tone,
+            controller
+              .stateBusy,
+          )
+        }
       >
-        <button
-          type="button"
-          onClick={
-            primaryAction.onClick
+        {
+          primaryAction.label
+        }
+      </button>
+
+      {selfApplied && (
+        <CWAIReviewSelfAppliedActions
+          canContinue={
+            canContinueSelfAfterApply
           }
-          disabled={stateBusy}
-          style={
-            cwAIReviewPrimaryButtonStyle(
-              primaryAction.tone,
-              stateBusy,
+          canPause={canPause}
+          busy={
+            controller.stateBusy
+          }
+          stateAction={
+            controller.stateAction
+          }
+          showPauseForm={
+            controller.showPauseForm
+          }
+          pauseReason={
+            controller.pauseReason
+          }
+          onContinue={() =>
+            onInjectToRefine?.(
+              item,
             )
           }
-        >
-          {primaryAction.label}
-        </button>
+          onTogglePause={
+            controller.togglePauseForm
+          }
+          onPauseReasonChange={
+            controller.setPauseReason
+          }
+          onPause={() =>
+            void controller
+              .handlePause()
+          }
+        />
+      )}
 
-        {!forceDetailsOpen &&
-          (
-            !primaryAction.opensDetails ||
-            detailsOpen
-          ) && (
-            <button
+      {!forceDetailsOpen &&
+        (
+          !primaryAction
+            .opensDetails ||
+          controller
+            .detailsOpen
+        ) && (
+          <button
             type="button"
-            onClick={() =>
-              setDetailsOpen(
-                (previous) =>
-                  !previous,
-              )
+            onClick={
+              controller
+                .toggleDetails
             }
             style={
               cwAIReviewSecondaryButtonStyle
             }
           >
-            {detailsOpen
+            {controller
+              .detailsOpen
               ? "收起详情"
               : "更多信息"}
-            </button>
-          )}
-      </div>
+          </button>
+        )}
+    </>
+  );
 
-      {stateMessage && (
+  const feedbackArea = (
+    <>
+      {controller
+        .stateMessage && (
         <CWAIReviewItemFeedback
           type="success"
-          content={stateMessage}
+          content={
+            controller
+              .stateMessage
+          }
         />
       )}
 
-      {stateError && (
+      {controller
+        .stateError && (
         <CWAIReviewItemFeedback
           type="error"
-          content={stateError}
+          content={
+            controller
+              .stateError
+          }
         />
       )}
+    </>
+  );
 
-      {detailsVisible && (
-        <div
-          style={{
-            marginTop: "10px",
-            paddingTop: "10px",
-            borderTop:
-              `1px solid ${C.border}`,
-          }}
-        >
-          <CWAIReviewItemDetails
-            experience={experience}
-            item={item}
-            itemMap={itemMap}
-            activeRelations={
-              activeRelations
-            }
-            manuallyAdded={
-              manuallyAdded
-            }
-            evidenceSummary={
-              evidenceSummary
-            }
-            pageLabel={pageLabel}
-            canPrepare={canPrepare}
-            canPause={canPause}
-            canResume={canResume}
-            stateBusy={stateBusy}
-            generating={generating}
-            showPauseForm={
-              showPauseForm
-            }
-            pauseReason={
-              pauseReason
-            }
-            stateAction={
-              stateAction
-            }
-            discussionVersion={
-              discussionVersion
-            }
-            onSelectPage={
-              onSelectPage
-            }
-            onChanged={onChanged}
-            onPrepareModification={() =>
-              void handlePrepareModification()
-            }
-            onTogglePauseForm={() => {
-              setShowPauseForm(
-                (previous) =>
-                  !previous,
-              );
+  const detailsArea =
+    detailsVisible ? (
+      <CWAIReviewItemDetails
+        experience={
+          experience
+        }
+        item={item}
+        itemMap={
+          itemMap
+        }
+        activeRelations={
+          activeRelations
+        }
+        pageLabel={
+          pageLabel
+        }
+        canPrepare={
+          canPrepare
+        }
+        canPause={
+          canPause &&
+          !selfApplied
+        }
+        canResume={
+          canResume
+        }
+        stateBusy={
+          controller
+            .stateBusy
+        }
+        generating={
+          controller
+            .generating
+        }
+        showPauseForm={
+          controller
+            .showPauseForm
+        }
+        pauseReason={
+          controller
+            .pauseReason
+        }
+        stateAction={
+          controller
+            .stateAction
+        }
+        discussionVersion={
+          controller
+            .discussionVersion
+        }
+        onSelectPage={
+          onSelectPage
+        }
+        onChanged={
+          onChanged
+        }
+        onPrepareModification={() =>
+          void controller
+            .handlePrepareModification()
+        }
+        onTogglePauseForm={
+          controller
+            .togglePauseForm
+        }
+        onPauseReasonChange={
+          controller
+            .setPauseReason
+        }
+        onPause={() =>
+          void controller
+            .handlePause()
+        }
+        onResume={() =>
+          void controller
+            .handleResume()
+        }
+      />
+    ) : null;
 
-              setStateError("");
-              setStateMessage("");
-            }}
-            onPauseReasonChange={
-              setPauseReason
-            }
-            onPause={() =>
-              void handlePause()
-            }
-            onResume={() =>
-              void handleResume()
-            }
-          />
-        </div>
-      )}
-    </article>
+  return (
+    <>
+      <TeacherImprovementCard
+        experience={
+          experience
+        }
+        item={item}
+        activeRelations={
+          activeRelations
+        }
+        sourceLabel={
+          sourceLabel
+        }
+        pageLabel={
+          pageLabel
+        }
+        nextStep={
+          nextStep
+        }
+        selectable={false}
+        selected={
+          selected
+        }
+        canSelectForReturn={
+          false
+        }
+        actions={
+          actionArea
+        }
+        feedback={
+          feedbackArea
+        }
+        details={
+          detailsArea
+        }
+      />
+
+      <CWReviewToast
+        message={
+          controller
+            .toastMessage
+        }
+        onClose={
+          controller
+            .clearToastMessage
+        }
+      />
+    </>
   );
 }

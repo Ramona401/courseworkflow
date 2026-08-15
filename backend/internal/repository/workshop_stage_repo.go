@@ -46,13 +46,13 @@ var wsRepoLog = logger.WithModule("workshop_stage_repo")
 
 // stageSelectColumns 阶段定义表的标准SELECT列（16列）
 const stageSelectColumns = `
-	id, stage_code, stage_name, stage_order, source, recipe_id,
-	ai_role, system_prompt,
-	COALESCE(output_format::text, '{}'),
-	COALESCE(component_types::text, '[]'),
-	gate_mode, skippable, status,
-	COALESCE(prompt_variants::text, '{}'),
-	created_at, updated_at
+        id, stage_code, stage_name, stage_order, source, recipe_id,
+        ai_role, system_prompt,
+        COALESCE(output_format::text, '{}'),
+        COALESCE(component_types::text, '[]'),
+        gate_mode, skippable, status,
+        COALESCE(prompt_variants::text, '{}'),
+        created_at, updated_at
 `
 
 // ==================== 阶段定义查询 ====================
@@ -60,27 +60,27 @@ const stageSelectColumns = `
 // GetSystemDefaultStages 获取系统预设的默认阶段列表（仅active，按stage_order排序）
 func GetSystemDefaultStages(ctx context.Context) ([]*models.WorkshopStage, error) {
 	query := `SELECT ` + stageSelectColumns + `
-		FROM workshop_stages
-		WHERE source = 'system' AND status = 'active'
-		ORDER BY stage_order ASC`
+                FROM workshop_stages
+                WHERE source = 'system' AND status = 'active'
+                ORDER BY stage_order ASC`
 	return scanStageRows(ctx, query)
 }
 
 // GetAllSystemStages 获取全部系统阶段（含disabled，供管理页面使用）
 func GetAllSystemStages(ctx context.Context) ([]*models.WorkshopStage, error) {
 	query := `SELECT ` + stageSelectColumns + `
-		FROM workshop_stages
-		WHERE source = 'system'
-		ORDER BY stage_order ASC`
+                FROM workshop_stages
+                WHERE source = 'system'
+                ORDER BY stage_order ASC`
 	return scanStageRows(ctx, query)
 }
 
 // GetRecipeStages 获取指定配方的自定义阶段列表
 func GetRecipeStages(ctx context.Context, recipeID string) ([]*models.WorkshopStage, error) {
 	query := `SELECT ` + stageSelectColumns + `
-		FROM workshop_stages
-		WHERE source = 'recipe' AND recipe_id = $1 AND status = 'active'
-		ORDER BY stage_order ASC`
+                FROM workshop_stages
+                WHERE source = 'recipe' AND recipe_id = $1 AND status = 'active'
+                ORDER BY stage_order ASC`
 	return scanStageRowsWithArgs(ctx, query, recipeID)
 }
 
@@ -88,8 +88,8 @@ func GetRecipeStages(ctx context.Context, recipeID string) ([]*models.WorkshopSt
 func GetStageByCode(ctx context.Context, source string, stageCode string) (*models.WorkshopStage, error) {
 	s := &models.WorkshopStage{}
 	query := `SELECT ` + stageSelectColumns + `
-		FROM workshop_stages
-		WHERE source = $1 AND stage_code = $2 AND status = 'active'`
+                FROM workshop_stages
+                WHERE source = $1 AND stage_code = $2 AND status = 'active'`
 	err := database.DB.QueryRow(ctx, query, source, stageCode).Scan(
 		&s.ID, &s.StageCode, &s.StageName, &s.StageOrder, &s.Source, &s.RecipeID,
 		&s.AIRole, &s.SystemPrompt,
@@ -119,14 +119,14 @@ func UpdateSystemStage(ctx context.Context, stageCode string, req *models.Update
 
 	now := time.Now()
 	result, err := database.DB.Exec(ctx, `
-		UPDATE workshop_stages
-		SET stage_name = $1, ai_role = $2, system_prompt = $3,
-		    output_format = $4, component_types = $5,
-		    gate_mode = $6, skippable = $7, status = $8,
-		    prompt_variants = $9,
-		    updated_at = $10
-		WHERE source = 'system' AND stage_code = $11
-	`,
+                UPDATE workshop_stages
+                SET stage_name = $1, ai_role = $2, system_prompt = $3,
+                    output_format = $4, component_types = $5,
+                    gate_mode = $6, skippable = $7, status = $8,
+                    prompt_variants = $9,
+                    updated_at = $10
+                WHERE source = 'system' AND stage_code = $11
+        `,
 		req.StageName, req.AIRole, req.SystemPrompt,
 		req.OutputFormat, req.ComponentTypes,
 		req.GateMode, req.Skippable, req.Status,
@@ -147,13 +147,13 @@ func UpdateSystemStage(ctx context.Context, stageCode string, req *models.Update
 // CreateStageOutput 创建阶段产出记录（教案进入某阶段时调用）
 func CreateStageOutput(ctx context.Context, out *models.WorkshopStageOutput) error {
 	query := `
-		INSERT INTO workshop_stage_outputs (
-			lesson_plan_id, stage_code, stage_order,
-			structured_output, narrative_output, conversation_snapshot,
-			model_used, tokens_used, status
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		RETURNING id, created_at, updated_at
-	`
+                INSERT INTO workshop_stage_outputs (
+                        lesson_plan_id, stage_code, stage_order,
+                        structured_output, narrative_output, conversation_snapshot,
+                        model_used, tokens_used, status
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING id, created_at, updated_at
+        `
 	err := database.DB.QueryRow(ctx, query,
 		out.LessonPlanID, out.StageCode, out.StageOrder,
 		out.StructuredOutput, out.NarrativeOutput, out.ConversationSnapshot,
@@ -165,19 +165,68 @@ func CreateStageOutput(ctx context.Context, out *models.WorkshopStageOutput) err
 	return nil
 }
 
+// EnsureStageOutput 幂等保证阶段产出记录存在。
+//
+// 阶段配置仍由Service层从教案快照校验，本函数只负责数据库生命周期：
+//   - 首次进入阶段时创建 in_progress 记录；
+//   - 记录已存在时保持其正式内容、状态和完成时间不变；
+//   - 任何真实数据库错误直接返回，调用方不得继续切换 current_stage。
+func EnsureStageOutput(ctx context.Context, out *models.WorkshopStageOutput) error {
+	if out == nil || out.LessonPlanID == "" || out.StageCode == "" || out.StageOrder <= 0 {
+		return errors.New("阶段产出初始化参数无效")
+	}
+
+	structuredOutput := out.StructuredOutput
+	if structuredOutput == "" {
+		structuredOutput = "{}"
+	}
+	narrativeOutput := out.NarrativeOutput
+	conversationSnapshot := out.ConversationSnapshot
+	if conversationSnapshot == "" {
+		conversationSnapshot = "[]"
+	}
+	status := out.Status
+	if status == "" {
+		status = models.StageOutputInProgress
+	}
+
+	_, err := database.DB.Exec(ctx, `
+                INSERT INTO workshop_stage_outputs (
+                        lesson_plan_id, stage_code, stage_order,
+                        structured_output, narrative_output, conversation_snapshot,
+                        model_used, tokens_used, status
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (lesson_plan_id, stage_code) DO NOTHING
+        `,
+		out.LessonPlanID,
+		out.StageCode,
+		out.StageOrder,
+		structuredOutput,
+		narrativeOutput,
+		conversationSnapshot,
+		out.ModelUsed,
+		out.TokensUsed,
+		status,
+	)
+	if err != nil {
+		return fmt.Errorf("确保阶段产出存在失败: %w", err)
+	}
+	return nil
+}
+
 // GetStageOutput 查询指定教案指定阶段的产出物
 func GetStageOutput(ctx context.Context, lessonPlanID string, stageCode string) (*models.WorkshopStageOutput, error) {
 	out := &models.WorkshopStageOutput{}
 	query := `
-		SELECT id, lesson_plan_id, stage_code, stage_order,
-		       COALESCE(structured_output::text, '{}'),
-		       COALESCE(narrative_output, ''),
-		       COALESCE(conversation_snapshot::text, '[]'),
-		       COALESCE(model_used, ''), COALESCE(tokens_used, 0),
-		       status, completed_at, created_at, updated_at
-		FROM workshop_stage_outputs
-		WHERE lesson_plan_id = $1 AND stage_code = $2
-	`
+                SELECT id, lesson_plan_id, stage_code, stage_order,
+                       COALESCE(structured_output::text, '{}'),
+                       COALESCE(narrative_output, ''),
+                       COALESCE(conversation_snapshot::text, '[]'),
+                       COALESCE(model_used, ''), COALESCE(tokens_used, 0),
+                       status, completed_at, created_at, updated_at
+                FROM workshop_stage_outputs
+                WHERE lesson_plan_id = $1 AND stage_code = $2
+        `
 	err := database.DB.QueryRow(ctx, query, lessonPlanID, stageCode).Scan(
 		&out.ID, &out.LessonPlanID, &out.StageCode, &out.StageOrder,
 		&out.StructuredOutput,
@@ -198,16 +247,16 @@ func GetStageOutput(ctx context.Context, lessonPlanID string, stageCode string) 
 // ListStageOutputs 查询指定教案的所有阶段产出物（按stage_order排序）
 func ListStageOutputs(ctx context.Context, lessonPlanID string) ([]*models.WorkshopStageOutput, error) {
 	query := `
-		SELECT id, lesson_plan_id, stage_code, stage_order,
-		       COALESCE(structured_output::text, '{}'),
-		       COALESCE(narrative_output, ''),
-		       COALESCE(conversation_snapshot::text, '[]'),
-		       COALESCE(model_used, ''), COALESCE(tokens_used, 0),
-		       status, completed_at, created_at, updated_at
-		FROM workshop_stage_outputs
-		WHERE lesson_plan_id = $1
-		ORDER BY stage_order ASC
-	`
+                SELECT id, lesson_plan_id, stage_code, stage_order,
+                       COALESCE(structured_output::text, '{}'),
+                       COALESCE(narrative_output, ''),
+                       COALESCE(conversation_snapshot::text, '[]'),
+                       COALESCE(model_used, ''), COALESCE(tokens_used, 0),
+                       status, completed_at, created_at, updated_at
+                FROM workshop_stage_outputs
+                WHERE lesson_plan_id = $1
+                ORDER BY stage_order ASC
+        `
 	rows, err := database.DB.Query(ctx, query, lessonPlanID)
 	if err != nil {
 		return nil, fmt.Errorf("查询教案阶段产出列表失败: %w", err)
@@ -241,22 +290,174 @@ func ListStageOutputs(ctx context.Context, lessonPlanID string) ([]*models.Works
 // 当 AI 输出的 JSON 包含未转义的中文引号等特殊字符时，json.Unmarshal 会失败。
 // 此时将 structured_output 降级为 {}，将原始内容附加到 narrative_output 保留。
 func UpdateStageOutputContent(ctx context.Context, lessonPlanID string, stageCode string, structuredOutput string, narrativeOutput string, modelUsed string, tokensUsed int) error {
+	safeStructured, safeNarrative := normalizeStageOutputPayload(
+		lessonPlanID,
+		stageCode,
+		structuredOutput,
+		narrativeOutput,
+	)
+
+	now := time.Now()
+	result, err := database.DB.Exec(ctx, `
+                UPDATE workshop_stage_outputs
+                SET structured_output = $1, narrative_output = $2,
+                    model_used = $3, tokens_used = $4, updated_at = $5
+                WHERE lesson_plan_id = $6 AND stage_code = $7
+        `, safeStructured, safeNarrative, modelUsed, tokensUsed, now, lessonPlanID, stageCode)
+	if err != nil {
+		return fmt.Errorf("更新阶段产出内容失败: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrStageOutputNotFound
+	}
+	return nil
+}
+
+// UpsertStageOutputContent 保存阶段产出内容；合法阶段记录缺失时确定性创建。
+//
+// stageOrder 必须来自 lesson_plans.stage_config 的服务端快照，不能由客户端提供。
+// 冲突更新时刻意不改 status/completed_at，避免普通保存把已完成或已跳过状态倒退。
+func UpsertStageOutputContent(
+	ctx context.Context,
+	lessonPlanID string,
+	stageCode string,
+	stageOrder int,
+	structuredOutput string,
+	narrativeOutput string,
+	modelUsed string,
+	tokensUsed int,
+) error {
+	if lessonPlanID == "" || stageCode == "" || stageOrder <= 0 {
+		return errors.New("阶段产出保存参数无效")
+	}
+
+	safeStructured, safeNarrative := normalizeStageOutputPayload(
+		lessonPlanID,
+		stageCode,
+		structuredOutput,
+		narrativeOutput,
+	)
+	now := time.Now()
+
+	_, err := database.DB.Exec(ctx, `
+                INSERT INTO workshop_stage_outputs (
+                        lesson_plan_id, stage_code, stage_order,
+                        structured_output, narrative_output, conversation_snapshot,
+                        model_used, tokens_used, status
+                ) VALUES ($1, $2, $3, $4, $5, '[]', $6, $7, $8)
+                ON CONFLICT (lesson_plan_id, stage_code) DO UPDATE
+                SET stage_order = EXCLUDED.stage_order,
+                    structured_output = EXCLUDED.structured_output,
+                    narrative_output = EXCLUDED.narrative_output,
+                    model_used = EXCLUDED.model_used,
+                    tokens_used = EXCLUDED.tokens_used,
+                    updated_at = $9
+        `,
+		lessonPlanID,
+		stageCode,
+		stageOrder,
+		safeStructured,
+		safeNarrative,
+		modelUsed,
+		tokensUsed,
+		models.StageOutputInProgress,
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf("保存阶段产出内容失败: %w", err)
+	}
+	return nil
+}
+
+// UpsertCompletedStageOutputContent 原子保存正式阶段产出并标记 completed。
+//
+// write/revise 正文成功提交后使用本入口，把“产出内容存在”和“阶段已完成”固化为同一条SQL事实；
+// 即使历史数据缺失目标行，也会在合法阶段快照校验通过后直接创建 completed 记录。
+func UpsertCompletedStageOutputContent(
+	ctx context.Context,
+	lessonPlanID string,
+	stageCode string,
+	stageOrder int,
+	structuredOutput string,
+	narrativeOutput string,
+	modelUsed string,
+	tokensUsed int,
+	conversationSnapshot string,
+) error {
+	if lessonPlanID == "" || stageCode == "" || stageOrder <= 0 {
+		return errors.New("已完成阶段产出保存参数无效")
+	}
+	if conversationSnapshot == "" {
+		conversationSnapshot = "[]"
+	}
+
+	safeStructured, safeNarrative := normalizeStageOutputPayload(
+		lessonPlanID,
+		stageCode,
+		structuredOutput,
+		narrativeOutput,
+	)
+	now := time.Now()
+
+	_, err := database.DB.Exec(ctx, `
+                INSERT INTO workshop_stage_outputs (
+                        lesson_plan_id, stage_code, stage_order,
+                        structured_output, narrative_output, conversation_snapshot,
+                        model_used, tokens_used, status, completed_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (lesson_plan_id, stage_code) DO UPDATE
+                SET stage_order = EXCLUDED.stage_order,
+                    structured_output = EXCLUDED.structured_output,
+                    narrative_output = EXCLUDED.narrative_output,
+                    conversation_snapshot = EXCLUDED.conversation_snapshot,
+                    model_used = EXCLUDED.model_used,
+                    tokens_used = EXCLUDED.tokens_used,
+                    status = EXCLUDED.status,
+                    completed_at = EXCLUDED.completed_at,
+                    updated_at = $10
+        `,
+		lessonPlanID,
+		stageCode,
+		stageOrder,
+		safeStructured,
+		safeNarrative,
+		conversationSnapshot,
+		modelUsed,
+		tokensUsed,
+		models.StageOutputCompleted,
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf("保存并完成阶段产出失败: %w", err)
+	}
+	return nil
+}
+
+// normalizeStageOutputPayload 统一保留既有 JSON 容错语义。
+func normalizeStageOutputPayload(
+	lessonPlanID string,
+	stageCode string,
+	structuredOutput string,
+	narrativeOutput string,
+) (string, string) {
 	safeStructured := structuredOutput
 	safeNarrative := narrativeOutput
 
-	// 验证 structuredOutput 是否为有效 JSON
-	if structuredOutput != "" && structuredOutput != "{}" {
+	if safeStructured == "" {
+		safeStructured = "{}"
+	}
+
+	if safeStructured != "{}" {
 		var testParse interface{}
-		if err := json.Unmarshal([]byte(structuredOutput), &testParse); err != nil {
-			// JSON 无效：降级存储，保留原始内容到 narrative
-			wsRepoLog.Warn("structured_output JSON无效，降级存储",
+		if err := json.Unmarshal([]byte(safeStructured), &testParse); err != nil {
+			wsRepoLog.Warn(
+				"structured_output JSON无效，降级存储",
 				"stage_code", stageCode,
 				"plan_id", lessonPlanID,
 				"error", err.Error(),
 				"raw_len", len(structuredOutput),
 			)
 			safeStructured = "{}"
-			// 将原始JSON内容追加到narrative，供后续容错提取使用
 			if safeNarrative == "" {
 				safeNarrative = structuredOutput
 			} else {
@@ -265,20 +466,7 @@ func UpdateStageOutputContent(ctx context.Context, lessonPlanID string, stageCod
 		}
 	}
 
-	now := time.Now()
-	result, err := database.DB.Exec(ctx, `
-		UPDATE workshop_stage_outputs
-		SET structured_output = $1, narrative_output = $2,
-		    model_used = $3, tokens_used = $4, updated_at = $5
-		WHERE lesson_plan_id = $6 AND stage_code = $7
-	`, safeStructured, safeNarrative, modelUsed, tokensUsed, now, lessonPlanID, stageCode)
-	if err != nil {
-		return fmt.Errorf("更新阶段产出内容失败: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return ErrStageOutputNotFound
-	}
-	return nil
+	return safeStructured, safeNarrative
 }
 
 // UpdateStageNarrativeOutput 单独更新阶段产出物的narrative_output字段
@@ -289,10 +477,10 @@ func UpdateStageOutputContent(ctx context.Context, lessonPlanID string, stageCod
 func UpdateStageNarrativeOutput(ctx context.Context, lessonPlanID string, stageCode string, narrativeOutput string) error {
 	now := time.Now()
 	result, err := database.DB.Exec(ctx, `
-		UPDATE workshop_stage_outputs
-		SET narrative_output = $1, updated_at = $2
-		WHERE lesson_plan_id = $3 AND stage_code = $4
-	`, narrativeOutput, now, lessonPlanID, stageCode)
+                UPDATE workshop_stage_outputs
+                SET narrative_output = $1, updated_at = $2
+                WHERE lesson_plan_id = $3 AND stage_code = $4
+        `, narrativeOutput, now, lessonPlanID, stageCode)
 	if err != nil {
 		return fmt.Errorf("更新阶段摘要失败: %w", err)
 	}
@@ -306,10 +494,10 @@ func UpdateStageNarrativeOutput(ctx context.Context, lessonPlanID string, stageC
 func CompleteStageOutput(ctx context.Context, lessonPlanID string, stageCode string, conversationSnapshot string) error {
 	now := time.Now()
 	result, err := database.DB.Exec(ctx, `
-		UPDATE workshop_stage_outputs
-		SET status = $1, completed_at = $2, conversation_snapshot = $3, updated_at = $2
-		WHERE lesson_plan_id = $4 AND stage_code = $5
-	`, models.StageOutputCompleted, now, conversationSnapshot, lessonPlanID, stageCode)
+                UPDATE workshop_stage_outputs
+                SET status = $1, completed_at = $2, conversation_snapshot = $3, updated_at = $2
+                WHERE lesson_plan_id = $4 AND stage_code = $5
+        `, models.StageOutputCompleted, now, conversationSnapshot, lessonPlanID, stageCode)
 	if err != nil {
 		return fmt.Errorf("完成阶段产出失败: %w", err)
 	}
@@ -323,10 +511,10 @@ func CompleteStageOutput(ctx context.Context, lessonPlanID string, stageCode str
 func SkipStageOutput(ctx context.Context, lessonPlanID string, stageCode string) error {
 	now := time.Now()
 	result, err := database.DB.Exec(ctx, `
-		UPDATE workshop_stage_outputs
-		SET status = $1, completed_at = $2, updated_at = $2
-		WHERE lesson_plan_id = $3 AND stage_code = $4
-	`, models.StageOutputSkipped, now, lessonPlanID, stageCode)
+                UPDATE workshop_stage_outputs
+                SET status = $1, completed_at = $2, updated_at = $2
+                WHERE lesson_plan_id = $3 AND stage_code = $4
+        `, models.StageOutputSkipped, now, lessonPlanID, stageCode)
 	if err != nil {
 		return fmt.Errorf("跳过阶段产出失败: %w", err)
 	}
@@ -341,11 +529,11 @@ func SkipStageOutput(ctx context.Context, lessonPlanID string, stageCode string)
 func ResetStageOutput(ctx context.Context, lessonPlanID string, stageCode string) error {
 	now := time.Now()
 	result, err := database.DB.Exec(ctx, `
-		UPDATE workshop_stage_outputs
-		SET structured_output = '{}', narrative_output = '', conversation_snapshot = '[]',
-		    model_used = '', tokens_used = 0, status = $1, completed_at = NULL, updated_at = $2
-		WHERE lesson_plan_id = $3 AND stage_code = $4
-	`, models.StageOutputInProgress, now, lessonPlanID, stageCode)
+                UPDATE workshop_stage_outputs
+                SET structured_output = '{}', narrative_output = '', conversation_snapshot = '[]',
+                    model_used = '', tokens_used = 0, status = $1, completed_at = NULL, updated_at = $2
+                WHERE lesson_plan_id = $3 AND stage_code = $4
+        `, models.StageOutputInProgress, now, lessonPlanID, stageCode)
 	if err != nil {
 		return fmt.Errorf("重置阶段产出失败: %w", err)
 	}

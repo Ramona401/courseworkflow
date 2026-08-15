@@ -139,6 +139,20 @@ func (h *CoursewareAssemblyHandler) GetState(
 		return
 	}
 
+	imageRepairState, repairStateErr :=
+		services.ReadCoursewareImageRepairState(
+			r.Context(),
+			coursewareID,
+			scopedActor,
+		)
+	if repairStateErr != nil {
+		utils.InternalError(
+			w,
+			"读取课件配图修复状态失败",
+		)
+		return
+	}
+
 	launchState :=
 		services.GetCoursewareAutoAssemblyLaunchState(
 			coursewareID,
@@ -154,12 +168,19 @@ func (h *CoursewareAssemblyHandler) GetState(
 	runtimeStatus := state.Status
 	effectiveSkipVideo :=
 		state.SkipVideo
+	effectiveRunKind :=
+		state.RunKind
+	effectiveIntegrity :=
+		state.Integrity
 	var launchStartedAt interface{}
 
 	if launchState.Pending {
 		runtimeStatus = "starting"
 		effectiveSkipVideo =
 			launchState.SkipVideo
+		effectiveRunKind =
+			models.CoursewareGenerationRunKindAssembly
+		effectiveIntegrity = nil
 		launchStartedAt =
 			launchState.StartedAt
 	}
@@ -167,17 +188,21 @@ func (h *CoursewareAssemblyHandler) GetState(
 	utils.Success(
 		w,
 		map[string]interface{}{
-			"courseware_id":     state.CoursewareID,
-			"assembly_version":  state.Version,
-			"assembly_status":   state.Status,
-			"runtime_status":    runtimeStatus,
-			"active_run_id":     state.ActiveRunID,
-			"started_by":        state.StartedBy,
-			"skip_video":        effectiveSkipVideo,
-			"started_at":        state.StartedAt,
-			"finished_at":       state.FinishedAt,
-			"is_starting":       launchState.Pending,
-			"launch_started_at": launchStartedAt,
+			"courseware_id":        state.CoursewareID,
+			"assembly_version":     state.Version,
+			"assembly_status":      state.Status,
+			"runtime_status":       runtimeStatus,
+			"run_kind":             effectiveRunKind,
+			"integrity":            effectiveIntegrity,
+			"image_repair":         imageRepairState,
+			"repair_failed_images": services.IsCoursewareImageRepairActive(coursewareID),
+			"active_run_id":        state.ActiveRunID,
+			"started_by":           state.StartedBy,
+			"skip_video":           effectiveSkipVideo,
+			"started_at":           state.StartedAt,
+			"finished_at":          state.FinishedAt,
+			"is_starting":          launchState.Pending,
+			"launch_started_at":    launchStartedAt,
 			"is_active": databaseActive ||
 				launchState.Pending,
 		},
@@ -228,6 +253,16 @@ func (h *CoursewareAssemblyHandler) Cancel(
 				w,
 				http.StatusConflict,
 				"装配运行状态已经变化，请刷新后重试",
+			)
+
+		case errors.Is(
+			err,
+			services.ErrCoursewareAutoAssemblyRunKindMismatch,
+		):
+			utils.Fail(
+				w,
+				http.StatusConflict,
+				"当前运行是普通批量生成，请使用生成停止操作",
 			)
 
 		default:

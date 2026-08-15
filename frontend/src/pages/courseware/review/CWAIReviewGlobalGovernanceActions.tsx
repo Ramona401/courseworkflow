@@ -6,9 +6,10 @@
  * 负责：
  *   - 从可信全局讨论消息人工新增整改项；
  *   - 接入关系建议的独立确认、取消和审计历史；
+ *   - 从可信全局消息生成、预览并一次确认R-07结构化影响方案；
  *   - 独立确认AI的consider_dismiss建议。
  *
- * 本组件不会确认候选修改指令、修改页面或提交人工审核决定。
+ * 单项治理不会自动确认候选修改指令；R-07统一方案只有教师最终点击后才原子落地所选治理动作。
  */
 
 import {
@@ -37,6 +38,7 @@ import {
 } from "./CWAIReviewGlobalGovernanceLimits";
 import CWAIReviewGlobalManualItemForm from "./CWAIReviewGlobalManualItemForm";
 import CWAIReviewGlobalRelationGovernance from "./CWAIReviewGlobalRelationGovernance";
+import CWAIReviewImpactPlan from "./CWAIReviewImpactPlan";
 
 export interface CWAIReviewGlobalGovernanceActionsProps {
   sessionId: string;
@@ -162,9 +164,15 @@ export default function CWAIReviewGlobalGovernanceActions({
           lineHeight: 1.5,
         }}
       >
-        AI关系和忽略建议只供参考。以下每个动作都需要独立人工确认，
-        不会自动确认修改指令、修改页面或提交审核决定。
+        可以先生成统一影响方案，预览“将新增 / 将合并 / 将暂不处理 /
+        将更新建议”等动作并取消不需要的项，再一次确认原子应用。
+        下方仍保留逐项人工治理入口。
       </div>
+
+      <CWAIReviewImpactPlan
+        sessionId={sessionId}
+        messageId={discussion.latest_message_id}
+      />
 
       <CWAIReviewGlobalManualItemForm
         sessionId={sessionId}

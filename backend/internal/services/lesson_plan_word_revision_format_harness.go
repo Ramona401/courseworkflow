@@ -301,6 +301,30 @@ func (s *LessonPlanGenService) commitLessonPlanStageArtifactWithWordHarness(
 		return outcome
 	}
 
+	// 正式副作用开始前先确保阶段产出生命周期已经建立。
+	// 如果此处都无法创建/读取合法阶段记录，write/revise不得先提交正文再留下bookkeeping缺口。
+	if err := s.stageService.EnsureStageOutput(
+		ctx,
+		lessonPlan.ID,
+		stageCode,
+	); err != nil {
+		lpGenLog.Warn(
+			"准备阶段产出物失败，拒绝提交正式产物",
+			"plan_id", lessonPlan.ID,
+			"stage", stageCode,
+			"error", err,
+		)
+		s.broadcastError(
+			lessonPlan.ID,
+			turnID,
+			"当前阶段产出状态未就绪，请重新进入当前阶段后重试。",
+		)
+		if stageCode == "write" || stageCode == "revise" {
+			outcome.Stop = true
+		}
+		return outcome
+	}
+
 	sideEffectErr :=
 		s.handleStageOutputSideEffects(
 			ctx,
@@ -420,22 +444,46 @@ func (s *LessonPlanGenService) commitLessonPlanStageArtifactWithWordHarness(
 			outcome.Result.TokensUsed
 	}
 
-	if err :=
-		s.stageService.
-			SaveStageOutput(
-				ctx,
-				lessonPlan.ID,
-				stageCode,
-				outcome.StructuredJSON,
-				outcome.Narrative,
-				modelUsed,
-				tokensUsed,
-			); err != nil {
+	var saveErr error
+	if stageCode == "write" || stageCode == "revise" {
+		saveErr = s.stageService.SaveCompletedStageOutput(
+			ctx,
+			lessonPlan.ID,
+			stageCode,
+			outcome.StructuredJSON,
+			outcome.Narrative,
+			modelUsed,
+			tokensUsed,
+			"[]",
+		)
+	} else {
+		saveErr = s.stageService.SaveStageOutput(
+			ctx,
+			lessonPlan.ID,
+			stageCode,
+			outcome.StructuredJSON,
+			outcome.Narrative,
+			modelUsed,
+			tokensUsed,
+		)
+	}
+
+	if saveErr != nil {
+		// 保留原有两个Warn语义，但现在它们只会在真正的原子保存失败时出现，
+		// 不再因为“目标阶段行从未初始化”这一正常生命周期缺口连续触发。
+		if stageCode == "write" || stageCode == "revise" {
+			lpGenLog.Warn(
+				"自动完成write/revise阶段产出失败",
+				"plan_id", lessonPlan.ID,
+				"stage", stageCode,
+				"error", saveErr,
+			)
+		}
 		lpGenLog.Warn(
 			"保存阶段产出物失败",
 			"plan_id", lessonPlan.ID,
 			"stage", stageCode,
-			"error", err,
+			"error", saveErr,
 		)
 		return outcome
 	}
@@ -457,11 +505,19 @@ func (s *LessonPlanGenService) commitLessonPlanStageArtifactWithWordHarness(
 		},
 	)
 
-	lpGenLog.Info(
-		"阶段产出物已保存",
-		"plan_id", lessonPlan.ID,
-		"stage", stageCode,
-	)
+	if stageCode == "write" || stageCode == "revise" {
+		lpGenLog.Info(
+			"write/revise阶段产出已原子保存并标记completed",
+			"plan_id", lessonPlan.ID,
+			"stage", stageCode,
+		)
+	} else {
+		lpGenLog.Info(
+			"阶段产出物已保存",
+			"plan_id", lessonPlan.ID,
+			"stage", stageCode,
+		)
+	}
 
 	return outcome
 }

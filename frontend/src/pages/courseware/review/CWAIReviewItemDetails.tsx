@@ -1,19 +1,25 @@
 /**
  * CWAIReviewItemDetails.tsx
  *
- * 用户主动打开“更多信息”后显示的深入处理区。
+ * 教师改进卡展开后的操作与过程区。
  *
- * 审核员可以完善整改要求；
- * 自审作者可以完善自己的修改方案；
- * 整改作者只能查看审核要求和处理记录，不会改写审核员的要求。
+ * R-01.1开始后，问题标题、可观察现象、教学影响、调整目标和验收检查
+ * 统一由TeacherImprovementCard读取后端教师字段展示。本组件不再重复读取
+ * title/description/original_suggestion/evidence_json，避免同一问题出现两套事实源。
+ *
+ * 本组件只负责：
+ *   - 已确认问题关系的解释和跳转；
+ *   - 准备方案、暂缓、恢复等既有状态操作入口；
+ *   - 页面内容变化后的人工重新检查提示；
+ *   - 单条整改讨论与指令版本流程。
+ *
+ * 这里仍是纯受控展示组件，不自行发请求、不决定权限。
  */
 
 import type {
   CWAIReviewItem,
   CWAIReviewItemRelation,
 } from "@/api/coursewares";
-
-import DiscussionMarkdown from "@/pages/courseware/components/courseware-workshop/DiscussionMarkdown";
 
 import {
   CW_GLOBAL_RELATION_CONFIG,
@@ -27,25 +33,21 @@ import {
   cwAIReviewPrimaryButtonStyle,
   cwAIReviewSecondaryButtonStyle,
   resolveCWAIReviewItemExperienceCopy,
+  resolveCWAIReviewPageChangeTeacherCopy,
 } from "./CWAIReviewItemPresentation.shared";
 
 export interface CWAIReviewItemDetailsProps {
-  experience:
-    CWAIReviewItemExperience;
-
+  experience: CWAIReviewItemExperience;
   item: CWAIReviewItem;
 
-  itemMap:
-    ReadonlyMap<
-      string,
-      CWAIReviewItem
-    >;
+  itemMap: ReadonlyMap<
+    string,
+    CWAIReviewItem
+  >;
 
   activeRelations:
     CWAIReviewItemRelation[];
 
-  manuallyAdded: boolean;
-  evidenceSummary: string;
   pageLabel: string;
 
   canPrepare: boolean;
@@ -82,13 +84,65 @@ export interface CWAIReviewItemDetailsProps {
   onResume: () => void;
 }
 
+function resolvePageChangeNotice(
+  experience: CWAIReviewItemExperience,
+  item: CWAIReviewItem,
+): string {
+  const pageChangeCopy =
+    resolveCWAIReviewPageChangeTeacherCopy(
+      item.status,
+    );
+
+  if (!pageChangeCopy) {
+    return "";
+  }
+
+  if (item.status === "stale") {
+    if (experience === "review") {
+      return (
+        `${pageChangeCopy.guidance} ` +
+        "请重新判断这个问题是否仍然成立，再决定后续审核要求。"
+      );
+    }
+
+    if (experience === "self") {
+      return (
+        `${pageChangeCopy.guidance} ` +
+        "确认仍符合当前修改方案后，再重新登记为修改完成。"
+      );
+    }
+
+    return (
+      `${pageChangeCopy.guidance} ` +
+      "请对照当前修改要求确认页面是否仍然达到要求，再重新登记为修改完成。"
+    );
+  }
+
+  if (experience === "review") {
+    return (
+      `${pageChangeCopy.guidance} ` +
+      "请确认原问题是否已经由其他页面处理，再决定是否继续要求修改。"
+    );
+  }
+
+  if (experience === "self") {
+    return (
+      `${pageChangeCopy.guidance} ` +
+      "请确认这项自审修改是否已经由其他页面处理，或是否仍需继续调整。"
+    );
+  }
+
+  return (
+    `${pageChangeCopy.guidance} ` +
+    "请确认当前修改要求是否已经由其他页面处理，再决定后续整改方式。"
+  );
+}
+
 export default function CWAIReviewItemDetails({
   experience,
   item,
   itemMap,
   activeRelations,
-  manuallyAdded,
-  evidenceSummary,
   pageLabel,
   canPrepare,
   canPause,
@@ -112,60 +166,28 @@ export default function CWAIReviewItemDetails({
       experience,
     );
 
+  const pauseReasonLength =
+    Array.from(pauseReason).length;
+
+  const pauseReasonInvalid =
+    !pauseReason.trim() ||
+    pauseReasonLength > 500;
+
+  const pageChangeNotice =
+    resolvePageChangeNotice(
+      experience,
+      item,
+    );
+
   return (
-    <div>
-      {item.title.trim() &&
-        item.description.trim() && (
-        <DetailBlock
-          title={
-            copy.descriptionTitle
-          }
-          content={
-            item.description
-          }
-        />
-      )}
-
-      {item.original_suggestion.trim() && (
-        <DetailBlock
-          title={
-            manuallyAdded
-              ? copy.suggestionManualTitle
-              : copy.suggestionAITitle
-          }
-          content={
-            item.original_suggestion
-          }
-        />
-      )}
-
-      {evidenceSummary && (
-        <DetailBlock
-          title={
-            copy.evidenceTitle
-          }
-          content={evidenceSummary}
-        />
-      )}
-
+    <div
+      style={{
+        paddingTop: "12px",
+      }}
+    >
       {activeRelations.length > 0 && (
-        <div
-          style={{
-            marginTop: "12px",
-            padding: "12px",
-            borderRadius: "9px",
-            border:
-              `1px solid ${C.border}`,
-            background: "#F8FAFC",
-          }}
-        >
-          <div
-            style={{
-              color: C.text,
-              fontSize: "14px",
-              fontWeight: 700,
-            }}
-          >
+        <div style={relationContainerStyle}>
+          <div style={sectionTitleStyle}>
             与其他问题的联系
           </div>
 
@@ -177,40 +199,26 @@ export default function CWAIReviewItemDetails({
                 relation={relation}
                 relatedItem={
                   itemMap.get(
-                    relation
-                      .source_item_id ===
+                    relation.source_item_id ===
                       item.id
-                      ? relation
-                          .target_item_id
-                      : relation
-                          .source_item_id,
+                      ? relation.target_item_id
+                      : relation.source_item_id,
                   )
                 }
-                onSelectPage={
-                  onSelectPage
-                }
+                onSelectPage={onSelectPage}
               />
             ),
           )}
         </div>
       )}
 
-      <div
-        style={{
-          display: "flex",
-          gap: "8px",
-          flexWrap: "wrap",
-          marginTop: "12px",
-        }}
-      >
-        {item.page_number_snapshot >
-          0 && (
+      <div style={actionRowStyle}>
+        {item.page_number_snapshot > 0 && (
           <button
             type="button"
             onClick={() =>
               onSelectPage(
-                item
-                  .page_number_snapshot,
+                item.page_number_snapshot,
               )
             }
             style={
@@ -234,8 +242,7 @@ export default function CWAIReviewItemDetails({
           >
             {generating
               ? "正在准备…"
-              : item.status ===
-                  "confirmed"
+              : item.status === "confirmed"
                 ? copy.prepareAgainAction
                 : copy.prepareAction}
           </button>
@@ -244,9 +251,7 @@ export default function CWAIReviewItemDetails({
         {canPause && (
           <button
             type="button"
-            onClick={
-              onTogglePauseForm
-            }
+            onClick={onTogglePauseForm}
             disabled={stateBusy}
             style={{
               ...cwAIReviewSecondaryButtonStyle,
@@ -275,18 +280,8 @@ export default function CWAIReviewItemDetails({
         )}
       </div>
 
-      {showPauseForm &&
-        canPause && (
-        <div
-          style={{
-            marginTop: "12px",
-            padding: "12px",
-            borderRadius: "9px",
-            border:
-              "1px solid #FED7AA",
-            background: "#FFF7ED",
-          }}
-        >
+      {showPauseForm && canPause && (
+        <div style={pauseContainerStyle}>
           <div
             style={{
               color: "#9A3412",
@@ -315,14 +310,7 @@ export default function CWAIReviewItemDetails({
             }
           />
 
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              marginTop: "6px",
-            }}
-          >
+          <div style={pauseFooterStyle}>
             <span
               style={{
                 flex: 1,
@@ -330,12 +318,7 @@ export default function CWAIReviewItemDetails({
                 fontSize: "12px",
               }}
             >
-              {
-                Array.from(
-                  pauseReason,
-                ).length
-              }
-              /500；以后仍可恢复
+              {pauseReasonLength}/500；以后仍可恢复
             </span>
 
             <button
@@ -343,18 +326,17 @@ export default function CWAIReviewItemDetails({
               onClick={onPause}
               disabled={
                 stateBusy ||
-                !pauseReason.trim()
+                pauseReasonInvalid
               }
               style={
                 cwAIReviewPrimaryButtonStyle(
                   "warning",
                   stateBusy ||
-                    !pauseReason.trim(),
+                    pauseReasonInvalid,
                 )
               }
             >
-              {stateAction ===
-              "dismiss"
+              {stateAction === "dismiss"
                 ? "正在保存…"
                 : copy.pauseConfirm}
             </button>
@@ -362,90 +344,23 @@ export default function CWAIReviewItemDetails({
         </div>
       )}
 
-      {(
-        item.status === "stale" ||
-        item.status === "orphaned"
-      ) && (
+      {pageChangeNotice && (
         <div
-          style={{
-            marginTop: "12px",
-            padding: "10px 12px",
-            borderRadius: "8px",
-            background: "#FEF2F2",
-            color: C.danger,
-            fontSize: "14px",
-            lineHeight: 1.6,
-          }}
+          role="status"
+          style={pageChangeNoticeStyle}
         >
-          {item.status === "stale"
-            ? experience ===
-              "review"
-              ? "页面内容已经在审核后发生变化，请重新查看页面，再判断这个问题是否仍然成立。"
-              : experience ===
-                "self"
-                ? "页面内容已经变化。请先打开当前页面实际检查；确认仍符合原修改方案后，点击“重新检查当前页面”。"
-                : "页面内容已经变化。请先对照审核要求实际检查；确认当前页面符合要求后，点击“重新检查当前页面”。"
-            : "原来的页面已经删除，这条内容只保留供以后回看。"}
+          {pageChangeNotice}
         </div>
       )}
 
       <div
-        style={{
-          marginTop: "14px",
-          paddingTop: "14px",
-          borderTop:
-            `1px solid ${C.border}`,
-        }}
+        style={discussionContainerStyle}
       >
         <CWAIReviewItemDiscussionView
           key={`${item.id}-${discussionVersion}`}
           experience={experience}
           item={item}
           onChanged={onChanged}
-        />
-      </div>
-    </div>
-  );
-}
-
-function DetailBlock({
-  title,
-  content,
-}: {
-  title: string;
-  content: string;
-}) {
-  return (
-    <div
-      style={{
-        marginTop: "12px",
-        padding: "12px",
-        borderRadius: "9px",
-        background: "#F8FAFC",
-        color: C.textSec,
-      }}
-    >
-      <div
-        style={{
-          marginBottom: "6px",
-          color: C.text,
-          fontSize: "14px",
-          fontWeight: 700,
-        }}
-      >
-        {title}
-      </div>
-
-      <div
-        style={{
-          maxWidth: "75ch",
-          fontSize: "14px",
-          lineHeight: 1.6,
-        }}
-      >
-        <DiscussionMarkdown
-          content={content}
-          compact
         />
       </div>
     </div>
@@ -548,25 +463,15 @@ function ProblemConnectionRow({
       isSource,
     );
 
-  const relatedID =
-    isSource
-      ? relation.target_item_id
-      : relation.source_item_id;
-
   const relatedLabel =
-    relatedItem?.title.trim() ||
-    relatedItem?.description.trim() ||
-    relatedID;
+    (
+      relatedItem?.teacher_title ||
+      ""
+    ).trim() ||
+    "相关问题";
 
   return (
-    <div
-      style={{
-        marginTop: "6px",
-        paddingTop: "6px",
-        borderTop:
-          `1px solid ${C.border}`,
-      }}
-    >
+    <div style={relationRowStyle}>
       <div
         style={{
           display: "flex",
@@ -591,8 +496,7 @@ function ProblemConnectionRow({
 
         {relatedItem &&
           relatedItem
-            .page_number_snapshot >
-            0 && (
+            .page_number_snapshot > 0 && (
           <button
             type="button"
             onClick={() =>
@@ -601,18 +505,9 @@ function ProblemConnectionRow({
                   .page_number_snapshot,
               )
             }
-            style={{
-              minHeight: "32px",
-              padding: "5px 8px",
-              borderRadius: "6px",
-              border:
-                `1px solid ${C.primary}`,
-              background: "#fff",
-              color: C.primary,
-              fontSize: "11px",
-              fontWeight: 700,
-              cursor: "pointer",
-            }}
+            style={
+              relationPageButtonStyle
+            }
           >
             打开P
             {
@@ -632,8 +527,7 @@ function ProblemConnectionRow({
           wordBreak: "break-word",
         }}
       >
-        相关问题：
-        {relatedLabel}
+        相关问题：{relatedLabel}
       </div>
 
       <div
@@ -649,3 +543,77 @@ function ProblemConnectionRow({
     </div>
   );
 }
+
+const sectionTitleStyle = {
+  color: C.text,
+  fontSize: "14px",
+  fontWeight: 700,
+} as const;
+
+const relationContainerStyle = {
+  padding: "12px",
+  borderRadius: "9px",
+  border:
+    `1px solid ${C.border}`,
+  background: "#F8FAFC",
+} as const;
+
+const relationRowStyle = {
+  marginTop: "6px",
+  paddingTop: "6px",
+  borderTop:
+    `1px solid ${C.border}`,
+} as const;
+
+const relationPageButtonStyle = {
+  minHeight: "32px",
+  padding: "5px 8px",
+  borderRadius: "6px",
+  border:
+    `1px solid ${C.primary}`,
+  background: "#FFFFFF",
+  color: C.primary,
+  fontSize: "11px",
+  fontWeight: 700,
+  cursor: "pointer",
+} as const;
+
+const actionRowStyle = {
+  display: "flex",
+  gap: "8px",
+  flexWrap: "wrap",
+  marginTop: "12px",
+} as const;
+
+const pauseContainerStyle = {
+  marginTop: "12px",
+  padding: "12px",
+  borderRadius: "9px",
+  border:
+    "1px solid #FED7AA",
+  background: "#FFF7ED",
+} as const;
+
+const pauseFooterStyle = {
+  display: "flex",
+  alignItems: "center",
+  gap: "8px",
+  marginTop: "6px",
+} as const;
+
+const pageChangeNoticeStyle = {
+  marginTop: "12px",
+  padding: "10px 12px",
+  borderRadius: "8px",
+  background: "#FEF2F2",
+  color: C.danger,
+  fontSize: "14px",
+  lineHeight: 1.6,
+} as const;
+
+const discussionContainerStyle = {
+  marginTop: "14px",
+  paddingTop: "14px",
+  borderTop:
+    `1px solid ${C.border}`,
+} as const;

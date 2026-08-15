@@ -18,6 +18,7 @@ import { useState, useEffect, useRef } from 'react'
 import { CW_WIDTH, CW_HEIGHT } from './workshopConstants'
 import { injectPreviewMode, NAV_KEY_MSG_TYPE } from './previewInject'
 import PlatformCoursewareAssistantOverlay from './PlatformCoursewareAssistantOverlay'
+import { rememberCoursewarePreviewPage } from './coursewarePreviewPosition'
 
 export default function CWFullscreenPreview({ pages, initialPageNum, codeView, onToggleCode, onClose, onSlideshow }: {
   pages: { id?: string; page_number: number; title: string; html_content: string }[]
@@ -36,6 +37,18 @@ export default function CWFullscreenPreview({ pages, initialPageNum, codeView, o
   const idx = pages.findIndex(p => p.page_number === curPageNum)
   const page = pages[idx] || pages[0]
   const html = page?.html_content || ''
+
+  /**
+   * 全屏翻页时同步稳定page_id。
+   *
+   * 浏览器在全屏状态直接刷新会退出全屏并重新挂载工坊，
+   * 因此必须在每次全屏页变化时提前写入sessionStorage。
+   */
+  useEffect(() => {
+    if (page?.id) {
+      rememberCoursewarePreviewPage(page.id)
+    }
+  }, [page?.id])
 
   // v0.41: 注入预览降级脚本
   const previewHtml = injectPreviewMode(html)

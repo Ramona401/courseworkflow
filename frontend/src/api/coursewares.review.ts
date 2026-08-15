@@ -2,25 +2,26 @@
  * 课件工坊 API —— 多级审核层。
  *
  * 正式审核提交时可以携带：
- *
  *   - 已完成的课件AI审核会话ID；
  *   - 本轮新确认、需要交付作者的问题ID；
  *   - 审核员明确确认已经解决的上轮问题ID。
  *
  * 业务约束：
- *
  *   - 只有“退回修改”可以交付本轮新问题；
  *   - 通过审核时，本轮旧问题必须全部确认解决；
  *   - 继续退回时，可以只确认部分旧问题已经解决；
  *   - 首次审核没有历史整改问题时，可以不提交复审问题字段；
- *   - 前端不提交AI报告正文或问题状态；
+ *   - 前端不提交AI报告正文、内部哈希或问题状态；
  *   - 后端重新校验并在同一事务中保存全部结果。
+ *
+ * R-01.1：
+ *   - carryover_items与普通AI整改项使用同一套教师视图字段；
+ *   - 复审界面默认只消费teacher_*与acceptance_checks；
+ *   - title/description仅保留旧客户端兼容，不作为新界面的事实源。
  */
 
 import apiClient from "./client";
-import {
-  extractData,
-} from "./coursewares.types";
+import { extractData } from "./coursewares.types";
 
 import type {
   CoursewareDetail,
@@ -30,14 +31,16 @@ import type {
   CoursewareAnnotation,
 } from "./coursewares.collab";
 
+import type {
+  CWAIReviewItemStatus,
+  CWAIReviewSeverity,
+} from "./coursewares.ai-review.types";
+
 // ==================== 类型定义 ====================
 
 /** 审核决策请求（审核员L1/L2操作）。 */
 export interface CWReviewDecisionRequest {
-  decision:
-    | "approved"
-    | "revision";
-
+  decision: "approved" | "revision";
   score?: number;
   comment: string;
   dimensions?: string;
@@ -145,7 +148,10 @@ export interface CWReviewedListResponse {
 /**
  * 当前级别、当前轮次需要审核员复查的历史正式问题。
  *
- * 不包含原审核员、作者和内部AI会话身份。
+ * 安全契约：
+ *   - 不包含原审核员、作者和内部AI会话身份；
+ *   - page_html_hash/applied_page_hash只保留兼容字段形状，后端固定返回空串；
+ *   - 新复审界面只消费教师视图字段，不回退读取旧title/description。
  */
 export interface CWReviewCarryoverItem {
   id: string;
@@ -162,14 +168,24 @@ export interface CWReviewCarryoverItem {
   page_html_hash: string;
   page_updated_at_snapshot: string | null;
 
-  severity: string;
+  severity: CWAIReviewSeverity;
   dimension: string;
 
+  /** 仅兼容旧客户端；新教师卡不读取。 */
   title: string;
   description: string;
+
+  teacher_title: string;
+  what_happened: string;
+  teaching_impact: string;
+  improvement_goal: string;
+  acceptance_checks: string[];
+  teacher_context: string;
+  manual_check_required: boolean;
+
   confirmed_instruction: string;
 
-  status: string;
+  status: CWAIReviewItemStatus;
   applied_page_hash: string;
 
   confirmed_at: string | null;
@@ -195,11 +211,10 @@ export async function submitCoursewareForReview(
 ): Promise<{
   message: string;
 }> {
-  const response =
-    await apiClient.post(
-      `/coursewares/${coursewareId}/submit-review`,
-      {},
-    );
+  const response = await apiClient.post(
+    `/coursewares/${coursewareId}/submit-review`,
+    {},
+  );
 
   return extractData(response);
 }
@@ -211,11 +226,10 @@ export async function reviewCWL1(
 ): Promise<{
   message: string;
 }> {
-  const response =
-    await apiClient.post(
-      `/courseware-reviews/${coursewareId}/l1`,
-      request,
-    );
+  const response = await apiClient.post(
+    `/courseware-reviews/${coursewareId}/l1`,
+    request,
+  );
 
   return extractData<{
     message: string;
@@ -229,11 +243,10 @@ export async function reviewCWL2(
 ): Promise<{
   message: string;
 }> {
-  const response =
-    await apiClient.post(
-      `/courseware-reviews/${coursewareId}/l2`,
-      request,
-    );
+  const response = await apiClient.post(
+    `/courseware-reviews/${coursewareId}/l2`,
+    request,
+  );
 
   return extractData<{
     message: string;
@@ -244,28 +257,22 @@ export async function reviewCWL2(
 export async function getCWReviewHistory(
   coursewareId: string,
 ): Promise<CWReviewHistoryResponse> {
-  const response =
-    await apiClient.get(
-      `/courseware-reviews/${coursewareId}/history`,
-    );
-
-  return extractData<CWReviewHistoryResponse>(
-    response,
+  const response = await apiClient.get(
+    `/courseware-reviews/${coursewareId}/history`,
   );
+
+  return extractData<CWReviewHistoryResponse>(response);
 }
 
 /** 查询待审课件、历史审核和本轮旧问题。 */
 export async function getCWReviewDetail(
   coursewareId: string,
 ): Promise<CWReviewDetailResponse> {
-  const response =
-    await apiClient.get(
-      `/courseware-reviews/${coursewareId}/detail`,
-    );
-
-  return extractData<CWReviewDetailResponse>(
-    response,
+  const response = await apiClient.get(
+    `/courseware-reviews/${coursewareId}/detail`,
   );
+
+  return extractData<CWReviewDetailResponse>(response);
 }
 
 /** 查询当前用户可审核的待审课件。 */
@@ -275,17 +282,14 @@ export async function getCWPendingReviews(
     offset?: number;
   },
 ): Promise<CWPendingReviewListResponse> {
-  const response =
-    await apiClient.get(
-      "/courseware-reviews/pending",
-      {
-        params,
-      },
-    );
-
-  return extractData<CWPendingReviewListResponse>(
-    response,
+  const response = await apiClient.get(
+    "/courseware-reviews/pending",
+    {
+      params,
+    },
   );
+
+  return extractData<CWPendingReviewListResponse>(response);
 }
 
 /** 查询已审核记录。 */
@@ -297,38 +301,32 @@ export async function getCWReviewedRecords(
     offset?: number;
   },
 ): Promise<CWReviewedListResponse> {
-  const response =
-    await apiClient.get(
-      "/courseware-reviews/reviewed",
-      {
-        params,
-      },
-    );
-
-  return extractData<CWReviewedListResponse>(
-    response,
+  const response = await apiClient.get(
+    "/courseware-reviews/reviewed",
+    {
+      params,
+    },
   );
+
+  return extractData<CWReviewedListResponse>(response);
 }
 
 /** 查询审核统计。 */
 export async function getCWReviewStats(
   level?: number,
 ): Promise<CWReviewStatsResponse> {
-  const response =
-    await apiClient.get(
-      "/courseware-reviews/stats",
-      {
-        params: level
-          ? {
-              level,
-            }
-          : {},
-      },
-    );
-
-  return extractData<CWReviewStatsResponse>(
-    response,
+  const response = await apiClient.get(
+    "/courseware-reviews/stats",
+    {
+      params: level
+        ? {
+            level,
+          }
+        : {},
+    },
   );
+
+  return extractData<CWReviewStatsResponse>(response);
 }
 
 // ==================== 审核级别常量 ====================

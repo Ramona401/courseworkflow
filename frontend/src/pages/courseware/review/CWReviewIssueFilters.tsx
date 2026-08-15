@@ -519,7 +519,7 @@ export default function CWReviewIssueFilters({
               待确认
             </option>
             <option value="stale">
-              页面变化
+              需要重新检查
             </option>
             <option value="completed">
               已完成

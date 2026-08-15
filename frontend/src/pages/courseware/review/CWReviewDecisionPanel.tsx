@@ -1,26 +1,30 @@
 /**
  * CWReviewDecisionPanel.tsx
  *
- * 课件正式审核决定、退回清单和审核意见面板。
+ * 课件正式审核决定与人工审核意见面板。
  *
- * 草稿同步规则：
- *   1. 审核员点击按钮后，才首次用当前退回清单生成审核意见；
- *   2. 如果审核意见仍与上次系统草稿完全一致，清单变化时可安全同步；
- *   3. 一旦审核员手工编辑，后续清单变化不再自动覆盖；
- *   4. 审核员可显式点击“更新审核意见草稿”重新采用最新清单；
- *   5. 从总览移出只影响本次正式交付选择，不删除或忽略整改项。
+ * R-05“本次修改清单”由CWReviewDeliveryPreview独立负责。
+ * R-08审核意见重新整理与差异确认由CWReviewCommentCandidatePanel独立负责。
+ *
+ * 本文件保留：
+ *   - 审核决定；
+ *   - 上轮整改通过守卫；
+ *   - 本次修改清单；
+ *   - 评分；
+ *   - 人工审核意见；
+ *   - R-08入口；
+ *   - 最终正式提交动作。
  */
 
 import {
   useEffect,
-  useMemo,
-  useState,
   type CSSProperties,
 } from "react";
 
-import type { CWAIReviewItem } from "@/api/coursewares";
-
 import type { CWAIReviewContext } from "./CWAIReviewPanel";
+import CWReviewCommentCandidatePanel from "./CWReviewCommentCandidatePanel";
+import CWReviewDeliveryPreview from "./CWReviewDeliveryPreview";
+import { publishCWReviewDeliveryDecision } from "./cwReviewDeliveryState";
 import {
   requestCWReviewCarryoverFocus,
   useCWReviewApprovalGuard,
@@ -30,20 +34,11 @@ const C = {
   success: "#10B981",
   warning: "#F59E0B",
   danger: "#EF4444",
-  primary: "#4F7BE8",
-  text: "#1F2937",
   textSec: "#6B7280",
   textMuted: "#9CA3AF",
   borderMid: "#E5E7EB",
   bg: "#FAFBFC",
 };
-
-interface DeliveryGroup {
-  key: string;
-  pageNumber: number;
-  pageTitle: string;
-  items: CWAIReviewItem[];
-}
 
 export interface CWReviewDecisionPanelProps {
   level: number;
@@ -62,97 +57,6 @@ export interface CWReviewDecisionPanelProps {
   onSubmit: () => void;
 }
 
-function buildDeliveryGroups(
-  items: CWAIReviewItem[],
-): DeliveryGroup[] {
-  const groups = new Map<string, DeliveryGroup>();
-
-  for (const item of items) {
-    const pageNumber = item.page_number_snapshot;
-    const stablePageID = item.page_id?.trim() || "";
-
-    const key =
-      stablePageID ||
-      (pageNumber > 0
-        ? `snapshot:${pageNumber}:${item.page_title_snapshot}`
-        : "global");
-
-    const current = groups.get(key) || {
-      key,
-      pageNumber,
-      pageTitle: item.page_title_snapshot || "",
-      items: [],
-    };
-
-    current.items.push(item);
-
-    if (!current.pageTitle && item.page_title_snapshot) {
-      current.pageTitle = item.page_title_snapshot;
-    }
-
-    groups.set(key, current);
-  }
-
-  return Array.from(groups.values()).sort((left, right) => {
-    if (left.pageNumber <= 0 && right.pageNumber > 0) {
-      return -1;
-    }
-    if (right.pageNumber <= 0 && left.pageNumber > 0) {
-      return 1;
-    }
-
-    return left.pageNumber - right.pageNumber;
-  });
-}
-
-function buildDeliveryCommentDraft(
-  groups: DeliveryGroup[],
-): string {
-  const itemCount = groups.reduce(
-    (total, group) => total + group.items.length,
-    0,
-  );
-
-  if (itemCount === 0) {
-    return "";
-  }
-
-  const lines = [
-    `经审核，本课件需退回修改。本次共确认 ${groups.length} 个页面或整课范围、${itemCount} 条整改要求：`,
-    "",
-  ];
-
-  groups.forEach((group, groupIndex) => {
-    const pageLabel =
-      group.pageNumber > 0 ? `P${group.pageNumber}` : "整课";
-
-    const titleSuffix = group.pageTitle
-      ? `（${group.pageTitle}）`
-      : "";
-
-    lines.push(`${groupIndex + 1}. ${pageLabel}${titleSuffix}`);
-
-    group.items.forEach((item, itemIndex) => {
-      const title = item.title.trim();
-      const instruction = item.confirmed_instruction.trim();
-
-      lines.push(
-        `   ${itemIndex + 1}) ${
-          title ? `${title}：` : ""
-        }${instruction}`,
-      );
-    });
-
-    lines.push("");
-  });
-
-  lines.push(
-    "请在修改后逐项复核页面内容、交互运行效果及与教案目标的一致性，再重新提交审核。",
-  );
-
-  return lines.join("\n").trim();
-}
-
 export default function CWReviewDecisionPanel({
   level,
   decision,
@@ -168,98 +72,41 @@ export default function CWReviewDecisionPanel({
   onCancel,
   onSubmit,
 }: CWReviewDecisionPanelProps) {
-  const [expanded, setExpanded] = useState(true);
-  const [lastAppliedDraft, setLastAppliedDraft] = useState("");
-
-  const approvalGuard =
-    useCWReviewApprovalGuard();
-
-  const approvalBlocked =
-    approvalGuard.blockedCount > 0;
-
-  const deliveryGroups = useMemo(
-    () => buildDeliveryGroups(aiReviewContext.selectedItems),
-    [aiReviewContext.selectedItems],
-  );
-
-  const currentDeliveryDraft = useMemo(
-    () => buildDeliveryCommentDraft(deliveryGroups),
-    [deliveryGroups],
-  );
-
-  const deliveryItemCount =
-    aiReviewContext.selectedItems.length;
-
-  const deliveryPageCount =
-    deliveryGroups.length;
-
-  useEffect(() => {
-    if (
-      approvalBlocked &&
-      decision === "approved"
-    ) {
-      onDecisionChange(
-        "revision",
-      );
-    }
-  }, [
-    approvalBlocked,
-    decision,
-    onDecisionChange,
-  ]);
+  const approvalGuard = useCWReviewApprovalGuard();
+  const approvalBlocked = approvalGuard.blockedCount > 0;
 
   /**
-   * 只有当前审核意见仍等于上次系统草稿时，才随清单变化自动同步。
+   * 把当前人工审核决定发布给同页AI问题工具栏。
    *
-   * comment一旦被人工编辑，与lastAppliedDraft不再相等，
-   * 本effect便不会覆盖人工内容。
+   * 工具栏顶部“本次修改清单”数量必须与正式提交口径一致：
+   * approved固定为0，revision才使用当前规范化交付选择数量。
    */
   useEffect(() => {
-    if (!lastAppliedDraft || comment !== lastAppliedDraft) {
-      return;
-    }
-    if (currentDeliveryDraft === lastAppliedDraft) {
-      return;
-    }
+    publishCWReviewDeliveryDecision(decision);
 
-    onCommentChange(currentDeliveryDraft);
-    setLastAppliedDraft(currentDeliveryDraft);
-  }, [
-    comment,
-    currentDeliveryDraft,
-    lastAppliedDraft,
-    onCommentChange,
-  ]);
+    return () => {
+      publishCWReviewDeliveryDecision(null);
+    };
+  }, [decision]);
 
-  const draftSynced =
-    !!currentDeliveryDraft &&
-    comment === currentDeliveryDraft &&
-    lastAppliedDraft === currentDeliveryDraft;
+  /**
+   * 控制器应保证selectedItemIds与selectedItems是同一规范化集合。
+   * 提交前再做一次fail-closed，防止显示数量与review_item_ids分叉。
+   */
+  const deliveryCountMismatch =
+    decision === "revision" &&
+    aiReviewContext.selectedItemIds.length !==
+      aiReviewContext.selectedItems.length;
 
-  const draftNeedsManualRefresh =
-    !!lastAppliedDraft &&
-    currentDeliveryDraft !== lastAppliedDraft &&
-    comment !== lastAppliedDraft;
-
-  const applyCurrentDraft = () => {
-    if (!currentDeliveryDraft) {
-      return;
-    }
-
-    onCommentChange(currentDeliveryDraft);
-    setLastAppliedDraft(currentDeliveryDraft);
-  };
-
-  const removeSelectedItem = (itemID: string) => {
-    aiReviewContext.removeSelectedItem?.(itemID);
-  };
+  const deliveryItemCount =
+    decision === "revision"
+      ? aiReviewContext.selectedItems.length
+      : 0;
 
   const submitBlocked =
     submitting ||
-    (
-      decision === "approved" &&
-      approvalBlocked
-    );
+    deliveryCountMismatch ||
+    (decision === "approved" && approvalBlocked);
 
   const handleSubmit = () => {
     if (submitBlocked) {
@@ -289,8 +136,7 @@ export default function CWReviewDecisionPanel({
             value: "approved" as const,
             label: "✅ 通过",
             color: C.success,
-            disabled:
-              approvalBlocked,
+            disabled: approvalBlocked,
           },
           {
             value: "revision" as const,
@@ -302,9 +148,7 @@ export default function CWReviewDecisionPanel({
           <button
             key={option.value}
             type="button"
-            disabled={
-              option.disabled
-            }
+            disabled={option.disabled}
             title={
               option.disabled
                 ? `还有${approvalGuard.blockedCount}条上轮问题未确认解决`
@@ -312,9 +156,7 @@ export default function CWReviewDecisionPanel({
             }
             onClick={() => {
               if (!option.disabled) {
-                onDecisionChange(
-                  option.value,
-                );
+                onDecisionChange(option.value);
               }
             }}
             style={{
@@ -329,17 +171,10 @@ export default function CWReviewDecisionPanel({
                 decision === option.value
                   ? `${option.color}10`
                   : "#fff",
-              cursor:
-                option.disabled
-                  ? "not-allowed"
-                  : "pointer",
-              opacity:
-                option.disabled
-                  ? 0.55
-                  : 1,
+              cursor: option.disabled ? "not-allowed" : "pointer",
+              opacity: option.disabled ? 0.55 : 1,
               fontSize: "14px",
-              fontWeight:
-                decision === option.value ? 600 : 400,
+              fontWeight: decision === option.value ? 600 : 400,
               color:
                 decision === option.value
                   ? option.color
@@ -351,29 +186,21 @@ export default function CWReviewDecisionPanel({
         ))}
       </div>
 
-      {approvalGuard.totalCount >
-        0 && (
+      {approvalGuard.totalCount > 0 && (
         <div
           style={{
             marginBottom: "12px",
             padding: "11px 12px",
             borderRadius: "9px",
-            border:
-              approvalBlocked
-                ? "1px solid #FECACA"
-                : "1px solid #A7F3D0",
-            background:
-              approvalBlocked
-                ? "#FEF2F2"
-                : "#ECFDF5",
+            border: approvalBlocked
+              ? "1px solid #FECACA"
+              : "1px solid #A7F3D0",
+            background: approvalBlocked ? "#FEF2F2" : "#ECFDF5",
           }}
         >
           <div
             style={{
-              color:
-                approvalBlocked
-                  ? C.danger
-                  : C.success,
+              color: approvalBlocked ? C.danger : C.success,
               fontSize: "13px",
               fontWeight: 700,
               lineHeight: 1.55,
@@ -392,45 +219,29 @@ export default function CWReviewDecisionPanel({
               lineHeight: 1.6,
             }}
           >
-            已确认解决
-            {" "}
-            {approvalGuard.resolvedCount}
-            {" "}
-            条
-            {approvalGuard.notReadyCount >
-              0
+            已确认解决 {approvalGuard.resolvedCount} 条
+            {approvalGuard.notReadyCount > 0
               ? `；${approvalGuard.notReadyCount} 条作者尚未完成或状态异常`
               : ""}
-            {approvalGuard.waitingReviewCount >
-              0
+            {approvalGuard.waitingReviewCount > 0
               ? `；${approvalGuard.waitingReviewCount} 条已完成修改但尚未勾选确认`
               : ""}
-            {approvalGuard.changedPageCount >
-              0
+            {approvalGuard.changedPageCount > 0
               ? `；其中 ${approvalGuard.changedPageCount} 条涉及页面变化`
               : ""}
-            。
-            继续退回不受此限制。
+            。继续退回不受此限制。
           </div>
 
           {approvalBlocked && (
             <button
               type="button"
-              onClick={
-                requestCWReviewCarryoverFocus
-              }
+              onClick={requestCWReviewCarryoverFocus}
               style={{
+                ...smallButtonStyle,
                 marginTop: "9px",
                 minHeight: "36px",
-                padding: "8px 11px",
-                borderRadius: "8px",
-                border:
-                  `1px solid ${C.danger}`,
-                background: "#FFFFFF",
                 color: C.danger,
-                fontSize: "12px",
-                fontWeight: 700,
-                cursor: "pointer",
+                border: `1px solid ${C.danger}`,
               }}
             >
               去复查上轮整改
@@ -439,287 +250,12 @@ export default function CWReviewDecisionPanel({
         </div>
       )}
 
-
-      {decision === "revision" && (
-        <div
-          style={{
-            marginBottom: "12px",
-            padding: "10px 11px",
-            borderRadius: "9px",
-            border:
-              deliveryItemCount > 0
-                ? "1px solid #FED7AA"
-                : `1px solid ${C.borderMid}`,
-            background:
-              deliveryItemCount > 0 ? "#FFF7ED" : "#FFFFFF",
-          }}
-        >
-          <div
-            style={{
-              display: "flex",
-              alignItems: "flex-start",
-              gap: "8px",
-            }}
-          >
-            <div style={{ minWidth: 0, flex: 1 }}>
-              <div
-                style={{
-                  color:
-                    deliveryItemCount > 0
-                      ? "#9A3412"
-                      : C.textSec,
-                  fontSize: "11px",
-                  fontWeight: 700,
-                  lineHeight: 1.6,
-                }}
-              >
-                {deliveryItemCount > 0
-                  ? `📤 本次将交付 ${deliveryPageCount} 个页面或整课范围、${deliveryItemCount} 条确认指令`
-                  : "📭 当前没有随本次退回交付的确认指令"}
-              </div>
-
-              <div
-                style={{
-                  marginTop: "3px",
-                  color: C.textMuted,
-                  fontSize: "9px",
-                  lineHeight: 1.5,
-                }}
-              >
-                从本区域移出只影响本次退回，不会删除、忽略或修改原整改项。
-              </div>
-            </div>
-
-            {deliveryItemCount > 0 && (
-              <button
-                type="button"
-                onClick={() => setExpanded((previous) => !previous)}
-                style={smallButtonStyle}
-              >
-                {expanded ? "收起清单" : "展开清单"}
-              </button>
-            )}
-          </div>
-
-          {deliveryItemCount === 0 && (
-            <button
-              type="button"
-              onClick={onOpenAI}
-              style={{
-                ...smallButtonStyle,
-                marginTop: "8px",
-                color: C.primary,
-                border: `1px solid ${C.primary}`,
-              }}
-            >
-              返回AI审核确认整改项
-            </button>
-          )}
-
-          {expanded && deliveryGroups.length > 0 && (
-            <div
-              style={{
-                maxHeight: "230px",
-                overflowY: "auto",
-                marginTop: "9px",
-                paddingRight: "2px",
-              }}
-            >
-              {deliveryGroups.map((group) => (
-                <div
-                  key={group.key}
-                  style={{
-                    marginTop: "7px",
-                    padding: "8px",
-                    borderRadius: "7px",
-                    border: "1px solid #FED7AA",
-                    background: "#FFFFFF",
-                  }}
-                >
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "6px",
-                    }}
-                  >
-                    {group.pageNumber > 0 ? (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          onSelectPage(group.pageNumber);
-                          onOpenAI();
-                        }}
-                        style={{
-                          ...smallButtonStyle,
-                          color: "#C2410C",
-                          border: "1px solid #FDBA74",
-                        }}
-                      >
-                        P{group.pageNumber}
-                      </button>
-                    ) : (
-                      <span
-                        style={{
-                          padding: "3px 7px",
-                          borderRadius: "6px",
-                          background: "#FFF7ED",
-                          color: "#C2410C",
-                          fontSize: "10px",
-                          fontWeight: 700,
-                        }}
-                      >
-                        整课
-                      </span>
-                    )}
-
-                    <span
-                      style={{
-                        minWidth: 0,
-                        flex: 1,
-                        color: C.text,
-                        fontSize: "10px",
-                        fontWeight: 700,
-                      }}
-                    >
-                      {group.pageTitle ||
-                        (group.pageNumber > 0
-                          ? `第${group.pageNumber}页`
-                          : "整课综合问题")}
-                    </span>
-
-                    <span
-                      style={{
-                        color: C.textMuted,
-                        fontSize: "9px",
-                      }}
-                    >
-                      {group.items.length} 条
-                    </span>
-                  </div>
-
-                  {group.items.map((item) => (
-                    <div
-                      key={item.id}
-                      style={{
-                        marginTop: "7px",
-                        paddingTop: "7px",
-                        borderTop: "1px solid #FDE7D3",
-                      }}
-                    >
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "flex-start",
-                          gap: "7px",
-                        }}
-                      >
-                        <div
-                          style={{
-                            minWidth: 0,
-                            flex: 1,
-                          }}
-                        >
-                          <div
-                            style={{
-                              color: C.text,
-                              fontSize: "10px",
-                              fontWeight: 700,
-                              lineHeight: 1.5,
-                            }}
-                          >
-                            {item.title || "已确认整改要求"}
-                          </div>
-
-                          <div
-                            style={{
-                              marginTop: "3px",
-                              color: C.textSec,
-                              fontSize: "10px",
-                              lineHeight: 1.55,
-                              whiteSpace: "pre-wrap",
-                              wordBreak: "break-word",
-                            }}
-                          >
-                            {item.confirmed_instruction}
-                          </div>
-                        </div>
-
-                        <button
-                          type="button"
-                          onClick={() => removeSelectedItem(item.id)}
-                          disabled={!aiReviewContext.removeSelectedItem}
-                          title="仅从本次正式退回清单移出"
-                          style={{
-                            ...smallButtonStyle,
-                            flexShrink: 0,
-                            color: C.danger,
-                            border: "1px solid #FECACA",
-                            cursor: aiReviewContext.removeSelectedItem
-                              ? "pointer"
-                              : "not-allowed",
-                          }}
-                        >
-                          移出
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ))}
-            </div>
-          )}
-
-          {deliveryItemCount > 0 && (
-            <div
-              style={{
-                marginTop: "9px",
-                paddingTop: "9px",
-                borderTop: "1px solid #FED7AA",
-              }}
-            >
-              <button
-                type="button"
-                onClick={applyCurrentDraft}
-                style={{
-                  width: "100%",
-                  padding: "7px",
-                  borderRadius: "7px",
-                  border: "none",
-                  background: C.warning,
-                  color: "#fff",
-                  fontSize: "10px",
-                  fontWeight: 700,
-                  cursor: "pointer",
-                }}
-              >
-                {lastAppliedDraft
-                  ? "按当前清单更新审核意见草稿"
-                  : "按当前清单生成审核意见草稿"}
-              </button>
-
-              <div
-                style={{
-                  marginTop: "5px",
-                  color: draftSynced
-                    ? C.success
-                    : draftNeedsManualRefresh
-                      ? C.warning
-                      : C.textMuted,
-                  fontSize: "9px",
-                  lineHeight: 1.5,
-                }}
-              >
-                {draftSynced
-                  ? "✓ 当前审核意见已与退回清单同步；未人工编辑时会安全跟随清单变化。"
-                  : draftNeedsManualRefresh
-                    ? "清单已变化，但检测到人工编辑内容，因此没有自动覆盖。"
-                    : "系统不会自动覆盖人工审核意见；首次使用请点击上方按钮。"}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
+      <CWReviewDeliveryPreview
+        decision={decision}
+        aiReviewContext={aiReviewContext}
+        onSelectPage={onSelectPage}
+        onOpenAI={onOpenAI}
+      />
 
       <input
         type="number"
@@ -764,6 +300,14 @@ export default function CWReviewDecisionPanel({
         }}
       />
 
+      <CWReviewCommentCandidatePanel
+        decision={decision}
+        comment={comment}
+        submitting={submitting}
+        aiReviewContext={aiReviewContext}
+        onCommentChange={onCommentChange}
+      />
+
       <div
         style={{
           display: "flex",
@@ -789,49 +333,41 @@ export default function CWReviewDecisionPanel({
 
         <button
           type="button"
-          onClick={
-            handleSubmit
-          }
-          disabled={
-            submitBlocked
-          }
+          onClick={handleSubmit}
+          disabled={submitBlocked}
           title={
-            decision === "approved" &&
-            approvalBlocked
-              ? `还有${approvalGuard.blockedCount}条上轮问题未确认解决`
-              : undefined
+            deliveryCountMismatch
+              ? "本次修改清单数量与提交ID数量不一致，请刷新后重试"
+              : decision === "approved" && approvalBlocked
+                ? `还有${approvalGuard.blockedCount}条上轮问题未确认解决`
+                : undefined
           }
           style={{
             flex: 1,
             padding: "10px",
             borderRadius: "10px",
             border: "none",
-            background:
-              submitBlocked
-                ? "#CBD5E1"
-                : decision === "approved"
-                  ? C.success
-                  : C.warning,
+            background: submitBlocked
+              ? "#CBD5E1"
+              : decision === "approved"
+                ? C.success
+                : C.warning,
             color: "#fff",
-            cursor:
-              submitBlocked
-                ? "not-allowed"
-                : "pointer",
+            cursor: submitBlocked ? "not-allowed" : "pointer",
             fontSize: "14px",
             fontWeight: 600,
-            opacity:
-              submitBlocked
-                ? 0.7
-                : 1,
+            opacity: submitBlocked ? 0.7 : 1,
           }}
         >
           {submitting
             ? "提交中…"
-            : decision === "approved"
-              ? approvalBlocked
-                ? `还有 ${approvalGuard.blockedCount} 条未确认`
-                : "✅ 确认通过"
-              : "↩️ 确认退回"}
+            : deliveryCountMismatch
+              ? "清单数量异常"
+              : decision === "approved"
+                ? approvalBlocked
+                  ? `还有 ${approvalGuard.blockedCount} 条未确认`
+                  : "✅ 确认通过"
+                : `↩️ 确认退回（${deliveryItemCount} 条）`}
         </button>
       </div>
 

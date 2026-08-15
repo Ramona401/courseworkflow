@@ -97,15 +97,10 @@ import {
   Routes,
   Route,
   Navigate,
+  useLocation,
   useParams,
 } from 'react-router-dom'
-import {
-  Suspense,
-  lazy,
-  Component,
-  type ReactNode,
-  type ErrorInfo,
-} from 'react'
+import { Suspense, lazy } from 'react'
 import { AuthContext } from '@/store/auth'
 import { useAuth } from '@/store/auth'
 import { useAuthProvider } from '@/hooks/useAuthProvider'
@@ -116,6 +111,7 @@ import MainLayout from '@/components/layout/MainLayout'
 import LPLayout from '@/components/layout-lp/LPLayout'
 import CWLayout from '@/components/layout-cw/CWLayout'
 import EducationDomainGuard from '@/components/auth/EducationDomainGuard'
+import { PageLoading, RouteErrorBoundary } from '@/components/routing/RouteRuntime'
 
 /* ==================== 课件审核系统（懒加载） ==================== */
 const LoginPage = lazy(() => import('@/pages/login/LoginPage'))
@@ -160,140 +156,19 @@ const CWTemplatesPage = lazy(() => import('@/pages/courseware/CWTemplatesPage'))
 const CoursewareWorkshopPage = lazy(() => import('@/pages/courseware/CoursewareWorkshopPage'))
 const CWReviewDashboardPage = lazy(() => import('@/pages/courseware/review/CWReviewDashboardPage'))
 const CWReviewWorkbenchPage = lazy(() => import('@/pages/courseware/review/CWReviewWorkbenchPage'))
+const CWReviewHistoryPage = lazy(() => import('@/pages/courseware/review/CWReviewHistoryPage'))
 
 /* ==================== 知识库压缩入库系统（隐藏全屏，懒加载） ==================== */
 const KBCurriculumPage = lazy(() => import('@/pages/kb-admin/KBCurriculumPage'))
 
 /* ==================== 通用独立页面（懒加载） ==================== */
 const AccountPage = lazy(() => import('@/pages/account/AccountPage'))
+const IdentityCallbackPage = lazy(() => import('@/pages/account/IdentityCallbackPage'))
 const AICenterPage = lazy(() => import('@/pages/ai-center/AICenterPage'))
 const AITraceDashboardPage = lazy(() => import('@/pages/ai-traces/AITraceDashboardPage'))
 const AdminPage = lazy(() => import('@/pages/admin/AdminPage'))
 const BaseDataPage = lazy(() => import('@/pages/base-data/BaseDataPage'))
 const TrashPage = lazy(() => import('@/pages/trash/TrashPage'))
-
-/* ==================== 路由加载错误边界 ==================== */
-interface EBProps {
-  children: ReactNode
-}
-
-interface EBState {
-  hasError: boolean
-}
-
-class RouteErrorBoundary extends Component<EBProps, EBState> {
-  constructor(props: EBProps) {
-    super(props)
-    this.state = { hasError: false }
-  }
-
-  static getDerivedStateFromError(_error: Error): EBState {
-    return { hasError: true }
-  }
-
-  componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error('[RouteErrorBoundary]', error, info)
-  }
-
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div style={{
-          height: '100vh',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          background: '#FAFBFC',
-        }}>
-          <div style={{
-            textAlign: 'center',
-            maxWidth: '400px',
-            padding: '0 20px',
-          }}>
-            <div style={{
-              fontSize: '48px',
-              marginBottom: '16px',
-            }}>
-              😵
-            </div>
-
-            <div style={{
-              fontSize: '18px',
-              fontWeight: 700,
-              color: '#1F2937',
-              marginBottom: '8px',
-            }}>
-              页面加载失败
-            </div>
-
-            <div style={{
-              fontSize: '13px',
-              color: '#6B7280',
-              marginBottom: '20px',
-              lineHeight: 1.6,
-            }}>
-              可能是网络波动导致资源加载失败，请刷新页面重试。
-            </div>
-
-            <button
-              onClick={() => window.location.reload()}
-              style={{
-                padding: '10px 28px',
-                borderRadius: '10px',
-                border: 'none',
-                background: 'linear-gradient(135deg, #4F7BE8, #6366F1)',
-                color: '#fff',
-                fontSize: '14px',
-                fontWeight: 600,
-                cursor: 'pointer',
-              }}
-            >
-              刷新页面
-            </button>
-          </div>
-        </div>
-      )
-    }
-
-    return this.props.children
-  }
-}
-
-/* ==================== 全局加载占位符 ==================== */
-function PageLoading() {
-  return (
-    <div style={{
-      height: '100vh',
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      background: '#FAFBFC',
-    }}>
-      <div style={{ textAlign: 'center' }}>
-        <div style={{
-          width: '28px',
-          height: '28px',
-          border: '2.5px solid #E5E7EB',
-          borderTopColor: '#4F7BE8',
-          borderRadius: '50%',
-          animation: 'spin 0.8s linear infinite',
-          margin: '0 auto 10px',
-        }} />
-
-        <style>
-          {`@keyframes spin { to { transform: rotate(360deg); } }`}
-        </style>
-
-        <div style={{
-          color: '#9CA3AF',
-          fontSize: '13px',
-        }}>
-          页面加载中...
-        </div>
-      </div>
-    </div>
-  )
-}
 
 /* ==================== 路由守卫 ==================== */
 function AuthGuard({
@@ -394,14 +269,25 @@ function ModuleGuard({
 }
 
 /* ==================== 主路由 ==================== */
-export default function App() {
+
+// Identity Phase 1结果页必须真正独立于TE-DNA本地认证初始化。
+// 如果在根组件无条件调用useAuthProvider，浏览器残留的过期本地JWT会触发/auth/me 401，
+// 全局HTTP拦截器随后跳/login，导致公开callback结果页被本地登录态劫持。
+function AppRouteBody() {
+  const location = useLocation()
+
+  if (location.pathname === '/identity/callback') {
+    return <IdentityCallbackPage />
+  }
+
+  return <AuthenticatedAppRoutes />
+}
+
+function AuthenticatedAppRoutes() {
   const authValue = useAuthProvider()
 
   return (
     <AuthContext.Provider value={authValue}>
-      <BrowserRouter>
-        <RouteErrorBoundary>
-          <Suspense fallback={<PageLoading />}>
             <Routes>
               {/* 登录页不受教育域守卫影响。 */}
               <Route
@@ -674,6 +560,7 @@ export default function App() {
                   path="templates"
                   element={<CWTemplatesPage />}
                 />
+                <Route path="review-history/:reviewId" element={<CWReviewHistoryPage />} />
                 <Route
                   path=":id"
                   element={<CoursewareWorkshopPage />}
@@ -888,9 +775,18 @@ export default function App() {
                 }
               />
             </Routes>
-          </Suspense>
-        </RouteErrorBoundary>
-      </BrowserRouter>
     </AuthContext.Provider>
+  )
+}
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <RouteErrorBoundary>
+        <Suspense fallback={<PageLoading />}>
+          <AppRouteBody />
+        </Suspense>
+      </RouteErrorBoundary>
+    </BrowserRouter>
   )
 }

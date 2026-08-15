@@ -393,7 +393,7 @@ func (s *LessonPlanGenService) processChatStageAsync(
 				s.broadcastError(
 					planID,
 					turnID,
-					"本轮正式内容没有通过课本、附件与教学依据一致性校验，系统已阻止展示和保存。请核对资料后重试。",
+					lessonPlanEvidenceHarnessRejectedPublicMessage(err),
 				)
 			case errors.Is(err, ErrLessonPlanEvidenceHarnessUnavailable):
 				lpGenLog.Warn(
@@ -680,6 +680,10 @@ func (s *LessonPlanGenService) processChatStageAsync(
 				),
 			)
 		}
+		return
+	}
+
+	if s.blockUnharnessedTextbookArtifact(planID, turnID, currentStage, hasContent, turnPlan) {
 		return
 	}
 

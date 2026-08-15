@@ -118,13 +118,34 @@ func (s *CoursewarePPTService) UploadAndCreateCourseware(
 
 	// ---- 1. 校验文件大小 ----
 	if header.Size > PPTMaxSize {
-		return nil, nil, fmt.Errorf("PPT文件过大，最大支持50MB（当前%.1fMB）", float64(header.Size)/(1024*1024))
+		return nil, nil, newCoursewareSourceUploadError(
+			CoursewareSourceUploadTooLarge,
+			fmt.Sprintf(
+				"PPT文件过大，最大支持50MB（当前%.1fMB）",
+				float64(header.Size)/(1024*1024),
+			),
+			nil,
+		)
+	}
+	if header.Size <= 0 {
+		return nil, nil, newCoursewareSourceUploadError(
+			CoursewareSourceUploadInvalidFormat,
+			"这个PPT文件为空，请重新选择有效的.pptx文件。",
+			nil,
+		)
 	}
 
 	// ---- 2. 校验文件扩展名 ----
 	ext := strings.ToLower(filepath.Ext(header.Filename))
 	if ext != ".pptx" {
-		return nil, nil, fmt.Errorf("仅支持.pptx格式的PPT文件（当前: %s）", ext)
+		return nil, nil, newCoursewareSourceUploadError(
+			CoursewareSourceUploadInvalidExtension,
+			fmt.Sprintf(
+				"仅支持.pptx格式的PPT文件（当前: %s）",
+				ext,
+			),
+			nil,
+		)
 	}
 
 	// ---- 3. 校验MIME类型（宽松：某些浏览器不准确） ----
@@ -165,19 +186,31 @@ func (s *CoursewarePPTService) UploadAndCreateCourseware(
 	// ---- 5. 解析PPT内容 ----
 	extractResult, err := s.ExtractPPTContent(fullPath)
 	if err != nil {
-		// 解析失败不删除文件（可能后续手动处理）
-		pptServiceLog.Warn("PPT解析失败，课件仍会创建",
+		pptServiceLog.Warn(
+			"PPT上传文件结构无效，已拒绝创建空课件",
 			"path", fullPath,
 			"error", err.Error(),
 		)
-		// 创建空的解析结果，允许用户手动输入
-		extractResult = &PPTExtractResult{
-			SlideCount: 0,
-			Slides:     nil,
-			FileName:   header.Filename,
-		}
-	} else {
-		extractResult.FileName = header.Filename
+		_ = os.Remove(fullPath)
+		return nil, nil, newCoursewareSourceUploadError(
+			CoursewareSourceUploadInvalidFormat,
+			"无法读取这个PPT文件：文件扩展名虽然是.pptx，但内部不是有效的PowerPoint PPTX文档。请用PowerPoint/WPS打开原文件，重新“另存为 .pptx”后上传。",
+			err,
+		)
+	}
+	extractResult.FileName = header.Filename
+
+	if extractResult.SlideCount == 0 {
+		pptServiceLog.Warn(
+			"PPT上传未提取到有效幻灯片，已拒绝创建空课件",
+			"path", fullPath,
+		)
+		_ = os.Remove(fullPath)
+		return nil, nil, newCoursewareSourceUploadError(
+			CoursewareSourceUploadNoUsableContent,
+			"这个PPT文件可以打开，但没有读取到有效幻灯片内容，无法生成课件。请确认文件中包含正常的PPT页面后重新上传。",
+			nil,
+		)
 	}
 
 	// ---- 6. 确定课件标题 ----

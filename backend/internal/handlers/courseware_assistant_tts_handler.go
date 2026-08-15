@@ -9,15 +9,17 @@ package handlers
 // 请求正文：
 //   {
 //     "text": "教学智能体完整回答",
-//     "operation_id": "浏览器生成的UUID"
+//     "operation_id": "浏览器生成的UUID",
+//     "character": "female或male"
 //   }
 //
 // 安全边界：
 //   - 路由必须经过教师JWT认证；
 //   - 教师身份只取claims.UserID；
-//   - 请求正文不能提交owner_user_id、school_id、courseware_id、page_id、音色或付费账户；
+//   - 请求正文不能提交owner_user_id、school_id、courseware_id、page_id、任意音色或付费账户；
+//   - character只接受female/male展示人物枚举，真实speaker仍由Service固定映射；
 //   - Service按deployment_id和claims.UserID重新校验部署所有者；
-//   - 音色由服务端按文本语言自动选择：中文vivi 2.0，英文Tim；
+//   - 女老师中文使用vivi 2.0，男老师中文使用云舟，英文继续使用Tim；
 //   - 成功直接返回audio/mpeg，不返回服务器私有文件路径；
 //   - 失败响应沿用统一JSON信封，不泄露供应商密钥、内部路径、计费价格或数据库错误。
 
@@ -104,6 +106,7 @@ func (h *CoursewareAssistantTTSHandler) Synthesize(
 	var request struct {
 		Text        string `json:"text"`
 		OperationID string `json:"operation_id"`
+		Character   string `json:"character,omitempty"`
 	}
 
 	r.Body = http.MaxBytesReader(
@@ -133,6 +136,9 @@ func (h *CoursewareAssistantTTSHandler) Synthesize(
 	request.OperationID = strings.TrimSpace(
 		request.OperationID,
 	)
+	request.Character = strings.TrimSpace(
+		request.Character,
+	)
 
 	if request.Text == "" {
 		utils.BadRequest(
@@ -157,6 +163,7 @@ func (h *CoursewareAssistantTTSHandler) Synthesize(
 		deploymentID,
 		claims.UserID,
 		request.Text,
+		request.Character,
 		request.OperationID,
 	)
 	if err != nil {
@@ -229,7 +236,7 @@ func writeCoursewareAssistantTTSError(
 	):
 		utils.BadRequest(
 			w,
-			"教学智能体回答为空、过长或朗读任务标识无效",
+			"教学智能体回答为空、过长、人物选择或朗读任务标识无效",
 		)
 
 	case errors.Is(

@@ -25,6 +25,10 @@ const (
 	// CWAssetURLPrefix Nginx对课件资产目录的URL映射前缀。
 	CWAssetURLPrefix = "/uploads/courseware-assets/"
 
+	// CWAssetPublicFileMode 是已经完成校验并正式发布到 /uploads/ 的资产文件权限。
+	// 临时文件保持私有；只有正式资产在原子落盘完成后才切换为 Nginx 可读的 0644。
+	CWAssetPublicFileMode = 0o644
+
 	// CWAssetMaxSize 单张手动上传图片最大5MB。
 	CWAssetMaxSize = 5 * 1024 * 1024
 

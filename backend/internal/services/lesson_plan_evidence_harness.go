@@ -337,13 +337,14 @@ const lessonPlanEvidenceJudgeSystemPrompt = `你是“教案正式产物多证�
 
 来源优先级：
 1. 篇名、正文、题目、页码、人物、地点、动物、数据和页面事实：老师挂载的课本页或教师附件优先。
-2. 本课正式知识点、学习深度、前置关系、后续发展和教学边界：教师确认后生成的active知识脉络优先。
+2. 若教师实际挂载课程大纲并形成active知识脉络，本课知识点、学习深度和教学边界以其为约束；未挂载或无active知识脉络时，不得用通用课标、模型常识或前序模型结论否定老师挂载的课本。
 3. 原始课程大纲只在老师明确询问大纲原文或版本要求时用于回答该查询；不得用整份大纲重新改写已经确认的本课课程锚点。
 4. 单元方案负责单元位置、进阶、任务和评价衔接；班级学情负责差异化组织，不得改写课本事实或active知识脉络。
 5. 原始课程大纲没有收录教师挂载的篇章，不得据此把该篇章判为幻觉或“超纲”。
 6. 只有无法从教师任务、课本、附件、active知识脉络、显式原始大纲查询、单元方案、班级学情或前序正式产出追溯的模型新增事实，才属于无依据扩写。
-7. 候选内容与高优先级来源冲突时必须判为不通过；无法确认时同样不通过。
+7. 候选内容与高优先级来源冲突时必须判为不通过；若低优先级前序产出或共识与当前课本冲突，必须以当前课本为准，不得反向判定遵循课本的候选失败。
 8. Harness、Judge、置信度、模型评分和系统规则等内部概念，不得被写成学生必学知识。
+9. 本Harness只裁定证据与事实一致性；排版、Markdown空行、标题层级、标点、LaTeX显示形式、中英文误混、错别字、拼写等纯表层质量问题不得进入三个违规数组，也不得据此判失败；若事实本身可追溯，仅有语言或格式瑕疵不属于无依据新增或来源冲突。
 
 严格输出：
 {
@@ -487,6 +488,8 @@ func parseLessonPlanEvidenceVerdict(
 		strings.TrimSpace(
 			verdict.RepairInstruction,
 		)
+
+	normalizeLessonPlanEvidenceVerdictPolicy(verdict)
 
 	if len(
 		verdict.UnsupportedModelAdditions,
@@ -710,6 +713,33 @@ func startLessonPlanEvidenceHarnessProgress(
 			},
 		)
 	}
+}
+
+// blockUnharnessedTextbookArtifact 防止普通讨论旁路写入正式教案正文。
+func (s *LessonPlanGenService) blockUnharnessedTextbookArtifact(
+	planID, turnID, stageCode string,
+	hasContent bool,
+	plan *lessonPlanTurnContextPlan,
+) bool {
+	if plan == nil || !hasContent || !plan.UseTextbook ||
+		plan.BlockingEvidenceHarness {
+		return false
+	}
+	if stageCode != "write" && stageCode != "revise" {
+		return false
+	}
+
+	lpGenLog.Warn(
+		"普通讨论产生完整教案候选，已阻止绕过课本Harness写入",
+		"plan_id", planID,
+		"stage", stageCode,
+	)
+	s.broadcastError(
+		planID,
+		turnID,
+		"检测到完整教案候选，但本轮未经过课本一致性校验，已阻止写入。请明确要求生成或修改完整教案后重试。",
+	)
+	return true
 }
 
 func applyLessonPlanTurnPlanToReceipt(

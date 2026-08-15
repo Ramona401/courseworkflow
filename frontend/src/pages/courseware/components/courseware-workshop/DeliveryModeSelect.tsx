@@ -1,11 +1,13 @@
 /**
  * DeliveryModeSelect.tsx — Step4交付模式选择器
  *
- * 除三档选择外，本组件会在挂载时查询后端装配生命周期：
- *   - 若发现starting/running/cancel_requested，自动恢复到对应装配面板；
- *   - 查询期间暂时锁定卡片，避免刷新后重复启动；
- *   - 查询失败只提示，不阻断老师继续选择。
+ * 生命周期恢复边界：
+ *   - assembly-state 同时承载自动装配和普通批量生成；
+ *   - 只有 run_kind=assembly 的活动运行才恢复自动装配模式；
+ *   - 活动 batch 只显示提示，绝不能根据 skip_video 被误判为自动装配；
+ *   - 状态查询失败只提示，不永久阻断老师继续选择。
  */
+
 import {
   useEffect,
   useState,
@@ -108,11 +110,18 @@ export default function DeliveryModeSelect({
 
       try {
         const state =
-          await getCoursewareAssemblyState(id)
+          await getCoursewareAssemblyState(
+            id,
+          )
 
-        if (disposed) return
+        if (disposed) {
+          return
+        }
 
-        if (state.is_active) {
+        if (
+          state.is_active &&
+          state.run_kind === 'assembly'
+        ) {
           onSelect(
             state.skip_video
               ? 'no_video'
@@ -120,10 +129,19 @@ export default function DeliveryModeSelect({
           )
           return
         }
+
+        if (
+          state.is_active &&
+          state.run_kind === 'batch'
+        ) {
+          setRuntimeWarning(
+            '普通批量页面生成正在后台运行，本页不会把它恢复成自动装配。请等待任务结束，或在普通生成入口停止后再选择新的交付方式。',
+          )
+        }
       } catch {
         if (!disposed) {
           setRuntimeWarning(
-            '未能确认后台装配状态。你仍可继续选择；若系统提示任务已运行，请刷新页面。',
+            '未能确认后台生成状态。你仍可继续选择；若系统提示已有任务运行，请刷新后再确认。',
           )
         }
       } finally {
@@ -142,11 +160,15 @@ export default function DeliveryModeSelect({
 
   return (
     <div>
-      <div style={{ marginBottom: 16 }}>
+      <div
+        style={{
+          marginBottom: 16,
+        }}
+      >
         <div
           style={{
-            fontSize: 13,
             color: C.textSecondary,
+            fontSize: 13,
             lineHeight: 1.7,
           }}
         >
@@ -181,13 +203,13 @@ export default function DeliveryModeSelect({
             marginBottom: 16,
             background: '#EFF6FF',
             border: '1px solid #BFDBFE',
-            fontSize: 12.5,
             color: '#1D4ED8',
+            fontSize: 12.5,
           }}
         >
           <span>🔄</span>
           <span>
-            正在确认是否有后台装配任务，请稍候…
+            正在确认是否有后台生成任务，请稍候…
           </span>
         </div>
       )}
@@ -203,8 +225,8 @@ export default function DeliveryModeSelect({
             marginBottom: 16,
             background: '#FFFBEB',
             border: '1px solid #FDE68A',
-            fontSize: 12.5,
             color: '#92400E',
+            fontSize: 12.5,
             lineHeight: 1.6,
           }}
         >
@@ -224,12 +246,18 @@ export default function DeliveryModeSelect({
             marginBottom: 16,
             background: '#FFFBEB',
             border: '1px solid #FDE68A',
-            fontSize: 12.5,
             color: '#92400E',
+            fontSize: 12.5,
             lineHeight: 1.6,
           }}
         >
-          <span style={{ fontSize: 15 }}>💡</span>
+          <span
+            style={{
+              fontSize: 15,
+            }}
+          >
+            💡
+          </span>
           <span>
             自动配图会在下一步打开画风选择弹窗，可当场建立风格锚点后开始装配。
           </span>
@@ -245,7 +273,8 @@ export default function DeliveryModeSelect({
         }}
       >
         {MODE_CARDS.map(card => {
-          const locked = checkingRuntime
+          const locked =
+            checkingRuntime
 
           return (
             <div
@@ -254,26 +283,6 @@ export default function DeliveryModeSelect({
                 if (!locked) {
                   onSelect(card.mode)
                 }
-              }}
-              style={{
-                position: 'relative',
-                borderRadius: 14,
-                padding: '18px 16px',
-                border: `2px solid ${
-                  locked
-                    ? C.border
-                    : `${card.accent}55`
-                }`,
-                background: locked
-                  ? '#F9FAFB'
-                  : card.accentBg,
-                cursor: locked
-                  ? 'wait'
-                  : 'pointer',
-                opacity: locked ? 0.65 : 1,
-                transition: 'all 200ms',
-                display: 'flex',
-                flexDirection: 'column',
               }}
               onMouseEnter={event => {
                 if (!locked) {
@@ -285,34 +294,58 @@ export default function DeliveryModeSelect({
                 event.currentTarget.style.boxShadow =
                   'none'
               }}
+              style={{
+                position: 'relative',
+                display: 'flex',
+                flexDirection: 'column',
+                padding: '18px 16px',
+                borderRadius: 14,
+                border: `2px solid ${
+                  locked
+                    ? C.border
+                    : `${card.accent}55`
+                }`,
+                background: locked
+                  ? '#F9FAFB'
+                  : card.accentBg,
+                cursor: locked
+                  ? 'wait'
+                  : 'pointer',
+                opacity: locked
+                  ? 0.65
+                  : 1,
+                transition: 'all 200ms',
+              }}
             >
               <div
                 style={{
-                  fontSize: 26,
                   marginBottom: 8,
+                  fontSize: 26,
                 }}
               >
                 {card.emoji}
               </div>
+
               <div
                 style={{
-                  fontSize: 16,
-                  fontWeight: 700,
+                  marginBottom: 4,
                   color: locked
                     ? C.textMuted
                     : card.accent,
-                  marginBottom: 4,
+                  fontSize: 16,
+                  fontWeight: 700,
                 }}
               >
                 {card.title}
               </div>
+
               <div
                 style={{
-                  fontSize: 12.5,
-                  color: C.textSecondary,
-                  lineHeight: 1.5,
-                  marginBottom: 12,
                   minHeight: 34,
+                  marginBottom: 12,
+                  color: C.textSecondary,
+                  fontSize: 12.5,
+                  lineHeight: 1.5,
                 }}
               >
                 {card.desc}
@@ -320,13 +353,13 @@ export default function DeliveryModeSelect({
 
               <ul
                 style={{
+                  display: 'flex',
+                  flex: 1,
+                  flexDirection: 'column',
+                  gap: 6,
                   margin: 0,
                   padding: 0,
                   listStyle: 'none',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 6,
-                  flex: 1,
                 }}
               >
                 {card.bullets.map(
@@ -335,20 +368,22 @@ export default function DeliveryModeSelect({
                       key={index}
                       style={{
                         display: 'flex',
-                        alignItems: 'flex-start',
+                        alignItems:
+                          'flex-start',
                         gap: 6,
+                        color:
+                          C.textSecondary,
                         fontSize: 12,
-                        color: C.textSecondary,
                         lineHeight: 1.5,
                       }}
                     >
                       <span
                         style={{
+                          flexShrink: 0,
                           color: locked
                             ? C.textMuted
                             : card.accent,
                           fontWeight: 700,
-                          flexShrink: 0,
                         }}
                       >
                         ·
@@ -362,17 +397,17 @@ export default function DeliveryModeSelect({
               <div
                 style={{
                   marginTop: 14,
-                  textAlign: 'center',
-                  fontSize: 13,
-                  fontWeight: 600,
                   padding: '8px 0',
                   borderRadius: 8,
-                  color: locked
-                    ? C.textMuted
-                    : '#fff',
                   background: locked
                     ? '#F3F4F6'
                     : card.accent,
+                  color: locked
+                    ? C.textMuted
+                    : '#fff',
+                  fontSize: 13,
+                  fontWeight: 600,
+                  textAlign: 'center',
                 }}
               >
                 {locked

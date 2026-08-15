@@ -29,13 +29,20 @@ const (
 const (
 	CWReviewItemOriginAIFinding              = "ai_finding"
 	CWReviewItemOriginGlobalDiscussionManual = "global_discussion_manual"
+
+	// CWReviewItemOriginGoalDriftManual 表示教师在完善当前修改要求时，
+	// 明确把另一项问题拆成独立改进项。
+	//
+	// 它不绑定全局讨论消息，也不会覆盖来源问题的确认要求或历史。
+	CWReviewItemOriginGoalDriftManual = "goal_drift_manual"
 )
 
 // IsCWReviewItemOriginType 判断整改项产生方式是否合法。
 func IsCWReviewItemOriginType(originType string) bool {
 	switch originType {
 	case CWReviewItemOriginAIFinding,
-		CWReviewItemOriginGlobalDiscussionManual:
+		CWReviewItemOriginGlobalDiscussionManual,
+		CWReviewItemOriginGoalDriftManual:
 		return true
 	default:
 		return false

@@ -7,17 +7,18 @@ package services
 // 设计边界：
 //
 //   1. 复用现有dismissed状态，不建设第二套排除模型；
-//   2. 忽略只适用于未交付的自审项或正式审核草稿项；
-//   3. 正式整改项只能由创建该项的审核员在提交决定前操作；
-//   4. 已绑定正式反馈的整改项属于不可变审核历史，禁止忽略和恢复；
-//   5. 忽略原因通过整改项系统消息保存，不污染AI原始证据；
-//   6. 忽略和恢复均不删除讨论记录、确认指令或整改项实体；
-//   7. 恢复前重新检查稳定页面及HTML哈希；
-//   8. 作者自审问题只有到达applied后，才允许作者本人确认解决；
-//   9. 作者确认解决前，仓储会原子重新检查当前页面内容指纹；
-//  10. 页面变化或删除时，问题改为stale或orphaned；
-//  11. 正式审核问题不能通过作者自审接口关闭；
-//  12. 全局讨论“确认忽略”复用同一内部入口。
+//   2. 普通忽略适用于未交付自审项或正式审核草稿项；
+//   3. 自审applied额外允许“暂时不处理”，并完整保留最近一次修改完成证据；
+//   4. 恢复这类暂存问题时回到applied，而不是伪造回第一次修改前；
+//   5. 正式整改项只能由创建该项的审核员在提交决定前操作；
+//   6. 已绑定正式反馈的整改项属于不可变审核历史，禁止忽略和恢复；
+//   7. 忽略原因通过整改项系统消息保存，不污染AI原始证据；
+//   8. 忽略和恢复均不删除讨论记录、确认指令或整改项实体；
+//   9. 自审applied相关动作以applied_page_hash重新检查修改完成后的页面；
+//  10. 作者自审问题只有到达applied后，才允许作者本人确认解决；
+//  11. 页面变化或删除时，问题改为stale或orphaned；
+//  12. 正式审核问题不能通过作者自审接口关闭；
+//  13. 全局讨论“确认忽略”复用普通未应用问题入口。
 
 import (
 	"context"
@@ -147,7 +148,10 @@ func (s *CoursewareAIReviewService) ResolveSelfCWReviewItem(
 	)
 }
 
-// DismissCWReviewItem 将一个仍可处理且尚未交付的整改项标记为无需修改。
+// DismissCWReviewItem 将一个仍可处理且尚未交付的整改项标记为暂不处理。
+//
+// 自审applied走专用事务：以applied_page_hash检查最近一次修改完成后的页面，
+// 并保留applied版本、时间和页面指纹，供后续恢复或继续调整。
 func (s *CoursewareAIReviewService) DismissCWReviewItem(
 	ctx context.Context,
 	itemID string,
@@ -165,6 +169,56 @@ func (s *CoursewareAIReviewService) DismissCWReviewItem(
 		)
 	if err != nil {
 		return nil, err
+	}
+
+	if item.SourceType ==
+		models.CWReviewItemSourceSelf &&
+		item.Status ==
+			models.CWReviewItemStatusApplied {
+		normalizedReason, err :=
+			normalizeCWReviewItemDismissReason(
+				reason,
+			)
+		if err != nil {
+			return nil, err
+		}
+
+		if err :=
+			ensureCWReviewItemStateManageable(
+				item,
+				actor,
+			); err != nil {
+			return nil, err
+		}
+
+		err =
+			repository.DismissAppliedSelfCoursewareReviewItem(
+				ctx,
+				item.ID,
+				actor.UserID,
+				normalizedReason,
+			)
+		if err != nil {
+			return nil,
+				mapCWReviewSelfPostApplyStateError(
+					err,
+				)
+		}
+
+		updatedItem, err :=
+			repository.GetCoursewareReviewItemForParticipant(
+				ctx,
+				item.ID,
+				actor.UserID,
+			)
+		if err != nil {
+			return nil, err
+		}
+
+		return buildCWReviewItemDiscussionResult(
+			ctx,
+			updatedItem,
+		)
 	}
 
 	return dismissCWReviewItem(
@@ -188,19 +242,14 @@ func dismissCWReviewItem(
 	*CWReviewItemDiscussionResult,
 	error,
 ) {
-	reason =
-		strings.TrimSpace(
+	normalizedReason, err :=
+		normalizeCWReviewItemDismissReason(
 			reason,
 		)
-
-	if reason == "" ||
-		utf8.RuneCountInString(
-			reason,
-		) >
-			cwReviewItemMaxDismissReasonRunes {
-		return nil,
-			ErrCWReviewItemDismissReasonInvalid
+	if err != nil {
+		return nil, err
 	}
+	reason = normalizedReason
 
 	if err :=
 		ensureCWReviewItemStateManageable(
@@ -254,8 +303,8 @@ func dismissCWReviewItem(
 
 // RestoreCWReviewItem 恢复一个未交付的已忽略整改项。
 //
-// 有确认指令时仓储恢复为confirmed，没有确认指令时恢复为detected。
-// 恢复不会自动勾选正式退回清单；前端控制器根据返回状态执行既有选择规则。
+// 普通问题仍按既有规则恢复为confirmed/detected。
+// 带applied事实的自审问题恢复为applied，继续等待人工检查或再次调整。
 func (s *CoursewareAIReviewService) RestoreCWReviewItem(
 	ctx context.Context,
 	itemID string,
@@ -288,24 +337,55 @@ func (s *CoursewareAIReviewService) RestoreCWReviewItem(
 			ErrCWReviewItemNotActionable
 	}
 
-	// dismissed状态不会被ensureCWReviewItemFresh自动迁移，
-	// 但仍会返回页面变化或删除错误，从而阻止恢复失效问题。
-	if _, err :=
-		ensureCWReviewItemFresh(
-			ctx,
-			item,
-			actor.UserID,
-		); err != nil {
-		return nil, err
+	appliedVersionID := ""
+	if item.AppliedInstructionVersionID != nil {
+		appliedVersionID =
+			strings.TrimSpace(
+				*item.AppliedInstructionVersionID,
+			)
 	}
 
-	if err :=
-		repository.RestoreCoursewareReviewItem(
-			ctx,
-			item.ID,
-			actor.UserID,
-		); err != nil {
-		return nil, err
+	dismissedAfterApplied :=
+		item.SourceType ==
+			models.CWReviewItemSourceSelf &&
+			item.AppliedAt != nil &&
+			strings.TrimSpace(
+				item.AppliedPageHash,
+			) != "" &&
+			appliedVersionID != ""
+
+	if dismissedAfterApplied {
+		if err :=
+			repository.RestoreDismissedAppliedSelfCoursewareReviewItem(
+				ctx,
+				item.ID,
+				actor.UserID,
+			); err != nil {
+			return nil,
+				mapCWReviewSelfPostApplyStateError(
+					err,
+				)
+		}
+	} else {
+		// 普通dismissed仍按问题最初稳定页面检查，
+		// 并按既有规则恢复为confirmed或detected。
+		if _, err :=
+			ensureCWReviewItemFresh(
+				ctx,
+				item,
+				actor.UserID,
+			); err != nil {
+			return nil, err
+		}
+
+		if err :=
+			repository.RestoreCoursewareReviewItem(
+				ctx,
+				item.ID,
+				actor.UserID,
+			); err != nil {
+			return nil, err
+		}
 	}
 
 	updatedItem, err :=
@@ -322,6 +402,47 @@ func (s *CoursewareAIReviewService) RestoreCWReviewItem(
 		ctx,
 		updatedItem,
 	)
+}
+
+func normalizeCWReviewItemDismissReason(
+	reason string,
+) (string, error) {
+	normalized :=
+		strings.TrimSpace(
+			reason,
+		)
+
+	if normalized == "" ||
+		utf8.RuneCountInString(
+			normalized,
+		) >
+			cwReviewItemMaxDismissReasonRunes {
+		return "",
+			ErrCWReviewItemDismissReasonInvalid
+	}
+
+	return normalized, nil
+}
+
+func mapCWReviewSelfPostApplyStateError(
+	err error,
+) error {
+	switch {
+	case errors.Is(
+		err,
+		repository.ErrCoursewareReviewItemAppliedPageChanged,
+	):
+		return ErrCWReviewItemStale
+
+	case errors.Is(
+		err,
+		repository.ErrCoursewareReviewItemAppliedPageMissing,
+	):
+		return ErrCWReviewItemOrphaned
+
+	default:
+		return err
+	}
 }
 
 // ensureCWReviewItemStateManageable 校验忽略和恢复操作的不可变边界。

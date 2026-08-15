@@ -32,6 +32,10 @@ import type {
   UpdateCoursewareAssistantDeploymentPolicyRequest,
 } from '@/api/coursewares'
 
+import {
+  publishCoursewareAssistantDeploymentRefresh,
+} from './coursewareAssistantDeploymentSync'
+
 export type CoursewareAssistantDeploymentAction =
   | ''
   | 'publish'
@@ -174,6 +178,15 @@ export function useCoursewareAssistantDeployments({
         if (operationRef.current !== operationID || resourceRef.current !== capturedResource) return null
 
         setNotice({ kind: 'success', text: successText })
+
+        // 当前课件页可能同时挂载管理区预览、画布悬浮预览、全屏或放映预览。
+        // 所有部署写操作成功后统一广播，让各独立Hook只重读当前页部署状态，
+        // 不刷新整个课件页面，也不复制服务端返回数据作为第二事实源。
+        publishCoursewareAssistantDeploymentRefresh(
+          coursewareId,
+          pageId,
+        )
+
         onChanged?.()
         return result
       } catch (cause) {
@@ -184,7 +197,14 @@ export function useCoursewareAssistantDeployments({
         if (operationRef.current === operationID && resourceRef.current === capturedResource) setWorkingAction('')
       }
     },
-    [load, onChanged, resourceKey, workingAction],
+    [
+      coursewareId,
+      load,
+      onChanged,
+      pageId,
+      resourceKey,
+      workingAction,
+    ],
   )
 
   const publishFirst = useCallback(

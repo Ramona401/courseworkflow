@@ -83,15 +83,18 @@ export async function forkCourseware(
 export async function autoAssemble(
   coursewareId: string,
   skipVideo = false,
+  repairFailedImages = false,
 ): Promise<{
   message: string
   courseware_id: string
   skip_video: boolean
+  repair_failed_images: boolean
 }> {
   const response = await apiClient.post(
     `/coursewares/${coursewareId}/auto-assemble`,
     {
       skip_video: skipVideo,
+      repair_failed_images: repairFailedImages,
     },
   )
 

@@ -14,8 +14,13 @@ import { C, CW_HEIGHT, CW_WIDTH } from './workshopConstants'
 import { injectPreviewMode } from './previewInject'
 import { createCodeSnippet, deleteCWPage, reorderCWPages, savePageHtml } from '@/api/coursewares'
 import AddPageModal from './AddPageModal'
+import CoursewareBatchIntegritySection from './CoursewareBatchIntegritySection'
 import PageNumberCalibrationButton from './PageNumberCalibrationButton'
 import PlatformCoursewareAssistantOverlay from './PlatformCoursewareAssistantOverlay'
+import {
+  rememberCoursewarePreviewPage,
+  resolveRememberedCoursewarePreviewPageNumber,
+} from './coursewarePreviewPosition'
 
 /** 源码编辑器只在老师打开源码视图时下载，避免进入工坊即加载。 */
 const LazySourceCodeEditor = lazy(() => import('./SourceCodeEditor'))
@@ -92,6 +97,7 @@ export default function PagePreviewBlock({
    * 老师显式开启互动试玩后，鼠标事件才交给iframe内课件。
    */
   const [interactivePreview, setInteractivePreview] = useState(false)
+  const restoredPositionCoursewareRef = useRef('')
 
   const containerWidth = 912
   const previewScale = containerWidth / CW_WIDTH
@@ -100,6 +106,48 @@ export default function PagePreviewBlock({
   const html = activePageItem?.html_content || ''
   const previewHtml = injectPreviewMode(html)
   const hasUnsavedCode = codeEditing && codeDraft !== html
+
+  /**
+   * 刷新后恢复上一次真正停留的稳定页面。
+   *
+   * 首次拿到当前课件页面列表时先尝试用sessionStorage中的page_id恢复；
+   * 只有恢复动作完成后才写回当前位置，避免加载默认P1时覆盖掉原来的P7/P12。
+   * 后续普通切页、全屏退出回写、放映退出回写都会通过activePage变化自动更新记录。
+   */
+  useEffect(() => {
+    if (!coursewareId || pages.length === 0) return
+
+    if (restoredPositionCoursewareRef.current !== coursewareId) {
+      const restoredPageNumber =
+        resolveRememberedCoursewarePreviewPageNumber(
+          coursewareId,
+          pages,
+        )
+
+      restoredPositionCoursewareRef.current = coursewareId
+
+      if (
+        restoredPageNumber !== null &&
+        restoredPageNumber !== activePage
+      ) {
+        onSelectPage(restoredPageNumber)
+        return
+      }
+    }
+
+    if (activePageItem?.id) {
+      rememberCoursewarePreviewPage(
+        activePageItem.id,
+        coursewareId,
+      )
+    }
+  }, [
+    activePage,
+    activePageItem?.id,
+    coursewareId,
+    onSelectPage,
+    pages,
+  ])
 
   /**
    * 浏览器刷新、关闭标签或离开站点前保护未保存源码。
@@ -329,11 +377,18 @@ export default function PagePreviewBlock({
   return <>
     {opMsg && <MsgBar msg={opMsg} />}
 
+    {editable && coursewareId && (
+      <CoursewareBatchIntegritySection
+        coursewareId={coursewareId}
+        onPagesChanged={onPagesChanged}
+      />
+    )}
+
     {pages.length > 0 && (
       <div style={{ marginBottom: 20 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 14, fontWeight: 600, color: C.textPrimary }}>📄 已生成 {pages.length} 页</span>
+            <span style={{ fontSize: 14, fontWeight: 600, color: C.textPrimary }}>📄 当前页面列表 {pages.length} 页</span>
             {editable && <span style={{ fontSize: 12, color: C.textMuted }}>拖拽调序 · 点 × 删除</span>}
           </div>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -564,4 +619,3 @@ export default function PagePreviewBlock({
     {showAddModal && coursewareId && <AddPageModal coursewareId={coursewareId} currentPageCount={pages.length} onDone={handleAddDone} onClose={() => setShowAddModal(false)} />}
   </>
 }
-

@@ -52,7 +52,13 @@ type cwReviewNextState struct {
 	NeedL2         bool
 }
 
-// reviewCoursewareAtLevel 执行L1或L2正式审核。
+// CWReviewDecisionResult 是一次正式课件审核提交成功后的可信结果。
+// DeliveredItemCount 只在事务成功后返回，代表本次真正绑定到正式反馈的整改项数量。
+type CWReviewDecisionResult struct {
+	DeliveredItemCount int
+}
+
+// reviewCoursewareAtLevel 保留既有服务入口，只返回错误，避免影响已有调用方。
 func (s *CoursewareReviewService) reviewCoursewareAtLevel(
 	ctx context.Context,
 	coursewareID string,
@@ -60,131 +66,117 @@ func (s *CoursewareReviewService) reviewCoursewareAtLevel(
 	req *models.CWReviewDecisionRequest,
 	reviewLevel int,
 ) error {
-	if actor == nil ||
-		strings.TrimSpace(actor.UserID) == "" {
-		return ErrCoursewareActorRequired
+	_, err := s.reviewCoursewareAtLevelWithResult(ctx, coursewareID, actor, req, reviewLevel)
+	return err
+}
+
+// ReviewL1WithResult 执行L1正式审核并返回本次真实交付数量。
+func (s *CoursewareReviewService) ReviewL1WithResult(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+	req *models.CWReviewDecisionRequest,
+) (*CWReviewDecisionResult, error) {
+	return s.reviewCoursewareAtLevelWithResult(ctx, coursewareID, actor, req, models.ReviewLevelL1)
+}
+
+// ReviewL2WithResult 执行L2正式审核并返回本次真实交付数量。
+func (s *CoursewareReviewService) ReviewL2WithResult(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+	req *models.CWReviewDecisionRequest,
+) (*CWReviewDecisionResult, error) {
+	return s.reviewCoursewareAtLevelWithResult(ctx, coursewareID, actor, req, models.ReviewLevelL2)
+}
+
+// reviewCoursewareAtLevelWithResult 执行L1或L2正式审核并返回可信交付数量。
+func (s *CoursewareReviewService) reviewCoursewareAtLevelWithResult(
+	ctx context.Context,
+	coursewareID string,
+	actor *CoursewareActorContext,
+	req *models.CWReviewDecisionRequest,
+	reviewLevel int,
+) (*CWReviewDecisionResult, error) {
+	if actor == nil || strings.TrimSpace(actor.UserID) == "" {
+		return nil, ErrCoursewareActorRequired
 	}
 
-	courseware, err :=
-		repository.GetCoursewareByID(
-			ctx,
-			strings.TrimSpace(coursewareID),
-		)
-	if err != nil ||
-		courseware == nil {
-		return ErrCWReviewCoursewareNotFound
+	courseware, err := repository.GetCoursewareByID(ctx, strings.TrimSpace(coursewareID))
+	if err != nil || courseware == nil {
+		return nil, ErrCWReviewCoursewareNotFound
 	}
 
-	if err :=
-		ValidateCoursewareReviewEducationDomain(
-			actor,
-			courseware,
-		); err != nil {
-		return err
+	if err := ValidateCoursewareReviewEducationDomain(actor, courseware); err != nil {
+		return nil, err
 	}
 
 	if !isValidCWReviewDecision(req) {
-		return ErrCWReviewInvalidDecision
+		return nil, ErrCWReviewInvalidDecision
 	}
 
-	req.Comment =
-		strings.TrimSpace(
-			req.Comment,
-		)
+	req.Comment = strings.TrimSpace(req.Comment)
 	if req.Comment == "" {
-		return ErrCWReviewFeedbackInvalid
+		return nil, ErrCWReviewFeedbackInvalid
 	}
 
-	if err :=
-		s.authorizeCWReviewLevel(
-			ctx,
-			courseware,
-			actor,
-			reviewLevel,
-		); err != nil {
-		return err
+	if err := s.authorizeCWReviewLevel(ctx, courseware, actor, reviewLevel); err != nil {
+		return nil, err
 	}
 
-	feedback, err :=
-		buildCWFormalReviewFeedbackSnapshot(
-			ctx,
-			courseware,
-			actor,
-			req,
-			reviewLevel,
-		)
+	feedback, err := buildCWFormalReviewFeedbackSnapshot(ctx, courseware, actor, req, reviewLevel)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	nextState, err :=
-		s.resolveCWReviewNextState(
-			ctx,
-			courseware,
-			req.Decision,
-			reviewLevel,
-		)
+	nextState, err := s.resolveCWReviewNextState(ctx, courseware, req.Decision, reviewLevel)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	resolvedReviewItemIDs :=
-		normalizeCWFormalReviewItemIDs(
-			req.ResolvedReviewItemIDs,
-		)
+	resolvedReviewItemIDs := normalizeCWFormalReviewItemIDs(req.ResolvedReviewItemIDs)
 
-	commitInput :=
-		&repository.CoursewareReviewDecisionCommitInput{
-			CoursewareID: courseware.ID,
-			ReviewerID:   actor.UserID,
-			ReviewLevel:  reviewLevel,
+	commitInput := &repository.CoursewareReviewDecisionCommitInput{
+		CoursewareID: courseware.ID,
+		ReviewerID:   actor.UserID,
+		ReviewLevel:  reviewLevel,
 
-			Decision: req.Decision,
-			Score:    req.Score,
-			Comment:  req.Comment,
-			Dimensions: strings.TrimSpace(
-				req.Dimensions,
-			),
+		Decision:   req.Decision,
+		Score:      req.Score,
+		Comment:    req.Comment,
+		Dimensions: strings.TrimSpace(req.Dimensions),
 
-			ExpectedPublishState: models.CWPublishSubmitted,
-			ExpectedReviewLevel:  courseware.ReviewLevel,
+		ExpectedPublishState: models.CWPublishSubmitted,
+		ExpectedReviewLevel:  courseware.ReviewLevel,
 
-			NextPublishState:   nextState.PublishState,
-			NextReviewLevel:    nextState.ReviewLevel,
-			NextReviewSchoolID: nextState.ReviewSchoolID,
+		NextPublishState:   nextState.PublishState,
+		NextReviewLevel:    nextState.ReviewLevel,
+		NextReviewSchoolID: nextState.ReviewSchoolID,
 
-			AIReviewSessionID: feedback.AIReviewSessionID,
-			ReviewItemIDs:     feedback.ReviewItemIDs,
+		AIReviewSessionID: feedback.AIReviewSessionID,
+		ReviewItemIDs:     feedback.ReviewItemIDs,
 
-			ResolvedReviewItemIDs: resolvedReviewItemIDs,
+		ResolvedReviewItemIDs: resolvedReviewItemIDs,
 
-			OverallRisk:         feedback.OverallRisk,
-			OverallSummary:      feedback.OverallSummary,
-			StrengthsJSON:       feedback.StrengthsJSON,
-			ObviousProblemsJSON: feedback.ObviousProblemsJSON,
-		}
+		OverallRisk:         feedback.OverallRisk,
+		OverallSummary:      feedback.OverallSummary,
+		StrengthsJSON:       feedback.StrengthsJSON,
+		ObviousProblemsJSON: feedback.ObviousProblemsJSON,
+	}
 
-	review, _, err :=
-		repository.CommitCoursewareReviewDecision(
-			ctx,
-			commitInput,
-		)
+	review, _, err := repository.CommitCoursewareReviewDecision(ctx, commitInput)
 	if err != nil {
-		return mapCWReviewCommitError(
-			err,
-			reviewLevel,
-		)
+		return nil, mapCWReviewCommitError(err, reviewLevel)
 	}
 
-	s.afterCWReviewDecisionCommitted(
-		ctx,
-		courseware,
-		actor.UserID,
-		review,
-		nextState.NeedL2,
-	)
+	deliveredItemCount := len(feedback.ReviewItemIDs)
+	if req.Decision != models.ReviewDecisionRevision {
+		deliveredItemCount = 0
+	}
 
-	return nil
+	s.afterCWReviewDecisionCommitted(ctx, courseware, actor.UserID, review, nextState.NeedL2)
+
+	return &CWReviewDecisionResult{DeliveredItemCount: deliveredItemCount}, nil
 }
 
 // isValidCWReviewDecision 校验正式审核请求与决策值。

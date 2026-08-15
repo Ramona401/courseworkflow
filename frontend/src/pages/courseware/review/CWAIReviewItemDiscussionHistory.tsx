@@ -1,18 +1,18 @@
 /**
  * CWAIReviewItemDiscussionHistory.tsx
  *
- * 单条问题的处理过程展示。
+ * 单条问题的讨论与人工执行记录。
  *
- * 根据当前使用场景显示不同称呼：
- *   - 审核员看到审核记录；
- *   - 自审作者看到调整记录；
- *   - 整改作者看到审核员留下的说明和整改记录。
+ * 本组件只展示父组件已经明确展开的历史内容，不自行发送消息或保存要求。
+ * 父组件负责默认折叠，避免讨论区抢占教师改进卡的主要任务。
  *
- * 本组件只展示已有内容，不发送消息、不保存整改要求。
+ * 作者正式整改的execution-note消息会显示为“本次执行补充”，
+ * 其他用户消息仍按当前场景显示教师/审核员称呼。
  */
 
-import type {
-  CWAIReviewItemDiscussion,
+import {
+  parseCWAIReviewJSON,
+  type CWAIReviewItemDiscussion,
 } from "@/api/coursewares";
 
 import DiscussionMarkdown from "@/pages/courseware/components/courseware-workshop/DiscussionMarkdown";
@@ -23,31 +23,32 @@ import {
 } from "./CWAIReviewItemPresentation.shared";
 
 export interface CWAIReviewItemDiscussionHistoryProps {
-  messages:
-    CWAIReviewItemDiscussion["messages"];
-
+  messages: CWAIReviewItemDiscussion["messages"];
   summary?: string | null;
-
-  copy:
-    CWAIReviewItemExperienceCopy;
+  copy: CWAIReviewItemExperienceCopy;
 }
 
-function formatTime(
-  raw: string | null,
-): string {
+function formatTime(raw: string | null): string {
   if (!raw) {
     return "";
   }
 
   try {
-    return new Date(
-      raw,
-    ).toLocaleString(
-      "zh-CN",
-    );
+    return new Date(raw).toLocaleString("zh-CN");
   } catch {
     return raw;
   }
+}
+
+function isExecutionNote(
+  metaJSON: string,
+): boolean {
+  const meta = parseCWAIReviewJSON<Record<string, unknown>>(
+    metaJSON,
+    {},
+  );
+
+  return meta.event === "owner_execution_note";
 }
 
 export default function CWAIReviewItemDiscussionHistory({
@@ -60,136 +61,107 @@ export default function CWAIReviewItemDiscussionHistory({
       {messages.length > 0 ? (
         <div
           style={{
-            maxHeight: "260px",
-            overflowY: "auto",
             display: "flex",
             flexDirection: "column",
             gap: "7px",
             marginBottom: "9px",
           }}
         >
-          {messages.map(
-            (message) => {
-              const assistant =
-                message.role ===
-                "assistant";
+          {messages.map((message) => {
+            const assistant = message.role === "assistant";
+            const system = message.role === "system";
+            const executionNote =
+              message.role === "user" &&
+              isExecutionNote(message.meta_json);
 
-              const system =
-                message.role ===
-                  "system";
-
-              return (
-                <div
-                  key={message.id}
-                  style={{
-                    alignSelf:
-                      assistant ||
-                      system
-                        ? "stretch"
-                        : "flex-end",
-                    maxWidth:
-                      assistant ||
-                      system
-                        ? "100%"
-                        : "88%",
-                    padding:
-                      "8px 9px",
-                    borderRadius:
-                      "8px",
-                    background:
-                      system
-                        ? "#FFFBEB"
+            return (
+              <div
+                key={message.id}
+                style={{
+                  alignSelf:
+                    assistant || system || executionNote
+                      ? "stretch"
+                      : "flex-end",
+                  maxWidth:
+                    assistant || system || executionNote
+                      ? "100%"
+                      : "88%",
+                  padding: "8px 9px",
+                  borderRadius: "8px",
+                  background: executionNote
+                    ? "#FFF7ED"
+                    : system
+                      ? "#FFFBEB"
+                      : assistant
+                        ? "#F8FAFC"
+                        : "#EEF2FF",
+                  border: `1px solid ${
+                    executionNote
+                      ? "#FED7AA"
+                      : system
+                        ? "#FDE68A"
                         : assistant
-                          ? "#F8FAFC"
-                          : "#EEF2FF",
-                    border:
-                      `1px solid ${
-                        system
-                          ? "#FDE68A"
-                          : assistant
-                            ? C.border
-                            : "#C7D2FE"
-                      }`,
+                          ? C.border
+                          : "#C7D2FE"
+                  }`,
+                }}
+              >
+                <div
+                  style={{
+                    marginBottom: "3px",
+                    color: executionNote
+                      ? C.warning
+                      : system
+                        ? C.warning
+                        : assistant
+                          ? C.primary
+                          : "#4338CA",
+                    fontSize: "10px",
+                    fontWeight: 700,
                   }}
                 >
-                  <div
-                    style={{
-                      marginBottom:
-                        "3px",
-                      color:
-                        system
-                          ? C.warning
-                          : assistant
-                            ? C.primary
-                            : "#4338CA",
-                      fontSize:
-                        "10px",
-                      fontWeight:
-                        700,
-                    }}
-                  >
-                    {system
-                      ? copy
-                          .discussionSystemLabel
+                  {executionNote
+                    ? "本次执行补充"
+                    : system
+                      ? copy.discussionSystemLabel
                       : assistant
-                        ? copy
-                            .discussionAssistantLabel
-                        : copy
-                            .discussionUserLabel}
+                        ? copy.discussionAssistantLabel
+                        : copy.discussionUserLabel}
+                </div>
+
+                {assistant ? (
+                  <div style={{ color: C.text }}>
+                    <DiscussionMarkdown
+                      content={message.content}
+                      compact
+                    />
                   </div>
-
-                  {assistant ? (
-                    <div
-                      style={{
-                        color: C.text,
-                      }}
-                    >
-                      <DiscussionMarkdown
-                        content={
-                          message.content
-                        }
-                        compact
-                      />
-                    </div>
-                  ) : (
-                    <div
-                      style={{
-                        color:
-                          system
-                            ? C.textSec
-                            : C.text,
-                        whiteSpace:
-                          "pre-wrap",
-                        fontSize:
-                          "11px",
-                        lineHeight:
-                          1.65,
-                        wordBreak:
-                          "break-word",
-                      }}
-                    >
-                      {message.content}
-                    </div>
-                  )}
-
+                ) : (
                   <div
                     style={{
-                      marginTop:
-                        "3px",
-                      color:
-                        C.textMuted,
-                      fontSize:
-                        "9px",
+                      color: system ? C.textSec : C.text,
+                      whiteSpace: "pre-wrap",
+                      fontSize: "11px",
+                      lineHeight: 1.65,
+                      wordBreak: "break-word",
                     }}
                   >
-                    {formatTime(
-                      message.created_at,
-                    )}
+                    {message.content}
                   </div>
+                )}
+
+                <div
+                  style={{
+                    marginTop: "3px",
+                    color: C.textMuted,
+                    fontSize: "9px",
+                  }}
+                >
+                  {formatTime(message.created_at)}
                 </div>
-              );
-            },
-          )}
+              </div>
+            );
+          })}
         </div>
       ) : (
         <div
@@ -222,16 +194,10 @@ export default function CWAIReviewItemDiscussionHistory({
               fontWeight: 700,
             }}
           >
-            {
-              copy
-                .discussionSummaryTitle
-            }
+            {copy.discussionSummaryTitle}
           </div>
 
-          <DiscussionMarkdown
-            content={summary}
-            compact
-          />
+          <DiscussionMarkdown content={summary} compact />
         </div>
       )}
     </>

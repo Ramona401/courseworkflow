@@ -1,7 +1,7 @@
 /**
  * coursewares.ai-review-governance.ts
  *
- * 课件AI审核全局讨论结论落地与问题列表治理API。
+ * 课件AI审核全局讨论结论落地、问题列表治理与R-07结构化影响方案API。
  *
  * 安全边界：
  *   1. 全局讨论人工新增问题必须绑定已经保存的可信assistant消息；
@@ -9,7 +9,8 @@
  *   3. 问题清单直接关系由用户明确选择类型、方向并填写说明；
  *   4. 关系确认、取消和AI建议忽略均为独立人工动作；
  *   5. 所有动作都不会自动确认候选指令、修改页面或提交审核决定；
- *   6. 取消关系和确认忽略必须填写可追溯原因。
+ *   6. 取消关系和确认忽略必须填写可追溯原因；
+ *   7. R-07最终Apply只提交version和selected_operation_ids，不回传Preview payload。
  */
 
 import apiClient from "./client";
@@ -18,6 +19,7 @@ import { extractData } from "./coursewares.types";
 import type {
   CWAIReviewGlobalDiscussion,
   CWAIReviewGlobalRelationType,
+  CWAIReviewImpactPlan,
   CWAIReviewItem,
   CWAIReviewItemDiscussion,
   CWAIReviewItemRelation,
@@ -223,6 +225,71 @@ export async function confirmCWAIReviewGlobalDismissal(
   );
 
   return extractData<CWAIReviewItemDiscussion>(
+    response,
+  );
+}
+
+/**
+ * R-07：从可信全局讨论assistant消息生成结构化影响方案Draft。
+ *
+ * 浏览器只提交message_id；AI正文、operation payload与preconditions均由后端重建和冻结。
+ */
+export async function createCWAIReviewImpactPlan(
+  sessionId: string,
+  messageId: string,
+): Promise<CWAIReviewImpactPlan> {
+  const response = await apiClient.post(
+    `/courseware-ai-reviews/${sessionId}/impact-plans`,
+    {
+      message_id: messageId,
+    },
+    {
+      timeout: 300000,
+    },
+  );
+
+  return extractData<CWAIReviewImpactPlan>(
+    response,
+  );
+}
+
+/**
+ * R-07：按URL中的plan_id读取已冻结的教师Preview。
+ */
+export async function getCWAIReviewImpactPlan(
+  sessionId: string,
+  planId: string,
+): Promise<CWAIReviewImpactPlan> {
+  const response = await apiClient.get(
+    `/courseware-ai-reviews/${sessionId}/impact-plans/${planId}`,
+  );
+
+  return extractData<CWAIReviewImpactPlan>(
+    response,
+  );
+}
+
+/**
+ * R-07：教师一次确认并原子应用明确勾选的operation。
+ *
+ * 最终正文固定只有version + selected_operation_ids。
+ * 不允许把Preview payload、AI正文、preconditions或身份字段回传。
+ */
+export async function applyCWAIReviewImpactPlan(
+  sessionId: string,
+  planId: string,
+  version: number,
+  selectedOperationIds: string[],
+): Promise<CWAIReviewImpactPlan> {
+  const response = await apiClient.post(
+    `/courseware-ai-reviews/${sessionId}/impact-plans/${planId}/apply`,
+    {
+      version,
+      selected_operation_ids: selectedOperationIds,
+    },
+  );
+
+  return extractData<CWAIReviewImpactPlan>(
     response,
   );
 }

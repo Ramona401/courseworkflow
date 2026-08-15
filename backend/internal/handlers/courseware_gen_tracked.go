@@ -6,7 +6,7 @@ package handlers
 // 同一课件不能同时执行封面预览、批量页面生成、全自动装配或3D页面生成。
 //
 // 快速部署断点续生：
-//   - GeneratePages在关停时调用CancelGenerate，停止继续派发未开始页面；
+//   - GeneratePages在关停时调用CancelGenerateVersioned，先冻结数据库写回再停止继续派发；
 //   - AutoAssemble在关停时调用CancelAutoAssemblyVersioned，先冻结数据库写回再停止继续派发；
 //   - 已发出的同步AI请求不等待完整返回；
 //   - 已成功落库页面保留；
@@ -173,7 +173,7 @@ func (h *CoursewareGenHandler) GeneratePagesTracked(
 		id,
 		services.BackgroundTaskCritical,
 		func() {
-			_ = h.genService.CancelGenerate(
+			_ = h.genService.CancelGenerateVersioned(
 				context.Background(),
 				id,
 				asyncActor,
@@ -191,7 +191,7 @@ func (h *CoursewareGenHandler) GeneratePagesTracked(
 		id,
 		800*time.Millisecond,
 		func() error {
-			return h.genService.GenerateRemainingPages(
+			return h.genService.GenerateRemainingPagesVersioned(
 				context.Background(),
 				id,
 				asyncActor,
@@ -244,7 +244,8 @@ func (h *CoursewareGenHandler) AutoAssembleTracked(
 	}
 
 	var request struct {
-		SkipVideo bool `json:"skip_video"`
+		SkipVideo          bool `json:"skip_video"`
+		RepairFailedImages bool `json:"repair_failed_images"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(
@@ -267,6 +268,32 @@ func (h *CoursewareGenHandler) AutoAssembleTracked(
 			err,
 		)
 		return
+	}
+
+	repairFailedImages := request.RepairFailedImages
+	if repairFailedImages {
+		repairState, repairErr :=
+			services.ReadCoursewareImageRepairState(
+				r.Context(),
+				id,
+				scopedActor,
+			)
+		if repairErr != nil {
+			writeCoursewareOwnerRuntimeError(
+				w,
+				repairErr,
+			)
+			return
+		}
+		if repairState == nil ||
+			repairState.RetryableCount == 0 {
+			utils.Fail(
+				w,
+				http.StatusConflict,
+				"当前没有可智能修复的失败配图，请先同步后台状态",
+			)
+			return
+		}
 	}
 
 	asyncActor :=
@@ -327,9 +354,17 @@ func (h *CoursewareGenHandler) AutoAssembleTracked(
 				launchToken,
 			)
 
+			runCtx := context.Background()
+			if repairFailedImages {
+				runCtx =
+					services.WithCoursewareImageRepairMode(
+						runCtx,
+					)
+			}
+
 			return h.autoAssemblyService.
 				AutoAssembleVersionedWithLaunch(
-					context.Background(),
+					runCtx,
 					id,
 					asyncActor,
 					skipVideo,
@@ -338,12 +373,18 @@ func (h *CoursewareGenHandler) AutoAssembleTracked(
 		},
 	)
 
+	message := "全自动装配或断点续装已启动，请通过SSE监听进度"
+	if repairFailedImages {
+		message = "失败配图智能补配已启动；只处理服务端确认的失败图片槽位"
+	}
+
 	utils.Success(
 		w,
 		map[string]interface{}{
-			"message":       "全自动装配或断点续装已启动，请通过SSE监听进度",
-			"courseware_id": id,
-			"skip_video":    skipVideo,
+			"message":              message,
+			"courseware_id":        id,
+			"skip_video":           skipVideo,
+			"repair_failed_images": repairFailedImages,
 		},
 	)
 }

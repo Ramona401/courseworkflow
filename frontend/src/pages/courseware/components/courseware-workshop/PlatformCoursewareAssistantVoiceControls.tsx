@@ -2,15 +2,14 @@
  * PlatformCoursewareAssistantVoiceControls.tsx
  *
  * 老师端课堂语音控制：
- *   - 复用全平台 useVoiceInput 完成教师JWT语音识别；
- *   - partial文字实时写入备用输入框；
- *   - final文字直接提交教学智能体；
- *   - 开始录音前停止豆包或设备朗读，避免声音回灌；
- *   - 默认使用豆包自然音色，失败时自动降级设备语音；
- *   - 提供自动朗读、暂停、继续、停止和内存重播操作。
+ * - 复用全平台 useVoiceInput 完成教师JWT语音识别；
+ * - partial文字实时写入备用输入框，final文字直接提交教学智能体；
+ * - 开始录音前停止豆包或设备朗读，避免声音回灌；
+ * - minimal模式只显示一个麦克风状态按钮，供全屏/放映的极简课堂界面使用；
+ * - 完整模式继续提供自动朗读、暂停、继续、停止和内存重播操作。
  */
 
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 
 import {
   LoaderCircle,
@@ -31,6 +30,7 @@ import type { AssistantSpeechProvider } from '@/hooks/useAssistantSpeechPlayback
 interface PlatformCoursewareAssistantVoiceControlsProps {
   disabled: boolean
   classroomMode: boolean
+  minimal?: boolean
   autoSpeak: boolean
   speechSupported: boolean
   speechPreparing: boolean
@@ -59,9 +59,63 @@ function formatDuration(seconds: number): string {
   return `${minutes}:${remainder}`
 }
 
+function VoiceWaveform({
+  heardSpeech,
+  classroomMode,
+  minimal,
+}: {
+  heardSpeech: boolean
+  classroomMode: boolean
+  minimal: boolean
+}) {
+  const bars = [0.5, 0.72, 0.92, 0.64, 1, 0.68, 0.88, 0.7, 0.48]
+  const maximumHeight = minimal
+    ? classroomMode ? 34 : 28
+    : classroomMode ? 28 : 22
+  const barWidth = minimal
+    ? classroomMode ? 5 : 4
+    : classroomMode ? 4 : 3
+
+  return (
+    <span
+      aria-hidden="true"
+      style={{
+        height: maximumHeight,
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: minimal ? 3 : 2.5,
+        flex: '0 0 auto',
+      }}
+    >
+      {bars.map((ratio, index) => (
+        <span
+          key={`${ratio}-${index}`}
+          style={{
+            width: barWidth,
+            height: heardSpeech
+              ? Math.max(7, Math.round(maximumHeight * ratio))
+              : Math.max(4, Math.round(maximumHeight * 0.16)),
+            borderRadius: 999,
+            background: 'currentColor',
+            opacity: heardSpeech ? 1 : 0.5,
+            transformOrigin: 'center',
+            transition: 'height 120ms ease, opacity 120ms ease',
+            animation: heardSpeech
+              ? `tednaAssistantWaveBar ${520 + index * 35}ms ease-in-out infinite alternate`
+              : 'none',
+            animationDelay: `-${index * 55}ms`,
+          }}
+        />
+      ))}
+    </span>
+  )
+}
+
 export default function PlatformCoursewareAssistantVoiceControls({
   disabled,
   classroomMode,
+  minimal = false,
   autoSpeak,
   speechSupported,
   speechPreparing,
@@ -81,13 +135,23 @@ export default function PlatformCoursewareAssistantVoiceControls({
   onReplaySpeech,
   onVoiceStatusChange,
 }: PlatformCoursewareAssistantVoiceControlsProps) {
+  const [heardSpeech, setHeardSpeech] = useState(false)
+
   const voice = useVoiceInput({
     disabled,
     maxDurationSeconds: 60,
     onPartial: text => {
+      if (text.trim()) {
+        setHeardSpeech(true)
+      }
+
       onInputChange(text)
     },
     onFinal: text => {
+      if (text.trim()) {
+        setHeardSpeech(true)
+      }
+
       onInputChange(text)
 
       if (onSubmitVoice(text)) {
@@ -102,6 +166,12 @@ export default function PlatformCoursewareAssistantVoiceControls({
     onVoiceStatusChange,
     voice.status,
   ])
+
+  useEffect(() => {
+    if (voice.status !== 'recording') {
+      setHeardSpeech(false)
+    }
+  }, [voice.status])
 
   useEffect(() => {
     return () => {
@@ -143,7 +213,9 @@ export default function PlatformCoursewareAssistantVoiceControls({
     }
 
     if (recording) {
-      return `正在听 ${formatDuration(voice.elapsedSeconds)}，点击结束并发送`
+      return heardSpeech
+        ? `已听到声音 ${formatDuration(voice.elapsedSeconds)} · 点击结束并发送`
+        : `正在听… ${formatDuration(voice.elapsedSeconds)} · 请直接说话`
     }
 
     if (connecting) {
@@ -159,24 +231,206 @@ export default function PlatformCoursewareAssistantVoiceControls({
 
   const voiceIcon = (() => {
     if (recording) {
-      return <Square size={classroomMode ? 22 : 18} fill="currentColor" />
+      return (
+        <VoiceWaveform
+          heardSpeech={heardSpeech}
+          classroomMode={classroomMode}
+          minimal={minimal}
+        />
+      )
     }
 
     if (connecting) {
-      return <X size={classroomMode ? 23 : 19} />
+      return (
+        <X
+          size={minimal
+            ? classroomMode ? 34 : 29
+            : classroomMode ? 23 : 19}
+        />
+      )
     }
 
     if (stopping) {
       return (
         <LoaderCircle
-          size={classroomMode ? 24 : 20}
+          size={minimal
+            ? classroomMode ? 34 : 29
+            : classroomMode ? 24 : 20}
           style={{ animation: 'tednaAssistantVoiceSpin 900ms linear infinite' }}
         />
       )
     }
 
-    return <Mic size={classroomMode ? 27 : 22} />
+    return (
+      <Mic
+        size={minimal
+          ? classroomMode ? 38 : 32
+          : classroomMode ? 27 : 22}
+      />
+    )
   })()
+
+  if (minimal) {
+    const compactError = voice.error || speechError
+    const buttonSize = classroomMode ? 88 : 74
+    const listeningWidth = classroomMode ? 238 : 204
+
+    return (
+      <div
+        role="group"
+        aria-label="教学智能体课堂麦克风"
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: 7,
+        }}
+      >
+        <button
+          type="button"
+          onClick={handleVoiceClick}
+          disabled={voiceUnavailable || stopping}
+          aria-label={voiceLabel}
+          title={voiceLabel}
+          style={{
+            width: recording ? listeningWidth : buttonSize,
+            height: recording
+              ? classroomMode ? 76 : 64
+              : buttonSize,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: recording
+              ? classroomMode ? '10px 18px' : '8px 14px'
+              : 0,
+            borderRadius: recording
+              ? classroomMode ? 24 : 20
+              : '50%',
+            border: recording
+              ? `2px solid ${heardSpeech
+                  ? 'rgba(167,243,208,0.92)'
+                  : 'rgba(199,210,254,0.92)'}`
+              : '2px solid rgba(255,255,255,0.82)',
+            background: recording
+              ? heardSpeech
+                ? 'linear-gradient(135deg, #0F766E, #0D9488)'
+                : 'linear-gradient(135deg, #4338CA, #4F46E5)'
+              : connecting || stopping
+                ? 'rgba(238,242,255,0.97)'
+                : '#4F7BE8',
+            color: recording
+              ? '#FFFFFF'
+              : connecting || stopping
+                ? '#4F46E5'
+                : '#FFFFFF',
+            boxShadow: recording
+              ? heardSpeech
+                ? '0 0 0 8px rgba(13,148,136,0.12), 0 16px 38px rgba(15,118,110,0.26)'
+                : '0 0 0 8px rgba(79,70,229,0.10), 0 16px 38px rgba(49,46,129,0.24)'
+              : '0 0 0 7px rgba(79,123,232,0.12), 0 16px 38px rgba(30,64,175,0.28)',
+            cursor: voiceUnavailable || stopping ? 'not-allowed' : 'pointer',
+            opacity: voiceUnavailable ? 0.5 : 1,
+            transition: 'all 180ms ease',
+          }}
+        >
+          {recording ? (
+            <span
+              style={{
+                width: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: classroomMode ? 13 : 10,
+              }}
+            >
+              {voiceIcon}
+
+              <span
+                style={{
+                  minWidth: 0,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'flex-start',
+                  lineHeight: 1.2,
+                }}
+              >
+                <strong
+                  style={{
+                    fontSize: classroomMode ? 15 : 12,
+                    fontWeight: 900,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {heardSpeech ? '已听到声音' : '正在听…'}
+                </strong>
+
+                <span
+                  style={{
+                    marginTop: 4,
+                    color: 'rgba(255,255,255,0.82)',
+                    fontSize: classroomMode ? 11.5 : 9.5,
+                    fontWeight: 700,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {formatDuration(voice.elapsedSeconds)} · 点击结束并发送
+                </span>
+              </span>
+            </span>
+          ) : (
+            voiceIcon
+          )}
+        </button>
+
+        {recording && (
+          <div
+            aria-live="polite"
+            style={{
+              color: heardSpeech ? '#0F766E' : '#4338CA',
+              fontSize: classroomMode ? 12 : 10,
+              fontWeight: 800,
+              textShadow: '0 1px 8px rgba(255,255,255,0.95)',
+            }}
+          >
+            {heardSpeech
+              ? '声音已进入识别，智能体正在听'
+              : '请直接说话，听到后声波会亮起'}
+          </div>
+        )}
+
+        {compactError && (
+          <div
+            aria-live="polite"
+            style={{
+              maxWidth: classroomMode ? 300 : 250,
+              padding: '6px 9px',
+              borderRadius: 9,
+              background: 'rgba(254,242,242,0.96)',
+              color: '#B91C1C',
+              boxShadow: '0 6px 18px rgba(15,23,42,0.10)',
+              fontSize: classroomMode ? 12 : 10,
+              lineHeight: 1.45,
+              textAlign: 'center',
+            }}
+          >
+            {compactError}
+          </div>
+        )}
+
+        <style>{`
+          @keyframes tednaAssistantVoiceSpin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+          }
+
+          @keyframes tednaAssistantWaveBar {
+            0% { transform: scaleY(0.42); }
+            100% { transform: scaleY(1); }
+          }
+        `}</style>
+      </div>
+    )
+  }
 
   const secondaryButtonStyle: React.CSSProperties = {
     minHeight: classroomMode ? 44 : 34,
@@ -249,10 +503,14 @@ export default function PlatformCoursewareAssistantVoiceControls({
           padding: classroomMode ? '12px 18px' : '9px 14px',
           borderRadius: classroomMode ? 16 : 12,
           border: recording
-            ? '1px solid #DC2626'
+            ? heardSpeech
+              ? '1px solid #0D9488'
+              : '1px solid #6366F1'
             : '1px solid rgba(79,123,232,0.38)',
           background: recording
-            ? '#EF4444'
+            ? heardSpeech
+              ? 'linear-gradient(135deg, #0F766E, #0D9488)'
+              : 'linear-gradient(135deg, #4338CA, #4F46E5)'
             : connecting || stopping
               ? '#EEF2FF'
               : '#4F7BE8',
@@ -262,7 +520,9 @@ export default function PlatformCoursewareAssistantVoiceControls({
               ? '#4F46E5'
               : '#FFFFFF',
           boxShadow: recording
-            ? '0 8px 24px rgba(239,68,68,0.28)'
+            ? heardSpeech
+              ? '0 8px 24px rgba(13,148,136,0.28)'
+              : '0 8px 24px rgba(79,70,229,0.24)'
             : '0 8px 24px rgba(79,123,232,0.22)',
           fontSize: classroomMode ? 18 : 13,
           fontWeight: 850,
@@ -434,8 +694,12 @@ export default function PlatformCoursewareAssistantVoiceControls({
           from { transform: rotate(0deg); }
           to { transform: rotate(360deg); }
         }
+
+        @keyframes tednaAssistantWaveBar {
+          0% { transform: scaleY(0.42); }
+          100% { transform: scaleY(1); }
+        }
       `}</style>
     </div>
   )
 }
-

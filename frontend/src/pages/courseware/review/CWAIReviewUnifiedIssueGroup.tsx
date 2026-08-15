@@ -4,10 +4,15 @@
  * 统一问题工作台中的整课或单页问题分组。
  *
  * 页面分组默认折叠，只有当前任务所在分组主动展开。分组标题整行可点击，
- * 并集中展示问题数量、未完成数量、待确认数量和页面变化数量。
+ * 并集中展示问题数量、未完成数量、待确认数量和需要重新检查数量。
  *
  * “选择一起分析”只决定哪些问题需要放在一起比较或讨论；
- * 问题卡片中的“本次退回给作者”才决定最终会发给作者哪些内容。
+ * 教师改进卡中的正式审核主要操作才决定本次退回作者的内容。
+ *
+ * R-01.1去重：
+ *   - 分组层不再提供“处理这条”，避免与卡片唯一主要操作竞争；
+ *   - 分组层不再提供“打开页面”，页面定位由单条卡片的辅助入口负责；
+ *   - 协作选择继续保留，因为它只服务多问题分析，不等于正式退回选择。
  */
 
 import type {
@@ -20,14 +25,9 @@ import CWAIReviewItemPanel from "./CWAIReviewItemPanel";
 
 const C = {
   primary: "#4F7BE8",
-  primarySoft: "#EEF2FF",
   warning: "#D97706",
-  danger: "#DC2626",
-  success: "#059669",
   purple: "#7C3AED",
-  purpleSoft: "#F5F3FF",
   text: "#1F2937",
-  textSec: "#64748B",
   textMuted: "#94A3B8",
   border: "#E2E8F0",
   card: "#FFFFFF",
@@ -51,7 +51,15 @@ export interface CWAIReviewUnifiedIssueGroupProps {
   deliverySelectedItemIDSet: ReadonlySet<string>;
 
   onToggleExpanded: () => void;
+
+  /**
+   * 继续保留兼容属性。
+   *
+   * 聚焦工作区仍由列表工具栏、深链接和键盘导航使用，
+   * 分组内不再额外渲染“处理这条”按钮。
+   */
   onOpenItem: (itemID: string) => void;
+
   onToggleWorkSelection: (itemID: string, selected: boolean) => void;
   onToggleDeliverySelection: (itemID: string, selected: boolean) => void;
   onItemChanged: (item: CWAIReviewItem) => void;
@@ -73,14 +81,15 @@ export default function CWAIReviewUnifiedIssueGroup({
   workSelectedItemIDSet,
   deliverySelectedItemIDSet,
   onToggleExpanded,
-  onOpenItem,
   onToggleWorkSelection,
   onToggleDeliverySelection,
   onItemChanged,
   onSelectPage,
   onInjectToRefine,
 }: CWAIReviewUnifiedIssueGroupProps) {
-  const groupItemIDSet = new Set(group.items.map((item) => item.id));
+  const groupItemIDSet = new Set(
+    group.items.map((item) => item.id),
+  );
 
   const groupRelations = activeRelations.filter(
     (relation) =>
@@ -88,18 +97,29 @@ export default function CWAIReviewUnifiedIssueGroup({
       groupItemIDSet.has(relation.target_item_id),
   );
 
-  const togetherSelectedCount = group.items.filter((item) =>
-    workSelectedItemIDSet.has(item.id),
+  const togetherSelectedCount = group.items.filter(
+    (item) => workSelectedItemIDSet.has(item.id),
   ).length;
 
-  const deliverySelectedCount = group.items.filter((item) =>
-    deliverySelectedItemIDSet.has(item.id),
+  const deliverySelectedCount = group.items.filter(
+    (item) => deliverySelectedItemIDSet.has(item.id),
   ).length;
 
-  const pendingCount = group.items.filter((item) => !isCompletedItem(item)).length;
-  const waitingConfirmCount = group.items.filter((item) => item.status === "applied").length;
-  const staleCount = group.items.filter((item) => item.status === "stale").length;
-  const completedCount = group.items.filter(isCompletedItem).length;
+  const pendingCount = group.items.filter(
+    (item) => !isCompletedItem(item),
+  ).length;
+
+  const waitingConfirmCount = group.items.filter(
+    (item) => item.status === "applied",
+  ).length;
+
+  const staleCount = group.items.filter(
+    (item) => item.status === "stale",
+  ).length;
+
+  const completedCount = group.items.filter(
+    isCompletedItem,
+  ).length;
 
   return (
     <section
@@ -117,7 +137,10 @@ export default function CWAIReviewUnifiedIssueGroup({
           alignItems: "stretch",
           gap: "8px",
           padding: "10px 12px",
-          background: pendingCount > 0 ? "#FFFFFF" : "#F8FAFC",
+          background:
+            pendingCount > 0
+              ? "#FFFFFF"
+              : "#F8FAFC",
         }}
       >
         <button
@@ -142,9 +165,14 @@ export default function CWAIReviewUnifiedIssueGroup({
             aria-hidden="true"
             style={{
               flexShrink: 0,
-              color: group.pageNumber > 0 ? C.primary : C.purple,
+              color:
+                group.pageNumber > 0
+                  ? C.primary
+                  : C.purple,
               fontSize: "16px",
-              transform: expanded ? "rotate(90deg)" : "rotate(0deg)",
+              transform: expanded
+                ? "rotate(90deg)"
+                : "rotate(0deg)",
               transition: "transform 160ms ease",
             }}
           >
@@ -164,7 +192,10 @@ export default function CWAIReviewUnifiedIssueGroup({
                 whiteSpace: "nowrap",
               }}
             >
-              {group.pageNumber > 0 ? `P${group.pageNumber} ` : "整课 "}
+              {group.pageNumber > 0
+                ? `P${group.pageNumber} `
+                : "整课 "}
+
               {group.pageTitle ||
                 (group.pageNumber > 0
                   ? `第${group.pageNumber}页`
@@ -181,34 +212,21 @@ export default function CWAIReviewUnifiedIssueGroup({
               }}
             >
               {group.items.length} 条问题
-              {pendingCount > 0 ? ` · ${pendingCount} 条未完成` : ""}
-              {waitingConfirmCount > 0 ? ` · ${waitingConfirmCount} 条待确认` : ""}
-              {staleCount > 0 ? ` · ${staleCount} 条页面变化` : ""}
-              {completedCount > 0 ? ` · ${completedCount} 条已完成` : ""}
+              {pendingCount > 0
+                ? ` · ${pendingCount} 条未完成`
+                : ""}
+              {waitingConfirmCount > 0
+                ? ` · ${waitingConfirmCount} 条待确认`
+                : ""}
+              {staleCount > 0
+                ? ` · ${staleCount} 条需要重新检查`
+                : ""}
+              {completedCount > 0
+                ? ` · ${completedCount} 条已完成`
+                : ""}
             </span>
           </span>
         </button>
-
-        {group.pageNumber > 0 && (
-          <button
-            type="button"
-            onClick={() => onSelectPage(group.pageNumber)}
-            style={{
-              flexShrink: 0,
-              minHeight: "36px",
-              padding: "8px 10px",
-              borderRadius: "8px",
-              border: `1px solid ${C.primary}`,
-              background: C.primarySoft,
-              color: C.primary,
-              fontSize: "12px",
-              fontWeight: 700,
-              cursor: "pointer",
-            }}
-          >
-            打开页面
-          </button>
-        )}
       </div>
 
       {(groupRelations.length > 0 ||
@@ -226,7 +244,9 @@ export default function CWAIReviewUnifiedIssueGroup({
           }}
         >
           {groupRelations.length > 0 && (
-            <span style={{ color: C.purple }}>关联 {groupRelations.length}</span>
+            <span style={{ color: C.purple }}>
+              关联 {groupRelations.length}
+            </span>
           )}
 
           {togetherSelectedCount > 0 && (
@@ -236,7 +256,9 @@ export default function CWAIReviewUnifiedIssueGroup({
           )}
 
           {!isSelfReview && deliverySelectedCount > 0 && (
-            <span style={{ color: C.warning }}>本次退回 {deliverySelectedCount}</span>
+            <span style={{ color: C.warning }}>
+              本次退回 {deliverySelectedCount}
+            </span>
           )}
         </div>
       )}
@@ -249,8 +271,11 @@ export default function CWAIReviewUnifiedIssueGroup({
           }}
         >
           {visibleItems.map((item) => {
-            const canAnalyzeTogether = isCWGlobalDiscussionActionableItem(item);
-            const selectedTogether = workSelectedItemIDSet.has(item.id);
+            const canAnalyzeTogether =
+              isCWGlobalDiscussionActionableItem(item);
+
+            const selectedTogether =
+              workSelectedItemIDSet.has(item.id);
 
             return (
               <div
@@ -262,7 +287,9 @@ export default function CWAIReviewUnifiedIssueGroup({
                   border: selectedTogether
                     ? "1px solid #93C5FD"
                     : "1px solid transparent",
-                  background: selectedTogether ? "#F8FAFF" : "transparent",
+                  background: selectedTogether
+                    ? "#F8FAFF"
+                    : "transparent",
                 }}
               >
                 <div
@@ -276,27 +303,14 @@ export default function CWAIReviewUnifiedIssueGroup({
                 >
                   <button
                     type="button"
-                    onClick={() => onOpenItem(item.id)}
-                    style={{
-                      minHeight: "32px",
-                      padding: "6px 10px",
-                      borderRadius: "8px",
-                      border: `1px solid ${C.primary}`,
-                      background: C.primary,
-                      color: "#FFFFFF",
-                      fontSize: "12px",
-                      fontWeight: 700,
-                      cursor: "pointer",
-                    }}
-                  >
-                    处理这条
-                  </button>
-
-                  <button
-                    type="button"
                     aria-pressed={selectedTogether}
                     disabled={!canAnalyzeTogether}
-                    onClick={() => onToggleWorkSelection(item.id, !selectedTogether)}
+                    onClick={() =>
+                      onToggleWorkSelection(
+                        item.id,
+                        !selectedTogether,
+                      )
+                    }
                     title={
                       canAnalyzeTogether
                         ? "选择这条问题，与其他问题放在一起比较或讨论"
@@ -309,7 +323,9 @@ export default function CWAIReviewUnifiedIssueGroup({
                       border: selectedTogether
                         ? "1px solid #60A5FA"
                         : "1px solid #CBD5E1",
-                      background: selectedTogether ? "#DBEAFE" : "#FFFFFF",
+                      background: selectedTogether
+                        ? "#DBEAFE"
+                        : "#FFFFFF",
                       color: selectedTogether
                         ? "#1D4ED8"
                         : canAnalyzeTogether
@@ -317,11 +333,17 @@ export default function CWAIReviewUnifiedIssueGroup({
                           : C.textMuted,
                       fontSize: "12px",
                       fontWeight: 700,
-                      cursor: canAnalyzeTogether ? "pointer" : "not-allowed",
-                      opacity: canAnalyzeTogether ? 1 : 0.6,
+                      cursor: canAnalyzeTogether
+                        ? "pointer"
+                        : "not-allowed",
+                      opacity: canAnalyzeTogether
+                        ? 1
+                        : 0.6,
                     }}
                   >
-                    {selectedTogether ? "✓ 已选一起分析" : "选择一起分析"}
+                    {selectedTogether
+                      ? "✓ 已选一起分析"
+                      : "选择一起分析"}
                   </button>
 
                   <span
@@ -331,7 +353,7 @@ export default function CWAIReviewUnifiedIssueGroup({
                       lineHeight: 1.5,
                     }}
                   >
-                    不会改变本次退回内容
+                    只用于多问题比较，不会改变本次退回内容
                   </span>
                 </div>
 

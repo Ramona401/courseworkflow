@@ -29,6 +29,10 @@ import type {
   CoursewareAssistantDeploymentView,
 } from '@/api/coursewares'
 
+import {
+  subscribeCoursewareAssistantDeploymentRefresh,
+} from './coursewareAssistantDeploymentSync'
+
 export interface CoursewareAssistantPreviewNotice {
   kind: 'info' | 'success' | 'error'
   text: string
@@ -177,6 +181,24 @@ export function useCoursewareAssistantPreview({
       }
     }
   }, [coursewareId, pageId, resourceKey])
+
+  useEffect(() => {
+    return subscribeCoursewareAssistantDeploymentRefresh(
+      coursewareId,
+      pageId,
+      () => {
+        // 部署策略或状态变化后，旧会话可能已经与实时策略不一致。
+        // 先安全结束本地会话，再重新读取部署，避免继续展示旧valid_until/轮次/状态。
+        clearSession()
+        void loadDeployments()
+      },
+    )
+  }, [
+    clearSession,
+    coursewareId,
+    loadDeployments,
+    pageId,
+  ])
 
   useEffect(() => {
     clearSession()

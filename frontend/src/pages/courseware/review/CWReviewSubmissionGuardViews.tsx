@@ -1,19 +1,18 @@
 /**
- * CWReviewSubmissionGuards.tsx
+ * CWReviewSubmissionGuardViews.tsx
  *
- * 课件正式审核和作者重新提交的前端就绪提示。
+ * 正式审核复审守卫发布器与作者重新提交前的就绪提示。
  *
  * 边界：
  *   - 后端仍是审核状态和提交权限的最终安全边界；
- *   - 本文件只根据已加载的历史整改项生成前端提示和按钮禁用状态；
+ *   - 本文件只根据已加载的整改项生成提示和阻断快照；
  *   - 不修改问题状态，不构造审核请求体，不调用提交接口；
- *   - 正式审核工作台使用共享快照，避免继续扩张超过900行的主编排组件。
+ *   - 页面内容已变化与原页面已不存在统一提示为“需重新检查”。
  */
 
 import {
   useEffect,
   useMemo,
-  useSyncExternalStore,
   type CSSProperties,
 } from "react";
 
@@ -22,8 +21,17 @@ import type {
   CWReviewCarryoverItem,
 } from "@/api/coursewares";
 
-const OPEN_CARRYOVER_EVENT =
-  "tedna:cw-review-open-carryover";
+import {
+  resolveCWAIReviewPageChangeTeacherCopy,
+} from "./CWAIReviewItemPresentation.shared";
+
+import {
+  CW_REVIEW_OPEN_CARRYOVER_EVENT,
+  EMPTY_CW_REVIEW_APPROVAL_GUARD,
+  publishCWReviewApprovalGuard,
+  resetCWReviewApprovalGuard,
+  type CWReviewApprovalGuardSnapshot,
+} from "./CWReviewSubmissionGuardState";
 
 const C = {
   success: "#059669",
@@ -33,60 +41,7 @@ const C = {
   text: "#1F2937",
   textSec: "#64748B",
   textMuted: "#94A3B8",
-  border: "#E2E8F0",
 };
-
-export interface CWReviewApprovalGuardSnapshot {
-  totalCount: number;
-  resolvedCount: number;
-  blockedCount: number;
-  notReadyCount: number;
-  waitingReviewCount: number;
-  changedPageCount: number;
-}
-
-const EMPTY_APPROVAL_GUARD:
-  CWReviewApprovalGuardSnapshot = {
-  totalCount: 0,
-  resolvedCount: 0,
-  blockedCount: 0,
-  notReadyCount: 0,
-  waitingReviewCount: 0,
-  changedPageCount: 0,
-};
-
-let currentApprovalGuard =
-  EMPTY_APPROVAL_GUARD;
-
-const approvalGuardListeners =
-  new Set<() => void>();
-
-function subscribeApprovalGuard(
-  listener: () => void,
-): () => void {
-  approvalGuardListeners.add(
-    listener,
-  );
-
-  return () => {
-    approvalGuardListeners.delete(
-      listener,
-    );
-  };
-}
-
-function publishApprovalGuard(
-  snapshot:
-    CWReviewApprovalGuardSnapshot,
-): void {
-  currentApprovalGuard =
-    snapshot;
-
-  for (const listener of
-    approvalGuardListeners) {
-    listener();
-  }
-}
 
 function buildApprovalGuard(
   items: CWReviewCarryoverItem[],
@@ -111,9 +66,7 @@ function buildApprovalGuard(
 
     if (resolved) {
       resolvedCount += 1;
-    } else if (
-      item.status === "applied"
-    ) {
+    } else if (item.status === "applied") {
       waitingReviewCount += 1;
     } else {
       notReadyCount += 1;
@@ -131,32 +84,19 @@ function buildApprovalGuard(
     totalCount: items.length,
     resolvedCount,
     blockedCount:
-      items.length -
-      resolvedCount,
+      items.length - resolvedCount,
     notReadyCount,
     waitingReviewCount,
     changedPageCount,
   };
 }
 
-export function useCWReviewApprovalGuard():
-  CWReviewApprovalGuardSnapshot {
-  return useSyncExternalStore(
-    subscribeApprovalGuard,
-    () => currentApprovalGuard,
-    () => EMPTY_APPROVAL_GUARD,
-  );
-}
-
-export function requestCWReviewCarryoverFocus():
-  void {
-  window.dispatchEvent(
-    new CustomEvent(
-      OPEN_CARRYOVER_EVENT,
-    ),
-  );
-}
-
+/**
+ * 向审核决定面板发布当前上轮问题复审状态。
+ *
+ * 同一工作台只应存在一个Publisher。
+ * 卸载时必须清空快照，避免旧课件阻断状态残留。
+ */
 export function CWReviewDecisionGuardPublisher({
   items,
   resolvedItemIds,
@@ -180,16 +120,14 @@ export function CWReviewDecisionGuardPublisher({
     );
 
   useEffect(() => {
-    publishApprovalGuard(
+    publishCWReviewApprovalGuard(
       snapshot,
     );
   }, [snapshot]);
 
   useEffect(
     () => () => {
-      publishApprovalGuard(
-        EMPTY_APPROVAL_GUARD,
-      );
+      resetCWReviewApprovalGuard();
     },
     [],
   );
@@ -203,13 +141,13 @@ export function CWReviewDecisionGuardPublisher({
       };
 
     window.addEventListener(
-      OPEN_CARRYOVER_EVENT,
+      CW_REVIEW_OPEN_CARRYOVER_EVENT,
       handleOpenCarryover,
     );
 
     return () => {
       window.removeEventListener(
-        OPEN_CARRYOVER_EVENT,
+        CW_REVIEW_OPEN_CARRYOVER_EVENT,
         handleOpenCarryover,
       );
     };
@@ -234,30 +172,50 @@ function isFormalSubmissionReady(
 function statusLabel(
   item: CWAIReviewItem,
 ): string {
+  const pageChangeCopy =
+    resolveCWAIReviewPageChangeTeacherCopy(
+      item.status,
+    );
+
+  if (pageChangeCopy) {
+    return (
+      `${pageChangeCopy.label}，` +
+      "需要人工重新检查"
+    );
+  }
+
   switch (item.status) {
     case "detected":
       return "尚未形成修改要求";
+
     case "discussing":
       return "修改要求仍在讨论";
+
     case "confirmed":
       return "尚未完成页面修改";
+
     case "applying":
       return "页面修改进行中";
-    case "stale":
-      return "页面修改后又发生变化";
-    case "orphaned":
-      return "原问题页面已删除";
+
     case "applied":
       return "已完成并等待复审";
+
     case "resolved":
       return "已确认解决";
+
     case "dismissed":
       return "已记录暂不处理";
+
     default:
       return "等待继续处理";
   }
 }
 
+/**
+ * 作者正式整改重新提交前的就绪说明。
+ *
+ * 只统计正式审核整改项，自审项不参与正式提交阻断。
+ */
 export function CWOwnerReviewSubmissionReadiness({
   items,
   onSelectPage,
@@ -272,8 +230,7 @@ export function CWOwnerReviewSubmissionReadiness({
       () =>
         items.filter(
           (item) =>
-            item.source_type ===
-            "formal",
+            item.source_type === "formal",
         ),
       [items],
     );
@@ -285,9 +242,7 @@ export function CWOwnerReviewSubmissionReadiness({
   const blockingItems =
     formalItems.filter(
       (item) =>
-        !isFormalSubmissionReady(
-          item,
-        ),
+        !isFormalSubmissionReady(item),
     );
 
   const readyCount =
@@ -354,14 +309,10 @@ export function CWOwnerReviewSubmissionReadiness({
           lineHeight: 1.65,
         }}
       >
-        正式整改共
-        {" "}
-        {formalItems.length}
-        {" "}
-        条，已有
-        {" "}
-        {readyCount}
-        {" "}
+        正式整改共{" "}
+        {formalItems.length}{" "}
+        条，已有{" "}
+        {readyCount}{" "}
         条达到可重新提交状态。
         自审项不会计入正式提交阻断。
       </div>
@@ -378,9 +329,7 @@ export function CWOwnerReviewSubmissionReadiness({
           >
             <Metric
               label="未完成"
-              value={
-                blockingItems.length
-              }
+              value={blockingItems.length}
               tone="danger"
             />
 
@@ -391,13 +340,20 @@ export function CWOwnerReviewSubmissionReadiness({
             />
 
             <Metric
-              label="页面变化"
-              value={
-                changedPageCount
-              }
+              label="需重新检查"
+              value={changedPageCount}
               tone="danger"
             />
           </div>
+
+          {changedPageCount > 0 && (
+            <div style={pageChangeNoticeStyle}>
+              其中有{" "}
+              {changedPageCount}{" "}
+              条因为页面内容已变化或原页面已不存在，
+              需要人工重新检查当前课件后才能继续提交。
+            </div>
+          )}
 
           <div
             style={{
@@ -418,55 +374,61 @@ export function CWOwnerReviewSubmissionReadiness({
             </div>
 
             {previewItems.map(
-              (item) => (
-                <div
-                  key={item.id}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    marginTop: 7,
-                    color: C.textSec,
-                    fontSize: 13,
-                    lineHeight: 1.55,
-                  }}
-                >
-                  <span
+              (item) => {
+                const teacherTitle =
+                  item.teacher_title?.trim() ||
+                  item.title.trim() ||
+                  item.description.trim() ||
+                  "未填写问题标题";
+
+                const canOpenPage =
+                  item.page_number_snapshot > 0 &&
+                  item.status !== "orphaned";
+
+                return (
+                  <div
+                    key={item.id}
                     style={{
-                      minWidth: 0,
-                      flex: 1,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      marginTop: 7,
+                      color: C.textSec,
+                      fontSize: 13,
+                      lineHeight: 1.55,
                     }}
                   >
-                    {item.page_number_snapshot >
-                    0
-                      ? `P${item.page_number_snapshot}`
-                      : "整课"}
-                    {" · "}
-                    {item.title.trim() ||
-                      item.description.trim() ||
-                      "未填写问题标题"}
-                    {" · "}
-                    {statusLabel(item)}
-                  </span>
-
-                  {item.page_number_snapshot >
-                    0 && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        onSelectPage(
-                          item.page_number_snapshot,
-                        )
-                      }
-                      style={
-                        openPageButtonStyle
-                      }
+                    <span
+                      style={{
+                        minWidth: 0,
+                        flex: 1,
+                      }}
                     >
-                      打开页面
-                    </button>
-                  )}
-                </div>
-              ),
+                      {item.page_number_snapshot > 0
+                        ? `P${item.page_number_snapshot}`
+                        : "整课"}
+                      {" · "}
+                      {teacherTitle}
+                      {" · "}
+                      {statusLabel(item)}
+                    </span>
+
+                    {canOpenPage && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onSelectPage(
+                            item.page_number_snapshot,
+                          )
+                        }
+                        style={openPageButtonStyle}
+                      >
+                        打开页面
+                      </button>
+                    )}
+                  </div>
+                );
+              },
             )}
 
             {blockingItems.length >
@@ -479,11 +441,9 @@ export function CWOwnerReviewSubmissionReadiness({
                   lineHeight: 1.5,
                 }}
               >
-                另有
-                {" "}
+                另有{" "}
                 {blockingItems.length -
-                  previewItems.length}
-                {" "}
+                  previewItems.length}{" "}
                 条未在摘要中展开，请在下方整改工作区继续处理。
               </div>
             )}
@@ -522,11 +482,11 @@ function Metric({
         minWidth: 86,
         padding: "7px 9px",
         borderRadius: 8,
-        background:
-          config.background,
-        color: value > 0
-          ? config.color
-          : C.textMuted,
+        background: config.background,
+        color:
+          value > 0
+            ? config.color
+            : C.textMuted,
       }}
     >
       <div
@@ -552,17 +512,35 @@ function Metric({
   );
 }
 
+const pageChangeNoticeStyle:
+  CSSProperties = {
+    marginTop: 10,
+    padding: "9px 11px",
+    borderRadius: 8,
+    border:
+      "1px solid #FECACA",
+    background: "#FFFFFF",
+    color: C.danger,
+    fontSize: 13,
+    lineHeight: 1.6,
+  };
+
 const openPageButtonStyle:
   CSSProperties = {
-  flexShrink: 0,
-  minHeight: 32,
-  padding: "5px 8px",
-  borderRadius: 7,
-  border:
-    `1px solid ${C.primary}`,
-  background: "#FFFFFF",
-  color: C.primary,
-  fontSize: 12,
-  fontWeight: 700,
-  cursor: "pointer",
-};
+    flexShrink: 0,
+    minHeight: 32,
+    padding: "5px 8px",
+    borderRadius: 7,
+    border:
+      `1px solid ${C.primary}`,
+    background: "#FFFFFF",
+    color: C.primary,
+    fontSize: 12,
+    fontWeight: 700,
+    cursor: "pointer",
+  };
+
+/**
+ * 保留引用，确保空快照的结构仍被本组件编译链验证。
+ */
+void EMPTY_CW_REVIEW_APPROVAL_GUARD;

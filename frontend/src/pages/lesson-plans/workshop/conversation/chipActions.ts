@@ -33,6 +33,9 @@ import {
   buildConversationChipActionKey,
   isConversationPublishIntent,
 } from './conversationActionIntent'
+import {
+  beginStageContinuationExpectation,
+} from './stageContinuationActivity'
 
 /**
  * 芯片执行上下文 —— 页面组件实现并注入的能力集合
@@ -120,6 +123,7 @@ export async function dispatchChip(
         if (
           isStageAdvanceConfirmText(text)
         ) {
+          beginStageContinuationExpectation()
           await ctx.advanceNext()
         } else {
           await ctx.sendText(text)
@@ -180,6 +184,7 @@ export async function dispatchChip(
       }
 
       case 'advance_stage':
+        beginStageContinuationExpectation()
         await ctx.advanceNext()
         break
 

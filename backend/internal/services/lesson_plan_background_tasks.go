@@ -18,8 +18,9 @@ package services
 // 排空策略：
 //   - AI主链属于critical，部署时等待其自然完成；
 //   - 自动教案索引属于best_effort，draining后不再启动；
-//   - Harness采集在主AI任务完成前执行，但老师已经收到message_done，
-//     因而不会增加前端等待，只让Tracker多等待最多5秒完成采集。
+//   - Harness采集在message_done之后转为独立best_effort子任务；
+//   - lesson_plan_ai互斥锁不再被样本采集尾巴占用，老师收到回复后可立即推进阶段；
+//   - Harness子任务仍由Tracker登记，部署draining期间允许已有主任务派生并等待其自然收尾。
 //
 // panic策略：
 //   - 所有AI主链通过BackgroundTask.Run执行；
@@ -51,6 +52,9 @@ const (
 
 	// lessonPlanIndexTaskType 是自动教案AOCI索引任务类型。
 	lessonPlanIndexTaskType = "lesson_plan_index"
+
+	// lessonPlanHarnessTaskType 是主回复完成后的Harness样本采集任务类型。
+	lessonPlanHarnessTaskType = "lesson_plan_harness_sample"
 )
 
 // ==================== AI主任务登记与执行 ====================
@@ -82,6 +86,103 @@ func startLessonPlanAITask(
 	default:
 		return nil, fmt.Errorf("教案后台任务登记失败: %s", result)
 	}
+}
+
+// lessonPlanAIStageMutationOwnerContextKey 是Chat内部阶段准备能力的私有context键。
+//
+// 值不是planID，而是已经登记成功的BackgroundTask唯一key；
+// 外部HTTP请求无法构造这个私有Go值，普通阶段操作仍严格受AI busy硬闸保护。
+type lessonPlanAIStageMutationOwnerContextKey struct{}
+
+// withLessonPlanAIStageMutationOwner 仅在调用方真实持有当前教案lesson_plan_ai任务句柄时
+// 授予本条同步调用链“内部阶段准备”能力。
+//
+// 典型场景：Chat已经取得唯一AI主任务锁，随后整稿意图需要在AI真正启动前
+// 从review切到revise。若没有这项所有权能力，阶段状态机会把当前Chat自己的任务
+// 误判成“另一条AI仍在运行”，形成自锁。
+func withLessonPlanAIStageMutationOwner(
+	ctx context.Context,
+	task *BackgroundTask,
+	planID string,
+) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	expectedKey := buildBackgroundTaskKey(
+		lessonPlanAITaskType,
+		planID,
+	)
+	if expectedKey == "" ||
+		task == nil ||
+		task.key != expectedKey {
+		return ctx
+	}
+
+	return context.WithValue(
+		ctx,
+		lessonPlanAIStageMutationOwnerContextKey{},
+		expectedKey,
+	)
+}
+
+// lessonPlanAIStageMutationOwnedByContext 判断当前调用链是否真实持有同一教案AI主任务。
+func lessonPlanAIStageMutationOwnedByContext(
+	ctx context.Context,
+	planID string,
+) bool {
+	if ctx == nil {
+		return false
+	}
+
+	expectedKey := buildBackgroundTaskKey(
+		lessonPlanAITaskType,
+		planID,
+	)
+	if expectedKey == "" {
+		return false
+	}
+
+	ownerKey, ok := ctx.Value(
+		lessonPlanAIStageMutationOwnerContextKey{},
+	).(string)
+
+	return ok &&
+		ownerKey == expectedKey
+}
+
+// ensureLessonPlanAIIdleForStageMutation 确保阶段状态变更不会与另一条同教案AI主任务并发。
+//
+// 外部阶段操作：只要lesson_plan_ai正在运行就拒绝。
+// 当前Chat内部阶段准备：若context携带“当前已登记任务句柄”产生的精确所有权能力，
+// 允许在真正启动AI前完成确定性的write/revise阶段准备。
+//
+// 这样同时保持两条安全边界：
+//   - 老师按钮/另一条Chat不能在AI运行中提前改变current_stage；
+//   - 当前Chat不会因为自己已经先登记AI任务而把整稿意图的内部切阶段锁死。
+func ensureLessonPlanAIIdleForStageMutation(
+	ctx context.Context,
+	planID string,
+) error {
+	if !GlobalBackgroundTasks.IsRunning(
+		lessonPlanAITaskType,
+		planID,
+	) {
+		return nil
+	}
+
+	if lessonPlanAIStageMutationOwnedByContext(
+		ctx,
+		planID,
+	) {
+		lpGenLog.Info(
+			"当前Chat任务获准执行内部阶段准备",
+			"plan_id", planID,
+		)
+		return nil
+	}
+
+	return ErrLPGenTaskRunning
 }
 
 // runLessonPlanAITask 启动已经登记的教案AI主任务。
@@ -182,10 +283,12 @@ func (s *LessonPlanGenService) triggerAutoLessonIndexTracked(
 
 // ==================== Harness采集 ====================
 
-// captureHarnessSampleBestEffort 在主AI任务尾部采集Harness评测样本。
+// captureHarnessSampleBestEffort 在主AI回复完成后登记独立Harness样本采集任务。
 //
-// 调用时message_done和建议芯片已经发送给老师，所以本方法不会增加前端等待。
-// 最长5秒后由context结束，失败或panic只记日志，不改变主任务结果。
+// 关键并发边界：
+//   - message_done已经发送给老师后，lesson_plan_ai主任务应尽快释放互斥锁；
+//   - Harness样本是best_effort，不得继续占用lesson_plan_ai，否则老师立即点击阶段推进会被误判为并发AI；
+//   - 样本采集仍通过TryStartChild登记，部署draining期间可以完成必要收尾。
 func (s *LessonPlanGenService) captureHarnessSampleBestEffort(
 	planID string,
 	stageCode string,
@@ -197,17 +300,70 @@ func (s *LessonPlanGenService) captureHarnessSampleBestEffort(
 	systemPrompt string,
 	aiRaw string,
 ) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
+	resourceID := fmt.Sprintf(
+		"%s:%s:%d",
+		planID,
+		stageCode,
+		time.Now().UnixNano(),
+	)
+
+	task, result := GlobalBackgroundTasks.TryStartChild(
+		lessonPlanHarnessTaskType,
+		resourceID,
+		BackgroundTaskBestEffort,
+		nil,
+	)
+	if result != BackgroundStarted {
+		lpGenLog.Warn(
+			"harness采集任务未登记，不影响主流程",
+			"plan_id", planID,
+			"stage", stageCode,
+			"result", string(result),
+		)
+		return
+	}
+
+	go func() {
+		err := task.Run(func() error {
+			s.captureHarnessSample(
+				planID,
+				stageCode,
+				authorID,
+				schoolID,
+				assistantID,
+				assistantLabel,
+				modelUsed,
+				systemPrompt,
+				aiRaw,
+			)
+			return nil
+		})
+		if err != nil {
 			lpGenLog.Warn(
-				"harness采集panic，已兜底忽略",
+				"harness采集后台任务异常，不影响主流程",
 				"plan_id", planID,
 				"stage", stageCode,
-				"panic", recovered,
+				"error", err,
 			)
 		}
 	}()
+}
 
+// captureHarnessSample 执行单次Harness评测样本采集。
+//
+// 最长5秒后由context结束；数据库、学校授权或panic异常均只影响本次样本，
+// 不影响已经完成的教师主回复和阶段状态。
+func (s *LessonPlanGenService) captureHarnessSample(
+	planID string,
+	stageCode string,
+	authorID string,
+	schoolID string,
+	assistantID string,
+	assistantLabel string,
+	modelUsed string,
+	systemPrompt string,
+	aiRaw string,
+) {
 	bgCtx, cancel := context.WithTimeout(
 		context.Background(),
 		5*time.Second,

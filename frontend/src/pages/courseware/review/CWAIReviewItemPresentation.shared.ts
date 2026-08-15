@@ -7,8 +7,8 @@
  *   - self：作者提交前自审并修改自己的课件；
  *   - remediation：作者收到退回后按审核要求完成整改。
  *
- * 三种场景共用同一张问题卡片，但显示不同的进展说明和主要操作。
- * 系统内部状态不会直接暴露给用户。
+ * 本文件只保留纯文案、能力判断与样式，不导出React组件。
+ * 状态标签与页面变化教师语言由CWAIReviewItemStatus.shared.ts负责。
  */
 
 import type {
@@ -17,14 +17,22 @@ import type {
 
 import type {
   CWAIReviewItem,
-  CWAIReviewItemStatus,
   CWAIReviewSeverity,
 } from "@/api/coursewares";
 
-export type CWAIReviewItemExperience =
-  | "review"
-  | "self"
-  | "remediation";
+import type {
+  CWAIReviewItemExperience,
+} from "./CWAIReviewItemStatus.shared";
+
+export type {
+  CWAIReviewItemExperience,
+  CWAIReviewPageChangeTeacherCopy,
+} from "./CWAIReviewItemStatus.shared";
+
+export {
+  resolveCWAIReviewItemStatus,
+  resolveCWAIReviewPageChangeTeacherCopy,
+} from "./CWAIReviewItemStatus.shared";
 
 export interface CWAIReviewItemExperienceCopy {
   sourceAI: string;
@@ -92,7 +100,8 @@ export const CW_AI_REVIEW_ITEM_COLORS = {
   card: "#FFFFFF",
 };
 
-const C = CW_AI_REVIEW_ITEM_COLORS;
+const C =
+  CW_AI_REVIEW_ITEM_COLORS;
 
 const EXPERIENCE_COPY:
   Record<
@@ -111,8 +120,8 @@ const EXPERIENCE_COPY:
       applyingAction: "查看作者处理进展",
       appliedAction: "检查作者修改结果",
       resolvedAction: "查看复审记录",
-      staleAction: "重新检查这个问题",
-      orphanedAction: "查看保留记录",
+      staleAction: "重新检查当前页面",
+      orphanedAction: "检查相关页面",
 
       pauseAction: "本次不退回",
       resumeAction: "恢复审核",
@@ -174,7 +183,7 @@ const EXPERIENCE_COPY:
       appliedAction: "确认问题已解决",
       resolvedAction: "查看处理记录",
       staleAction: "重新检查当前页面",
-      orphanedAction: "查看保留记录",
+      orphanedAction: "检查相关页面",
 
       pauseAction: "这次暂不调整",
       resumeAction: "恢复调整",
@@ -236,7 +245,7 @@ const EXPERIENCE_COPY:
       appliedAction: "检查是否达到要求",
       resolvedAction: "查看完成记录",
       staleAction: "重新检查当前页面",
-      orphanedAction: "查看保留记录",
+      orphanedAction: "检查相关页面",
 
       pauseAction: "说明无需修改",
       resumeAction: "恢复整改",
@@ -245,7 +254,8 @@ const EXPERIENCE_COPY:
         "请说明当前页面为什么已经符合审核要求",
       pauseConfirm: "提交说明",
 
-      prepareSuccess: "请按照审核员确认的要求完成修改。",
+      prepareSuccess:
+        "请按照审核员确认的要求完成修改。",
       pauseSuccess: "已保存说明。",
       resumeConfirmedSuccess: "已恢复整改。",
       resumePendingSuccess: "已恢复整改。",
@@ -275,97 +285,6 @@ const EXPERIENCE_COPY:
       readOnlyRequirementTitle: "审核员确认的整改要求",
       readOnlyRequirementHelp:
         "请按这段要求完成修改，再检查页面是否真正达到要求。",
-    },
-  };
-
-const STATUS_STYLE:
-  Record<
-    CWAIReviewItemStatus,
-    {
-      color: string;
-      background: string;
-    }
-  > = {
-    detected: {
-      color: C.primary,
-      background: "#EEF2FF",
-    },
-    discussing: {
-      color: C.purple,
-      background: "#F5F3FF",
-    },
-    confirmed: {
-      color: C.success,
-      background: "#ECFDF5",
-    },
-    applying: {
-      color: C.warning,
-      background: "#FFFBEB",
-    },
-    applied: {
-      color: C.info,
-      background: "#F0F9FF",
-    },
-    resolved: {
-      color: C.success,
-      background: "#ECFDF5",
-    },
-    dismissed: {
-      color: C.textSec,
-      background: "#F8FAFC",
-    },
-    stale: {
-      color: C.danger,
-      background: "#FEF2F2",
-    },
-    orphaned: {
-      color: C.danger,
-      background: "#FEF2F2",
-    },
-  };
-
-const STATUS_LABEL:
-  Record<
-    CWAIReviewItemExperience,
-    Record<
-      CWAIReviewItemStatus,
-      string
-    >
-  > = {
-    review: {
-      detected: "还需明确整改要求",
-      discussing: "正在完善整改要求",
-      confirmed: "整改要求已确认",
-      applying: "作者正在修改",
-      applied: "作者已完成修改",
-      resolved: "已确认解决",
-      dismissed: "本次不退回",
-      stale: "页面已变化，需要重审",
-      orphaned: "原页面已删除",
-    },
-
-    self: {
-      detected: "还需形成修改方案",
-      discussing: "正在完善修改方案",
-      confirmed: "修改方案已准备好",
-      applying: "正在修改页面",
-      applied: "修改完成，等待确认",
-      resolved: "问题已解决",
-      dismissed: "这次暂不调整",
-      stale: "页面已更新，需要重查",
-      orphaned: "原页面已删除",
-    },
-
-    remediation: {
-      detected: "请查看审核要求",
-      discussing: "请查看审核要求",
-      confirmed: "可以开始修改",
-      applying: "正在完成整改",
-      applied: "修改完成，等待复审",
-      resolved: "已完成整改",
-      dismissed: "本次无需修改",
-      stale: "页面已变化，需要确认",
-      orphaned: "原页面已删除",
     },
   };
 
@@ -434,9 +353,7 @@ export function resolveCWAIReviewItemExperience(
     return "remediation";
   }
 
-  if (
-    item.source_type === "self"
-  ) {
+  if (item.source_type === "self") {
     return "self";
   }
 
@@ -463,21 +380,6 @@ export function resolveCWAIReviewItemSourceLabel(
     : copy.sourceAI;
 }
 
-export function resolveCWAIReviewItemStatus(
-  experience: CWAIReviewItemExperience,
-  status: CWAIReviewItemStatus,
-): {
-  label: string;
-  color: string;
-  background: string;
-} {
-  return {
-    label:
-      STATUS_LABEL[experience][status],
-    ...STATUS_STYLE[status],
-  };
-}
-
 export function canManageCWAIReviewItemBeforeReturn(
   item: CWAIReviewItem,
 ): boolean {
@@ -491,9 +393,7 @@ export function canPrepareCWAIReviewItemModification(
   item: CWAIReviewItem,
 ): boolean {
   if (
-    !canManageCWAIReviewItemBeforeReturn(
-      item,
-    )
+    !canManageCWAIReviewItemBeforeReturn(item)
   ) {
     return false;
   }
@@ -530,9 +430,7 @@ export function resolveCWAIReviewItemNextStep(
   selectedForReturn: boolean,
   canOpenPageModification: boolean,
 ): string {
-  if (
-    experience === "review"
-  ) {
+  if (experience === "review") {
     switch (item.status) {
       case "detected":
         return "建议下一步：明确作者需要怎样修改。";
@@ -558,16 +456,14 @@ export function resolveCWAIReviewItemNextStep(
         return "本次不退回给作者，后续仍可以恢复审核。";
 
       case "stale":
-        return "页面内容已经变化，请重新判断问题是否仍然成立。";
+        return "页面内容已变化，需要人工重新检查当前页面，再判断这个问题是否仍然成立。";
 
       case "orphaned":
-        return "原页面已经删除，这条内容只保留供回看。";
+        return "原页面已不存在，需要人工重新检查相关页面或整课内容，再决定是否继续要求修改。";
     }
   }
 
-  if (
-    experience === "self"
-  ) {
+  if (experience === "self") {
     switch (item.status) {
       case "detected":
         return "建议下一步：先形成一份适合自己课件的修改方案。";
@@ -593,10 +489,10 @@ export function resolveCWAIReviewItemNextStep(
         return "这次暂不调整，后续仍可以恢复。";
 
       case "stale":
-        return "页面内容已经变化。请打开当前页面实际检查；确认仍符合原方案后，再重新登记为修改完成。";
+        return "页面内容已变化，需要人工重新检查当前页面；确认仍符合原方案后，再重新登记为修改完成。";
 
       case "orphaned":
-        return "原页面已经删除，这条内容只保留供回看。";
+        return "原页面已不存在，需要人工重新检查相关页面或整课内容，再判断这项自审修改是否仍然需要继续处理。";
     }
   }
 
@@ -623,10 +519,10 @@ export function resolveCWAIReviewItemNextStep(
       return "这条问题本次不需要继续修改。";
 
     case "stale":
-      return "页面已经变化。请对照审核要求实际检查；确认符合要求后，再重新登记为修改完成并提交复审。";
+      return "页面内容已变化，需要人工重新检查当前页面；确认符合当前修改要求后，再重新登记为修改完成并提交复审。";
 
     case "orphaned":
-      return "原页面已经删除，这条要求只保留供回看。";
+      return "原页面已不存在，需要人工重新检查相关页面或整课内容，并确认当前修改要求是否已经由其他页面覆盖。";
   }
 }
 
@@ -690,8 +586,7 @@ export const cwAIReviewSecondaryButtonStyle:
     minHeight: "36px",
     padding: "8px 12px",
     borderRadius: "8px",
-    border:
-      `1px solid ${C.border}`,
+    border: `1px solid ${C.border}`,
     background: "#FFFFFF",
     color: C.textSec,
     fontSize: "13px",
@@ -714,36 +609,3 @@ export const cwAIReviewPauseTextareaStyle:
     lineHeight: 1.6,
     outline: "none",
   };
-
-export function CWAIReviewItemFeedback({
-  type,
-  content,
-}: {
-  type:
-    | "success"
-    | "error";
-  content: string;
-}) {
-  return (
-    <div
-      style={{
-        marginTop: "10px",
-        padding: "10px 12px",
-        borderRadius: "8px",
-        background:
-          type === "success"
-            ? "#ECFDF5"
-            : "#FEF2F2",
-        color:
-          type === "success"
-            ? C.success
-            : C.danger,
-        fontSize: "13px",
-        fontWeight: 600,
-        lineHeight: 1.6,
-      }}
-    >
-      {content}
-    </div>
-  );
-}

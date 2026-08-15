@@ -7,6 +7,7 @@ package handlers
 //   - billing_node_code不属于HTTP协议；
 //   - Handler固定使用video_first_frame计费节点；
 //   - 图片尺寸固定为2560×1440，保证分镜首帧为16:9；
+//   - 正式首帧落盘后必须具备Nginx只读访问权限，供浏览器和视频供应商读取；
 //   - operation_id必须为UUID，同一失败重试复用同一值，
 //     防止网络异常导致重复调用图片供应商和重复扣积分。
 

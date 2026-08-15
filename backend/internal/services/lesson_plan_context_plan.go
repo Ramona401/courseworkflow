@@ -6,7 +6,7 @@ package services
 //   - “已挂载”只表示本会话可用，不等于每轮自动注入；
 //   - 普通讨论只使用阶段骨架、短历史和老师当前问题；
 //   - 完整教案、全面评审、修订定稿等正式产物才加载必要证据并启用多证据Harness；
-//   - 课本、参考资料中的篇章事实优先于通用课程大纲；
+//   - 老师实际上传并挂载的课本是本课事实最高优先级，其他资料只能补充不能反向覆盖；
 //   - 不新增AI分类调用，全部使用确定性规则。
 
 import (
@@ -27,6 +27,7 @@ const (
 // lessonPlanTurnContextPlan 描述本轮真正需要加载的上下文与质量链。
 type lessonPlanTurnContextPlan struct {
 	FormalArtifact          bool
+	DiscussionOnly          bool
 	UseRecipe               bool
 	UsePriorOutputs         bool
 	UseComponents           bool
@@ -93,40 +94,36 @@ func buildLessonPlanTurnContextPlan(
 		request.Message,
 	)
 
-	revisionMutation :=
-		isLessonPlanRevisionMutationIntent(
+	contentMutation :=
+		isLessonPlanFormalContentMutationIntent(
 			stageCode,
 			text,
 		)
 
-	formalKeywords := []string{
-		"完整教案", "完整正文", "整份教案", "全案", "一键生成",
-		"生成教案", "写出教案", "正式教案", "完整分析", "完整设计",
-		"全面评审", "正式评审", "完整评审", "修订定稿", "最终定稿",
-		"发布前检查", "发布前校验", "完整方案", "完整替换", "改一版教案",
-		"更新完整教案", "按评审意见修改", "按这个修改", "全部修改",
-	}
-
 	formal := request.FullGenerate ||
-		revisionMutation ||
-		containsAnyLessonPlanTurnText(text, formalKeywords)
+		contentMutation ||
+		isLessonPlanFormalArtifactTextIntent(text)
 	automaticFormalReview := automaticStageOpening && stageCode == "review"
 
-	if stageCode == "review" && containsAnyLessonPlanTurnText(
-		text,
-		[]string{"评审", "审核", "评分", "全面检查", "完整检查"},
-	) {
+	if stageCode == "review" &&
+		!isLessonPlanArtifactDiagnosticIntent(text) &&
+		containsAnyLessonPlanTurnText(
+			text,
+			[]string{"评审", "审核", "评分", "全面检查", "完整检查"},
+		) {
 		formal = true
 	}
-	if stageCode == "revise" && containsAnyLessonPlanTurnText(
-		text,
-		[]string{"定稿", "完整修改", "修改教案", "更新正文", "改一版", "按评审"},
-	) {
+	if stageCode == "revise" &&
+		!isLessonPlanArtifactDiagnosticIntent(text) &&
+		containsAnyLessonPlanTurnText(
+			text,
+			[]string{"定稿", "完整修改", "修改教案", "更新正文", "改一版", "按评审"},
+		) {
 		formal = true
 	}
 	if automaticStageOpening &&
 		!automaticFormalReview &&
-		!revisionMutation {
+		!contentMutation {
 		formal = false
 	}
 	if automaticFormalReview {
@@ -149,11 +146,6 @@ func buildLessonPlanTurnContextPlan(
 		request.RefMaterial,
 	) != ""
 
-	textbookKeywords := []string{
-		"课本", "教材", "课文", "原文", "页面", "页码", "第几页",
-		"课本图片", "教材图片", "原图", "附图", "插图", "版面",
-		"截图", "图中", "图片内容", "文章内容", "这篇文章", "这篇课文",
-	}
 	imageKeywords := []string{
 		"原图", "图片", "版面", "插图", "附图", "截图", "图中",
 		"看图", "页面布局", "排版", "图片是不是", "图片内容",
@@ -186,10 +178,6 @@ func buildLessonPlanTurnContextPlan(
 		"评审意见", "前序", "刚才定的", "前面确定",
 	}
 
-	explicitTextbook := containsAnyLessonPlanTurnText(
-		text,
-		textbookKeywords,
-	)
 	explicitRefMaterial := containsAnyLessonPlanTurnText(
 		text,
 		refMaterialKeywords,
@@ -205,6 +193,8 @@ func buildLessonPlanTurnContextPlan(
 	}
 
 	plan.FormalArtifact = formal
+	plan.DiscussionOnly = !formal &&
+		(stageCode == "write" || stageCode == "revise")
 	plan.UseRecipe = formal || containsAnyLessonPlanTurnText(
 		text,
 		recipeKeywords,
@@ -216,11 +206,15 @@ func buildLessonPlanTurnContextPlan(
 	plan.UseComponents = formal ||
 		len(request.SelectedComponents) > 0 ||
 		containsAnyLessonPlanTurnText(text, componentKeywords)
-	plan.UseTextbook = hasTextbook && (formal || explicitTextbook)
+
+	// 老师已挂载的课本是本课事实锚点，每轮都必须读取OCR。
+	// 课程大纲保持独立：未挂载时不得用通用课标反向限制课本。
+	plan.UseTextbook = hasTextbook
 	plan.NeedsTextbookImage = plan.UseTextbook &&
 		containsAnyLessonPlanTurnText(text, imageKeywords)
 	plan.UseUnitPlan = hasUnitPlan &&
 		(formal || containsAnyLessonPlanTurnText(text, unitPlanKeywords))
+
 	// 课程大纲全文只保留给老师明确询问大纲原文或版本要求的原始查询。
 	// 正式教案、评审和修订不再因为“正式产物”自动注入整份大纲。
 	plan.UseRawCourseOutline = hasOutline &&
@@ -256,8 +250,8 @@ func buildLessonPlanTurnContextPlan(
 	switch {
 	case automaticFormalReview:
 		plan.Reason = "评审阶段自动任务，按正式评审加载证据"
-	case revisionMutation:
-		plan.Reason = "修订阶段明确要求修改正式正文，按正式产物执行"
+	case contentMutation:
+		plan.Reason = "明确要求修改正式正文，按正式产物执行"
 	case automaticStageOpening:
 		plan.Reason = "阶段过渡开场，使用轻量阶段骨架并承接前序结论"
 	case formal:
@@ -345,15 +339,16 @@ func buildLessonPlanSourceAuthorityPrompt(
 
 	var builder strings.Builder
 	builder.WriteString("\n\n【本轮资料证据优先级（系统确定性规则）】\n")
-	builder.WriteString("1. 篇名、正文、题目、页码、人物、地点、动物、数据和页面事实：老师挂载的课本页或教师附件优先；课程大纲没有收录某篇材料，不等于该材料不存在或属于模型幻觉。\n")
-	builder.WriteString("2. 本课正式知识点、学习深度、前置关系、后续发展、教学边界和教师已确认决定：优先以active核心共识胶囊为统一依据；胶囊尚未形成时使用active知识脉络兜底。已纠正或替代内容不得被前序摘要、配方、组件或模型常识重新激活。\n")
-	builder.WriteString("3. 老师明确询问课程大纲原文或版本要求时，才读取原始大纲用于回答该问题；原始大纲不能替代已经确认的本课课程锚点。\n")
-	builder.WriteString("4. 单元方案负责本单元位置、进阶、任务与评价衔接；班级学情负责差异化组织，不得改写课本事实或统一知识脉络。\n")
-	builder.WriteString("5. 只有无法从老师任务、课本、附件、知识脉络、原始大纲查询或单元方案追溯的模型新增事实，才属于无依据扩写。\n")
-	builder.WriteString("6. 资料之间出现冲突时，明确指出冲突与来源，不得静默用模型常识替换老师材料。\n")
+	builder.WriteString("1. 老师实际上传并挂载到本教案的课本，是本课内容事实的最高优先级来源。篇名、正文、题目、页码、人物、地点、动物、数据、实验、例题和页面文字事实与任何其它来源冲突时，一律以当前挂载课本为准。\n")
+	builder.WriteString("2. 老师本轮明确要求与教师附件用于补充教学任务和额外材料；附件不得反向改写当前挂载课本已经明确的教材事实。没有挂载课本时，教师附件才承担相应事实锚点。\n")
+	builder.WriteString("3. active核心共识胶囊与active知识脉络只承载和当前课本不冲突的已确认教学决定；如果历史分析、知识脉络或共识与当前课本冲突，必须让位于课本并以当前课本纠正。\n")
+	builder.WriteString("4. 单元方案、原始课程大纲和班级学情分别补充单元进阶、课程层级要求与差异化组织；它们不能否定、替换或覆盖老师上传课本中的本课事实。课程大纲没有收录某篇材料，不等于该材料不存在或属于模型幻觉。\n")
+	builder.WriteString("5. 配方、组件和AI助手只决定结构、活动、风格与教学组织方式，不是教材事实来源；与课本事实冲突时必须无条件让位于课本。\n")
+	builder.WriteString("6. 只有无法从老师任务、当前挂载课本、教师附件、有效知识脉络、显式大纲查询、单元方案或班级学情追溯的模型新增事实，才属于无依据扩写。\n")
+	builder.WriteString("7. 资料之间出现冲突时，应以最高优先级来源纠正候选内容；不得用模型常识、配方、助手或低优先级历史结论反向否定老师上传课本。\n")
 
 	if plan.NeedsTextbookImage {
-		builder.WriteString("7. 当前文本生成链只获得课本OCR文字，不能声称已经直接核验图片版式、插图或栏目位置；涉及版面问题时必须明确说明这一限制，不得猜测。\n")
+		builder.WriteString("8. 当前文本生成链只获得课本OCR文字，不能声称已经直接核验图片版式、插图或栏目位置；涉及版面问题时必须明确说明这一限制，不得猜测。\n")
 	}
 
 	return builder.String()
@@ -372,17 +367,20 @@ func buildLightweightLessonPlanContextReceipt(
 	}
 
 	receipt.Recipe = lightweightMaterialReceipt(
-		lessonPlan.RecipeID != nil && strings.TrimSpace(*lessonPlan.RecipeID) != "",
+		lessonPlan.RecipeID != nil &&
+			strings.TrimSpace(*lessonPlan.RecipeID) != "",
 		plan.UseRecipe,
 		"配方已挂载，但本轮普通讨论不需要完整配方上下文",
 	)
 	receipt.Textbook = lightweightMaterialReceipt(
-		strings.TrimSpace(lessonPlan.TextbookPageIDs) != "" && strings.TrimSpace(lessonPlan.TextbookPageIDs) != "[]",
+		strings.TrimSpace(lessonPlan.TextbookPageIDs) != "" &&
+			strings.TrimSpace(lessonPlan.TextbookPageIDs) != "[]",
 		plan.UseTextbook,
 		"课本已关联，但本轮问题不依赖课本，未注入",
 	)
 	receipt.UnitPlan = lightweightMaterialReceipt(
-		lessonPlan.UnitPlanID != nil && strings.TrimSpace(*lessonPlan.UnitPlanID) != "",
+		lessonPlan.UnitPlanID != nil &&
+			strings.TrimSpace(*lessonPlan.UnitPlanID) != "",
 		plan.UseUnitPlan,
 		"单元方案已关联，但本轮问题不需要单元整体证据，未注入",
 	)
@@ -391,9 +389,12 @@ func buildLightweightLessonPlanContextReceipt(
 		plan.UseRawCourseOutline,
 		"课程大纲已挂载，但本轮没有明确查询原始大纲，未注入全文",
 	)
-	knowledgeLineageReason := "知识脉络来源已关联，但当前尚未形成可用active快照"
+
+	knowledgeLineageReason :=
+		"知识脉络来源已关联，但当前尚未形成可用active快照"
 	if plan.UseContextCapsule {
-		knowledgeLineageReason = "active知识脉络的课程核心已进入本课共识胶囊，本轮未重复注入"
+		knowledgeLineageReason =
+			"active知识脉络的课程核心已进入本课共识胶囊，本轮未重复注入"
 	}
 	receipt.KnowledgeLineage = lightweightMaterialReceipt(
 		lessonPlan.CourseOutlineID != nil &&
@@ -401,8 +402,10 @@ func buildLightweightLessonPlanContextReceipt(
 		plan.UseKnowledgeLineage,
 		knowledgeLineageReason,
 	)
+
 	receipt.ClassProfile = lightweightMaterialReceipt(
-		lessonPlan.ClassProfileID != nil && strings.TrimSpace(*lessonPlan.ClassProfileID) != "",
+		lessonPlan.ClassProfileID != nil &&
+			strings.TrimSpace(*lessonPlan.ClassProfileID) != "",
 		plan.UseClassProfile,
 		"班级学情已关联，但本轮问题不涉及差异化教学，未注入",
 	)
@@ -414,21 +417,28 @@ func buildLightweightLessonPlanContextReceipt(
 
 	if plan.UseRefMaterial && receipt.RefMaterial != nil {
 		receipt.RefMaterial.CharacterCount = len(
-			[]rune(strings.TrimSpace(request.RefMaterial)),
+			[]rune(
+				strings.TrimSpace(
+					request.RefMaterial,
+				),
+			),
 		)
 	}
 
-	if plan.UseComponents || len(request.SelectedComponents) > 0 {
-		receipt.Components = &models.ComponentsContextReceipt{
-			Status:        "loaded",
-			SelectionMode: "planned",
-			Reason:        "本轮任务明确需要专业组件或老师已选择组件",
-		}
+	if plan.UseComponents ||
+		len(request.SelectedComponents) > 0 {
+		receipt.Components =
+			&models.ComponentsContextReceipt{
+				Status:        "loaded",
+				SelectionMode: "planned",
+				Reason:        "本轮任务明确需要专业组件或老师已选择组件",
+			}
 	} else {
-		receipt.Components = &models.ComponentsContextReceipt{
-			Status: "deferred",
-			Reason: "普通讨论未加载专业组件",
-		}
+		receipt.Components =
+			&models.ComponentsContextReceipt{
+				Status: "deferred",
+				Reason: "普通讨论未加载专业组件",
+			}
 	}
 
 	return receipt
@@ -445,11 +455,13 @@ func lightweightMaterialReceipt(
 			Status: "loaded",
 			Reason: "本轮确定性上下文规划器判定需要使用",
 		}
+
 	case linked:
 		return &models.MaterialContextReceipt{
 			Status: "deferred",
 			Reason: deferredReason,
 		}
+
 	default:
 		return &models.MaterialContextReceipt{
 			Status: "not_linked",
@@ -475,11 +487,13 @@ func limitLessonPlanWorkingMessages(
 		}
 
 		message := messages[index]
-		if message == nil || strings.TrimSpace(message.Content) == "" {
+		if message == nil ||
+			strings.TrimSpace(message.Content) == "" {
 			continue
 		}
 
-		remaining := lessonPlanLightHistoryRunes - usedRunes
+		remaining :=
+			lessonPlanLightHistoryRunes - usedRunes
 		if remaining <= 0 {
 			break
 		}
@@ -487,21 +501,33 @@ func limitLessonPlanWorkingMessages(
 		messageRunes := []rune(message.Content)
 		if len(messageRunes) > remaining {
 			copyMessage := *message
-			copyMessage.Content = truncateLessonPlanHistoryContent(
-				messageRunes,
-				remaining,
+			copyMessage.Content =
+				truncateLessonPlanHistoryContent(
+					messageRunes,
+					remaining,
+				)
+			selected = append(
+				selected,
+				&copyMessage,
 			)
-			selected = append(selected, &copyMessage)
-			usedRunes += len([]rune(copyMessage.Content))
+			usedRunes += len(
+				[]rune(copyMessage.Content),
+			)
 			break
 		}
 
-		selected = append(selected, message)
+		selected = append(
+			selected,
+			message,
+		)
 		usedRunes += len(messageRunes)
 	}
 
 	for left, right := 0, len(selected)-1; left < right; left, right = left+1, right-1 {
-		selected[left], selected[right] = selected[right], selected[left]
+		selected[left],
+			selected[right] =
+			selected[right],
+			selected[left]
 	}
 
 	return selected
@@ -519,7 +545,11 @@ func truncateLessonPlanHistoryContent(
 		return string(content)
 	}
 
-	marker := []rune("\n…历史消息已按上下文预算截断…\n")
+	marker :=
+		[]rune(
+			"\n…历史消息已按上下文预算截断…\n",
+		)
+
 	if limit <= len(marker)+2 {
 		return string(content[:limit])
 	}
@@ -530,11 +560,18 @@ func truncateLessonPlanHistoryContent(
 
 	return string(content[:head]) +
 		string(marker) +
-		string(content[len(content)-tail:])
+		string(
+			content[len(content)-tail:],
+		)
 }
 
-func normalizeLessonPlanTurnText(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
+func normalizeLessonPlanTurnText(
+	value string,
+) string {
+	value = strings.ToLower(
+		strings.TrimSpace(value),
+	)
+
 	replacer := strings.NewReplacer(
 		" ", "",
 		"\n", "",
@@ -546,50 +583,8 @@ func normalizeLessonPlanTurnText(value string) string {
 		"（", "(",
 		"）", ")",
 	)
+
 	return replacer.Replace(value)
-}
-
-// isLessonPlanRevisionMutationIntent 判断revise阶段是否在要求真正修改正式正文。
-//
-// 不能只看单个“改”字，否则“这个修改建议是什么意思”也会被误升级为整稿任务。
-// 这里要求同时出现修改动作和明确的教案目标对象；命中后由正式产物链负责生成、
-// Word结构校验、正文事务提交和content_update广播。
-func isLessonPlanRevisionMutationIntent(
-	stageCode string,
-	text string,
-) bool {
-	if strings.ToLower(
-		strings.TrimSpace(stageCode),
-	) != "revise" {
-		return false
-	}
-
-	hasMutationVerb :=
-		containsAnyLessonPlanTurnText(
-			text,
-			[]string{
-				"修改", "只改", "直接改", "帮我改",
-				"调整", "补充", "删除", "删掉",
-				"替换", "改成", "改为", "加上",
-				"加入", "写入", "写进", "完善",
-				"优化", "修订", "同步", "保存",
-			},
-		)
-	if !hasMutationVerb {
-		return false
-	}
-
-	return containsAnyLessonPlanTurnText(
-		text,
-		[]string{
-			"教案", "正文", "原文", "原有段落",
-			"段落文字", "教学目标", "教学重点",
-			"教学难点", "教学活动", "教学过程",
-			"导入", "作业", "板书", "反思",
-			"前面的问题", "上面的内容", "这个版本",
-			"右侧", "画布", "正式正文", "正式教案",
-		},
-	)
 }
 
 func containsAnyLessonPlanTurnText(
@@ -597,10 +592,18 @@ func containsAnyLessonPlanTurnText(
 	keywords []string,
 ) bool {
 	for _, keyword := range keywords {
-		normalizedKeyword := normalizeLessonPlanTurnText(keyword)
-		if normalizedKeyword != "" && strings.Contains(text, normalizedKeyword) {
+		normalizedKeyword :=
+			normalizeLessonPlanTurnText(
+				keyword,
+			)
+		if normalizedKeyword != "" &&
+			strings.Contains(
+				text,
+				normalizedKeyword,
+			) {
 			return true
 		}
 	}
+
 	return false
 }

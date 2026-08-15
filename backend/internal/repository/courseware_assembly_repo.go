@@ -115,17 +115,53 @@ func normalizeCoursewareAssemblyJSON(value string) (string, error) {
 // BeginCoursewareAssembly 原子领取一个新的课件装配版本。
 //
 // 事务顺序：
-//   1. FOR UPDATE锁定课件；
-//   2. 拒绝仍处于running/cancel_requested的活动运行；
-//   3. assembly_version加一；
-//   4. 创建不可混淆的运行记录；
-//   5. 把课件当前活动RunID指向新运行；
-//   6. 提交事务。
+//  1. FOR UPDATE锁定课件；
+//  2. 拒绝仍处于running/cancel_requested的活动运行；
+//  3. assembly_version加一；
+//  4. 创建不可混淆的运行记录；
+//  5. 把课件当前活动RunID指向新运行；
+//  6. 提交事务。
 func BeginCoursewareAssembly(
 	ctx context.Context,
 	coursewareID string,
 	startedBy string,
 	skipVideo bool,
+) (*models.CoursewareAssemblyRun, error) {
+	return beginCoursewareAssemblyWithMetadata(
+		ctx,
+		coursewareID,
+		startedBy,
+		skipVideo,
+		"{}",
+	)
+}
+
+// BeginCoursewareGenerationRun 原子领取带R-04完整性快照metadata的新生成运行。
+//
+// 与BeginCoursewareAssembly共用同一数据库版本与互斥边界，区别仅在于调用方可在
+// 运行记录首次可见时就写入run_kind和稳定页面方案快照，避免状态查询短暂把batch误判为assembly。
+func BeginCoursewareGenerationRun(
+	ctx context.Context,
+	coursewareID string,
+	startedBy string,
+	skipVideo bool,
+	initialMetadataJSON string,
+) (*models.CoursewareAssemblyRun, error) {
+	return beginCoursewareAssemblyWithMetadata(
+		ctx,
+		coursewareID,
+		startedBy,
+		skipVideo,
+		initialMetadataJSON,
+	)
+}
+
+func beginCoursewareAssemblyWithMetadata(
+	ctx context.Context,
+	coursewareID string,
+	startedBy string,
+	skipVideo bool,
+	initialMetadataJSON string,
 ) (*models.CoursewareAssemblyRun, error) {
 	coursewareID = strings.TrimSpace(coursewareID)
 	startedBy = strings.TrimSpace(startedBy)
@@ -135,6 +171,14 @@ func BeginCoursewareAssembly(
 			"%w: 缺少课件或操作者",
 			ErrCoursewareAssemblyInvalid,
 		)
+	}
+
+	normalizedInitialMetadata, err :=
+		normalizeCoursewareAssemblyJSON(
+			initialMetadataJSON,
+		)
+	if err != nil {
+		return nil, err
 	}
 
 	tx, err := database.DB.Begin(ctx)
@@ -154,12 +198,12 @@ func BeginCoursewareAssembly(
 	lockErr := tx.QueryRow(
 		ctx,
 		`SELECT
-			assembly_version,
-			assembly_status
-		FROM coursewares
-		WHERE id = $1
-		  AND deleted_at IS NULL
-		FOR UPDATE`,
+                        assembly_version,
+                        assembly_status
+                FROM coursewares
+                WHERE id = $1
+                  AND deleted_at IS NULL
+                FOR UPDATE`,
 		coursewareID,
 	).Scan(
 		&currentVersion,
@@ -187,37 +231,38 @@ func BeginCoursewareAssembly(
 	insertErr := tx.QueryRow(
 		ctx,
 		`INSERT INTO courseware_assembly_runs (
-			courseware_id,
-			version,
-			started_by,
-			skip_video,
-			status,
-			metadata
-		)
-		VALUES (
-			$1,
-			$2,
-			$3,
-			$4,
-			'running',
-			'{}'::jsonb
-		)
-		RETURNING
-			id,
-			courseware_id,
-			version,
-			started_by,
-			skip_video,
-			status,
-			error_message,
-			metadata::text,
-			started_at,
-			updated_at,
-			finished_at`,
+                        courseware_id,
+                        version,
+                        started_by,
+                        skip_video,
+                        status,
+                        metadata
+                )
+                VALUES (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        'running',
+                        $5::jsonb
+                )
+                RETURNING
+                        id,
+                        courseware_id,
+                        version,
+                        started_by,
+                        skip_video,
+                        status,
+                        error_message,
+                        metadata::text,
+                        started_at,
+                        updated_at,
+                        finished_at`,
 		coursewareID,
 		nextVersion,
 		startedBy,
 		skipVideo,
+		normalizedInitialMetadata,
 	).Scan(
 		&run.ID,
 		&run.CoursewareID,
@@ -241,17 +286,17 @@ func BeginCoursewareAssembly(
 	tag, updateErr := tx.Exec(
 		ctx,
 		`UPDATE coursewares
-		SET
-			assembly_version = $1,
-			assembly_status = 'running',
-			active_assembly_run_id = $2,
-			assembly_started_at = NOW(),
-			assembly_finished_at = NULL,
-			assembly_started_by = $3,
-			assembly_skip_video = $4,
-			updated_at = NOW()
-		WHERE id = $5
-		  AND deleted_at IS NULL`,
+                SET
+                        assembly_version = $1,
+                        assembly_status = 'running',
+                        active_assembly_run_id = $2,
+                        assembly_started_at = NOW(),
+                        assembly_finished_at = NULL,
+                        assembly_started_by = $3,
+                        assembly_skip_video = $4,
+                        updated_at = NOW()
+                WHERE id = $5
+                  AND deleted_at IS NULL`,
 		nextVersion,
 		run.ID,
 		startedBy,
@@ -300,16 +345,16 @@ func RecoverInterruptedCoursewareAssemblies(
 	if _, err := tx.Exec(
 		ctx,
 		`UPDATE courseware_assembly_runs
-		SET
-			status = 'interrupted',
-			error_message = CASE
-				WHEN BTRIM(error_message) = ''
-					THEN '服务重启，旧进程装配运行已中断'
-				ELSE error_message
-			END,
-			updated_at = NOW(),
-			finished_at = COALESCE(finished_at, NOW())
-		WHERE status IN ('running', 'cancel_requested')`,
+                SET
+                        status = 'interrupted',
+                        error_message = CASE
+                                WHEN BTRIM(error_message) = ''
+                                        THEN '服务重启，旧进程装配运行已中断'
+                                ELSE error_message
+                        END,
+                        updated_at = NOW(),
+                        finished_at = COALESCE(finished_at, NOW())
+                WHERE status IN ('running', 'cancel_requested')`,
 	); err != nil {
 		return 0, fmt.Errorf(
 			"收敛旧装配运行失败: %w",
@@ -320,18 +365,18 @@ func RecoverInterruptedCoursewareAssemblies(
 	tag, err := tx.Exec(
 		ctx,
 		`UPDATE coursewares
-		SET
-			assembly_status = 'interrupted',
-			active_assembly_run_id = NULL,
-			assembly_finished_at = COALESCE(
-				assembly_finished_at,
-				NOW()
-			),
-			updated_at = NOW()
-		WHERE assembly_status IN (
-			'running',
-			'cancel_requested'
-		)`,
+                SET
+                        assembly_status = 'interrupted',
+                        active_assembly_run_id = NULL,
+                        assembly_finished_at = COALESCE(
+                                assembly_finished_at,
+                                NOW()
+                        ),
+                        updated_at = NOW()
+                WHERE assembly_status IN (
+                        'running',
+                        'cancel_requested'
+                )`,
 	)
 	if err != nil {
 		return 0, fmt.Errorf(
@@ -367,16 +412,16 @@ func GetCoursewareAssemblyState(
 	err := database.DB.QueryRow(
 		ctx,
 		`SELECT
-			assembly_version,
-			assembly_status,
-			active_assembly_run_id,
-			assembly_started_by,
-			assembly_skip_video,
-			assembly_started_at,
-			assembly_finished_at
-		FROM coursewares
-		WHERE id = $1
-		  AND deleted_at IS NULL`,
+                        assembly_version,
+                        assembly_status,
+                        active_assembly_run_id,
+                        assembly_started_by,
+                        assembly_skip_video,
+                        assembly_started_at,
+                        assembly_finished_at
+                FROM coursewares
+                WHERE id = $1
+                  AND deleted_at IS NULL`,
 		coursewareID,
 	).Scan(
 		&state.Version,
@@ -397,6 +442,22 @@ func GetCoursewareAssemblyState(
 			err,
 		)
 	}
+
+	runKind, integrity, integrityErr :=
+		ReadCoursewareGenerationIntegrity(
+			ctx,
+			coursewareID,
+			state.Version,
+		)
+	if integrityErr != nil {
+		return nil, fmt.Errorf(
+			"读取课件生成完整性状态失败: %w",
+			integrityErr,
+		)
+	}
+
+	state.RunKind = runKind
+	state.Integrity = integrity
 
 	return state, nil
 }
@@ -431,13 +492,13 @@ func RequestCoursewareAssemblyCancel(
 	tag, err := tx.Exec(
 		ctx,
 		`UPDATE coursewares
-		SET
-			assembly_status = 'cancel_requested',
-			updated_at = NOW()
-		WHERE id = $1
-		  AND assembly_version = $2
-		  AND active_assembly_run_id = $3
-		  AND assembly_status = 'running'`,
+                SET
+                        assembly_status = 'cancel_requested',
+                        updated_at = NOW()
+                WHERE id = $1
+                  AND assembly_version = $2
+                  AND active_assembly_run_id = $3
+                  AND assembly_status = 'running'`,
 		coursewareID,
 		version,
 		runID,
@@ -455,13 +516,13 @@ func RequestCoursewareAssemblyCancel(
 	tag, err = tx.Exec(
 		ctx,
 		`UPDATE courseware_assembly_runs
-		SET
-			status = 'cancel_requested',
-			updated_at = NOW()
-		WHERE id = $1
-		  AND courseware_id = $2
-		  AND version = $3
-		  AND status = 'running'`,
+                SET
+                        status = 'cancel_requested',
+                        updated_at = NOW()
+                WHERE id = $1
+                  AND courseware_id = $2
+                  AND version = $3
+                  AND status = 'running'`,
 		runID,
 		coursewareID,
 		version,
@@ -532,13 +593,13 @@ func FinishCoursewareAssembly(
 	err = tx.QueryRow(
 		ctx,
 		`SELECT
-			assembly_version,
-			assembly_status,
-			active_assembly_run_id
-		FROM coursewares
-		WHERE id = $1
-		  AND deleted_at IS NULL
-		FOR UPDATE`,
+                        assembly_version,
+                        assembly_status,
+                        active_assembly_run_id
+                FROM coursewares
+                WHERE id = $1
+                  AND deleted_at IS NULL
+                FOR UPDATE`,
 		coursewareID,
 	).Scan(
 		&storedVersion,
@@ -567,16 +628,16 @@ func FinishCoursewareAssembly(
 	tag, err := tx.Exec(
 		ctx,
 		`UPDATE courseware_assembly_runs
-		SET
-			status = $1,
-			error_message = $2,
-			metadata = metadata || $3::jsonb,
-			updated_at = NOW(),
-			finished_at = NOW()
-		WHERE id = $4
-		  AND courseware_id = $5
-		  AND version = $6
-		  AND status IN ('running', 'cancel_requested')`,
+                SET
+                        status = $1,
+                        error_message = $2,
+                        metadata = metadata || $3::jsonb,
+                        updated_at = NOW(),
+                        finished_at = NOW()
+                WHERE id = $4
+                  AND courseware_id = $5
+                  AND version = $6
+                  AND status IN ('running', 'cancel_requested')`,
 		finalStatus,
 		errorMessage,
 		normalizedMetadata,
@@ -597,14 +658,14 @@ func FinishCoursewareAssembly(
 	tag, err = tx.Exec(
 		ctx,
 		`UPDATE coursewares
-		SET
-			assembly_status = $1,
-			active_assembly_run_id = NULL,
-			assembly_finished_at = NOW(),
-			updated_at = NOW()
-		WHERE id = $2
-		  AND assembly_version = $3
-		  AND active_assembly_run_id = $4`,
+                SET
+                        assembly_status = $1,
+                        active_assembly_run_id = NULL,
+                        assembly_finished_at = NOW(),
+                        updated_at = NOW()
+                WHERE id = $2
+                  AND assembly_version = $3
+                  AND active_assembly_run_id = $4`,
 		finalStatus,
 		coursewareID,
 		version,
@@ -656,24 +717,24 @@ func UpdateCWPageHTMLForAssembly(
 	tag, err := database.DB.Exec(
 		ctx,
 		`UPDATE courseware_pages AS page
-		SET
-			html_content = $1,
-			placeholder_map = NULLIF($2, '')::jsonb,
-			matched_component_ids = NULLIF($3, '')::jsonb,
-			status = $4,
-			assembly_version = $5,
-			layout_status = 'unchecked',
-			layout_audit_json = '{}'::jsonb,
-			layout_html_hash = NULL,
-			layout_checked_at = NULL,
-			updated_at = NOW()
-		FROM coursewares AS courseware
-		WHERE page.id = $6
-		  AND page.courseware_id = $7
-		  AND courseware.id = page.courseware_id
-		  AND courseware.assembly_version = $5
-		  AND courseware.assembly_status = 'running'
-		  AND courseware.active_assembly_run_id = $8`,
+                SET
+                        html_content = $1,
+                        placeholder_map = NULLIF($2, '')::jsonb,
+                        matched_component_ids = NULLIF($3, '')::jsonb,
+                        status = $4,
+                        assembly_version = $5,
+                        layout_status = 'unchecked',
+                        layout_audit_json = '{}'::jsonb,
+                        layout_html_hash = NULL,
+                        layout_checked_at = NULL,
+                        updated_at = NOW()
+                FROM coursewares AS courseware
+                WHERE page.id = $6
+                  AND page.courseware_id = $7
+                  AND courseware.id = page.courseware_id
+                  AND courseware.assembly_version = $5
+                  AND courseware.assembly_status = 'running'
+                  AND courseware.active_assembly_run_id = $8`,
 		input.HTMLContent,
 		input.PlaceholderMap,
 		input.MatchedComponentIDs,
@@ -745,20 +806,20 @@ func UpdateCoursewarePageLayoutAuditForAssembly(
 	tag, err := database.DB.Exec(
 		ctx,
 		`UPDATE courseware_pages AS page
-		SET
-			layout_status = $1,
-			layout_audit_json = $2::jsonb,
-			layout_html_hash = $3,
-			layout_checked_at = NOW(),
-			updated_at = NOW()
-		FROM coursewares AS courseware
-		WHERE page.id = $4
-		  AND page.courseware_id = $5
-		  AND page.assembly_version = $6
-		  AND courseware.id = page.courseware_id
-		  AND courseware.assembly_version = $6
-		  AND courseware.assembly_status = 'running'
-		  AND courseware.active_assembly_run_id = $7`,
+                SET
+                        layout_status = $1,
+                        layout_audit_json = $2::jsonb,
+                        layout_html_hash = $3,
+                        layout_checked_at = NOW(),
+                        updated_at = NOW()
+                FROM coursewares AS courseware
+                WHERE page.id = $4
+                  AND page.courseware_id = $5
+                  AND page.assembly_version = $6
+                  AND courseware.id = page.courseware_id
+                  AND courseware.assembly_version = $6
+                  AND courseware.assembly_status = 'running'
+                  AND courseware.active_assembly_run_id = $7`,
 		input.LayoutStatus,
 		normalizedAudit,
 		input.HTMLHash,
@@ -798,14 +859,14 @@ func IsCoursewareAssemblyVersionCurrent(
 	err := database.DB.QueryRow(
 		ctx,
 		`SELECT EXISTS (
-			SELECT 1
-			FROM coursewares
-			WHERE id = $1
-			  AND deleted_at IS NULL
-			  AND assembly_version = $2
-			  AND active_assembly_run_id = $3
-			  AND assembly_status = 'running'
-		)`,
+                        SELECT 1
+                        FROM coursewares
+                        WHERE id = $1
+                          AND deleted_at IS NULL
+                          AND assembly_version = $2
+                          AND active_assembly_run_id = $3
+                          AND assembly_status = 'running'
+                )`,
 		coursewareID,
 		version,
 		runID,

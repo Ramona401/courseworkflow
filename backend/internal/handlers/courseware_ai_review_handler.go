@@ -5,6 +5,7 @@ package handlers
 // 课件 AI 审核助手 HTTP 处理器。
 //
 // 会话API：
+//
 //   POST /api/v1/courseware-ai-reviews
 //        创建并准备新的AI审核会话。
 //
@@ -23,6 +24,13 @@ package handlers
 // 全局讨论和AI建议治理API由
 // courseware_ai_review_global_discussion_handler.go处理。
 //
+// R-06正式问题组API由courseware_ai_review_item_group_handler.go处理。
+//
+// R-07结构化影响方案API由courseware_ai_review_impact_plan_handler.go处理。
+//
+// R-08审核意见重新汇总候选API由
+// courseware_ai_review_comment_candidate_handler.go处理。
+//
 // 整改项API由courseware_ai_review_item_handler.go处理。
 //
 // 权限原则：
@@ -31,7 +39,9 @@ package handlers
 //   - 后端重新读取课件和配置允许使用的来源材料；
 //   - AI结果不能自动提交人工审核决定；
 //   - 单条或全局讨论都不能直接修改页面；
-//   - 正式交付的历史整改项不能被治理接口改写。
+//   - 正式交付的历史整改项不能被治理接口改写；
+//   - R-07最终Apply只接受plan/version/selected operation IDs；
+//   - R-08最终Apply不接受candidate正文，只接受candidate ID、当前教师意见和当前选择。
 //
 // R-02 启动配置：
 //   - 至少选择一个审核维度；
@@ -109,7 +119,7 @@ func (h *CoursewareAIReviewHandler) HandleCollection(
 	}
 }
 
-// HandleItem 处理会话、全局讨论、关系治理和整改项通配子路由。
+// HandleItem 处理会话、全局讨论、影响方案、审核意见候选、问题组、关系治理和整改项通配子路由。
 func (h *CoursewareAIReviewHandler) HandleItem(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -118,6 +128,21 @@ func (h *CoursewareAIReviewHandler) HandleItem(
 
 	if isCoursewareAIReviewGlobalDiscussionRoute(parts) {
 		h.HandleGlobalDiscussionRoute(w, r, parts)
+		return
+	}
+
+	if isCoursewareAIReviewImpactPlanRoute(parts) {
+		h.HandleImpactPlanRoute(w, r, parts)
+		return
+	}
+
+	if isCoursewareAIReviewCommentCandidateRoute(parts) {
+		h.HandleReviewCommentCandidateRoute(w, r, parts)
+		return
+	}
+
+	if isCoursewareAIReviewItemGroupRoute(parts) {
+		h.HandleReviewItemGroupRoute(w, r, parts)
 		return
 	}
 
@@ -383,6 +408,10 @@ func (h *CoursewareAIReviewHandler) handleError(
 		errors.Is(err, services.ErrCWAIReviewSessionNotFound),
 		errors.Is(err, repository.ErrCoursewareReviewItemNotFound),
 		errors.Is(err, repository.ErrCoursewareReviewItemRelationNotFound),
+		errors.Is(err, repository.ErrCoursewareReviewItemGroupNotFound),
+		errors.Is(err, repository.ErrCoursewareReviewItemGroupMemberNotFound),
+		errors.Is(err, repository.ErrCoursewareReviewImpactPlanNotFound),
+		errors.Is(err, repository.ErrCoursewareReviewCommentCandidateNotFound),
 		errors.Is(err, repository.ErrCoursewareAIReviewMessageNotFound),
 		errors.Is(err, repository.ErrAIAssistantNotFound),
 		errors.Is(err, services.ErrCoursewareAccessNotFound):
@@ -400,7 +429,12 @@ func (h *CoursewareAIReviewHandler) handleError(
 		errors.Is(err, services.ErrCWAIReviewGlobalProposalNotFound),
 		errors.Is(err, services.ErrCWAIReviewGlobalRelationNotSuggested),
 		errors.Is(err, services.ErrCWAIReviewGlobalDismissNotSuggested),
-		errors.Is(err, repository.ErrCoursewareReviewItemConflict):
+		errors.Is(err, services.ErrCWAIReviewGroupNotActionable),
+		errors.Is(err, services.ErrCWAIReviewImpactPlanConflict),
+		errors.Is(err, services.ErrCWReviewCommentCandidateStale),
+		errors.Is(err, repository.ErrCoursewareReviewImpactPlanConflict),
+		errors.Is(err, repository.ErrCoursewareReviewItemConflict),
+		errors.Is(err, repository.ErrCoursewareReviewItemGroupConflict):
 		utils.Fail(w, http.StatusConflict, err.Error())
 
 	case errors.Is(err, services.ErrCWAIReviewConfigInvalid),
@@ -421,10 +455,29 @@ func (h *CoursewareAIReviewHandler) handleError(
 		errors.Is(err, services.ErrCWAIReviewGlobalRelationReasonInvalid),
 		errors.Is(err, services.ErrCWAIReviewManualRelationInvalid),
 		errors.Is(err, services.ErrCWAIReviewManualRelationExplanationInvalid),
+		errors.Is(err, services.ErrCWAIReviewGroupInvalid),
+		errors.Is(err, services.ErrCWAIReviewGroupNameInvalid),
+		errors.Is(err, services.ErrCWAIReviewGroupReasonInvalid),
+		errors.Is(err, services.ErrCWAIReviewGroupSelectionInvalid),
+		errors.Is(err, services.ErrCWAIReviewImpactPlanInvalid),
+		errors.Is(err, services.ErrCWAIReviewImpactPlanNoOperations),
+		errors.Is(err, services.ErrCWReviewCommentCandidateInvalid),
+		errors.Is(err, services.ErrCWReviewCommentCandidateNoItems),
+		errors.Is(err, repository.ErrCoursewareReviewImpactSelectionInvalid),
 		errors.Is(err, repository.ErrAIAssistantInactive),
 		errors.Is(err, services.ErrAssistantManualMismatch),
 		errors.Is(err, services.ErrCoursewareRuntimeDomainRequired):
 		utils.BadRequest(w, err.Error())
+
+	case errors.Is(
+		err,
+		services.ErrCWReviewCommentCandidateOutputInvalid,
+	):
+		utils.Fail(
+			w,
+			http.StatusBadGateway,
+			"AI生成的审核意见候选格式异常，请重新整理",
+		)
 
 	default:
 		utils.InternalError(w, "课件AI审核操作失败，请稍后重试")

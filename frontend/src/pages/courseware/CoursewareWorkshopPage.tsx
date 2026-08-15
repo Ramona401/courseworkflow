@@ -3,9 +3,9 @@
  *
  * 本文件只负责进入工坊前的生命周期分流：
  *   1. 同时读取课件详情与数据库装配状态；
- *   2. starting/running/cancel_requested 时直接恢复自动装配面板；
- *   3. 其它状态进入原课件工坊内容组件；
- *   4. 不把历史 completed/failed/cancelled/interrupted 误当当前运行。
+ *   2. 当前active assembly，或终态但R-04完整性未通过的assembly，恢复自动装配面板；
+ *   3. active batch 与其它状态都进入原课件工坊内容组件；
+ *   4. 已完整历史终态不恢复；终态未完整运行只恢复对账与补生入口。
  *
  * 原完整工坊实现保存在 CoursewareWorkshopContent.tsx。
  */
@@ -34,6 +34,9 @@ import type {
 
 import AutoAssemblyPanel
   from './components/courseware-workshop/AutoAssemblyPanel'
+import {
+  shouldRecoverIncompleteAssemblyState,
+} from './components/courseware-workshop/coursewareAssemblyRuntimeState'
 import {
   C,
 } from './components/courseware-workshop/workshopConstants'
@@ -142,8 +145,19 @@ export default function CoursewareWorkshopPage() {
         }
       }
 
+      const shouldResumeAssembly =
+        Boolean(
+          resolvedAssemblyState?.is_active &&
+            resolvedAssemblyState.run_kind ===
+              'assembly',
+        ) ||
+        shouldRecoverIncompleteAssemblyState(
+          resolvedAssemblyState,
+        )
+
       if (
-        resolvedAssemblyState?.is_active
+        shouldResumeAssembly &&
+        resolvedAssemblyState
       ) {
         setCourseware(
           coursewareResult.value,
@@ -282,7 +296,9 @@ export default function CoursewareWorkshopPage() {
             lineHeight: 1.6,
           }}
         >
-          检测到该课件仍有后台自动装配运行，已直接恢复运行面板。
+          {initialAssemblyState.is_active
+            ? '检测到该课件仍有后台自动装配运行，已直接恢复运行面板。'
+            : '检测到上次自动装配未完整生成，已恢复完整性对账与补生入口。'}
         </div>
       </div>
 

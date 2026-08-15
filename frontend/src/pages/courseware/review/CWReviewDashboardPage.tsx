@@ -9,6 +9,11 @@
  *      不再用弹窗——弹窗里 iframe 未等比缩放课件被截断看不全无法审核。
  *      点「审核 →」navigate 到 /courseware/review/{id}?level=N，与教案审核跳详情页范式一致。
  *
+ * R-03：
+ *   - 待审核记录仍进入当前审核工作台；
+ *   - 已审核记录使用review_id进入独立只读历史详情；
+ *   - 已审核记录绝不重新进入作者工坊或当前审核工作台。
+ *
  * 角色可见 Tab（与后端 GetPendingReviews 角色分流一致）：
  *   - operator/viewer            → L1
  *   - senior_operator            → L1 + L2
@@ -32,8 +37,8 @@ import {
 
 // ==================== 样式常量（暖色系） ====================
 const C = {
-  primary:   '#F59E0B',   // 橙（L1 / 主色）
-  danger:    '#EF4444',   // 红（L2 / 退回）
+  primary:   '#F59E0B',
+  danger:    '#EF4444',
   success:   '#10B981',
   warning:   '#F59E0B',
   blue:      '#2563EB',
@@ -126,7 +131,6 @@ export default function CWReviewDashboardPage() {
       const level = activeTab === 'l1' ? 1 : 2
       if (subView === 'pending') {
         const pending = await getCWPendingReviews({ limit: 100 })
-        // 后端按角色分流返回，前端再按当前 Tab 级别过滤
         setPendingItems((pending?.items || []).filter(i => i.review_level === level))
         setReviewedItems([])
       } else {
@@ -145,13 +149,17 @@ export default function CWReviewDashboardPage() {
   useEffect(() => { loadStats() }, [loadStats])
   useEffect(() => { loadList() }, [loadList])
 
-  // —— 跳转到独立审核工作台页面（替代原弹窗） ——
+  // —— 跳转到当前待审核工作台 ——
   const gotoWorkbench = (coursewareId: string) => {
     const level = activeTab === 'l1' ? 1 : 2
     navigate(`/courseware/review/${coursewareId}?level=${level}`)
   }
 
-  // —— 统计卡片配置（可点击切换子视图） ——
+  // —— R-03：已审核记录只能进入review_id只读历史详情 ——
+  const gotoHistory = (reviewId: string) => {
+    navigate(`/courseware/review-history/${reviewId}`)
+  }
+
   const statsCards = reviewStats ? [
     { key: 'pending' as SubView, label: '待审核', value: reviewStats.total_pending, color: C.warning, icon: '📋' },
     { key: 'reviewed' as SubView, label: '已审核', value: reviewStats.total_reviewed, color: C.blue, icon: '📊' },
@@ -159,10 +167,8 @@ export default function CWReviewDashboardPage() {
     { key: 'revision' as SubView, label: '已退回', value: reviewStats.total_revision, color: C.danger, icon: '↩️' },
   ] : []
 
-  // ==================== 渲染 ====================
   return (
     <div style={{ padding: '24px 28px', maxWidth: '1200px', margin: '0 auto' }}>
-      {/* 标题 */}
       <div style={{ marginBottom: '20px' }}>
         <h2 style={{ margin: 0, fontSize: '22px', fontWeight: 700, color: C.text }}>🛡️ 课件审核中心</h2>
         <p style={{ fontSize: '14px', color: C.textSec, margin: '6px 0 0' }}>
@@ -179,7 +185,6 @@ export default function CWReviewDashboardPage() {
 
       {availableTabs.length > 0 && (
         <>
-          {/* 统计卡片（可点击切换子视图） */}
           {statsCards.length > 0 && (
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px', marginBottom: '20px' }}>
               {statsCards.map(s => {
@@ -202,7 +207,6 @@ export default function CWReviewDashboardPage() {
             </div>
           )}
 
-          {/* Tab 栏 + 列表 */}
           <div style={{ background: C.card, borderRadius: '12px', border: `1px solid ${C.border}`, overflow: 'hidden' }}>
             <div style={{ display: 'flex', borderBottom: `1px solid ${C.border}`, padding: '0 4px' }}>
               {availableTabs.map(tab => {
@@ -217,7 +221,6 @@ export default function CWReviewDashboardPage() {
               })}
             </div>
 
-            {/* 待审核列表 */}
             {subView === 'pending' && (
               <div>
                 {loadingList && <div style={{ padding: '40px', textAlign: 'center', color: C.textMuted }}>加载中...</div>}
@@ -243,10 +246,6 @@ export default function CWReviewDashboardPage() {
                       </div>
                     </div>
                     <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
-                      <button onClick={() => navigate(`/courseware/${item.courseware_id}`)}
-                        style={{ padding: '8px 16px', borderRadius: '8px', border: `1px solid ${C.borderMid}`, background: '#fff', cursor: 'pointer', fontSize: '13px', color: C.textSec }}>
-                        进工坊
-                      </button>
                       <button onClick={() => gotoWorkbench(item.courseware_id)}
                         style={{ padding: '8px 20px', borderRadius: '8px', border: 'none', background: C.primary, color: '#fff', cursor: 'pointer', fontSize: '13px', fontWeight: 600 }}>
                         审核 →
@@ -257,7 +256,6 @@ export default function CWReviewDashboardPage() {
               </div>
             )}
 
-            {/* 已审核记录列表 */}
             {subView !== 'pending' && (
               <div>
                 {loadingList && <div style={{ padding: '40px', textAlign: 'center', color: C.textMuted }}>加载中...</div>}
@@ -296,9 +294,22 @@ export default function CWReviewDashboardPage() {
                           </div>
                         )}
                       </div>
-                      <button onClick={() => navigate(`/courseware/${item.courseware_id}`)}
-                        style={{ padding: '8px 16px', borderRadius: '8px', border: `1px solid ${C.borderMid}`, background: '#fff', cursor: 'pointer', fontSize: '13px', color: C.textSec, flexShrink: 0 }}>
-                        进工坊
+                      <button
+                        type="button"
+                        onClick={() => gotoHistory(item.id)}
+                        style={{
+                          padding: '8px 16px',
+                          borderRadius: '8px',
+                          border: `1px solid ${C.blue}45`,
+                          background: `${C.blue}0D`,
+                          cursor: 'pointer',
+                          fontSize: '13px',
+                          color: C.blue,
+                          fontWeight: 600,
+                          flexShrink: 0,
+                        }}
+                      >
+                        查看审核记录 →
                       </button>
                     </div>
                   )

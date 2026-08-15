@@ -98,6 +98,13 @@ func (s *WorkshopStageService) advanceStageWithComponents(
 		return nil, ErrLPGenUnauthorized
 	}
 
+	if err := ensureLessonPlanAIIdleForStageMutation(
+		ctx,
+		lessonPlanID,
+	); err != nil {
+		return nil, err
+	}
+
 	snapshots, currentIndex, err := s.resolveStages(lessonPlan)
 	if err != nil {
 		return nil, err
@@ -115,32 +122,6 @@ func (s *WorkshopStageService) advanceStageWithComponents(
 	} else if targetIndex >= len(snapshots) {
 		return nil, ErrStageAlreadyLast
 	}
-
-	if s.aesKey != "" &&
-		!skipQualityEvaluation &&
-		s.leavingStageHasSubstantiveContent(
-			ctx,
-			lessonPlanID,
-		) {
-		go s.asyncLLMEvaluateAndBroadcast(
-			ctx,
-			lessonPlanID,
-			lessonPlan.CurrentStage,
-		)
-	}
-
-	s.generateAndSaveEpisodicSummary(
-		ctx,
-		lessonPlanID,
-		lessonPlan.CurrentStage,
-	)
-
-	_ = repository.CompleteStageOutput(
-		ctx,
-		lessonPlanID,
-		lessonPlan.CurrentStage,
-		"[]",
-	)
 
 	targetStage := snapshots[targetIndex]
 	initialStructuredOutput := "{}"
@@ -162,23 +143,52 @@ func (s *WorkshopStageService) advanceStageWithComponents(
 		)
 	}
 
-	output := &models.WorkshopStageOutput{
-		LessonPlanID:         lessonPlanID,
-		StageCode:            targetStage.StageCode,
-		StageOrder:           targetStage.StageOrder,
-		StructuredOutput:     initialStructuredOutput,
-		NarrativeOutput:      "",
-		ConversationSnapshot: "[]",
-		Status:               models.StageOutputInProgress,
+	// 阶段切换前先保证当前与目标两侧的生命周期记录都存在。
+	// 任何真实数据库错误都在 current_stage 变化前返回，不能再以Warn继续推进。
+	if err := s.ensureStageOutputForSnapshot(
+		ctx,
+		lessonPlanID,
+		snapshots[currentIndex],
+		"{}",
+	); err != nil {
+		return nil, fmt.Errorf("确保当前阶段产出存在失败: %w", err)
 	}
 
-	if err := repository.CreateStageOutput(ctx, output); err != nil {
-		wsLog.Warn(
-			"创建阶段产出记录失败，可能已经存在",
-			"plan_id", lessonPlanID,
-			"stage", targetStage.StageCode,
-			"error", err,
+	if err := s.ensureStageOutputForSnapshot(
+		ctx,
+		lessonPlanID,
+		targetStage,
+		initialStructuredOutput,
+	); err != nil {
+		return nil, fmt.Errorf("确保目标阶段产出存在失败: %w", err)
+	}
+
+	if s.aesKey != "" &&
+		!skipQualityEvaluation &&
+		s.leavingStageHasSubstantiveContent(
+			ctx,
+			lessonPlanID,
+		) {
+		go s.asyncLLMEvaluateAndBroadcast(
+			ctx,
+			lessonPlanID,
+			lessonPlan.CurrentStage,
 		)
+	}
+
+	s.generateAndSaveEpisodicSummary(
+		ctx,
+		lessonPlanID,
+		lessonPlan.CurrentStage,
+	)
+
+	if err := repository.CompleteStageOutput(
+		ctx,
+		lessonPlanID,
+		lessonPlan.CurrentStage,
+		"[]",
+	); err != nil {
+		return nil, fmt.Errorf("完成当前阶段产出失败: %w", err)
 	}
 
 	if err := repository.UpdateLessonPlanCurrentStage(
@@ -300,6 +310,13 @@ func (s *WorkshopStageService) SkipStage(
 		return nil, ErrLPGenUnauthorized
 	}
 
+	if err := ensureLessonPlanAIIdleForStageMutation(
+		ctx,
+		lessonPlanID,
+	); err != nil {
+		return nil, err
+	}
+
 	snapshots, currentIndex, err := s.resolveStages(lessonPlan)
 	if err != nil {
 		return nil, err
@@ -307,18 +324,6 @@ func (s *WorkshopStageService) SkipStage(
 	if !snapshots[currentIndex].Skippable {
 		return nil, ErrStageNotSkippable
 	}
-
-	s.generateAndSaveEpisodicSummary(
-		ctx,
-		lessonPlanID,
-		lessonPlan.CurrentStage,
-	)
-
-	_ = repository.SkipStageOutput(
-		ctx,
-		lessonPlanID,
-		lessonPlan.CurrentStage,
-	)
 
 	targetIndex := currentIndex + 1
 	if targetStageCode != "" {
@@ -334,23 +339,37 @@ func (s *WorkshopStageService) SkipStage(
 	}
 
 	targetStage := snapshots[targetIndex]
-	output := &models.WorkshopStageOutput{
-		LessonPlanID:         lessonPlanID,
-		StageCode:            targetStage.StageCode,
-		StageOrder:           targetStage.StageOrder,
-		StructuredOutput:     "{}",
-		NarrativeOutput:      "",
-		ConversationSnapshot: "[]",
-		Status:               models.StageOutputInProgress,
+
+	if err := s.ensureStageOutputForSnapshot(
+		ctx,
+		lessonPlanID,
+		snapshots[currentIndex],
+		"{}",
+	); err != nil {
+		return nil, fmt.Errorf("确保待跳过阶段产出存在失败: %w", err)
 	}
 
-	if err := repository.CreateStageOutput(ctx, output); err != nil {
-		wsLog.Warn(
-			"创建跳过后的阶段产出失败，可能已经存在",
-			"plan_id", lessonPlanID,
-			"stage", targetStage.StageCode,
-			"error", err,
-		)
+	if err := s.ensureStageOutputForSnapshot(
+		ctx,
+		lessonPlanID,
+		targetStage,
+		"{}",
+	); err != nil {
+		return nil, fmt.Errorf("确保跳过后的目标阶段产出存在失败: %w", err)
+	}
+
+	s.generateAndSaveEpisodicSummary(
+		ctx,
+		lessonPlanID,
+		lessonPlan.CurrentStage,
+	)
+
+	if err := repository.SkipStageOutput(
+		ctx,
+		lessonPlanID,
+		lessonPlan.CurrentStage,
+	); err != nil {
+		return nil, fmt.Errorf("标记当前阶段为已跳过失败: %w", err)
 	}
 
 	if err := repository.UpdateLessonPlanCurrentStage(
@@ -402,6 +421,13 @@ func (s *WorkshopStageService) BackStage(
 		return nil, ErrLPGenUnauthorized
 	}
 
+	if err := ensureLessonPlanAIIdleForStageMutation(
+		ctx,
+		lessonPlanID,
+	); err != nil {
+		return nil, err
+	}
+
 	snapshots, currentIndex, err := s.resolveStages(lessonPlan)
 	if err != nil {
 		return nil, err
@@ -411,6 +437,14 @@ func (s *WorkshopStageService) BackStage(
 	}
 
 	targetStage := snapshots[currentIndex-1]
+	if err := s.ensureStageOutputForSnapshot(
+		ctx,
+		lessonPlanID,
+		targetStage,
+		"{}",
+	); err != nil {
+		return nil, fmt.Errorf("确保回退目标阶段产出存在失败: %w", err)
+	}
 
 	if err := repository.UpdateLessonPlanCurrentStage(
 		ctx,
@@ -448,6 +482,13 @@ func (s *WorkshopStageService) SwitchToStage(
 		return nil, ErrLPGenUnauthorized
 	}
 
+	if err := ensureLessonPlanAIIdleForStageMutation(
+		ctx,
+		lessonPlanID,
+	); err != nil {
+		return nil, err
+	}
+
 	snapshots, _, err := s.resolveStages(lessonPlan)
 	if err != nil {
 		return nil, err
@@ -462,6 +503,17 @@ func (s *WorkshopStageService) SwitchToStage(
 	}
 
 	targetStage := snapshots[targetIndex]
+
+	// 任意非线性切换都先建立目标阶段产出生命周期，再修改 current_stage。
+	// Prepared层的write/revise兼容保护可以继续幂等调用，不会产生重复行。
+	if err := s.ensureStageOutputForSnapshot(
+		ctx,
+		lessonPlanID,
+		targetStage,
+		"{}",
+	); err != nil {
+		return nil, fmt.Errorf("确保切换目标阶段产出存在失败: %w", err)
+	}
 
 	if err := repository.UpdateLessonPlanCurrentStage(
 		ctx,
@@ -499,6 +551,13 @@ func (s *WorkshopStageService) ResetStage(
 		return nil, ErrLPGenUnauthorized
 	}
 
+	if err := ensureLessonPlanAIIdleForStageMutation(
+		ctx,
+		lessonPlanID,
+	); err != nil {
+		return nil, err
+	}
+
 	snapshots, _, err := s.resolveStages(lessonPlan)
 	if err != nil {
 		return nil, err
@@ -514,17 +573,23 @@ func (s *WorkshopStageService) ResetStage(
 
 	targetStage := snapshots[targetIndex]
 
+	// ResetStageOutput本身仍保持仓储兼容语义；服务层先确定性补齐目标记录，
+	// 因而重启阶段不再可能把 current_stage 指向一个没有output的阶段。
+	if err := s.ensureStageOutputForSnapshot(
+		ctx,
+		lessonPlanID,
+		targetStage,
+		"{}",
+	); err != nil {
+		return nil, fmt.Errorf("确保重启目标阶段产出存在失败: %w", err)
+	}
+
 	if err := repository.ResetStageOutput(
 		ctx,
 		lessonPlanID,
 		targetStageCode,
 	); err != nil {
-		wsLog.Warn(
-			"重置阶段产出失败",
-			"plan_id", lessonPlanID,
-			"stage", targetStageCode,
-			"error", err,
-		)
+		return nil, fmt.Errorf("重置阶段产出失败: %w", err)
 	}
 
 	if err := repository.DeleteStageOutputsAfter(

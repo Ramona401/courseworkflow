@@ -20,6 +20,10 @@ import {
 } from "./CoursewareAssistantDeploymentPolicyControls";
 
 import {
+  COURSEWARE_ASSISTANT_VALIDITY_SECTION_ID,
+} from "./coursewareAssistantValidityNavigation";
+
+import {
   COURSEWARE_ASSISTANT_STUDENT_PRESETS,
   COURSEWARE_ASSISTANT_TURN_PRESETS,
   COURSEWARE_ASSISTANT_VALIDITY_PRESETS,
@@ -159,46 +163,51 @@ export function CoursewareAssistantDeploymentPolicyEditor({
         )}
       </CoursewareAssistantDeploymentPresetSection>
 
-      <CoursewareAssistantDeploymentPresetSection
-        number="3"
-        title="使用到什么时候？"
-        description="到期后不能开始新会话，已有记录和历史版本仍会保留。"
-        options={
-          COURSEWARE_ASSISTANT_VALIDITY_PRESETS
-        }
-        selected={
-          policy.validityPreset
-        }
-        disabled={disabled}
-        onSelect={(preset) =>
-          setPolicy(
-            (previous) =>
-              selectCoursewareAssistantValidityPreset(
-                previous,
-                preset,
-              ),
-          )
-        }
+      <div
+        id={COURSEWARE_ASSISTANT_VALIDITY_SECTION_ID}
+        style={{ scrollMarginTop: 24 }}
       >
-        {policy.validityPreset ===
-          "custom" && (
-          <CoursewareAssistantDeploymentDateTimeField
-            value={
-              policy.validUntil
-            }
-            disabled={disabled}
-            onChange={(value) =>
-              setPolicy(
-                (previous) => ({
-                  ...previous,
-                  validUntil:
-                    value,
-                }),
-              )
-            }
-          />
-        )}
-      </CoursewareAssistantDeploymentPresetSection>
+        <CoursewareAssistantDeploymentPresetSection
+          number="3"
+          title="使用到什么时候？"
+          description="到期后不能开始新会话，已有记录和历史版本仍会保留。"
+          options={
+            COURSEWARE_ASSISTANT_VALIDITY_PRESETS
+          }
+          selected={
+            policy.validityPreset
+          }
+          disabled={disabled}
+          onSelect={(preset) =>
+            setPolicy(
+              (previous) =>
+                selectCoursewareAssistantValidityPreset(
+                  previous,
+                  preset,
+                ),
+            )
+          }
+        >
+          {policy.validityPreset ===
+            "custom" && (
+            <CoursewareAssistantDeploymentDateTimeField
+              value={
+                policy.validUntil
+              }
+              disabled={disabled}
+              onChange={(value) =>
+                setPolicy(
+                  (previous) => ({
+                    ...previous,
+                    validUntil:
+                      value,
+                  }),
+                )
+              }
+            />
+          )}
+        </CoursewareAssistantDeploymentPresetSection>
+      </div>
 
       <CoursewareAssistantDeploymentPolicySummary
         policy={policy}
@@ -215,3 +224,4 @@ export function CoursewareAssistantDeploymentPolicyEditor({
     </div>
   );
 }
+

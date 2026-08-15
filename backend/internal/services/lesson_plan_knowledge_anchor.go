@@ -9,7 +9,8 @@ package services
 //   - 不根据课题名称或模型记忆猜课文；
 //   - 不把未被教师选择的备选方案当作结论；
 //   - source_evidence和knowledge_points[].evidence必须是分析对话原文摘录；
-//   - 后端会逐条验证证据是否真实存在于分析对话。
+//   - 后端会逐条验证证据是否真实存在于分析对话；
+//   - AI首次违反结构或证据协议时只允许一次受控重试，二次仍失败必须继续拒绝推进。
 
 import (
 	"context"
@@ -91,113 +92,16 @@ func (s *WorkshopStageService) extractConfirmedLessonPlanKnowledgeAnchors(
 		)
 	}
 
-	if strings.TrimSpace(s.aesKey) == "" {
-		return nil, fmt.Errorf(
-			"%w: 阶段服务AI密钥未初始化",
-			ErrLessonPlanKnowledgeAnchorExtractionUnavailable,
-		)
-	}
-
-	effectiveConfig, err := aiClient.GetEffectiveConfig(
-		s.aesKey,
-		models.SceneLessonPlanHarness,
-		"",
-		"",
-		"",
-	)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"%w: 加载课程锚点提取模型失败: %v",
-			ErrLessonPlanKnowledgeAnchorExtractionUnavailable,
-			err,
-		)
-	}
-
-	effectiveConfig.Temperature = 0
-	if effectiveConfig.MaxTokens <= 0 ||
-		effectiveConfig.MaxTokens > lessonPlanKnowledgeAnchorMaxTokens {
-		effectiveConfig.MaxTokens = lessonPlanKnowledgeAnchorMaxTokens
-	}
-
-	inputData := map[string]interface{}{
-		"lesson_plan": map[string]string{
-			"subject": source.Subject,
-			"grade":   source.Grade,
-			"topic":   source.Topic,
-		},
-		"confirmation_event":
-			"教师刚刚主动完成教学分析阶段；只能结构化对话中已敲定的结论，不能补猜",
-		"stage_structured_output":        source.StageStructuredOutput,
-		"stage_narrative_output":         source.StageNarrativeOutput,
-		"confirmed_analysis_conversation": transcript,
-	}
-
-	inputJSON, err := json.Marshal(inputData)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"%w: 序列化课程锚点输入失败: %v",
-			ErrLessonPlanKnowledgeAnchorExtractionUnavailable,
-			err,
-		)
-	}
-
-	result, err := aiClient.CallAI(
-		effectiveConfig,
-		lessonPlanKnowledgeAnchorSystemPrompt,
-		string(inputJSON),
-		buildLessonPlanKnowledgeTraceContext(
+	// 这里只把已经通过确定性前置校验的可信来源交给AI。
+	// 首轮若仅因为JSON协议、核心字段或原文证据校验失败，
+	// 由独立辅助模块基于同一份输入执行且仅执行一次受控重试。
+	parsed, modelUsed, tokensUsed, err :=
+		s.extractLessonPlanKnowledgeAnchorAIWithRetry(
 			ctx,
-			source.LessonPlanID,
-			source.AuthorID,
-		),
-	)
+			source,
+			transcript,
+		)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"%w: 课程锚点提取调用失败: %v",
-			ErrLessonPlanKnowledgeAnchorExtractionUnavailable,
-			err,
-		)
-	}
-	if result == nil || strings.TrimSpace(result.Content) == "" {
-		return nil, fmt.Errorf(
-			"%w: 课程锚点提取结果为空",
-			ErrLessonPlanKnowledgeAnchorExtractionUnavailable,
-		)
-	}
-
-	jsonText, ok := aiClient.ExtractJSON(result.Content)
-	if !ok {
-		return nil, fmt.Errorf(
-			"%w: 课程锚点结果不是合法JSON",
-			ErrLessonPlanKnowledgeAnchorExtractionUnavailable,
-		)
-	}
-
-	parsed := &lessonPlanKnowledgeAnchorAIResult{}
-	if err := json.Unmarshal([]byte(jsonText), parsed); err != nil {
-		return nil, fmt.Errorf(
-			"%w: 解析课程锚点失败: %v",
-			ErrLessonPlanKnowledgeAnchorExtractionUnavailable,
-			err,
-		)
-	}
-
-	normalizeLessonPlanKnowledgeAnchors(&parsed.Anchors)
-
-	// AI不能决定教师确认状态。调用入口必须是教师完成教学分析阶段。
-	parsed.Anchors.TeacherConfirmed = true
-
-	if !parsed.Ready || !parsed.Anchors.HasConfirmedCore() {
-		return nil, buildKnowledgeAnchorIncompleteError(
-			parsed.MissingFields,
-			parsed.AmbiguityNotes,
-		)
-	}
-
-	if err := validateKnowledgeAnchorEvidenceAgainstTranscript(
-		&parsed.Anchors,
-		transcript,
-	); err != nil {
 		return nil, err
 	}
 
@@ -226,8 +130,8 @@ func (s *WorkshopStageService) extractConfirmedLessonPlanKnowledgeAnchors(
 		AnchorJSON:         anchorJSON,
 		AnchorHash:         hashLessonPlanKnowledgePayload(anchorJSON),
 		AnalysisSourceHash: analysisSourceHash,
-		ModelUsed:          result.ModelUsed,
-		TokensUsed:         result.TokensUsed,
+		ModelUsed:          modelUsed,
+		TokensUsed:         tokensUsed,
 	}, nil
 }
 

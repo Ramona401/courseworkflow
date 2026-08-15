@@ -192,17 +192,39 @@ client.interceptors.response.use(
       )
     }
 
-    if (error.code === 'ECONNABORTED') {
+    if (
+      error.code === 'ECONNABORTED' ||
+      error.code === 'ETIMEDOUT'
+    ) {
       return Promise.reject(
         new Error(
-          '请求超时，数据量较大，请稍后重试',
+          '请求处理超时，请稍后重试',
+        ),
+      )
+    }
+
+    if (
+      typeof navigator !== 'undefined' &&
+      navigator.onLine === false
+    ) {
+      return Promise.reject(
+        new Error(
+          '当前设备网络已断开，请恢复网络后重试',
+        ),
+      )
+    }
+
+    if (error.code === 'ERR_NETWORK') {
+      return Promise.reject(
+        new Error(
+          '暂时无法连接服务，请稍后重试',
         ),
       )
     }
 
     return Promise.reject(
       new Error(
-        '网络连接失败，请检查网络',
+        '请求未获得服务器响应，请稍后重试',
       ),
     )
   },

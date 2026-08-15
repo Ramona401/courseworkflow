@@ -7,10 +7,10 @@ package services
 //   - 图片流水线按图片模型并发处理页面。
 //
 // 断点续装：
-//   - 只为html_content为空的页面生成HTML；
-//   - 已有HTML页面先重新执行背景与画布保护，再进入媒体恢复链；
-//   - 每个页面和图片槽位完成后立即写入数据库；
-//   - 进程重启后再次调用本服务，只继续数据库中的未完成内容。
+//   - 普通续装只为html_content为空的页面生成HTML，已有HTML页继续媒体恢复；
+//   - R-04完整性未通过后的“只补生成”由服务端冻结上一轮失败page_id，仅重生目标页；
+//   - 补生成模式不触碰非目标页的呈现保护、IAOCI规划、生图或媒体计费；
+//   - 每个页面和图片槽位完成后立即写入数据库，进程重启后仍以数据库事实恢复。
 //
 // 快速部署：
 //   - 服务关停时CancelAutoAssembly关闭任务取消信号；
@@ -39,50 +39,6 @@ import (
 )
 
 var cwAssemblyLog = logger.WithModule("cw_assembly")
-
-var cwAssemblyRunning sync.Map
-
-// cwAssemblyCancelSignal 是并发安全的一次性取消信号。
-type cwAssemblyCancelSignal struct {
-	channel chan struct{}
-	once    sync.Once
-}
-
-func newCWAssemblyCancelSignal() *cwAssemblyCancelSignal {
-	return &cwAssemblyCancelSignal{
-		channel: make(chan struct{}),
-	}
-}
-
-func (signal *cwAssemblyCancelSignal) Cancel() {
-	if signal == nil {
-		return
-	}
-
-	signal.once.Do(
-		func() {
-			close(signal.channel)
-		},
-	)
-}
-
-// cwAssemblyCancelMap 保存当前进程中的装配停止信号。
-var cwAssemblyCancelMap sync.Map
-
-func isCWAssemblyCancelled(
-	cancelChannel <-chan struct{},
-) bool {
-	if cancelChannel == nil {
-		return false
-	}
-
-	select {
-	case <-cancelChannel:
-		return true
-	default:
-		return false
-	}
-}
 
 // CoursewareAutoAssemblyService 全自动装配服务。
 type CoursewareAutoAssemblyService struct {
@@ -204,62 +160,62 @@ func (s *CoursewareAutoAssemblyService) AutoAssemble(
 		return err
 	}
 
-	// 断点续装页可能来自旧版本生成、手工导入或此前被AI复制了错误背景标记。
-	// 在区分“待生成HTML页”和“已有HTML页”之前，先统一修复所有已有HTML页面。
-	for _, page := range pages {
-		if page == nil ||
-			strings.TrimSpace(
-				page.HTMLContent,
-			) == "" {
-			continue
+	retryScope, retryMode :=
+		coursewareAutoAssemblyRetryScopeFrom(
+			ctx,
+		)
+
+	// 普通断点续装继续修复全部已有HTML页；完整性补生成必须严格只触碰目标页，
+	// 因此不能在选择补生成范围之前改写其它页面。
+	if !retryMode {
+		for _, page := range pages {
+			if page == nil ||
+				strings.TrimSpace(
+					page.HTMLContent,
+				) == "" {
+				continue
+			}
+
+			repairedHTML, repairErr :=
+				s.ensureAutoAssemblyPagePresentation(
+					ctx,
+					pageContext,
+					page,
+				)
+
+			if repairErr != nil {
+				cwAssemblyLog.Warn(
+					"断点续装页面背景与画布保护失败，保留原HTML继续处理",
+					"courseware_id", coursewareID,
+					"page_number", page.PageNumber,
+					"page_id", page.ID,
+					"error", repairErr,
+				)
+				continue
+			}
+
+			page.HTMLContent =
+				repairedHTML
 		}
-
-		repairedHTML, repairErr :=
-			s.ensureAutoAssemblyPagePresentation(
-				ctx,
-				pageContext,
-				page,
-			)
-
-		if repairErr != nil {
-			cwAssemblyLog.Warn(
-				"断点续装页面背景与画布保护失败，保留原HTML继续处理",
-				"courseware_id", coursewareID,
-				"page_number", page.PageNumber,
-				"page_id", page.ID,
-				"error", repairErr,
-			)
-			continue
-		}
-
-		page.HTMLContent =
-			repairedHTML
 	}
 
 	totalPages := len(pages)
 
-	remainingPages := make(
-		[]*models.CoursewarePage,
-		0,
-		len(pages),
-	)
-
-	for _, page := range pages {
-		if strings.TrimSpace(
-			page.HTMLContent,
-		) == "" {
-			remainingPages = append(
-				remainingPages,
-				page,
-			)
-		}
-	}
-
-	alreadyHTMLPages :=
-		s.collectAlreadyHtmlPagesForImage(
+	remainingPages,
+		alreadyHTMLPages,
+		workErr :=
+		selectCoursewareAutoAssemblyWorkPages(
 			pages,
-			remainingPages,
+			retryScope,
+			retryMode,
 		)
+	if workErr != nil {
+		s.pushError(
+			coursewareID,
+			workErr.Error(),
+		)
+		return workErr
+	}
 
 	htmlConcurrency :=
 		s.cfg.CoursewareGenConcurrency
@@ -279,7 +235,13 @@ func (s *CoursewareAutoAssemblyService) AutoAssemble(
 		len(remainingPages),
 	)
 
-	if skipVideo {
+	if retryMode {
+		startMessage = fmt.Sprintf(
+			"开始只补生成上一轮未成功页（共 %d 页，本次补 %d 页）...",
+			totalPages,
+			len(remainingPages),
+		)
+	} else if skipVideo {
 		startMessage = fmt.Sprintf(
 			"开始装配或断点续装（HTML+配图，不做视频；共 %d 页，HTML待生成 %d 页）...",
 			totalPages,
@@ -300,7 +262,9 @@ func (s *CoursewareAutoAssemblyService) AutoAssemble(
 				"html_concurrency":  htmlConcurrency,
 				"image_concurrency": imageConcurrency,
 				"skip_video":        skipVideo,
-				"resume_mode":       len(alreadyHTMLPages) > 0,
+				"resume_mode":       retryMode || len(alreadyHTMLPages) > 0,
+				"retry_mode":        retryMode,
+				"retry_page_count":  len(remainingPages),
 				"message":           startMessage,
 			},
 		},
@@ -543,6 +507,28 @@ dispatchHTMLLoop:
 
 			currentPage.HTMLContent = fullHTML
 
+			// 生成任务开始时的page对象来自旧页面快照，Status/MatchedComponentIDs可能仍是pending/空值。
+			// 媒体链会继续写HTML，因此派发前必须重取刚刚落库的页面，禁止旧快照把generated回退成pending。
+			freshPage, refreshErr :=
+				repository.GetCoursewarePageByNumber(
+					ctx,
+					coursewareID,
+					currentPage.PageNumber,
+				)
+			if refreshErr != nil ||
+				freshPage == nil {
+				cwAssemblyLog.Warn(
+					"HTML已落库但重取页面失败，跳过本轮媒体处理以避免旧元数据回写",
+					"courseware_id", coursewareID,
+					"page_number", currentPage.PageNumber,
+					"page_id", currentPage.ID,
+					"error", refreshErr,
+				)
+				return
+			}
+
+			currentPage = freshPage
+
 			// 部署关停后不再派发新的图片任务。
 			_ = dispatchImage(
 				currentPage,
@@ -650,54 +636,6 @@ dispatchHTMLLoop:
 				"message":       doneMessage,
 			},
 		},
-	)
-
-	return nil
-}
-
-// CancelAutoAssembly 停止继续派发全自动装配的新页面和新图片任务。
-//
-// 已经成功落库的数据不回滚；
-// 新进程再次执行AutoAssemble时从数据库断点续装。
-func (s *CoursewareAutoAssemblyService) CancelAutoAssembly(
-	ctx context.Context,
-	coursewareID string,
-	actor *CoursewareActorContext,
-) error {
-	if _, _, err :=
-		(&CoursewareService{}).LoadCoursewareForOwnerRuntime(
-			ctx,
-			coursewareID,
-			actor,
-		); err != nil {
-		return err
-	}
-
-	value, exists :=
-		cwAssemblyCancelMap.Load(
-			coursewareID,
-		)
-	if !exists {
-		cwAssemblyLog.Info(
-			"当前没有运行中的全自动装配任务",
-			"courseware_id",
-			coursewareID,
-		)
-		return nil
-	}
-
-	signal, ok :=
-		value.(*cwAssemblyCancelSignal)
-	if !ok || signal == nil {
-		return nil
-	}
-
-	signal.Cancel()
-
-	cwAssemblyLog.Info(
-		"已通知全自动装配停止继续派发",
-		"courseware_id",
-		coursewareID,
 	)
 
 	return nil
@@ -894,99 +832,4 @@ func (s *CoursewareAutoAssemblyService) prepareAssembly(
 	}
 
 	return pageContext, pages, nil
-}
-
-// collectAlreadyHtmlPagesForImage 收集已有HTML页面。
-func (s *CoursewareAutoAssemblyService) collectAlreadyHtmlPagesForImage(
-	allPages []*models.CoursewarePage,
-	remainingPages []*models.CoursewarePage,
-) []*models.CoursewarePage {
-	remainingSet := make(
-		map[string]bool,
-		len(remainingPages),
-	)
-
-	for _, page := range remainingPages {
-		remainingSet[page.ID] = true
-	}
-
-	result := make(
-		[]*models.CoursewarePage,
-		0,
-	)
-
-	for _, page := range allPages {
-		if strings.TrimSpace(
-			page.HTMLContent,
-		) != "" &&
-			!remainingSet[page.ID] {
-			result = append(
-				result,
-				page,
-			)
-		}
-	}
-
-	return result
-}
-
-// pushError 推送装配错误。
-func (s *CoursewareAutoAssemblyService) pushError(
-	coursewareID string,
-	message string,
-) {
-	GlobalCWSSEHub.Broadcast(
-		coursewareID,
-		CWSSEEvent{
-			EventType: CWSSEError,
-			Data: map[string]interface{}{
-				"message": message,
-			},
-		},
-	)
-}
-
-// buildPageDoneMessage 构造单页完成消息。
-func (s *CoursewareAutoAssemblyService) buildPageDoneMessage(
-	pageNumber int,
-	result cwAssemblyPageResult,
-) string {
-	parts := []string{
-		fmt.Sprintf(
-			"第 %d 页装配完成",
-			pageNumber,
-		),
-	}
-
-	switch {
-	case result.imageSkipped:
-		parts = append(
-			parts,
-			"无需配图",
-		)
-
-	case result.imageOK:
-		parts = append(
-			parts,
-			"全部图片槽位完成✓",
-		)
-
-	default:
-		parts = append(
-			parts,
-			"部分或全部图片槽位失败",
-		)
-	}
-
-	if result.videoOK {
-		parts = append(
-			parts,
-			"视频占位✓",
-		)
-	}
-
-	return strings.Join(
-		parts,
-		"，",
-	)
 }

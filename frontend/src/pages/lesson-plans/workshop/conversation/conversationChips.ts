@@ -117,6 +117,16 @@ export function computeVisibleChips(input: VisibleChipsInput): ChipDef[] {
         }
 
         if (
+          chip.action_type === 'open_tool' &&
+          (
+            chip.payload?.tool === 'textbook' ||
+            chip.payload?.tool === 'ref_material'
+          )
+        ) {
+          return false
+        }
+
+        if (
           (
             chip.action_type ===
               'send_text' ||

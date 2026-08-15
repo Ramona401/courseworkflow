@@ -20,6 +20,58 @@ export type CoursewareAssemblyRuntimeStatus =
   | 'failed'
   | 'interrupted'
 
+/** R-04 受控页面生成运行类型。 */
+export type CoursewareGenerationRunKind =
+  | 'assembly'
+  | 'batch'
+
+/** R-04 对教师展示的稳定页面引用。 */
+export interface CoursewareGenerationPageRef {
+  page_id: string
+  page_number: number
+  title: string
+  reason?: string
+}
+
+/** R-04 服务端页数完整性事实，前端不得自行重算 complete。 */
+export interface CoursewareGenerationIntegrity {
+  schema_version: number
+  run_kind: CoursewareGenerationRunKind
+  expected_count: number
+  actual_page_count: number
+  success_count: number
+  failed_count: number
+  cancelled_count: number
+  missing_count: number
+  pending_count: number
+  complete: boolean
+  success_pages: CoursewareGenerationPageRef[]
+  failed_pages: CoursewareGenerationPageRef[]
+  cancelled_pages: CoursewareGenerationPageRef[]
+  missing_pages: CoursewareGenerationPageRef[]
+  reconciled_at?: string | null
+}
+
+export type CoursewareImageRepairErrorCode =
+  | 'iaoci_plan_invalid'
+  | 'image_content_review'
+
+export interface CoursewareImageRepairItem {
+  page_id: string
+  page_number: number
+  page_title: string
+  placeholder_id: string
+  image_key?: string
+  error_code: CoursewareImageRepairErrorCode
+  message: string
+}
+
+export interface CoursewareImageRepairState {
+  retryable_count: number
+  affected_page_count: number
+  items: CoursewareImageRepairItem[]
+}
+
 export interface CoursewareAssemblyState {
   courseware_id: string
   assembly_version: number
@@ -32,6 +84,10 @@ export interface CoursewareAssemblyState {
     | 'failed'
     | 'interrupted'
   runtime_status: CoursewareAssemblyRuntimeStatus
+  run_kind: CoursewareGenerationRunKind | ''
+  integrity: CoursewareGenerationIntegrity | null
+  image_repair: CoursewareImageRepairState | null
+  repair_failed_images: boolean
   active_run_id: string | null
   started_by: string | null
   skip_video: boolean

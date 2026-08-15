@@ -26,10 +26,10 @@ import (
 // MergeStages 合并系统默认阶段与配方阶段覆盖，生成最终阶段列表
 //
 // 逻辑：
-//   1. 加载系统默认阶段（source='system', status='active'）
-//   2. 如果配方有 stages_config，检测格式（new/legacy）
-//   3. 按格式执行合并：启用/禁用/插入/覆盖/替换提示词
-//   4. 返回合并后的阶段快照列表
+//  1. 加载系统默认阶段（source='system', status='active'）
+//  2. 如果配方有 stages_config，检测格式（new/legacy）
+//  3. 按格式执行合并：启用/禁用/插入/覆盖/替换提示词
+//  4. 返回合并后的阶段快照列表
 func (s *WorkshopStageService) MergeStages(ctx context.Context, recipeStagesConfig string, recipeID string) ([]models.StageConfigSnapshot, error) {
 	defaults, err := repository.GetSystemDefaultStages(ctx)
 	if err != nil {
@@ -202,10 +202,10 @@ func (s *WorkshopStageService) mergeStagesLegacyFormat(merged []models.StageConf
 // InitStagesForPlan 为教案初始化阶段配置
 //
 // 逻辑：
-//   1. 调用MergeStages合并阶段
-//   2. 将阶段配置快照写入lesson_plans.stage_config
-//   3. 设置current_stage为第一个阶段
-//   4. 创建第一个阶段的产出物记录（status=in_progress）
+//  1. 调用MergeStages合并阶段
+//  2. 将阶段配置快照写入lesson_plans.stage_config
+//  3. 设置current_stage为第一个阶段
+//  4. 创建第一个阶段的产出物记录（status=in_progress）
 func (s *WorkshopStageService) InitStagesForPlan(ctx context.Context, lessonPlanID string, recipeStagesConfig string, recipeID string) ([]models.StageConfigSnapshot, error) {
 	snapshots, err := s.MergeStages(ctx, recipeStagesConfig, recipeID)
 	if err != nil {
@@ -226,8 +226,8 @@ func (s *WorkshopStageService) InitStagesForPlan(ctx context.Context, lessonPlan
 		LessonPlanID: lessonPlanID, StageCode: firstStage.StageCode, StageOrder: firstStage.StageOrder,
 		StructuredOutput: "{}", NarrativeOutput: "", ConversationSnapshot: "[]", Status: models.StageOutputInProgress,
 	}
-	if err := repository.CreateStageOutput(ctx, output); err != nil {
-		return nil, fmt.Errorf("创建初始阶段产出记录失败: %w", err)
+	if err := repository.EnsureStageOutput(ctx, output); err != nil {
+		return nil, fmt.Errorf("确保初始阶段产出记录失败: %w", err)
 	}
 	wsLog.Info("教案阶段初始化完成", "plan_id", lessonPlanID, "stages_count", len(snapshots), "first_stage", firstStage.StageCode)
 	return snapshots, nil

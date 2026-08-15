@@ -15,6 +15,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -161,6 +162,62 @@ func (s *CoursewareAssetService) PlanPageImagesIAOCI(
 		page.ID,
 	)
 
+	// 当前页已经成功并绑定资产的稳定槽位必须复用。
+	// 人工智能补配模式还会保留“内容审核失败”的原IAOCI，让后续生成链先按该错误做安全重述，
+	// 而不是重新规划后丢掉真实失败原因。
+	repairMode := coursewareImageRepairModeFromContext(ctx)
+	currentPreservedByKey := make(
+		map[string]*models.CoursewareImageIndex,
+	)
+	for _, index := range historyIndexes {
+		if index == nil ||
+			index.PageID == nil ||
+			*index.PageID != page.ID ||
+			index.IndexType !=
+				models.CWImageIndexTypeImage {
+			continue
+		}
+
+		generatedReusable :=
+			index.Status == models.CWImageIndexStatusGenerated &&
+				index.AssetID != nil &&
+				strings.TrimSpace(*index.AssetID) != ""
+		contentReviewReusable :=
+			repairMode &&
+				index.Status == models.CWImageIndexStatusFailed &&
+				isCoursewareImageContentReviewFailureText(
+					index.LastError,
+				)
+
+		if generatedReusable || contentReviewReusable {
+			currentPreservedByKey[index.ImageKey] = index
+		}
+	}
+
+	// 如果当前每个稳定槽位都有可复用事实，直接返回计划，不再调用文本AI重新规划。
+	// 这使“内容审核失败”的人工补配真正只调整失败提示词，也让全成功页面断点恢复零规划成本。
+	if preservedItems, complete :=
+		cwBuildPreservedImageIAOCIPlanItems(
+			slots,
+			currentPreservedByKey,
+		); complete {
+		_ = repository.UpdatePageImageSuggestions(
+			ctx,
+			coursewareID,
+			pageNumber,
+			"",
+		)
+
+		cwAssetLog.Info(
+			"页面图片IAOCI直接复用现有稳定槽位计划",
+			"courseware_id", coursewareID,
+			"page_number", pageNumber,
+			"slot_count", len(slots),
+			"repair_mode", repairMode,
+		)
+		return preservedItems, nil
+	}
+
 	userInput := cwBuildImageIAOCIPlanInput(
 		courseware,
 		page,
@@ -225,20 +282,52 @@ func (s *CoursewareAssetService) PlanPageImagesIAOCI(
 		)
 	}
 
-	parsedAOCIs, err :=
+	parsedAOCIs, validationErr :=
 		cwParseImageAOCIBlocks(result.Content)
-	if err != nil {
-		return nil, err
+	if validationErr == nil {
+		validationErr =
+			cwValidatePlannedImageAOCIs(
+				parsedAOCIs,
+				slots,
+				expectedOrder,
+				expectedSlot,
+				historyKeySet,
+			)
 	}
 
-	if err := cwValidatePlannedImageAOCIs(
-		parsedAOCIs,
-		slots,
-		expectedOrder,
-		expectedSlot,
-		historyKeySet,
-	); err != nil {
-		return nil, err
+	if validationErr != nil {
+		cwAssetLog.Warn(
+			"图片IAOCI首次规划未通过严格校验，准备自动修复一次",
+			"courseware_id", coursewareID,
+			"page_number", pageNumber,
+			"error", validationErr,
+		)
+
+		parsedAOCIs, err =
+			s.repairImageIAOCIPlanOnce(
+				ctx,
+				aiConfig,
+				systemPrompt.Content,
+				userInput,
+				result.Content,
+				validationErr,
+				traceContext,
+				slots,
+				expectedOrder,
+				expectedSlot,
+				historyKeySet,
+			)
+		if err != nil {
+			if errors.Is(
+				err,
+				errCoursewareImageIAOCIPlanRepairCallFailed,
+			) {
+				return nil, err
+			}
+			return nil, newCoursewareImageIAOCIPlanRepairableError(
+				err,
+			)
+		}
 	}
 
 	// 第一阶段：先保存全部图片索引。
@@ -248,9 +337,38 @@ func (s *CoursewareAssetService) PlanPageImagesIAOCI(
 		0,
 		len(parsedAOCIs),
 	)
+	preservedExisting :=
+		make(map[string]bool)
 
 	for _, imageAOCI := range parsedAOCIs {
 		slot := expectedSlot[imageAOCI.ImageKey]
+
+		if existing := currentPreservedByKey[imageAOCI.ImageKey]; existing != nil {
+			existingAOCI, parseErr :=
+				utils.ParseImageAOCI(
+					existing.AOCIText,
+				)
+			if parseErr == nil {
+				preservedExisting[imageAOCI.ImageKey] = true
+
+				planItems = append(
+					planItems,
+					CoursewareImageAOCIPlanItem{
+						IndexID:       existing.ID,
+						PlaceholderID: slot.PlaceholderID,
+						ImageKey:      existing.ImageKey,
+						AOCIText:      existing.AOCIText,
+						Caption:       existing.FocusText,
+						Prompt:        existing.GenerationPrompt,
+						Size: cwImageAOCISize(
+							existingAOCI,
+						),
+						Order: slot.Order,
+					},
+				)
+				continue
+			}
+		}
 
 		formattedAOCI, formatErr :=
 			utils.FormatImageAOCI(imageAOCI)
@@ -320,7 +438,12 @@ func (s *CoursewareAssetService) PlanPageImagesIAOCI(
 	}
 
 	// 第二阶段：全部索引存在后，再保存R关系。
+	// 已经生成成功的槽位保持原IAOCI与原关系，禁止仅因补配其它失败槽位而改写成功事实。
 	for _, imageAOCI := range parsedAOCIs {
+		if preservedExisting[imageAOCI.ImageKey] {
+			continue
+		}
+
 		if _, err :=
 			repository.ReplaceCoursewareImageRelationsByKeys(
 				ctx,
@@ -358,9 +481,66 @@ func (s *CoursewareAssetService) PlanPageImagesIAOCI(
 		"page_number", pageNumber,
 		"slot_count", len(slots),
 		"iaoci_count", len(planItems),
+		"reused_existing",
+		len(preservedExisting),
 		"model", result.ModelUsed,
 		"tokens", result.TokensUsed,
 	)
 
 	return planItems, nil
+}
+
+// cwBuildPreservedImageIAOCIPlanItems 把当前数据库中的稳定槽位事实转换为装配计划。
+// 只有所有真实槽位都能安全解析时才返回complete=true；任一槽位缺失或IAOCI损坏则回到正式规划链。
+func cwBuildPreservedImageIAOCIPlanItems(
+	slots []cwImagePlaceholderSlot,
+	preserved map[string]*models.CoursewareImageIndex,
+) (
+	[]CoursewareImageAOCIPlanItem,
+	bool,
+) {
+	if len(slots) == 0 || len(preserved) == 0 {
+		return nil, false
+	}
+
+	items := make(
+		[]CoursewareImageAOCIPlanItem,
+		0,
+		len(slots),
+	)
+	for _, slot := range slots {
+		existing := preserved[slot.ImageKey]
+		if existing == nil {
+			return nil, false
+		}
+
+		imageAOCI, err := utils.ParseImageAOCI(
+			existing.AOCIText,
+		)
+		if err != nil || imageAOCI.ImageKey != slot.ImageKey {
+			return nil, false
+		}
+
+		items = append(
+			items,
+			CoursewareImageAOCIPlanItem{
+				IndexID:       existing.ID,
+				PlaceholderID: slot.PlaceholderID,
+				ImageKey:      existing.ImageKey,
+				AOCIText:      existing.AOCIText,
+				Caption:       existing.FocusText,
+				Prompt:        existing.GenerationPrompt,
+				Size:          cwImageAOCISize(imageAOCI),
+				Order:         slot.Order,
+			},
+		)
+	}
+
+	sort.Slice(
+		items,
+		func(left int, right int) bool {
+			return items[left].Order < items[right].Order
+		},
+	)
+	return items, true
 }

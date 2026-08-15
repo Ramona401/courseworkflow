@@ -25,6 +25,7 @@ import { useState, useEffect, useRef } from 'react'
 import { C, CW_WIDTH, CW_HEIGHT } from './workshopConstants'
 import { injectPreviewMode, NAV_KEY_MSG_TYPE } from './previewInject'
 import PlatformCoursewareAssistantOverlay from './PlatformCoursewareAssistantOverlay'
+import { rememberCoursewarePreviewPage } from './coursewarePreviewPosition'
 
 export default function SlideshowPlayer({ pages, initialPage, onClose }: {
   pages: { id?: string; page_number: number; title: string; html_content: string }[]
@@ -51,6 +52,18 @@ export default function SlideshowPlayer({ pages, initialPage, onClose }: {
 
   // v0.41: 注入预览降级脚本
   const previewHtml = data ? injectPreviewMode(data.html_content) : ''
+
+  /**
+   * 放映翻页时同步稳定page_id。
+   *
+   * 真全屏里直接刷新时父组件来不及收到onClose回写，
+   * 这里提前保存当前页，刷新后的普通工坊即可恢复到同一页。
+   */
+  useEffect(() => {
+    if (data?.id) {
+      rememberCoursewarePreviewPage(data.id)
+    }
+  }, [data?.id])
 
   // P1-02: 统一翻页入口——只改本组件 state（单一真相源）+ 同步刷新 ref，不回调父组件
   const gotoPage = (pn: number) => {

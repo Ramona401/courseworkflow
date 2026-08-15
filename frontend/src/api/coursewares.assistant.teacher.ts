@@ -47,6 +47,8 @@ export interface CoursewareAssistantTTSResult {
   cacheHit: boolean
 }
 
+export type CoursewareAssistantTTSCharacter = 'female' | 'male'
+
 function pathSegment(value: string): string {
   const normalized = value.trim()
 
@@ -114,6 +116,8 @@ function coursewareAssistantTTSVoiceName(voiceCode: string): string {
   switch (voiceCode) {
   case 'zh_female_vv_uranus_bigtts':
     return 'vivi 2.0'
+  case 'zh_male_m191_uranus_bigtts':
+    return '云舟'
   case 'en_male_tim_uranus_bigtts':
     return 'Tim'
   default:
@@ -355,12 +359,14 @@ export async function startCoursewareAssistantPreviewSession(
  * 为当前教师本人拥有的教学智能体部署生成豆包MP3朗读。
  *
  * operationId由浏览器为一次完整回答生成并在恢复重试时复用；
- * 后端会重新校验部署所有者、选择中文vivi或英文Tim，并执行TTS积分预留与结算。
+ * character只允许female/male，后端仍负责把人物安全映射为批准的豆包speaker；
+ * 女老师中文使用vivi 2.0，男老师中文使用云舟，英文继续使用Tim。
  */
 export async function synthesizeCoursewareAssistantSpeech(
   deploymentId: string,
   text: string,
   operationId: string,
+  character: CoursewareAssistantTTSCharacter,
   signal?: AbortSignal,
 ): Promise<CoursewareAssistantTTSResult> {
   const normalizedText = text.trim()
@@ -379,6 +385,7 @@ export async function synthesizeCoursewareAssistantSpeech(
     {
       text: normalizedText,
       operation_id: normalizedOperationID,
+      character,
     },
     {
       responseType: 'blob',
